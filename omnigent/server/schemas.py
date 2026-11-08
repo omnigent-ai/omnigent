@@ -1706,6 +1706,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
+    sibling_source_id: str | None = None
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
@@ -1905,6 +1906,11 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         ``"xhigh"``, ``"max"``, and ``"ultra"``. Provider-specific support is
         validated when a turn executes. ``None`` means use the agent
         default.
+    :param model_override: Optional per-session LLM model override, e.g.
+        ``"databricks-claude-sonnet-4-6"``; the same session-level field as
+        the JSON create's ``model_override``, so the bundle's model stays
+        its default. Validated against the shared model-id charset.
+        ``None`` means use the agent default.
     :param host_id: Optional host to launch the runner on, e.g.
         ``"host_a1b2c3d4..."``. When set, the server generates a
         binding token, writes the expected runner_id to the session
@@ -1917,6 +1923,8 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         uploaded agent's ``os_env.cwd`` boundary at session create
         (per designs/SESSION_WORKSPACE_SELECTION.md). Optional
         otherwise.
+    :param workspaces: Repository URLs to clone into a managed sandbox.
+    :param git: Optional external-host worktree creation or binding options.
     :param terminal_launch_args: Optional pass-through CLI args for a
         native terminal wrapper (claude / codex), e.g.
         ``["--dangerously-skip-permissions"]``. Set at create-time so
@@ -1949,9 +1957,13 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     project_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    model_override: str | None = None
     host_id: str | None = None
     workspace: str | None = None
+    workspaces: list[str] | None = None
+    git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
+    sibling_source_id: str | None = None
     parent_session_id: str | None = None
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
@@ -1997,13 +2009,25 @@ class SessionCreateMetadata(_SandboxProfileSelection):
                     "host_type 'managed' lets the server provision the host; "
                     "host_id must not be set"
                 )
-            if self.workspace is not None:
+            if self.git is not None:
+                raise ValueError("git worktrees require an existing external host")
+            if self.workspace is not None and self.workspaces is not None:
+                raise ValueError(
+                    "set either 'workspace' (one repository) or 'workspaces' "
+                    "(several) for host_type 'managed', not both"
+                )
+            if self.workspaces is not None and len(self.workspaces) > _MAX_MANAGED_WORKSPACES:
+                raise ValueError(
+                    f"host_type 'managed' takes at most {_MAX_MANAGED_WORKSPACES} "
+                    f"repositories in 'workspaces' (got {len(self.workspaces)})"
+                )
+            for candidate in self.managed_repo_workspaces():
                 try:
-                    parse_repo_workspace(self.workspace)
+                    parse_repo_workspace(candidate)
                 except ValueError as exc:
                     raise ValueError(
                         "host_type 'managed' takes a git repository URL "
-                        f"(optionally '#<branch>') as workspace: {exc}"
+                        f"(optionally '#<branch>') in each workspace: {exc}"
                     ) from exc
             return self
         if self.sandbox_provider is not None:
@@ -2011,12 +2035,26 @@ class SessionCreateMetadata(_SandboxProfileSelection):
                 "sandbox_provider only applies to host_type 'managed' — "
                 "external hosts are not server-provisioned"
             )
+        if self.workspaces:
+            raise ValueError(
+                "'workspaces' (multi-repo clone) requires host_type 'managed' — "
+                "external hosts take a single absolute path in 'workspace'"
+            )
         if self.workspace is not None and is_repo_workspace(self.workspace):
             raise ValueError(
                 "a repository-URL workspace requires host_type 'managed' — "
                 "external hosts take an absolute path on the host"
             )
+        if self.git is not None and self.host_id is None:
+            raise ValueError("git worktree creation requires host_id")
         return self
+
+    def managed_repo_workspaces(self) -> list[str]:
+        if self.workspaces:
+            return list(self.workspaces)
+        if self.workspace is not None:
+            return [self.workspace]
+        return []
 
 
 class CreatedSessionResponse(BaseModel):
@@ -2170,6 +2208,13 @@ class BackgroundTaskInfo(BaseModel):
     status: str | None = None
     description: str | None = None
     command: str | None = None
+
+
+class SessionFamily(BaseModel):
+    id: str
+    representative_id: str | None
+    pinned: bool = False
+    pinned_at: str | None = None
 
 
 class SessionResponse(BaseModel):
@@ -2376,6 +2421,11 @@ class SessionResponse(BaseModel):
         Ordinary native sends use the in-memory
         :mod:`omnigent.runtime.pending_inputs` index; startup inputs also
         survive server restart in the conversation store.
+    :param failed_inputs: Durable managed-startup inputs that were never
+        delivered, e.g. because the sandbox host did not come online. Same
+        shape as ``pending_inputs``, in submission order; their file blocks
+        keep ids that still resolve under this session. Empty when nothing
+        failed.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. Set when the
         session was bound to a host workspace at create-time, or
@@ -2433,6 +2483,7 @@ class SessionResponse(BaseModel):
         snapshots independently of lifecycle status.
     """
 
+    family: SessionFamily | None = None
     id: str
     agent_id: str
     agent_name: str | None = None
@@ -2476,6 +2527,8 @@ class SessionResponse(BaseModel):
     # Durable startup inputs plus ordinary native inputs awaiting a receipt.
     # Each {"pending_id", "content"} restores a pending bubble on reconnect.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
+    # Startup inputs that were never delivered, shown as undelivered messages.
+    failed_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
@@ -2498,6 +2551,12 @@ class SessionResponse(BaseModel):
     # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
     # ``GET /v1/sessions?project=``.
     project_id: str | None = None
+    # The session whose Workspace rail lists this one as a side chat; ``None``
+    # otherwise, including side chats from before the rail was server-listed.
+    side_chat_parent_id: str | None = None
+    # Whether the viewer may start side chats here: only the owner of the
+    # session's root can. ``None`` where the response doesn't compute it.
+    side_chat_allowed: bool | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -2618,6 +2677,7 @@ class UpdateSessionRequest(BaseModel):
     """
 
     runner_id: str | None = None
+    family_pinned: bool | None = None
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
@@ -3114,6 +3174,11 @@ class SessionListItem(BaseModel):
         ``omnigent claude`` sessions. ``None`` for regular
         AP-only conversations. Lets the sidebar / picker render
         a runtime badge without a follow-up GET.
+    :param shared_with_others: Whether the requesting user owns this
+        session and has granted access to another user (the public link
+        alone doesn't count). ``None`` when the requester isn't the owner
+        or permissions are disabled, so the grant list never leaks to
+        non-owners.
     :param pending_elicitations_count: Number of approval prompts
         currently waiting on this session. Powers the sidebar's
         "needs attention" badge so a user with several sessions
@@ -3186,6 +3251,7 @@ class SessionListItem(BaseModel):
         "not known yet". ``None`` on servers without PR storage.
     """
 
+    family: SessionFamily | None = None
     id: str
     agent_id: str
     agent_name: str | None = None
@@ -3203,6 +3269,7 @@ class SessionListItem(BaseModel):
     permission_level: int | None = None
     owner: str | None = None
     external_session_id: str | None = None
+    shared_with_others: bool | None = None
     pending_elicitations_count: int = 0
     background_work_running: bool = False
     blocked_on: str | None = None
@@ -3223,6 +3290,14 @@ class SessionListItem(BaseModel):
     pull_requests_synced: bool | None = None
 
 
+class SessionPageBoundary(BaseModel):
+    """Last visible primary-page row, before family context is appended."""
+
+    id: str
+    created_at: int
+    updated_at: int
+
+
 class SessionList(BaseModel):
     """Paginated list of sessions; ``data`` is a page of ``SessionListItem``."""
 
@@ -3231,6 +3306,7 @@ class SessionList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+    page_boundary: SessionPageBoundary | None = None
 
 
 class ChildSessionList(BaseModel):
@@ -3238,6 +3314,32 @@ class ChildSessionList(BaseModel):
 
     object: Literal["list"] = "list"
     data: list[ChildSessionSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class SideChatSummary(BaseModel):
+    """
+    A side chat listed in its parent session's Workspace rail.
+
+    :param id: Side-chat session id, e.g. ``"conv_side123"``.
+    :param object: Fixed resource type, always ``"side_chat"``.
+    :param created_at: Unix epoch seconds when the side chat was created.
+    :param title: The side chat's title, when available.
+    """
+
+    id: str
+    object: Literal["side_chat"] = "side_chat"
+    created_at: int
+    title: str | None = None
+
+
+class SideChatList(BaseModel):
+    """Paginated list of side chats; ``data`` is a page of ``SideChatSummary``."""
+
+    object: Literal["list"] = "list"
+    data: list[SideChatSummary] = Field(default_factory=list)
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
@@ -4103,6 +4205,10 @@ class SessionCreatedEvent(_SSEEventBase):
     parent_session_id: str | None = None
 
 
+# Why a session's work moved to another session (``session.superseded``).
+SupersessionReason = Literal["clear"]
+
+
 class SessionSupersededEvent(_SSEEventBase):
     """
     This conversation was superseded by another and clients should
@@ -4140,7 +4246,7 @@ class SessionSupersededEvent(_SSEEventBase):
     type: Literal["session.superseded"]
     conversation_id: str
     target_conversation_id: str
-    reason: Literal["clear"] = "clear"
+    reason: SupersessionReason = "clear"
 
 
 class SessionBtwSidechatEvent(_SSEEventBase):

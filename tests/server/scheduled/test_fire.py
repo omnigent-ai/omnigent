@@ -65,6 +65,7 @@ class _FakeConversation:
     runner_last_seen: int | None = None
     parent_conversation_id: str | None = None
     root_conversation_id: str = ""
+    terminal_launch_args: list[str] | None = None
 
     def __post_init__(self) -> None:
         self.root_conversation_id = self.root_conversation_id or self.id
@@ -92,36 +93,57 @@ class FakeAgentStore:
 
 
 class _FakeExecutor:
-    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
+    def __init__(
+        self,
+        harness: str,
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
         # Mirrors AgentSpec.executor: a canonical harness in ``config['harness']``
         # (falls back to ``type``). The permission-mode injection reads this to
         # confirm a claude-native agent before adding ``--permission-mode``.
         self.type = harness
-        self.config = {"harness": harness}
+        self.config: dict[str, Any] = {"harness": harness}
+        if permission_mode is not None:
+            self.config["permission_mode"] = permission_mode
         self.reasoning_effort = reasoning_effort
 
 
 class _FakeSpec:
-    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
-        self.executor = _FakeExecutor(harness, reasoning_effort)
+    def __init__(
+        self,
+        harness: str,
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
+        self.executor = _FakeExecutor(harness, reasoning_effort, permission_mode)
 
 
 class _FakeLoadedAgent:
-    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
-        self.spec = _FakeSpec(harness, reasoning_effort)
+    def __init__(
+        self,
+        harness: str,
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
+        self.spec = _FakeSpec(harness, reasoning_effort, permission_mode)
 
 
 class FakeAgentCache:
     """Resolves an agent id to a spec with a fixed harness (for launch gating)."""
 
     def __init__(
-        self, harness: str = "claude-native", reasoning_effort: str | None = None
+        self,
+        harness: str = "claude-native",
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
     ) -> None:
         self._harness = harness
         self._reasoning_effort = reasoning_effort
+        self._permission_mode = permission_mode
 
     def load(self, agent_id: str, bundle_location: str, **_: Any) -> _FakeLoadedAgent:
-        return _FakeLoadedAgent(self._harness, self._reasoning_effort)
+        return _FakeLoadedAgent(self._harness, self._reasoning_effort, self._permission_mode)
 
 
 class FakeScheduledTaskStore:
@@ -143,6 +165,7 @@ class FakeScheduledTaskStore:
         # Fail adopt_session, after committing the session when ``adopt_commits``.
         self.adopt_error: Exception | None = None
         self.adopt_commits = False
+        self.released: list[tuple[str, str]] = []
 
     def get(self, scheduled_task_id: str) -> ScheduledTask | None:
         self.get_workspace_ids.append(current_workspace_id())
@@ -199,6 +222,14 @@ class FakeScheduledTaskStore:
                 self._rows[key] = replace(self._rows[key], session_id=session_id)
             raise self.adopt_error
         return self.adopt_outcome
+
+    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+        key = next((k for k, t in self._rows.items() if t.id == scheduled_task_id), None)
+        if key is None or self._rows[key].session_id != session_id:
+            return False
+        self._rows[key] = replace(self._rows[key], session_id=None)
+        self.released.append((scheduled_task_id, session_id))
+        return True
 
     def get_running_run_by_conversation(self, conversation_id: str) -> Any:
         if conversation_id in self.running_runs:
@@ -300,6 +331,9 @@ class FakeConversationStore:
 
     def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
         self.label_writes[conversation_id] = dict(labels)
+
+    def clear_host_binding(self, conversation_id: str, **kwargs: Any) -> None:
+        self.updated.append({"id": conversation_id, "clear_host_binding": kwargs})
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
@@ -929,6 +963,32 @@ def _claude_agent_deps(
             ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
             False,
         ),
+        (
+            "codex-native",
+            "ask-for-approval",
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "-c",
+                'approvals_reviewer="user"',
+            ],
+            False,
+        ),
+        (
+            "codex-native",
+            "approve-for-me",
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ],
+            False,
+        ),
         ("codex-native", "default", None, False),
         ("codex-native", "bypass", None, True),
         ("cursor-native", "auto-review", ["--auto-review"], False),
@@ -960,7 +1020,6 @@ async def test_permission_mode_launch_options(
     [
         ("claude-native", "acceptEdits", ["--permission-mode", "acceptEdits"], False),
         ("codex-native", "default", None, False),
-        ("codex-native", "bypass", None, True),
     ],
 )
 async def test_permission_mode_becomes_terminal_launch_args(
@@ -1015,7 +1074,7 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
 async def test_incompatible_permission_mode_fails_without_session() -> None:
     """A saved mode for another harness must not silently fall back to defaults."""
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")})
 
     launch = AsyncMock()
 
@@ -1031,7 +1090,7 @@ async def test_incompatible_permission_mode_fails_without_session() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "permission_mode_unsupported"
-    assert "'bypassPermissions' is not supported by 'codex-native'" in store.runs[0]["error"]
+    assert "'acceptEdits' is not supported by 'codex-native'" in store.runs[0]["error"]
     assert "Edit the automation" in store.runs[0]["error"]
     assert store.runs[0]["conversation_id"] is None
 
@@ -2818,7 +2877,6 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
 @pytest.mark.parametrize(
     ("existing", "task_overrides", "error_code"),
     [
-        (None, {}, "continued_session_missing"),
         (_continued_session(archived=True), {}, "continued_session_archived"),
         (
             _continued_session(parent_conversation_id="conv_root"),
@@ -2827,6 +2885,23 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
         ),
         (_continued_session(agent_id="ag_other"), {}, "continued_session_incompatible"),
         (_continued_session(), {"base_branch": "HEAD"}, "continued_session_incompatible"),
+        # Under the "new sessions only" contract a reused session keeps its own
+        # mode, so one switched to bypass must not take unattended prompts.
+        (
+            _continued_session(
+                labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+            ),
+            {},
+            "permission_mode_not_allowed",
+        ),
+        # Codex's full bypass, as spec-derived launch args emit it, with no label.
+        (
+            _continued_session(
+                terminal_launch_args=["--dangerously-bypass-approvals-and-sandbox"]
+            ),
+            {},
+            "permission_mode_not_allowed",
+        ),
         (
             _continued_session(
                 git_branch="main",
@@ -2921,6 +2996,46 @@ async def test_continue_never_replaces_an_unusable_session(
     assert conv_store.created == []
     assert [(run["status"], run["error_code"]) for run in store.runs] == [("failed", error_code)]
     assert "start a new session" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_continue_starts_a_new_session_when_the_old_one_was_deleted() -> None:
+    """The owner deleted the session between runs: the task starts and keeps a fresh one."""
+    conv_store = _ExistingConversationStore()  # conv_prev is gone
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert store.released == [("task_1", "conv_prev")]
+    [(task_id, new_session_id)] = store.adopted
+    assert task_id == "task_1"
+    assert new_session_id != "conv_prev"
+    assert [conv.id for conv in launched] == [new_session_id]
+    assert [run["status"] for run in store.runs] == ["running"]
+    assert store.runs[0].get("error_code") is None
+
+
+@pytest.mark.asyncio
+async def test_continue_follows_a_replacement_another_run_recorded_first() -> None:
+    """Two runs find the session gone; the loser continues the winner's new session."""
+    conv_store = _ExistingConversationStore(_continued_session(id="conv_new"))
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+
+    def release_after_a_competing_run(task_id: str, session_id: str) -> bool:
+        # The competing run released conv_prev and recorded conv_new before this one.
+        store._rows["task_1"] = replace(store._rows["task_1"], session_id="conv_new")
+        return False
+
+    store.release_session = release_after_a_competing_run  # type: ignore[method-assign]
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert store.adopted == []
+    assert conv_store.created == []
+    assert [conv.id for conv in launched] == ["conv_new"]
+    assert [(run["status"], run["conversation_id"]) for run in store.runs] == [
+        ("succeeded", "conv_new")
+    ]
 
 
 _SANDBOX_TASK_ID = "5a1d0c9e8b7f4a3d2c1b0a9f8e7d6c5b"
@@ -3034,6 +3149,52 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
     assert call.kwargs["host_id"] == own
     assert call.kwargs["relaunch_host"] is (existing if host_exists else None)
     # A relaunch keeps routing the sandbox by the task's host id.
+    assert conv_store.created[0]["labels"][REQUESTED_HOST_ID_LABEL_KEY] == own
+    assert [run["status"] for run in store.runs] == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_task_whose_session_was_deleted_starts_a_new_one_on_its_own_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the session gone, no earlier workspace is known, so the sandbox host the task
+    left behind is relaunched under the task's own host id."""
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, ManagedLaunchTracker
+    from omnigent.server.routes import sessions
+
+    task = _sandbox_continue_task(session_id="conv_prev", last_run_conversation_id="conv_prev")
+    own = continued_sandbox_host_id(task.id, task.workspace_id)
+    existing = _FakeHost(own, "local", sandbox_provider="agent_sandbox")
+
+    async def launch(**kwargs: Any) -> None:
+        kwargs["tracker"].finish(kwargs["session_id"])
+
+    managed_launch = AsyncMock(side_effect=launch)
+    monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
+    conv_store = _ExistingConversationStore()  # conv_prev was deleted
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            host_store=FakeHostStore({own: existing}),
+            sandbox_config=_managed_sandbox_config(),
+            managed_launches=ManagedLaunchTracker(),
+            startup_inputs=FakeStartupInputs(),
+        )
+    )
+
+    await on_fire(0, "task_1")
+    await _drain()
+    await _drain_managed_launches()
+
+    assert store.released == [(task.id, "conv_prev")]
+    [(task_id, new_session_id)] = store.adopted
+    assert task_id == task.id
+    assert new_session_id != "conv_prev"
+    [call] = managed_launch.await_args_list
+    assert call.kwargs["host_id"] == own
+    assert call.kwargs["relaunch_host"] is existing
     assert conv_store.created[0]["labels"][REQUESTED_HOST_ID_LABEL_KEY] == own
     assert [run["status"] for run in store.runs] == ["running"]
 
@@ -3658,3 +3819,106 @@ async def test_cancelled_session_creation_waits_for_writes_before_cleanup(
         thread_release.set()
         finish_cleanup.set()
         await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "mode"),
+    [
+        ("claude-native", "bypassPermissions"),
+        ("claude-native", "dontAsk"),
+        ("codex-native", "bypass"),
+        ("codex-native", "full-access"),
+        ("cursor-native", "yolo"),
+        ("antigravity-native", "skip"),
+        ("devin-native", "dangerous"),
+    ],
+)
+async def test_saved_unattended_disallowed_mode_fails_without_session(
+    harness: str, mode: str
+) -> None:
+    """A task saved before the restriction fails at fire instead of running unattended."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=mode)})
+    launch = AsyncMock()
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness=harness), launch_dispatch=launch
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    launch.assert_not_awaited()
+    assert conv_store.created == []
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
+    assert repr(mode) in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("spec_mode", "fires"), [(None, True), ("bypassPermissions", False)])
+async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fires: bool) -> None:
+    """A Claude SDK spec with no mode runs in auto; one set to bypassPermissions cannot fire."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    launch = AsyncMock()
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness="claude-sdk", permission_mode=spec_mode),
+    )
+
+    on_fire = build_on_fire(deps, launch_dispatch=launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    if fires:
+        assert len(conv_store.created) == 1
+    else:
+        launch.assert_not_awaited()
+        assert conv_store.created == []
+        assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
+        assert "the agent's default" in store.runs[0]["error"]
+
+
+@pytest.mark.parametrize(
+    ("labels", "launch_args", "expected"),
+    [
+        ({}, None, None),
+        ({"omnigent.claude_native.permission_mode": "auto"}, None, None),
+        (
+            {"omnigent.claude_native.permission_mode": "bypassPermissions"},
+            None,
+            "bypassPermissions",
+        ),
+        ({"omnigent.claude_native.permission_mode": "dontAsk"}, None, "dontAsk"),
+        # The live label wins over the flags the session was launched with.
+        (
+            {"omnigent.claude_native.permission_mode": "auto"},
+            ["--permission-mode", "bypassPermissions"],
+            None,
+        ),
+        ({}, ["--permission-mode", "bypassPermissions"], "--permission-mode bypassPermissions"),
+        ({}, ["--dangerously-skip-permissions"], "--dangerously-skip-permissions"),
+        ({}, ["--yolo"], "--yolo"),
+        (
+            {},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            "--dangerously-bypass-approvals-and-sandbox",
+        ),
+        (
+            {},
+            ["--sandbox", "read-only", "--ask-for-approval", "never"],
+            "--ask-for-approval never",
+        ),
+        ({}, ["--sandbox", "read-only", "--ask-for-approval", "on-request"], None),
+        ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, None, "bypass"),
+    ],
+)
+def test_session_unattended_disallowed_mode(
+    labels: dict[str, str], launch_args: list[str] | None, expected: str | None
+) -> None:
+    conv = SimpleNamespace(labels=labels, terminal_launch_args=launch_args)
+
+    assert fire_mod.session_unattended_disallowed_mode(conv) == expected

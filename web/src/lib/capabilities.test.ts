@@ -320,6 +320,32 @@ describe("resolveServerInfo request_managed_sandbox_host_id", () => {
   });
 });
 
+describe("resolveServerInfo session_bundle_workspaces", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("requires explicit support for %s", async (value, expected) => {
+    expect((await probe({ session_bundle_workspaces: value })).session_bundle_workspaces).toBe(
+      expected,
+    );
+  });
+});
+
+describe("resolveServerInfo sibling_session_destinations", () => {
+  it.each([
+    ["current_host", "current_host"],
+    ["current_host_or_new_sandbox", "current_host_or_new_sandbox"],
+    ["any_host", "any_host"],
+    [undefined, "any_host"],
+    ["connected_hosts", "current_host"],
+  ])("parses %s as %s", async (advertised, expected) => {
+    const parsed = await probe({ sibling_session_destinations: advertised });
+    expect(parsed.sibling_session_destinations).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo session_fork_workspaces", () => {
   it.each([
     [true, true],
@@ -329,6 +355,18 @@ describe("resolveServerInfo session_fork_workspaces", () => {
   ])("parses %s strictly as %s", async (advertised, expected) => {
     const parsed = await probe({ session_fork_workspaces: advertised });
     expect(parsed.session_fork_workspaces).toBe(expected);
+  });
+});
+
+describe("resolveServerInfo session_claude_sdk_clear", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ session_claude_sdk_clear: advertised });
+    expect(parsed.session_claude_sdk_clear).toBe(expected);
   });
 });
 
