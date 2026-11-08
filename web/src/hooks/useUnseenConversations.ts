@@ -330,15 +330,79 @@ export function markConversationUnread(conversationId: string, updatedAt: number
  * exempt from the hydration gate.
  */
 export function markConversationRead(conversationId: string, updatedAt: number): void {
+  if (!applyRead(conversationId, updatedAt)) return;
+  persistToStorage();
+  notifySubscribers();
+  void syncReadState(conversationId);
+}
+
+/** Writes an explicit read into the mirror without persisting; true when it changed. */
+function applyRead(conversationId: string, updatedAt: number): boolean {
   const hadOverride = explicitlyUnread.delete(conversationId);
   const baseline = Math.max(nowSeconds(), updatedAt);
   const stored = lastSeenMap[conversationId];
   const advanced = stored === undefined || stored < baseline;
   if (advanced) lastSeenMap[conversationId] = baseline;
-  if (!hadOverride && !advanced) return;
+  return hadOverride || advanced;
+}
+
+/** A conversation's read state from before a bulk mark, for {@link restoreReadState}. */
+export interface ReadStateUndo {
+  conversationId: string;
+  lastSeen: number | undefined;
+  explicitlyUnread: boolean;
+  /** The baseline the bulk mark wrote; a later read or unread moves it and wins. */
+  markedLastSeen: number;
+}
+
+/**
+ * {@link markConversationRead} for many conversations with one store write.
+ * Returns the prior state of each conversation it changed, so it can be undone.
+ */
+export function markConversationsRead(
+  targets: readonly { id: string; updatedAt: number }[],
+): ReadStateUndo[] {
+  const undo: ReadStateUndo[] = [];
+  for (const { id, updatedAt } of targets) {
+    const lastSeen = lastSeenMap[id];
+    const wasExplicitlyUnread = explicitlyUnread.has(id);
+    if (!applyRead(id, updatedAt)) continue;
+    undo.push({
+      conversationId: id,
+      lastSeen,
+      explicitlyUnread: wasExplicitlyUnread,
+      markedLastSeen: lastSeenMap[id]!,
+    });
+  }
+  if (undo.length === 0) return undo;
   persistToStorage();
   notifySubscribers();
-  void syncReadState(conversationId);
+  for (const { conversationId } of undo) void syncReadState(conversationId);
+  return undo;
+}
+
+/**
+ * Reverts {@link markConversationsRead}. A conversation whose baseline moved
+ * since (opened in a later second, or marked unread) keeps its newer state.
+ */
+export function restoreReadState(undo: readonly ReadStateUndo[]): void {
+  const restored: string[] = [];
+  for (const entry of undo) {
+    const { conversationId } = entry;
+    if (lastSeenMap[conversationId] !== entry.markedLastSeen) continue;
+    if (entry.lastSeen === undefined) {
+      const { [conversationId]: _marked, ...rest } = lastSeenMap;
+      lastSeenMap = rest;
+    } else {
+      lastSeenMap[conversationId] = entry.lastSeen;
+    }
+    if (entry.explicitlyUnread) explicitlyUnread.add(conversationId);
+    restored.push(conversationId);
+  }
+  if (restored.length === 0) return;
+  persistToStorage();
+  notifySubscribers();
+  for (const conversationId of restored) void syncReadState(conversationId);
 }
 
 /**
