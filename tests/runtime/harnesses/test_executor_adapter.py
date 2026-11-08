@@ -1398,6 +1398,139 @@ def test_translate_input_to_messages_carries_tool_history() -> None:
     assert "QUJD" not in messages[6]["content"]
 
 
+def test_translate_input_to_messages_bounds_total_tool_history() -> None:
+    """A long session replays every message but only its newest tool calls and outputs."""
+    from omnigent.runtime.harnesses import _executor_adapter as adapter
+
+    input_value: list[dict[str, Any]] = []
+    call_ids: list[str] = []
+    for turn in range(32):
+        parallel_ids = [f"call_{turn}_a", f"call_{turn}_b"]
+        call_ids += parallel_ids
+        input_value.append(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": f"collect batch {turn}"}],
+            }
+        )
+        input_value += [
+            {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "shell",
+                "arguments": json.dumps({"command": f"dump {call_id}"}),
+            }
+            for call_id in parallel_ids
+        ]
+        input_value += [
+            {"type": "function_call_output", "call_id": call_id, "output": "x" * 100_000}
+            for call_id in parallel_ids
+        ]
+        input_value.append(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": f"batch {turn} collected"}],
+            }
+        )
+
+    messages = adapter._translate_input_to_messages(input_value, include_tool_history=True)
+
+    tool_roles = ("tool_call", "tool_result")
+    replayed = [m for m in messages if m["role"] in tool_roles]
+    kept_calls = [m["metadata"]["call_id"] for m in replayed if m["role"] == "tool_call"]
+    kept_results = [m["metadata"]["call_id"] for m in replayed if m["role"] == "tool_result"]
+    assert 0 < len(kept_calls) < len(call_ids)
+    assert kept_calls == call_ids[-len(kept_calls) :]
+    assert sorted(kept_results) == sorted(kept_calls)
+    replayed_bytes = sum(len(json.dumps(m["content"]).encode()) for m in replayed)
+    assert replayed_bytes <= adapter._REPLAYED_TOOL_HISTORY_MAX_BYTES
+    assert [
+        m for m in messages if m["role"] not in tool_roles
+    ] == adapter._translate_input_to_messages(input_value)
+
+
+def test_translate_input_to_messages_skips_tool_call_too_large_to_replay() -> None:
+    """A newest call larger than the whole budget is skipped, not every older call."""
+    from omnigent.runtime.harnesses import _executor_adapter as adapter
+
+    oversized_content = "x" * (adapter._REPLAYED_TOOL_HISTORY_MAX_BYTES + 1)
+    input_value: list[dict[str, Any]] = [
+        {"type": "message", "role": "user", "content": "rewrite the file"},
+        {"type": "function_call", "call_id": "call_read", "name": "read", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_read", "output": "old text"},
+        {
+            "type": "function_call",
+            "call_id": "call_write",
+            "name": "write",
+            "arguments": json.dumps({"content": oversized_content}),
+        },
+        {"type": "function_call_output", "call_id": "call_write", "output": "written"},
+    ]
+
+    messages = adapter._translate_input_to_messages(input_value, include_tool_history=True)
+
+    assert [(m["role"], m.get("metadata", {}).get("call_id")) for m in messages] == [
+        ("user", None),
+        ("tool_call", "call_read"),
+        ("tool_result", "call_read"),
+    ]
+
+
+def test_translate_input_to_messages_drops_id_less_tool_result_with_its_call() -> None:
+    """A result without a call id is replayed or dropped together with the call before it."""
+    from omnigent.runtime.harnesses import _executor_adapter as adapter
+
+    oversized_content = "x" * (adapter._REPLAYED_TOOL_HISTORY_MAX_BYTES + 1)
+    input_value: list[dict[str, Any]] = [
+        {"type": "message", "role": "user", "content": "rewrite the file"},
+        {"type": "function_call", "name": "read", "arguments": "{}"},
+        {"type": "function_call_output", "output": "old text"},
+        {
+            "type": "function_call",
+            "name": "write",
+            "arguments": json.dumps({"content": oversized_content}),
+        },
+        {"type": "function_call_output", "output": "written"},
+    ]
+
+    messages = adapter._translate_input_to_messages(input_value, include_tool_history=True)
+
+    assert [(m["role"], m["content"]) for m in messages] == [
+        ("user", "rewrite the file"),
+        ("tool_call", {"tool": "read", "args": {}}),
+        ("tool_result", "old text"),
+    ]
+
+
+def test_translate_input_to_messages_groups_id_less_pair_apart_from_any_call_id() -> None:
+    """An id-less pair never shares a group with a call whose id happens to look positional."""
+    from omnigent.runtime.harnesses import _executor_adapter as adapter
+
+    oversized_content = "x" * (adapter._REPLAYED_TOOL_HISTORY_MAX_BYTES + 1)
+    input_value: list[dict[str, Any]] = [
+        {"type": "message", "role": "user", "content": "rewrite the file"},
+        {
+            "type": "function_call",
+            "call_id": "#3",
+            "name": "write",
+            "arguments": json.dumps({"content": oversized_content}),
+        },
+        {"type": "function_call_output", "call_id": "#3", "output": "written"},
+        {"type": "function_call", "name": "read", "arguments": "{}"},
+        {"type": "function_call_output", "output": "new text"},
+    ]
+
+    messages = adapter._translate_input_to_messages(input_value, include_tool_history=True)
+
+    assert [(m["role"], m["content"]) for m in messages] == [
+        ("user", "rewrite the file"),
+        ("tool_call", {"tool": "read", "args": {}}),
+        ("tool_result", "new text"),
+    ]
+
+
 # ── MCP tool-call observed/dispatch correlation ──────────
 #
 # These unit tests pin the queue mechanic that fixes the tool-call
