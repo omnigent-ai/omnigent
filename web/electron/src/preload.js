@@ -111,6 +111,66 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("omnigent:find-opened", listener);
     return () => ipcRenderer.removeListener("omnigent:find-opened", listener);
   },
+  /**
+   * Subscribe to native menu commands for this window (Close, New Terminal,
+   * New Browser Tab, Pin/Archive Session). `browserViewId` names the embedded
+   * browser view that held focus when Close fired, else null; `quitDetail` says
+   * what Quit stops, for its prompt. Returns an unsubscribe function.
+   * @param {(payload: {command: string, browserViewId: string | null, closingQuits: boolean, quitDetail: string | null}) => void} callback
+   * @returns {() => void}
+   */
+  onDesktopCommand: (callback) => {
+    const listener = (_event, payload) => {
+      if (!payload || typeof payload.command !== "string") return;
+      callback({
+        command: payload.command,
+        browserViewId: typeof payload.browserViewId === "string" ? payload.browserViewId : null,
+        closingQuits: payload.closingQuits === true,
+        quitDetail: typeof payload.quitDetail === "string" ? payload.quitDetail : null,
+      });
+    };
+    ipcRenderer.on("omnigent:desktop-command", listener);
+    return () => ipcRenderer.removeListener("omnigent:desktop-command", listener);
+  },
+  /**
+   * Report which menu commands this page can act on right now, plus the open
+   * session's pin/archive state, so the native menu can enable and label them.
+   * Fire-and-forget.
+   * @param {{commands: string[], sessionPinned: boolean, sessionArchived: boolean}} state
+   */
+  setDesktopCommandState: (state) => {
+    ipcRenderer.send("omnigent:set-desktop-command-state", {
+      commands: Array.isArray(state?.commands) ? state.commands.map(String) : [],
+      sessionPinned: state?.sessionPinned === true,
+      sessionArchived: state?.sessionArchived === true,
+    });
+  },
+  /** Close this window once the page has confirmed. Resolves whether it closed. */
+  closeWindow: () => ipcRenderer.invoke("omnigent:close-window"),
+  /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
+  confirmQuit: (options) =>
+    ipcRenderer.invoke("omnigent:confirm-quit", { dontAskAgain: options?.dontAskAgain === true }),
+  /** The "Show Omnigent from anywhere" shortcut (off by default). */
+  getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
+  /**
+   * Saves `{ enabled, accelerator }`, or turns the shortcut off for `{ enabled: false }`,
+   * keeping the saved chord. Resolves `{ ok, setting?, error? }`; `ok: false` means the
+   * saved setting is unchanged.
+   */
+  setGlobalShortcut: ({ enabled, accelerator } = {}) =>
+    ipcRenderer.invoke(
+      "omnigent:set-global-shortcut",
+      enabled !== true && accelerator === undefined
+        ? { enabled: false }
+        : { enabled: enabled === true, accelerator: String(accelerator ?? "") },
+    ),
+  /**
+   * Takes the next chord in the shell, before the page's shortcuts and the menu see it.
+   * Resolves its accelerator, or null when Escape or the cancel call ends recording.
+   */
+  recordGlobalShortcut: () => ipcRenderer.invoke("omnigent:record-global-shortcut"),
+  cancelGlobalShortcutRecording: () =>
+    ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
   takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
@@ -276,8 +336,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * active one). Pass null to detach everything (no pane mounted).
    * @param {string | null} conversationId
    */
-  browserSetActive: (conversationId) =>
-    ipcRenderer.invoke("omnigent:browser-set-active", { conversationId }),
+  browserSetActive: (conversationId, options) =>
+    ipcRenderer.invoke("omnigent:browser-set-active", {
+      conversationId,
+      focus: options?.focus === true,
+    }),
+  /** The attached browser page's view id if it has keyboard focus, else null. */
+  browserFocusedView: () => ipcRenderer.invoke("omnigent:browser-focused-view"),
   /**
    * Hide (true) or show (false) the active browser view while a DOM overlay is
    * open, so the native layer doesn't cover dialogs/menus/tooltips/toasts.

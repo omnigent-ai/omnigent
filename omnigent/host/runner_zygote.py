@@ -39,6 +39,8 @@ import time
 from pathlib import Path
 from typing import BinaryIO
 
+import psutil
+
 from omnigent.inner import _proc
 from omnigent.process_logging import child_logging_popen_kwargs
 from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR
@@ -49,11 +51,8 @@ logger = logging.getLogger(__name__)
 # fork + reply is sub-millisecond locally, so this is purely a safety net.
 _CONTROL_TIMEOUT_S = 30.0
 
-# Reported for a forked runner whose real exit code can no longer be recovered
-# because the zygote (its OS parent, the only process that could waitpid it)
-# died. The runner process itself is confirmed gone by a direct pid probe; we
-# just can't know its code, so surface a non-zero sentinel — a lost runner must
-# read as dead-and-failed, never as a clean exit or an eternal "still alive".
+# A gone runner whose exit status is unavailable from its zygote's control
+# channel still needs a nonzero result, even while that parent remains alive.
 _ZYGOTE_LOST_EXIT_CODE = 254
 
 
@@ -68,7 +67,7 @@ class ZygoteRunnerProc:
     """A ``subprocess.Popen``-shaped handle for a zygote-forked runner.
 
     Implements only the surface the daemon uses on a runner handle: ``pid``,
-    ``poll()``, ``returncode``, ``wait()``, ``terminate()``, ``kill()``. Exit
+    ``poll()``, ``returncode``, ``wait()``, ``terminate()``, ``kill()``, ``stop()``. Exit
     status comes from the zygote (the real parent); signals go to the pid.
 
     :param pid: The forked runner's process id.
@@ -85,6 +84,11 @@ class ZygoteRunnerProc:
             manager._generation if zygote_generation is None else zygote_generation
         )
         self.returncode: int | None = None
+        self._poll_lock = threading.Lock()
+        try:
+            self._process: psutil.Process | None = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            self._process = None
 
     def poll(self) -> int | None:
         """Return the exit code if the runner has exited, else ``None``.
@@ -92,12 +96,14 @@ class ZygoteRunnerProc:
         Caches the first observed exit code in :attr:`returncode`, matching
         ``subprocess.Popen.poll`` semantics the daemon relies on.
         """
-        if self.returncode is not None:
+        # Publish a consumed exit status before another poll can replace it.
+        with self._poll_lock:
+            if self.returncode is not None:
+                return self.returncode
+            code = self._manager.poll(self.pid, zygote_generation=self._zygote_generation)
+            if code is not None:
+                self.returncode = code
             return self.returncode
-        code = self._manager.poll(self.pid, zygote_generation=self._zygote_generation)
-        if code is not None:
-            self.returncode = code
-        return self.returncode
 
     def wait(self, timeout: float | None = None) -> int:
         """Block until the runner exits or *timeout* elapses.
@@ -123,6 +129,29 @@ class ZygoteRunnerProc:
         """Send ``SIGKILL`` to the runner (best-effort)."""
         self._signal(getattr(signal, "SIGKILL", signal.SIGTERM))
 
+    def stop(self, timeout: float = 5.0) -> None:
+        """Terminate without waiting for forkserver IPC, then escalate after *timeout*.
+
+        The captured process identity protects against PID reuse. Only the
+        forkserver poller may consume and cache this child's actual exit code.
+        """
+        process = self._process
+        if self.returncode is not None or process is None:
+            return
+        with contextlib.suppress(psutil.NoSuchProcess):
+            for send_signal in (process.terminate, process.kill):
+                if not process.is_running() or not _proc.process_alive(self.pid):
+                    return
+                send_signal()
+                deadline = time.monotonic() + timeout
+                while process.is_running() and _proc.process_alive(self.pid):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.05, remaining))
+                else:
+                    return
+
     def _signal(self, sig: int) -> None:
         """Signal the runner pid, ignoring an already-exited process.
 
@@ -135,8 +164,7 @@ class ZygoteRunnerProc:
 class ZygoteManager:
     """Owns the daemon's connection to the runner zygote forkserver.
 
-    Thread-safe: ``fork_runner`` is typically driven from ``asyncio.to_thread``
-    while ``poll`` runs on the event-loop thread, so every control exchange is
+    Thread-safe: all fork and poll control exchanges are synchronous and
     serialized under one lock.
 
     :param python_executable: Interpreter to launch the zygote with; defaults
@@ -154,6 +182,7 @@ class ZygoteManager:
         self._log_path = log_path
         self._proc: subprocess.Popen[bytes] | None = None
         self._sock: socket.socket | None = None
+        self._control_failed = False
         self._generation = 0
         self._lock = threading.RLock()
 
@@ -188,6 +217,8 @@ class ZygoteManager:
         """
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
+                if self._control_failed:
+                    raise ZygoteUnavailable("runner zygote control channel is unusable")
                 return
             if self._sock is not None:
                 self._sock.close()
@@ -205,6 +236,7 @@ class ZygoteManager:
             self._generation += 1
             self._proc = proc
             self._sock = parent_sock
+            self._control_failed = False
 
             # Prewarming and session launch can race. Keep the readiness check
             # and failed-start cleanup locked so neither caller can use an
@@ -258,6 +290,9 @@ class ZygoteManager:
                 stderr=log_fh,
                 # Avoid pinning the daemon's potentially transient cwd.
                 cwd="/",
+                # Own session, inherited by every fork: a hangup of the daemon's
+                # terminal must not reach runners or harnesses mid-turn.
+                **_proc.spawn_kwargs(),
             )
 
     def fork_runner(self, env: dict[str, str], log_path: str, workspace: str) -> ZygoteRunnerProc:
@@ -303,12 +338,8 @@ class ZygoteManager:
                 {"cmd": "poll", "pid": pid}, zygote_generation=zygote_generation
             )
         except ZygoteUnavailable:
-            # The zygote (the runner's OS parent) died, so exit status can no
-            # longer be recovered over the control socket. Probe the runner pid
-            # directly: if it is gone, surface a dead-and-failed sentinel so the
-            # daemon's watcher stops looping and reports the exit; if it is
-            # somehow still alive, report "still live" and keep polling. Never
-            # report an eternal None for a process that has actually exited.
+            # An unavailable control channel cannot supply exit status. Probe
+            # the PID directly, reporting a sentinel only once it is gone.
             return None if _proc.process_alive(pid) else _ZYGOTE_LOST_EXIT_CODE
         code = reply.get("returncode")
         return code if isinstance(code, int) else None
@@ -351,13 +382,18 @@ class ZygoteManager:
         with self._lock:
             if zygote_generation is not None and zygote_generation != self._generation:
                 raise ZygoteUnavailable("runner belongs to a previous zygote generation")
+            if self._control_failed:
+                raise ZygoteUnavailable("runner zygote control channel is unusable")
             sock = self._sock
             if sock is None:
                 raise ZygoteUnavailable("runner zygote is not running")
             try:
                 sock.sendall(json.dumps(request).encode("utf-8") + b"\n")
                 return self._read_reply(sock)
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, ZygoteUnavailable) as exc:
+                # A late or partial reply cannot be assigned to the next request.
+                # Keep the socket open: daemon EOF would kill healthy children.
+                self._control_failed = True
                 raise ZygoteUnavailable(f"runner zygote control error: {exc}") from exc
 
     @staticmethod
