@@ -59,6 +59,11 @@ class _FakeStartedServer:
         self.closed = True
 
 
+async def _credential_list_unavailable(client: Any) -> frozenset[str] | None:
+    # The env-key fallback then keeps the seeded provider ids.
+    return None
+
+
 @pytest.fixture
 def launch_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
@@ -66,6 +71,7 @@ def launch_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://omnigent.test")
     seeded: list[Path] = []
     monkeypatch.setattr(bridge, "seed_opencode_auth", lambda d: seeded.append(d))
+    monkeypatch.setattr(bridge, "restore_user_api_keys", _credential_list_unavailable)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent-config"))
     monkeypatch.setattr(provider, "resolve_bound_opencode_gateway", lambda **k: None)
     monkeypatch.setattr(provider, "resolve_databricks_gateway", lambda *a, **k: None)
@@ -204,7 +210,53 @@ async def test_launch_connects_env_provider_keys_before_resolving_session(
     assert resolve_calls == ["reached"]
 
 
-async def test_launch_survives_env_provider_key_hand_off_failure(
+class _LaunchStepRecorder:
+    """Records the order of the launch steps that follow ``server.start()``."""
+
+    def __init__(self) -> None:
+        self.order: list[str] = []
+        self.env_stored: frozenset[str] | None = None
+
+    async def restore_user_api_keys(self, client: Any) -> frozenset[str] | None:
+        self.order.append("restore")
+        return frozenset({"openai"})
+
+    async def connect_env_provider_keys(self, client: Any, *, stored: Any = ()) -> list[str]:
+        self.order.append("env")
+        self.env_stored = frozenset(stored)
+        return []
+
+    async def resolve_opencode_session(self, **kwargs: Any) -> str:
+        self.order.append("resolve")
+        raise _StopAtSessionResolve
+
+
+async def _failing_restore_user_api_keys(client: Any) -> list[str]:
+    raise RuntimeError("restore boom")
+
+
+async def test_launch_restores_user_api_keys_before_env_keys(
+    launch_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_server, "OpenCodeNativeServer", _FakeStartedServer)
+    recorder = _LaunchStepRecorder()
+    monkeypatch.setattr(bridge, "restore_user_api_keys", recorder.restore_user_api_keys)
+    monkeypatch.setattr(bridge, "connect_env_provider_keys", recorder.connect_env_provider_keys)
+    monkeypatch.setattr(
+        orchestration, "_resolve_opencode_session", recorder.resolve_opencode_session
+    )
+
+    with pytest.raises(_StopAtSessionResolve):
+        await orchestration._auto_create_opencode_terminal(
+            "conv_launch", SessionResourceRegistry(), lambda *a: None
+        )
+
+    assert recorder.order == ["restore", "env", "resolve"]
+    # Env keys skip what the session holds, not every seeded provider.
+    assert recorder.env_stored == frozenset({"openai"})
+
+
+async def test_launch_survives_credential_hand_off_failures(
     launch_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(app_server, "OpenCodeNativeServer", _FakeStartedServer)
@@ -214,6 +266,8 @@ async def test_launch_survives_env_provider_key_hand_off_failure(
 
     async def _fake_connect_env_provider_keys(client: Any, *, stored: Any = ()) -> list[str]:
         raise RuntimeError("boom")
+
+    monkeypatch.setattr(bridge, "restore_user_api_keys", _failing_restore_user_api_keys)
 
     async def _fake_resolve(**kwargs: Any) -> str:
         resolve_calls.append("reached")

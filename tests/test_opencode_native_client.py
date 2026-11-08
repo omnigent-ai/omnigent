@@ -380,6 +380,43 @@ async def test_connect_provider_key() -> None:
     await client.aclose()
 
 
+class _RecordingHandler:
+    """MockTransport handler that records each request and returns one response."""
+
+    def __init__(self, response: httpx.Response) -> None:
+        self.response = response
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return self.response
+
+
+async def test_list_credentials() -> None:
+    handler = _RecordingHandler(
+        httpx.Response(200, json={"data": [{"id": "cred_1", "integrationID": "openai"}, "junk"]})
+    )
+    client = _client(handler)
+    assert await client.list_credentials() == [{"id": "cred_1", "integrationID": "openai"}]
+    assert [(r.method, r.url.path) for r in handler.requests] == [("GET", "/api/credential")]
+    await client.aclose()
+
+
+async def test_create_credential() -> None:
+    handler = _RecordingHandler(httpx.Response(200, json={"data": {"id": "cred_1"}}))
+    client = _client(handler)
+    value = {"type": "key", "key": "sk-test"}
+    assert await client.create_credential("openai", label="API key", value=value) is True
+    [request] = handler.requests
+    assert (request.method, request.url.path) == ("POST", "/api/credential")
+    assert json.loads(request.content) == {
+        "integrationID": "openai",
+        "label": "API key",
+        "value": value,
+    }
+    await client.aclose()
+
+
 async def test_stream_events_parses_v2_frames_and_skips_heartbeats() -> None:
     sse_body = (
         'data: {"id": "evt_0", "created": 1, "type": "server.connected", "data": {}}\n'

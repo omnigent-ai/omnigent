@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -36,6 +37,8 @@ from omnigent.harnesses.opencode_native.bridge import (
     xdg_config_home_for_bridge_dir,
     xdg_data_home_for_bridge_dir,
 )
+from omnigent.harnesses.opencode_native.client import OpenCodeClientError
+from omnigent.onboarding.opencode_auth import OpenCodeCredential
 
 
 @pytest.fixture
@@ -648,6 +651,105 @@ async def test_connect_env_provider_keys_never_posts_aws_chain_vars() -> None:
     )
     assert connected == []
     assert client.calls == []
+
+
+class _CredentialClient:
+    def __init__(
+        self,
+        *,
+        present: list[str],
+        fail: str | None = None,
+        create_error: Exception | None = None,
+        list_error: Exception | None = None,
+    ) -> None:
+        self.present = present
+        self.created: list[tuple[str, str, dict[str, object]]] = []
+        self._fail = fail
+        self._create_error = create_error or RuntimeError("boom")
+        self._list_error = list_error
+
+    async def list_credentials(self) -> list[dict[str, object]]:
+        if self._list_error is not None:
+            raise self._list_error
+        return [{"id": f"cred_{name}", "integrationID": name} for name in self.present]
+
+    async def create_credential(
+        self, integration_id: str, *, label: str, value: dict[str, object]
+    ) -> bool:
+        self.created.append((integration_id, label, value))
+        if integration_id == self._fail:
+            raise self._create_error
+        return True
+
+
+async def test_restore_user_api_keys_creates_only_missing_and_survives_failures() -> None:
+    client = _CredentialClient(present=["anthropic"], fail="groq")
+    key = {"type": "key", "key": "k"}
+    held = await bridge.restore_user_api_keys(
+        client,
+        credentials={
+            "anthropic": OpenCodeCredential("API key", key),
+            "groq": OpenCodeCredential("API key", key),
+            "openai": OpenCodeCredential("API key", key),
+        },
+    )
+    # anthropic already had a credential; groq failed, so the session lacks it.
+    assert held == frozenset({"anthropic", "openai"})
+    assert client.created == [("groq", "API key", key), ("openai", "API key", key)]
+
+
+async def test_restore_user_api_keys_failure_log_omits_the_key(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = OpenCodeClientError(
+        "POST /api/credential failed: 400 sk-secret-value", status_code=400
+    )
+    client = _CredentialClient(present=[], fail="openai", create_error=error)
+    key = {"type": "key", "key": "sk-secret-value"}
+    with caplog.at_level(logging.DEBUG, logger=bridge.__name__):
+        held = await bridge.restore_user_api_keys(
+            client, credentials={"openai": OpenCodeCredential("API key", key)}
+        )
+    assert held == frozenset()
+    assert "openai (status 400)" in caplog.text
+    assert "sk-secret-value" not in caplog.text
+
+
+async def test_restore_user_api_keys_without_credential_route_returns_none() -> None:
+    """An OpenCode build without ``GET /api/credential`` skips the restore quietly."""
+    client = _CredentialClient(
+        present=[], list_error=OpenCodeClientError("not found", status_code=404)
+    )
+    key = {"type": "key", "key": "k"}
+    held = await bridge.restore_user_api_keys(
+        client, credentials={"openai": OpenCodeCredential("API key", key)}
+    )
+    assert held is None
+    assert client.created == []
+
+
+async def test_restore_user_api_keys_never_posts_oauth_logins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A copied rotating refresh token would invalidate the user's own login."""
+    share = _user_share(monkeypatch, tmp_path)
+    (share / "opencode" / "auth.json").write_text(
+        json.dumps(
+            {
+                "groq": {"type": "api", "key": "g"},
+                "openai": {"type": "oauth", "refresh": "r", "access": "a", "expires": 1},
+            }
+        )
+    )
+    client = _CredentialClient(present=[])
+    assert await bridge.restore_user_api_keys(client) == frozenset({"groq"})
+    assert client.created == [("groq", "API key", {"type": "key", "key": "g"})]
+
+
+async def test_restore_user_api_keys_reports_present_without_user_keys() -> None:
+    client = _CredentialClient(present=["anthropic"])
+    assert await bridge.restore_user_api_keys(client, credentials={}) == frozenset({"anthropic"})
+    assert client.created == []
 
 
 def _make_opencode_db(path: Path, *, claimed: bool) -> None:

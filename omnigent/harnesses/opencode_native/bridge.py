@@ -24,6 +24,7 @@ OpenCode's persisted session history.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import hashlib
@@ -34,7 +35,7 @@ import secrets
 import sqlite3
 import tempfile
 import urllib.parse
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -45,6 +46,7 @@ _logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
+    from omnigent.onboarding.opencode_auth import OpenCodeCredential
 
 # Env var the runner stamps on the harness process so the executor can
 # locate its bridge directory. Mirrors ``HARNESS_CODEX_NATIVE_BRIDGE_DIR``.
@@ -580,9 +582,10 @@ def seed_opencode_auth(bridge_dir: Path) -> Path | None:
     Write the user's OpenCode credentials into the per-session ``auth.json``.
 
     ``opencode serve`` runs with a per-session ``XDG_DATA_HOME`` and DB. OpenCode 2.x
-    imports ``$XDG_DATA_HOME/opencode/auth.json`` once, when that DB is created, so
-    seed it with the user's legacy ``auth.json`` plus their v2 SQLite credentials
-    (legacy shape; the DB wins on conflicts). Written ``0600``; refreshed each spawn.
+    can import ``$XDG_DATA_HOME/opencode/auth.json`` into that DB, so seed it with the
+    user's legacy ``auth.json`` plus their v2 SQLite credentials (legacy shape; the DB
+    wins on conflicts). Written ``0600``; refreshed each spawn. A fresh DB skips the
+    import; :func:`restore_user_api_keys` covers API keys after the server starts.
 
     :param bridge_dir: Native OpenCode bridge directory.
     :returns: The written path, or ``None`` when there are no credentials or the write fails.
@@ -671,6 +674,66 @@ async def connect_env_provider_keys(
         if ok:
             connected.append(provider_id)
     return connected
+
+
+class _CredentialClient(Protocol):
+    async def list_credentials(self) -> Sequence[Mapping[str, object]]: ...
+
+    async def create_credential(
+        self, integration_id: str, *, label: str, value: Mapping[str, object]
+    ) -> bool: ...
+
+
+async def restore_user_api_keys(
+    client: _CredentialClient,
+    *,
+    credentials: Mapping[str, OpenCodeCredential] | None = None,
+) -> frozenset[str] | None:
+    """
+    Store the user's OpenCode API keys in the per-session credential DB.
+
+    OpenCode's schema bootstrap of a fresh DB (seen on 2.0.32) records its
+    ``auth.json`` import as done without running it, so the seeded file never
+    reaches the DB. Each user API key whose integration has no credential is
+    created with ``POST /api/credential``. OAuth logins are not copied (see
+    :func:`~omnigent.onboarding.opencode_auth.user_opencode_api_keys`).
+
+    :param client: The per-session OpenCode client.
+    :param credentials: Credentials to store; ``None`` reads the user's API keys.
+    :returns: Integration ids holding a credential in the session afterwards, or
+        ``None`` when the server cannot list credentials.
+    """
+    from omnigent.onboarding.opencode_auth import user_opencode_api_keys
+
+    try:
+        rows = await client.list_credentials()
+    except Exception as exc:  # noqa: BLE001 - a server without the route skips the restore.
+        _logger.info(
+            "opencode credential list unavailable (status %s); API keys not restored",
+            getattr(exc, "status_code", None),
+        )
+        return None
+    present = {str(row.get("integrationID")) for row in rows}
+    wanted = (
+        await asyncio.to_thread(user_opencode_api_keys) if credentials is None else credentials
+    )
+    for integration_id, credential in wanted.items():
+        if integration_id in present:
+            continue
+        try:
+            await client.create_credential(
+                integration_id, label=credential.label, value=credential.value
+            )
+        except Exception as exc:  # noqa: BLE001 - one failure must not stop the rest.
+            # The error body can echo the posted secret, so log only the status.
+            _logger.info(
+                "opencode credential restore failed for %s (status %s)",
+                integration_id,
+                getattr(exc, "status_code", None),
+            )
+            continue
+        present.add(integration_id)
+    return frozenset(present)
 
 
 def auth_secret_path(bridge_dir: Path) -> Path:

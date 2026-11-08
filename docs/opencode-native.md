@@ -37,11 +37,15 @@ stops with a message asking you to remove it first.
 Omnigent stores no OpenCode credential. At launch, the runner writes a
 per-conversation `auth.json` merged from your legacy `auth.json` and your
 OpenCode 2.x credential store (`~/.local/share/opencode/opencode.db`; the store
-wins on conflicts), and OpenCode imports it once into the conversation's
-private database. Provider keys that exist only in the runner's environment
-(for example `ANTHROPIC_API_KEY`) are then connected through OpenCode's
-integration API at launch. With none of these, OpenCode runs on its free
-models.
+wins on conflicts). A fresh conversation database does not run OpenCode's own
+import of that file, so once the server is up the runner also stores each of
+your API keys that the conversation's private database lacks through OpenCode's
+credential API (`POST /api/credential`). OAuth logins are not stored this way,
+because a conversation's copy of a rotating refresh token can invalidate your
+own login; connect them inside the conversation instead. Provider keys that exist only in
+the runner's environment (for example `ANTHROPIC_API_KEY`) are then connected
+through OpenCode's integration API at launch. With none of these, OpenCode runs
+on its free models.
 
 ## Agent YAML
 

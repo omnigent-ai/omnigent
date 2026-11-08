@@ -1797,6 +1797,7 @@ async def _auto_create_opencode_terminal(
         clear_bridge_state,
         connect_env_provider_keys,
         prepare_bridge_dir,
+        restore_user_api_keys,
         seed_opencode_auth,
         seeded_provider_ids,
         write_bridge_state,
@@ -1962,8 +1963,8 @@ async def _auto_create_opencode_terminal(
         client_surface=resource_registry.client_surface(session_id),
     )
 
-    # The per-session DB imports $XDG_DATA_HOME/opencode/auth.json once when it is
-    # created; seed it with the user's auth.json and v2 SQLite credentials.
+    # Seed $XDG_DATA_HOME/opencode/auth.json with the user's auth.json and v2 SQLite
+    # credentials for OpenCode's own import; a fresh DB skips it (restored below).
     seed_opencode_auth(bridge_dir)
 
     # Start the Omnigent builtin-tool relay BEFORE opencode boots, so
@@ -2002,10 +2003,29 @@ async def _auto_create_opencode_terminal(
     try:
         client = server.client()
         try:
+            # A fresh per-session DB skips the seeded auth.json import, so the
+            # user's API keys reach it through the credential API (best effort).
+            session_credentials: frozenset[str] | None = None
+            try:
+                session_credentials = await restore_user_api_keys(client)
+            except Exception:
+                _logger.warning(
+                    "opencode launch: API key restore failed for %s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
             # Keys that live only in the runner's environment reach the
             # per-session server through its integration API (best effort).
+            # They skip integrations the session already holds; a provider the
+            # user logged in to with OAuth (not copied) can still use its env key.
+            stored_ids = (
+                seeded_provider_ids(bridge_dir)
+                if session_credentials is None
+                else session_credentials
+            )
             try:
-                await connect_env_provider_keys(client, stored=seeded_provider_ids(bridge_dir))
+                await connect_env_provider_keys(client, stored=stored_ids)
             except Exception:
                 _logger.warning(
                     "opencode launch: env provider key hand-off failed for %s",

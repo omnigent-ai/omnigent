@@ -481,6 +481,37 @@ class OpenCodeClient:
         )
         return True
 
+    async def list_credentials(self) -> list[_JsonObject]:
+        """
+        List stored credentials (``GET /api/credential``).
+
+        :returns: v2 credential rows, e.g. ``{"id": "cred_1", "integrationID": "openai", ...}``.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        data = await self._request_json("GET", "/api/credential")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        return []
+
+    async def create_credential(
+        self, integration_id: str, *, label: str, value: _JsonMapping
+    ) -> bool:
+        """
+        Store a credential for an integration (``POST /api/credential``).
+
+        :param integration_id: Integration id, e.g. ``"github-copilot"``.
+        :param label: Display label, e.g. ``"API key"``.
+        :param value: v2 ``Credential.Value``, e.g. ``{"type": "key", "key": "sk-..."}``.
+        :returns: ``True`` on a 2xx response.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        await self._request_json(
+            "POST",
+            "/api/credential",
+            json_body={"integrationID": integration_id, "label": label, "value": dict(value)},
+        )
+        return True
+
     async def prompt(
         self,
         session_id: str,
