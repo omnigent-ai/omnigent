@@ -72,6 +72,9 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
+from tests._helpers.compat import release_tuple
+from tests.e2e.conftest import get_mock_message_requests
+
 pytestmark = pytest.mark.skipif(
     shutil.which("claude") is None or sys.platform == "win32",
     reason=(
@@ -142,11 +145,14 @@ def _forwarded_launch_kwargs(
     return captured
 
 
-def _run_real_claude(args: tuple[str, ...] | list[str]) -> str:
+def _run_real_claude(
+    args: tuple[str, ...] | list[str], *, extra_env: dict[str, str] | None = None
+) -> str:
     """
     Run the real ``claude`` binary login-free and return its combined output.
 
     :param args: Argv passed to ``claude``; ``mcp.json`` in its cwd is valid.
+    :param extra_env: Variables added to the stripped environment, e.g. a mock API URL.
     :returns: Combined stdout and stderr.
     """
     workdir = Path(tempfile.mkdtemp(prefix="prompt-forwarding-"))
@@ -161,6 +167,7 @@ def _run_real_claude(args: tuple[str, ...] | list[str]) -> str:
             "PATH": os.environ.get("PATH", ""),
             "HOME": str(workdir),
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            **(extra_env or {}),
         }
         proc = subprocess.run(
             ["claude", *args],
@@ -252,3 +259,69 @@ def test_local_launch_prompt_is_not_forwarded_as_a_value_flags_argument(
         f"cannot swallow it. Forwarded args: {forwarded!r}\nclaude output:\n"
         f"{output.strip()}"
     )
+
+
+@pytest.mark.parametrize("with_caller_file", [False, True], ids=["inline-only", "file-and-inline"])
+def test_caller_prompt_file_and_inline_prompt_reach_claude_with_omnigent(
+    isolated_mock_llm_server_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_caller_file: bool,
+) -> None:
+    """
+    Real Claude receives the caller's file, then Omnigent's instructions, then the caller's prompt.
+
+    ``augment_claude_args`` leaves the caller's file flag and puts Omnigent's text before the
+    caller's inline prompt. Only the file case relies on Claude 2.1.295+ applying both flags.
+
+    :param isolated_mock_llm_server_url: Messages API that records Claude's requests.
+    :param tmp_path: Holds the caller's file and Omnigent's bridge directory.
+    :param monkeypatch: Points the bridge root at ``tmp_path``.
+    :param with_caller_file: Whether the caller also passes ``--append-system-prompt-file``.
+    """
+    from omnigent.harnesses.claude_native import bridge
+
+    claude_version = _run_real_claude(["--version"]).split()[0]
+    if with_caller_file and release_tuple(claude_version) < (2, 1, 295):
+        pytest.skip(f"Claude Code {claude_version} refuses both prompt flags together")
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
+    profile = tmp_path / "profile.md"
+    profile.write_text("FILE-MARKER caller profile\n", encoding="utf-8")
+    file_args = ["--append-system-prompt-file", str(profile)] if with_caller_file else []
+    caller_args = [*file_args, "--append-system-prompt", "INLINE-MARKER caller prompt"]
+    augmented = bridge.augment_claude_args(
+        tuple(caller_args),
+        bridge_dir=tmp_path / "claude-native" / "bridge",
+        workspace=tmp_path,
+        python_executable=sys.executable,
+        append_system_prompt="OMNIGENT-MARKER session instructions",
+    )
+
+    # Omnigent's text joins the caller's inline flag; its bridge flags are not needed here.
+    output = _run_real_claude(
+        ["-p", "hello", *augmented[: len(caller_args)]],
+        extra_env={
+            "ANTHROPIC_BASE_URL": isolated_mock_llm_server_url,
+            "ANTHROPIC_API_KEY": "sk-ant-e2e-placeholder",
+        },
+    )
+
+    systems = [
+        entry["body"].get("system") or []
+        for entry in get_mock_message_requests(isolated_mock_llm_server_url)
+    ]
+    system_texts = [
+        system if isinstance(system, str) else "\n".join(block.get("text", "") for block in system)
+        for system in systems
+    ]
+    markers = (*(["FILE-MARKER"] if with_caller_file else []), "OMNIGENT-MARKER", "INLINE-MARKER")
+    prompt = next(
+        (text for text in system_texts if any(marker in text for marker in markers)), None
+    )
+    assert prompt is not None, f"Claude sent no request carrying the prompt flags:\n{output}"
+    missing = [marker for marker in markers if marker not in prompt]
+    assert not missing, f"missing {missing} in system prompt:\n{prompt}\nclaude output:\n{output}"
+    positions = [prompt.index(marker) for marker in markers]
+    assert positions == sorted(positions), prompt
+    assert [prompt.count(marker) for marker in markers] == [1] * len(markers), prompt

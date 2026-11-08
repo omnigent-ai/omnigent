@@ -3,6 +3,7 @@ import { CheckIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { INLINE_RENAME_FIELD_PROPS } from "@/lib/inlineRename";
 
 interface SidebarEditRowProps {
   initialTitle: string;
@@ -55,6 +56,7 @@ export function SidebarEditRow({
     <div className="sidebar-compact-text flex h-8 items-center gap-1 rounded-[var(--radius-otto-sm)] bg-muted pr-1 pl-1 md:h-7">
       <input
         ref={inputRef}
+        {...INLINE_RENAME_FIELD_PROPS}
         type="text"
         aria-label={label}
         maxLength={USER_SESSION_TITLE_MAX_CHARS}
