@@ -15,6 +15,7 @@ import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { buildMentionPreamble } from "@/lib/composerMentions";
 import {
   type Bubble,
   type BubbleCache,
@@ -199,21 +200,6 @@ export function SideChatPane({
       }
     };
   }, [childId, selectionParentId, readOnly, starting]);
-  // Edit on this tab's own messages loads them into this tab's composer.
-  const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
-    hasDraft: () => {
-      const draft = useChatStore.getState().sideChatComposers[childId];
-      return Boolean(draft && (draft.text.trim() || draft.files.length || draft.quotes?.length));
-    },
-    applyDraft: ({ text, files }) =>
-      useChatStore.getState().updateSideChatComposer(childId, (current) => ({
-        ...current,
-        text,
-        files,
-        quotes: [],
-        autoFocus: true,
-      })),
-  });
   // Open the child's stream once (real tabs only) so it hydrates and streams
   // here. The store guards a double-bind and re-binds a failed entry, so
   // re-mounts / tab switches / retries are cheap.
@@ -235,6 +221,24 @@ export function SideChatPane({
     loadingConversation,
     conversationLoadError,
   } = state;
+  // Edit on this tab's own messages loads them into this tab's composer. It has
+  // no "@"-mention picker, so mentions come back as their attachment markers.
+  const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
+    target: childId,
+    canAccept: () => !readOnly && !starting,
+    hasDraft: () => {
+      const draft = useChatStore.getState().sideChatComposers[childId];
+      return Boolean(draft && (draft.text.trim() || draft.files.length || draft.quotes?.length));
+    },
+    applyDraft: ({ text, files, mentions }) =>
+      useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+        ...current,
+        text: buildMentionPreamble(mentions, sessionHarness) + text,
+        files,
+        quotes: [],
+        autoFocus: true,
+      })),
+  });
 
   // Hide the forked-in history: snapshot the item ids present once hydration
   // settles, then render only what arrives after (the side chat's own turns).

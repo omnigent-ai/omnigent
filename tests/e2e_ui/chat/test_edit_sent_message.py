@@ -3,13 +3,15 @@
 The bubble's Edit button hands its text and attachments to the composer of
 the same pane; the original bubble and history stay. Sending is an ordinary
 new message, steered like any other when the agent is mid-turn. Component
-tests cover the input matrix (pending, shared, read-only, failed downloads);
-these drive the real server, runner and file store through the browser.
+tests cover the input matrix (draft confirmation, pending, other authors,
+read-only, failed downloads); these drive the real server, runner and file
+store through the browser.
 """
 
 from __future__ import annotations
 
 import base64
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -60,8 +62,9 @@ def _wait_idle(page: Page) -> None:
 
 
 def _pause(page: Page) -> None:
-    """Hold the frame briefly so the recorded state is readable."""
-    page.wait_for_timeout(2500)
+    """When recording, hold the frame briefly so the recorded state is readable."""
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(2500)
 
 
 def test_edit_sent_message_with_image_and_send_revision(
@@ -123,52 +126,6 @@ def test_edit_sent_message_with_image_and_send_revision(
     _pause(page)
 
 
-def test_edit_asks_before_replacing_a_draft(
-    request: pytest.FixtureRequest,
-    seeded_session: tuple[str, str],
-    mock_llm_server_url: str,
-) -> None:
-    """With a draft in the composer, Edit confirms; Keep keeps it, Replace swaps it."""
-    base_url, session_id = seeded_session
-    sent = "edit-e2e-b1 List three risks for the launch"
-    draft = "An unfinished follow-up I don't want to lose"
-    configure_mock_llm(
-        mock_llm_server_url, [{"text": "Scope, schedule and staffing."}], match="edit-e2e-b1"
-    )
-
-    page: Page = request.getfixturevalue("page")
-    page.goto(f"{base_url}/c/{session_id}")
-    composer = page.get_by_label(_COMPOSER_LABEL)
-    expect(composer).to_be_visible(timeout=30_000)
-    _send(page, sent)
-    expect(page.locator(_ASSISTANT, has_text="Scope, schedule and staffing.")).to_be_visible(
-        timeout=60_000
-    )
-    _wait_idle(page)
-
-    composer.fill(draft)
-    _pause(page)
-    bubble = _user_bubble(page, sent)
-    dialog = page.get_by_role("dialog", name="Replace your draft?")
-
-    _click_edit(bubble)
-    expect(dialog).to_be_visible()
-    _pause(page)
-    dialog.get_by_role("button", name="Keep draft").click()
-    expect(dialog).to_have_count(0)
-    expect(composer).to_have_value(draft)
-    _pause(page)
-
-    _click_edit(bubble)
-    expect(dialog).to_be_visible()
-    _pause(page)
-    dialog.get_by_role("button", name="Replace draft").click()
-    expect(dialog).to_have_count(0)
-    expect(composer).to_have_value(sent)
-    expect(page.locator(_USER)).to_have_count(1)
-    _pause(page)
-
-
 def test_edit_while_agent_runs_does_not_stop_it_and_send_steers(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
@@ -178,10 +135,10 @@ def test_edit_while_agent_runs_does_not_stop_it_and_send_steers(
     base_url, session_id = seeded_session
     original = "edit-e2e-c1 Draft the release announcement"
     revised = "edit-e2e-c2 Draft the release announcement for customers"
-    # Title generation sends the same text and can take a gate of its own.
+    # Titles are off, so turn c1 is the only request that can take the gate.
     configure_mock_llm(
         mock_llm_server_url,
-        [{"text": "Here is an internal announcement.", "block": True}] * 2,
+        [{"text": "Here is an internal announcement.", "block": True}],
         match="edit-e2e-c1",
     )
     configure_mock_llm(
@@ -221,8 +178,7 @@ def test_edit_while_agent_runs_does_not_stop_it_and_send_steers(
         expect(working).to_be_visible()
         _pause(page)
     finally:
-        for _ in range(2):
-            httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0)
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0)
 
     expect(page.locator(_ASSISTANT, has_text="Here is the customer announcement.")).to_be_visible(
         timeout=60_000

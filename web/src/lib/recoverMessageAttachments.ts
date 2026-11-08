@@ -1,11 +1,12 @@
-import { PENDING_FILE_PREFIX, type MessageContentBlock } from "@/lib/blocks";
+import { imagePreview, PENDING_FILE_PREFIX, type MessageContentBlock } from "@/lib/blocks";
 import { downloadSessionFile } from "@/lib/filesApi";
 
 /**
  * Download a sent message's uploaded attachments so a composer can send them again.
+ * Images an imported transcript carries inline as data URIs are decoded locally.
  *
  * @param sessionId - The session the message was sent in.
- * @param content - The message blocks; image and file blocks are downloaded.
+ * @param content - The message blocks; image and file blocks are recovered.
  * @returns The files that came back, and the names of those that didn't.
  */
 export async function recoverMessageAttachments(
@@ -16,11 +17,16 @@ export async function recoverMessageAttachments(
     (block) => block.type === "input_image" || block.type === "input_file",
   );
   const results = await Promise.allSettled(
-    attachments.map((block) =>
-      sessionId !== null && block.file_id && !block.file_id.startsWith(PENDING_FILE_PREFIX)
-        ? downloadSessionFile(sessionId, block.file_id, block.filename ?? "attachment")
-        : Promise.reject(new Error("no uploaded file")),
-    ),
+    attachments.map(async (block) => {
+      if (block.type === "input_image") {
+        const preview = imagePreview(block);
+        if (preview.kind === "inline") return decodeDataUri(preview.src, block.filename);
+      }
+      if (sessionId !== null && block.file_id && !block.file_id.startsWith(PENDING_FILE_PREFIX)) {
+        return downloadSessionFile(sessionId, block.file_id, block.filename ?? "attachment");
+      }
+      throw new Error("no uploaded file");
+    }),
   );
   const files: File[] = [];
   const missing: string[] = [];
@@ -29,4 +35,18 @@ export async function recoverMessageAttachments(
     else missing.push(attachments[index]!.filename ?? "an attachment");
   });
   return { files, missing };
+}
+
+/** Turn a `data:` URI into a File; throws when the URI is malformed. */
+function decodeDataUri(uri: string, filename: string | undefined): File {
+  const match = /^data:([^;,]*)((?:;[^;,]*)*),(.*)$/is.exec(uri);
+  if (match === null) throw new Error("malformed data URI");
+  const mimeType = match[1] || "application/octet-stream";
+  const isBase64 = match[2]!.toLowerCase().split(";").includes("base64");
+  const payload = match[3]!;
+  const bytes = isBase64
+    ? Uint8Array.from(atob(payload), (character) => character.charCodeAt(0))
+    : new TextEncoder().encode(decodeURIComponent(payload));
+  const extension = mimeType.split("/")[1]?.split("+")[0] ?? "bin";
+  return new File([bytes], filename ?? `image.${extension}`, { type: mimeType });
 }

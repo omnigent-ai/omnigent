@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { AUTOMATION_CONTEXT_NOTE } from "@/lib/systemMessage";
@@ -7,7 +7,15 @@ import { FileViewerContext } from "@/shell/FileViewerContext";
 import { SessionSharedContext } from "@/components/chat/chatBubbleParts";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { EditSentMessageContext, type SentMessage } from "@/components/chat/editSentMessage";
+import type * as IdentityModule from "@/lib/identity";
 import { BubbleView, buildPendingBubbles } from "./ChatPage";
+
+// Unmocked, the viewer id is null in jsdom; Edit tests pin who is signed in.
+const viewer = vi.hoisted(() => ({ id: null as string | null }));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  getCurrentUserId: () => viewer.id,
+}));
 
 // UserBubble renders its text through the same markdown renderer as the
 // assistant bubble (FilePathAwareMessageResponse → Streamdown). These tests
@@ -596,9 +604,27 @@ describe("UserBubble edit button", () => {
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
   });
 
-  it("is absent on another contributor's message in a shared session", () => {
-    renderEditable(userBubble("hello", { createdBy: "teammate@example.com" }), { shared: true });
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  describe("with a signed-in viewer", () => {
+    beforeEach(() => {
+      viewer.id = "me@example.com";
+    });
+    afterEach(() => {
+      viewer.id = null;
+    });
+
+    it("is offered on the viewer's own attributed message", () => {
+      renderEditable(userBubble("hello", { createdBy: "me@example.com" }), { shared: true });
+      expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+    });
+
+    // Grid panes and sub-agent tabs render without the shared-session context.
+    it.each([true, false])(
+      "is absent on another contributor's message (session shared: %s)",
+      (shared) => {
+        renderEditable(userBubble("hello", { createdBy: "teammate@example.com" }), { shared });
+        expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+      },
+    );
   });
 });
 

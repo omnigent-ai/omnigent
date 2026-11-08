@@ -72,7 +72,7 @@ import {
   keyedAttachments,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { getCurrentAuthorId, getCurrentUserId } from "@/lib/identity";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
@@ -985,11 +985,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Badge OTHER contributors' messages only (never your own).
   const author = bubble.createdBy;
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
-  // Only your own sent messages; a pending one is still on its way.
+  // Edit only messages you sent, shared session or not. Single-user messages
+  // carry no author. A pending one is still on its way.
   const canEdit =
     editSentMessage !== null &&
     !bubble.pending &&
-    !showAuthorBadge &&
+    (author === undefined || author === getCurrentUserId()) &&
     Boolean(text || images.length || fileChips.length || mentionedChips.length);
 
   return (

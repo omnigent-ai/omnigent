@@ -142,7 +142,7 @@ describe("undelivered startup messages", () => {
 });
 
 describe("editing a sent side-chat message", () => {
-  function seedSentMessage() {
+  function seedSentMessage(text = "Why did this build fail?") {
     conversationRegistry.acquire(childId).setState({
       sessionStatus: "idle",
       blocks: itemsToBlocks([
@@ -154,15 +154,18 @@ describe("editing a sent side-chat message", () => {
           status: "completed",
           content: [
             { type: "input_file", file_id: "file_log", filename: "build.log" },
-            { type: "input_text", text: "Why did this build fail?" },
+            { type: "input_text", text },
           ],
         },
       ]),
     });
   }
 
-  it("loads the message and its attachment into this side chat's composer", async () => {
-    seedSentMessage();
+  it("loads the message, its attachment, and its @-mention into this side chat's composer", async () => {
+    // The side-chat composer has no mention picker, so the mention returns as the
+    // marker this session's harness reads.
+    seedSentMessage("[Attached: src/app.ts]\n\nWhy did this build fail?");
+    const withMention = "[Attached file: src/app.ts]\n\nWhy did this build fail?";
     const download = vi
       .spyOn(filesApi, "downloadSessionFile")
       .mockResolvedValue(new File(["error: boom"], "build.log", { type: "text/plain" }));
@@ -174,7 +177,7 @@ describe("editing a sent side-chat message", () => {
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
 
     const input = screen.getByTestId("side-chat-input");
-    await waitFor(() => expect(input).toHaveValue("Why did this build fail?"));
+    await waitFor(() => expect(input).toHaveValue(withMention));
     expect(download).toHaveBeenCalledExactlyOnceWith(childId, "file_log", "build.log");
     const composer = useChatStore.getState().sideChatComposers[childId];
     expect(composer?.files.map((file) => file.name)).toEqual(["build.log"]);
@@ -183,6 +186,12 @@ describe("editing a sent side-chat message", () => {
     // The sent message stays in the side chat's transcript.
     expect(screen.getByText("Why did this build fail?", { selector: "p, p *" })).toBeTruthy();
     expect(send).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+    const [sentText, , sentFiles] = send.mock.calls[0]!;
+    expect(sentText).toBe(withMention);
+    expect(sentFiles?.map((file) => file.name)).toEqual(["build.log"]);
   });
 
   it("asks before replacing the side chat's draft", async () => {

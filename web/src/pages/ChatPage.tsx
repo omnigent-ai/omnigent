@@ -3685,7 +3685,12 @@ function ComposerImpl(
   // User edits and quote changes leave recall mode.
   const recallingRef = useRef(false);
 
+  // Reply quotes and edited messages may only land in a composer that can send.
+  const acceptsInsertedContent = () =>
+    !(disabled || isReadOnly || (unreachable && !sendReconnectsArca) || composerLockedByBtw);
   const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
+    target: conversationId,
+    canAccept: acceptsInsertedContent,
     hasDraft: () => hasDraft,
     applyDraft: (edited) => {
       // Same handoff as a queued message's Edit, plus its "@"-mentions.
@@ -3709,8 +3714,7 @@ function ComposerImpl(
       textareaRef.current?.focus({ preventScroll: true });
     },
     appendReplyQuote(text) {
-      const blocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
-      if (blocked || composerLockedByBtw || !text.trim()) return;
+      if (!acceptsInsertedContent() || !text.trim()) return;
       appendQuote(text);
       textareaRef.current = tailTextareaRef.current;
       dirtyRef.current = true;
@@ -3721,8 +3725,6 @@ function ComposerImpl(
       recallingRef.current = false;
     },
     editSentMessage(message) {
-      const blocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
-      if (blocked || composerLockedByBtw) return;
       editSentMessage(message);
     },
     startSideChat(selectedText) {

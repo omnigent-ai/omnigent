@@ -218,9 +218,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   attachments, and "@"-mentions into that pane's composer; the transcript is
   unchanged. Sending is a new message, steered or queued like any mid-turn send,
   and Edit never stops the agent. A non-empty draft asks "Replace your draft?"
-  first. Side chats edit into their own composer. Edit is hidden on pending
-  messages, other contributors' messages, and read-only composers. An attachment
-  that can't be downloaded is skipped and named in a toast.
+  first, including for a draft typed while attachments download. Side chats,
+  grid session panes, and writable sub-agent Workspace tabs edit into their own
+  composer, where "@"-mentions return as attachment markers. Edit is hidden on
+  pending messages, other contributors' messages (shared session or not), and
+  read-only composers. An attachment that can't be recovered is skipped and
+  named in a toast; inline images from imported transcripts are recovered.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
   untouched draft; user edits remain. The "Something went wrong" card from the
@@ -809,12 +812,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/pages/ChatPage.composer.test.tsx`. The new-session and side-chat
   composers have no prompt recall; the vendor terminal owns its own history.
 - **`edit-sent-message`:**
-  `tests/e2e_ui/chat/test_edit_sent_message.py` covers an image round trip, the
-  replace-draft dialog, editing mid-turn, and side chats. Pending, shared, and
-  read-only states and failed downloads have component coverage in
+  `tests/e2e_ui/chat/test_edit_sent_message.py` covers an image round trip,
+  editing mid-turn, and side chats. The replace-draft dialog, downloads that
+  finish late, pending messages, other authors, read-only composers, and failed
+  downloads have component coverage in
   `web/src/pages/ChatPage.userBubble.test.tsx`,
-  `web/src/pages/ChatPage.composer.test.tsx`, and
-  `web/src/components/chat/SideChatPane.test.tsx`.
+  `web/src/pages/ChatPage.composer.test.tsx`,
+  `web/src/components/chat/SideChatPane.test.tsx`, and
+  `web/src/lib/recoverMessageAttachments.test.ts`.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
