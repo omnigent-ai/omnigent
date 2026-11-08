@@ -124,7 +124,7 @@ import { PullRequestLabels } from "./PullRequestLabels";
 import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
 import { PullRequestReviewers } from "./PullRequestReviewers";
 import { PanelMessage, PullRequestChangesTab } from "./PullRequestChangesTab";
-import { canShowOwnChanges } from "./PullRequestStackBar";
+import { canShowOwnChanges, stackParentOf } from "./PullRequestStackBar";
 import { useChangesViewState } from "./useChangesViewState";
 import { IconButton } from "./PullRequestFileSection";
 
@@ -1547,7 +1547,7 @@ function PullRequestPanelDetails({
     headSha,
     changesTabOpen && !!info.data?.capabilities?.stacked_prs,
   );
-  const stackParent = stack.data?.parent;
+  const stackParent = stackParentOf(stack);
   const ownChangesOnly = useChangesViewState(conversationId, prUrl ?? "").ownChangesOnly;
   const stackDiff = usePullRequestStackDiff(
     conversationId,

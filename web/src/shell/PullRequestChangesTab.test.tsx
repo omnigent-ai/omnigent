@@ -1484,6 +1484,22 @@ describe("PullRequestChangesTab stacked pull requests", () => {
     expect(screen.getByText("Loading changes…")).toBeInTheDocument();
   });
 
+  it("asks to update a host that can't serve the PR's own changes, without loading", () => {
+    renderTab({
+      conversationId: "stack-old-host",
+      stack: { data: { parent } },
+      stackDiff: { data: null, error: null, isSuccess: true },
+    });
+
+    fireEvent.click(toggle());
+
+    expect(
+      screen.getAllByText("This host can't show a PR's own changes. Update it to use this view.")
+        .length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText("Loading changes…")).toBeNull();
+  });
+
   it("names a parent branch without a toggle, since the diff is already the PR's own", () => {
     renderTab({
       conversationId: "stack-base-branch",

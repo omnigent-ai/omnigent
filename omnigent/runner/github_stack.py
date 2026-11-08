@@ -231,15 +231,22 @@ def pr_stack(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[str
             parent = _base_branch_parent(root, reference, base_ref)
         else:
             commits = [entry["sha"] for entry in github._pr_commit_entries(root, reference)]
-            parent = _commit_parent(
-                root,
-                reference,
-                head_repository=_text(pr, "head", "repo", "full_name") or reference.repository,
-                commits=commits,
-                head_sha=head_sha,
-            )
             described = description_parent_sha(pr.get("body"))
-            if parent is None and described and described != head_sha and described in commits:
+            if not (described and described != head_sha and described in commits):
+                described = None
+            try:
+                parent = _commit_parent(
+                    root,
+                    reference,
+                    head_repository=_text(pr, "head", "repo", "full_name") or reference.repository,
+                    commits=commits,
+                    head_sha=head_sha,
+                )
+            except ValueError:
+                # The description link needs no lookup, so it still answers a failed walk.
+                if described is None:
+                    raise
+            if parent is None and described is not None:
                 parent = _parent(
                     number=None,
                     url=None,
@@ -248,6 +255,8 @@ def pr_stack(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[str
                     head_sha=described,
                     source="description",
                 )
+        # A push during the reads would mix another head's commits into the answer.
+        github._check_pr_revision(root, reference, head_sha=head_sha)
     return {"object": PR_STACK_OBJECT, "head_sha": head_sha, "parent": parent}
 
 
@@ -290,6 +299,7 @@ def pr_stack_diff(
         )
         if rc != 0:
             raise ValueError(_DIFF_FAILED)
+        github._check_pr_revision(root, reference, head_sha=head_sha)
     files = github._changed_file_payloads(entries)
     result: dict[str, Any] = {
         "object": PR_STACK_DIFF_OBJECT,

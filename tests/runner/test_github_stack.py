@@ -31,12 +31,18 @@ class FakeGitHub:
         associated: dict[str, list[dict[str, Any]]] | None = None,
         pulls: list[dict[str, Any]] | None = None,
         compare: dict[str, Any] | None = None,
+        graphql_repository: object = ...,
+        push_after: str | None = None,
     ) -> None:
         self.pr = pr
         self.commits = commits or []
         self.associated = associated or {}
         self.pulls = pulls or []
         self.compare = compare or {"files": []}
+        # Overrides the GraphQL ``repository`` answer, e.g. ``None`` for an unreadable fork.
+        self.graphql_repository = graphql_repository
+        # Moves the PR head once this endpoint has been read, as a push mid-request would.
+        self.push_after = push_after
         self.graphql: list[dict[str, Any]] = []
         self.endpoints: list[str] = []
 
@@ -50,9 +56,13 @@ class FakeGitHub:
                 for key, sha in variables.items()
                 if key.startswith("c")
             }
+            if self.graphql_repository is not ...:
+                found = self.graphql_repository
             return 0, json.dumps({"data": {"repository": found}}), ""
         endpoint = argv[-1]
         self.endpoints.append(endpoint)
+        if endpoint == self.push_after:
+            self.pr = {**self.pr, "head": {**self.pr["head"], "sha": "9" * 40}}
         if endpoint == "repos/example/two/pulls/42":
             return 0, json.dumps(self.pr), ""
         if endpoint == _COMMITS_ENDPOINT:
@@ -210,6 +220,29 @@ def test_description_stack_link_is_the_fallback(monkeypatch: pytest.MonkeyPatch)
     }
 
 
+def test_failed_commit_walk_falls_back_to_the_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable head repository still lets the description link name the parent."""
+    body = f"## \N{PANCAKES} Stacked PR\n[diff](https://x/files/{_PARENT}..{_HEAD})\n"
+    fake = FakeGitHub(pr=_pr(body=body), commits=[_PARENT, _HEAD], graphql_repository=None)
+    _install(monkeypatch, fake)
+
+    parent = github_stack.pr_stack("/workspace", _PR, head_sha=_HEAD)["parent"]
+
+    assert (parent["head_sha"], parent["source"]) == (_PARENT, "description")
+
+
+def test_failed_commit_walk_without_a_description_link_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeGitHub(pr=_pr(), commits=[_PARENT, _HEAD], graphql_repository=None)
+    _install(monkeypatch, fake)
+
+    with pytest.raises(ValueError, match="could not look up the pull request's stack"):
+        github_stack.pr_stack("/workspace", _PR, head_sha=_HEAD)
+
+
 def test_description_link_outside_this_prs_commits_is_ignored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -279,6 +312,25 @@ def test_stack_rejects_a_moved_head(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ValueError, match="pull request changed"):
         github_stack.pr_stack("/workspace", _PR, head_sha="f" * 40)
+
+
+def test_stack_rejects_a_push_during_the_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Commits read after a push belong to another head, so the answer is refused."""
+    fake = FakeGitHub(pr=_pr(), commits=[_PARENT, _HEAD], push_after=_COMMITS_ENDPOINT)
+    _install(monkeypatch, fake)
+
+    with pytest.raises(ValueError, match="pull request changed"):
+        github_stack.pr_stack("/workspace", _PR, head_sha=_HEAD)
+
+
+def test_stack_diff_rejects_a_push_during_the_comparison(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeGitHub(pr=_pr(), commits=[_PARENT, _HEAD], push_after=_COMMITS_ENDPOINT)
+    _install(monkeypatch, fake)
+
+    with pytest.raises(ValueError, match="pull request changed"):
+        github_stack.pr_stack_diff("/workspace", _PR, head_sha=_HEAD, parent_sha=_PARENT)
 
 
 def test_stack_diff_compares_parent_head_with_pr_head(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -10681,7 +10681,9 @@ async def test_selected_pr_reaches_offline_host(
     if resource == "/commit-diff":
         params["commit_sha"] = "c" * 40
     if resource.startswith("/stack"):
-        params.update(head_sha="a" * 40, parent_sha="c" * 40)
+        params["head_sha"] = "a" * 40
+    if resource == "/stack-diff":
+        params["parent_sha"] = "c" * 40
     response = await offline_env_client.get(
         f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params=params
     )

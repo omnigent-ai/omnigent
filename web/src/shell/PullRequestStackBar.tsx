@@ -2,7 +2,14 @@
 
 import { LayersIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import type { PullRequestStackParent } from "@/hooks/usePullRequests";
+import type { PullRequestStack, PullRequestStackParent } from "@/hooks/usePullRequests";
+
+/** The stack lookup's parent; a failed lookup, even with older data, leaves only the full diff. */
+export function stackParentOf(
+  stack: { data?: PullRequestStack | null; error: unknown } | undefined,
+): PullRequestStackParent | null {
+  return stack?.error ? null : (stack?.data?.parent ?? null);
+}
 
 /** Whether the parent offers a PR-only view; a PR on its parent's branch already shows one. */
 export function canShowOwnChanges(parent: PullRequestStackParent | null | undefined): boolean {

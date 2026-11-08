@@ -33,6 +33,7 @@ import {
   type PullRequestChangedFile,
   type PullRequestChangedFilesResult,
   type PullRequestDiffResponse,
+  type PullRequestStackDiff,
   type usePullRequestChangedFiles,
   type usePullRequestDiff,
   type usePullRequestStack,
@@ -55,7 +56,7 @@ import {
 import { PullRequestFileActions } from "./PullRequestFileActions";
 import { PullRequestFindBar } from "./PullRequestFindBar";
 import { PullRequestPathFilter } from "./PullRequestPathFilter";
-import { canShowOwnChanges, PullRequestStackBar } from "./PullRequestStackBar";
+import { canShowOwnChanges, PullRequestStackBar, stackParentOf } from "./PullRequestStackBar";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
 import { PullRequestViewedProgress, PullRequestViewedToggle } from "./PullRequestViewedControls";
 import {
@@ -429,17 +430,20 @@ interface PatchSource {
 }
 
 /** The PR-only view's file list and patch, shaped like the full diff's. */
-function ownChangesSources(stackDiff: ReturnType<typeof usePullRequestStackDiff>): {
+function ownChangesSources(
+  result: PullRequestStackDiff | null | undefined,
+  fetchError: unknown,
+  isSuccess: boolean,
+): {
   changes: ChangedFilesSource;
   prDiff: PatchSource;
 } {
-  const result = stackDiff.data;
-  const isLoading = !result && !stackDiff.error;
   const error =
-    stackDiff.error ??
-    (stackDiff.isSuccess && !result
+    fetchError ??
+    (isSuccess && !result
       ? new Error("This host can't show a PR's own changes. Update it to use this view.")
       : null);
+  const isLoading = !result && !error;
   return {
     changes: {
       data: result
@@ -512,10 +516,17 @@ export function PullRequestChangesTab({
   const mobile = useIsMobileViewport();
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
   const { revealedPaths, reveal, clearReveal, find } = view;
-  // A lookup that fails or finds no parent leaves the full diff as the only view.
-  const stackParent = stack?.error ? null : (stack?.data?.parent ?? null);
+  const stackParent = stackParentOf(stack);
   const ownChangesOnly = !!stackDiff && view.ownChangesOnly && canShowOwnChanges(stackParent);
-  const ownSources = stackDiff && ownChangesOnly ? ownChangesSources(stackDiff) : null;
+  // Stable sources keep the patch parse and file-list memos below from rerunning each render.
+  const stackDiffResult = stackDiff?.data;
+  const stackDiffError = stackDiff?.error;
+  const stackDiffSuccess = !!stackDiff?.isSuccess;
+  const ownSources = useMemo(
+    () =>
+      ownChangesOnly ? ownChangesSources(stackDiffResult, stackDiffError, stackDiffSuccess) : null,
+    [ownChangesOnly, stackDiffResult, stackDiffError, stackDiffSuccess],
+  );
   const changes: ChangedFilesSource = ownSources?.changes ?? fullChanges;
   const prDiff: PatchSource = ownSources?.prDiff ?? fullDiff;
   // The filter input shows in the sidebar; while the sidebar is collapsed it opens inline.
