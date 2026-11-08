@@ -2771,13 +2771,15 @@ function ConversationList({
     (name: string, conversations: Conversation[], visibleCount: number) => {
       setFolderConversations((prev) => {
         const existing = prev.get(name);
-        // Skip the update when the id set is unchanged, so a background refetch
-        // that returns the same rows doesn't churn state (and re-render).
+        // Skip the update when the rows are unchanged, so a background refetch
+        // that returns the same rows doesn't churn state (and re-render). Compare
+        // the rows themselves: a refetch keeps an unchanged row's identity, and a
+        // row whose labels changed must replace the copy bulk actions read.
         if (
           existing &&
           existing.visibleCount === visibleCount &&
           existing.conversations.length === conversations.length &&
-          existing.conversations.every((c, i) => c.id === conversations[i]?.id)
+          existing.conversations.every((c, i) => c === conversations[i])
         ) {
           return prev;
         }
