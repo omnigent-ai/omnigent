@@ -5015,9 +5015,13 @@ async def _auto_create_commandcode_terminal(
     )
     from omnigent.harnesses.commandcode_native.forwarder import (
         clear_commandcode_bridge_state,
+        preseed_commandcode_resume_state,
         supervise_commandcode_forwarder,
     )
-    from omnigent.harnesses.commandcode_native.main import resolve_commandcode_executable
+    from omnigent.harnesses.commandcode_native.main import (
+        is_valid_commandcode_session_id,
+        resolve_commandcode_executable,
+    )
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
@@ -5065,6 +5069,43 @@ async def _auto_create_commandcode_terminal(
     commandcode_env = build_commandcode_session_env(
         bridge_dir, server_url=server_url, headers=_runner_headers, session_id=session_id
     )
+
+    # Relaunch a session that already produced a Command Code transcript by
+    # resuming it in place (``cmd --resume`` appends to the same file), so a
+    # re-created pane keeps its context — the same contract that makes the pane
+    # reaper safe. The id feeds a transcript-path component and ``--resume``
+    # argv, so it must validate before use (mirrors cursor's chat-id gate).
+    resume_session_id = launch_config.external_session_id
+    if resume_session_id and not is_valid_commandcode_session_id(resume_session_id):
+        _logger.warning(
+            "commandcode-native: persisted session id %r is not a well-formed "
+            "Command Code session id; ignoring it for resume (session=%s).",
+            resume_session_id,
+            session_id,
+            extra={"session_id": session_id},
+        )
+        resume_session_id = None
+    commandcode_home = resolve_user_commandcode_home()
+    # Tie ``--resume`` to preseed success: only resume when the prior transcript
+    # is actually there to seed the cursor from. Passing ``--resume`` without a
+    # preseed would reopen the chat in the TUI while the cleared forwarder's
+    # launch-recency discovery rejects the pre-launch file, so the relaunched
+    # session's turns would go unmirrored.
+    if resume_session_id and preseed_commandcode_resume_state(
+        bridge_dir,
+        commandcode_home=commandcode_home,
+        workspace=workspace,
+        external_session_id=resume_session_id,
+    ):
+        commandcode_args.extend(["--resume", resume_session_id])
+    elif resume_session_id:
+        _logger.warning(
+            "commandcode-native: no transcript for persisted session id %r; "
+            "starting a fresh session (session=%s).",
+            resume_session_id,
+            session_id,
+            extra={"session_id": session_id},
+        )
 
     # Inherit the agent's os_env so its declared sandbox, egress_rules and
     # env_passthrough are honoured (otherwise launch_required_terminal falls back
@@ -5128,7 +5169,7 @@ async def _auto_create_commandcode_terminal(
             headers={},
             session_id=session_id,
             bridge_dir=bridge_dir,
-            commandcode_home=resolve_user_commandcode_home(),
+            commandcode_home=commandcode_home,
             workspace=workspace,
             launch_epoch_ms=launch_epoch_ms,
             auth=_RunnerDatabricksAuth(_auth_factory),

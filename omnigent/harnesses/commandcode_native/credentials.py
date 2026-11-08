@@ -181,9 +181,7 @@ def build_commandcode_session_env(
     env: dict[str, str] = {"COMMANDCODE_OMNIGENT_BRIDGE": str(bridge_dir)}
     if server_url and session_id:
         base = server_url.rstrip("/")
-        env["OMNIGENT_POLICY_EVALUATE_URL"] = (
-            f"{base}/v1/sessions/{session_id}/policies/evaluate"
-        )
+        env["OMNIGENT_POLICY_EVALUATE_URL"] = f"{base}/v1/sessions/{session_id}/policies/evaluate"
         env["OMNIGENT_PERMISSION_URL"] = (
             f"{base}/v1/sessions/{session_id}/hooks/permission-request"
         )

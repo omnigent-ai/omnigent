@@ -188,9 +188,7 @@ def read_tmux_info(bridge_dir: Path) -> tuple[Path, str] | None:
     return Path(socket_path), tmux_target
 
 
-def _wait_for_tmux_info(
-    bridge_dir: Path, *, timeout_s: float
-) -> tuple[Path, str] | None:
+def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> tuple[Path, str] | None:
     """Poll for the tmux handshake file until *timeout_s* elapses."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -350,9 +348,7 @@ def inject_user_message(
             time.sleep(_READY_POLL_INTERVAL_S)
             continue
         if state.approval_menu_present:
-            raise CommandCodeApprovalPendingError(
-                "Command Code is waiting on an approval prompt"
-            )
+            raise CommandCodeApprovalPendingError("Command Code is waiting on an approval prompt")
         if state.ready:
             break
         time.sleep(_READY_POLL_INTERVAL_S)

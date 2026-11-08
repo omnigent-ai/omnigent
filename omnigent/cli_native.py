@@ -1590,9 +1590,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            extra_args=_resolve_harness_startup_args(
-                cfg, "commandcode-native", commandcode_args
-            ),
+            extra_args=_resolve_harness_startup_args(cfg, "commandcode-native", commandcode_args),
             auto_open_conversation=auto_open_conversation,
         )
 

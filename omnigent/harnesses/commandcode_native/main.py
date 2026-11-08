@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -65,6 +66,9 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 _DEFAULT_COMMANDCODE_COMMAND = "cmdc" if os.name == "nt" else "cmd"
 _COMMANDCODE_PATH_ENV = "OMNIGENT_COMMANDCODE_PATH"
+_COMMANDCODE_SESSION_ID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 _AGENT_NAME = "commandcode-native-ui"
 _TERMINAL_NAME = "commandcode"
 _TERMINAL_SESSION_KEY = "main"
@@ -140,6 +144,17 @@ def resolve_commandcode_executable(
             f"{_COMMANDCODE_PATH_ENV}=/path/to/cmd."
         )
     return resolved
+
+
+def is_valid_commandcode_session_id(session_id: str | None) -> bool:
+    """Return whether *session_id* is a well-formed Command Code session id.
+
+    Gates the persisted ``external_session_id`` before it is used as a
+    transcript-path component or passed to ``cmd --resume``. Command Code mints
+    UUID session ids (``~/.commandcode/projects/<slug>/<id>.jsonl``); anything
+    else is dropped and the session starts fresh.
+    """
+    return session_id is not None and _COMMANDCODE_SESSION_ID_RE.fullmatch(session_id) is not None
 
 
 def build_commandcode_launch(
@@ -422,17 +437,14 @@ async def _create_commandcode_session(
     return new_session_id
 
 
-async def _fetch_commandcode_session(
-    client: httpx.AsyncClient, session_id: str
-) -> _JsonObject:
+async def _fetch_commandcode_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:
         raise click.ClickException(f"Conversation {session_id!r} not found on the server.")
     if resp.status_code >= 400:
         raise click.ClickException(
-            f"Failed to fetch conversation {session_id!r} ({resp.status_code}): "
-            f"{error_text(resp)}"
+            f"Failed to fetch conversation {session_id!r} ({resp.status_code}): {error_text(resp)}"
         )
     payload = resp.json()
     if not isinstance(payload, dict):

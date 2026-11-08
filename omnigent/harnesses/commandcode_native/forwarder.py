@@ -84,6 +84,45 @@ def clear_commandcode_bridge_state(bridge_dir: Path) -> None:
         (bridge_dir / _STATE_FILE).unlink()
 
 
+def preseed_commandcode_resume_state(
+    bridge_dir: Path,
+    *,
+    commandcode_home: Path,
+    workspace: str,
+    external_session_id: str,
+) -> bool:
+    """Point the forwarder at the resumed transcript, at its current end.
+
+    On a ``cmd --resume`` relaunch the session transcript already exists, so
+    launch-recency discovery would reject it (and adoption from offset 0 would
+    re-mirror turns already in the Omnigent chat). Seeding the cursor past the
+    existing content leaves only post-relaunch entries to mirror.
+
+    :param external_session_id: The persisted Command Code session id (its
+        ``--resume`` key); the transcript is ``<id>.jsonl`` under the
+        workspace's project slug dir.
+    :returns: ``True`` when the transcript exists and the state was written;
+        ``False`` when it is absent (caller should launch fresh).
+    """
+    transcript_path = (
+        commandcode_home / "projects" / _project_slug(workspace) / f"{external_session_id}.jsonl"
+    )
+    try:
+        size = transcript_path.stat().st_size
+    except OSError:
+        return False
+    line_count = 0
+    with transcript_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            line_count += chunk.count(b"\n")
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    _write_state(
+        bridge_dir,
+        _ForwardState(path=str(transcript_path), offset=size, line=line_count),
+    )
+    return True
+
+
 async def supervise_commandcode_forwarder(
     *,
     base_url: str,
@@ -178,9 +217,7 @@ async def forward_commandcode_transcript_to_session(
                     external_session_id=external_id,
                 )
                 mirrored_external_id = external_id
-            items, next_offset, next_line = _read_new_items(
-                Path(path), state.offset, state.line
-            )
+            items, next_offset, next_line = _read_new_items(Path(path), state.offset, state.line)
             if items:
                 for item in items:
                     await _mirror_item(
@@ -225,11 +262,13 @@ def _discover_transcript(
     if not candidates:
         return None
     newest = max(candidates, key=lambda pair: pair[0])
-    # Prefer a transcript created for THIS launch; fall back to the newest
-    # matching one when the clock/epoch check is inconclusive.
+    # Only adopt a transcript written at/after this launch. Adopting a stale
+    # one (e.g. left by a prior ``cmd`` run in the same workspace) would
+    # re-mirror its whole history into a fresh conversation. Resumed sessions
+    # skip discovery via :func:`preseed_commandcode_resume_state`.
     if newest[0] * 1000 >= launch_epoch_ms - 2000:
         return newest[1]
-    return newest[1]
+    return None
 
 
 def _read_header(path: Path) -> dict[str, Any] | None:
@@ -337,9 +376,7 @@ def _row_to_items(row: dict[str, Any]) -> list[_MirroredItem]:
         text = _join_text_blocks(content)
         if text:
             out.append(
-                _MirroredItem(
-                    kind="message", role="assistant", text=text, response_id=response_id
-                )
+                _MirroredItem(kind="message", role="assistant", text=text, response_id=response_id)
             )
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
@@ -354,9 +391,7 @@ def _row_to_items(row: dict[str, Any]) -> list[_MirroredItem]:
                         response_id=response_id,
                         call_id=call_id,
                         name=name,
-                        arguments=json.dumps(
-                            args if args is not None else {}, ensure_ascii=False
-                        ),
+                        arguments=json.dumps(args if args is not None else {}, ensure_ascii=False),
                     )
                 )
         return out
@@ -486,9 +521,7 @@ async def _mirror_item(
     if item.kind == "message":
         status = "running" if item.role == "user" else "idle"
         output = item.text if item.role == "assistant" else ""
-        await _post_status(
-            client, url=url, headers=headers, status=status, output=output
-        )
+        await _post_status(client, url=url, headers=headers, status=status, output=output)
 
 
 async def _post_status(
@@ -576,5 +609,6 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
 __all__ = [
     "clear_commandcode_bridge_state",
     "forward_commandcode_transcript_to_session",
+    "preseed_commandcode_resume_state",
     "supervise_commandcode_forwarder",
 ]

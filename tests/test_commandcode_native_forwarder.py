@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from omnigent.harnesses.commandcode_native import forwarder as fwd
@@ -59,6 +60,64 @@ def test_discover_transcript_skips_checkpoints(tmp_path: Path) -> None:
         commandcode_home=tmp_path, workspace="/work/repo", launch_epoch_ms=0
     )
     assert found == path
+
+
+def test_discover_transcript_rejects_transcript_older_than_launch(tmp_path: Path) -> None:
+    """A transcript left by a prior ``cmd`` run must not be adopted.
+
+    Reading it from offset 0 would re-mirror its whole history into the fresh
+    conversation, so discovery waits for a file this launch produced.
+    """
+    stale = _write_session(tmp_path, "/work/repo", "sess-stale", [])
+    stale_epoch_ms = 1_700_000_000_000
+    os.utime(stale, (stale_epoch_ms / 1000, stale_epoch_ms / 1000))
+    assert (
+        fwd._discover_transcript(
+            commandcode_home=tmp_path,
+            workspace="/work/repo",
+            launch_epoch_ms=stale_epoch_ms + 60_000,
+        )
+        is None
+    )
+
+
+def test_preseed_resume_state_positions_cursor_at_end(tmp_path: Path) -> None:
+    transcript = _write_session(
+        tmp_path,
+        "/work/repo",
+        "sess",
+        [_msg("user", "user", [{"type": "text", "text": "earlier"}], "u0")],
+    )
+    bridge_dir = tmp_path / "bridge"
+    assert fwd.preseed_commandcode_resume_state(
+        bridge_dir,
+        commandcode_home=tmp_path,
+        workspace="/work/repo",
+        external_session_id="sess",
+    )
+
+    state = fwd._read_state(bridge_dir)
+    assert state.path == str(transcript)
+    assert state.offset == transcript.stat().st_size
+    # Nothing already in the transcript is re-mirrored.
+    items, _, _ = fwd._read_new_items(transcript, state.offset, state.line)
+    assert items == []
+    # A turn appended after the preseed is the only thing mirrored.
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(_msg("user", "user", [{"type": "text", "text": "next"}], "u1")) + "\n"
+        )
+    items, _, _ = fwd._read_new_items(transcript, state.offset, state.line)
+    assert [i.text for i in items] == ["next"]
+
+
+def test_preseed_resume_state_missing_transcript_returns_false(tmp_path: Path) -> None:
+    assert not fwd.preseed_commandcode_resume_state(
+        tmp_path / "bridge",
+        commandcode_home=tmp_path,
+        workspace="/work/repo",
+        external_session_id="missing",
+    )
 
 
 def test_read_new_items_maps_user_assistant_and_reasoning(tmp_path: Path) -> None:

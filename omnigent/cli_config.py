@@ -2966,9 +2966,7 @@ def _manage_commandcode_harness() -> None:
         return
 
     signed_in_status = "✓ Command Code is signed in"
-    status: str | None = (
-        signed_in_status if harness_cli_logged_in(COMMANDCODE_KEY) else None
-    )
+    status: str | None = signed_in_status if harness_cli_logged_in(COMMANDCODE_KEY) else None
     while True:
         rows: list[_HarnessMenuRow] = [
             _HarnessMenuRow("Sign in (cmd login)", action="login"),

@@ -375,9 +375,7 @@ def register_hooks_routes(
             # elicitation id; derive the vendor from the session's native agent.
             hook_vendor = native_agent.key
         hook_harness = f"{hook_vendor}-native"
-        hook_label = {"commandcode": "Command Code"}.get(
-            hook_vendor, hook_vendor.capitalize()
-        )
+        hook_label = {"commandcode": "Command Code"}.get(hook_vendor, hook_vendor.capitalize())
         is_claude = hook_vendor == "claude"
         # Legacy sessions may lack native metadata; a known native session must match.
         if native_agent is not None and native_agent.harness != hook_harness:

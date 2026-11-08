@@ -68,6 +68,7 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
     {
         "claude",
         "codex",
+        "commandcode",
         "cursor",
         "devin",
         "goose",
