@@ -72,6 +72,7 @@ import { SessionCard, type SessionCardNode } from "@/canvas/SessionCard";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useProjects, type Conversation, type ProjectSummary } from "@/hooks/useConversations";
+import { useHosts } from "@/hooks/useHosts";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { Link, useNavigate, useSearchParams } from "@/lib/routing";
@@ -91,9 +92,9 @@ const RESIZE_REFIT_DELAY_MS = 100;
 const EMPTY_PROJECTS: ProjectSummary[] = [];
 
 const TAB_CLASS =
-  "flex h-7 max-w-[200px] shrink-0 items-center gap-1.5 rounded-md px-2.5 text-ui text-muted-foreground transition-colors hover:bg-muted hover:text-foreground aria-selected:bg-brand-accent/10 aria-selected:text-foreground";
+  "flex h-7 mobile-touch-target mobile-app:h-auto max-w-[200px] shrink-0 items-center gap-1.5 rounded-md px-2.5 text-ui text-muted-foreground transition-colors hover:bg-muted hover:text-foreground aria-selected:bg-brand-accent/10 aria-selected:text-foreground";
 const CONTROL_CLASS =
-  "flex size-7 items-center justify-center rounded-md border bg-card text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-accent-foreground";
+  "flex size-7 mobile-touch-target items-center justify-center rounded-md border bg-card text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-accent-foreground";
 
 function sessionCountLabel(count: number): string {
   return count === 1 ? "1 session" : `${count} sessions`;
@@ -158,6 +159,8 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
   const { sessions, loaded, loadingMore, networkConfirmed, error, refresh } = useCanvasSessions();
   const projectsQuery = useProjects();
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
+  const { data: hosts = [], isLoading: hostsLoading } = useHosts();
+  const defaultProjectHostId = hosts.find((host) => host.status === "online")?.host_id ?? null;
 
   const [nodes, setNodes] = useState<SessionCardNode[]>([]);
   // The URL names the canvas; without it, reopen the viewer's last selection
@@ -634,6 +637,8 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
           })}
         </div>
         <NewProjectButton
+          hostId={defaultProjectHostId}
+          hostsLoading={hostsLoading}
           onCreated={(name) => {
             pendingProjectNameRef.current = name;
           }}

@@ -15,6 +15,7 @@ from typing import Any
 
 import httpx
 
+from omnigent.databricks_ai_gateway import gateway_request_tag_headers, with_ci_request_tags
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.adapters.base import BaseAdapter
 from omnigent.llms.types import (
@@ -164,6 +165,8 @@ class OpenAICompatibleAdapter(BaseAdapter):
                     if isinstance(key, str) and isinstance(value, str)
                 }
             )
+        if gateway_request_tag_headers(effective_base):
+            headers = with_ci_request_tags(headers)
 
         if stream:
             effective_timeout = timeout if timeout is not None else _STREAM_TIMEOUT
