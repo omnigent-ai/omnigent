@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -435,6 +436,30 @@ def test_record_to_row_without_event_or_attributes() -> None:
     row = dl.record_to_row(record, source="host")
     assert row["event_name"] is None
     assert row["attributes"] == {}
+
+
+async def test_log_attributes_follow_task_and_thread_without_leaking() -> None:
+    record = logging.makeLogRecord({"msg": "ordinary lifecycle log"})
+
+    async def read(task_id: str) -> dict:
+        with dl.log_attributes_scope(task_id=task_id, run_id="outer"):
+            with dl.log_attributes_scope(run_id="inner"):
+                row = await asyncio.to_thread(dl.record_to_row, record, "server")
+                assert row["attributes"] == {"task_id": task_id, "run_id": "inner"}
+            return dl.record_to_row(record, "server")
+
+    rows = await asyncio.gather(read("first"), read("second"))
+    assert [row["attributes"] for row in rows] == [
+        {"task_id": "first", "run_id": "outer"},
+        {"task_id": "second", "run_id": "outer"},
+    ]
+    assert dl.record_to_row(record, "server")["attributes"] == {}
+    record.attributes = {"run_id": "explicit", "secret": "Bearer test-secret-token"}
+    with dl.log_attributes_scope(run_id="ambient", token="Bearer ambient-secret-token"):
+        attributes = dl.record_to_row(record, "server")["attributes"]
+    assert attributes["run_id"] == "explicit"
+    assert "test-secret-token" not in attributes["secret"]
+    assert "ambient-secret-token" not in attributes["token"]
 
 
 def test_record_to_row_captures_stack_trace() -> None:
@@ -1718,3 +1743,15 @@ def test_near_deadline_auth_rejection_does_not_start_a_new_mint(_configured_env:
 
     assert client.mints == 1
     assert client.inserts == 1
+
+
+def test_stage_timings_split_wall_time_into_marked_stages() -> None:
+    """Each mark closes the stage since the previous one; repeats accumulate."""
+    moments = iter([0.0, 0.010, 0.250, 0.300, 0.400])
+    timings = dl.StageTimings(clock=lambda: next(moments))
+
+    timings.mark("config")
+    timings.mark("catalog")
+    timings.mark("config")
+
+    assert timings.attributes() == {"config_ms": 60, "catalog_ms": 240, "total_ms": 400}

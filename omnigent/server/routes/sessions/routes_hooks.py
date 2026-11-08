@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import weakref
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 from fastapi import (
@@ -69,6 +71,7 @@ from omnigent.server.routes._content_type import (
     require_json_content_type,
 )
 from omnigent.server.routes._sessions.common import (
+    _CLAUDE_NATIVE_EDIT_TOOLS,
     _EVALUATE_HOOK_ELICITATION_ID_RE,
     _TURN_ACTOR_LABEL,
     _llm_response_denied_turns,
@@ -115,6 +118,61 @@ from omnigent.stores.policy_store import PolicyStore
 #: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
+
+
+# Serializes same-session policy-engine builds: each build seeds declared label initial
+# values with a read-then-write that can overwrite a value an evaluation already updated.
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_policy_engine_build_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _policy_engine_build_lock(session_id: str) -> asyncio.Lock:
+    """
+    Return the lock serializing policy-engine builds for one session.
+
+    Get-or-create is race-free because there is no ``await`` between the
+    lookup and the insert (single event loop). Entries disappear once no
+    caller holds the lock.
+
+    :param session_id: Omnigent conversation id being evaluated, e.g. ``"conv_abc123"``.
+    :returns: The :class:`asyncio.Lock` shared by concurrent builds for ``session_id``.
+    """
+    lock = _policy_engine_build_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _policy_engine_build_locks[session_id] = lock
+    return lock
+
+
+async def _build_policy_engine_serialized(
+    session_id: str,
+    build: Callable[..., PolicyEngine],
+    *args: Any,
+) -> PolicyEngine:
+    """
+    Run ``build`` on a worker thread while holding the session's build lock.
+
+    The locked build runs in its own task behind :func:`asyncio.shield`, so a
+    cancelled request keeps the lock until its worker thread finishes instead of
+    letting the next same-session build overlap it.
+
+    :param session_id: Omnigent conversation id being evaluated, e.g. ``"conv_abc123"``.
+    :param build: Synchronous engine factory, e.g. the handler's ``_build_engine``.
+    :param args: Positional arguments for ``build``.
+    :returns: The built :class:`PolicyEngine`.
+    """
+
+    async def locked_build() -> PolicyEngine:
+        async with _policy_engine_build_lock(session_id):
+            return await asyncio.to_thread(build, *args)
+
+    task = asyncio.ensure_future(locked_build())
+    # Retrieve the outcome even if the caller was cancelled, so a failure isn't reported as
+    # an unretrieved task exception.
+    task.add_done_callback(lambda done: done.cancelled() or done.exception())
+    return await asyncio.shield(task)
 
 
 def _no_policy_allow_body(
@@ -415,6 +473,14 @@ def register_hooks_routes(
             and tool_input
         ):
             extras["exit_plan_mode"] = tool_input
+        # The full input lets the UI show an edit as a diff; content_preview is truncated.
+        if (
+            is_claude
+            and tool_name in _CLAUDE_NATIVE_EDIT_TOOLS
+            and isinstance(tool_input, dict)
+            and tool_input
+        ):
+            extras["file_edit"] = {"tool_name": tool_name, "tool_input": tool_input}
         asking_name = native_agent.display_name if native_agent is not None else hook_label
         asking_vendor = (
             _NATIVE_POLICY_VENDORS.get(native_agent.key, native_agent.key)
@@ -905,7 +971,9 @@ def register_hooks_routes(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
                 media_type="application/json",
             )
-        agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+        # A native harness calls this hook once per tool call. Keep the
+        # synchronous store reads below off the event loop shared by all sessions.
+        agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).
             return Response(
@@ -913,8 +981,13 @@ def register_hooks_routes(
                 media_type="application/json",
             )
 
-        loaded = _sf.get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        # Warm-cache loads are in-memory; the thread hop covers the cold path
+        # that extracts the bundle from disk.
+        loaded = await asyncio.to_thread(
+            _sf.get_agent_cache().load,
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.operator_authored,
         )
 
         _caps = _sf.get_caps()
@@ -979,7 +1052,8 @@ def register_hooks_routes(
                 host_connection=_host_conn,
             )
 
-        engine = _build_engine(conv)
+        # The build makes several synchronous store reads.
+        engine = await _build_policy_engine_serialized(session_id, _build_engine, conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
@@ -1033,7 +1107,9 @@ def register_hooks_routes(
                 deciding_policy = result.deciding_policy
                 assert deciding_policy is not None
                 async with _native_ask_gate_lock(session_id, deciding_policy):
-                    engine = _build_engine()
+                    # The build lock is taken after the gate lock and never held
+                    # while waiting for it, so the two can't deadlock.
+                    engine = await _build_policy_engine_serialized(session_id, _build_engine)
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (
                         Phase.TOOL_CALL,
