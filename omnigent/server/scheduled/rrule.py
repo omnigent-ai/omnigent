@@ -35,9 +35,6 @@ from omnigent.server.scheduled._bounded_rrule import RRuleSearchLimitError, iter
 # Connected hosts and continued sessions avoid provisioning a sandbox per fire.
 MIN_INTERVAL_SECONDS = 60 * 60
 MIN_SUBHOUR_INTERVAL_SECONDS = 10 * 60
-# Trigger automations may poll this often on a scheduler that skips their occurrences
-# while the session is busy (``build_occurrence_busy`` in fire.py).
-MIN_TRIGGER_INTERVAL_SECONDS = 2 * 60
 
 _UTC = ZoneInfo("UTC")
 
@@ -276,7 +273,6 @@ def validate_rrule(
     *,
     session_mode: str = "new",
     execution_target: str | None = None,
-    continued_minimum: int = MIN_SUBHOUR_INTERVAL_SECONDS,
 ) -> RRuleTrigger:
     """Parse and validate an RRULE string for use as a recurring trigger.
 
@@ -292,12 +288,9 @@ def validate_rrule(
     :param rule_str: The RFC 5545 recurrence rule string.
     :param tz: Accepted for API compatibility but not used by the interval
         check, which is timezone-agnostic for the cadences we allow.
-    :param session_mode: Continued sessions permit *continued_minimum*.
+    :param session_mode: Continued sessions permit the ten-minute minimum.
     :param execution_target: Connected hosts also permit ten-minute new sessions.
         Omit to retain the conservative new-session hourly floor.
-    :param continued_minimum: Minimum gap for continued sessions. A scheduler that
-        skips busy trigger automations lowers it for them to
-        :data:`MIN_TRIGGER_INTERVAL_SECONDS`.
     :returns: An :class:`RRuleTrigger`.
     :raises RRuleValidationError: On bad syntax, never-fires, fires-once, or a
         sub-minimum interval.
@@ -329,10 +322,8 @@ def validate_rrule(
     if count == 1:
         raise RRuleValidationError("RRULE fires only once")
     minimum = (
-        continued_minimum
-        if session_mode == "continue"
-        else MIN_SUBHOUR_INTERVAL_SECONDS
-        if execution_target == "connected_host"
+        MIN_SUBHOUR_INTERVAL_SECONDS
+        if session_mode == "continue" or execution_target == "connected_host"
         else MIN_INTERVAL_SECONDS
     )
     if min_gap < minimum:

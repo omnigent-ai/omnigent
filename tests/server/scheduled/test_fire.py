@@ -40,6 +40,7 @@ from omnigent.server.routes._host_worktree import (
 )
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import (
+    BUSY_QUIET_SECONDS,
     BUSY_SKIP_MAX_SECONDS,
     FireDeps,
     build_occurrence_busy,
@@ -3933,11 +3934,15 @@ def test_session_unattended_disallowed_mode(
     assert fire_mod.session_unattended_disallowed_mode(conv) == expected
 
 
-def _occurrence_busy_check(live_status: str | None, last_scheduled_at: int | None):
+def _occurrence_busy_check(
+    live_status: str | None, last_scheduled_at: int | None, *, updated_at: int = 0
+):
     """The busy check over one session's persisted status and the task's latest run."""
     session_id = "sess_busy_check"
     activity = (
-        {} if live_status is None else {session_id: SessionActivity(0, live_status=live_status)}
+        {}
+        if live_status is None
+        else {session_id: SessionActivity(updated_at, live_status=live_status)}
     )
     runs = [] if last_scheduled_at is None else [Mock(scheduled_at=last_scheduled_at)]
     sched_store = Mock(list_runs=Mock(return_value=(runs, None)))
@@ -3981,3 +3986,19 @@ async def test_a_late_poll_counts_the_ten_minutes_from_the_current_time() -> Non
     assert await check(task, due) is True
     # Dispatched half an hour late, the poll is sent even though the session looks busy.
     assert await check(task, due + 30 * 60) is False
+
+
+@pytest.mark.parametrize(
+    ("seconds_since_change", "busy"),
+    [
+        pytest.param(60, True, id="pausing-between-steps"),
+        pytest.param(BUSY_QUIET_SECONDS, False, id="quiet-for-two-minutes"),
+    ],
+)
+async def test_an_idle_session_that_just_changed_still_counts_as_busy(
+    seconds_since_change, busy
+) -> None:
+    due = 1_800_003_600
+    check = _occurrence_busy_check("idle", due - 5 * 60, updated_at=due - seconds_since_change)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) is busy

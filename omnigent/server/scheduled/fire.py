@@ -432,18 +432,21 @@ def build_on_fire(
     return on_fire
 
 
-# While its session looks busy, a continued session still gets a prompt this often, so a
-# stale "running" status cannot stall the task.
+# A session that changed this recently may only be pausing between steps, so it still
+# counts as busy.
+BUSY_QUIET_SECONDS = 2 * 60
+# While its session looks busy, a trigger automation still gets a prompt this often, so a
+# stale "running" status cannot stall it.
 BUSY_SKIP_MAX_SECONDS = 10 * 60
 
 
 def build_occurrence_busy(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable[bool]]:
     """Build the persistent scheduler's check for skipping a trigger automation's poll.
 
-    Only a continue task with a recorded session skips, and only while the session
-    shows as running (a turn in progress, or waiting on an approval or question) and
-    its latest run was scheduled less than :data:`BUSY_SKIP_MAX_SECONDS` before *now*,
-    so a late poll still goes out once that much time has passed.
+    Only a continue task with a recorded session skips, and only while the session is
+    busy: it shows as running (a turn in progress, or waiting on an approval or
+    question), or it changed less than :data:`BUSY_QUIET_SECONDS` ago. Even then, a
+    poll goes out once the latest run was scheduled :data:`BUSY_SKIP_MAX_SECONDS` ago.
     """
 
     async def occurrence_busy(task: ScheduledTask, now: int) -> bool:
@@ -461,7 +464,10 @@ def build_occurrence_busy(deps: FireDeps) -> Callable[[ScheduledTask, int], Awai
         session = activity.get(session_id)
         if session is None:
             return False
-        if _session_status_from_cache(session_id, session.live_status) != "running":
+        if (
+            _session_status_from_cache(session_id, session.live_status) != "running"
+            and now - session.updated_at >= BUSY_QUIET_SECONDS
+        ):
             return False
         runs, _ = await asyncio.to_thread(deps.scheduled_task_store.list_runs, task.id, limit=1)
         return bool(runs) and now - runs[0].scheduled_at < BUSY_SKIP_MAX_SECONDS

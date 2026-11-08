@@ -15,7 +15,6 @@ import pytest
 
 from omnigent.server.scheduled.rrule import (
     MIN_INTERVAL_SECONDS,
-    MIN_TRIGGER_INTERVAL_SECONDS,
     RRuleValidationError,
     get_next_fire_time,
     validate_rrule,
@@ -443,23 +442,6 @@ def test_minimum_interval_depends_on_execution(execution_target, session_mode, m
             validate_rrule(rule, **options)
     else:
         assert validate_rrule(rule, **options).rule == rule
-
-
-@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
-@pytest.mark.parametrize("minutes", [1, 2, 9])
-def test_busy_skipping_lowers_only_the_continued_session_floor(execution_target, minutes):
-    rule = f"FREQ=MINUTELY;INTERVAL={minutes}"
-    options = {
-        "execution_target": execution_target,
-        "continued_minimum": MIN_TRIGGER_INTERVAL_SECONDS,
-    }
-    if minutes < 2:
-        with pytest.raises(RRuleValidationError, match="Minimum interval is 2 minutes"):
-            validate_rrule(rule, session_mode="continue", **options)
-    else:
-        assert validate_rrule(rule, session_mode="continue", **options).rule == rule
-    with pytest.raises(RRuleValidationError):
-        validate_rrule(rule, session_mode="new", **options)
 
 
 @pytest.mark.parametrize(

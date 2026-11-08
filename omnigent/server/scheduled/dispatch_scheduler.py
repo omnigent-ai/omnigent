@@ -18,13 +18,7 @@ from omnigent.db.db_models import workspace_scope
 from omnigent.debug_logging import current_session_id_scope, debug_event, log_attributes_scope
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, ScheduledTaskSchedulerConfig
-from omnigent.server.scheduled.rrule import (
-    MIN_SUBHOUR_INTERVAL_SECONDS,
-    MIN_TRIGGER_INTERVAL_SECONDS,
-    RRuleSearchError,
-    RRuleValidationError,
-    validate_rrule,
-)
+from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.schedule import (
     host_ownership_key,
     is_trigger_automation,
@@ -366,9 +360,12 @@ DispatchEnabled = Callable[[], bool]
 # Read before each wait between polls.
 PollInterval = Callable[[], float]
 # Whether a due occurrence can be skipped, unrecorded, because the session it continues is
-# busy, given the current time. Asked only for trigger automations; passing one also lets
-# them poll every two minutes.
+# busy, given the current time. Asked only for trigger automations.
 OccurrenceBusy = Callable[[ScheduledTask, int], Awaitable[bool]]
+
+# With a busy check, the server tries to poll a trigger automation this often instead of
+# following the trigger's saved schedule.
+TRIGGER_POLL_SECONDS = 2 * 60
 
 
 class FireIdentityRevoked(Exception):
@@ -643,7 +640,7 @@ class PersistentTaskScheduler:
             try:
                 if not await self._validate_schedule(task):
                     continue
-                next_run = await asyncio.to_thread(next_scheduled_time, task, int(self._now()))
+                next_run = await self._next_occurrence(task, int(self._now()))
                 with workspace_scope(task.workspace_id):
                     if next_run is None:
                         await asyncio.to_thread(self._store.complete_schedule, task)
@@ -663,6 +660,12 @@ class PersistentTaskScheduler:
                 )
         if len(tasks) < self._batch_size:
             self._initialization_cursor = None
+
+    async def _next_occurrence(self, task: ScheduledTask, now: int) -> int | None:
+        """The server's next poll for a trigger it can check, else the saved schedule's next."""
+        if self._occurrence_busy is not None and is_trigger_automation(task):
+            return now + TRIGGER_POLL_SECONDS
+        return await asyncio.to_thread(next_scheduled_time, task, now)
 
     async def _skip_busy_occurrence(
         self, task: ScheduledTask, *, now: int, next_run_at: int
@@ -714,12 +717,6 @@ class PersistentTaskScheduler:
                 task.rrule,
                 session_mode=task.session_mode,
                 execution_target=task.execution_target,
-                # Only a trigger automation whose busy polls are skipped may poll more often.
-                continued_minimum=(
-                    MIN_TRIGGER_INTERVAL_SECONDS
-                    if self._occurrence_busy is not None and is_trigger_automation(task)
-                    else MIN_SUBHOUR_INTERVAL_SECONDS
-                ),
             )
         except RRuleSearchError:
             raise
@@ -929,10 +926,9 @@ class PersistentTaskScheduler:
                             target=task.execution_target,
                         ),
                     )
-                    next_run = await asyncio.to_thread(next_scheduled_time, task, now)
+                    next_run = await self._next_occurrence(task, now)
                     if self._stopped:
                         return
-                    # A skip defers the prompt to the next occurrence, so the last one is sent.
                     if next_run is not None and await self._skip_busy_occurrence(
                         task, now=now, next_run_at=next_run
                     ):

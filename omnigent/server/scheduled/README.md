@@ -192,16 +192,18 @@ would, and sends the prompt, also while the session is busy with an earlier turn
 It records `succeeded` once the prompt is delivered, without waiting for the turn.
 Trigger automations are the exception. A trigger automation is such a task whose
 prompt starts with the opening sentence of a Jira, Slack, GitHub or Linear
-trigger template, the same check the web form uses. Before claiming its due
-occurrence, the database scheduler skips it while the session shows as running
-(a turn in progress, or waiting on an approval or question) and the task's
-latest run was scheduled less than ten minutes ago. A skip only advances
+trigger template, the same check the web form uses. The database scheduler
+ignores a trigger's saved schedule and tries to poll it every two minutes
+(`TRIGGER_POLL_SECONDS`). Before claiming a poll, it skips it while the session
+is busy: it shows as running (a turn in progress, or waiting on an approval or
+question), or it changed in the last two minutes, since an agent can pause
+between steps. A poll still goes out once the latest run was scheduled ten
+minutes ago, so a stale status cannot stall the trigger. A skip only advances
 `next_run_at`: it writes no run row and logs `scheduled_run_skipped_busy`. The
 status is read from session activity, which needs no caller access check, so the
 poll does not act as the owner. A failed check sends the prompt. Other continued
-tasks, legacy timers and Run now never skip. Neither does the last occurrence of
-a schedule that ends (`COUNT` or `UNTIL`), because a skip only defers the prompt
-to the next occurrence.
+tasks, legacy timers and a scheduler with a custom `on_fire` hook (it has no busy
+check) follow the saved schedule and never skip, and neither does Run now.
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run
@@ -583,14 +585,6 @@ Upgrade scheduler replicas before API replicas begin accepting sub-hour schedule
 and avoid routing writes across mixed API versions during the rollout. Older API
 replicas reject short schedules; older schedulers can pause them as invalid.
 Keep the existing scheduler mode unchanged during the version upgrade.
-
-The database scheduler accepts trigger automation schedules down to two minutes,
-because it skips their occurrences while the session is busy. Everything else
-keeps the ten-minute minimum for continued sessions: other continued tasks, the
-legacy timers, a database scheduler with a custom `on_fire` hook (it has no busy
-check), and the API until every scheduler replica skips busy trigger
-automations. A scheduler that keeps ten minutes, including an older one, pauses
-a shorter schedule as invalid.
 
 Updates validate the proposed recurrence, session mode and target outside the
 database transaction, then compare their saved values under the task row lock.
