@@ -1,6 +1,11 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getSeenCommentIds, markCommentsSeen, useSeenCommentIds } from "./useSeenComments";
+import {
+  forgetSeenComments,
+  getSeenCommentIds,
+  markCommentsSeen,
+  useSeenCommentIds,
+} from "./useSeenComments";
 
 const STORAGE_KEY = "omnigent:seen-comment-ids";
 
@@ -52,6 +57,18 @@ describe("markCommentsSeen", () => {
     expect(stored["new"]).toBe(9_000);
     expect(stored["c0"]).toBeUndefined();
     expect(stored["c999"]).toBe(1000);
+  });
+});
+
+describe("forgetSeenComments", () => {
+  it("undoes only the ids a mark newly recorded, so they surface again", () => {
+    markCommentsSeen(["c1"]);
+    const added = markCommentsSeen(["c1", "c2"]);
+    expect(added).toEqual(["c2"]);
+
+    forgetSeenComments(added);
+
+    expect([...getSeenCommentIds()]).toEqual(["c1"]);
   });
 });
 

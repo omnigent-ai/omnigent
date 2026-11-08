@@ -19,7 +19,10 @@ export function useAutomationInbox(identityReady: boolean) {
   ]);
   const enabled =
     identityReady && viewerId !== null && info !== "loading" && info.scheduled_task_inbox === true;
-  const { seen, markRead } = useSeenAutomationFailures(scope, server !== null);
+  const { seen, markRead, markManyRead, unmarkRead } = useSeenAutomationFailures(
+    scope,
+    server !== null,
+  );
   const query = useInfiniteQuery({
     queryKey: ["automation-inbox", scope],
     queryFn: ({ pageParam }) => listAutomationFailures(pageParam),
@@ -40,5 +43,7 @@ export function useAutomationInbox(identityReady: boolean) {
     hasNextPage: enabled && query.hasNextPage,
     items: [...unique.values()].filter((item) => !seen.has(item.runId)),
     markRead,
+    markManyRead,
+    unmarkRead,
   };
 }
