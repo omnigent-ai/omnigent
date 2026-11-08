@@ -809,7 +809,7 @@ interface WorkspacePanelProps {
   mobileSideChatsOpen?: boolean;
   /** Open or close the mobile side-chats drawer. */
   onMobileSideChatsOpenChange?: (open: boolean) => void;
-  /** Names a side chat started from its tab while on screen, so the shell doesn't reveal it again. */
+  /** Names a side chat started from its tab during this visit, so the shell doesn't reveal it again. */
   onSideChatShownInPlace?: (childId: string) => void;
   /** Reports whether a side-chat or sub-agent tab is open, so a phone can reach the drawer. */
   onHasSideChatTabsChange?: (hasSideChatTabs: boolean) => void;
@@ -1124,15 +1124,18 @@ function WorkspacePanelImpl({
   // would cross-assign when two launches overlap; the generic path skips the
   // queue entirely and rekeys its own tab directly (see startPendingSideChat).
   const awaitingPendingIdsRef = useRef<string[]>([]);
-  // Generic children started from a pending tab here, until their signal is consumed.
-  const startedSideChatIdsRef = useRef(new Set<string>());
+  // Pending tabs started during this visit, then their generic children; leaving forgets them.
+  const startedInPlaceIdsRef = useRef(new Set<string>());
   const signalConversationIdRef = useRef(conversationId);
   // A side chat the server just created (Codex's native fork, or the generic
   // fork) announces itself via `sideChatToOpen`. If a pending tab is awaiting,
   // rekey it in place; otherwise open a fresh tab. AppShell reveals the rail.
   useEffect(() => {
-    const returned = signalConversationIdRef.current !== conversationId;
-    signalConversationIdRef.current = conversationId;
+    if (signalConversationIdRef.current !== conversationId) {
+      // A start the user navigated away from is revealed when it finishes.
+      startedInPlaceIdsRef.current.clear();
+      signalConversationIdRef.current = conversationId;
+    }
     if (sideChatToOpen === null) return;
     // Only the parent that owns this side chat consumes (and clears) the signal
     // — a fork that resolves after the user navigated elsewhere waits for its
@@ -1141,7 +1144,7 @@ function WorkspacePanelImpl({
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
     const subagentId = subagentSessionIdFromTab(childId);
-    let startedHere = startedSideChatIdsRef.current.delete(childId);
+    let startedInPlace = startedInPlaceIdsRef.current.delete(childId);
     if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
       // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
       sideChats.select(subagentId);
@@ -1154,15 +1157,14 @@ function WorkspacePanelImpl({
       if (awaiting !== undefined) {
         sideChats.rekey(awaiting, childId);
         useChatStore.getState().clearSideChatComposer(awaiting);
-        startedHere = true;
+        if (startedInPlaceIdsRef.current.delete(awaiting)) startedInPlace = true;
       } else {
         // Generic already rekeyed its own tab; this just re-selects it (idempotent).
         sideChats.open(childId);
       }
     }
     onRightRailTabChange("sidechat");
-    // A start that finished while the user was in another conversation is still revealed on return.
-    if (startedHere && !returned) onSideChatShownInPlace?.(childId);
+    if (startedInPlace) onSideChatShownInPlace?.(childId);
     clearSideChatToOpen();
   }, [
     sideChatToOpen,
@@ -1217,6 +1219,7 @@ function WorkspacePanelImpl({
   // the parent's live runner. Rejects so the composer re-enables and keeps
   // the typed text for a retry.
   const startPendingSideChat = (pendingId: string, text: string): Promise<void> => {
+    startedInPlaceIdsRef.current.add(pendingId);
     if (usesNativeSideChatFork(sideChatHarness)) {
       if (parentAgentId === null) return Promise.reject(new Error("no agent"));
       // The child arrives asynchronously via session_created with no id to pair
@@ -1257,7 +1260,9 @@ function WorkspacePanelImpl({
         // now that the text has moved to the real child. Only on success — a
         // failed create keeps it so the user can retry.
         useChatStore.getState().clearSideChatComposer(pendingId);
-        startedSideChatIdsRef.current.add(childSessionId);
+        if (startedInPlaceIdsRef.current.delete(pendingId)) {
+          startedInPlaceIdsRef.current.add(childSessionId);
+        }
         useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
       },
       (err) => {
