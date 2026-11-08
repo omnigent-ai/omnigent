@@ -6,7 +6,8 @@
 // (no async search index), so a plain invalidate can't resurrect a just-deleted
 // row — no patch-in-place gymnastics are needed here.
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
 import {
   createScheduledTask,
   deleteScheduledTask,
@@ -194,12 +195,30 @@ export function useUpdateScheduledTask() {
   });
 }
 
+/**
+ * Refresh the cached session lists, and the session's own entry when known,
+ * after an automation adds the session its runs start from or clears its label.
+ */
+export function refreshAutomationSourceSession(
+  queryClient: QueryClient,
+  sessionId?: string | null,
+): void {
+  for (const root of LIST_ROW_QUERY_ROOTS) {
+    void queryClient.invalidateQueries({ queryKey: [root] });
+  }
+  void queryClient.invalidateQueries({ queryKey: ["projects"] });
+  if (sessionId) void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+}
+
 /** Delete a task, then refresh the list. */
 export function useDeleteScheduledTask() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteScheduledTask(id),
     onSuccess: (_data, id) => {
+      const deleted =
+        queryClient.getQueryData<ScheduledTask>(scheduledTaskKey(id)) ??
+        queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id);
       // Drop the deleted task everywhere it's cached, so Back to its detail
       // page can't render it from a cache that is still fresh.
       queryClient.setQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY, (tasks) =>
@@ -208,6 +227,11 @@ export function useDeleteScheduledTask() {
       queryClient.removeQueries({ queryKey: scheduledTaskKey(id), exact: true });
       queryClient.removeQueries({ queryKey: scheduledTaskRunsKey(id), exact: true });
       void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+      // The server cleared the automation's label from the session it ran from,
+      // so menus and delete warnings must stop naming the automation.
+      if (deleted?.sourceSessionId) {
+        refreshAutomationSourceSession(queryClient, deleted.sourceSessionId);
+      }
     },
   });
 }
