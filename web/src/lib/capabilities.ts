@@ -76,8 +76,19 @@ export type FeatureKey =
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
 
+export type SiblingSessionDestinations =
+  "current_host" | "current_host_or_new_sandbox" | "any_host";
+
+export function parseSiblingSessionDestinations(value: unknown): SiblingSessionDestinations {
+  if (value === undefined || value === "any_host") return "any_host";
+  return value === "current_host_or_new_sandbox" ? value : "current_host";
+}
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  sibling_sessions?: boolean;
+  session_bundle_workspaces?: boolean;
+  sibling_session_destinations?: SiblingSessionDestinations;
   accounts_enabled: boolean;
   /**
    * True only on an explicit single-user local runtime
@@ -266,6 +277,11 @@ export interface ServerInfo {
   /** Types the session events route accepts; empty on older servers. */
   session_event_types?: readonly string[];
   /**
+   * True when a claude-sdk `clear` continues in a new session. Older servers
+   * list `clear` for native sessions only; absent there (off).
+   */
+  session_claude_sdk_clear?: boolean;
+  /**
    * True when the server stores session PRs (``/v1/sessions/{id}/pull-requests``
    * and ``Conversation.pull_request``); absent on older servers (off).
    */
@@ -390,6 +406,8 @@ function parseBranding(raw: unknown): Branding | null {
 
 /** Sentinel used when the probe fails — accounts and release features are off. */
 export const FALLBACK_SERVER_INFO: ServerInfo = {
+  sibling_session_destinations: "any_host",
+  session_bundle_workspaces: false,
   accounts_enabled: false,
   // Fail to multi-user: a failed probe must not hide account/sharing chrome.
   single_user: false,
@@ -538,6 +556,11 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const smartRoutingEnabled = data.smart_routing_enabled === true;
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
+          sibling_sessions: data.sibling_sessions === true,
+          sibling_session_destinations: parseSiblingSessionDestinations(
+            data.sibling_session_destinations,
+          ),
+          session_bundle_workspaces: data.session_bundle_workspaces === true,
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,
@@ -595,6 +618,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_event_types: Array.isArray(data.session_event_types)
             ? data.session_event_types.filter((t): t is string => typeof t === "string")
             : [],
+          session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
