@@ -243,6 +243,31 @@ describe("HarnessCredentialForm", () => {
     expect(keyInput.value).toBe("");
   });
 
+  it("hands a save that leaves only tmux missing to the parent", () => {
+    // "tmux-unavailable" means the credential worked and tmux is the last
+    // blocker, so the form closes and the parent shows the tmux step.
+    mutateMock.mockImplementation((_input, opts?: { onSuccess?: (r: unknown) => void }) =>
+      opts?.onSuccess?.({
+        object: "harness_credential",
+        harness: "codex-native",
+        configured_harnesses: { "codex-native": "tmux-unavailable" },
+      }),
+    );
+    const onDone = vi.fn();
+    render(
+      <HarnessCredentialForm harness="codex-native" host={HOST} command={null} onDone={onDone} />,
+    );
+    fireEvent.change(screen.getByTestId("harness-credential-key"), { target: { value: "sk-x" } });
+    fireEvent.click(screen.getByTestId("harness-credential-save"));
+    expect(showToastMock).toHaveBeenCalledWith(
+      "Saved. codex-native still needs tmux 3.3 or newer on corey-laptop.",
+    );
+    expect(showToastMock).not.toHaveBeenCalledWith(expect.stringContaining("is ready on"));
+    expect(onDone).toHaveBeenCalledWith(
+      expect.objectContaining({ configured_harnesses: { "codex-native": "tmux-unavailable" } }),
+    );
+  });
+
   it("surfaces a sticky error toast when the write is rejected", () => {
     // A backend-rejected write (e.g. a malformed gateway base_url the host
     // bounces as a 502) rejects the mutation. The form must report the failure

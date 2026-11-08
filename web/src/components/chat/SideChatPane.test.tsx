@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { StrictMode } from "react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
 import type { ComposerMicButtonProps } from "@/components/ComposerMicButton";
 import { toast } from "sonner";
@@ -39,11 +40,15 @@ const mockSession = vi.hoisted(() => ({
 }));
 // A conversation id whose snapshot the mock should report as still loading.
 const loadingSession = vi.hoisted(() => ({ id: null as string | null }));
+const failedSession = vi.hoisted(() => ({ id: null as string | null }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id?: string | null) => ({
-    session: { ...mockSession.snapshot, labels: mockSession.labels },
+    session:
+      id && id === failedSession.id
+        ? null
+        : { ...mockSession.snapshot, labels: mockSession.labels },
     isLoading: id != null && id === loadingSession.id,
-    error: null,
+    error: id && id === failedSession.id ? new Error("Snapshot unavailable") : null,
   }),
 }));
 vi.mock("@/hooks/useWorkingLabelTick", () => ({ useWorkingLabelTick: () => 0 }));
@@ -77,6 +82,7 @@ beforeEach(() => {
   mockSession.labels = {};
   mockSession.snapshot = {};
   loadingSession.id = null;
+  failedSession.id = null;
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
   sendSlashCommand.mockReset().mockResolvedValue(undefined);
@@ -112,6 +118,27 @@ afterEach(() => {
   conversationRegistry.clear();
   useChatStore.setState(initialStoreState);
   localStorage.clear();
+});
+
+describe("undelivered startup messages", () => {
+  it("shows a failed session's first message and its recovery action in a grid", () => {
+    const lost = "Summarize the open PRs";
+    conversationRegistry.acquire(childId).setState({
+      failedInputs: [{ pendingId: "pending_first", content: [{ type: "input_text", text: lost }] }],
+    });
+    renderPane(
+      <MemoryRouter>
+        <SideChatPane childId={childId} fullSession />
+      </MemoryRouter>,
+    );
+
+    const notice = screen.getByTestId("message-undelivered");
+    expect(notice).toHaveTextContent("Not delivered");
+    expect(screen.getByText(lost)).toBeTruthy();
+    expect(
+      within(notice).getByRole("button", { name: "Copy message to new session" }),
+    ).toBeEnabled();
+  });
 });
 
 describe("side-chat working indicator", () => {
@@ -164,6 +191,39 @@ describe("side-chat working indicator", () => {
     renderPane(<SideChatPane childId={childId} />);
 
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
+  });
+
+  it.each([
+    { name: "after a reply", blocks: true },
+    { name: "with no visible bubbles", blocks: false },
+  ])("shows and announces the child's background tasks $name", ({ blocks }) => {
+    renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      conversationRegistry.acquire(childId).setState({
+        sessionStatus: "idle",
+        backgroundTaskCount: 2,
+        blocks: blocks
+          ? itemsToBlocks([
+              {
+                id: "started",
+                response_id: "turn_started",
+                type: "message",
+                role: "assistant",
+                status: "completed",
+                content: [{ type: "output_text", text: "Started the build in the background." }],
+              },
+            ])
+          : [],
+      }),
+    );
+
+    expect(screen.getByTestId("background-tasks-indicator")).toHaveTextContent(
+      "2 background tasks running",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("2 background tasks running");
+
+    act(() => conversationRegistry.acquire(childId).setState({ backgroundTaskCount: 0 }));
+    expect(screen.queryByTestId("background-tasks-indicator")).toBeNull();
   });
 
   it("updates the working label from the child's own blocked state", () => {
@@ -381,6 +441,91 @@ describe("side chat opened from a text selection", () => {
 
     expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
     expect(onStart).toHaveBeenCalledExactlyOnceWith("why?");
+  });
+});
+
+describe("side chat opened from a + button", () => {
+  it("focuses a pending tab's input at once", () => {
+    useChatStore.setState({
+      sideChatComposers: { "pending:plus": { text: "", files: [], autoFocus: true } },
+    });
+    renderPane(<SideChatPane childId="pending:plus" onStart={vi.fn()} />);
+
+    expect(screen.getByTestId("side-chat-input")).toHaveFocus();
+    expect(useChatStore.getState().sideChatComposers["pending:plus"]?.autoFocus).toBe(false);
+  });
+
+  it("focuses a live tab's input once its agent binding enables it, surviving remounts and only once", () => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null, sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: "", files: [], autoFocus: true } },
+    });
+    // The rail or drawer can unmount the pane while the fork is still binding.
+    renderPane(<SideChatPane childId={childId} />).unmount();
+    const bound = renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    expect(input).toBeDisabled();
+    expect(input).not.toHaveFocus();
+
+    act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
+
+    expect(input).toBeEnabled();
+    expect(input).toHaveFocus();
+    expect(useChatStore.getState().sideChatComposers[childId]?.autoFocus).toBe(false);
+
+    // Re-selecting the tab later mounts it again without stealing focus.
+    bound.unmount();
+    renderPane(<SideChatPane childId={childId} />);
+    expect(screen.getByTestId("side-chat-input")).toBeEnabled();
+    expect(screen.getByTestId("side-chat-input")).not.toHaveFocus();
+  });
+
+  it.each([
+    ["a textarea", () => <textarea data-testid="other-field" />],
+    ["a text input", () => <input type="text" data-testid="other-field" />],
+    ["an editable element", () => <div contentEditable tabIndex={0} data-testid="other-field" />],
+  ])("drops a live tab's request when the user starts typing in %s while it binds", (_, field) => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null, sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: "", files: [], autoFocus: true } },
+    });
+    renderPane(
+      <>
+        <button type="button" data-testid="menu-trigger" />
+        <input type="checkbox" data-testid="toggle" />
+        {field()}
+        <SideChatPane childId={childId} />
+      </>,
+    );
+    // A closing menu returning focus to its button, or a toggled checkbox, is not typing.
+    act(() => screen.getByTestId("menu-trigger").focus());
+    act(() => screen.getByTestId("toggle").focus());
+    expect(useChatStore.getState().sideChatComposers[childId]?.autoFocus).toBe(true);
+
+    act(() => screen.getByTestId("other-field").focus());
+    expect(useChatStore.getState().sideChatComposers[childId]?.autoFocus).toBe(false);
+
+    act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
+    expect(screen.getByTestId("side-chat-input")).toBeEnabled();
+    expect(screen.getByTestId("other-field")).toHaveFocus();
+  });
+
+  it("leaves a text input that already had focus before the pane mounted alone", () => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null, sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: "", files: [], autoFocus: true } },
+    });
+    // A slow fork: the user went back to typing before the side chat appeared.
+    render(<textarea data-testid="main-composer" />);
+    act(() => screen.getByTestId("main-composer").focus());
+    renderPane(<SideChatPane childId={childId} />);
+
+    act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
+
+    expect(screen.getByTestId("side-chat-input")).toBeEnabled();
+    expect(screen.getByTestId("side-chat-input")).not.toHaveFocus();
+    expect(screen.getByTestId("main-composer")).toHaveFocus();
+    expect(useChatStore.getState().sideChatComposers[childId]?.autoFocus).toBe(false);
   });
 });
 
@@ -1237,6 +1382,169 @@ describe("unsent composer state survives the pane moving", () => {
   );
 });
 
+describe("history a side chat copied from its parent", () => {
+  function userItem(id: string, responseId: string, text: string) {
+    return {
+      id,
+      response_id: responseId,
+      type: "message" as const,
+      role: "user" as const,
+      status: "completed" as const,
+      content: [{ type: "input_text" as const, text }],
+    };
+  }
+  function listSideChat() {
+    mockSession.labels = { "omnigent.side_chat": "1" };
+    mockSession.snapshot = { sideChatParentId: "conv_main" };
+  }
+
+  it("hides exactly the items the fork copied, on any device", () => {
+    listSideChat();
+    // This browser's own snapshot would hide nothing; the fork's copies say otherwise.
+    localStorage.setItem(`omnigent.sideChatInherited:${childId}`, "[]");
+    const copied = childId.slice(0, 12);
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "openai-agents",
+      loadingConversation: false,
+      // The copy ends on a hidden input, and the reply before it, the fork and the
+      // side chat's first question all share one second.
+      blocks: itemsToBlocks([
+        { ...userItem(`${copied}old`, "resp_old", "Copied earlier"), created_at: 990 },
+        { ...userItem(`${copied}reply`, "resp_reply", "Copied reply"), created_at: 1_000 },
+        {
+          ...userItem(`${copied}tail`, "resp_tail", "Hidden input"),
+          created_at: 1_000,
+          is_meta: true,
+        },
+        { ...userItem("item_side", "resp_side", "Asked in the side chat"), created_at: 1_000 },
+      ]),
+    });
+
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Copied earlier")).toBeNull();
+    expect(screen.queryByText("Copied reply")).toBeNull();
+    expect(screen.queryByText("Hidden input")).toBeNull();
+    expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+  });
+
+  it("waits for the session before choosing which history to hide", () => {
+    loadingSession.id = childId;
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ sessionHarness: "openai-agents", loadingConversation: true });
+    const { rerender } = renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      entry.setState({
+        loadingConversation: false,
+        blocks: itemsToBlocks([
+          userItem(`${childId.slice(0, 12)}copy`, "resp_copy", "Copied reply"),
+          userItem("item_side", "resp_side", "Asked in the side chat"),
+        ]),
+      }),
+    );
+    expect(screen.queryByText("Asked in the side chat")).toBeNull();
+
+    loadingSession.id = null;
+    listSideChat();
+    rerender(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Copied reply")).toBeNull();
+    expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
+  });
+
+  it.each([false, true])(
+    "does not hide a new turn when a delayed snapshot settles (failed: %s)",
+    (failed) => {
+      loadingSession.id = childId;
+      const entry = conversationRegistry.acquire(childId);
+      entry.setState({ sessionHarness: "openai-agents", loadingConversation: true });
+      const { rerender } = renderPane(<SideChatPane childId={childId} />);
+      const copied = userItem(`${childId.slice(0, 12)}copy`, "resp_copy", "Copied reply");
+      act(() => entry.setState({ loadingConversation: false, blocks: itemsToBlocks([copied]) }));
+      act(() =>
+        entry.setState({
+          blocks: itemsToBlocks([
+            copied,
+            userItem("item_side", "resp_side", "A new side-chat turn"),
+          ]),
+        }),
+      );
+      loadingSession.id = null;
+      failedSession.id = failed ? childId : null;
+      rerender(<SideChatPane childId={childId} />);
+
+      expect(screen.getByText("A new side-chat turn")).toBeInTheDocument();
+      expect(screen.queryByText("Copied reply")).toBeNull();
+      const saved = localStorage.getItem(`omnigent.sideChatInherited:${childId}`);
+      expect(saved === null ? null : JSON.parse(saved)).toEqual(failed ? null : [copied.id]);
+      if (failed) {
+        failedSession.id = null;
+        listSideChat();
+        rerender(<SideChatPane childId={childId} />);
+        expect(screen.queryByText("Copied reply")).toBeNull();
+        expect(screen.getByText("A new side-chat turn")).toBeInTheDocument();
+      }
+    },
+  );
+
+  it("uses a saved legacy boundary when the snapshot fails", () => {
+    failedSession.id = childId;
+    localStorage.setItem(`omnigent.sideChatInherited:${childId}`, '["legacy_copy"]');
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "openai-agents",
+      loadingConversation: false,
+      blocks: itemsToBlocks([
+        userItem("legacy_copy", "resp_copy", "Copied reply"),
+        userItem("item_side", "resp_side", "A saved side-chat turn"),
+      ]),
+    });
+
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Copied reply")).toBeNull();
+    expect(screen.getByText("A saved side-chat turn")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBe('["legacy_copy"]');
+  });
+
+  it("leaves a listed Codex side chat's own transcript alone", () => {
+    listSideChat();
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ sessionHarness: "codex-native", loadingConversation: true });
+    renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      entry.setState({
+        loadingConversation: false,
+        blocks: itemsToBlocks([
+          // A native fork copies nothing, so even a prefix-looking id is its own turn.
+          userItem(`${childId.slice(0, 12)}own`, "resp_own", "Asked in the Codex side chat"),
+          userItem("item_next", "resp_next", "Followed up"),
+        ]),
+      }),
+    );
+
+    expect(screen.getByText("Asked in the Codex side chat")).toBeInTheDocument();
+    expect(screen.getByText("Followed up")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
+  });
+
+  it("hides nothing when the fork copied nothing", () => {
+    listSideChat();
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ sessionHarness: "openai-agents", loadingConversation: true });
+    renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      entry.setState({
+        loadingConversation: false,
+        blocks: itemsToBlocks([userItem("item_side", "resp_side", "Asked in the side chat")]),
+      }),
+    );
+
+    expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
+  });
+});
+
 describe("side chat sealed by the server", () => {
   it("is read-only once the server marks the child closed", () => {
     mockSession.labels = { "omnigent.closed": "true" };
@@ -1275,6 +1583,146 @@ describe("side chat sealed by the server", () => {
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", childId] }),
     );
+  });
+});
+
+describe("side-chat scroll position", () => {
+  const earlierAnswer = itemsToBlocks([
+    {
+      id: "earlier",
+      response_id: "turn_earlier",
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: "Earlier side-chat answer" }],
+    },
+  ]);
+
+  function scrollReaderUp() {
+    const transcript = screen.getByText("Earlier side-chat answer").closest(".overflow-y-auto")!;
+    Object.defineProperties(transcript, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 300 },
+    });
+    fireEvent.scroll(transcript);
+  }
+
+  it.each([
+    { name: "side chat", fullSession: false },
+    { name: "grid session", fullSession: true },
+  ])("keeps a scrolled-up $name reader in place until they send", ({ fullSession }) => {
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({
+      sessionStatus: "running",
+      activeResponse: { responseId: "turn_reply", state: "streaming", error: null },
+      blocks: earlierAnswer,
+    });
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+    renderPane(<SideChatPane childId={childId} fullSession={fullSession} />);
+    scrollReaderUp();
+    scrollIntoView.mockClear();
+
+    act(() =>
+      entry.setState({
+        sessionStatus: "idle",
+        activeResponse: { responseId: "turn_reply", state: "completed", error: null },
+      }),
+    );
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "One more question" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(send).toHaveBeenCalledOnce();
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
+
+    scrollIntoView.mockClear();
+    act(() =>
+      entry.setState({
+        activeResponse: { responseId: "turn_follow_up", state: "completed", error: null },
+      }),
+    );
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
+  });
+
+  it("follows the list's size while the reader is at the end", () => {
+    // A reply's last markdown update can land after the render that changed the turn.
+    const observers: { callback: () => void; targets: Element[]; disconnect: () => void }[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        callback: () => void;
+        targets: Element[] = [];
+        disconnect = vi.fn();
+        constructor(callback: () => void) {
+          this.callback = callback;
+          observers.push(this);
+        }
+        observe(target: Element) {
+          this.targets.push(target);
+        }
+        unobserve() {}
+      },
+    );
+    try {
+      const conversation = conversationRegistry.acquire(childId);
+      conversation.setState({ sessionStatus: "idle" });
+      const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+      const { unmount } = renderPane(<SideChatPane childId={childId} />);
+      // An empty side chat has no list; the observer attaches when the first reply mounts it.
+      expect(
+        screen.getByText("Ask a question here without affecting the main conversation."),
+      ).toBeInTheDocument();
+      act(() => conversation.setState({ blocks: earlierAnswer }));
+      const answer = screen.getByText("Earlier side-chat answer");
+      const list = observers.find((observer) => observer.targets.some((t) => t.contains(answer)))!;
+
+      scrollIntoView.mockClear();
+      act(() => list.callback());
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
+
+      scrollReaderUp();
+      scrollIntoView.mockClear();
+      act(() => list.callback());
+      expect(scrollIntoView).not.toHaveBeenCalled();
+
+      unmount();
+      expect(list.disconnect).toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each([
+    {
+      action: "queues a follow-up",
+      draft: "Also check the tests",
+      dispatched: () => useChatStore.getState().queuedMessages.length === 1,
+    },
+    {
+      action: "runs a skill",
+      draft: "/review 123",
+      dispatched: () => sendSlashCommand.mock.calls.length === 1,
+    },
+  ])("follows the tail again when a scrolled-up reader $action", ({ draft, dispatched }) => {
+    writeAlwaysSteer(false);
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", blocks: earlierAnswer });
+    skillsFixture.current = {
+      skills: [{ name: "review", description: "Review code" }],
+      skillsStatus: "ready",
+    };
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+    renderPane(<SideChatPane childId={childId} />);
+    scrollReaderUp();
+    scrollIntoView.mockClear();
+
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: draft } });
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    expect(dispatched()).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "end" });
   });
 });
 
