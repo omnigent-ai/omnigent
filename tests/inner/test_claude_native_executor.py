@@ -2144,7 +2144,12 @@ _TERMINAL_GONE_SUMMARY = (
 
 
 async def _run_turn_after_terminal_exit(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, exit_status: str | None, pane: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    exit_status: str | None,
+    pane: str,
+    kill_error: str | None = None,
 ) -> tuple[ExecutorError, str]:
     """Fail delivery the way the readiness wait does when the pane is gone."""
     raised_message = _TERMINAL_GONE_SUMMARY + claude_bridge._format_terminal_failure_tail(pane)
@@ -2153,12 +2158,13 @@ async def _run_turn_after_terminal_exit(
         del bridge_dir_arg, content, timeout_s
         raise ClaudeTerminalExited(raised_message, exit_status=exit_status)
 
+    def fake_kill(bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False) -> None:
+        del bridge_dir_arg, timeout_s, expected_close
+        if kill_error is not None:
+            raise RuntimeError(kill_error)
+
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
-    monkeypatch.setattr(
-        claude_native_executor,
-        "kill_session",
-        lambda bridge_dir_arg, *, timeout_s, expected_close=False: None,
-    )
+    monkeypatch.setattr(claude_native_executor, "kill_session", fake_kill)
     events = [
         event
         async for event in ClaudeNativeExecutor(tmp_path / "bridge").run_turn(
@@ -2205,6 +2211,23 @@ async def test_run_turn_explains_a_launch_failure_the_exited_pane_printed(
     assert error.message == (
         f"{title}\n\n{error.cause}\n\nTry this: {error.remediation}\n\n"
         f"{_TERMINAL_GONE_SUMMARY}\n\nLast captured terminal output:\n{pane}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_turn_keeps_a_cleanup_failure_beside_the_launch_diagnosis(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pane = "Error: Not logged in · Please run /login"
+    error, _ = await _run_turn_after_terminal_exit(
+        monkeypatch, tmp_path, exit_status=None, pane=pane, kill_error="tmux kill failed"
+    )
+
+    assert error.code == "required_terminal_exited"
+    assert error.title == "Agent isn't signed in"
+    assert error.message.endswith(
+        f"{_TERMINAL_GONE_SUMMARY} Cleanup also failed: tmux kill failed\n\n"
+        f"Last captured terminal output:\n{pane}"
     )
 
 
