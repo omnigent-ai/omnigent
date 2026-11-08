@@ -197,6 +197,14 @@ def build_opencode_config(
     config: dict[str, object] = {
         "$schema": OPENCODE_CONFIG_SCHEMA,
         "permissions": _permission_rules(permissions),
+        # A native bridge has no assistant output until the runner-side
+        # forwarder observes the first real turn.  OpenCode 2.0.x can compact
+        # immediately after admitting a prompt when a large MCP/instruction
+        # surface fills a small local model's context; a second automatic pass
+        # then fails with "Nothing to compact yet" and aborts that first turn.
+        # Keep automatic compaction off for bridge-owned sessions.  Explicit
+        # compaction remains available through the native control route.
+        "compaction": {"auto": False},
     }
     providers: dict[str, object] = {k: dict(v) for k, v in (extra_providers or {}).items()}
     if gateway is not None:

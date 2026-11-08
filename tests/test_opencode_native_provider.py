@@ -980,6 +980,7 @@ def test_build_opencode_config_minimal_is_ask_all() -> None:
     )
     assert cfg == {
         "$schema": "https://opencode.ai/config.json",
+        "compaction": {"auto": False},
         "permissions": [{"action": "*", "resource": "*", "effect": "ask"}],
     }
 
@@ -1003,6 +1004,7 @@ def test_build_opencode_config_full_v2_shape() -> None:
     }
     assert cfg["plugins"] == ["/b/ucode-auth", "/b/omnigent-policy"]
     assert cfg["instructions"] == ["/x/opencode/AGENTS.md"]
+    assert cfg["compaction"] == {"auto": False}
     for v1_key in ("provider", "permission", "plugin"):
         assert v1_key not in cfg
 
