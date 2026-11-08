@@ -2145,6 +2145,119 @@ def test_cursor_listing_failure_degrades_to_usable_static_row(
     assert "cannot run here" not in listing.note
 
 
+@pytest.mark.parametrize(
+    ("harness", "cli"),
+    [
+        ("opencode-native", "opencode"),
+        ("native-opencode", "opencode"),
+        ("opencode", "opencode"),
+        ("hermes-native", "hermes"),
+        ("native-hermes", "hermes"),
+    ],
+)
+def test_native_cli_catalog_does_not_claim_worker_is_dead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str, cli: str
+) -> None:
+    """CLI-owned routing must not inherit an unrelated SDK provider default."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  unrelated:\n    kind: databricks\n    profile: unused\n    default: true\n",
+    )
+    provider = resolve_model_provider(_worker_spec(harness), harness)
+    assert (provider.kind, provider.cli) == ("cli-config", cli)
+    row = catalog_for_spec(_worker_spec(harness))["self"]
+    assert (row["source"], row["verified"], row["models"]) == ("static", False, [])
+    assert "cannot run here" not in str(row["note"])
+    assert "not been verified" in str(row["note"])
+
+
+@pytest.mark.parametrize("harness", ["kiro-native", "native-kiro"])
+@pytest.mark.parametrize("discovery", ["models", "empty", "failure"])
+def test_kiro_catalog_uses_cli_discovery_without_claiming_authentication(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str, discovery: str
+) -> None:
+    from omnigent.harnesses.kiro_native import main as kiro_native
+
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    calls = 0
+
+    def discover() -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        if discovery == "failure":
+            raise OSError("CLI unavailable")
+        return [{"id": "auto"}] if discovery == "models" else []
+
+    monkeypatch.setattr(kiro_native, "list_kiro_cli_model_options", discover)
+    provider = resolve_model_provider(_worker_spec(harness), harness)
+    assert (provider.kind, provider.cli) == ("cli-config", "kiro-cli")
+    first = list_models_for_worker(_worker_spec(harness), harness)
+    second = list_models_for_worker(_worker_spec(harness), harness)
+    assert calls == 2
+    assert first == second
+    assert first.source == ("cli" if discovery == "models" else "static")
+    assert first.verified is (discovery == "models")
+    assert [model.id for model in first.models] == (["auto"] if discovery == "models" else [])
+    assert "cannot run here" not in first.note
+    assert "not been verified" in first.note
+
+
+@pytest.mark.parametrize("harness", ["opencode-native", "native-opencode", "opencode"])
+def test_opencode_catalog_preserves_bound_gateway_and_allowlist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  bound:\n    kind: local\n    openai:\n"
+        "      base_url: http://localhost:11434/v1\n      api_key: unused\n"
+        "inference:\n  harnesses:\n    opencode-native:\n"
+        "      provider: bound\n      default_model: cloud/glm-5.3\n"
+        "      model_allowlist: [cloud/glm-5.3]\n",
+    )
+    spec = _worker_spec(harness)
+    provider = resolve_model_provider(spec, harness)
+    assert (provider.kind, provider.family) == ("local", "openai")
+    assert provider.base_url == "http://localhost:11434/v1"
+
+    def models(request: httpx.Request) -> httpx.Response:
+        assert request.url == "http://localhost:11434/v1/models"
+        return httpx.Response(200, json={"data": [{"id": "cloud/glm-5.3"}, {"id": "other"}]})
+
+    listing = list_models_for_worker(spec, harness, transport=httpx.MockTransport(models))
+    assert (listing.source, listing.verified) == ("openai-compatible", True)
+    assert [model.id for model in listing.models] == ["cloud/glm-5.3"]
+    conflicting = _worker_spec(harness, auth=ProviderAuth(name="other"))
+    assert resolve_model_provider(conflicting, harness).kind == "none"
+    disallowed = _worker_spec(harness, model="other")
+    assert resolve_model_provider(disallowed, harness).kind == "none"
+
+
+@pytest.mark.parametrize("invalid", ["responses", "no-default", "no-openai", "no-models"])
+def test_opencode_catalog_does_not_bypass_invalid_binding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, invalid: str
+) -> None:
+    family = "anthropic" if invalid == "no-openai" else "openai"
+    default = "" if invalid == "no-default" else "      default_model: routed-model\n"
+    wire = "      wire_api: responses\n" if invalid == "responses" else ""
+    allowlist = "      model_allowlist: []\n" if invalid == "no-models" else ""
+    if invalid == "no-models":
+        default = ""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        f"providers:\n  bound:\n    kind: local\n    {family}:\n"
+        f"      base_url: http://localhost:11434/v1\n      api_key: unused\n{wire}"
+        "inference:\n  harnesses:\n    opencode-native:\n"
+        f"      provider: bound\n{default}{allowlist}",
+    )
+    spec = _worker_spec("opencode-native")
+    assert resolve_model_provider(spec, "opencode-native").kind == "none"
+    row = catalog_for_spec(spec)["self"]
+    assert (row["source"], row["verified"], row["models"]) == ("none", False, [])
+
+
 def test_none_listing_explains_dead_worker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
