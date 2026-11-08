@@ -73,6 +73,7 @@ describe("findCachedListRow", () => {
 
 describe("fetchConversationById", () => {
   it("maps the session response to a list row without items or usage", async () => {
+    const family = { id: "family_1", representative_id: "conv_sibling", pinned: false };
     fetchMock.mockResolvedValue(
       mockResponse({
         id: "conv_old",
@@ -80,6 +81,7 @@ describe("fetchConversationById", () => {
         created_at: 10,
         updated_at: 20,
         archived: true,
+        family,
         project_id: "proj_1",
         parent_session_id: "conv_parent",
         host_id: "host_1",
@@ -98,6 +100,7 @@ describe("fetchConversationById", () => {
       id: "conv_old",
       title: "Old",
       archived: true,
+      family,
       project_id: "proj_1",
       parent_session_id: "conv_parent",
       host_id: "host_1",
