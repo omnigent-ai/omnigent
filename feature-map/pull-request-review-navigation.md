@@ -40,6 +40,16 @@ and a changed file is flagged.
   changed, until **Dismiss** or until every changed file is marked. A file that can't
   be compared (binary, pure rename, missing from the fetched diff, or cut short) loses
   its mark without a badge or notice.
+- `stack`: A GitHub PR stacked on another PR shows `Stacked on #N <title>` above
+  the files, with `(merged)` for a merged parent. A PR whose base branch is the
+  parent's head branch shows only that row, since its diff already starts at the
+  parent. A PR on the default branch whose commits include another same-repo PR's
+  head (fork-model stacks) also gets **This PR only**, off by default. On, it lists
+  only the changes since the parent's head, without review conversations, viewed
+  controls or context expansion, and reads `No changes since the parent PR.` when
+  there are none. With no PR parent, a `## 🥞 Stacked PR` description link to
+  `files/<parent>..<head>` names the parent commit instead. PRs with no parent
+  show no row.
 
 ## How to get to it (user POV)
 
@@ -115,6 +125,19 @@ new head where only `main.py` changes. `README.md` keeps its mark, `main.py` sho
   show **Changed since viewed**, and the notice should show. Files the commit leaves
   alone keep their marks.
 
+### stack
+
+`tests/e2e_ui/github/test_github_tab.py::test_stacked_pr_shows_its_own_changes`
+covers `rail`. For a fork-model stack it checks the `Stacked on #4241` row and its
+link, turns on **This PR only** and checks that only the PR's own file remains,
+then turns it off and checks the full list is back. For a same-repo stack it checks
+the row has no toggle.
+
+- `composer-desktop`, `composer-mobile` and `canvas`: Open Changes on a PR stacked
+  on another open PR. Confirm the `Stacked on #N` row. On a fork-model stack, click
+  **This PR only** and confirm files that only the parent changed disappear, then
+  click it again to restore them.
+
 Component coverage for these helpers and views lives in
 `web/src/shell/PullRequestChangesTab.test.tsx`,
 `web/src/shell/PullRequestFileSection.test.tsx`,
@@ -185,5 +208,8 @@ Component coverage for these helpers and views lives in
   list and drops keyboard focus. Marks made in another tab on the same head show as
   checked but do not collapse the file until the Changes view remounts (for example
   after a reload) or the head changes.
+- **This PR only is GitHub-only and lookup-based.** The parent is looked up when the
+  Changes tab opens and reused for five minutes per head. The commit walk checks at most
+  the PR's newest 100 commits. A parent in another repository is not found.
 - **Canvas requires its release feature.** Check it is enabled before using the
   `canvas` entry.

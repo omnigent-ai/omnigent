@@ -67,6 +67,7 @@ NO_CAPABILITIES = {
     "details_editing": False,
     "attachment_uploads": False,
     "commit_history": False,
+    "stacked_prs": False,
 }
 # Keys of the panel's end-to-end info fixture, less GitHub's legacy fields.
 INFO_KEYS = {"object", "available", "branch", "base_ref", "repo", "pr"}

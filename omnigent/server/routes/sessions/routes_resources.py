@@ -2987,6 +2987,80 @@ def register_resources_routes(
         )
 
     @file_read_router.get(
+        "/sessions/{session_id}/resources/github/stack",
+        # Internal (UI GitHub stacked PR view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_stack(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+        head_sha: str | None = None,
+    ) -> Any:
+        """
+        Return the selected PR's parent in its stack at the displayed head.
+
+        Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param head_sha: The full head commit id the panel shows; rejected when the PR moved.
+        :returns: A ``session.github.pr_stack`` whose ``parent`` may be null.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if head_sha is not None:
+            params["head_sha"] = head_sha
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_stack",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/stack",
+        )
+
+    @file_read_router.get(
+        "/sessions/{session_id}/resources/github/stack-diff",
+        # Internal (UI GitHub stacked PR view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_stack_diff(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+        head_sha: str | None = None,
+        parent_sha: str | None = None,
+    ) -> Any:
+        """
+        Return the selected PR's changes since its parent PR's head.
+
+        Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param head_sha: The full head commit id the panel shows; rejected when the PR moved.
+        :param parent_sha: The parent's head, which must be one of the PR's commits.
+        :returns: A ``session.github.pr_stack_diff`` with ``patch`` and ``files``.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if head_sha is not None:
+            params["head_sha"] = head_sha
+        if parent_sha is not None:
+            params["parent_sha"] = parent_sha
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_stack_diff",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/stack-diff",
+        )
+
+    @file_read_router.get(
         "/sessions/{session_id}/resources/github/diff/{relative_path:path}",
         # Internal (UI GitHub diff view) — hidden from the public API reference.
         include_in_schema=False,

@@ -18,6 +18,8 @@ interface ChangesView {
   find: FindState;
   /** The head whose "changed files lost their viewed marks" notice the reader dismissed. */
   dismissedResetHead: string | null;
+  /** Show only a stacked PR's own changes instead of the whole diff against its base. */
+  ownChangesOnly: boolean;
 }
 
 export interface ChangesViewState extends ChangesView {
@@ -27,6 +29,7 @@ export interface ChangesViewState extends ChangesView {
   clearReveal: (path: string) => void;
   setFind: (patch: Partial<FindState>) => void;
   setDismissedResetHead: (head: string | null) => void;
+  setOwnChangesOnly: (ownChangesOnly: boolean) => void;
 }
 
 const EMPTY_VIEW: ChangesView = {
@@ -35,6 +38,7 @@ const EMPTY_VIEW: ChangesView = {
   revealedPaths: new Set(),
   find: { open: false, query: "", matchCase: false, regex: false },
   dismissedResetHead: null,
+  ownChangesOnly: false,
 };
 // Never evicted: records are small and per PR; add eviction if this grows.
 const views = new Map<string, ChangesView>();
@@ -73,6 +77,7 @@ export function useChangesViewState(conversationId: string, prUrl: string): Chan
       clearReveal: (path) => update(key, (current) => withRevealed(current, path, false)),
       setFind: (patch) => update(key, (current) => ({ find: { ...current.find, ...patch } })),
       setDismissedResetHead: (dismissedResetHead) => update(key, () => ({ dismissedResetHead })),
+      setOwnChangesOnly: (ownChangesOnly) => update(key, () => ({ ownChangesOnly })),
     }),
     [key],
   );

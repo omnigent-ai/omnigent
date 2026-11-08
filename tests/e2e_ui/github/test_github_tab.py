@@ -1520,3 +1520,162 @@ def test_changes_filter_copy_open(page: Page, seeded_session: tuple[str, str], e
     expect(page.get_by_role("menuitem", name="Open in GitHub")).to_have_attribute(
         "href", "https://example.com/fork/app/blob/head/README.md"
     )
+
+
+def _changed_file(path: str, status: str, added: int) -> dict[str, object]:
+    return {
+        "object": "session.github.changed_file",
+        "path": path,
+        "name": path.rsplit("/", 1)[-1],
+        "status": status,
+        "lines_added": added,
+        "lines_removed": 0,
+    }
+
+
+def _file_patch(path: str, line: str) -> str:
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        f"--- a/{path}\n+++ b/{path}\n"
+        "@@ -1,2 +1,3 @@\n"
+        f" line1\n+{line}\n line2\n"
+    )
+
+
+_PARENT_FILE = "src/stack/parent.py"
+_OWN_FILE = "src/app/main.py"
+_PARENT_HEAD = "a" * 40
+
+
+def _stub_stacked_pr(page: Page, source: str) -> tuple[list[str], list[str]]:
+    """Stub a PR stacked on #4241 found via ``source``; return the stack and stack-diff URLs."""
+    pr_url = _INFO["pr"]["url"]
+    base_ref = "main" if source == "commit" else "feature/parent"
+    info = {
+        **_INFO,
+        "base_ref": base_ref,
+        "tracking_available": True,
+        "selected_pr_url": pr_url,
+        "prs": [
+            {
+                "url": pr_url,
+                "host": "example.com",
+                "repository": "acme/app",
+                "number": _PR_NUMBER,
+                "relationship": "created",
+            }
+        ],
+        "capabilities": {"line_counts": True, "linked_pr_diff": True, "stacked_prs": True},
+        "pr": {**_INFO["pr"], "base_ref": base_ref, "head_sha": "head", "base_sha": "base"},
+    }
+    stack_requests: list[str] = []
+    stack_diff_requests: list[str] = []
+
+    def stack(route: Route) -> None:
+        stack_requests.append(route.request.url)
+        route.fulfill(
+            json={
+                "object": "session.github.pr_stack",
+                "head_sha": "head",
+                "parent": {
+                    "number": 4241,
+                    "url": "https://example.com/pr/4241",
+                    "title": "Add the stack parent",
+                    "state": "OPEN",
+                    "head_sha": _PARENT_HEAD,
+                    "source": source,
+                },
+            }
+        )
+
+    def stack_diff(route: Route) -> None:
+        stack_diff_requests.append(route.request.url)
+        route.fulfill(
+            json={
+                "object": "session.github.pr_stack_diff",
+                "patch": _file_patch(_OWN_FILE, "own line"),
+                "files": [_changed_file(_OWN_FILE, "modified", 1)],
+                "has_more": False,
+                "head_sha": "head",
+                "parent_sha": _PARENT_HEAD,
+            }
+        )
+
+    _stub_github(page)
+    page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
+    page.route(
+        re.compile(r"/resources/github/changes"),
+        lambda route: route.fulfill(
+            json={
+                **_CHANGES,
+                "data": [
+                    _changed_file(_PARENT_FILE, "created", 1),
+                    _changed_file(_OWN_FILE, "modified", 1),
+                ],
+                "head_sha": "head",
+                "base_sha": "base",
+            }
+        ),
+    )
+    page.route(
+        re.compile(r"/resources/github/diff(?:\?|$)"),
+        lambda route: route.fulfill(
+            json={
+                **_PR_DIFF,
+                "patch": _file_patch(_PARENT_FILE, "parent line")
+                + _file_patch(_OWN_FILE, "own line"),
+            }
+        ),
+    )
+    page.route(re.compile(r"/resources/github/stack(?:\?|$)"), stack)
+    page.route(re.compile(r"/resources/github/stack-diff(?:\?|$)"), stack_diff)
+    return stack_requests, stack_diff_requests
+
+
+@pytest.mark.parametrize("source", ["commit", "base_branch"], ids=["fork-model", "same-repo"])
+def test_stacked_pr_shows_its_own_changes(
+    request: pytest.FixtureRequest, seeded_session: tuple[str, str], source: str
+) -> None:
+    """A stacked PR names its parent; a fork-model stack toggles to the PR's own changes.
+
+    A PR on its parent's branch already diffs against the parent, so it has no toggle.
+    """
+    base_url, session_id = seeded_session
+    # Setup runs before the recorded page exists, so the clip opens on the journey.
+    page = request.getfixturevalue("page")
+    stack_requests, stack_diff_requests = _stub_stacked_pr(page, source)
+    page.set_viewport_size({"width": 1440, "height": 900})
+
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    panel = page.get_by_role("complementary", name="Workspace")
+    panel.get_by_role("tab", name="Pull Requests").click()
+    panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+
+    files = panel.locator("[data-github-file]")
+    expect(files).to_have_count(2, timeout=30_000)
+    stack_row = panel.get_by_role("group", name="Stacked pull request")
+    expect(stack_row).to_contain_text("Stacked on #4241 Add the stack parent")
+    expect(stack_row.get_by_role("link", name="#4241")).to_have_attribute(
+        "href", "https://example.com/pr/4241"
+    )
+    assert "head_sha=head" in stack_requests[0]
+    toggle = stack_row.get_by_role("button", name="This PR only")
+    if source == "base_branch":
+        expect(toggle).to_have_count(0)
+        assert stack_diff_requests == []
+        return
+
+    expect(toggle).to_have_attribute("aria-pressed", "false")
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-pressed", "true")
+    expect(files).to_have_count(1)
+    expect(files).to_have_attribute("data-github-file", _OWN_FILE)
+    expect(stack_row).to_contain_text("Showing changes since the parent's head.")
+    assert f"parent_sha={_PARENT_HEAD}" in stack_diff_requests[0]
+    assert "head_sha=head" in stack_diff_requests[0]
+
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-pressed", "false")
+    expect(files).to_have_count(2)
+    expect(panel.locator(f'[data-github-file="{_PARENT_FILE}"]')).to_be_visible()

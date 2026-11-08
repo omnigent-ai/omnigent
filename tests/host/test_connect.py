@@ -11163,7 +11163,7 @@ def test_github_label_ops_are_served_on_host(
 def test_github_commit_ops_are_served_on_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The host lists a tracked PR's commits and reads one commit when the runner is offline."""
+    """The host serves a tracked PR's commits and stack when the runner is offline."""
     from omnigent.host.frames import HostFsRequestFrame
     from omnigent.runner import github_resource
     from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
@@ -11181,6 +11181,12 @@ def test_github_commit_ops_are_served_on_host(
             author = {"name": "Ada", "date": "2026-11-01T10:00:00Z"}
             entries = [{"sha": commit, "commit": {"message": "Fix", "author": author}}]
             return 0, json.dumps([entries]), ""
+        if "--input" in argv:
+            return 0, json.dumps({"data": {"repository": {}}}), ""
+        if argv[-1] == f"repos/example/one/compare/{commit}...{head}":
+            if "Accept: application/vnd.github.diff" in argv:
+                return 0, "own-patch", ""
+            return 0, json.dumps({"files": [{"filename": "own.py", "status": "added"}]}), ""
         return 0, "commit-patch", ""
 
     monkeypatch.setattr(github_resource, "_gh", gh)
@@ -11207,6 +11213,24 @@ def test_github_commit_ops_are_served_on_host(
                 params={"pr_url": url, "commit_sha": commit},
             )
         )
+        stack = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="stack",
+                op="github_stack",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "head_sha": head},
+            )
+        )
+        stack_diff = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="stack-diff",
+                op="github_stack_diff",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "head_sha": head, "parent_sha": commit},
+            )
+        )
     finally:
         _cleanup_host(host)
 
@@ -11214,6 +11238,11 @@ def test_github_commit_ops_are_served_on_host(
     assert [entry["sha"] for entry in listed.payload["data"]] == [commit]
     assert patch.status == "ok", patch
     assert patch.payload == {"object": "session.github.pr_diff", "patch": "commit-patch"}
+    assert stack.status == "ok", stack
+    assert stack.payload == {"object": "session.github.pr_stack", "head_sha": head, "parent": None}
+    assert stack_diff.status == "ok", stack_diff
+    assert stack_diff.payload["patch"] == "own-patch"
+    assert [entry["path"] for entry in stack_diff.payload["files"]] == ["own.py"]
 
 
 def test_github_merge_ops_are_served_on_host(

@@ -31,8 +31,12 @@ import {
   type NormalizedPullRequestInfo,
   type PullRequest,
   type PullRequestChangedFile,
+  type PullRequestChangedFilesResult,
+  type PullRequestDiffResponse,
   type usePullRequestChangedFiles,
   type usePullRequestDiff,
+  type usePullRequestStack,
+  type usePullRequestStackDiff,
 } from "@/hooks/usePullRequests";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { gitProviderCopy } from "@/lib/gitProviders";
@@ -51,6 +55,7 @@ import {
 import { PullRequestFileActions } from "./PullRequestFileActions";
 import { PullRequestFindBar } from "./PullRequestFindBar";
 import { PullRequestPathFilter } from "./PullRequestPathFilter";
+import { canShowOwnChanges, PullRequestStackBar } from "./PullRequestStackBar";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
 import { PullRequestViewedProgress, PullRequestViewedToggle } from "./PullRequestViewedControls";
 import {
@@ -411,6 +416,60 @@ function openUnavailableReason(
 
 const NO_HIDDEN_PATHS: ReadonlySet<string> = new Set();
 
+/** The query fields the tab reads, so a PR-only view can stand in for the full diff. */
+interface ChangedFilesSource {
+  data?: PullRequestChangedFilesResult;
+  isLoading: boolean;
+  error: unknown;
+}
+interface PatchSource {
+  data?: PullRequestDiffResponse;
+  isLoading: boolean;
+  error: unknown;
+}
+
+/** The PR-only view's file list and patch, shaped like the full diff's. */
+function ownChangesSources(stackDiff: ReturnType<typeof usePullRequestStackDiff>): {
+  changes: ChangedFilesSource;
+  prDiff: PatchSource;
+} {
+  const result = stackDiff.data;
+  const isLoading = !result && !stackDiff.error;
+  const error =
+    stackDiff.error ??
+    (stackDiff.isSuccess && !result
+      ? new Error("This host can't show a PR's own changes. Update it to use this view.")
+      : null);
+  return {
+    changes: {
+      data: result
+        ? {
+            available: true,
+            data: result.files,
+            has_more: result.has_more,
+            warning: result.warning,
+            head_sha: result.head_sha,
+            base_sha: result.parent_sha,
+          }
+        : undefined,
+      isLoading,
+      error,
+    },
+    prDiff: {
+      data: result
+        ? {
+            object: "session.github.pr_diff",
+            patch: result.patch,
+            head_sha: result.head_sha,
+            base_sha: result.parent_sha,
+          }
+        : undefined,
+      isLoading,
+      error,
+    },
+  };
+}
+
 /**
  * The Changes tab content. Mounted beside the other tabs' content (it renders its
  * own TabsContent) so collapse and scroll-spy state survive tab switches.
@@ -422,10 +481,12 @@ export function PullRequestChangesTab({
   prUrl,
   canEdit,
   selected,
-  changes,
-  prDiff,
+  changes: fullChanges,
+  prDiff: fullDiff,
   reviews,
   identity,
+  stack,
+  stackDiff,
 }: {
   conversationId: string;
   data: NormalizedPullRequestInfo;
@@ -440,6 +501,10 @@ export function PullRequestChangesTab({
   reviews: ReturnType<typeof usePullRequestReviewThreads>;
   /** The PR's server identity, for the viewed-file key; null when unknown. */
   identity: PullRequestIdentity | null;
+  /** The PR's parent in a stack; absent when the provider can't find stacks. */
+  stack?: ReturnType<typeof usePullRequestStack>;
+  /** The PR's own changes, fetched while the PR-only view is on. */
+  stackDiff?: ReturnType<typeof usePullRequestStackDiff>;
 }) {
   const baseRef = data.base_ref ?? undefined;
   const headSha = pr.head_sha;
@@ -447,6 +512,12 @@ export function PullRequestChangesTab({
   const mobile = useIsMobileViewport();
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
   const { revealedPaths, reveal, clearReveal, find } = view;
+  // A lookup that fails or finds no parent leaves the full diff as the only view.
+  const stackParent = stack?.error ? null : (stack?.data?.parent ?? null);
+  const ownChangesOnly = !!stackDiff && view.ownChangesOnly && canShowOwnChanges(stackParent);
+  const ownSources = stackDiff && ownChangesOnly ? ownChangesSources(stackDiff) : null;
+  const changes: ChangedFilesSource = ownSources?.changes ?? fullChanges;
+  const prDiff: PatchSource = ownSources?.prDiff ?? fullDiff;
   // The filter input shows in the sidebar; while the sidebar is collapsed it opens inline.
   const [filterOpen, setFilterOpen] = useState(false);
   // The revision the displayed list reports. Open uses only this pinned revision, so a newer
@@ -484,7 +555,8 @@ export function PullRequestChangesTab({
   }, [prDiff.data]);
   // Hashed from this parse, before the expand-context loader edits these files.
   const patchHashes = useMemo(() => patchFileHashes(filesByPath), [filesByPath]);
-  const viewedFiles = useViewedFiles(identity, renderedHead, patchHashes);
+  // Marks hash the full diff's patches, so the PR-only view neither shows nor records them.
+  const viewedFiles = useViewedFiles(ownChangesOnly ? null : identity, renderedHead, patchHashes);
 
   const themeType = useResolvedThemeMode();
   // Diff layout is the app-global FileViewer preference (unified/split); seed
@@ -518,8 +590,14 @@ export function PullRequestChangesTab({
   const fileTree = useMemo(() => buildSidebarTree(visibleFiles), [visibleFiles]);
   const visiblePaths = useMemo(() => visibleFiles.map((file) => file.path), [visibleFiles]);
   // The toolbar, and with it the find bar, renders only when there is something to show.
+  const noChangesMessage = ownChangesOnly
+    ? "No changes since the parent PR."
+    : "No changes vs base.";
+  // Conversations anchor to the full diff, so the PR-only view leaves them out.
+  const reviewPage = ownChangesOnly ? undefined : reviews.page;
+  const loadingThreads = !ownChangesOnly && reviews.isFetching;
   const toolbarShown =
-    files.length > 0 || reviews.isFetching || (reviews.page?.data ?? []).some((t) => !t.resolved);
+    files.length > 0 || loadingThreads || (reviewPage?.data ?? []).some((t) => !t.resolved);
 
   // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
   // drive every section; a path in the set is collapsed unless it is revealed.
@@ -677,9 +755,10 @@ export function PullRequestChangesTab({
       // unchanged lines aren't in the patch, so expansion (and the exact
       // trailing-region count) is served by loadDiffFiles on demand.
       expansionLineCount: 10,
-      loadDiffFiles,
+      // File contents are served at the PR's base, not the parent's head.
+      loadDiffFiles: ownChangesOnly ? undefined : loadDiffFiles,
     }),
-    [themeType, diffStyle, loadDiffFiles],
+    [themeType, diffStyle, loadDiffFiles, ownChangesOnly],
   );
 
   // The stacked diff scrolls as one; the sidebar highlights the file at the top
@@ -934,18 +1013,18 @@ export function PullRequestChangesTab({
       pr.base_sha &&
       pr.head_sha === prDiff.data?.head_sha &&
       pr.base_sha === prDiff.data?.base_sha &&
-      reviews.page
+      reviewPage
     ),
     headSha: pr.head_sha,
     baseSha: pr.base_sha,
     loadComments: reviews.loadComments,
     loadingComments: reviews.loadingComments,
   };
-  const threads = reviews.page?.data ?? [];
+  const threads = reviewPage?.data ?? [];
   const matchingRevision =
-    !!reviews.page &&
-    reviews.page.head_sha === prDiff.data?.head_sha &&
-    reviews.page.base_sha === prDiff.data?.base_sha;
+    !!reviewPage &&
+    reviewPage.head_sha === prDiff.data?.head_sha &&
+    reviewPage.base_sha === prDiff.data?.base_sha;
   const canShowFiles =
     !changes.error &&
     !prDiff.error &&
@@ -994,7 +1073,15 @@ export function PullRequestChangesTab({
   // A controls row, then the sidebar (jump-to-file) + one scroll of all files' diffs.
   return (
     <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col" onKeyDown={onTabKeyDown}>
+      {stackParent && (
+        <PullRequestStackBar
+          parent={stackParent}
+          ownChangesOnly={ownChangesOnly}
+          onOwnChangesOnlyChange={view.setOwnChangesOnly}
+        />
+      )}
       {data.capabilities.review_threads &&
+        !ownChangesOnly &&
         (reviews.page?.has_more ||
           reviews.historyStale ||
           reviews.page?.warning ||
@@ -1062,7 +1149,7 @@ export function PullRequestChangesTab({
           onToggleFilter={files.length > 0 && sidebarCollapsed ? toggleInlineFilter : undefined}
           canNavigateThreads={unresolved.length > 0}
           onNavigateThread={navigateThread}
-          loadingThreads={reviews.isFetching}
+          loadingThreads={loadingThreads}
           diffStyle={diffStyle}
           onToggleDiffStyle={toggleDiffStyle}
           allCollapsed={allCollapsed}
@@ -1136,7 +1223,7 @@ export function PullRequestChangesTab({
                 changes.data?.has_more ||
                 changes.data?.warning
                   ? "Changed files are unavailable."
-                  : "No changes vs base."}
+                  : noChangesMessage}
               </p>
             ) : (
               fileTree.map((node) => (
@@ -1182,7 +1269,7 @@ export function PullRequestChangesTab({
                 changes.data?.warning ? (
                 "Changed files are unavailable."
               ) : (
-                "No changes vs base."
+                noChangesMessage
               )}
             </PanelMessage>
           ) : allViewed ? (

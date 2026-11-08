@@ -39,6 +39,7 @@ _CAPABILITIES = ProviderCapabilities(
     details_editing=True,
     attachment_uploads=True,
     commit_history=True,
+    stacked_prs=True,
 )
 
 
@@ -214,6 +215,22 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._pr_commit_patch(root, reference, commit_sha=commit_sha)
+
+    def stack(self, root: str, reference: PullRequestRef, *, head_sha: str) -> dict[str, Any]:
+        """Find the PR's parent from its base branch, commits, or stack description."""
+        from omnigent.runner import github_stack
+
+        return github_stack.pr_stack(root, reference, head_sha=head_sha)
+
+    def stack_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, parent_sha: str
+    ) -> dict[str, Any]:
+        """Compare the parent's head with the PR's head."""
+        from omnigent.runner import github_stack
+
+        return github_stack.pr_stack_diff(
+            root, reference, head_sha=head_sha, parent_sha=parent_sha
+        )
 
     def set_preference(
         self,

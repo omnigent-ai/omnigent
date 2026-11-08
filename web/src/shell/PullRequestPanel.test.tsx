@@ -130,6 +130,8 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       error: state.diffError,
       isFetching: false,
     }),
+    usePullRequestStack: () => ({ data: undefined, error: null }),
+    usePullRequestStackDiff: () => ({ data: undefined, error: null }),
     fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
     // The account selector (shown in the repo-unresolved empty state) calls this;
     // stub the mutation shape it reads.

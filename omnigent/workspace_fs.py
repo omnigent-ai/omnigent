@@ -774,6 +774,44 @@ class WorkspaceReader:
             ),
         )
 
+    def github_stack(
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        head_sha: str | None = None,
+    ) -> _WorkspacePayload:
+        """The selected PR's parent in its stack at the displayed head."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_stack(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                head_sha=head_sha,
+            ),
+        )
+
+    def github_stack_diff(
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        head_sha: str | None = None,
+        parent_sha: str | None = None,
+    ) -> _WorkspacePayload:
+        """The selected PR's changes since its parent PR's head."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_stack_diff(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                head_sha=head_sha,
+                parent_sha=parent_sha,
+            ),
+        )
+
     def github_labels(
         self, session_id: str | None = None, pr_url: str | None = None
     ) -> _WorkspacePayload:

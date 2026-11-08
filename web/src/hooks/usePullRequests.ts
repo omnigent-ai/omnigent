@@ -229,6 +229,8 @@ export interface PullRequestCapabilities {
   details_editing?: boolean;
   /** Images and videos can be uploaded into the description; absent from older hosts. */
   attachment_uploads?: boolean;
+  /** The PR's parent in a stack and the changes since it can be read; absent from older hosts. */
+  stacked_prs?: boolean;
 }
 
 /** Why the panel can't show pull request content.
@@ -773,6 +775,108 @@ export function usePullRequestDiff(
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+/** The PR this one is stacked on, found from its base branch, commits or description. */
+export interface PullRequestStackParent {
+  /** Null when only the description's stack link names the parent's head. */
+  number: number | null;
+  url: string | null;
+  title: string | null;
+  /** "OPEN" or "MERGED", or null when unknown. */
+  state: string | null;
+  head_sha: string;
+  /** `base_branch` stacks already diff against the parent, so they offer no PR-only view. */
+  source: "base_branch" | "commit" | "description";
+}
+
+export interface PullRequestStack {
+  object: "session.github.pr_stack";
+  head_sha: string;
+  parent: PullRequestStackParent | null;
+}
+
+/** The PR's own changes: its parent's head compared with its head. */
+export interface PullRequestStackDiff {
+  object: "session.github.pr_stack_diff";
+  patch: string;
+  files: PullRequestChangedFile[];
+  has_more: boolean;
+  warning?: string;
+  head_sha: string;
+  parent_sha: string;
+}
+
+async function fetchPinnedPullRequestResource<T>(
+  conversationId: string,
+  resource: string,
+  query: Record<string, string>,
+): Promise<T | null> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/${resource}?${new URLSearchParams(query)}`,
+  );
+  // A host or server that predates stacks has no route.
+  if (res.status === 404) return null;
+  if (res.status === 503 && (await isRunnerUnavailable503(res))) {
+    throw new RunnerOfflineError();
+  }
+  if (!res.ok) throw await errorFromResponse(res);
+  return (await res.json()) as T;
+}
+
+/**
+ * Find the PR's parent in its stack at `headSha`. Resolves to null when the host
+ * predates stacks. The answer is reused for five minutes, since parents change rarely.
+ */
+export function usePullRequestStack(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+  headSha: string | undefined,
+  enabled: boolean,
+) {
+  const serveable = useWorkspaceServeable(conversationId);
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return useQuery({
+    queryKey: ["github-pr-stack", conversationId, prUrl, headSha],
+    queryFn: () =>
+      fetchPinnedPullRequestResource<PullRequestStack>(conversationId!, "stack", {
+        pr_url: prUrl!,
+        head_sha: headSha!,
+      }),
+    enabled: enabled && !!conversationId && !!prUrl && !!headSha && serveable !== false,
+    retry,
+    retryDelay: runnerOfflineRetryDelay,
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+/** Fetch the changes from the parent's head to the PR's head, for the PR-only view. */
+export function usePullRequestStackDiff(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+  headSha: string | undefined,
+  parentSha: string | undefined,
+  enabled: boolean,
+) {
+  const serveable = useWorkspaceServeable(conversationId);
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return useQuery({
+    queryKey: ["github-pr-stack-diff", conversationId, prUrl, headSha, parentSha],
+    queryFn: () =>
+      fetchPinnedPullRequestResource<PullRequestStackDiff>(conversationId!, "stack-diff", {
+        pr_url: prUrl!,
+        head_sha: headSha!,
+        parent_sha: parentSha!,
+      }),
+    enabled:
+      enabled && !!conversationId && !!prUrl && !!headSha && !!parentSha && serveable !== false,
+    retry,
+    retryDelay: runnerOfflineRetryDelay,
+    // Both ends are fixed commits, so the comparison never changes.
+    staleTime: Infinity,
     gcTime: 30 * 60_000,
   });
 }

@@ -102,6 +102,8 @@ import {
   normalizePullRequestInfo,
   usePullRequestChangedFiles,
   usePullRequestDiff,
+  usePullRequestStack,
+  usePullRequestStackDiff,
   usePullRequestInfo,
   useSetPullRequestPreference,
   useUpdateSessionPr,
@@ -122,6 +124,8 @@ import { PullRequestLabels } from "./PullRequestLabels";
 import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
 import { PullRequestReviewers } from "./PullRequestReviewers";
 import { PanelMessage, PullRequestChangesTab } from "./PullRequestChangesTab";
+import { canShowOwnChanges } from "./PullRequestStackBar";
+import { useChangesViewState } from "./useChangesViewState";
 import { IconButton } from "./PullRequestFileSection";
 
 export { LARGE_DIFF_THRESHOLD } from "./PullRequestFileSection";
@@ -1535,6 +1539,23 @@ function PullRequestPanelDetails({
   // Summary (checks + PR body), Comments, and Changes (the stacked diff).
   // Summary is the landing tab — like GitHub's PR page opening on the
   // Conversation view.
+  const changesTabOpen =
+    active && activeTab === "changes" && !sandboxAsleep && serveable !== false && hasPr;
+  const stack = usePullRequestStack(
+    conversationId,
+    prUrl,
+    headSha,
+    changesTabOpen && !!info.data?.capabilities?.stacked_prs,
+  );
+  const stackParent = stack.data?.parent;
+  const ownChangesOnly = useChangesViewState(conversationId, prUrl ?? "").ownChangesOnly;
+  const stackDiff = usePullRequestStackDiff(
+    conversationId,
+    prUrl,
+    headSha,
+    stackParent?.head_sha,
+    changesTabOpen && ownChangesOnly && canShowOwnChanges(stackParent),
+  );
   const reviews = usePullRequestReviewThreads(
     conversationId,
     prUrl,
@@ -1899,6 +1920,8 @@ function PullRequestPanelDetails({
           prDiff={prDiff}
           reviews={reviews}
           identity={identity}
+          stack={info.data?.capabilities?.stacked_prs ? stack : undefined}
+          stackDiff={stackDiff}
         />
       </Tabs>
     </TooltipProvider>

@@ -681,6 +681,13 @@ def test_commit_history_is_refused_for_merge_requests(
         pr_resource.pr_commits(root, session_id="gitlab-commits", pr_url=URL, head_sha=HEAD)
     with pytest.raises(ValueError, match=message):
         pr_resource.pr_commit_diff(root, session_id="gitlab-commits", pr_url=URL, commit_sha=BASE)
+    assert module.PULL_REQUESTS.capabilities.stacked_prs is False
+    with pytest.raises(ValueError, match="Stacked pull requests are not supported for GitLab"):
+        pr_resource.pr_stack(root, session_id="gitlab-commits", pr_url=URL, head_sha=HEAD)
+    with pytest.raises(ValueError, match="Stacked pull requests are not supported for GitLab"):
+        pr_resource.pr_stack_diff(
+            root, session_id="gitlab-commits", pr_url=URL, head_sha=HEAD, parent_sha=BASE
+        )
 
 
 def test_upstream_remote_precedence_preserves_other_gitlab_remotes(root: str) -> None:

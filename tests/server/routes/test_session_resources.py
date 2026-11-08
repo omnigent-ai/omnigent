@@ -10646,6 +10646,8 @@ async def test_sibling_environment_routes_are_not_gzipped(
         ("/changes", "github_changes"),
         ("/commits", "github_commits"),
         ("/commit-diff", "github_commit_diff"),
+        ("/stack", "github_stack"),
+        ("/stack-diff", "github_stack_diff"),
         ("/diff", "github_pr_diff"),
         ("/diff/new.py", "github_diff"),
         ("/labels", "github_labels"),
@@ -10678,6 +10680,8 @@ async def test_selected_pr_reaches_offline_host(
         params["head_sha"] = "a" * 40
     if resource == "/commit-diff":
         params["commit_sha"] = "c" * 40
+    if resource.startswith("/stack"):
+        params.update(head_sha="a" * 40, parent_sha="c" * 40)
     response = await offline_env_client.get(
         f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params=params
     )
@@ -10689,6 +10693,11 @@ async def test_selected_pr_reaches_offline_host(
         assert captured["params"]["head_sha"] == "a" * 40
     if resource == "/commit-diff":
         assert captured["params"]["commit_sha"] == "c" * 40
+    if resource == "/stack":
+        assert captured["params"]["head_sha"] == "a" * 40
+    if resource == "/stack-diff":
+        assert captured["params"]["head_sha"] == "a" * 40
+        assert captured["params"]["parent_sha"] == "c" * 40
     if resource.startswith("/review-threads"):
         assert captured["params"]["after"] == "cursor"
         if resource.endswith("/comments"):

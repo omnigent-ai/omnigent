@@ -1401,6 +1401,11 @@ def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, 
         entries = [
             entry for page in entries for entry in (page if isinstance(page, list) else [page])
         ]
+    return {"object": "list", "data": _changed_file_payloads(entries), "has_more": False}
+
+
+def _changed_file_payloads(entries: Sequence[object]) -> list[dict[str, Any]]:
+    """Shape GitHub's PR or comparison file entries as ``session.github.changed_file``."""
     data: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -1421,7 +1426,7 @@ def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, 
                 "previous_path": entry.get("previous_filename"),
             }
         )
-    return {"object": "list", "data": data, "has_more": False}
+    return data
 
 
 def _pr_changed_files_at_revision(

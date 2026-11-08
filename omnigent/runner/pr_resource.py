@@ -43,6 +43,7 @@ from omnigent.runner.git_providers import (
     PullRequestFacet,
     ReviewerRef,
     ReviewThreadsFacet,
+    StackFacet,
     local_git,
     unsupported_remote_info,
 )
@@ -1237,6 +1238,60 @@ def pr_commit_diff(
     """
     facet, reference = _commits_target(session_id, pr_url)
     return facet.commit_diff(root, reference, commit_sha=_commit_sha(commit_sha, "commit_sha"))
+
+
+def _stack_target(
+    session_id: str | None, pr_url: str | None
+) -> tuple[StackFacet, SessionPullRequest]:
+    """Return the selected tracked PR and its facet, which must find stacks."""
+    facet, reference = _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.stacked_prs,
+        unselected="Select a pull request to find its stack",
+        unsupported="Stacked pull requests are not supported for {kind}",
+    )
+    if not isinstance(facet, StackFacet):
+        raise ValueError("This provider does not find stacked pull requests")
+    return facet, reference
+
+
+def pr_stack(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: object = None,
+) -> dict[str, Any]:
+    """Return the selected PR's parent in its stack at the displayed head.
+
+    :raises ValueError: Without a selected tracked PR, when its provider cannot find
+        stacks, or when ``head_sha`` is not a full commit id.
+    """
+    facet, reference = _stack_target(session_id, pr_url)
+    return facet.stack(root, reference, head_sha=_commit_sha(head_sha, "head_sha"))
+
+
+def pr_stack_diff(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: object = None,
+    parent_sha: object = None,
+) -> dict[str, Any]:
+    """Return the selected PR's changes since its parent's head.
+
+    :raises ValueError: Without a selected tracked PR, when its provider cannot find
+        stacks, or when either commit is not a full commit id.
+    """
+    facet, reference = _stack_target(session_id, pr_url)
+    return facet.stack_diff(
+        root,
+        reference,
+        head_sha=_commit_sha(head_sha, "head_sha"),
+        parent_sha=_commit_sha(parent_sha, "parent_sha"),
+    )
 
 
 def pr_file_diff(

@@ -121,13 +121,21 @@ function renderTab({
   patch = PATCH,
   threads = [],
   listing = {},
+  stack,
+  stackDiff,
+  identity,
 }: {
   conversationId: string;
   files?: PullRequestChangedFile[];
   patch?: string;
   threads?: ReviewThread[];
   /** Changed-file list fields beyond the file array, such as truncation. */
-  listing?: { has_more?: boolean; total_count?: number | null };
+  listing?: { has_more?: boolean; total_count?: number | null; head_sha?: string };
+  /** Enables viewed marks, together with a listing pinned to the diff's head. */
+  identity?: PullRequestIdentity;
+  /** The stack lookup and PR-only diff query results, as the panel passes them. */
+  stack?: unknown;
+  stackDiff?: unknown;
 }) {
   const prUrl = prUrlFor(conversationId);
   const tabProps = (current: string) =>
@@ -150,6 +158,9 @@ function renderTab({
         loadComments: () => {},
         loadingComments: null,
       },
+      stack,
+      stackDiff,
+      identity,
     }) as unknown as React.ComponentProps<typeof PullRequestChangesTab>;
   const element = (current: string) => (
     <TooltipProvider>
@@ -1382,5 +1393,118 @@ describe("PullRequestChangesTab file actions and filter", () => {
     expect(container.querySelector('[data-review-thread="t-b"]')).toBeNull();
     expect(container.querySelector('[data-review-thread="t-a"]')).not.toBeNull();
     expect(screen.queryByText("Earlier conversations and unavailable diffs")).toBeNull();
+  });
+});
+
+describe("PullRequestChangesTab stacked pull requests", () => {
+  const parent = {
+    number: 41,
+    url: "https://github.com/o/r/pull/41",
+    title: "Add the parser",
+    state: "OPEN",
+    head_sha: "parent",
+    source: "commit",
+  };
+  const ownOnly = (files: PullRequestChangedFile[], patch: string) => ({
+    data: {
+      object: "session.github.pr_stack_diff",
+      files,
+      patch,
+      has_more: false,
+      head_sha: "head",
+      parent_sha: "parent",
+    },
+    error: null,
+    isSuccess: true,
+  });
+  const toggle = () => screen.getByRole("button", { name: "This PR only" });
+  const shownDiffs = () =>
+    [...document.querySelectorAll("[data-github-file]")].map((section) =>
+      section.getAttribute("data-github-file"),
+    );
+
+  it("switches between the whole diff and the PR's own changes", () => {
+    renderTab({
+      conversationId: "stack-toggle",
+      files: [changed("a.ts"), changed("b.ts")],
+      patch: A + B,
+      stack: { data: { parent } },
+      stackDiff: ownOnly([changed("b.ts")], B),
+    });
+
+    const bar = screen.getByRole("group", { name: "Stacked pull request" });
+    expect(bar).toHaveTextContent("Stacked on #41 Add the parser");
+    expect(within(bar).getByRole("link", { name: "#41" })).toHaveAttribute("href", parent.url);
+    expect(toggle()).toHaveAttribute("aria-pressed", "false");
+    expect(shownDiffs()).toEqual(["a.ts", "b.ts"]);
+
+    fireEvent.click(toggle());
+
+    expect(toggle()).toHaveAttribute("aria-pressed", "true");
+    expect(shownDiffs()).toEqual(["b.ts"]);
+    expect(bar).toHaveTextContent("Review conversations and viewed marks are in the full diff.");
+
+    fireEvent.click(toggle());
+
+    expect(toggle()).toHaveAttribute("aria-pressed", "false");
+    expect(shownDiffs()).toEqual(["a.ts", "b.ts"]);
+  });
+
+  it("leaves conversations and viewed marks to the whole diff", () => {
+    const thread = { id: "t1", path: "b.ts", resolved: false } as ReviewThread;
+    renderTab({
+      conversationId: "stack-threads",
+      files: [changed("a.ts"), changed("b.ts")],
+      patch: A + B,
+      threads: [thread],
+      listing: { head_sha: "head" },
+      identity: { provider: "github", host: "github.com", repository: "o/r", number: 1 },
+      stack: { data: { parent } },
+      stackDiff: ownOnly([changed("b.ts")], B),
+    });
+    expect(document.querySelector('[data-review-thread="t1"]')).not.toBeNull();
+    expect(screen.getByRole("checkbox", { name: "Viewed b.ts" })).toBeInTheDocument();
+
+    fireEvent.click(toggle());
+
+    expect(document.querySelector('[data-review-thread="t1"]')).toBeNull();
+    expect(screen.queryByRole("button", { name: "Next unresolved conversation" })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "Viewed b.ts" })).toBeNull();
+  });
+
+  it("shows a loading state until the PR's own changes arrive", () => {
+    renderTab({
+      conversationId: "stack-loading",
+      stack: { data: { parent } },
+      stackDiff: { data: undefined, error: null, isSuccess: false },
+    });
+
+    fireEvent.click(toggle());
+
+    expect(screen.getByText("Loading changes…")).toBeInTheDocument();
+  });
+
+  it("names a parent branch without a toggle, since the diff is already the PR's own", () => {
+    renderTab({
+      conversationId: "stack-base-branch",
+      stack: { data: { parent: { ...parent, source: "base_branch" } } },
+      stackDiff: ownOnly([], ""),
+    });
+
+    expect(screen.getByRole("group", { name: "Stacked pull request" })).toHaveTextContent(
+      "Stacked on #41 Add the parser",
+    );
+    expect(screen.queryByRole("button", { name: "This PR only" })).toBeNull();
+  });
+
+  it.each([
+    ["no parent", { data: { parent: null } }],
+    ["a failed lookup", { data: undefined, error: new Error("GitHub could not look it up") }],
+    ["no lookup", undefined],
+  ])("shows no stack row for %s", (_name, stack) => {
+    renderTab({ conversationId: `stack-none-${_name}`, stack, stackDiff: ownOnly([], "") });
+
+    expect(screen.queryByRole("group", { name: "Stacked pull request" })).toBeNull();
+    expect(shownDiffs()).toEqual(["a.ts", "b.ts", "c.ts"]);
   });
 });
