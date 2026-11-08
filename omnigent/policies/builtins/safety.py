@@ -25,6 +25,16 @@ _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
 _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os_shell"})
 
+# Omnigent terminal tools that run, read, or stop a terminal process.
+# ``sys_terminal_launch`` starts a configured command and ``sys_terminal_send``
+# types into it, so either runs commands the way ``sys_os_shell`` does;
+# ``sys_terminal_read`` returns pane output, including the user's own shells
+# in the session, and ``sys_terminal_close`` kills the process.
+# ``sys_terminal_list`` only names terminals, so it is not gated.
+_SYS_TERMINAL_TOOLS = frozenset(
+    {"sys_terminal_launch", "sys_terminal_send", "sys_terminal_read", "sys_terminal_close"}
+)
+
 # Claude Code / Codex native tools that MUTATE a file, surfaced via the
 # PreToolUse hook contract. Single source of truth: the write policies in
 # ``omnigent.policies.builtins.orchestration`` build their gated sets from
@@ -244,10 +254,13 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
 def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     """ASK for user approval before any file or shell tool call.
 
-    Covers six tool-name families:
+    Covers these tool-name families:
 
     - **Omnigent built-in OS tools** (``sys_os_read``,
       ``sys_os_write``, ``sys_os_edit``, ``sys_os_shell``).
+    - **Omnigent terminal tools** (``sys_terminal_launch``,
+      ``sys_terminal_send``, ``sys_terminal_read``,
+      ``sys_terminal_close``). ``sys_terminal_list`` is not gated.
     - **Claude Code native tools** (``Bash``, ``Read``, ``Write``,
       ``Edit``, ``MultiEdit``, ``NotebookEdit``, ``Glob``, ``Grep``) —
       surfaced via the ``PreToolUse`` hook contract.
@@ -285,6 +298,7 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     tool = data.get("name", "")
     _all_os_tools = (
         _SYS_OS_TOOLS
+        | _SYS_TERMINAL_TOOLS
         | _NATIVE_OS_TOOLS
         | _CURSOR_NATIVE_OS_TOOLS
         | _PI_NATIVE_OS_TOOLS
@@ -311,6 +325,18 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
         elif tool == "execute_code":
             code = args.get("code") if isinstance(args, dict) else None
             preview = code[:80] if isinstance(code, str) else ""
+        elif tool in _SYS_TERMINAL_TOOLS:
+            # Name the target instance, e.g. ``bash/s1``, then the launch
+            # overrides or the typed text and keys. Like the tool, a send
+            # with no ``keys`` presses ``Enter`` and ``keys=''`` presses none.
+            terminal_args = args if isinstance(args, dict) else {}
+            parts = [f"{terminal_args.get('terminal', '')}/{terminal_args.get('session', '')}"]
+            for key in ("cwd", "sandbox", "text"):
+                if key in terminal_args:
+                    parts.append(f"{key}={terminal_args[key]!r}")
+            if tool == "sys_terminal_send":
+                parts.append(f"keys={terminal_args.get('keys', 'Enter')!r}")
+            preview = " ".join(parts)
         else:
             # Omnigent tools use ``path``; Claude native tools use ``file_path``,
             # except NotebookEdit which uses ``notebook_path``.
@@ -960,7 +986,8 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "kind": "callable",
         "name": "Require Approval for File & Shell Operations",
         "description": "Asks for user approval before any file or shell tool call — "
-        "covers Omnigent sys_os_* tools, Claude Code and Codex native tools "
+        "covers Omnigent sys_os_* tools, the Omnigent sys_terminal_* tools that "
+        "launch, type into, read, or close a terminal, Claude Code and Codex native tools "
         "(Bash, Read, Write, Edit, MultiEdit, NotebookEdit, Glob, Grep), "
         "Cursor native tools (Shell), Pi native tools (read, bash, write, edit), "
         "opencode native tools (shell, edit, read, grep, glob), "

@@ -18,7 +18,7 @@ beside the Automations heading reopens it.
   with its schedule and prompt: a Slack bot answering product questions, a
   first look at new PagerDuty incidents, and a daily Dependabot merge. Back
   returns to the step the viewer left; Done dismisses the guide.
-- `capabilities`: show periodic Jira/Slack/GitHub checks only with session
+- `capabilities`: show periodic Jira/Slack/GitHub/Linear checks only with session
   continuity and orchestration; show continuity and sandbox copy only when
   supported. Use the deployment's app name.
 - `remember-dismissal`: local storage keeps dismissal across reloads, separately

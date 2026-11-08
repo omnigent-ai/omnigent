@@ -542,9 +542,8 @@ describe("NewChatLandingScreen project prefill", () => {
 
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
     fireEvent.click(screen.getByRole("button", { name: RECENT_WORKSPACE }));
-    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
-      "title",
-      RECENT_WORKSPACE,
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      `Working directory: ${RECENT_WORKSPACE}`,
     );
     await waitFor(() =>
       expect(screen.queryByTestId("new-chat-landing-branch-chip")).not.toBeInTheDocument(),
@@ -791,10 +790,12 @@ describe("NewChatLandingScreen project prefill", () => {
 
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
     const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
-    await waitFor(() => expect(workspaceTrigger).toHaveAttribute("title", LINKED_WORKTREE));
+    await waitFor(() =>
+      expect(workspaceTrigger).toHaveAccessibleName(`Working directory: ${LINKED_WORKTREE}`),
+    );
     expect(workspaceTrigger).toHaveTextContent("gamma");
     expect(worktreeTrigger).toHaveTextContent("feature-x");
-    expect(worktreeTrigger).toHaveAttribute("title", "Existing worktree branch: feature/x");
+    expect(worktreeTrigger).toHaveAccessibleName("Existing worktree branch: feature/x");
     const body = await submitAndReadBody();
     // Bound straight to the worktree dir; the worktree's branch rides along and
     // no base branch is set (it's a bind, not a fork).

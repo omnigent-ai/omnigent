@@ -20,6 +20,7 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import telemetry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.scheduled_context import add_scheduled_run_header
 from omnigent.spec import AgentSpec
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 
@@ -462,6 +463,7 @@ class RunnerRouter:
             client = self._clients.get(runner_id)
             if client is None:
                 client = httpx.AsyncClient(
+                    event_hooks={"request": [add_scheduled_run_header]},
                     transport=WSTunnelTransport(self._registry, runner_id),
                     base_url="http://runner",
                     timeout=httpx.Timeout(5.0, read=None),

@@ -37,6 +37,7 @@ import {
   HARNESS_CREDENTIAL_COPY,
   harnessInstallableOnHost,
   harnessWarningBadgeText,
+  MIN_TMUX_VERSION,
   missingHarnessCredentialCopy,
   type HarnessCredentialKind,
 } from "@/lib/harnessSetup";
@@ -64,24 +65,18 @@ interface HarnessEntry {
 // (/v1/harnesses) carries no descriptions, so these live here; the rest of each
 // entry (name, icon, order) comes from NATIVE_CODING_AGENTS.
 const HARNESS_DESCRIPTIONS: Record<string, string> = {
-  "claude-native":
-    "Anthropic’s coding agent for understanding codebases, editing files, and running development workflows.",
-  "codex-native":
-    "OpenAI’s coding agent for building features, fixing bugs, and working across repositories.",
-  "opencode-native": "An open-source coding agent for the terminal, IDE, and desktop.",
-  "cursor-native":
-    "An AI code editor with agent workflows for navigating, editing, and shipping code.",
-  "pi-native": "A minimal, extensible coding agent harness built for terminal workflows.",
-  "devin-native": "Cognition’s autonomous coding agent for end-to-end software tasks.",
-  "antigravity-native":
-    "Google’s agent-first development platform for planning and executing software tasks.",
-  "kiro-native":
-    "An agentic IDE for spec-driven development, hooks, and production-ready software.",
-  "qwen-native": "An open-source terminal coding agent powered by Qwen models.",
-  "goose-native": "An open-source local AI agent for coding, automation, and extensible workflows.",
-  "kimi-native":
-    "A terminal coding agent for editing code, running commands, and completing development tasks.",
-  "hermes-native": "A self-improving AI agent that learns reusable skills from experience.",
+  "claude-native": "Anthropic’s agent for coding and development workflows.",
+  "codex-native": "OpenAI’s coding agent for building features and fixing bugs.",
+  "opencode-native": "An open-source coding agent for terminal, IDE, and desktop.",
+  "cursor-native": "An AI editor with agents for navigating and editing code.",
+  "pi-native": "A minimal, extensible terminal coding agent.",
+  "devin-native": "Cognition’s autonomous coding agent.",
+  "antigravity-native": "Google’s agent platform for software development.",
+  "kiro-native": "An agentic IDE for spec-driven development.",
+  "qwen-native": "An open-source terminal coding agent powered by Qwen.",
+  "goose-native": "An open-source local agent for coding and automation.",
+  "kimi-native": "A terminal coding agent for editing code and running commands.",
+  "hermes-native": "An agent that learns reusable skills from experience.",
 };
 
 // The harness catalog, derived from the shared native-agent registry so this
@@ -600,7 +595,7 @@ function HarnessCard({
           <SetupButton entry={entry} onSetup={() => onFix("install")} />
         )}
       </div>
-      <p className="line-clamp-2 text-ui text-muted-foreground">{entry.description}</p>
+      <p className="line-clamp-2 text-sm text-muted-foreground">{entry.description}</p>
     </>
   );
   const className =
@@ -843,16 +838,21 @@ function HarnessWarning({
   const copy =
     reason === "readiness-error"
       ? `${entry.name} isn’t working on ${host.name}. Run setup again to fix it.`
-      : mode === "update"
-        ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
-        : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
-  const action = !installable
-    ? "Set up"
-    : mode === "update"
-      ? "Update"
-      : mode === "install"
-        ? "Install"
-        : "Reconfigure";
+      : mode === "tmux"
+        ? `${entry.name} needs tmux ${MIN_TMUX_VERSION} or newer on ${host.name}. Install or upgrade tmux so new sessions can use ${entry.name}.`
+        : mode === "update"
+          ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
+          : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
+  const action =
+    mode === "tmux"
+      ? "Set up tmux"
+      : !installable
+        ? "Set up"
+        : mode === "update"
+          ? "Update"
+          : mode === "install"
+            ? "Install"
+            : "Reconfigure";
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-ui">
       <div className="flex min-w-0 flex-1 items-start gap-3">

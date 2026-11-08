@@ -388,10 +388,13 @@ describe("arca connect failures", () => {
     }
   });
   it("maps a timeout, sign-in, missing-CLI, and unreachable instance", () => {
-    assert.match(
-      describeConnectFailure({ code: null, stdout: "", stderr: "", timedOut: true }).error,
-      /timed out/i,
+    const timeout = describeConnectFailure({ code: null, stdout: "", stderr: "", timedOut: true });
+    assert.match(timeout.error, /timed out/i);
+    assert.equal(
+      timeout.errorMessage,
+      "Connecting to Arca timed out. The instance may still be starting.",
     );
+    assert.equal(timeout.errorAction, "Check `arca status` and try again.");
 
     const auth = describeConnectFailure({
       code: 1,
@@ -400,11 +403,22 @@ describe("arca connect failures", () => {
     });
     assert.equal(auth.authError, true);
     assert.match(auth.error, /isaac omni login/);
+    assert.equal(auth.errorMessage, "The Arca instance isn't signed in to this server.");
+    assert.equal(
+      auth.errorAction,
+      "Run `arca ssh` and sign in with `isaac omni login <server-url>`, then try again.",
+    );
 
-    assert.match(
-      describeConnectFailure({ code: 127, stdout: "", stderr: "bash: isaac: command not found" })
-        .error,
-      /isn't available on the Arca instance/,
+    const missingCli = describeConnectFailure({
+      code: 127,
+      stdout: "",
+      stderr: "bash: isaac: command not found",
+    });
+    assert.match(missingCli.error, /isn't available on the Arca instance/);
+    assert.equal(missingCli.errorMessage, "`isaac omni` isn't available on the Arca instance.");
+    assert.equal(
+      missingCli.errorAction,
+      "Check the isaac setup there (`arca ssh`, then `isaac omni --help`) and try again.",
     );
     assert.match(
       describeConnectFailure({ code: 1, stdout: "", stderr: "isaac: omni: command not found" })
@@ -412,13 +426,16 @@ describe("arca connect failures", () => {
       /isn't available on the Arca instance/,
     );
 
-    assert.match(
-      describeConnectFailure({
-        code: 1,
-        stdout: "",
-        stderr: "Error connecting to arca. The instance may be stopped or unreachable.",
-      }).error,
-      /arca stop && arca start/,
+    const unreachable = describeConnectFailure({
+      code: 1,
+      stdout: "",
+      stderr: "Error connecting to arca. The instance may be stopped or unreachable.",
+    });
+    assert.match(unreachable.error, /arca stop && arca start/);
+    assert.equal(unreachable.errorMessage, "Couldn't reach the Arca instance.");
+    assert.equal(
+      unreachable.errorAction,
+      "Try `arca stop && arca start` in a terminal, then connect again.",
     );
   });
 

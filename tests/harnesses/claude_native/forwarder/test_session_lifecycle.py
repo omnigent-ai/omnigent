@@ -25,18 +25,24 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "project_available", [True, False], ids=["project-available", "project-not-found"]
+)
 async def test_clear_hook_rotates_active_session_without_reprocessing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    project_available: bool,
 ) -> None:
     """
     Claude ``/clear`` creates a fresh Omnigent session and consumes the hook.
 
     This exercises the rotation transaction directly: create the new
-    session, bind the same runner, transfer the terminal, rewrite the
-    active bridge session, clear the old runner binding, and keep the
-    hook cursor past the clear record so the next poll does not fork
-    again from the same hook line.
+    session with the old title and project, bind the same runner,
+    transfer the terminal, rewrite the active bridge session, clear the
+    old runner binding, and keep the hook cursor past the clear record
+    so the next poll does not fork again from the same hook line. A
+    project the server reports as not found (deleted, or owned by another
+    user) gets one unfiled retry and the same transaction.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
@@ -74,17 +80,14 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
                         "omnigent.ui": "terminal",
                         BRIDGE_ID_LABEL_KEY: "bridge_shared",
                     },
+                    "title": "Fix login flow",
+                    "project_id": "proj_alpha",
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions":
-            assert body == {
-                "agent_id": "ag_claude",
-                "labels": {
-                    "omnigent.ui": "terminal",
-                    BRIDGE_ID_LABEL_KEY: "bridge_shared",
-                },
-            }
-            return httpx.Response(201, json={"id": "conv_new"})
+            if project_available or "project_id" not in body:
+                return httpx.Response(201, json={"id": "conv_new"})
+            return httpx.Response(404, json={"error": {"message": "Project not found"}})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_new":
             assert body == {"runner_id": "runner_one"}
             return httpx.Response(200, json={"id": "conv_new"})
@@ -133,19 +136,18 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
     assert read_active_session_id(bridge_dir) == "conv_new"
     assert not (bridge_dir / "transcript_forwarder.json").exists()
     assert (bridge_dir / "hook_forwarder.json").exists()
+    unfiled_body = {
+        "agent_id": "ag_claude",
+        "labels": {"omnigent.ui": "terminal", BRIDGE_ID_LABEL_KEY: "bridge_shared"},
+        "title": "Fix login flow",
+    }
+    filed_body = {**unfiled_body, "project_id": "proj_alpha", "workspace": None, "git": None}
+    creates = [("POST", "/v1/sessions", filed_body)]
+    if not project_available:
+        creates.append(("POST", "/v1/sessions", unfiled_body))
     assert calls == [
         ("GET", "/v1/sessions/conv_old", None),
-        (
-            "POST",
-            "/v1/sessions",
-            {
-                "agent_id": "ag_claude",
-                "labels": {
-                    "omnigent.ui": "terminal",
-                    BRIDGE_ID_LABEL_KEY: "bridge_shared",
-                },
-            },
-        ),
+        *creates,
         ("PATCH", "/v1/sessions/conv_new", {"runner_id": "runner_one"}),
         (
             "POST",
