@@ -9,6 +9,7 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -494,8 +495,24 @@ async def test_terminal_only_native_work_idle_accounting(
             )
 
 
+_API_ERROR_CAUSE = "The request exceeded the model's context window."
+# Longer than the published message's 1,024-character clip, so the raw envelope cannot
+# stand in for the cause it carries.
+_LONG_API_ERROR_ENVELOPE = "API Error: 500 " + json.dumps(
+    {"error": {"type": "api_error", "message": _API_ERROR_CAUSE}, "details": "x" * 1200}
+)
+_PANE_FAILURE_DETAILS = {
+    "pane_detail": "API Error: 499 Authorization: Bearer synthetic-secret-token",
+    "pane_envelope": _LONG_API_ERROR_ENVELOPE,
+    # Claude's own refusal of a turn whose context is full; no StopFailure hook follows.
+    "pane_overflow": "Prompt is too long",
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_source", ["forwarder", "pane"])
+@pytest.mark.parametrize(
+    "status_source", ["forwarder", "pane", "pane_detail", "pane_envelope", "pane_overflow"]
+)
 async def test_native_failed_status_releases_idle_pin(status_source: str) -> None:
     """A native ``failed`` edge settles the turn for the watchdog."""
     from tests.runner.conftest import _runner_client
@@ -507,22 +524,52 @@ async def test_native_failed_status_releases_idle_pin(status_source: str) -> Non
         assert created.status_code == 201, created.text
         await _post_status(client, conv_id, "running")
         assert app.state.has_active_work() is True
-        if status_source == "pane":
+        if status_source.startswith("pane"):
             from omnigent.runner.app import _session_event_queues_ref
 
             queue = _session_event_queues_ref[conv_id]
             while not queue.empty():
                 queue.get_nowait()
-            publish = app.state.session_resource_registry._session_status_publisher
-            assert publish is not None
-            publish(conv_id, "failed", None)
+            if status_source in _PANE_FAILURE_DETAILS:
+                publish_failure = app.state.session_resource_registry._session_failure_publisher
+                assert publish_failure is not None
+                publish_failure(conv_id, _PANE_FAILURE_DETAILS[status_source])
+            else:
+                publish = app.state.session_resource_registry._session_status_publisher
+                assert publish is not None
+                publish(conv_id, "failed", None)
             events = []
             while not queue.empty():
                 events.append(queue.get_nowait())
             failures = [event for event in events if event and event.get("status") == "failed"]
             assert len(failures) == 1
-            assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
-            assert "Open the terminal" in failures[0]["error"]["message"]
+            if status_source == "pane_detail":
+                assert failures[0]["error"]["code"] == "native_turn_error"
+                assert failures[0]["error"]["message"].startswith("API Error: 499")
+                assert "synthetic-secret-token" not in str(failures)
+                context = failures[0]["failure_context"]
+                assert context["http_status"] == 499
+                assert context["failure_source"] == "claude_program_status"
+                assert context["detail_source"] == "program_status_error"
+                assert "native_hook_event" not in context
+            elif status_source == "pane_envelope":
+                assert len(_LONG_API_ERROR_ENVELOPE) > 1024
+                assert failures[0]["error"]["code"] == "native_turn_error"
+                assert failures[0]["error"]["message"] == _API_ERROR_CAUSE
+                context = failures[0]["failure_context"]
+                assert context["native_error_message"] == _API_ERROR_CAUSE
+                assert context["http_status"] == 500
+                assert context["failure_source"] == "claude_program_status"
+            elif status_source == "pane_overflow":
+                assert failures[0]["error"]["code"] == "context_length_exceeded"
+                assert failures[0]["error"]["message"].startswith("Context limit reached")
+                assert "/compact" in failures[0]["error"]["message"]
+                context = failures[0]["failure_context"]
+                assert context["native_error_message"] == "Prompt is too long"
+                assert context["failure_source"] == "claude_program_status"
+            else:
+                assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
+                assert "Open the terminal" in failures[0]["error"]["message"]
         else:
             await _post_status(client, conv_id, "failed")
         assert app.state.has_active_work() is False
@@ -549,6 +596,121 @@ async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin() -> None:
         app.state.active_turns.pop(conv_id, None)
         publish_pane_status(conv_id, "idle", None)
         assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_only_pane_inferred_status_is_marked_inferred() -> None:
+    """The server checks this mark before an edge may reopen a turn."""
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_inferred_reason"
+    app = await _native_app_with_session(conv_id)
+    publish = app.state.session_resource_registry._session_status_publisher
+    assert publish is not None
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        publish(conv_id, "running", "dialog open")
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        queue = _session_event_queues_ref[conv_id]
+        events = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert [
+        (event["blocked_on"], event.get("inferred"))
+        for event in events
+        if event.get("type") == "session.status" and "blocked_on" in event
+    ] == [("dialog open", None), ("terminal prompt", True)]
+
+
+@pytest.mark.asyncio
+async def test_pane_inference_is_scoped_to_the_server_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A current server's init envelope enables pane-inferred status until a reconnect.
+
+    An id-only init for another session leaves it on. After a reconnect, an
+    inferred edge still queued is dropped until the new server accepts them,
+    either in an init envelope or when its relay reopens the session stream.
+    """
+    from omnigent.entities import Conversation
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PAYLOAD_KEY,
+        build_runner_session_init_payload,
+    )
+    from tests.runner.conftest import _runner_client
+
+    def envelope_init(session_id: str) -> dict[str, object]:
+        conversation = Conversation(
+            id=session_id,
+            created_at=1,
+            updated_at=1,
+            agent_id="ag",
+            root_conversation_id=session_id,
+        )
+        return build_runner_session_init_payload(conversation, server_version="0.22.0")
+
+    async def streamed_statuses(
+        session_id: str, *, relay_accepts_inferred: bool = False
+    ) -> list[tuple[str, str | None, bool]]:
+        app.state.session_event_queues[session_id].put_nowait(None)
+        params = {"accepts_inferred_status": "true"} if relay_accepts_inferred else None
+        response = await client.get(f"/v1/sessions/{session_id}/stream", params=params)
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        return [
+            (event["status"], event.get("blocked_on"), event.get("inferred") is True)
+            for event in events
+            if event.get("type") == "session.status"
+        ]
+
+    conv_id = "conv_native_current_server"
+    monkeypatch.setattr("omnigent.runner.app._server_accepts_inferred_status", False)
+    app = await _native_app_with_session(conv_id)
+    registry = app.state.session_resource_registry
+    accepts_inferred_status = registry._accepts_inferred_status
+    publish = registry._session_status_publisher
+    assert publish is not None
+    assert accepts_inferred_status() is False
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json=envelope_init(conv_id))
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is True
+        # A current server falls back to this body when it cannot build an envelope.
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_native_id_only_init", "agent_id": "ag"}
+        )
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is True
+        await streamed_statuses(conv_id)
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        assert await streamed_statuses(conv_id) == [("running", "terminal prompt", True)]
+
+        publish(conv_id, "running", None, inferred=True)
+        await app.state.catch_up_scan()
+        assert accepts_inferred_status() is False
+        publish(conv_id, "running", None)
+        assert await streamed_statuses(conv_id) == [("running", None, False)]
+        # A reconnect while every session is idle reopens the relay before any init.
+        assert await streamed_statuses(conv_id, relay_accepts_inferred=True) == []
+        assert accepts_inferred_status() is True
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        assert await streamed_statuses(conv_id) == [("running", "terminal prompt", True)]
+
+        await app.state.catch_up_scan()
+        older_init = envelope_init("conv_native_older_server")
+        older_envelope = older_init[SESSION_INIT_PAYLOAD_KEY]
+        assert isinstance(older_envelope, dict)
+        older_envelope.pop("accepts_inferred_status")
+        created = await client.post("/v1/sessions", json=older_init)
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is False
+        created = await client.post("/v1/sessions", json=envelope_init("conv_native_new_server"))
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is True
 
 
 @pytest.mark.asyncio
@@ -625,7 +787,8 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "evidence", ["permission_prompt", "pane_output", "pane_input", "no_evidence"]
+    "evidence",
+    ["permission_prompt", "background_shell", "pane_output", "pane_input", "no_evidence"],
 )
 async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     tmp_path: Path,
@@ -703,5 +866,20 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
             publish = app.state.session_resource_registry._session_status_publisher
             publish(conv_id, "running", None)
             publish(conv_id, "idle", None)
+            background = app.state.session_resource_registry._session_background_publisher
+            if evidence == "background_shell":
+                # Claude reports ``shell`` (idle) while a background command it
+                # started outlives the turn; that command is still agent work.
+                background(conv_id, True)
             assert app.state.native_pane_status[conv_id] == "idle"
             assert app.state.has_active_work() is (evidence != "no_evidence")
+            # Sandbox keepalive counts agent work only: recent pane input or output
+            # also comes from someone viewing the pane, so only the prompt and a
+            # background shell count.
+            assert app.state.has_sandbox_work() is (
+                evidence in ("permission_prompt", "background_shell")
+            )
+            if evidence == "background_shell":
+                background(conv_id, False)
+                assert app.state.has_active_work() is False
+                assert app.state.has_sandbox_work() is False

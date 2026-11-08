@@ -100,6 +100,31 @@ describe("ComposerAttachments", () => {
     // URL from being revoked by StrictMode's mount → cleanup → remount cycle.
     expect(revoke).not.toHaveBeenCalledWith(src);
   });
+
+  it("under StrictMode, revokes every created URL exactly once and no others", () => {
+    const created: string[] = [];
+    URL.createObjectURL = vi.fn(() => {
+      const url = `blob:mock-${created.length}`;
+      created.push(url);
+      return url;
+    });
+    const { unmount } = render(
+      <StrictMode>
+        <ImageLightboxProvider>
+          <ComposerAttachments
+            files={[new File([new Uint8Array(4)], "shot.png", { type: "image/png" })]}
+            onRemove={vi.fn()}
+          />
+        </ImageLightboxProvider>
+      </StrictMode>,
+    );
+    const committedSrc = screen.getByRole("img", { name: "shot.png" }).getAttribute("src");
+    unmount();
+    // Each created URL is revoked once; the last one is the committed src, revoked on unmount.
+    expect(revoke.mock.calls.map(([url]) => url).sort()).toEqual([...created].sort());
+    expect(new Set(created).size).toBe(created.length);
+    expect(revoke).toHaveBeenLastCalledWith(committedSrc);
+  });
 });
 
 describe("formatFileSize", () => {
