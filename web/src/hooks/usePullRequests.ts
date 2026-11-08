@@ -811,7 +811,7 @@ export interface PullRequestStackDiff {
 
 /** Whether a 404 is the bare "not found" of a host or server that predates the route. */
 export function isMissingRoute(message: string): boolean {
-  return /^(404\b.*|(resource( '\w+')? )?not found)$/i.test(message.trim());
+  return /^(404\b.*|(resource( 'github')? )?not found)$/i.test(message.trim());
 }
 
 async function fetchPinnedPullRequestResource<T>(

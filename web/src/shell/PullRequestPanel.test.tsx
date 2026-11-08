@@ -53,6 +53,7 @@ const state = vi.hoisted(() => ({
   // The whole-PR diff response; the panel parses its patch into per-file diffs.
   diff: null as PullRequestDiffResponse | null,
   diffError: null as Error | null,
+  stack: { data: undefined, error: null } as { data?: unknown; error: unknown },
   canEdit: true,
   updateSessionPr: vi.fn(),
   realPrHooks: false,
@@ -130,8 +131,8 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       error: state.diffError,
       isFetching: false,
     }),
-    usePullRequestStack: () => ({ data: undefined, error: null }),
-    usePullRequestStackDiff: () => ({ data: undefined, error: null }),
+    usePullRequestStack: () => state.stack,
+    usePullRequestStackDiff: vi.fn(() => ({ data: undefined, error: null })),
     fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
     // The account selector (shown in the repo-unresolved empty state) calls this;
     // stub the mutation shape it reads.
@@ -206,6 +207,7 @@ import {
   usePullRequestChangedFiles,
   usePullRequestRepoLabels,
   usePullRequestReviewCandidates,
+  usePullRequestStackDiff,
 } from "@/hooks/usePullRequests";
 
 import {
@@ -393,6 +395,7 @@ beforeEach(() => {
   state.parsedFiles = [{ name: "hello.py" }, { name: "src/app.ts" }];
   state.diff = { object: "session.github.pr_diff", patch: "PATCH" };
   state.diffError = null;
+  state.stack = { data: undefined, error: null };
   state.canEdit = true;
   state.repoLabels = { data: undefined, isPending: true, isError: false, error: null };
   state.updateLabels = { mutate: vi.fn(), isError: false, error: null };
@@ -1520,6 +1523,39 @@ describe("PullRequestPanel", () => {
     fireEvent.click(await screen.findByRole("checkbox", { name: "Viewed hello.py" }));
     const key = viewedStorageKey(window.location.origin, "alice", selected);
     expect(localStorage.getItem(key)).toContain("hello.py");
+  });
+
+  it("fetches the PR's own changes once This PR only is on", async () => {
+    const url = state.info!.data!.pr!.url;
+    state.info!.data!.pr!.head_sha = "head";
+    state.info!.data!.selected_pr_url = url;
+    state.info!.data!.capabilities = {
+      account_switching: false,
+      base_remote_selection: false,
+      line_counts: false,
+      linked_pr_diff: false,
+      stacked_prs: true,
+    };
+    state.stack = {
+      data: {
+        parent: {
+          number: 41,
+          url: "",
+          title: "Parent",
+          state: "OPEN",
+          head_sha: "parent",
+          source: "commit",
+        },
+      },
+      error: null,
+    };
+    const stackDiff = vi.mocked(usePullRequestStackDiff);
+    renderChanges();
+    expect(stackDiff).toHaveBeenLastCalledWith("conv_1", url, "head", "parent", false);
+
+    fireEvent.click(await screen.findByRole("button", { name: "This PR only" }));
+
+    expect(stackDiff).toHaveBeenLastCalledWith("conv_1", url, "head", "parent", true);
   });
 
   it("stacks a diff section per changed file", async () => {

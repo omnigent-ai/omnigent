@@ -1550,7 +1550,11 @@ function PullRequestPanelDetails({
     changesTabOpen && !!info.data?.capabilities?.stacked_prs,
   );
   const stackParent = stackParentOf(stack);
-  const ownChangesOnly = useChangesViewState(conversationId, prUrl ?? "").ownChangesOnly;
+  // Keyed like the Changes tab's view state, which writes this toggle.
+  const ownChangesOnly = useChangesViewState(
+    conversationId,
+    prUrl ?? info.data?.pr?.url ?? "",
+  ).ownChangesOnly;
   const stackDiff = usePullRequestStackDiff(
     conversationId,
     prUrl,

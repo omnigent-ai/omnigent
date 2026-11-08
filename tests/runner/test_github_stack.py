@@ -32,6 +32,7 @@ class FakeGitHub:
         pulls: list[dict[str, Any]] | None = None,
         compare: dict[str, Any] | None = None,
         graphql_repository: object = ...,
+        failed_lookups: tuple[str, ...] = (),
         push_after: str | None = None,
     ) -> None:
         self.pr = pr
@@ -41,6 +42,8 @@ class FakeGitHub:
         self.compare = compare or {"files": []}
         # Overrides the GraphQL ``repository`` answer, e.g. ``None`` for an unreadable fork.
         self.graphql_repository = graphql_repository
+        # Commits whose alias errors, answered as GitHub does: null data plus an error path.
+        self.failed_lookups = failed_lookups
         # Moves the PR head once this endpoint has been read, as a push mid-request would.
         self.push_after = push_after
         self.graphql: list[dict[str, Any]] = []
@@ -56,9 +59,12 @@ class FakeGitHub:
                 for key, sha in variables.items()
                 if key.startswith("c")
             }
+            failed = [key for key, sha in variables.items() if sha in self.failed_lookups]
+            found.update(dict.fromkeys(failed))
             if self.graphql_repository is not ...:
                 found = self.graphql_repository
-            return 0, json.dumps({"data": {"repository": found}}), ""
+            errors = [{"path": ["repository", key], "message": "timeout"} for key in failed]
+            return 0, json.dumps({"data": {"repository": found}, "errors": errors}), ""
         endpoint = argv[-1]
         self.endpoints.append(endpoint)
         if endpoint == self.push_after:
@@ -244,6 +250,20 @@ def test_failed_commit_walk_falls_back_to_the_description(
     parent = github_stack.pr_stack("/workspace", _PR, head_sha=_HEAD)["parent"]
 
     assert (parent["head_sha"], parent["source"]) == (_PARENT, "description")
+
+
+def test_unanswered_newer_commit_stops_the_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An older PR head can't be the parent while a newer commit's PRs are unknown."""
+    fake = FakeGitHub(
+        pr=_pr(),
+        commits=[_BASE_COMMIT, _PARENT, _HEAD],
+        associated={_BASE_COMMIT: [_pull(40, _BASE_COMMIT)]},
+        failed_lookups=(_PARENT,),
+    )
+    _install(monkeypatch, fake)
+
+    with pytest.raises(ValueError, match="could not look up the pull request's stack"):
+        github_stack.pr_stack("/workspace", _PR, head_sha=_HEAD)
 
 
 def test_failed_commit_walk_without_a_description_link_fails(

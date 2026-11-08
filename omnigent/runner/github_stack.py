@@ -131,11 +131,12 @@ def _heads_query(count: int) -> str:
 
 def _associated_pull_requests(
     root: str, reference: PullRequestRef, repository: str, shas: Sequence[str]
-) -> dict[str, list[dict[str, Any]]]:
+) -> dict[str, list[dict[str, Any]] | None]:
     """Map each commit to its associated pull requests, read from ``repository``.
 
     GitHub associates an open fork pull request with its commits only in the fork, so
-    ``repository`` is the head repository. A commit the repository lacks maps to nothing.
+    ``repository`` is the head repository. A commit the repository lacks maps to nothing;
+    a commit whose lookup errored maps to ``None``.
     """
     owner, name = repository.split("/", 1)
     variables: dict[str, str] = {"owner": owner, "name": name}
@@ -161,8 +162,19 @@ def _associated_pull_requests(
     found = data.get("repository") if isinstance(data, dict) else None
     if not isinstance(found, dict):
         raise ValueError(_LOOKUP_FAILED)
-    associated: dict[str, list[dict[str, Any]]] = {}
+    errors = response.get("errors") if isinstance(response, dict) else None
+    failed = {
+        error["path"][1]
+        for error in errors or []
+        if isinstance(error, dict)
+        and isinstance(error.get("path"), list)
+        and len(error["path"]) > 1
+    }
+    associated: dict[str, list[dict[str, Any]] | None] = {}
     for index, sha in enumerate(shas):
+        if f"c{index}" in failed:
+            associated[sha] = None
+            continue
         commit = found.get(f"c{index}")
         connection = commit.get("associatedPullRequests") if isinstance(commit, dict) else None
         nodes = connection.get("nodes") if isinstance(connection, dict) else None
@@ -184,7 +196,11 @@ def _commit_parent(
         return None
     associated = _associated_pull_requests(root, reference, head_repository, candidates)
     for sha in candidates:
-        for pull in associated.get(sha, []):
+        pulls = associated.get(sha, [])
+        if pulls is None:
+            # An older commit could only name a grandparent while a newer one is unknown.
+            raise ValueError(_LOOKUP_FAILED)
+        for pull in pulls:
             base_repository = _text(pull, "baseRepository", "nameWithOwner") or ""
             if (
                 pull.get("headRefOid") == sha

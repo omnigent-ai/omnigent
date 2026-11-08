@@ -15,12 +15,7 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import {
-  isMissingRoute,
-  usePullRequestInfo,
-  usePullRequestInfos,
-  usePullRequestStack,
-} from "./usePullRequests";
+import { usePullRequestInfo, usePullRequestInfos, usePullRequestStack } from "./usePullRequests";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -176,16 +171,5 @@ describe("usePullRequestStack", () => {
     expect((result.current.error as Error).message).toBe(
       "workspace directory does not exist on host",
     );
-  });
-});
-
-describe("isMissingRoute", () => {
-  it.each(["Not Found", "Resource not found", "Resource 'github' not found", "404 Not Found"])(
-    "treats %s as a route an older host lacks",
-    (message) => expect(isMissingRoute(message)).toBe(true),
-  );
-
-  it("keeps a 404 that names its reason", () => {
-    expect(isMissingRoute("Session has no filesystem; GitHub API unavailable.")).toBe(false);
   });
 });

@@ -434,7 +434,7 @@ function ownChangesSources(
   result: PullRequestStackDiff | null | undefined,
   fetchError: unknown,
   isSuccess: boolean,
-  isFetching: boolean,
+  isLoading: boolean,
 ): {
   changes: ChangedFilesSource;
   prDiff: PatchSource;
@@ -444,24 +444,24 @@ function ownChangesSources(
     (isSuccess && !result
       ? new Error("This host can't show a PR's own changes. Update it to use this view.")
       : null);
-  const isLoading = isFetching && !result && !error;
-  // A paused query (asleep sandbox, no parent yet) compared nothing, so it can't claim no changes.
-  const paused = !result && !error && !isFetching;
+  let changesData: PullRequestChangedFilesResult | undefined;
+  if (result) {
+    changesData = {
+      available: true,
+      data: result.files,
+      has_more: result.has_more,
+      warning: result.warning,
+      head_sha: result.head_sha,
+      base_sha: result.parent_sha,
+    };
+  } else if (!error && !isLoading) {
+    // A paused query (asleep sandbox, no parent yet) compared nothing, so it can't claim no changes.
+    changesData = { available: false, data: [] };
+  }
   return {
     changes: {
-      data: result
-        ? {
-            available: true,
-            data: result.files,
-            has_more: result.has_more,
-            warning: result.warning,
-            head_sha: result.head_sha,
-            base_sha: result.parent_sha,
-          }
-        : paused
-          ? { available: false, data: [] }
-          : undefined,
-      isLoading,
+      data: changesData,
+      isLoading: isLoading && !result && !error,
       error,
     },
     prDiff: {
