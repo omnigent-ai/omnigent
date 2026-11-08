@@ -19,14 +19,15 @@ from omnigent.debug_logging import current_session_id_scope, debug_event, log_at
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, ScheduledTaskSchedulerConfig
 from omnigent.server.scheduled.rrule import (
-    MIN_CONTINUED_INTERVAL_SECONDS,
     MIN_SUBHOUR_INTERVAL_SECONDS,
+    MIN_TRIGGER_INTERVAL_SECONDS,
     RRuleSearchError,
     RRuleValidationError,
     validate_rrule,
 )
 from omnigent.server.scheduled.schedule import (
     host_ownership_key,
+    is_trigger_automation,
     manual_trigger_key,
     next_scheduled_time,
     occurrence_host_id,
@@ -365,7 +366,7 @@ DispatchEnabled = Callable[[], bool]
 # Read before each wait between polls.
 PollInterval = Callable[[], float]
 # Whether a due occurrence can be skipped, unrecorded, because the session it continues is busy.
-# Passing one also lets continued sessions run every two minutes instead of every ten.
+# Asked only for trigger automations; passing one also lets them poll every two minutes.
 OccurrenceBusy = Callable[[ScheduledTask], Awaitable[bool]]
 
 
@@ -665,12 +666,12 @@ class PersistentTaskScheduler:
     async def _skip_busy_occurrence(
         self, task: ScheduledTask, *, now: int, next_run_at: int
     ) -> bool:
-        """Advance past a due occurrence, recording no run, while its continued session is busy.
+        """Advance past a trigger automation's due poll, recording no run, while it is busy.
 
         Returns True when this occurrence must not be claimed. A failed busy check
         returns False, so the occurrence is sent as it would be without skipping.
         """
-        if self._occurrence_busy is None:
+        if self._occurrence_busy is None or not is_trigger_automation(task):
             return False
         assert task.next_run_at is not None
         try:
@@ -712,10 +713,10 @@ class PersistentTaskScheduler:
                 task.rrule,
                 session_mode=task.session_mode,
                 execution_target=task.execution_target,
-                # Without busy skipping, a continued session keeps the ten-minute floor.
+                # Only a trigger automation whose busy polls are skipped may poll more often.
                 continued_minimum=(
-                    MIN_CONTINUED_INTERVAL_SECONDS
-                    if self._occurrence_busy is not None
+                    MIN_TRIGGER_INTERVAL_SECONDS
+                    if self._occurrence_busy is not None and is_trigger_automation(task)
                     else MIN_SUBHOUR_INTERVAL_SECONDS
                 ),
             )

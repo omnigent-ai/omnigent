@@ -14,8 +14,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from omnigent.server.scheduled.rrule import (
-    MIN_CONTINUED_INTERVAL_SECONDS,
     MIN_INTERVAL_SECONDS,
+    MIN_TRIGGER_INTERVAL_SECONDS,
     RRuleValidationError,
     get_next_fire_time,
     validate_rrule,
@@ -451,7 +451,7 @@ def test_busy_skipping_lowers_only_the_continued_session_floor(execution_target,
     rule = f"FREQ=MINUTELY;INTERVAL={minutes}"
     options = {
         "execution_target": execution_target,
-        "continued_minimum": MIN_CONTINUED_INTERVAL_SECONDS,
+        "continued_minimum": MIN_TRIGGER_INTERVAL_SECONDS,
     }
     if minutes < 2:
         with pytest.raises(RRuleValidationError, match="Minimum interval is 2 minutes"):

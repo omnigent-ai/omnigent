@@ -111,7 +111,7 @@ from omnigent.server.scheduled.harness_settings import (
     unattended_permission_mode_allowed,
     validate_scheduled_permission_mode,
 )
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
 from omnigent.server.scheduled.telemetry import (
     current_fire_stage,
     fire_stage,
@@ -364,12 +364,7 @@ class _NewRunRecorder:
 
 
 def _scheduled_session_title(task: ScheduledTask) -> str:
-    if task.session_mode == "continue" and task.prompt.startswith(
-        tuple(
-            f"This automation watches {source} and starts one Omnigent session"
-            for source in ("Jira", "Slack", "GitHub", "Linear")
-        )
-    ):
+    if is_trigger_automation(task):
         return f"[automation job] {task.name}"
     return task.name
 
@@ -443,7 +438,7 @@ BUSY_SKIP_MAX_SECONDS = 10 * 60
 
 
 def build_occurrence_busy(deps: FireDeps) -> Callable[[ScheduledTask], Awaitable[bool]]:
-    """Build the persistent scheduler's check for skipping an occurrence.
+    """Build the persistent scheduler's check for skipping a trigger automation's poll.
 
     Only a continue task with a recorded session skips, and only while the session
     shows as running (a turn in progress, or waiting on an approval or question) and

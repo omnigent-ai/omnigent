@@ -80,3 +80,16 @@ def occurrence_host_id(task: ScheduledTask, trigger_key: str) -> str | None:
 def host_ownership_key(workspace_id: int, host_id: str | None) -> str:
     """Key a replica's ownership check by host, or by workspace for a task with no host."""
     return host_id if host_id is not None else str(workspace_id)
+
+
+# A task doesn't record its template, so, like the web form (``isTriggerPrompt`` in
+# web/src/components/scheduled/triggerTemplates.ts), recognize the opening sentence.
+_TRIGGER_PROMPT_OPENINGS = tuple(
+    f"This automation watches {source} and starts one Omnigent session"
+    for source in ("Jira", "Slack", "GitHub", "Linear")
+)
+
+
+def is_trigger_automation(task: ScheduledTask) -> bool:
+    """Whether a task polls for new items, set up from a Jira, Slack, GitHub or Linear template."""
+    return task.session_mode == "continue" and task.prompt.startswith(_TRIGGER_PROMPT_OPENINGS)

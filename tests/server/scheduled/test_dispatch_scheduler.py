@@ -37,12 +37,16 @@ def store(db_uri: str) -> SqlAlchemyScheduledTaskStore:
 
 
 def _task(
-    store: SqlAlchemyScheduledTaskStore, seed: str = "task", rrule: str = "FREQ=HOURLY", **kwargs
+    store: SqlAlchemyScheduledTaskStore,
+    seed: str = "task",
+    rrule: str = "FREQ=HOURLY",
+    prompt: str = "prompt",
+    **kwargs,
 ):
     task = store.create(
         uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex,
         seed,
-        "prompt",
+        prompt,
         rrule,
         None,
         uuid.uuid4().hex,
@@ -2483,9 +2487,14 @@ async def test_ten_minute_persisted_schedule_by_execution(store, session_mode, e
         assert saved.next_run_at is None
 
 
-async def test_busy_continued_session_skips_its_occurrence_without_a_run(store, caplog) -> None:
+_TRIGGER_PROMPT = "This automation watches Slack and starts one Omnigent session per message."
+
+
+async def test_busy_trigger_automation_skips_its_poll_without_a_run(store, caplog) -> None:
     caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
-    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=2", session_mode="continue")
+    task = _task(
+        store, rrule="FREQ=MINUTELY;INTERVAL=2", prompt=_TRIGGER_PROMPT, session_mode="continue"
+    )
     clock = FakeClock(task.next_run_at)
     fire = AsyncMock()
     busy = AsyncMock(return_value=True)
@@ -2511,7 +2520,9 @@ async def test_busy_continued_session_skips_its_occurrence_without_a_run(store, 
     ids=["idle", "check-failed"],
 )
 async def test_idle_or_unknown_session_still_claims_its_occurrence(store, busy) -> None:
-    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=2", session_mode="continue")
+    task = _task(
+        store, rrule="FREQ=MINUTELY;INTERVAL=2", prompt=_TRIGGER_PROMPT, session_mode="continue"
+    )
     clock = FakeClock(task.next_run_at)
     fire = AsyncMock()
     scheduler = PersistentTaskScheduler(
@@ -2526,7 +2537,12 @@ async def test_idle_or_unknown_session_still_claims_its_occurrence(store, busy) 
 
 
 async def test_busy_session_still_gets_the_last_occurrence(store) -> None:
-    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=2;COUNT=2", session_mode="continue")
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=2;COUNT=2",
+        prompt=_TRIGGER_PROMPT,
+        session_mode="continue",
+    )
     clock = FakeClock(task.next_run_at)
     fire = AsyncMock()
     busy = AsyncMock(return_value=True)
@@ -2545,11 +2561,40 @@ async def test_busy_session_still_gets_the_last_occurrence(store) -> None:
     assert store.get(task.id).state == "completed"
 
 
-async def test_continued_sessions_keep_ten_minutes_without_a_busy_check(store) -> None:
-    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=2", session_mode="continue")
+async def test_other_continued_sessions_are_sent_while_busy(store) -> None:
+    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=10", session_mode="continue")
     clock = FakeClock(task.next_run_at)
     fire = AsyncMock()
-    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(return_value=None), now=clock.now)
+    busy = AsyncMock(return_value=True)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, occurrence_busy=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    busy.assert_not_awaited()
+    fire.assert_awaited_once()
+    [run] = store.list_runs(task.id)[0]
+    assert run.scheduled_at == task.next_run_at
+
+
+@pytest.mark.parametrize(
+    "prompt,busy_check",
+    [(_TRIGGER_PROMPT, False), ("prompt", True)],
+    ids=["no-busy-check", "not-a-trigger"],
+)
+async def test_two_minute_polls_need_a_trigger_automation_and_a_busy_check(
+    store, prompt, busy_check
+) -> None:
+    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=2", prompt=prompt, session_mode="continue")
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store,
+        fire,
+        AsyncMock(return_value=None),
+        now=clock.now,
+        occurrence_busy=AsyncMock(return_value=False) if busy_check else None,
+    )
     await scheduler.poll_once()
     await _drain(scheduler)
     fire.assert_not_awaited()

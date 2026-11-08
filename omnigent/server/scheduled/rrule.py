@@ -35,9 +35,9 @@ from omnigent.server.scheduled._bounded_rrule import RRuleSearchLimitError, iter
 # Connected hosts and continued sessions avoid provisioning a sandbox per fire.
 MIN_INTERVAL_SECONDS = 60 * 60
 MIN_SUBHOUR_INTERVAL_SECONDS = 10 * 60
-# A scheduler that skips a continued session's occurrences while the session is busy
-# (``build_occurrence_busy`` in fire.py) may run continued sessions this often.
-MIN_CONTINUED_INTERVAL_SECONDS = 2 * 60
+# Trigger automations may poll this often on a scheduler that skips their occurrences
+# while the session is busy (``build_occurrence_busy`` in fire.py).
+MIN_TRIGGER_INTERVAL_SECONDS = 2 * 60
 
 _UTC = ZoneInfo("UTC")
 
@@ -295,8 +295,9 @@ def validate_rrule(
     :param session_mode: Continued sessions permit *continued_minimum*.
     :param execution_target: Connected hosts also permit ten-minute new sessions.
         Omit to retain the conservative new-session hourly floor.
-    :param continued_minimum: Minimum gap for continued sessions. Only a scheduler
-        that skips busy sessions lowers it, to :data:`MIN_CONTINUED_INTERVAL_SECONDS`.
+    :param continued_minimum: Minimum gap for continued sessions. A scheduler that
+        skips busy trigger automations lowers it for them to
+        :data:`MIN_TRIGGER_INTERVAL_SECONDS`.
     :returns: An :class:`RRuleTrigger`.
     :raises RRuleValidationError: On bad syntax, never-fires, fires-once, or a
         sub-minimum interval.
