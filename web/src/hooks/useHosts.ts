@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
+import { getOmnigentServerIdentity } from "@/lib/host";
 import { harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
@@ -64,7 +65,10 @@ interface HostsResponse {
   hosts: Host[];
 }
 
-export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
+export async function fetchHosts(
+  includeSandbox: boolean,
+  sourceHostId?: string | null,
+): Promise<Host[]> {
   const res = await authenticatedFetch("/v1/hosts");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
@@ -75,12 +79,13 @@ export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   // field and are kept. `includeSandbox` opts a caller (the chat-header
   // HostBadge) back into seeing them so it can label sandbox sessions.
   if (includeSandbox) return body.hosts;
-  return body.hosts.filter((h) => !h.sandbox_provider);
+  return body.hosts.filter((h) => !h.sandbox_provider || h.host_id === sourceHostId);
 }
 
 interface UseHostsOptions {
   enabled?: boolean;
   includeSandbox?: boolean;
+  sourceHostId?: string | null;
   /** Refetch on every window refocus (paired with `staleTime: 0`) so returning
    *  to the tab is a guaranteed readiness recovery. Only the setup flow needs
    *  this; other consumers keep the 30 s stale window to avoid an app-wide bump
@@ -96,8 +101,8 @@ export function useHosts(options: UseHostsOptions = {}) {
     // Distinct cache key per filtering mode so the picker's filtered
     // list and the header's unfiltered list don't overwrite each other.
     // A bare ["hosts"] invalidation still prefix-matches both.
-    queryKey: ["hosts", { includeSandbox }],
-    queryFn: () => fetchHosts(includeSandbox),
+    queryKey: ["hosts", { includeSandbox, sourceHostId: options.sourceHostId }],
+    queryFn: () => fetchHosts(includeSandbox, options.sourceHostId),
     enabled,
     // Readiness is pushed live via WS (hosts_changed → invalidate in
     // SessionUpdatesProvider), so the badge normally clears within seconds of
@@ -151,7 +156,8 @@ export function useHostModelOptions(
 ) {
   const queryClient = useQueryClient();
   const canRefresh = enabled && hostId !== null && poll;
-  const pollerKey = JSON.stringify([hostId, harness]);
+  const server = getOmnigentServerIdentity();
+  const pollerKey = JSON.stringify([hostId, harness, server]);
   // Only committed selections participate; suspended renders leave retries alone.
   useLayoutEffect(() => {
     if (!canRefresh) return;
@@ -169,7 +175,7 @@ export function useHostModelOptions(
     };
   }, [queryClient, pollerKey, canRefresh]);
   const query = useQuery({
-    queryKey: ["host-model-options", hostId, harness],
+    queryKey: ["host-model-options", hostId, harness, server],
     queryFn: () => fetchHostModelOptions(hostId as string, harness),
     enabled: enabled && hostId !== null,
     // Poll the active picker for provider changes; inactive harnesses can

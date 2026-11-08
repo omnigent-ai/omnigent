@@ -26,17 +26,19 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_launch import HostLaunchTarget, resolve_host_launch
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.server.routes.skills import create_skills_router
+from omnigent.server.sharing_settings import SiblingSessionDestinations
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.sandbox_profile_store import SandboxProfileStore
 from tests.budgets import budget
 from tests.server.helpers import websocket_scope as _websocket_scope
 
@@ -648,8 +650,26 @@ async def test_list_hosts_reports_offline_after_disconnect(
     assert get_resp.json()["status"] == "offline"
 
 
+@pytest.mark.parametrize(
+    "nested,enabled,policy,previous_host,expected_status",
+    [
+        (False, True, "current_host", None, 200),
+        (False, True, "current_host", "3" * 32, 200),
+        (True, True, "current_host", _HOST_ID, 200),
+        (True, True, "any_host", "3" * 32, 200),
+        (True, True, "current_host", "3" * 32, 403),
+        (True, True, "current_host_or_new_sandbox", "3" * 32, 403),
+        (True, False, "current_host", "3" * 32, 200),
+    ],
+)
 async def test_launch_runner_happy_path(
-    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    nested: bool,
+    enabled: bool,
+    policy: str,
+    previous_host: str | None,
+    expected_status: int,
 ) -> None:
     """
     Verify the full launch flow: host receives launch frame, responds
@@ -658,10 +678,19 @@ async def test_launch_runner_happy_path(
     If the host never receives the frame, the send_text path is broken.
     If the future doesn't resolve, the receive loop routing is broken.
     """
-    app, registry, _hs, conv_store = host_api_app
+    monkeypatch.setenv("OMNIGENT_FEATURES", "sibling_sessions" if enabled else "-sibling_sessions")
+    app, registry, _hs, conv_store = _build_host_api_app(db_uri)
+    app.state.sibling_session_destinations = lambda: SiblingSessionDestinations(policy)
     comm = await _connect_host(app, registry)
 
-    conv = conv_store.create_conversation(agent_id=None)
+    conv = conv_store.create_conversation(
+        agent_id=None, host_id=previous_host, workspace="/tmp/source" if previous_host else None
+    )
+    if nested:
+        source = conv_store.create_conversation(
+            agent_id=None, host_id=previous_host, workspace="/tmp/source"
+        )
+        conv_store.add_new_sibling(source.id, conv.id, user_id=None)
 
     async def _respond_to_launch() -> None:
         """Read the launch frame from the host's outbound queue and respond."""
@@ -690,7 +719,7 @@ async def test_launch_runner_happy_path(
                 return
         raise AssertionError("Host never received launch frame")
 
-    responder = asyncio.create_task(_respond_to_launch())
+    responder = asyncio.create_task(_respond_to_launch()) if expected_status == 200 else None
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
@@ -701,7 +730,18 @@ async def test_launch_runner_happy_path(
             },
         )
 
-    await responder
+    if responder is not None:
+        await responder
+
+    assert resp.status_code == expected_status, resp.text
+    if expected_status == 403:
+        unchanged = conv_store.get_conversation(conv.id)
+        assert unchanged is not None and unchanged.runner_id is None
+        assert unchanged.host_id == previous_host
+        assert unchanged.family_id == source.id
+        assert "server policy" in resp.text
+        assert registry.get(_HOST_ID).outbound_queue.empty()
+        return
 
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     data = resp.json()
@@ -750,8 +790,11 @@ async def test_launch_runner_happy_path(
         ),
     ],
 )
+@pytest.mark.parametrize("nested", [False, True])
 async def test_launch_runner_categorical_failure_returns_specific_status(
-    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    nested: bool,
     wire_error_code: str | None,
     launch_error: str,
     expected_status: int,
@@ -769,7 +812,9 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
     """
     from omnigent.errors import OmnigentError
 
-    app, registry, _hs, conv_store = host_api_app
+    monkeypatch.setenv("OMNIGENT_FEATURES", "sibling_sessions")
+    app, registry, _hs, conv_store = _build_host_api_app(db_uri)
+    app.state.sibling_session_destinations = lambda: SiblingSessionDestinations.CURRENT_HOST
 
     # The bare test app has no exception handlers; register the same
     # OmnigentError → JSON handler create_app installs (app.py), so the
@@ -790,6 +835,21 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
 
     comm = await _connect_host(app, registry)
     conv = conv_store.create_conversation(agent_id=None)
+    if nested:
+        conv_store.set_host_id(conv.id, _HOST_ID, workspace="/tmp/source")
+        source = conv_store.create_conversation(agent_id=None)
+        conv_store.add_new_sibling(source.id, conv.id, user_id=None)
+        profiles = SandboxProfileStore(conv_store)
+        snapshot = {
+            "provider": "test",
+            "id": "build",
+            "revision": "v1",
+            "name": "Build",
+            "description": "",
+            "user_id": RESERVED_USER_LOCAL,
+            "workspace_id": 0,
+        }
+        profiles.bind_session(conv.id, snapshot)
 
     async def _refuse_launch() -> None:
         """Reply ``failed`` with the parameterized structured code."""
@@ -839,12 +899,21 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
         assert "SECRET_TOKEN" not in body["error"]["message"]
         assert "forged workspace failure" not in body["error"]["message"]
 
-    # _rollback_failed_launch ran: the session is fully unbound so a
-    # retry after `omnigent setup` starts clean.
     updated = conv_store.get_conversation(conv.id)
     assert updated is not None
     assert updated.runner_id is None, "failed launch must unbind runner_id"
-    assert updated.host_id is None, "failed launch must unbind host_id"
+    assert updated.host_id == (_HOST_ID if nested else None)
+    if nested:
+        assert updated.workspace == "/tmp/source"
+        assert profiles.get_session_snapshot(conv.id) == snapshot
+        responder = asyncio.create_task(_refuse_launch())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            retry = await client.post(
+                f"/v1/hosts/{_HOST_ID}/runners",
+                json={"session_id": conv.id, "workspace": "/tmp/test-workspace"},
+            )
+        await responder
+        assert retry.status_code == expected_status, retry.text
 
 
 async def test_launch_runner_409_host_offline(
