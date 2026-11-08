@@ -57,6 +57,9 @@ def _catalog_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> NativeCo
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
     monkeypatch.setattr(codex_native_app_server, "_find_codex_cli", lambda: sys.executable)
 
     def _unexpected_resolution(*, model: object, spec: object = None) -> NativeCodexLaunch:
