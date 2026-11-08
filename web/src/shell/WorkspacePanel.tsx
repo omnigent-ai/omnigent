@@ -1124,8 +1124,10 @@ function WorkspacePanelImpl({
   // would cross-assign when two launches overlap; the generic path skips the
   // queue entirely and rekeys its own tab directly (see startPendingSideChat).
   const awaitingPendingIdsRef = useRef<string[]>([]);
-  // Server-side starts from a pending tab this visit, then their children; leaving forgets them.
+  // Server-side starts sent from a pending tab during this visit; leaving forgets them.
   const startedInPlaceIdsRef = useRef(new Set<string>());
+  // The signal such a start published, matched by identity so a displaced one can't linger.
+  const shownInPlaceSignalRef = useRef<typeof sideChatToOpen>(null);
   const signalConversationIdRef = useRef(conversationId);
   // A side chat the server just created (Codex's native fork, or the generic
   // fork) announces itself via `sideChatToOpen`. If a pending tab is awaiting,
@@ -1134,6 +1136,7 @@ function WorkspacePanelImpl({
     if (signalConversationIdRef.current !== conversationId) {
       // A start the user navigated away from is revealed when it finishes.
       startedInPlaceIdsRef.current.clear();
+      shownInPlaceSignalRef.current = null;
       signalConversationIdRef.current = conversationId;
     }
     if (sideChatToOpen === null) return;
@@ -1144,7 +1147,8 @@ function WorkspacePanelImpl({
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
     const subagentId = subagentSessionIdFromTab(childId);
-    const startedInPlace = startedInPlaceIdsRef.current.delete(childId);
+    const startedInPlace = shownInPlaceSignalRef.current === sideChatToOpen;
+    if (startedInPlace) shownInPlaceSignalRef.current = null;
     if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
       // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
       sideChats.select(subagentId);
@@ -1260,10 +1264,9 @@ function WorkspacePanelImpl({
         // now that the text has moved to the real child. Only on success — a
         // failed create keeps it so the user can retry.
         useChatStore.getState().clearSideChatComposer(pendingId);
-        if (startedInPlaceIdsRef.current.delete(pendingId)) {
-          startedInPlaceIdsRef.current.add(childSessionId);
-        }
+        const startedInPlace = startedInPlaceIdsRef.current.delete(pendingId);
         useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
+        if (startedInPlace) shownInPlaceSignalRef.current = useChatStore.getState().sideChatToOpen;
       },
       (err) => {
         // The rail path had no failure feedback (unlike the composer entry

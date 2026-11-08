@@ -233,6 +233,7 @@ describe("mobile side-chats drawer", () => {
     return drawer;
   }
 
+  /** Hold the next server-side start; `beforeRender` runs once it resolves, before React renders. */
   function holdSideChatStart() {
     let finishStart!: (result: { childSessionId: string }) => void;
     vi.mocked(createSideChat).mockReturnValue(
@@ -240,7 +241,12 @@ describe("mobile side-chats drawer", () => {
         finishStart = resolve;
       }),
     );
-    return (childSessionId: string) => act(async () => finishStart({ childSessionId }));
+    return (childSessionId: string, beforeRender?: () => void) =>
+      act(async () => {
+        finishStart({ childSessionId });
+        await Promise.resolve();
+        beforeRender?.();
+      });
   }
 
   it("opens for a side chat belonging to the conversation on screen", () => {
@@ -358,6 +364,39 @@ describe("mobile side-chats drawer", () => {
     expect(rail()).toHaveAttribute("data-state", "closed");
     openActionsMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_new");
+  });
+
+  it("stays closed when dismissed while a retried side chat is starting", async () => {
+    const finishStart = holdSideChatStart();
+    vi.mocked(createSideChat).mockRejectedValueOnce(new Error("no runner"));
+    renderShell();
+    const drawer = await sendFromNewSideChatTab();
+    await act(async () =>
+      fireEvent.click(within(drawer).getByRole("button", { name: "Send first message" })),
+    );
+    expect(createSideChat).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    await finishStart("conv_side_new");
+
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(rail()).toHaveAttribute("data-state", "closed");
+  });
+
+  it("reveals a later request for a new side chat whose own signal was displaced", async () => {
+    const finishStart = holdSideChatStart();
+    renderShell();
+    const drawer = await sendFromNewSideChatTab();
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+
+    // Another side chat's signal replaces the start's before the panel handles it.
+    await finishStart("conv_side_new", () => signal("conv_ws"));
+    expect(drawer).toHaveAttribute("data-state", "open");
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    act(() => signal("conv_ws", "conv_side_new"));
+
+    expect(drawer).toHaveAttribute("data-state", "open");
     expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_new");
   });
 
