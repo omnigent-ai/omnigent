@@ -7027,6 +7027,112 @@ describe("Composer — editing queued messages", () => {
   });
 });
 
+describe("Composer — editing a sent message", () => {
+  const CONV = "conv_edit_sent";
+  const notesContent = [
+    { type: "input_file" as const, file_id: "file_notes", filename: "notes.txt" },
+    { type: "input_file" as const, file_id: "file_gone", filename: "chart.png" },
+    { type: "input_text" as const, text: "Summarize these" },
+  ];
+  const sentMessage = {
+    sessionId: CONV,
+    text: "Summarize these",
+    content: notesContent,
+    mentions: [{ path: "src/app.ts", isDir: false }],
+  };
+  const fetchMock = vi.fn();
+  const toasts: unknown[] = [];
+  const recordToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
+
+  beforeEach(() => {
+    clearSessionDrafts();
+    // A running turn: Edit must not stop it, and the edited send steers like any other.
+    useChatStore.setState({
+      conversationId: CONV,
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "running",
+      queuedMessages: [],
+    });
+    fetchMock.mockReset();
+    fetchMock.mockImplementation(async (url: string) =>
+      url.endsWith("/files/file_notes/content")
+        ? new Response("meeting notes", { headers: { "Content-Type": "text/plain" } })
+        : new Response(JSON.stringify({ detail: "gone" }), { status: 404 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    toasts.length = 0;
+    window.addEventListener("omnigent:toast", recordToast);
+  });
+
+  afterEach(() => {
+    window.removeEventListener("omnigent:toast", recordToast);
+    vi.unstubAllGlobals();
+    cleanup();
+  });
+
+  it("loads the text, attachments, and @-mentions into an empty composer", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ isWorking: true });
+    renderWithTooltips(<Composer {...props} ref={ref} />);
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+
+    await waitFor(() => expect(textarea()).toHaveValue("Summarize these"));
+    expect(textarea()).toHaveFocus();
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+    expect(toasts).toEqual(["Couldn't copy chart.png. Attach again before you send."]);
+    expect(props.onStop).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: "Summarize these, briefly" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+    const [sentText, sentFiles] = vi.mocked(props.onSend).mock.calls[0]! as [
+      string,
+      File[] | undefined,
+    ];
+    expect(sentText).toContain("Summarize these, briefly");
+    expect(sentText).toContain("src/app.ts");
+    expect(sentFiles?.map((file) => file.name)).toEqual(["notes.txt"]);
+    expect(await sentFiles?.[0]?.text()).toBe("meeting notes");
+  });
+
+  it("asks before replacing a draft, keeping it unless the user confirms", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Keep draft" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("half-written thought");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Replace draft" }),
+    );
+
+    await waitFor(() => expect(textarea()).toHaveValue("Summarize these"));
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+  });
+
+  it("ignores Edit while the composer is disabled", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps({ disabled: true })} ref={ref} />);
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+
+    await act(async () => {});
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("Composer config gear", () => {
   beforeEach(() => {
     setComposerState({

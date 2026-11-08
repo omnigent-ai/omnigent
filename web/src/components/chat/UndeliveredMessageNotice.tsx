@@ -2,38 +2,10 @@ import { useState } from "react";
 import { CircleAlertIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
-import { PENDING_FILE_PREFIX, type MessageContentBlock } from "@/lib/blocks";
-import { downloadSessionFile } from "@/lib/filesApi";
+import type { MessageContentBlock } from "@/lib/blocks";
 import { newSessionLocation } from "@/lib/newSessionHandoff";
+import { recoverMessageAttachments } from "@/lib/recoverMessageAttachments";
 import { useNavigate } from "@/lib/routing";
-
-/**
- * Download a message's uploaded attachments so a new session can send them again.
- *
- * @returns The files that came back, and the names of those that didn't.
- */
-async function recoverAttachments(
-  sessionId: string | null,
-  content: MessageContentBlock[],
-): Promise<{ files: File[]; missing: string[] }> {
-  const attachments = content.filter(
-    (block) => block.type === "input_image" || block.type === "input_file",
-  );
-  const results = await Promise.allSettled(
-    attachments.map((block) =>
-      sessionId !== null && block.file_id && !block.file_id.startsWith(PENDING_FILE_PREFIX)
-        ? downloadSessionFile(sessionId, block.file_id, block.filename ?? "attachment")
-        : Promise.reject(new Error("no uploaded file")),
-    ),
-  );
-  const files: File[] = [];
-  const missing: string[] = [];
-  results.forEach((result, index) => {
-    if (result.status === "fulfilled") files.push(result.value);
-    else missing.push(attachments[index]!.filename ?? "an attachment");
-  });
-  return { files, missing };
-}
 
 /**
  * Recovery actions for a startup input that was never delivered.
@@ -56,7 +28,7 @@ export function UndeliveredMessageNotice({
 
   async function startNewSession() {
     setStarting(true);
-    const { files, missing } = await recoverAttachments(sessionId, content);
+    const { files, missing } = await recoverMessageAttachments(sessionId, content);
     if (missing.length > 0) {
       showToast(`Couldn't copy ${missing.join(", ")}. Attach again before you send.`);
     }

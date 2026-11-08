@@ -22,6 +22,7 @@ import {
   FolderIcon,
   Link2Icon,
   Loader2Icon,
+  PencilIcon,
   SplitIcon,
   XIcon,
 } from "lucide-react";
@@ -90,6 +91,7 @@ import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
 import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
+import { EditSentMessageContext } from "@/components/chat/editSentMessage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
@@ -944,6 +946,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useScopedConversationId();
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
+  const editSentMessage = useContext(EditSentMessageContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
   //   imported inline data URI, an in-flight upload chip, or a placeholder
   //   for a block carrying neither.
@@ -982,6 +985,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Badge OTHER contributors' messages only (never your own).
   const author = bubble.createdBy;
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
+  // Only your own sent messages; a pending one is still on its way.
+  const canEdit =
+    editSentMessage !== null &&
+    !bubble.pending &&
+    !showAuthorBadge &&
+    Boolean(text || images.length || fileChips.length || mentionedChips.length);
 
   return (
     <Message
@@ -1206,6 +1215,24 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 componentId="chat.message.copy_user"
               >
                 {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+              </MessageAction>
+            )}
+            {canEdit && (
+              <MessageAction
+                tooltip="Edit"
+                size="icon-xxs"
+                className="[@media(pointer:coarse)]:size-8"
+                onClick={() =>
+                  editSentMessage({
+                    sessionId,
+                    text,
+                    content: bubble.content,
+                    mentions: mentionedChips,
+                  })
+                }
+                componentId="chat.message.edit_user"
+              >
+                <PencilIcon size={14} />
               </MessageAction>
             )}
             <MessageAction

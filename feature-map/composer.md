@@ -214,6 +214,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   session. Up/Down at the text boundaries browse recalled messages; editing one
   returns to normal caret navigation. Whitespace and queued messages recalled
   for editing remain drafts.
+- `edit-sent-message`: Edit (pencil) on your own sent message copies its text,
+  attachments, and "@"-mentions into that pane's composer; the transcript is
+  unchanged. Sending is a new message, steered or queued like any mid-turn send,
+  and Edit never stops the agent. A non-empty draft asks "Replace your draft?"
+  first. Side chats edit into their own composer. Edit is hidden on pending
+  messages, other contributors' messages, and read-only composers. An attachment
+  that can't be downloaded is skipped and named in a toast.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
   untouched draft; user edits remain. The "Something went wrong" card from the
@@ -295,6 +302,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
   message box; press Enter to keep the text or Escape to discard it.
 - Send while the agent is working to queue a message, then steer it.
+- Hover one of your sent messages and click Edit (pencil) to load its text and
+  attachments into the message box, revise, and send it as a new message.
 - With the in-session message box empty, press Up to recall a previous prompt
   (or the last queued message). While writing a draft, Up stops at the top.
 - With a native session's host offline, send a message; it waits in the queue
@@ -799,6 +808,13 @@ Other connection providers alone do not enable the managed MCP picker.
   Multiline, whitespace, quotes, and queued drafts have component coverage in
   `web/src/pages/ChatPage.composer.test.tsx`. The new-session and side-chat
   composers have no prompt recall; the vendor terminal owns its own history.
+- **`edit-sent-message`:**
+  `tests/e2e_ui/chat/test_edit_sent_message.py` covers an image round trip, the
+  replace-draft dialog, editing mid-turn, and side chats. Pending, shared, and
+  read-only states and failed downloads have component coverage in
+  `web/src/pages/ChatPage.userBubble.test.tsx`,
+  `web/src/pages/ChatPage.composer.test.tsx`, and
+  `web/src/components/chat/SideChatPane.test.tsx`.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport

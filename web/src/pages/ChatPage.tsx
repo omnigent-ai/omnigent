@@ -1,4 +1,9 @@
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
+import {
+  EditSentMessageContext,
+  useEditSentMessage,
+  type SentMessage,
+} from "@/components/chat/editSentMessage";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useConversationRedirect } from "@/hooks/useConversationRedirect";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
@@ -1655,6 +1660,11 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // out of streaming-frame re-renders.
 
   const composerRef = useRef<ComposerHandle>(null);
+  // Stable, so the memoized transcript doesn't re-render when the composer does.
+  const editSentMessage = useCallback(
+    (message: SentMessage) => composerRef.current?.editSentMessage(message),
+    [],
+  );
   // Cold selector (harness rarely changes) — gates the selection popup's "Ask
   // in side chat" action to harnesses that support side chat.
   const selectionSessionHarness = useChatStore((s) => s.sessionHarness);
@@ -1872,6 +1882,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     );
   });
 
+  // Read-only composers take no quotes or edited messages.
+  const composerReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
+
   // Single return so both surfaces keep stable fragment positions across
   // view flips — an early return would change the tree shape and remount
   // the terminal overlays, disposing the live attaches they exist to
@@ -1885,25 +1898,27 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           {/* The scrolling transcript column owns every streaming-hot store
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
-          <Transcript
-            hostId={hostId}
-            setConversationEl={setConversationEl}
-            containerEl={containerEl}
-            scroller={scroller}
-            setScroller={setScroller}
-            sendScrollNonce={sendScrollNonce}
-            hasMoreHistory={hasMoreHistory}
-            loadingMoreHistory={loadingMoreHistory}
-            isMobileViewport={isMobileViewport}
-            showsWorking={showsWorking}
-            agentsError={agentsError}
-            sandboxLaunching={sandboxLaunching}
-            spacerMeasureRef={spacerMeasureRef}
-          />
+          <EditSentMessageContext.Provider value={composerReadOnly ? null : editSentMessage}>
+            <Transcript
+              hostId={hostId}
+              setConversationEl={setConversationEl}
+              containerEl={containerEl}
+              scroller={scroller}
+              setScroller={setScroller}
+              sendScrollNonce={sendScrollNonce}
+              hasMoreHistory={hasMoreHistory}
+              loadingMoreHistory={loadingMoreHistory}
+              isMobileViewport={isMobileViewport}
+              showsWorking={showsWorking}
+              agentsError={agentsError}
+              sandboxLaunching={sandboxLaunching}
+              spacerMeasureRef={spacerMeasureRef}
+            />
+          </EditSentMessageContext.Provider>
           {/* Floating reply button — scoped to the conversation container.
           Withheld when the composer refuses quotes (read-only grant or a
           structurally non-interactive session), as SideChatPane does. */}
-          {!isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason) && (
+          {!composerReadOnly && (
             <SelectionPopup
               containerRef={conversationRef}
               onReply={(text) => composerRef.current?.appendReplyQuote(text)}
@@ -2030,6 +2045,8 @@ export function ConversationLoadError({
 
 interface ComposerHandle {
   appendReplyQuote: (text: string) => void;
+  /** Load a sent message into the composer, confirming before replacing a draft. */
+  editSentMessage: (message: SentMessage) => void;
   startSideChat: (selectedText: string) => void;
   /** Take keyboard focus for typing (not on phones, or while a /btw answer holds it). */
   focus: () => void;
@@ -3668,6 +3685,23 @@ function ComposerImpl(
   // User edits and quote changes leave recall mode.
   const recallingRef = useRef(false);
 
+  const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
+    hasDraft: () => hasDraft,
+    applyDraft: (edited) => {
+      // Same handoff as a queued message's Edit, plus its "@"-mentions.
+      replaceText(edited.text);
+      dirtyRef.current = true;
+      resetCursor();
+      recallingRef.current = false;
+      textareaRef.current = tailTextareaRef.current;
+      restoreFiles(edited.files);
+      setMentionedItems(edited.mentions);
+      setCommandError(null);
+      dismissMention();
+      textareaRef.current?.focus();
+    },
+  });
+
   const replyQuoteInsertedRef = useRef(false);
   useImperativeHandle(ref, () => ({
     focus() {
@@ -3685,6 +3719,11 @@ function ComposerImpl(
       dismissMention();
       resetCursor();
       recallingRef.current = false;
+    },
+    editSentMessage(message) {
+      const blocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
+      if (blocked || composerLockedByBtw) return;
+      editSentMessage(message);
     },
     startSideChat(selectedText) {
       // Quote in the visible side chat, or open a pending tab immediately.
@@ -4069,6 +4108,7 @@ function ComposerImpl(
         isMobile && "z-20 px-4 pb-[max(16px,env(safe-area-inset-bottom))]",
       )}
     >
+      {replaceDraftDialog}
       {/* Hidden file input for the attach button */}
       <input
         ref={fileInputRef}

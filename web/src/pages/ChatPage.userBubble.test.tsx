@@ -4,6 +4,9 @@ import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { AUTOMATION_CONTEXT_NOTE } from "@/lib/systemMessage";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import { SessionSharedContext } from "@/components/chat/chatBubbleParts";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { EditSentMessageContext, type SentMessage } from "@/components/chat/editSentMessage";
 import { BubbleView, buildPendingBubbles } from "./ChatPage";
 
 // UserBubble renders its text through the same markdown renderer as the
@@ -536,6 +539,66 @@ describe("UserBubble copy button", () => {
       }),
     );
     expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+  });
+});
+
+describe("UserBubble edit button", () => {
+  function renderEditable(bubble: Bubble, { shared = false } = {}) {
+    const editMessage = vi.fn<(message: SentMessage) => void>();
+    render(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <SessionSharedContext.Provider value={shared}>
+          <EditSentMessageContext.Provider value={editMessage}>
+            {/* A shared session badges other contributors with a tooltip. */}
+            <TooltipProvider>
+              <BubbleView bubble={bubble} />
+            </TooltipProvider>
+          </EditSentMessageContext.Provider>
+        </SessionSharedContext.Provider>
+      </FileViewerContext.Provider>,
+    );
+    return editMessage;
+  }
+
+  it("hands the message's text, blocks, and @-mentions to the composer", () => {
+    const content: MessageContentBlock[] = [
+      { type: "input_file", file_id: "file_1", filename: "notes.pdf" },
+      { type: "input_text", text: "summarize this\n\n[Attached: src/app.ts]" },
+    ];
+    const editMessage = renderEditable(userBubble("", { content }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    expect(editMessage).toHaveBeenCalledWith({
+      sessionId: null,
+      text: "summarize this",
+      content,
+      mentions: [{ path: "src/app.ts", isDir: false }],
+    });
+    // Editing copies the message; the bubble stays in the transcript.
+    expect(screen.getByText("summarize this")).toBeInTheDocument();
+  });
+
+  it("offers Edit on an attachments-only message", () => {
+    renderEditable(
+      userBubble("", { content: [{ type: "input_image", file_id: "img_1", filename: "a.png" }] }),
+    );
+    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+  });
+
+  it("is absent without a composer to take the message", () => {
+    renderBubble(userBubble("hello"));
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
+
+  it("is absent while the message is still sending", () => {
+    renderEditable(userBubble("hello", { pending: true }));
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
+
+  it("is absent on another contributor's message in a shared session", () => {
+    renderEditable(userBubble("hello", { createdBy: "teammate@example.com" }), { shared: true });
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
   });
 });
 

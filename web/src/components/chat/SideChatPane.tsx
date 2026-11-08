@@ -1,4 +1,5 @@
 import { SelectionPopup } from "./SelectionPopup";
+import { EditSentMessageContext, useEditSentMessage } from "./editSentMessage";
 import { SideChatSettings } from "./SideChatSettings";
 import {
   useCallback,
@@ -198,6 +199,21 @@ export function SideChatPane({
       }
     };
   }, [childId, selectionParentId, readOnly, starting]);
+  // Edit on this tab's own messages loads them into this tab's composer.
+  const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
+    hasDraft: () => {
+      const draft = useChatStore.getState().sideChatComposers[childId];
+      return Boolean(draft && (draft.text.trim() || draft.files.length || draft.quotes?.length));
+    },
+    applyDraft: ({ text, files }) =>
+      useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+        ...current,
+        text,
+        files,
+        quotes: [],
+        autoFocus: true,
+      })),
+  });
   // Open the child's stream once (real tabs only) so it hydrates and streams
   // here. The store guards a double-bind and re-binds a failed entry, so
   // re-mounts / tab switches / retries are cheap.
@@ -391,6 +407,7 @@ export function SideChatPane({
     <ConversationScopeContext.Provider value={childId}>
       {/* Keys pressed in here belong to the side chat, not the parent's question. */}
       <div className="side-chat-backdrop flex h-full min-h-0 flex-col" data-side-chat-pane="">
+        {replaceDraftDialog}
         <div
           ref={transcriptRef}
           className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4"
@@ -447,15 +464,19 @@ export function SideChatPane({
             </div>
           ) : (
             <div ref={listRef} className="flex flex-col gap-4">
-              {bubbles.map((bubble, index) => (
-                <BubbleView
-                  key={bubbleKey(bubble)}
-                  bubble={bubble}
-                  isLastAssistant={index === lastAssistantIndex}
-                  showsWorking={showsWorking}
-                  recoveryDisabled={readOnly}
-                />
-              ))}
+              <EditSentMessageContext.Provider
+                value={readOnly || starting ? null : editSentMessage}
+              >
+                {bubbles.map((bubble, index) => (
+                  <BubbleView
+                    key={bubbleKey(bubble)}
+                    bubble={bubble}
+                    isLastAssistant={index === lastAssistantIndex}
+                    showsWorking={showsWorking}
+                    recoveryDisabled={readOnly}
+                  />
+                ))}
+              </EditSentMessageContext.Provider>
               <WorkingIndicatorRow
                 key={childId}
                 show={shouldShowWorkingIndicator(showsWorking || showsBackgroundTasks, bubbles)}

@@ -141,6 +141,85 @@ describe("undelivered startup messages", () => {
   });
 });
 
+describe("editing a sent side-chat message", () => {
+  function seedSentMessage() {
+    conversationRegistry.acquire(childId).setState({
+      sessionStatus: "idle",
+      blocks: itemsToBlocks([
+        {
+          id: "sent",
+          response_id: "turn",
+          type: "message",
+          role: "user",
+          status: "completed",
+          content: [
+            { type: "input_file", file_id: "file_log", filename: "build.log" },
+            { type: "input_text", text: "Why did this build fail?" },
+          ],
+        },
+      ]),
+    });
+  }
+
+  it("loads the message and its attachment into this side chat's composer", async () => {
+    seedSentMessage();
+    const download = vi
+      .spyOn(filesApi, "downloadSessionFile")
+      .mockResolvedValue(new File(["error: boom"], "build.log", { type: "text/plain" }));
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: "", files: [], settings: { modelOverride: "m" } } },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    const input = screen.getByTestId("side-chat-input");
+    await waitFor(() => expect(input).toHaveValue("Why did this build fail?"));
+    expect(download).toHaveBeenCalledExactlyOnceWith(childId, "file_log", "build.log");
+    const composer = useChatStore.getState().sideChatComposers[childId];
+    expect(composer?.files.map((file) => file.name)).toEqual(["build.log"]);
+    expect(composer?.settings).toEqual({ modelOverride: "m" });
+    expect(input).toHaveFocus();
+    // The sent message stays in the side chat's transcript.
+    expect(screen.getByText("Why did this build fail?", { selector: "p, p *" })).toBeTruthy();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("asks before replacing the side chat's draft", async () => {
+    seedSentMessage();
+    vi.spyOn(filesApi, "downloadSessionFile").mockRejectedValue(new Error("gone"));
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: { text: "", files: [], quotes: [{ id: "q", before: "", text: "quoted" }] },
+      },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog", { name: "Replace your draft?" })).getByRole(
+        "button",
+        { name: "Replace draft" },
+      ),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("Why did this build fail?"),
+    );
+    expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({
+      quotes: [],
+      files: [],
+    });
+  });
+
+  it("is not offered in a read-only side chat", () => {
+    seedSentMessage();
+    renderPane(<SideChatPane childId={childId} readOnly />);
+    expect(screen.getByText("Why did this build fail?")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
+});
+
 describe("side-chat working indicator", () => {
   it("shows the full session history and live state without exposing a read-only composer", () => {
     const entry = conversationRegistry.acquire(childId);
