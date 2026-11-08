@@ -206,7 +206,11 @@ def _persisted_messages(snapshot: dict[str, Any], role: str, text: str) -> list[
         item
         for item in snapshot["items"]
         if item.get("data", {}).get("role") == role
-        and text in json.dumps(item["data"].get("content", []))
+        and any(
+            text in block.get("text", "")
+            for block in item["data"].get("content", [])
+            if block.get("type") in {"input_text", "output_text", "text"}
+        )
     ]
 
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useLayoutEffect, useState } from "react";
 import {
   Database,
   File as FileIcon,
@@ -114,12 +114,12 @@ export function iconForFile(file: File): LucideIcon {
   return FileIcon;
 }
 
-/** Blob URL for an image preview, created and revoked inside one effect so the
- *  URL the committed <img> points at is never revoked early (StrictMode double
- *  mount) and never leaks. Guarded: jsdom (tests) lacks createObjectURL. */
+/** Blob URL for an image preview. A layout effect sets it before the browser paints
+ *  the tile. Created and revoked in one effect, so StrictMode's double mount never
+ *  revokes the URL the committed <img> uses, and nothing leaks. jsdom lacks createObjectURL. */
 function useObjectUrl(file: File | null): string | undefined {
   const [url, setUrl] = useState<string>();
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!file || typeof URL.createObjectURL !== "function") {
       setUrl(undefined);
       return;

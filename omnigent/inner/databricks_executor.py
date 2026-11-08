@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import configparser
 import datetime as dt
+import enum
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from omnigent.models import model_catalog
 
 if TYPE_CHECKING:
     import configparser
+    from pathlib import Path
 
     from openai import OpenAI, Stream
     from openai.types.chat import ChatCompletionChunk
@@ -210,9 +212,8 @@ def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksC
         both fields.
     """
     import configparser
-    from pathlib import Path
 
-    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    cfg_path = _databrickscfg_path()
     if not cfg_path.exists():
         return None
 
@@ -413,9 +414,8 @@ def _read_databrickscfg_host(profile: str | None = None) -> str | None:
     :returns: Workspace host URL, or ``None`` when no host can be resolved.
     """
     import configparser
-    from pathlib import Path
 
-    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    cfg_path = _databrickscfg_path()
     if not cfg_path.exists():
         return None
 
@@ -576,6 +576,17 @@ def _databricks_cli_token_expires_at(
     return min(candidates, default=base + _CLI_TOKEN_DEFAULT_TTL_SECONDS)
 
 
+class _UnknownConfigFile(enum.Enum):
+    """Marks auth whose Databricks config file version was not recorded."""
+
+    UNKNOWN = "unknown"
+
+
+# ``(st_dev, st_ino, st_mtime_ns, st_size)`` of the config file, ``None`` when
+# it is missing, or UNKNOWN when nobody recorded which version auth came from.
+_ConfigFileVersion: TypeAlias = tuple[int, int, int, int] | _UnknownConfigFile | None
+
+
 class _DatabricksBearerAuth(httpx.Auth):
     """httpx Auth that calls ``Config.authenticate()`` on every HTTP request.
 
@@ -611,6 +622,9 @@ class _DatabricksBearerAuth(httpx.Auth):
         self._config = config
         self._profile_name = profile_name
         self._failure_message = failure_message
+        # The config file as it was before this auth was resolved; stamped by
+        # :func:`_resolve_databricks_auth`.
+        self.resolved_config_file: _ConfigFileVersion = _UnknownConfigFile.UNKNOWN
 
     @property
     def profile_name(self) -> str | None:
@@ -679,6 +693,26 @@ def _resolve_databricks_auth(
     profile: str | None = None,
     *,
     host: str | None = None,
+    workspace_id: str | None = None,
+) -> tuple[_DatabricksBearerAuth, str]:
+    """Resolve Databricks credentials, recording the config file they came from.
+
+    See :func:`_discover_databricks_auth` for parameters and errors. The
+    returned auth's ``resolved_config_file`` is the config file version taken
+    before resolving, so a rewrite that lands mid-resolution still reads as a
+    change to :class:`_ReusedDatabricksTokenSource`.
+    """
+    config_file = _databrickscfg_fingerprint()
+    auth, resolved_host = _discover_databricks_auth(profile, host=host, workspace_id=workspace_id)
+    auth.resolved_config_file = config_file
+    return auth, resolved_host
+
+
+def _discover_databricks_auth(
+    profile: str | None = None,
+    *,
+    host: str | None = None,
+    workspace_id: str | None = None,
 ) -> tuple[_DatabricksBearerAuth, str]:
     """Resolve Databricks credentials and return per-request auth + host.
 
@@ -698,6 +732,9 @@ def _resolve_databricks_auth(
         profile/env fallback is NOT attempted in this mode — the
         record asked for a specific workspace, so a credential miss
         fails loud.
+    :param workspace_id: With ``host``, the ``?o=`` workspace the caller
+        targets, e.g. ``"123"``. Profiles pinned to it are tried first (see
+        :func:`_prefer_profiles_for_workspace`).
     :returns: ``(auth, host)`` — an httpx Auth for injection into
         ``httpx.Client``/``httpx.AsyncClient`` and the workspace URL,
         e.g. ``"https://example.cloud.databricks.com"``.
@@ -710,7 +747,7 @@ def _resolve_databricks_auth(
     if host is not None:
         if profile is not None:
             raise ValueError("_resolve_databricks_auth takes profile or host, not both")
-        return _resolve_databricks_auth_for_host(host)
+        return _resolve_databricks_auth_for_host(host, workspace_id=workspace_id)
 
     try:
         from databricks.sdk.config import Config
@@ -800,7 +837,9 @@ def _sdk_config(**kwargs: str) -> Any:  # type: ignore[explicit-any]  # SDK Conf
     return Config(**kwargs)  # type: ignore[arg-type]
 
 
-def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth, str]:
+def _resolve_databricks_auth_for_host(
+    host: str, *, workspace_id: str | None = None
+) -> tuple[_DatabricksBearerAuth, str]:
     """Resolve per-request auth for a specific workspace host.
 
     Prefers a ``~/.databrickscfg`` profile pinned to *host*:
@@ -822,10 +861,14 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     as the person, not the service principal. Among user profiles, the
     one whose token the server last accepted for this host goes first
     (see :func:`_remember_profile`), so a stale login listed earlier is
-    not retried by every new process.
+    not retried by every new process. When *workspace_id* is given, profiles
+    pinned to that workspace go ahead of the rest of their identity class
+    (see :func:`_prefer_profiles_for_workspace`).
 
     :param host: Workspace host, e.g.
         ``"https://example.databricks.com"``.
+    :param workspace_id: The ``?o=`` workspace the caller targets, e.g.
+        ``"123"``, or ``None`` when the host names a single workspace.
     :returns: ``(auth, host)`` — an httpx Auth and the workspace URL.
     :raises DatabricksAuthError: When no credential source resolves
         for the host.
@@ -850,8 +893,13 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     # principal is then selected — otherwise the host would silently register
     # under the SP again, the exact wrong-identity symptom the ordering fixes.
     failed_user_profiles: list[str] = []
-    for profile_name in _prefer_remembered_profile(
-        _order_profiles_by_identity_preference(matches, sp_sections), remembered, sp_sections
+    for profile_name in _prefer_profiles_for_workspace(
+        _prefer_remembered_profile(
+            _order_profiles_by_identity_preference(matches, sp_sections), remembered, sp_sections
+        ),
+        config,
+        workspace_id,
+        sp_sections,
     ):
         sources = ["SDK", "CLI"]
         if profile_name in cli_logins:
@@ -907,30 +955,69 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     return _DatabricksBearerAuth(host_cfg, failure_message=host_failure), host
 
 
+def _databrickscfg_path() -> Path:
+    """Return the Databricks config file the SDK and CLI read.
+
+    :returns: ``$DATABRICKS_CONFIG_FILE`` when set, else ``~/.databrickscfg``,
+        with a leading ``~`` expanded as the SDK does.
+    """
+    from pathlib import Path
+
+    return Path(
+        os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg")
+    ).expanduser()
+
+
+def _databrickscfg_fingerprint() -> tuple[int, int, int, int] | None:
+    """Identify the current version of the Databricks config file.
+
+    Follows symlinks, so a profile linked to a file that is atomically
+    replaced (a new inode) or rewritten in place (a new mtime) both register
+    as a change.
+
+    :returns: ``(st_dev, st_ino, st_mtime_ns, st_size)``, or ``None`` when the
+        file is missing or unreadable.
+    """
+    try:
+        stat = _databrickscfg_path().stat()
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
 class _ReusedDatabricksTokenSource:
-    """Reuse SDK auth, re-resolving it after a token mint fails."""
+    """Reuse SDK auth, re-resolving it after a mint fails or the config file changes."""
 
     def __init__(self, server_url: str | None = None, *, host: str | None = None) -> None:
         if server_url is not None and host is not None:
             raise ValueError("_ReusedDatabricksTokenSource takes server_url or host, not both")
         self._server_url = server_url
         self._host = host
-        self._auth: _DatabricksBearerAuth | None = None
+        # The reused auth and the config file version it was resolved from,
+        # replaced as one value so concurrent mints never pair one resolution's
+        # auth with another's version.
+        self._cached: tuple[_DatabricksBearerAuth, _ConfigFileVersion] | None = None
         self._failure_logged = False
 
     @property
     def profile_name(self) -> str | None:
         """The ``~/.databrickscfg`` profile behind the resolved auth, if any."""
-        return self._auth.profile_name if self._auth is not None else None
+        cached = self._cached
+        return cached[0].profile_name if cached is not None else None
 
-    def _resolve(self) -> _DatabricksBearerAuth | None:
+    def _resolve(self) -> tuple[_DatabricksBearerAuth, _ConfigFileVersion] | None:
         """Resolve fresh SDK auth, returning ``None`` on credential failure.
 
         Callers proceed unauthenticated on ``None``, so the failure is logged
         here: it is otherwise the only record of why a request carried no
         bearer. Only the first failure since the last successful resolution is
         logged, since a failing source is re-resolved on every mint.
+
+        :returns: The auth and the config file version taken before resolving
+            it, so a rewrite that lands mid-resolution still reads as a change
+            on the next mint.
         """
+        config_file = _databrickscfg_fingerprint()
         try:
             if self._host is not None:
                 auth = _resolve_databricks_auth(host=self._host)[0]
@@ -950,32 +1037,44 @@ class _ReusedDatabricksTokenSource:
                 logger.info("Databricks SDK auth unavailable: %s: %s", type(exc).__name__, exc)
             return None
         self._failure_logged = False
-        return auth
+        return auth, config_file
 
     def current_token(self) -> str | None:
-        """Mint a token, resolving auth lazily and retrying once if it is stale."""
-        cached = self._auth
-        if cached is not None:
+        """Mint a token, resolving auth lazily and retrying once if it is stale.
+
+        Auth is also re-resolved when the config file has changed since it was
+        resolved. A PAT profile's token is read once at resolution and never
+        fails to mint locally, so a profile rewritten with a rotated token
+        would otherwise keep serving the old one until the server rejects it.
+        """
+        cached = self._cached
+        if cached is not None and _databrickscfg_fingerprint() == cached[1]:
             try:
-                return cached.current_token()
+                return cached[0].current_token()
             except DatabricksAuthError:
-                self._auth = None
-        auth = self._resolve()
-        if auth is None:
+                pass
+        resolved = self._resolve()
+        if resolved is None:
+            if self._cached is cached:
+                self._cached = None
             return None
-        self._auth = auth
+        self._cached = resolved
         try:
-            return auth.current_token()
+            return resolved[0].current_token()
         except DatabricksAuthError:
             return None
 
     def adopt(self, auth: _DatabricksBearerAuth) -> None:
         """Serve tokens from *auth*, which the server has already accepted.
 
+        *auth* keeps the config file version it was resolved from, so a file
+        rewritten while the server was verifying it is still picked up on the
+        next mint. Auth with no recorded version is re-resolved on that mint.
+
         :param auth: Auth resolved outside this source, e.g. by a recovery
             after the server refused this source's token.
         """
-        self._auth = auth
+        self._cached = (auth, auth.resolved_config_file)
         self._failure_logged = False
 
 
@@ -1066,6 +1165,37 @@ def _prefer_remembered_profile(
     return [*rest[:position], remembered, *rest[position:]]
 
 
+def _prefer_profiles_for_workspace(
+    ordered: list[str],
+    config: configparser.ConfigParser | None,
+    workspace_id: str | None,
+    sp_sections: set[str],
+) -> list[str]:
+    """Within each identity class, prefer profiles pinned to *workspace_id*.
+
+    A ``databricks auth login --host <host>?o=<id>`` records ``workspace_id``;
+    profiles pinned to the target go first, then unpinned ones, then ones
+    pinned elsewhere, which stay reachable because an account-wide grant may
+    still reach the target.
+
+    :param ordered: Profiles in identity (and remembered) preference order.
+    :param config: The parsed ``~/.databrickscfg``, or ``None`` when absent.
+    :param workspace_id: The targeted workspace, e.g. ``"123"``, or ``None``.
+    :param sp_sections: Section names classified as service principals.
+    :returns: *ordered*, reordered when *workspace_id* is given.
+    """
+    if workspace_id is None or config is None:
+        return ordered
+    env_profile = (os.environ.get("DATABRICKS_CONFIG_PROFILE") or "").strip()
+    explicit = ordered[:1] if ordered[:1] == [env_profile] else []
+
+    def rank(name: str) -> tuple[bool, int]:
+        pinned = config[name].get("workspace_id", "").strip() if name in config else ""
+        return (name in sp_sections, 0 if pinned == workspace_id else 1 if not pinned else 2)
+
+    return explicit + sorted(ordered[len(explicit) :], key=rank)
+
+
 # Sentinel default_section: keeps [DEFAULT] a plain section carrying only its
 # own keys (no inheritance in either direction), so a [DEFAULT] user profile's
 # ``auth_type = databricks-cli`` cannot smear onto named SP sections and
@@ -1080,9 +1210,8 @@ def _read_databrickscfg_no_inheritance() -> configparser.ConfigParser | None:
         ``None`` when the config file is missing or unparseable.
     """
     import configparser
-    from pathlib import Path
 
-    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    cfg_path = _databrickscfg_path()
     if not cfg_path.exists():
         return None
     config = configparser.ConfigParser(default_section=_NO_DEFAULT_INHERITANCE)
@@ -1294,9 +1423,8 @@ def databrickscfg_workspace_id_for_host(host: str) -> str | None:
         missing/unparseable or no matching profile carries one.
     """
     import configparser
-    from pathlib import Path
 
-    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    cfg_path = _databrickscfg_path()
     if not cfg_path.exists():
         return None
     config = configparser.ConfigParser()
@@ -1315,9 +1443,8 @@ def databrickscfg_workspace_id_for_host(host: str) -> str | None:
 def databrickscfg_workspace_id_for_profile(profile: str) -> str | None:
     """Return the ``workspace_id`` recorded for an exact Databricks profile."""
     import configparser
-    from pathlib import Path
 
-    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    cfg_path = _databrickscfg_path()
     if not cfg_path.exists():
         return None
     config = configparser.ConfigParser()
@@ -1354,10 +1481,13 @@ def _get_openai_client(profile: str | None = None) -> OpenAI:
 
     # Direct OpenAI-compatible config takes precedence
     if os.environ.get("OPENAI_BASE_URL"):
+        from omnigent.databricks_ai_gateway import gateway_request_tag_headers
+
         from .open_responses_sdk import _OPENAI_KEY_PLACEHOLDER
 
         return OpenAI(
             base_url=os.environ["OPENAI_BASE_URL"],
+            default_headers=gateway_request_tag_headers(os.environ["OPENAI_BASE_URL"]),
             # See _OPENAI_KEY_PLACEHOLDER docstring in open_responses_sdk.
             api_key=os.environ.get("OPENAI_API_KEY", _OPENAI_KEY_PLACEHOLDER),
         )
