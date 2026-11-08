@@ -113,29 +113,37 @@ it("tolerates unavailable browser storage", () => {
   expect(readModelCatalogCache(key())).toBeNull();
 });
 
-it("keeps running-session catalogs apart from agent previews and for a week", () => {
+it("keeps session catalogs apart from previews and other agents, for a week", () => {
   vi.useFakeTimers();
   const now = Date.now();
-  const sessionKey = sandboxSessionCatalogKey("company", "codex-native");
+  const sessionKey = sandboxSessionCatalogKey("company", "codex-native", "ag_1");
   writeModelCatalogCache(sessionKey, models, false);
   expect(readModelCatalogCache(key())).toBeNull();
-  expect(readModelCatalogCache(sandboxSessionCatalogKey("company", "claude-native"))).toBeNull();
-  expect(readModelCatalogCache(sandboxSessionCatalogKey("other", "codex-native"))).toBeNull();
+  expect(
+    readModelCatalogCache(sandboxSessionCatalogKey("company", "claude-native", "ag_1")),
+  ).toBeNull();
+  expect(
+    readModelCatalogCache(sandboxSessionCatalogKey("other", "codex-native", "ag_1")),
+  ).toBeNull();
+  expect(
+    readModelCatalogCache(sandboxSessionCatalogKey("company", "codex-native", "ag_2")),
+  ).toBeNull();
   vi.setSystemTime(now + 2 * 24 * 60 * 60 * 1000);
   expect(readModelCatalogCache(sessionKey, SANDBOX_SESSION_CATALOG_MAX_AGE_MS)?.models).toEqual(
     models,
   );
   vi.setSystemTime(now + SANDBOX_SESSION_CATALOG_MAX_AGE_MS + 1);
   expect(readModelCatalogCache(sessionKey, SANDBOX_SESSION_CATALOG_MAX_AGE_MS)).toBeNull();
-  expect(sandboxSessionCatalogKey(null, "codex-native")).toBeNull();
+  expect(sandboxSessionCatalogKey(null, "codex-native", "ag_1")).toBeNull();
+  expect(sandboxSessionCatalogKey("company", "codex-native", null)).toBeNull();
   vi.mocked(getCurrentUserId).mockReturnValue("bob");
-  expect(sandboxSessionCatalogKey("company", "codex-native")).not.toBe(sessionKey);
+  expect(sandboxSessionCatalogKey("company", "codex-native", "ag_1")).not.toBe(sessionKey);
   vi.mocked(getCurrentUserId).mockReturnValue("alice");
   vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-b");
-  expect(sandboxSessionCatalogKey("company", "codex-native")).not.toBe(sessionKey);
+  expect(sandboxSessionCatalogKey("company", "codex-native", "ag_1")).not.toBe(sessionKey);
   vi.mocked(getOmnigentServerIdentity).mockReturnValue(null);
-  expect(sandboxSessionCatalogKey("company", "codex-native")).toBeNull();
+  expect(sandboxSessionCatalogKey("company", "codex-native", "ag_1")).toBeNull();
   vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-a");
   vi.mocked(getCurrentUserId).mockReturnValue(null);
-  expect(sandboxSessionCatalogKey("company", "codex-native")).toBeNull();
+  expect(sandboxSessionCatalogKey("company", "codex-native", "ag_1")).toBeNull();
 });

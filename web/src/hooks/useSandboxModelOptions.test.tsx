@@ -10,7 +10,6 @@ import * as host from "@/lib/host";
 import type { SandboxStatus } from "@/lib/types";
 import {
   sandboxModelOptionsKey,
-  useSandboxAgentUsesProviderDefault,
   useSandboxModelOptions,
   useSandboxLaunchModelOptions,
   useSandboxUnsupportedAgents,
@@ -108,51 +107,6 @@ describe("useSandboxModelOptions", () => {
     await Promise.resolve();
     expect(fetchMock).not.toHaveBeenCalled();
   });
-});
-
-describe("useSandboxAgentUsesProviderDefault", () => {
-  const gatewayPreview = { ...catalog, configured: false, provider_label: "AI Gateway" };
-
-  it.each([
-    ["the provider's gateway catalog", gatewayPreview, true],
-    ["an empty gateway catalog", { ...gatewayPreview, models: [], status: "empty" }, true],
-    [
-      "an agent with its own provider or profile",
-      { ...gatewayPreview, status: "unconfigured" },
-      false,
-    ],
-    ["a harness the provider cannot serve", { ...gatewayPreview, status: "unsupported" }, false],
-    ["a configured inference binding", catalog, false],
-  ])("answers for %s", async (_label, preview, expected) => {
-    fetchMock.mockResolvedValue(new Response(JSON.stringify(preview)));
-    const { result } = renderEligibility();
-    await waitFor(() => expect(result.current.preview.isSuccess).toBe(true));
-    expect(result.current.usesDefault).toBe(expected);
-  });
-
-  it("says no until the preview loads and when it fails", async () => {
-    fetchMock.mockResolvedValue(new Response("{}", { status: 503 }));
-    const { result } = renderEligibility();
-    expect(result.current.usesDefault).toBe(false);
-    await waitFor(() => expect(result.current.preview.isError).toBe(true));
-    expect(result.current.usesDefault).toBe(false);
-  });
-
-  /** Render the answer beside the preview query it reads, so tests can wait for it to settle. */
-  function renderEligibility() {
-    return renderHook(
-      () => ({
-        usesDefault: useSandboxAgentUsesProviderDefault(
-          "agent_sandbox",
-          "claude-native",
-          "ag_1",
-          true,
-        ),
-        preview: useSandboxModelOptions("agent_sandbox", "claude-native", "ag_1", "alice", true),
-      }),
-      { wrapper: wrapper() },
-    );
-  }
 });
 
 describe("useSandboxUnsupportedAgents", () => {
@@ -404,57 +358,31 @@ describe("useSandboxLaunchModelOptions", () => {
   );
 
   it.each([
-    ["a provider-default preview", ready, ["opus"]],
-    [
-      "a configured inference binding",
-      { ...ready, configured: true },
-      ["gateway/opus", "gateway/gpt"],
-    ],
-    ["an agent with its own provider", { ...ready, models: [], status: "unconfigured" }, undefined],
-  ])("uses a running session's saved catalog only for %s", async (_label, preview, expected) => {
+    ["the agent's own saved catalog", "ag_1", ["opus"]],
+    ["another agent's saved catalog", "ag_other", ["gateway/opus", "gateway/gpt"]],
+  ])("prefers %s over the gateway list", async (_label, savedFor, expected) => {
     writeModelCatalogCache(
-      sandboxSessionCatalogKey("agent_sandbox", "claude-native"),
+      sandboxSessionCatalogKey("agent_sandbox", "claude-native", savedFor),
       [{ id: "opus", displayName: "Opus" }],
       false,
     );
+    serve();
+    const { result } = render();
+    await waitFor(() => expect(result.current?.map((row) => row.id)).toEqual(expected));
+  });
+
+  it("offers no saved catalog to an agent the provider's catalog cannot serve", async () => {
+    writeModelCatalogCache(
+      sandboxSessionCatalogKey("agent_sandbox", "claude-native", "ag_1"),
+      [{ id: "opus", displayName: "Opus" }],
+      false,
+    );
+    const preview = { ...ready, models: [], status: "unconfigured" };
     serve(preview);
     const { client, result } = render();
     const key = sandboxModelOptionsKey("agent_sandbox", "claude-native", "ag_1", "alice");
     await waitFor(() => expect(client.getQueryData(key)).toEqual(preview));
-    expect(result.current?.map((row) => row.id)).toEqual(expected);
-  });
-
-  it("ignores a running session's saved catalog while the preview has failed", async () => {
-    writeModelCatalogCache(
-      sandboxSessionCatalogKey("agent_sandbox", "claude-native"),
-      [{ id: "opus", displayName: "Opus" }],
-      false,
-    );
-    fetchMock.mockResolvedValue(new Response("{}", { status: 503 }));
-    const { client, result } = render();
-    const key = sandboxModelOptionsKey("agent_sandbox", "claude-native", "ag_1", "alice");
-    await waitFor(() => expect(client.getQueryState(key)?.status).toBe("error"));
     expect(result.current).toBeUndefined();
-  });
-
-  it("drops a running session's saved catalog once a preview refresh fails", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    try {
-      writeModelCatalogCache(
-        sandboxSessionCatalogKey("agent_sandbox", "claude-native"),
-        [{ id: "opus", displayName: "Opus" }],
-        false,
-      );
-      serve();
-      const { result } = render();
-      await waitFor(() => expect(result.current?.map((row) => row.id)).toEqual(["opus"]));
-      fetchMock.mockResolvedValue(new Response("{}", { status: 503 }));
-      await act(() => vi.advanceTimersByTimeAsync(15_000));
-      // The failed refresh keeps the last good preview rows, not the shared catalog.
-      await waitFor(() => expect(result.current).toEqual(previewRows));
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   it("recovers a launch's rows after an unavailable preview or a failed request", async () => {

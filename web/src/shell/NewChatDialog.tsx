@@ -307,13 +307,12 @@ import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   previewIsUnsupported,
-  previewSharesSessionCatalog,
   sandboxModelOptionsKey,
   useSandboxModelOptions,
   useSandboxUnsupportedAgents,
 } from "@/hooks/useSandboxModelOptions";
 import { useSavedSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
-import { markSandboxLaunch } from "@/lib/sandboxSessionProvenance";
+import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
@@ -3493,16 +3492,13 @@ function NewChatLandingContent({
   // A harness the default catalog cannot serve keeps its ordinary picker.
   const sandboxDefaultModelsEnabled =
     sandboxDefaultModelsOffered && sandboxModels.data?.status !== "unconfigured";
-  // A running session's own catalog is more accurate than the gateway preview.
+  // The agent's last sandbox session catalog is more accurate than the gateway preview.
   const savedSandboxCatalog = useSavedSandboxSessionCatalog(
     sandboxDefaultModelsOffered ? previewSandboxProvider : null,
     previewHarness,
+    effectiveAgentId,
   );
-  // Only agents that use the provider default share the running sessions' catalog.
-  const sandboxSessionCatalog =
-    sandboxDefaultModelsEnabled && previewSharesSessionCatalog(sandboxModels)
-      ? savedSandboxCatalog
-      : undefined;
+  const sandboxSessionCatalog = sandboxDefaultModelsEnabled ? savedSandboxCatalog : undefined;
   const sandboxInferenceConfigured =
     sandboxPreviewEnabled && sandboxModels.data?.configured === true;
   const sandboxHasModelCatalog = sandboxInferenceConfigured || sandboxDefaultModelsEnabled;
@@ -6381,10 +6377,7 @@ function NewChatLandingContent({
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
         if (sandboxSelected) {
           const launchedRow = sandboxCatalog?.find((row) => row.id === normalizedModelOverride);
-          markSandboxLaunch(created.id, {
-            model: normalizedModelOverride ?? null,
-            modelLabel: launchedRow ? nativeModelLabel(launchedRow) : null,
-          });
+          markSandboxLaunch(created.id, launchedRow ? nativeModelLabel(launchedRow) : null);
         }
       }
       // Persist the configuration that actually launched. Modal Save updates

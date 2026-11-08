@@ -15,7 +15,6 @@
 // Session metadata and item pages are shimmed through `seedSession`
 // helpers so tests can model capped snapshots and full transcripts.
 
-import { hasLiveSessionCatalog } from "@/lib/sandboxSessionProvenance";
 import type * as IdentityModule from "@/lib/identity";
 import { sideChatSettingsMutationKey } from "@/lib/sideChat";
 
@@ -12262,14 +12261,12 @@ describe("chatStore — session configuration scope", () => {
     await useChatStore.getState().switchTo("conv_cn_delayed");
 
     expect(patchCallsFor("conv_cn_delayed").some((p) => "model_override" in p)).toBe(false);
-    expect(hasLiveSessionCatalog("conv_cn_delayed")).toBe(false);
 
     handleSessionEvent({
       type: "session_model_options",
       conversationId: "conv_cn_delayed",
     });
     await tick();
-    expect(hasLiveSessionCatalog("conv_cn_delayed")).toBe(true);
 
     // The catalog fills the picker; the sticky stays a preference — no
     // silent request is ever written on its behalf.

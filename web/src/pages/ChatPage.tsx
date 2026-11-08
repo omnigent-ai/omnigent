@@ -252,11 +252,7 @@ import {
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
-import {
-  useSandboxAgentUsesProviderDefault,
-  useSandboxLaunchModelOptions,
-} from "@/hooks/useSandboxModelOptions";
-import { hasLiveSessionCatalog } from "@/lib/sandboxSessionProvenance";
+import { useSandboxLaunchModelOptions } from "@/hooks/useSandboxModelOptions";
 import { useSandboxLaunchSelectionCheck } from "@/hooks/useSandboxLaunchSelectionCheck";
 import { useRememberSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
@@ -958,29 +954,22 @@ export function ChatPage() {
     sandboxHostRows?.find((row) => row.host_id === activeSession?.hostId)?.sandbox_provider ??
     sandboxStatus?.provider ??
     null;
-  const sessionCatalogIsActive = activeSession != null && activeConversationId === activeSession.id;
-  const liveSessionCatalog =
-    sessionCatalogIsActive &&
-    !activeSession.inferenceConfigured &&
-    hasLiveSessionCatalog(activeSession.id);
-  // Agents with their own provider or profile have private catalogs, so only default ones are shared.
-  const agentUsesProviderDefault = useSandboxAgentUsesProviderDefault(
-    sessionSandboxProvider,
-    sandboxPreviewHarness,
-    activeSession?.agentId ?? null,
-    liveSessionCatalog,
-  );
+  const sandboxSessionCatalogActive =
+    activeSession != null &&
+    activeConversationId === activeSession.id &&
+    !activeSession.inferenceConfigured;
   useRememberSandboxSessionCatalog(
     sessionSandboxProvider,
     sandboxPreviewHarness,
-    activeSession?.id ?? null,
-    liveSessionCatalog && agentUsesProviderDefault,
+    activeSession?.agentId ?? null,
+    sessionModelOptions,
+    sandboxSessionCatalogActive,
   );
   useSandboxLaunchSelectionCheck(
     activeSession?.id ?? null,
     sandboxPreviewHarness,
     sessionModelOptions,
-    sessionCatalogIsActive && !activeSession.inferenceConfigured,
+    sandboxSessionCatalogActive,
   );
 
   // The session is unreachable and a message can't wake it: the host is

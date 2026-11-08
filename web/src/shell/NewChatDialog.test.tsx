@@ -13367,9 +13367,9 @@ describe("managed sandbox gateway preview", () => {
       displayName: "GPT 6 Luna",
       supportedReasoningEfforts: [{ reasoningEffort: "ultra" }],
     };
-    writeModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native"), [luna], false);
+    writeModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native", "a2"), [luna], false);
     writeModelCatalogCache(
-      sandboxSessionCatalogKey("arclet", "claude-native"),
+      sandboxSessionCatalogKey("arclet", "claude-native", "a1"),
       [{ id: "opus", displayName: "Opus" }],
       false,
     );
@@ -13402,38 +13402,21 @@ describe("managed sandbox gateway preview", () => {
     });
   });
 
-  it.each([
-    ["failed", undefined, new Error("Gateway down"), false],
-    ["failed to refresh", catalog, new Error("Gateway down"), false],
-    ["reports the agent's own inference", { ...catalog, configured: true }, null, true],
-  ])(
-    "withholds a running session's saved catalog from an agent whose discovery %s",
-    async (_label, data, error, showsAgentModels) => {
-      getCurrentUserIdMock.mockReturnValue("alice");
-      const luna = { id: "gpt-6-luna", displayName: "GPT 6 Luna" };
-      writeModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native"), [luna], false);
-      vi.mocked(useSandboxModelOptions).mockReturnValue({
-        data,
-        isLoading: false,
-        error,
-      } as unknown as ReturnType<typeof useSandboxModelOptions>);
-      authenticatedFetchMock.mockResolvedValue({
-        ok: true,
-        json: async () => ({ id: "conv_new" }),
-      } as Response);
-      renderGatewaySandbox();
-      selectAgent("a2");
-      openAgentModels("a2");
-      expect(screen.queryByTestId(`new-chat-landing-agent-model-${luna.id}`)).toBeNull();
-      const agentRow = screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`);
-      if (showsAgentModels) expect(agentRow).toBeInTheDocument();
-      else expect(agentRow).toBeNull();
-      closeMenu();
-      const { body } = await submitAndReadBody();
-      expect(body.agent_id).toBe("a2");
-      expect(body.model_override).not.toBe(luna.id);
-    },
-  );
+  it("does not offer another agent's saved catalog", async () => {
+    getCurrentUserIdMock.mockReturnValue("alice");
+    const luna = { id: "gpt-6-luna", displayName: "GPT 6 Luna" };
+    writeModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native", "a3"), [luna], false);
+    preview();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    selectAgent("a2");
+    openAgentModels("a2");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${luna.id}`)).toBeNull();
+    expect(screen.getByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeInTheDocument();
+  });
 
   it("drops an effort unsupported by the newly selected model", async () => {
     const glm = {
