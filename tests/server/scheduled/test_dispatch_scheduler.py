@@ -2537,7 +2537,7 @@ async def test_trigger_automations_poll_every_two_minutes_whatever_their_schedul
     assert store.get(task.id).next_run_at == task.next_run_at + TRIGGER_POLL_SECONDS
 
 
-async def test_a_new_trigger_automation_polls_within_two_minutes(store) -> None:
+async def test_an_uninitialized_trigger_automation_polls_within_two_minutes(store) -> None:
     store.configure_dispatch(False)
     task = _task(store, prompt=_TRIGGER_PROMPT, session_mode="continue")
     store.configure_dispatch(True)
@@ -2552,6 +2552,27 @@ async def test_a_new_trigger_automation_polls_within_two_minutes(store) -> None:
     await scheduler.poll_once()
     await _drain(scheduler)
     assert store.get(task.id).next_run_at == task.created_at + TRIGGER_POLL_SECONDS
+
+
+@pytest.mark.parametrize("busy_check", [True, False], ids=["busy-check", "no-busy-check"])
+async def test_a_saved_trigger_polls_two_minutes_out_only_with_a_busy_check(
+    store, busy_check
+) -> None:
+    PersistentTaskScheduler(
+        store,
+        AsyncMock(),
+        AsyncMock(return_value=None),
+        occurrence_busy=AsyncMock(return_value=False) if busy_check else None,
+    )
+    created = _task(store, prompt=_TRIGGER_PROMPT, session_mode="continue")
+    store.update(created.id, state="paused")
+    resumed = store.update(created.id, state="active")
+    for saved, at in ((created, created.created_at), (resumed, resumed.updated_at)):
+        if busy_check:
+            assert saved.next_run_at == at + TRIGGER_POLL_SECONDS
+        else:
+            # Without a busy check, the hourly saved schedule still applies.
+            assert saved.next_run_at - at > TRIGGER_POLL_SECONDS
 
 
 async def test_other_continued_sessions_keep_their_schedule_and_send_while_busy(store) -> None:

@@ -446,6 +446,9 @@ class PersistentTaskScheduler:
         )
         store.check_dispatch_support()
         store.configure_dispatch(True)
+        store.configure_trigger_polling(
+            TRIGGER_POLL_SECONDS if occurrence_busy is not None else None
+        )
         self._store = store
         self._on_fire = on_fire
         self._on_expired = on_expired

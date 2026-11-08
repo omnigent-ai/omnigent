@@ -50,6 +50,7 @@ from omnigent.server.scheduled.run_reconciler import (
 )
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
+    is_trigger_automation,
     next_scheduled_time,
     occurrence_host_id,
     scheduled_trigger_key,
@@ -216,6 +217,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         """
         super().__init__(storage_location)
         self._dispatch_enabled = False
+        self._trigger_poll_seconds: int | None = None
         self._engine = get_or_create_engine(storage_location)
         self._session = make_named_managed_session_maker(
             self._engine,
@@ -1070,13 +1072,30 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         if not self._dispatch_enabled:
             row.next_run_at = None
             return
-        row.next_run_at = next_scheduled_time(_to_entity(row), after)
+        task = _to_entity(row)
+        if (
+            self._trigger_poll_seconds is not None
+            and task.state == "active"
+            and is_trigger_automation(task)
+        ):
+            # The scheduler picks a trigger's polls, so a saved trigger polls this soon.
+            row.next_run_at = after + self._trigger_poll_seconds
+            return
+        row.next_run_at = next_scheduled_time(task, after)
         if row.next_run_at is None and row.state == encode_scheduled_task_state("active"):
             row.state = encode_scheduled_task_state("completed")
 
     def configure_dispatch(self, enabled: bool) -> None:
         """Select cursor maintenance before serving requests, using the app's release flag."""
         self._dispatch_enabled = enabled
+
+    def configure_trigger_polling(self, seconds: int | None) -> None:
+        """Set when a created, edited or resumed trigger automation first polls.
+
+        The scheduler sets *seconds* when it picks trigger poll times itself; ``None``
+        keeps each trigger's saved schedule.
+        """
+        self._trigger_poll_seconds = seconds
 
     def reset_dispatch_cursors(self) -> None:
         """Clear saved schedules in bounded transactions before starting legacy timers."""

@@ -446,7 +446,7 @@ def build_occurrence_busy(deps: FireDeps) -> Callable[[ScheduledTask, int], Awai
     Only a continue task with a recorded session skips, and only while the session is
     busy: it shows as running (a turn in progress, or waiting on an approval or
     question), or it changed less than :data:`BUSY_QUIET_SECONDS` ago. Even then, a
-    poll goes out once the latest run was scheduled :data:`BUSY_SKIP_MAX_SECONDS` ago.
+    poll goes out once the latest run went out :data:`BUSY_SKIP_MAX_SECONDS` ago.
     """
 
     async def occurrence_busy(task: ScheduledTask, now: int) -> bool:
@@ -470,7 +470,11 @@ def build_occurrence_busy(deps: FireDeps) -> Callable[[ScheduledTask, int], Awai
         ):
             return False
         runs, _ = await asyncio.to_thread(deps.scheduled_task_store.list_runs, task.id, limit=1)
-        return bool(runs) and now - runs[0].scheduled_at < BUSY_SKIP_MAX_SECONDS
+        if not runs:
+            return False
+        # Count from when the latest poll went out, which can be later than it was due.
+        sent_at = runs[0].fired_at if runs[0].fired_at is not None else runs[0].scheduled_at
+        return now - sent_at < BUSY_SKIP_MAX_SECONDS
 
     return occurrence_busy
 

@@ -194,11 +194,14 @@ Trigger automations are the exception. A trigger automation is such a task whose
 prompt starts with the opening sentence of a Jira, Slack, GitHub or Linear
 trigger template, the same check the web form uses. The database scheduler
 ignores a trigger's saved schedule and tries to poll it every two minutes
-(`TRIGGER_POLL_SECONDS`). Before claiming a poll, it skips it while the session
-is busy: it shows as running (a turn in progress, or waiting on an approval or
-question), or it changed in the last two minutes, since an agent can pause
-between steps. A poll still goes out once the latest run was scheduled ten
-minutes ago, so a stale status cannot stall the trigger. A skip only advances
+(`TRIGGER_POLL_SECONDS`). It also configures the store so that a trigger that is
+created, edited or resumed first polls two minutes later; after an upgrade, an
+existing trigger switches over at its next saved poll. Before claiming a poll,
+the scheduler skips it while the session is busy: it shows as running (a turn in
+progress, or waiting on an approval or question), or it changed in the last two
+minutes, since an agent can pause between steps. A poll still goes out once the
+latest run went out (`fired_at`) ten minutes ago, so a stale status cannot stall
+the trigger. A skip only advances
 `next_run_at`: it writes no run row and logs `scheduled_run_skipped_busy`. The
 status is read from session activity, which needs no caller access check, so the
 poll does not act as the owner. A failed check sends the prompt. Other continued

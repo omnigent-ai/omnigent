@@ -3935,7 +3935,11 @@ def test_session_unattended_disallowed_mode(
 
 
 def _occurrence_busy_check(
-    live_status: str | None, last_scheduled_at: int | None, *, updated_at: int = 0
+    live_status: str | None,
+    last_scheduled_at: int | None,
+    *,
+    updated_at: int = 0,
+    fired_at: int | None = None,
 ):
     """The busy check over one session's persisted status and the task's latest run."""
     session_id = "sess_busy_check"
@@ -3944,7 +3948,11 @@ def _occurrence_busy_check(
         if live_status is None
         else {session_id: SessionActivity(updated_at, live_status=live_status)}
     )
-    runs = [] if last_scheduled_at is None else [Mock(scheduled_at=last_scheduled_at)]
+    runs = (
+        []
+        if last_scheduled_at is None
+        else [Mock(scheduled_at=last_scheduled_at, fired_at=fired_at)]
+    )
     sched_store = Mock(list_runs=Mock(return_value=(runs, None)))
     conversation_store = Mock(get_session_activity=Mock(return_value=activity))
     return build_occurrence_busy(_deps(sched_store, conversation_store=conversation_store))
@@ -3986,6 +3994,14 @@ async def test_a_late_poll_counts_the_ten_minutes_from_the_current_time() -> Non
     assert await check(task, due) is True
     # Dispatched half an hour late, the poll is sent even though the session looks busy.
     assert await check(task, due + 30 * 60) is False
+
+
+async def test_the_ten_minutes_count_from_when_the_latest_poll_went_out() -> None:
+    due = 1_800_003_600
+    # The latest poll was due half an hour ago but only went out two minutes ago.
+    check = _occurrence_busy_check("running", due - 30 * 60, fired_at=due - 2 * 60)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) is True
 
 
 @pytest.mark.parametrize(
