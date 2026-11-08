@@ -2004,7 +2004,10 @@ async def _auto_create_opencode_terminal(
         client = server.client()
         try:
             # A fresh per-session DB skips the seeded auth.json import, so the
-            # user's API keys reach it through the credential API (best effort).
+            # user's API keys reach it through the integration API (best effort).
+            # Keep this before the env keys: on a fresh server connect/key returns
+            # 404 until GET /api/integration (the restore's first call) has loaded
+            # the integrations.
             session_credentials: frozenset[str] | None = None
             try:
                 session_credentials = await restore_user_api_keys(client)

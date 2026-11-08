@@ -46,7 +46,7 @@ _logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
-    from omnigent.onboarding.opencode_auth import OpenCodeCredential
+    from omnigent.onboarding.opencode_auth import OpenCodeApiKey
 
 # Env var the runner stamps on the harness process so the executor can
 # locate its bridge directory. Mirrors ``HARNESS_CODEX_NATIVE_BRIDGE_DIR``.
@@ -676,53 +676,79 @@ async def connect_env_provider_keys(
     return connected
 
 
-class _CredentialClient(Protocol):
-    async def list_credentials(self) -> Sequence[Mapping[str, object]]: ...
+class _IntegrationKeyClient(Protocol):
+    async def list_integrations(self) -> Sequence[Mapping[str, object]]: ...
 
-    async def create_credential(
-        self, integration_id: str, *, label: str, value: Mapping[str, object]
+    async def connect_provider_key(
+        self,
+        provider_id: str,
+        api_key: str,
+        *,
+        label: str | None = None,
+        answer: Mapping[str, object] | None = None,
     ) -> bool: ...
 
 
+def _integrations_with_credentials(integrations: Iterable[Mapping[str, object]]) -> set[str]:
+    """
+    Return the ids of the integrations that list a stored credential.
+
+    An ``env`` connection is not a stored credential and does not count.
+
+    :param integrations: v2 ``Integration.Info`` rows from ``GET /api/integration``.
+    :returns: Integration ids, e.g. ``{"openai"}``.
+    """
+    held: set[str] = set()
+    for info in integrations:
+        connections = info.get("connections")
+        if isinstance(connections, list) and any(
+            isinstance(conn, Mapping) and conn.get("type") == "credential" for conn in connections
+        ):
+            held.add(str(info.get("id")))
+    return held
+
+
 async def restore_user_api_keys(
-    client: _CredentialClient,
+    client: _IntegrationKeyClient,
     *,
-    credentials: Mapping[str, OpenCodeCredential] | None = None,
+    api_keys: Mapping[str, OpenCodeApiKey] | None = None,
 ) -> frozenset[str] | None:
     """
     Store the user's OpenCode API keys in the per-session credential DB.
 
-    OpenCode's schema bootstrap of a fresh DB (seen on 2.0.32) records its
-    ``auth.json`` import as done without running it, so the seeded file never
-    reaches the DB. Each user API key whose integration has no credential is
-    created with ``POST /api/credential``. OAuth logins are not copied (see
+    OpenCode's schema bootstrap of a fresh DB (seen on 2.0.18 and 2.0.32)
+    records its ``auth.json`` import as done without running it, so the seeded
+    file never reaches the DB. Each user API key whose integration lists no
+    stored credential is connected with ``POST /api/integration/{id}/connect/key``.
+    OAuth logins are not copied (see
     :func:`~omnigent.onboarding.opencode_auth.user_opencode_api_keys`).
 
     :param client: The per-session OpenCode client.
-    :param credentials: Credentials to store; ``None`` reads the user's API keys.
+    :param api_keys: API keys to store; ``None`` reads the user's API keys.
     :returns: Integration ids holding a credential in the session afterwards, or
-        ``None`` when the server cannot list credentials.
+        ``None`` when the server cannot list integrations.
     """
     from omnigent.onboarding.opencode_auth import user_opencode_api_keys
 
     try:
-        rows = await client.list_credentials()
-    except Exception as exc:  # noqa: BLE001 - a server without the route skips the restore.
+        integrations = await client.list_integrations()
+    except Exception as exc:  # noqa: BLE001 - without the list the restore cannot skip held keys.
         _logger.info(
-            "opencode credential list unavailable (status %s); API keys not restored",
+            "opencode integration list unavailable (status %s); API keys not restored",
             getattr(exc, "status_code", None),
         )
         return None
-    present = {str(row.get("integrationID")) for row in rows}
-    wanted = (
-        await asyncio.to_thread(user_opencode_api_keys) if credentials is None else credentials
-    )
-    for integration_id, credential in wanted.items():
+    present = _integrations_with_credentials(integrations)
+    wanted = await asyncio.to_thread(user_opencode_api_keys) if api_keys is None else api_keys
+    for integration_id, api_key in wanted.items():
         if integration_id in present:
             continue
         try:
-            await client.create_credential(
-                integration_id, label=credential.label, value=credential.value
+            await client.connect_provider_key(
+                integration_id,
+                api_key.key,
+                label=api_key.label,
+                answer=api_key.configuration,
             )
         except Exception as exc:  # noqa: BLE001 - one failure must not stop the rest.
             # The error body can echo the posted secret, so log only the status.

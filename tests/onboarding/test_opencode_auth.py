@@ -206,6 +206,21 @@ def test_user_opencode_api_keys_keep_v2_keys_convert_legacy_and_skip_oauth(
             ("broken", {"type": "key", "key": "old"}, None, 4),
             ("broken", {"type": "mystery"}, 1, 0),
             ("mistral", {"type": "key", "key": "m"}, None, 5),
+            # Key form answers are kept; metadata has no place in connect/key.
+            (
+                "cloudflare-workers-ai",
+                {
+                    "type": "key",
+                    "key": "c",
+                    "configuration": {"accountId": "acct"},
+                    "metadata": {"note": "n"},
+                },
+                None,
+                6,
+            ),
+            # A key row with no string key is not usable and hides the integration.
+            ("deepseek", {"type": "key", "key": "old"}, None, 7),
+            ("deepseek", {"type": "key"}, 1, 0),
         ]
     )
     with sqlite3.connect(db_path) as conn:
@@ -222,13 +237,13 @@ def test_user_opencode_api_keys_keep_v2_keys_convert_legacy_and_skip_oauth(
             "openai": {"type": "oauth", "refresh": "r", "access": "a", "expires": 1},
         },
     )
-    groq = {"type": "key", "key": "g", "metadata": {"region": "eu"}}
     assert oc.user_opencode_api_keys() == {
-        # v2 keys keep their stored value and label, and win over auth.json.
-        "anthropic": oc.OpenCodeCredential("x", {"type": "key", "key": "fresh"}),
-        "mistral": oc.OpenCodeCredential("API key", {"type": "key", "key": "m"}),
-        # Legacy keys convert like OpenCode's own import, trailing slash stripped.
-        "groq": oc.OpenCodeCredential("API key", groq),
+        # v2 keys keep their stored key and label, and win over auth.json.
+        "anthropic": oc.OpenCodeApiKey("x", "fresh"),
+        "mistral": oc.OpenCodeApiKey("API key", "m"),
+        "cloudflare-workers-ai": oc.OpenCodeApiKey("x", "c", {"accountId": "acct"}),
+        # Legacy keys are used too, trailing slash stripped and metadata dropped.
+        "groq": oc.OpenCodeApiKey("API key", "g"),
     }
 
 

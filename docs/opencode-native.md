@@ -40,12 +40,12 @@ OpenCode 2.x credential store (`~/.local/share/opencode/opencode.db`; the store
 wins on conflicts). A fresh conversation database does not run OpenCode's own
 import of that file, so once the server is up the runner also stores each of
 your API keys that the conversation's private database lacks through OpenCode's
-credential API (`POST /api/credential`). OAuth logins are not stored this way,
-because a conversation's copy of a rotating refresh token can invalidate your
-own login; connect them inside the conversation instead. Provider keys that exist only in
-the runner's environment (for example `ANTHROPIC_API_KEY`) are then connected
-through OpenCode's integration API at launch. With none of these, OpenCode runs
-on its free models.
+integration API (`POST /api/integration/{id}/connect/key`). OAuth logins are not
+stored this way, because a conversation's copy of a rotating refresh token can
+invalidate your own login; connect them inside the conversation instead. Provider
+keys that exist only in the runner's environment (for example
+`ANTHROPIC_API_KEY`) are then connected through the same API at launch. With
+none of these, OpenCode runs on its free models.
 
 ## Agent YAML
 

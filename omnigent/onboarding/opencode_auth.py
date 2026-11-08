@@ -162,34 +162,33 @@ _KEY_CREDENTIAL_LABEL = "API key"
 
 
 @dataclass(frozen=True)
-class OpenCodeCredential:
-    """A user credential in OpenCode 2.x ``Credential.Value`` shape.
+class OpenCodeApiKey:
+    """A user API key in the shape of OpenCode's ``connect/key`` request.
 
     :param label: Display label, e.g. ``"API key"``.
-    :param value: The v2 value, e.g. ``{"type": "key", "key": "sk-..."}``.
+    :param key: The secret key.
+    :param configuration: Answers to the integration's key form, e.g.
+        ``{"resourceName": "my-resource"}`` for Azure; ``None`` when there are none.
     """
 
     label: str
-    value: dict[str, object]
+    key: str
+    configuration: dict[str, object] | None = None
 
 
-def _legacy_key_value(entry: object) -> dict[str, object] | None:
-    """Convert a legacy ``auth.json`` ``api`` entry the way OpenCode's own import does.
+def _legacy_api_key(entry: object) -> str | None:
+    """Return the key of a legacy ``auth.json`` ``api`` entry.
 
     ``wellknown`` entries yield ``None`` too: OpenCode's import also registers
-    their source, which a bare key value cannot reproduce.
+    their source, which a bare key cannot reproduce. ``metadata`` is dropped,
+    because ``connect/key`` has no field for it.
 
-    :returns: A v2 ``key`` value, or ``None`` for any other entry.
+    :returns: The key, or ``None`` for any other entry.
     """
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or entry.get("type") != "api":
         return None
-    if entry.get("type") == "api" and isinstance(entry.get("key"), str):
-        value: dict[str, object] = {"type": "key", "key": entry["key"]}
-        metadata = entry.get("metadata")
-        if isinstance(metadata, dict) and metadata:
-            value["metadata"] = metadata
-        return value
-    return None
+    key = entry.get("key")
+    return key if isinstance(key, str) else None
 
 
 def _v2_credential_value(raw: object) -> dict[str, object] | None:
@@ -203,20 +202,38 @@ def _v2_credential_value(raw: object) -> dict[str, object] | None:
     return None
 
 
-def user_opencode_api_keys(db_path: Path | None = None) -> dict[str, OpenCodeCredential]:
-    """Return the user's OpenCode API keys in v2 ``Credential.Value`` shape.
+def _v2_api_key(label: str, value: dict[str, object]) -> OpenCodeApiKey | None:
+    """Return a v2 ``key`` credential value as an :class:`OpenCodeApiKey`.
+
+    ``metadata`` is dropped, because ``connect/key`` has no field for it.
+
+    :returns: The API key, or ``None`` for any other credential type.
+    """
+    key = value.get("key")
+    if value["type"] != "key" or not isinstance(key, str):
+        return None
+    configuration = value.get("configuration")
+    return OpenCodeApiKey(
+        label or _KEY_CREDENTIAL_LABEL,
+        key,
+        configuration if isinstance(configuration, dict) and configuration else None,
+    )
+
+
+def user_opencode_api_keys(db_path: Path | None = None) -> dict[str, OpenCodeApiKey]:
+    """Return the user's OpenCode API keys.
 
     The active (then newest) v2 credential per integration wins over
-    ``auth.json``; a legacy ``auth.json`` key without a v2 row is converted like
-    OpenCode's own import does. Only ``key`` credentials are returned, and an
-    integration whose winning credential has another type is left out entirely.
-    OAuth logins in particular must stay out: a per-session copy of a rotating
-    refresh token can invalidate the user's own login.
+    ``auth.json``; a legacy ``auth.json`` key without a v2 row is used too. Only
+    ``key`` credentials are returned, and an integration whose winning credential
+    has another type is left out entirely. OAuth logins in particular must stay
+    out: a per-session copy of a rotating refresh token can invalidate the user's
+    own login.
 
     :param db_path: DB to read; ``None`` uses :func:`opencode_db_path`.
-    :returns: ``{integration_id: credential}``.
+    :returns: ``{integration_id: api_key}``.
     """
-    keys: dict[str, OpenCodeCredential] = {}
+    keys: dict[str, OpenCodeApiKey] = {}
     try:
         legacy = json.loads(opencode_auth_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -224,19 +241,20 @@ def user_opencode_api_keys(db_path: Path | None = None) -> dict[str, OpenCodeCre
     if isinstance(legacy, dict):
         for raw_id, entry in legacy.items():
             integration_id = str(raw_id).rstrip("/")
-            value = _legacy_key_value(entry)
-            if integration_id and value is not None:
-                keys[integration_id] = OpenCodeCredential(_KEY_CREDENTIAL_LABEL, value)
+            key = _legacy_api_key(entry)
+            if integration_id and key is not None:
+                keys[integration_id] = OpenCodeApiKey(_KEY_CREDENTIAL_LABEL, key)
     stored: dict[str, tuple[str, dict[str, object]]] = {}
     for integration_id, label, raw in _v2_credential_rows(db_path):
         value = _v2_credential_value(raw)
         if value is not None:
             stored[integration_id] = (label, value)
     for integration_id, (label, value) in stored.items():
-        if value["type"] == "key":
-            keys[integration_id] = OpenCodeCredential(label or _KEY_CREDENTIAL_LABEL, value)
-        else:
+        api_key = _v2_api_key(label, value)
+        if api_key is None:
             keys.pop(integration_id, None)
+        else:
+            keys[integration_id] = api_key
     return keys
 
 

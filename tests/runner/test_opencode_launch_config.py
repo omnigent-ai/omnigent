@@ -59,7 +59,7 @@ class _FakeStartedServer:
         self.closed = True
 
 
-async def _credential_list_unavailable(client: Any) -> frozenset[str] | None:
+async def _integration_list_unavailable(client: Any) -> frozenset[str] | None:
     # The env-key fallback then keeps the seeded provider ids.
     return None
 
@@ -71,7 +71,7 @@ def launch_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://omnigent.test")
     seeded: list[Path] = []
     monkeypatch.setattr(bridge, "seed_opencode_auth", lambda d: seeded.append(d))
-    monkeypatch.setattr(bridge, "restore_user_api_keys", _credential_list_unavailable)
+    monkeypatch.setattr(bridge, "restore_user_api_keys", _integration_list_unavailable)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent-config"))
     monkeypatch.setattr(provider, "resolve_bound_opencode_gateway", lambda **k: None)
     monkeypatch.setattr(provider, "resolve_databricks_gateway", lambda *a, **k: None)

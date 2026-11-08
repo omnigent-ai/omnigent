@@ -464,51 +464,51 @@ class OpenCodeClient:
             return [item for item in data if isinstance(item, dict)]
         return []
 
-    async def connect_provider_key(self, provider_id: str, api_key: str) -> bool:
+    async def list_integrations(self) -> list[_JsonObject]:
         """
-        Store an API key for a provider integration
-        (``POST /api/integration/{id}/connect/key``).
+        List integrations and their connections (``GET /api/integration``).
 
-        :param provider_id: Integration id, e.g. ``"anthropic"``.
-        :param api_key: The key to store in the server's credential DB.
-        :returns: ``True`` on a 2xx response.
+        :returns: v2 ``Integration.Info`` rows, e.g.
+            ``{"id": "openai", "connections": [{"type": "credential", ...}], ...}``.
         :raises OpenCodeClientError: On a non-2xx status.
         """
-        await self._request_json(
-            "POST",
-            f"/api/integration/{provider_id}/connect/key",
-            json_body={"key": api_key},
-        )
-        return True
-
-    async def list_credentials(self) -> list[_JsonObject]:
-        """
-        List stored credentials (``GET /api/credential``).
-
-        :returns: v2 credential rows, e.g. ``{"id": "cred_1", "integrationID": "openai", ...}``.
-        :raises OpenCodeClientError: On a non-2xx status.
-        """
-        data = await self._request_json("GET", "/api/credential")
+        data = await self._request_json("GET", "/api/integration")
         if isinstance(data, list):
             return [item for item in data if isinstance(item, dict)]
         return []
 
-    async def create_credential(
-        self, integration_id: str, *, label: str, value: _JsonMapping
+    async def connect_provider_key(
+        self,
+        provider_id: str,
+        api_key: str,
+        *,
+        label: str | None = None,
+        answer: _JsonMapping | None = None,
     ) -> bool:
         """
-        Store a credential for an integration (``POST /api/credential``).
+        Store an API key for a provider integration
+        (``POST /api/integration/{id}/connect/key``).
 
-        :param integration_id: Integration id, e.g. ``"github-copilot"``.
-        :param label: Display label, e.g. ``"API key"``.
-        :param value: v2 ``Credential.Value``, e.g. ``{"type": "key", "key": "sk-..."}``.
+        Each call adds a credential and makes it the active one.
+
+        :param provider_id: Integration id, e.g. ``"anthropic"``.
+        :param api_key: The key to store in the server's credential DB.
+        :param label: Display label, e.g. ``"API key"``; ``None`` lets OpenCode
+            use the integration name.
+        :param answer: Answers to the integration's key form, e.g.
+            ``{"resourceName": "my-resource"}`` for Azure.
         :returns: ``True`` on a 2xx response.
         :raises OpenCodeClientError: On a non-2xx status.
         """
+        body: dict[str, object] = {"key": api_key}
+        if label is not None:
+            body["label"] = label
+        if answer is not None:
+            body["answer"] = dict(answer)
         await self._request_json(
             "POST",
-            "/api/credential",
-            json_body={"integrationID": integration_id, "label": label, "value": dict(value)},
+            f"/api/integration/{provider_id}/connect/key",
+            json_body=body,
         )
         return True
 

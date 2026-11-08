@@ -392,27 +392,32 @@ class _RecordingHandler:
         return self.response
 
 
-async def test_list_credentials() -> None:
+async def test_list_integrations() -> None:
+    openai = {"id": "openai", "connections": [{"type": "credential", "id": "cred_1"}]}
     handler = _RecordingHandler(
-        httpx.Response(200, json={"data": [{"id": "cred_1", "integrationID": "openai"}, "junk"]})
+        httpx.Response(200, json={"location": {"directory": "/repo"}, "data": [openai, "junk"]})
     )
     client = _client(handler)
-    assert await client.list_credentials() == [{"id": "cred_1", "integrationID": "openai"}]
-    assert [(r.method, r.url.path) for r in handler.requests] == [("GET", "/api/credential")]
+    assert await client.list_integrations() == [openai]
+    assert [(r.method, r.url.path) for r in handler.requests] == [("GET", "/api/integration")]
     await client.aclose()
 
 
-async def test_create_credential() -> None:
-    handler = _RecordingHandler(httpx.Response(200, json={"data": {"id": "cred_1"}}))
+async def test_connect_provider_key_sends_label_and_answer() -> None:
+    handler = _RecordingHandler(httpx.Response(204))
     client = _client(handler)
-    value = {"type": "key", "key": "sk-test"}
-    assert await client.create_credential("openai", label="API key", value=value) is True
+    assert (
+        await client.connect_provider_key(
+            "azure", "sk-test", label="API key", answer={"resourceName": "res"}
+        )
+        is True
+    )
     [request] = handler.requests
-    assert (request.method, request.url.path) == ("POST", "/api/credential")
+    assert (request.method, request.url.path) == ("POST", "/api/integration/azure/connect/key")
     assert json.loads(request.content) == {
-        "integrationID": "openai",
+        "key": "sk-test",
         "label": "API key",
-        "value": value,
+        "answer": {"resourceName": "res"},
     }
     await client.aclose()
 
