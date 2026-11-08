@@ -386,6 +386,7 @@ import {
   expandMentionTokens,
   findMentionTokens,
   presentMentions,
+  type TaggedMentions,
   withSessionMentionHint,
   detectMentionAt,
   type MentionState,
@@ -2110,6 +2111,8 @@ interface LandingDraft {
   project: string;
   message: string;
   files: File[];
+  /** Files and sessions tagged with "@" in ``message``. */
+  mentions?: TaggedMentions;
   pickedAgentId: string | null;
   selectedHostId: string | null;
   sandboxSelected: boolean;
@@ -5282,7 +5285,10 @@ function NewChatLandingContent({
     text: message,
     setText: setMessage,
     textareaRef,
+    initialMentions: restoredDraft?.mentions,
   });
+  // The draft snapshot is built above the hook; add the tags it owns.
+  draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
   const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;
   useComposerMirrorAlignment(mirrorRef, textareaRef, mentionTokensShown);
 

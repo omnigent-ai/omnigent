@@ -141,6 +141,7 @@ import {
   findMentionTokens,
   newFileMentionToken,
   presentMentions,
+  type TaggedMentions,
   withSessionMentionHint,
   detectMentionAt,
   type MentionItem,
@@ -2511,6 +2512,10 @@ function ComposerImpl(
   // draft-restore effect.
   const [settledConversationId, setSettledConversationId] = useState<string | null>(null);
   const draftConversationIdRef = useRef<string | null>(null);
+  // Tagged "@" items saved and restored with each conversation's draft. Filled
+  // in once useMentionBrowser below owns the state.
+  const taggedMentionsRef = useRef<TaggedMentions>({ files: [], sessions: [] });
+  const restoreTaggedMentionsRef = useRef<(mentions: TaggedMentions | undefined) => void>(() => {});
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
@@ -2895,6 +2900,7 @@ function ComposerImpl(
         : undefined;
     const restored = promoted ?? (conversationId ? getSessionDraft(conversationId) : undefined);
     replaceText(restored?.text ?? "", restored?.replyDraft);
+    restoreTaggedMentionsRef.current(restored?.mentions);
     textareaRef.current = tailTextareaRef.current;
     attachmentsRef.current.restoreFiles(restored?.files ?? []);
     dirtyRef.current = false;
@@ -2913,6 +2919,7 @@ function ComposerImpl(
         text: valueRef.current,
         files: filesRef.current,
         replyDraft: replyDraftRef.current,
+        mentions: taggedMentionsRef.current,
       });
     };
   }, [conversationId, replaceText]);
@@ -2937,7 +2944,13 @@ function ComposerImpl(
   // rather than only learning about a draft when this composer unmounts.
   useEffect(() => {
     if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
-    setSessionDraft(conversationId, { text: fullText, files, replyDraft: storedReplyDraft });
+    setSessionDraft(conversationId, {
+      text: fullText,
+      files,
+      replyDraft: storedReplyDraft,
+      // Tagging always edits the text too, so fullText re-runs this effect.
+      mentions: taggedMentionsRef.current,
+    });
   }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
 
   const terminalPending = useChatStore((s) => s.terminalPending);
@@ -3174,6 +3187,11 @@ function ComposerImpl(
   // tagged items and inline tokens, deduping against what's already tagged,
   // then clear the store queue so they aren't re-applied. Placed after
   // ``useMentionBrowser`` since it owns ``setMentionedItems``.
+  taggedMentionsRef.current = { files: mentionedItems, sessions: mentionedSessions };
+  restoreTaggedMentionsRef.current = (mentions) => {
+    setMentionedItems(mentions?.files ?? []);
+    setMentionedSessions(mentions?.sessions ?? []);
+  };
   // Read at drain time without re-running the effect on every keystroke.
   const mentionedItemsRef = useRef(mentionedItems);
   mentionedItemsRef.current = mentionedItems;

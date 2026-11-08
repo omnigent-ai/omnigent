@@ -1,9 +1,14 @@
 import { useSyncExternalStore } from "react";
+import { readTaggedMentions, type TaggedMentions } from "./composerMentions";
 import { readComposerDraft, type ComposerDraft } from "./replyDraft";
 
 export interface SessionDraft extends ComposerDraft {
   files: File[];
+  /** Files and sessions tagged with "@", so restored tokens still expand on send. */
+  mentions?: TaggedMentions;
 }
+
+type StoredDraft = string | (ComposerDraft & { mentions?: TaggedMentions });
 
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
 const listeners = new Set<() => void>();
@@ -19,7 +24,12 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
     const drafts = new Map<string, SessionDraft>();
     for (const [id, entry] of Object.entries(entries)) {
       const draft = readComposerDraft(entry);
-      if (draft?.text) drafts.set(id, { ...draft, files: [] });
+      if (!draft?.text) continue;
+      const mentions =
+        typeof entry === "object" && entry !== null
+          ? readTaggedMentions((entry as { mentions?: unknown }).mentions)
+          : undefined;
+      drafts.set(id, mentions ? { ...draft, files: [], mentions } : { ...draft, files: [] });
     }
     return drafts;
   } catch {
@@ -30,11 +40,20 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
 function saveDraftsToStorage(): void {
   if (typeof window === "undefined") return;
   try {
-    const entries: Record<string, string | ComposerDraft> = {};
+    const entries: Record<string, StoredDraft> = {};
     for (const [id, draft] of sessionDrafts) {
-      if (draft.text)
-        entries[id] = draft.replyDraft
-          ? { text: draft.text, replyDraft: draft.replyDraft }
+      if (!draft.text) continue;
+      const tagged =
+        draft.mentions && (draft.mentions.files.length > 0 || draft.mentions.sessions.length > 0)
+          ? draft.mentions
+          : undefined;
+      entries[id] =
+        draft.replyDraft || tagged
+          ? {
+              text: draft.text,
+              ...(draft.replyDraft ? { replyDraft: draft.replyDraft } : {}),
+              ...(tagged ? { mentions: tagged } : {}),
+            }
           : draft.text;
     }
     if (Object.keys(entries).length === 0) {
@@ -85,20 +104,33 @@ export function retireSessionDraft(conversationId: string): SessionDraft | undef
 }
 
 /** Merge a failed temporary session's unsent input back into its source draft. */
-export function recoverFailedSessionDraft<T extends { message: string; files: File[] }>(
-  originalDraft: T,
-  temporaryConversationId?: string,
-): T {
+export function recoverFailedSessionDraft<
+  T extends { message: string; files: File[]; mentions?: TaggedMentions },
+>(originalDraft: T, temporaryConversationId?: string): T {
   if (temporaryConversationId === undefined) return originalDraft;
   const temporaryDraft = retireSessionDraft(temporaryConversationId);
   if (temporaryDraft === undefined) return originalDraft;
   const message = [originalDraft.message, temporaryDraft.text]
     .filter((part) => part.trim() !== "")
     .join("\n\n");
+  const mentions =
+    originalDraft.mentions || temporaryDraft.mentions
+      ? {
+          files: [
+            ...(originalDraft.mentions?.files ?? []),
+            ...(temporaryDraft.mentions?.files ?? []),
+          ],
+          sessions: [
+            ...(originalDraft.mentions?.sessions ?? []),
+            ...(temporaryDraft.mentions?.sessions ?? []),
+          ],
+        }
+      : undefined;
   return {
     ...originalDraft,
     message,
     files: [...originalDraft.files, ...temporaryDraft.files],
+    ...(mentions ? { mentions } : {}),
   };
 }
 

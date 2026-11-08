@@ -272,7 +272,11 @@ export function presentMentions<T extends InlineMention>(
   mentions: readonly T[],
   texts: readonly string[],
 ): T[] {
-  return mentions.filter((m) => texts.some((t) => findMentionTokens(t, [m.token]).length > 0));
+  // Scan all tokens together so a token found only inside a longer one
+  // (``@README.md`` within ``@README.md (file)``) does not count as present.
+  const tokens = mentions.map((m) => m.token);
+  const found = new Set(texts.flatMap((t) => findMentionTokens(t, tokens).map((r) => r.token)));
+  return mentions.filter((m) => found.has(m.token));
 }
 
 /** Replace each token in ``text`` with its marker, in place. */
@@ -336,6 +340,46 @@ export function replaceSentMentions(
 /** Sent-message text for reading and copying: markers become ``@name``. */
 export function readableSentText(text: string): string {
   return replaceSentMentions(text, (m) => (m.kind === "session" ? `@${m.title}` : `@${m.path}`));
+}
+
+/** Everything tagged in one composer draft, saved and restored with its text. */
+export interface TaggedMentions {
+  files: MentionItem[];
+  sessions: SessionMention[];
+}
+
+function readTaggedFile(value: unknown): MentionItem | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { path, isDir, lineRange, token } = value as Record<string, unknown>;
+  if (typeof path !== "string" || typeof isDir !== "boolean") return null;
+  const item: MentionItem = { path, isDir };
+  if (typeof token === "string") item.token = token;
+  if (typeof lineRange === "object" && lineRange !== null) {
+    const { start, end } = lineRange as Record<string, unknown>;
+    if (typeof start === "number" && typeof end === "number") item.lineRange = { start, end };
+  }
+  return item;
+}
+
+function readTaggedSession(value: unknown): SessionMention | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { id, title, isSubagent, token } = value as Record<string, unknown>;
+  if (typeof id !== "string" || typeof title !== "string" || typeof isSubagent !== "boolean")
+    return null;
+  return typeof token === "string" ? { id, title, isSubagent, token } : { id, title, isSubagent };
+}
+
+/** Tagged items read back from storage; invalid entries are dropped. */
+export function readTaggedMentions(value: unknown): TaggedMentions | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { files, sessions } = value as Record<string, unknown>;
+  const result: TaggedMentions = {
+    files: Array.isArray(files) ? files.map(readTaggedFile).filter((it) => it !== null) : [],
+    sessions: Array.isArray(sessions)
+      ? sessions.map(readTaggedSession).filter((it) => it !== null)
+      : [],
+  };
+  return result.files.length > 0 || result.sessions.length > 0 ? result : undefined;
 }
 
 /** Shared empty list, so default props keep a stable reference. */

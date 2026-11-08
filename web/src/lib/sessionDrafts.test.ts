@@ -41,6 +41,26 @@ describe("session drafts", () => {
     expect(reloaded.getSessionDraft("another")).toBeUndefined();
   });
 
+  it("persists @-tagged files and sessions across a reload, dropping invalid entries", async () => {
+    const text = "Ask @Alpha planning about @src/a.ts";
+    const mentions = {
+      files: [{ path: "src/a.ts", isDir: false, token: "@src/a.ts" }],
+      sessions: [
+        { id: "s_alpha", title: "Alpha planning", isSubagent: false, token: "@Alpha planning" },
+      ],
+    };
+    const { setSessionDraft } = await import("./sessionDrafts");
+    setSessionDraft("conversation", { text, files: [], mentions });
+    const stored = JSON.parse(sessionStorage.getItem(key)!);
+    expect(stored).toEqual({ conversation: { text, mentions } });
+
+    stored.conversation.mentions.sessions.push({ id: 7 });
+    sessionStorage.setItem(key, JSON.stringify(stored));
+    vi.resetModules();
+    const reloaded = await import("./sessionDrafts");
+    expect(reloaded.getSessionDraft("conversation")).toEqual({ text, files: [], mentions });
+  });
+
   it("preserves fallback text when stored metadata is invalid or unsupported", async () => {
     const text = "> authored\ncontinued\n";
     sessionStorage.setItem(

@@ -14,6 +14,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
@@ -637,6 +638,22 @@ describe("dead file links give feedback instead of a silent no-op", () => {
   });
 });
 
+describe("mention pills from tagged files", () => {
+  it("opens the tagged file, without its line span, when the pill is clicked", () => {
+    renderMarkdown(
+      `see ${mentionPillMarkdown({ kind: "file", path: "src/a.ts" })} and ` +
+        mentionPillMarkdown({ kind: "file", path: "src/b.ts:3-9" }),
+      ["src/a.ts", "src/b.ts"],
+    );
+    const [whole, span] = screen.getAllByTestId("mention-pill");
+    expect([whole.textContent, span.textContent]).toEqual(["@src/a.ts", "@src/b.ts:3-9"]);
+    fireEvent.click(whole);
+    expect(openFile).toHaveBeenLastCalledWith("src/a.ts");
+    fireEvent.click(span);
+    expect(openFile).toHaveBeenLastCalledWith("src/b.ts");
+  });
+});
+
 describe("links to folders", () => {
   const openFolder = vi.fn();
   const FOLDER_VIEWER = { ...FILE_VIEWER_WITH_SESSION, openFolder };
@@ -677,6 +694,23 @@ describe("links to folders", () => {
     fireEvent.click(await screen.findByRole("button", { name: "targets" }));
     expect(openFolder).toHaveBeenCalledWith(FOLDER);
     expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("opens a tagged folder's pill in the Files tree", async () => {
+    fetchMock.mockResolvedValue(folderListing());
+    renderMarkdown(
+      mentionPillMarkdown({ kind: "file", path: "experimental/data/mobile-touch-targets/" }),
+      [],
+      FOLDER_VIEWER,
+    );
+    const pill = screen.getByTestId("mention-pill");
+    expect(pill.textContent).toBe("@experimental/data/mobile-touch-targets/");
+    // The pill opens once the existence check confirms it is a folder.
+    await waitFor(() => {
+      fireEvent.click(pill);
+      expect(openFolder).toHaveBeenCalledWith(FOLDER);
+    });
+    expect(openFile).not.toHaveBeenCalled();
   });
 
   it("leaves a folder as plain text where no Files tree can show it", async () => {

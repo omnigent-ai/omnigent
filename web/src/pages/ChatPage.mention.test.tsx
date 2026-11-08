@@ -519,10 +519,11 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     append("with @readme");
     fireEvent.click(screen.getByTitle("Attach readme.md"));
     expect(tokens()).toEqual(["@readme.md", "@readme.md (file)"]);
+    // Deleting the session token leaves only the file; its longer token must not
+    // keep the session tagged (which would still add the session hint).
+    type("compare  with @readme.md (file) ");
     fireEvent.submit(textarea().closest("form")!);
-    expect(onSend.mock.calls[0]![0]).toMatch(
-      /^compare \[Session: "readme\.md" id=s_readme subagent=no\] with \[Attached: readme\.md\]\n\n\[Tagged sessions:/,
-    );
+    expect(onSend).toHaveBeenCalledWith("compare  with [Attached: readme.md]", undefined);
   });
 
   it("keeps the highlighted file when session results land above it", async () => {
@@ -710,6 +711,23 @@ describe("Composer @-session mentions", () => {
       'Ask [Session: "auth" id=s_child subagent=yes] to compare with ' +
         `[Session: "Alpha planning" id=s_alpha subagent=no]\n\n${SESSION_MENTION_HINT}`,
       undefined,
+    );
+  });
+
+  it("keeps tagged sessions when the composer remounts with the saved draft", () => {
+    const onSend = vi.fn();
+    const first = renderWithTooltips(<Composer {...composerProps()} />);
+    type("Ask @alpha");
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+    append("to review");
+    // Leaving the page unmounts the composer; the draft is saved per session.
+    first.unmount();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    expect(textarea().value).toBe("Ask @Alpha planning to review");
+    expect(tokens()).toEqual(["@Alpha planning"]);
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe(
+      `Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review\n\n${SESSION_MENTION_HINT}`,
     );
   });
 

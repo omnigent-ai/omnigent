@@ -10,6 +10,7 @@ import {
   type MentionState,
   type SessionMention,
   sessionMentionToken,
+  type TaggedMentions,
 } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -36,6 +37,8 @@ export interface MentionBrowserParams {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   /** On mobile, Enter inserts a newline rather than acting on the menu. */
   isMobile?: boolean;
+  /** Tags restored with a saved draft, used for the first render only. */
+  initialMentions?: TaggedMentions;
 }
 
 export interface MentionBrowser {
@@ -77,10 +80,15 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setText,
     textareaRef,
     isMobile = false,
+    initialMentions,
   } = params;
   const [mentionIndex, setMentionIndex] = useState(-1);
-  const [mentionedItems, setMentionedItems] = useState<MentionItem[]>([]);
-  const [mentionedSessions, setMentionedSessions] = useState<SessionMention[]>([]);
+  const [mentionedItems, setMentionedItems] = useState<MentionItem[]>(
+    () => initialMentions?.files ?? [],
+  );
+  const [mentionedSessions, setMentionedSessions] = useState<SessionMention[]>(
+    () => initialMentions?.sessions ?? [],
+  );
   // Sessions occupy rows [0, sessionEntries.length); files follow.
   const rowCount = sessionEntries.length + mentionEntries.length;
   const mentionOpen = rowCount > 0;

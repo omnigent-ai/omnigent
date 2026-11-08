@@ -121,6 +121,16 @@ describe("expanding composer text", () => {
     );
   });
 
+  it("does not count a token found only inside a longer token as present", () => {
+    const clashing = [
+      { token: "@README.md", marker: "[Session: …]" },
+      { token: "@README.md (file)", marker: "[Attached: README.md]" },
+    ];
+    expect(presentMentions(clashing, ["see @README.md (file)"]).map((m) => m.token)).toEqual([
+      "@README.md (file)",
+    ]);
+  });
+
   it("drops mentions whose token was deleted from every segment", () => {
     expect(presentMentions(mentions, ["only @auth here"]).map((m) => m.token)).toEqual(["@auth"]);
   });
