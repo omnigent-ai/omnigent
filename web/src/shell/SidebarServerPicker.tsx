@@ -1,8 +1,7 @@
 import { useEffect, useState } from "react";
 import { CheckIcon, LogOutIcon, PlusIcon, SettingsIcon } from "lucide-react";
 import { toast } from "sonner";
-import { logout } from "@/lib/accountsApi";
-import { withBasePath } from "@/lib/basePath";
+import { signOutOfBrowserSession } from "@/lib/accountsApi";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { CompactShortcutKeys, settingsShortcutKeys } from "@/components/KeyboardShortcut";
@@ -116,10 +115,7 @@ export function SidebarServerPicker() {
   const { inSettings } = useSettingsRoute();
 
   useEffect(() => {
-    if (!nativeServerPicker) {
-      setInfo(currentOriginPicker());
-      return;
-    }
+    if (!nativeServerPicker) return;
     let cancelled = false;
     // Without picker data the footer still renders, so Settings stays reachable.
     void getServerPicker().then((result) => {
@@ -190,13 +186,7 @@ export function SidebarServerPicker() {
       return;
     }
     if (browserServerInfo === null || browserServerInfo.login_url === null) return;
-    if (browserServerInfo.accounts_enabled) {
-      void logout().then(() => {
-        window.location.href = withBasePath("/login");
-      });
-      return;
-    }
-    window.location.href = withBasePath("/auth/logout");
+    void signOutOfBrowserSession(browserServerInfo.accounts_enabled);
   };
 
   return (
@@ -210,7 +200,12 @@ export function SidebarServerPicker() {
         onOpenChange={(open) => {
           // Re-read when opened so a newly applied/removed MDM profile appears
           // without restarting the server-served SPA.
-          if (open && nativeServerPicker) void getServerPicker().then(setInfo);
+          // A failed re-read keeps the last list rather than dropping the footer.
+          if (open && nativeServerPicker) {
+            void getServerPicker().then((result) => {
+              if (result) setInfo(result);
+            });
+          }
         }}
       >
         <DropdownMenuTrigger asChild>

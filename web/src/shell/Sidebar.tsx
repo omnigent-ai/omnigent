@@ -1279,10 +1279,8 @@ function SidebarImpl({
                   testId="electron-sidebar-search-button"
                 />
               )}
-              {/* On the macOS shell this copy is hidden: Search renders beside
-            the wordmark above, while the toggle and Back/Forward stay in
-            AppShell's persistent title-bar strip. Everywhere else this is the
-            only action cluster. */}
+              {/* Hidden on the macOS shell, where Search sits by the wordmark and the
+            toggle and Back/Forward live in AppShell's title strip. */}
               <SidebarHeaderActions
                 expanded={!peek}
                 // onOpen is optional (the sidebar renders standalone in tests), so

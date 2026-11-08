@@ -5,6 +5,7 @@ import { openTerminalLink } from "@/components/blocks/TerminalSession";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import {
   requestHistoryNavigation,
+  resetHistoryNavigationForTests,
   useHistoryNavigation,
   useHistoryNavigationAvailability,
 } from "./useHistoryNavigation";
@@ -58,6 +59,8 @@ beforeEach(() => {
 
 afterEach(() => {
   embedded = false;
+  navigationType = "POP";
+  resetHistoryNavigationForTests();
   resetDesktopCommandsForTests();
   Reflect.deleteProperty(window, "omnigentDesktop");
   document.body.innerHTML = "";
@@ -164,6 +167,35 @@ describe("useHistoryNavigationAvailability", () => {
 
     step(0, "POP", view);
     expect(view.result.current).toEqual({ canGoBack: false, canGoForward: true });
+  });
+
+  it("keeps Forward accurate across navigations made while the buttons are unmounted", () => {
+    setHistoryIndex(5);
+    navigationType = "PUSH";
+    const shell = renderHook(() => useHistoryNavigation(true));
+    let buttons = renderHook(() => useHistoryNavigationAvailability());
+    step(2, "POP", shell);
+    buttons.rerender();
+    expect(buttons.result.current.canGoForward).toBe(true);
+
+    // Settings hides the buttons; pushing it from entry 2 drops entries 4 and 5.
+    buttons.unmount();
+    step(3, "PUSH", shell);
+    step(2, "POP", shell);
+    buttons = renderHook(() => useHistoryNavigationAvailability());
+    expect(buttons.result.current).toEqual({ canGoBack: true, canGoForward: true });
+
+    step(3, "POP", shell);
+    buttons.rerender();
+    expect(buttons.result.current).toEqual({ canGoBack: true, canGoForward: false });
+  });
+
+  it("ignores navigation requests that are not a single step", () => {
+    renderInShell();
+    for (const detail of [-3, 0, 2, "back", null]) {
+      window.dispatchEvent(new CustomEvent("omnigent:history-navigation", { detail }));
+    }
+    expect(navigate).not.toHaveBeenCalled();
   });
 
   it("embedded, offers Back only after the page the app opened on", () => {

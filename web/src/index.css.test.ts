@@ -1484,7 +1484,16 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
 
   it("has the clearance rule this test exists to protect", () => {
     expect(rule, "the maximized rail tab-strip padding rule is gone from index.css").toBeDefined();
-    expect(rule).toContain("padding-left: calc(var(--mac-traffic-light-width) + 5rem)");
+    expect(rule).toContain("padding-left: var(--mac-header-actions-clearance)");
+  });
+
+  it("clears the same width as the chat header, which sits under the same cluster", () => {
+    expect(cssSource).toMatch(
+      /\.traffic-light-clearance \{\s*padding-left: var\(--mac-header-actions-clearance\);/,
+    );
+    expect(cssSource).toContain(
+      "--mac-header-actions-clearance: calc(var(--mac-traffic-light-width) + 6.75rem);",
+    );
   });
 
   it("clears the lights on the mac shell while the sidebar is collapsed", () => {

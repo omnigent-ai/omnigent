@@ -2687,11 +2687,8 @@ function AppShellImpl() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
-            {/* The sidebar toggle and Back/Forward live HERE on the macOS shell
-          so they hold one fixed position beside the traffic lights no matter
-          what the sidebar does. Search sits with the wordmark while the sidebar
-          is open and joins this cluster when it collapses; Settings is in the
-          profile footer. */}
+            {/* macOS shell: the toggle and Back/Forward stay fixed beside the traffic
+          lights. Search joins them when collapsed; Settings is in the profile footer. */}
             {/* Hidden on /settings: the settings nav replaces the session list
           INSIDE the sidebar, and its "Back" row is the only way out. Leaving a
           collapse toggle up here would let the user hide the one exit and strand

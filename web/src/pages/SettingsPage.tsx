@@ -104,8 +104,7 @@ import {
 } from "@/components/ui/dialog";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
-import { changePassword, logout } from "@/lib/accountsApi";
-import { withBasePath } from "@/lib/basePath";
+import { changePassword, signOutOfBrowserSession } from "@/lib/accountsApi";
 import {
   beginGithubConnect,
   disconnectGithub,
@@ -2705,21 +2704,7 @@ function AccountSection() {
     })();
   }, []);
 
-  const onSignOut = useCallback(async () => {
-    if (accountsEnabled) {
-      // Accounts: clear the cookie via the JSON logout endpoint, then land on
-      // the SPA login form.
-      await logout();
-      // Hard navigation so the chat store / react-query cache reset.
-      window.location.href = withBasePath("/login");
-      return;
-    }
-    // OIDC: logout is a server-side GET redirect at /auth/logout that clears
-    // the session cookie (and honors the IdP end-session endpoint when
-    // configured). A hard navigation lets the browser follow it and resets
-    // client caches.
-    window.location.href = withBasePath("/auth/logout");
-  }, [accountsEnabled]);
+  const onSignOut = useCallback(() => signOutOfBrowserSession(accountsEnabled), [accountsEnabled]);
 
   const resetPwForm = useCallback(() => {
     setOldPw("");

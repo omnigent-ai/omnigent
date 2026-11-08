@@ -1,9 +1,7 @@
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
-// Behaviour tests for the mobile sidebar drawer shape: it stops short of the
-// right edge so a strip of the chat stays visible, tapping that strip dismisses
-// it (replacing the collapse toggle, which is now desktop-only), Search floats
-// at the top of the drawer, and Settings sits in the profile footer.
+// Mobile drawer: a strip of chat stays visible and dismisses it on tap, Search
+// floats at the top, and Settings sits in the profile footer.
 
 import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

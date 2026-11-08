@@ -1263,6 +1263,8 @@ aside[aria-label="Workspace"][data-maximized] {
 html[data-electron-mac] {
   --mac-titlebar-height: calc(48px / var(--omnigent-electron-zoom, 1));
   --mac-traffic-light-width: calc(88px / var(--omnigent-electron-zoom, 1));
+  /* The lights plus the collapsed cluster: four 1.5rem icons with 0.25rem gaps. */
+  --mac-header-actions-clearance: calc(var(--mac-traffic-light-width) + 6.75rem);
 }
 html[data-electron-mac][data-electron-full-screen] {
   --mac-traffic-light-width: 12px;
@@ -1369,7 +1371,7 @@ html[data-electron-mac]
 /* Clear the fixed native-control area plus the font-relative action cluster
  * when the collapsed sidebar exposes the chat header at the window edge. */
 html[data-electron-mac] .traffic-light-clearance {
-  padding-left: calc(var(--mac-traffic-light-width) + 5rem + 16px);
+  padding-left: var(--mac-header-actions-clearance);
 }
 /* A maximized rail reaches the same window corner while the sidebar is closed.
  * Once the sidebar opens, the rail starts to its right and needs no clearance. */
@@ -1377,7 +1379,7 @@ html[data-electron-mac]
   .app-shell:not([data-sidebar-open])
   aside[aria-label="Workspace"][data-maximized]
   .workspace-tab-strip {
-  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
+  padding-left: var(--mac-header-actions-clearance);
 }
 /* Below md the phone header and drawer carry their own controls, so drop the
  * title-bar cluster and start those headers right of the lights. */

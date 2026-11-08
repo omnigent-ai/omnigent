@@ -1,9 +1,7 @@
-// In the desktop app, ⌘[ / ⌘] (Ctrl+[ / Ctrl+] on Win/Linux), the Go menu, trackpad
-// swipes, and the mouse back/forward buttons step back and forward through in-app
-// navigation history; the sidebar's Back/Forward buttons do so everywhere. A browser
-// tab keeps the browser's own Back and Forward. Bind ONCE.
+// Desktop: ⌘[ / ⌘], the Go menu, swipes and mouse buttons step through in-app history.
+// The sidebar Back/Forward buttons work everywhere; browser tabs keep native Back. Bind ONCE.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -33,14 +31,43 @@ let firstAppEntry = 0;
 /** The last entry Forward can reach; a push drops the entries after it. */
 let lastReachableIndex: number | null = null;
 
-/** Whether Back and Forward have an in-app entry to step to, for the buttons. */
-export function useHistoryNavigationAvailability(): { canGoBack: boolean; canGoForward: boolean } {
-  useLocation();
-  const navigationType = useNavigationType();
+interface HistoryNavigationAvailability {
+  canGoBack: boolean;
+  canGoForward: boolean;
+}
+const NO_HISTORY: HistoryNavigationAvailability = { canGoBack: false, canGoForward: false };
+let availability = NO_HISTORY;
+const availabilityListeners = new Set<() => void>();
+
+/** Record a navigation. The always-mounted shell hook calls this, so none are missed. */
+function recordNavigation(navigationType: string): void {
   const index = historyIndex();
-  if (lastReachableIndex === null || navigationType === "PUSH") lastReachableIndex = index;
-  else lastReachableIndex = Math.max(lastReachableIndex, index);
-  return { canGoBack: index > firstAppEntry, canGoForward: index < lastReachableIndex };
+  lastReachableIndex =
+    lastReachableIndex === null || navigationType === "PUSH"
+      ? index
+      : Math.max(lastReachableIndex, index);
+  const canGoBack = index > firstAppEntry;
+  const canGoForward = index < lastReachableIndex;
+  if (canGoBack === availability.canGoBack && canGoForward === availability.canGoForward) return;
+  availability = { canGoBack, canGoForward };
+  for (const listener of availabilityListeners) listener();
+}
+
+function subscribeToAvailability(listener: () => void): () => void {
+  availabilityListeners.add(listener);
+  return () => availabilityListeners.delete(listener);
+}
+
+/** Whether Back and Forward have an in-app entry to step to, for the buttons. */
+export function useHistoryNavigationAvailability(): HistoryNavigationAvailability {
+  return useSyncExternalStore(subscribeToAvailability, () => availability);
+}
+
+/** Forget recorded history between tests. */
+export function resetHistoryNavigationForTests(): void {
+  firstAppEntry = 0;
+  lastReachableIndex = null;
+  availability = NO_HISTORY;
 }
 
 /** Step back or forward the way ⌘[ / ⌘] do. */
@@ -50,11 +77,14 @@ export function requestHistoryNavigation(direction: HistoryNavigationDirection):
 
 export function useHistoryNavigation(isMac = isMacPlatform()): void {
   const navigate = useNavigate();
+  const location = useLocation();
+  const navigationType = useNavigationType();
   const embedded = useIsEmbedded();
   // Set during the first render, before anything below reads it.
   useState(() => {
     firstAppEntry = embedded ? historyIndex() : 0;
   });
+  useEffect(() => recordNavigation(navigationType), [location, navigationType]);
   // Back stops at the first in-app entry rather than leaving for a sign-in or setup page.
   const go = useCallback(
     (delta: HistoryNavigationDirection) => {
@@ -83,8 +113,10 @@ export function useHistoryNavigation(isMac = isMacPlatform()): void {
       event.preventDefault();
       go(delta);
     };
-    const onRequest = (event: Event) =>
-      go((event as CustomEvent<HistoryNavigationDirection>).detail);
+    const onRequest = (event: Event) => {
+      const { detail } = event as CustomEvent<unknown>;
+      if (detail === -1 || detail === 1) go(detail);
+    };
     const electron = isElectronShell();
     window.addEventListener(HISTORY_NAVIGATION_REQUEST_EVENT, onRequest);
     if (electron) {
