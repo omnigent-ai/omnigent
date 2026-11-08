@@ -14,6 +14,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only on Windows
     resource = None  # type: ignore[assignment]
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from threading import Lock
 from typing import Protocol
@@ -176,6 +177,8 @@ class MeterLike(Protocol):
         name: str,
         unit: str = "",
         description: str = "",
+        *,
+        explicit_bucket_boundaries_advisory: Sequence[float] | None = None,
     ) -> HistogramInstrument:
         """
         Create a histogram instrument.
@@ -183,6 +186,7 @@ class MeterLike(Protocol):
         :param name: Metric name, e.g.
             ``"omnigent.server.http.request.duration"``.
         :param unit: UCUM unit string, e.g. ``"s"``.
+        :param explicit_bucket_boundaries_advisory: Preferred bounds in the instrument unit.
         :param description: Human-readable metric description.
         :returns: OpenTelemetry histogram instrument.
         """
@@ -823,6 +827,22 @@ def _create_request_otel_instruments(meter: MeterLike) -> _RequestOtelInstrument
             "omnigent.server.http.request.duration",
             unit="s",
             description="HTTP request processing duration.",
+            explicit_bucket_boundaries_advisory=(
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.075,
+                0.1,
+                0.25,
+                0.5,
+                0.75,
+                1,
+                2.5,
+                5,
+                7.5,
+                10,
+            ),
         ),
         in_flight=meter.create_gauge(
             "omnigent.server.http.requests.in_flight",
