@@ -1203,8 +1203,9 @@ async def _prepare_codex_terminal(
         # in-process codex harness. Resolved before any rollout synthesis
         # so session_meta can name the provider the launch routes through.
         _codex_launch = resolve_native_codex_launch(model=model, terminal_launch_args=codex_args)
+        resume_rollout: Path | None = None
         if thread_id is not None:
-            await _ensure_local_codex_resume_rollout(
+            resume_rollout = await _ensure_local_codex_resume_rollout(
                 client,
                 session_id=session_id,
                 external_session_id=thread_id,
@@ -1264,6 +1265,7 @@ async def _prepare_codex_terminal(
                     retain_client=codex_remote_resume_omits_permission_args(
                         app_server.codex_cli_version
                     ),
+                    rollout_path=resume_rollout,
                 )
                 write_bridge_state(
                     bridge_dir,
@@ -2302,6 +2304,15 @@ def _codex_rollout_records_from_session_items(
                             message = {
                                 **message,
                                 "arguments": _codex_replayed_arguments(message["arguments"]),
+                            }
+                        elif (
+                            message.get("type")
+                            in ("function_call_output", "custom_tool_call_output")
+                            and "output" in message
+                        ):
+                            message = {
+                                **message,
+                                "output": sanitize_replayed_image_blocks(message["output"]),
                             }
                     replacement_history.append(message)
                 replacement_history = _codex_history_without_orphan_outputs(replacement_history)

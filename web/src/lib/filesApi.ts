@@ -40,3 +40,26 @@ export async function uploadFile(sessionId: string, file: File): Promise<Uploade
     created_at: resource.metadata?.created_at ?? 0,
   };
 }
+
+/**
+ * Download a session's uploaded file back into a `File`, e.g. to attach it again.
+ *
+ * @param sessionId - The session the file was uploaded to.
+ * @param fileId - The file's id from its message block.
+ * @param filename - Name for the returned file, e.g. ``"chart.png"``.
+ * @throws ApiError when the server refuses the download.
+ */
+export async function downloadSessionFile(
+  sessionId: string,
+  fileId: string,
+  filename: string,
+): Promise<File> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(fileId)}/content`,
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  const blob = await res.blob();
+  // Its bytes, not the Blob itself: a File from another implementation (e.g. a test
+  // DOM's) doesn't recognize the fetch Blob and stores "[object Blob]".
+  return new File([await blob.arrayBuffer()], filename, { type: blob.type });
+}
