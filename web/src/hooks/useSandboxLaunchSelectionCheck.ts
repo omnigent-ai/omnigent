@@ -66,6 +66,13 @@ export function useSandboxLaunchSelectionCheck(
   enabled: boolean,
 ) {
   const conversationId = useChatStore((state) => state.conversationId);
+  // Leaving before the catalog arrives retires the check, so a later reopen never resets.
+  useEffect(
+    () => () => {
+      if (sessionId !== null) pendingLaunchChecks.delete(sessionId);
+    },
+    [sessionId],
+  );
   useEffect(() => {
     if (!enabled || sessionId === null || conversationId !== sessionId) return;
     if (harness === null || models.length === 0 || !pendingLaunchChecks.has(sessionId)) return;

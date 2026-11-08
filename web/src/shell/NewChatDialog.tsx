@@ -3498,7 +3498,10 @@ function NewChatLandingContent({
     previewHarness,
     effectiveAgentId,
   );
-  const sandboxSessionCatalog = sandboxDefaultModelsEnabled ? savedSandboxCatalog : undefined;
+  const sandboxSessionCatalog =
+    sandboxDefaultModelsEnabled && sandboxModels.data?.status !== "unsupported"
+      ? savedSandboxCatalog
+      : undefined;
   const sandboxInferenceConfigured =
     sandboxPreviewEnabled && sandboxModels.data?.configured === true;
   const sandboxHasModelCatalog = sandboxInferenceConfigured || sandboxDefaultModelsEnabled;

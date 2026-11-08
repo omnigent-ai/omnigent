@@ -170,6 +170,23 @@ describe("sandbox session catalog hooks", () => {
     expect(toast.info).not.toHaveBeenCalled();
   });
 
+  it("retires the check when the user leaves before the catalog arrives", async () => {
+    markSandboxLaunch(sessionId, null);
+    const hook = renderHook(
+      ({ id, models }: { id: string; models: NativeModelOption[] }) =>
+        useSandboxLaunchSelectionCheck(id, "codex-native", models, true),
+      { initialProps: { id: sessionId, models: [] as NativeModelOption[] } },
+    );
+    act(() => useChatStore.setState({ conversationId: "conv_elsewhere" }));
+    hook.rerender({ id: "conv_elsewhere", models: [] });
+    // Reopening later and receiving the catalog must not reset anything.
+    act(() => useChatStore.setState({ conversationId: sessionId }));
+    hook.rerender({ id: sessionId, models: codexModels });
+    await act(async () => {});
+    expect(setModel).not.toHaveBeenCalled();
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["a session this tab did not launch, such as one waking", { launched: false }],
     ["a session with configured inference", { enabled: false }],
