@@ -7,10 +7,11 @@ import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
-import { useLocation, useNavigate } from "@/lib/routing";
+import { useLocation, useNavigate, useParams } from "@/lib/routing";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { useSettingsRoute } from "@/shell/settingsNav";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
@@ -19,7 +20,7 @@ import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 // kept mounted across a param change (ChatPage across `/` ↔ `/c/:id`) still emits
 // one view per destination under the same id.
 //
-// SettingsPage and TasksPage own their page-view IDs because their section
+// SettingsRoute and TasksPage own their page-view IDs because their section
 // depends on route/query parameters.
 function withPageView<P extends object>(id: string, Component: ComponentType<P>): ComponentType<P> {
   return function WithPageView(props: P) {
@@ -92,6 +93,22 @@ function AppRedirect({ to }: { to: string }) {
     navigate({ pathname: to, search, hash }, { replace: true });
   }, [navigate, to, search, hash]);
   return null;
+}
+
+// Bare /settings renders General at once and canonicalizes the URL afterwards.
+// A redirect-only route would commit an empty outlet beside the swapped settings
+// nav and hold that blank frame while the lazy page loads; the view counts once.
+function SettingsRoute({ canonicalPath }: { canonicalPath: string }) {
+  const { section: sectionSegment } = useParams();
+  const { section } = useSettingsRoute();
+  const canonical = sectionSegment !== undefined;
+  useOmnigentPageView(canonical ? `settings.${section}` : null);
+  return (
+    <>
+      {!canonical && <AppRedirect to={canonicalPath} />}
+      <SettingsPage />
+    </>
+  );
 }
 
 interface AppProps {
@@ -231,12 +248,11 @@ function AppRoutes({ basename }: AppProps) {
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section
               is carried in the URL (/settings/<section>); bare /settings
-              redirects to the canonical General section. */}
+              shows General and is replaced with /settings/general. */}
           <Route
-            path={`${prefix}/settings`}
-            element={<AppRedirect to={`${prefix}/settings/general`} />}
+            path={`${prefix}/settings/:section?/:subSection?`}
+            element={<SettingsRoute canonicalPath={`${prefix}/settings/general`} />}
           />
-          <Route path={`${prefix}/settings/:section/:subSection?`} element={<SettingsPage />} />
           <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
           {/* Members / Policies are now settings sub-categories
               (/settings/members, /settings/policies) so entering them
