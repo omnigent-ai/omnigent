@@ -34,21 +34,24 @@ function AutomationDeleteCallout({
   );
 }
 
-/** An automation's name, quoted and linked to its page; following it closes the dialog. */
+/**
+ * An automation's name, quoted and linked to its page; following it closes the
+ * dialog. The name wraps as one unit and truncates rather than splitting.
+ */
 function AutomationLink({ task, onNavigate }: { task: ScheduledTask; onNavigate: () => void }) {
   const info = useServerInfo();
   return (
-    <>
+    <span className="inline-flex max-w-full items-baseline whitespace-nowrap">
       “
       <Link
         to={automationPagePath(info, task)}
         onClick={onNavigate}
-        className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
+        className="min-w-0 truncate font-medium text-primary underline underline-offset-2 hover:text-primary/80"
       >
         {task.name}
       </Link>
       ”
-    </>
+    </span>
   );
 }
 
