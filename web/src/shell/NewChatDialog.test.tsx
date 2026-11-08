@@ -116,6 +116,8 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { sandboxSessionCatalogKey, writeModelCatalogCache } from "@/lib/modelCatalogCache";
+import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
+import type * as LaunchSelectionCheckModule from "@/hooks/useSandboxLaunchSelectionCheck";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import {
   useHostModelOptions,
@@ -277,6 +279,10 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
   USER_AGENTS_QUERY_KEY: ["available-agents-user"],
 }));
 vi.mock("@/lib/agentsApi", () => ({ installAgentBundle: vi.fn() }));
+vi.mock("@/hooks/useSandboxLaunchSelectionCheck", async (importOriginal) => ({
+  ...(await importOriginal<typeof LaunchSelectionCheckModule>()),
+  markSandboxLaunch: vi.fn(),
+}));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
@@ -13400,6 +13406,40 @@ describe("managed sandbox gateway preview", () => {
       model_override: luna.id,
       reasoning_effort: "ultra",
     });
+  });
+
+  it.each([
+    ["stays on the launch", false, true],
+    ["leaves before the create answers", true, false],
+  ])("arms the launch check only when the user %s", async (_label, leave, armed) => {
+    vi.mocked(markSandboxLaunch).mockClear();
+    preview();
+    let resolveCreate!: (res: Response) => void;
+    authenticatedFetchMock.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    renderGatewaySandbox();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    if (leave) window.history.pushState({}, "", "/c/conv_elsewhere");
+    resolveCreate({ ok: true, json: async () => ({ id: "conv_new" }) } as unknown as Response);
+    if (armed) {
+      await waitFor(() => expect(markSandboxLaunch).toHaveBeenCalledWith("conv_new", null));
+    } else {
+      // Let the create settle; the launch must not be armed afterwards.
+      await act(
+        () =>
+          new Promise<void>((resolve) => {
+            setTimeout(resolve, 50);
+          }),
+      );
+      expect(markSandboxLaunch).not.toHaveBeenCalled();
+    }
   });
 
   it("does not offer another agent's saved catalog", async () => {
