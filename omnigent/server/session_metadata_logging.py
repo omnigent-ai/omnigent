@@ -19,6 +19,10 @@ from omnigent.native.native_coding_agents import (
     NATIVE_CODING_AGENTS,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+)
 
 _logger = logging.getLogger(__name__)
 _NATIVE_SUBAGENT_HARNESSES = {
@@ -96,6 +100,8 @@ def log_session_metadata(
                 session_kind=conv.kind,
                 parent_session_id=conv.parent_conversation_id,
                 root_session_id=conv.root_conversation_id,
+                created_by_session_id=conv.labels.get(CREATED_BY_SESSION_LABEL_KEY),
+                scheduled_task_id=conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY),
                 observation=observation,
                 harness_lookup_error_type=lookup_error_type,
                 **harness_attributes(harness, source=source),
