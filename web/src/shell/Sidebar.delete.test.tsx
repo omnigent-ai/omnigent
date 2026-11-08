@@ -13,7 +13,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // See ConversationRow.confirmDelete in Sidebar.tsx.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -38,6 +38,20 @@ vi.mock("@/hooks/useConversations", async () => {
 // Heavy sibling widgets in the sidebar pull their own hooks/providers;
 // stub them so this test stays scoped to the conversation row.
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+
+// A session an automation runs from: its delete looks up and deletes the automation.
+vi.mock("@/lib/scheduledTasksApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ScheduledTasksApiModule>()),
+  getScheduledTask: vi.fn(),
+  deleteScheduledTask: vi.fn(),
+}));
+import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
+import {
+  deleteScheduledTask,
+  getScheduledTask,
+  ScheduledTaskApiError,
+  type ScheduledTask,
+} from "@/lib/scheduledTasksApi";
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
@@ -256,5 +270,59 @@ describe("active-session redirect on delete", () => {
     // conv_2 is untouched, so the user stays in the chat they're reading —
     // a redirect here would yank them out of an unrelated session.
     expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_2");
+  });
+});
+
+describe("deleting a session an automation runs from", () => {
+  const AUTOMATION_SOURCE: Conversation = {
+    ...CONV,
+    git_branch: null,
+    labels: { "omnigent.scheduled_task_source": "st_1" },
+  };
+
+  beforeEach(() => {
+    vi.mocked(getScheduledTask).mockResolvedValue({
+      id: "st_1",
+      name: "Weekly rubric",
+    } as ScheduledTask);
+    vi.mocked(deleteScheduledTask).mockReset().mockResolvedValue(undefined);
+    mockConversations([AUTOMATION_SOURCE]);
+  });
+
+  it("warns that the automation goes too, then deletes it before the session", async () => {
+    renderSidebar();
+    openDeleteDialog();
+
+    const dialog = screen.getByRole("dialog");
+    await waitFor(() =>
+      expect(within(dialog).getByTestId("automation-source-delete-notice")).toHaveTextContent(
+        "The automation “Weekly rubric” runs from this session. Deleting the session also deletes the automation.",
+      ),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete both" }));
+
+    await waitFor(() =>
+      expect(mocks.del.mutate).toHaveBeenCalledWith({ id: "conv_1", deleteBranch: false }),
+    );
+    expect(deleteScheduledTask).toHaveBeenCalledWith("st_1");
+    expect(vi.mocked(deleteScheduledTask).mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.del.mutate.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("keeps the session when its automation can't be deleted", async () => {
+    vi.mocked(deleteScheduledTask).mockRejectedValue(
+      new ScheduledTaskApiError("Server error", 500, null),
+    );
+    renderSidebar();
+    openDeleteDialog();
+
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Delete both" }),
+    );
+
+    await waitFor(() => expect(deleteScheduledTask).toHaveBeenCalledWith("st_1"));
+    await act(async () => {});
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
   });
 });

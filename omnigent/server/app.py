@@ -276,6 +276,9 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True
+    # Scheduled tasks accept ``source_session_id``: each run starts from a copy
+    # of a session. Older servers reject it.
+    scheduled_task_source_sessions: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
     automation_trigger_poll_minutes: int = 10
@@ -3994,6 +3997,7 @@ def create_app(
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
                 artifact_store=artifact_store,
+                file_store=file_store,
                 project_store=project_store,
                 automations=app.state.automations,
                 liveness_lookup=_bulk_session_liveness,

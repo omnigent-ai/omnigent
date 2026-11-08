@@ -28,6 +28,7 @@ import {
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
@@ -2236,6 +2237,18 @@ export function useReorderPinnedConversations() {
 // module (see sessionListCache) so the cache membership checks can read it
 // without a value import cycle; re-exported here for the existing consumers.
 export { PROJECT_LABEL_KEY };
+
+/**
+ * Whether the server has the automations feature (recurring scheduled tasks)
+ * enabled for the caller. When false the SPA hides the sidebar Automations
+ * tab and the session menu's "Create automation" item (the
+ * `/v1/scheduled-tasks` API 404s, so they would be dead ends). Returns false
+ * until the boot probe resolves.
+ */
+export function useAutomationsEnabled(): boolean {
+  const serverInfo = useServerInfo();
+  return serverInfo !== "loading" && serverInfo.automations_enabled === true;
+}
 
 /**
  * A sidebar project folder. During the label→first-class transition a folder

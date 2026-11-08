@@ -41,10 +41,20 @@ from omnigent.server.routes._host_worktree import (
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.server.scheduled.source_session import (
+    run_copy_dropped_label_keys,
+    run_prompt_text,
+)
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+    FORK_SOURCE_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_SOURCE_LABEL_KEY,
+)
 from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
@@ -304,6 +314,8 @@ class FakeConversationStore:
         self.fail_create = fail_create
         self.label_writes: dict[str, dict[str, str]] = {}
         self.deleted: list[str] = []
+        self.forked: list[dict[str, Any]] = []
+        self.host_bindings: list[tuple[str, str, str | None, str | None]] = []
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         self.deleted.append(conversation_id)
@@ -334,6 +346,30 @@ class FakeConversationStore:
 
     def clear_host_binding(self, conversation_id: str, **kwargs: Any) -> None:
         self.updated.append({"id": conversation_id, "clear_host_binding": kwargs})
+
+    def fork_conversation(self, source_conversation_id: str, **kwargs: Any) -> _FakeConversation:
+        self._seq += 1
+        self.forked.append({"source_id": source_conversation_id, **kwargs})
+        return _FakeConversation(
+            id=f"conv_{self._seq}",
+            agent_id=kwargs.get("agent_id") or "",
+            labels=dict(kwargs.get("extra_labels") or {}),
+        )
+
+    def list_items(self, conversation_id: str, **kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(data=[], has_more=False, last_id=None)
+
+    def set_host_id(
+        self,
+        conversation_id: str,
+        host_id: str,
+        workspace: str | None = None,
+        git_branch: str | None = None,
+    ) -> _FakeConversation:
+        self.host_bindings.append((conversation_id, host_id, workspace, git_branch))
+        return _FakeConversation(
+            id=conversation_id, agent_id="ag_1", host_id=host_id, workspace=workspace
+        )
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
@@ -3922,3 +3958,81 @@ def test_session_unattended_disallowed_mode(
     conv = SimpleNamespace(labels=labels, terminal_launch_args=launch_args)
 
     assert fire_mod.session_unattended_disallowed_mode(conv) == expected
+
+
+# ── Runs that start from a copy of a session ───────────────────────────────
+
+
+def test_a_run_from_a_session_sends_its_instructions_or_the_opener_when_empty() -> None:
+    assert run_prompt_text(_task(prompt="Do the work.")) == "Do the work."
+    assert run_prompt_text(_task(source_session_id="conv_source", prompt=" ")) == (
+        "Perform the task from this conversation again."
+    )
+    assert run_prompt_text(_task(source_session_id="conv_source", prompt=" Do it ")) == "Do it"
+
+
+@pytest.mark.asyncio
+async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created == []
+    (fork,) = conv_store.forked
+    assert (fork["source_id"], fork["agent_id"], fork["title"]) == (
+        "conv_source",
+        "ag_1",
+        "nightly",
+    )
+    # The run rebuilds its native transcript from its own copy, never another session's file.
+    assert fork["resume_source_native_session"] is False
+    assert {
+        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+        FORK_SOURCE_LABEL_KEY,
+        SCHEDULED_TASK_SOURCE_LABEL_KEY,
+    } <= fork["dropped_label_keys"]
+    assert fork["extra_labels"][SCHEDULED_TASK_ORIGIN_LABEL_KEY] == "task_1"
+    assert fork["override_terminal_launch_args_set"] is True
+    # The copy is bound where the run executes before it launches.
+    assert conv_store.host_bindings == [("conv_1", "host_1", "/repo", None)]
+    assert [conv.id for conv in launched] == ["conv_1"]
+    assert [run["status"] for run in store.runs] == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_source_session_fails_the_run_and_pauses_the_task() -> None:
+    conv_store = FakeConversationStore()
+    conv_store.get_conversation = lambda conversation_id: None  # type: ignore[method-assign]
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.forked == [] and launched == []
+    (run,) = store.runs
+    assert (run["status"], run.get("error_code")) == ("failed", "source_session_missing")
+    assert {"id": "task_1", "state": "paused"} in store.updates
+
+
+def test_a_run_on_another_agent_leaves_off_the_copys_mcp_picks() -> None:
+    labels = {"omnigent.mcp_service.jira": "1", "omnigent.ui": "terminal"}
+
+    same_agent = run_copy_dropped_label_keys(labels, agent_changed=False)
+    other_agent = run_copy_dropped_label_keys(labels, agent_changed=True)
+
+    # Presentation is always re-stamped for the run's agent.
+    assert {"omnigent.ui", "omnigent.wrapper"} <= same_agent
+    assert "omnigent.mcp_service.jira" not in same_agent
+    assert "omnigent.mcp_service.jira" in other_agent

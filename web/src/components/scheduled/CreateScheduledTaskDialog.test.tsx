@@ -33,6 +33,9 @@ import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import type { ServerInfo } from "@/lib/capabilities";
+import type { AutomationSourceSession } from "@/lib/automationFromSession";
+import { MemoryRouter } from "react-router-dom";
 import {
   emptyTriggerFields,
   readTriggerWorkerSettings,
@@ -67,6 +70,12 @@ vi.mock("@/hooks/useHosts", () => ({
 vi.mock("@/hooks/useSandboxModelOptions", async (original) => ({
   ...(await original<typeof sandboxModelsHook>()),
   useSandboxModelOptions: vi.fn(() => ({ data: undefined })),
+}));
+// The "Starts from" field reads the source session's snapshot for its title
+// and launch settings.
+const sourceSnapshot = vi.hoisted(() => ({ current: null as unknown }));
+vi.mock("@/hooks/useSession", () => ({
+  useSession: () => ({ session: sourceSnapshot.current, isLoading: false, error: null }),
 }));
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useCreateScheduledTask: vi.fn(),
@@ -4970,5 +4979,186 @@ describe("automation random worktree", () => {
     expect(updateMutateAsync.mock.calls[0][0].input.baseBranch).toBe(
       baseBranch === null ? "HEAD" : null,
     );
+  });
+});
+
+describe("creating an automation from a session", () => {
+  const SOURCE: AutomationSourceSession = {
+    id: "conv_src",
+    title: "Weekly rubric",
+    agentId: "ag_claude_native",
+    agentName: "Claude Code",
+    hostId: "host_1",
+    workspace: "/home/me/repo",
+    labels: {},
+  };
+
+  beforeEach(() => {
+    sourceSnapshot.current = null;
+  });
+
+  function renderFromSession({
+    source = SOURCE,
+    info = {},
+    onCreated = vi.fn(),
+    editingTask = null,
+  }: {
+    source?: AutomationSourceSession | null;
+    info?: Partial<ServerInfo>;
+    onCreated?: (task: ScheduledTasksApiModule.ScheduledTask) => void;
+    editingTask?: ScheduledTasksApiModule.ScheduledTask | null;
+  } = {}) {
+    return render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true },
+          scheduled_task_harness_settings: true,
+          scheduled_task_session_modes: true,
+          ...info,
+        }}
+      >
+        <MemoryRouter>
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            sourceSession={source}
+            editingTask={editingTask}
+            onCreated={onCreated}
+          />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+  }
+
+  async function submit() {
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    return mutateAsync.mock.calls[0][0];
+  }
+
+  it("names the automation after the session, preselects its agent and fixes trigger and session mode", () => {
+    renderFromSession();
+
+    expect(screen.getByText("New automation from “Weekly rubric”")).toBeInTheDocument();
+    expect(screen.getByLabelText("Name")).toHaveValue("Weekly rubric");
+    const startsFrom = screen.getByTestId("task-starts-from-link");
+    expect(startsFrom).toHaveAttribute("href", "/c/conv_src");
+    expect(startsFrom).toHaveTextContent("Weekly rubric");
+    expect(screen.getByRole("textbox", { name: "Additional instructions" })).toHaveValue("");
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute(
+      "data-effective",
+      "ag_claude_native",
+    );
+    expect(screen.queryByText("Trigger type")).toBeNull();
+    expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
+  });
+
+  it("saves the session as the source, allows empty instructions, and runs where the session ran", async () => {
+    const onCreated = vi.fn();
+    renderFromSession({ onCreated });
+
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+    const input = await submit();
+    expect(input).toMatchObject({
+      sourceSessionId: "conv_src",
+      agentId: "ag_claude_native",
+      prompt: "",
+      hostId: "host_1",
+      workspace: "/home/me/repo",
+    });
+    expect(input).not.toHaveProperty("sessionMode");
+    expect(input).not.toHaveProperty("executionTarget");
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "st_new" }));
+  });
+
+  it("defaults to an Arclet sandbox when one is offered", async () => {
+    renderFromSession({ info: { managed_sandboxes_enabled: true, sandbox_provider: "arclet" } });
+
+    const input = await submit();
+    expect(input).toMatchObject({
+      executionTarget: "managed_sandbox",
+      sourceSessionId: "conv_src",
+    });
+    expect(input).not.toHaveProperty("hostId");
+  });
+
+  it("does not default to another sandbox provider", async () => {
+    renderFromSession({
+      info: { managed_sandboxes_enabled: true, sandbox_provider: "databricks-lakebox" },
+    });
+
+    const input = await submit();
+    expect(input).toMatchObject({ hostId: "host_1", workspace: "/home/me/repo" });
+    expect(input).not.toHaveProperty("executionTarget");
+  });
+
+  it("falls back to the first online host when the session's host isn't listed", async () => {
+    renderFromSession({ source: { ...SOURCE, hostId: "host_sandbox", workspace: "/workspace" } });
+
+    const input = await submit();
+    expect(input).toMatchObject({ hostId: "host_1" });
+    expect(input).not.toHaveProperty("workspace");
+  });
+
+  it("starts from the session's permission mode unless automations refuse it", async () => {
+    sourceSnapshot.current = {
+      id: "conv_src",
+      labels: { "omnigent.claude_native.permission_mode": "acceptEdits" },
+    };
+    const { unmount } = renderFromSession();
+    expect(await submit()).toMatchObject({ permissionMode: "acceptEdits" });
+    unmount();
+
+    mutateAsync.mockClear();
+    sourceSnapshot.current = {
+      id: "conv_src",
+      labels: { "omnigent.claude_native.permission_mode": "bypassPermissions" },
+    };
+    renderFromSession();
+    expect((await submit()).permissionMode).not.toBe("bypassPermissions");
+  });
+
+  it("runs a session-based automation on another agent when one is picked", async () => {
+    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+      data: [...AGENTS, testAgent("ag_codex", "codex-native-ui", { harness: "codex-native" })],
+    } as ReturnType<typeof agentsHook.useAvailableAgents>);
+    renderFromSession();
+
+    fireEvent.click(screen.getByRole("button", { name: "pick codex-native" }));
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-effective", "ag_codex");
+    const input = await submit();
+
+    expect(input).toMatchObject({ agentId: "ag_codex", sourceSessionId: "conv_src" });
+  });
+
+  it("edits a session-based automation with its source session shown", async () => {
+    sourceSnapshot.current = { id: "conv_copy", title: "Weekly rubric copy" };
+    renderFromSession({
+      source: null,
+      editingTask: scheduledTask({
+        agentId: "ag_claude_native",
+        prompt: "",
+        hostId: "host_1",
+        sourceSessionId: "conv_copy",
+      }),
+    });
+
+    const startsFrom = screen.getByTestId("task-starts-from-link");
+    expect(startsFrom).toHaveAttribute("href", "/c/conv_copy");
+    expect(startsFrom).toHaveTextContent("Weekly rubric copy");
+    expect(screen.getByRole("textbox", { name: "Additional instructions" })).toHaveValue("");
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute(
+      "data-effective",
+      "ag_claude_native",
+    );
+    expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
+
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Rubric refresh" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).toMatchObject({ name: "Rubric refresh", prompt: "" });
+    expect(input).not.toHaveProperty("agentId");
   });
 });

@@ -236,6 +236,13 @@ export interface ServerInfo {
    * hidden there. Fails to ``false``.
    */
   archive_worktree_cleanup?: boolean;
+  /**
+   * True when the automations feature (recurring scheduled tasks) is enabled
+   * for the caller. When false the SPA hides the sidebar Automations tab and
+   * every automation entry point (the ``/v1/scheduled-tasks`` API 404s, so
+   * linking to it would be a dead page). Absent ⇒ false.
+   */
+  automations_enabled?: boolean;
   /** True when scheduled tasks accept the optional random-worktree base ref. */
   scheduled_task_worktrees?: boolean;
   /**
@@ -250,6 +257,12 @@ export interface ServerInfo {
    * Session control there. Fails to ``false``.
    */
   scheduled_task_session_modes?: boolean;
+  /**
+   * True when a scheduled task can start every run from a copy of an existing
+   * session (``source_session_id``). Gates the session menu's "Create
+   * automation…" item. Fails to ``false``.
+   */
+  scheduled_task_source_sessions?: boolean;
   /** Connected hosts and continued sandboxes accept ten-minute schedules. */
   scheduled_task_subhour?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
@@ -433,8 +446,10 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   dictation_available: false,
   scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
+  automations_enabled: false,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
@@ -599,8 +614,10 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           scheduled_task_worktrees: data.scheduled_task_worktrees === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          automations_enabled: data.automations_enabled === true,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           automation_trigger_poll_minutes:
             typeof data.automation_trigger_poll_minutes === "number" &&

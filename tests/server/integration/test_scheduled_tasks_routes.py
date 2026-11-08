@@ -3100,6 +3100,162 @@ async def test_a_picked_session_must_be_the_owners_and_fit_the_task(
     assert new_mode.status_code == 422, new_mode.text
 
 
+def _session_with_history(db_uri: str, owner: str = "alice@example.com", **fields: object) -> str:
+    """An owned session with one finished exchange and a turn still in progress."""
+    from omnigent.entities import MessageData, NewConversationItem
+
+    def message(role: str, response_id: str, text: str) -> NewConversationItem:
+        part = "input_text" if role == "user" else "output_text"
+        return NewConversationItem(
+            type="message",
+            response_id=response_id,
+            data=MessageData(
+                role=role,
+                content=[{"type": part, "text": text}],
+                agent=None if role == "user" else "claude-native",
+            ),
+        )
+
+    session_id = _owned_session(db_uri, owner, **fields)
+    SqlAlchemyConversationStore(db_uri).append(
+        session_id,
+        [
+            message("user", "resp_1", "summarize the alerts"),
+            message("assistant", "resp_1", "three alerts"),
+            message("user", "resp_2", "and the next turn"),
+        ],
+    )
+    return session_id
+
+
+def _item_texts(db_uri: str, session_id: str) -> list[str]:
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
+    parts = [item.data.content[0] for item in items]
+    return [part["text"] if isinstance(part, dict) else part.text for part in parts]
+
+
+async def test_create_from_a_session_copies_it_for_the_runs(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    source_id = _session_with_history(db_uri)
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=source_id, prompt=""),
+        headers=_headers(),
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert (body["session_mode"], body["prompt"]) == ("new", "")
+    source_copy_id = body["source_session_id"]
+    assert source_copy_id not in (None, source_id)
+    source_copy = SqlAlchemyConversationStore(db_uri).get_conversation(source_copy_id)
+    assert source_copy is not None
+    assert source_copy.title == "nightly triage"
+    assert source_copy.labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] == body["id"]
+    # Copied through the last finished reply; the turn in progress stays behind.
+    assert _item_texts(db_uri, source_copy_id) == ["summarize the alerts", "three alerts"]
+    assert _item_texts(db_uri, source_id)[-1] == "and the next turn"
+    assert SqlAlchemyPermissionStore(db_uri).check_access(
+        "alice@example.com", source_copy_id, LEVEL_OWNER
+    )
+    fetched = await auth_client.get(f"/v1/scheduled-tasks/{body['id']}", headers=_headers())
+    assert fetched.json()["source_session_id"] == source_copy_id
+
+
+async def test_a_source_session_must_be_the_owners_top_level_session(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri, "bob@example.com")
+    parent = _owned_session(db_uri)
+    existing = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=_owned_session(db_uri)),
+        headers=_headers(),
+    )
+    assert existing.status_code == 200, existing.text
+    cases = {
+        "someone else's": (_owned_session(db_uri, "bob@example.com"), 404),
+        "missing": ("cd" * 16, 404),
+        "a sub-agent's": (_owned_session(db_uri, parent_conversation_id=parent), 400),
+        "an automation's copy": (existing.json()["source_session_id"], 400),
+    }
+    for label, (session_id, status) in cases.items():
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=session_id),
+            headers=_headers(),
+        )
+        assert resp.status_code == status, (label, resp.text)
+
+    continuing = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=parent, session_mode="continue"),
+        headers=_headers(),
+    )
+    assert continuing.status_code == 422, continuing.text
+
+
+async def test_a_task_that_starts_from_a_session_can_switch_agents_but_not_continue(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    codex = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    claude = builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+    # Runs can use another agent than the copied session's; the copy keeps its own.
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=_owned_session(db_uri), agent_id=codex),
+            headers=_headers(),
+        )
+    ).json()
+    assert created["agent_id"] == codex
+    copy = SqlAlchemyConversationStore(db_uri).get_conversation(created["source_session_id"])
+    assert copy is not None and copy.agent_id == claude
+    url = f"/v1/scheduled-tasks/{created['id']}"
+
+    switched = await auth_client.patch(url, json={"agent_id": claude}, headers=_headers())
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["agent_id"] == claude
+    continuing = await auth_client.patch(
+        url, json={"session_mode": "continue"}, headers=_headers()
+    )
+    assert continuing.status_code == 400, continuing.text
+    cleared = await auth_client.patch(url, json={"prompt": ""}, headers=_headers())
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["source_session_id"] == created["source_session_id"]
+
+
+async def test_deleting_the_automation_keeps_its_copy_as_an_ordinary_session(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    source_id = _owned_session(db_uri, title="Daily alerts")
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=source_id),
+            headers=_headers(),
+        )
+    ).json()
+    copy_id = created["source_session_id"]
+    conversations = SqlAlchemyConversationStore(db_uri)
+    copy = conversations.get_conversation(copy_id)
+    assert copy is not None and copy.title == "Daily alerts"
+
+    deleted = await auth_client.delete(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+
+    assert deleted.status_code == 200, deleted.text
+    kept = conversations.get_conversation(copy_id)
+    assert kept is not None
+    assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in kept.labels
+
+
 async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
     auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

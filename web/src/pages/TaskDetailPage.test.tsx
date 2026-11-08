@@ -56,6 +56,15 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
 const showToast = vi.fn();
 vi.mock("@/components/ui/toast", () => ({ showToast: (...args: unknown[]) => showToast(...args) }));
 
+// A session-based automation names the session copy its runs start from.
+vi.mock("@/hooks/useSession", () => ({
+  useSession: () => ({
+    session: { title: "Weekly rubric copy" },
+    isLoading: false,
+    error: null,
+  }),
+}));
+
 // Agent / host catalogs — return simple lists so labels resolve.
 const defaultAgentCatalog = (_options?: { pinnedAgentIds?: string[] }) => ({
   data: [{ id: "ag_1", name: "polly", display_name: "Polly", harness: null as string | null }],
@@ -229,6 +238,17 @@ function renderPage() {
 }
 
 describe("header, prompt, configuration", () => {
+  it("shows where a session-based automation's runs start and its additional instructions", () => {
+    setTask(task({ prompt: "", sourceSessionId: "conv_copy" }));
+    renderPage();
+
+    const startsFrom = screen.getByTestId("task-detail-starts-from");
+    expect(startsFrom).toHaveAttribute("href", "/c/conv_copy");
+    expect(startsFrom).toHaveTextContent("Weekly rubric copy");
+    expect(screen.getByRole("heading", { name: "Additional instructions" })).toBeVisible();
+    expect(screen.getByTestId("task-detail-prompt")).toHaveTextContent("None");
+  });
+
   it("shows the user prompt first and keeps generated instructions collapsed and read-only", () => {
     const prompt = renderTriggerPrompt(
       "slack",
@@ -739,6 +759,13 @@ describe("header actions", () => {
       expect.objectContaining({ onSuccess: expect.any(Function) }),
     );
     expect(navigate).toHaveBeenCalledWith("/tasks");
+  });
+
+  it("deletes an automation that starts from a session right away, like any other", () => {
+    setTask(task({ sourceSessionId: "conv_copy" }));
+    renderPage();
+    fireEvent.click(screen.getByTestId("task-detail-delete"));
+    expect(deleteMutate).toHaveBeenCalledWith("st_1", expect.anything());
   });
 
   it("edit opens the reused create dialog in edit mode", () => {

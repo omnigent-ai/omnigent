@@ -7,6 +7,9 @@ import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
 import type * as UseFileContentModule from "@/hooks/useFileContent";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
+import { deleteScheduledTask } from "@/lib/scheduledTasksApi";
+import type { ServerInfo } from "@/lib/capabilities";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -35,6 +38,18 @@ const mocks = vi.hoisted(() => ({
   exportTranscript: vi.fn(),
   triggerDownload: vi.fn(),
   toastError: vi.fn(),
+}));
+
+vi.mock("@/components/scheduled/CreateAutomationFromSessionDialog", () => ({
+  CreateAutomationFromSessionDialog: ({ conversation }: { conversation: { id: string } }) => (
+    <div data-testid="create-automation-dialog" data-conversation-id={conversation.id} />
+  ),
+}));
+// A session an automation runs from: its delete looks up and deletes the automation.
+vi.mock("@/lib/scheduledTasksApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ScheduledTasksApiModule>()),
+  getScheduledTask: vi.fn(() => Promise.resolve({ id: "st_1", name: "Weekly rubric" })),
+  deleteScheduledTask: vi.fn(() => Promise.resolve()),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -886,5 +901,73 @@ describe("HeaderConversationMenu desktop menu commands", () => {
     renderMenu({ onFork });
     act(() => sendCommand({ command: "fork-session", browserViewId: null }));
     expect(onFork).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("automations started from this session", () => {
+  const AGENT_SESSION: Conversation = { ...CONVERSATION, agent_id: "ag_1", git_branch: null };
+
+  function renderWithInfo(info: Partial<ServerInfo>, conversation = AGENT_SESSION) {
+    return render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...info }}>
+          <MemoryRouter initialEntries={[`/c/${conversation.id}`]}>
+            <HeaderConversationMenu
+              conversation={conversation}
+              currentProject={null}
+              canShare
+              canFork
+              onShare={() => {}}
+              onFork={mocks.fork}
+            />
+          </MemoryRouter>
+        </CapabilitiesProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("offers Create automation below Mark as unread and opens the dialog for the session", () => {
+    renderWithInfo({ automations_enabled: true, scheduled_task_source_sessions: true });
+    openMenu();
+
+    const items = screen.getAllByRole("menuitem");
+    const readState = items.indexOf(screen.getByTestId("header-mark-unread-conversation"));
+    expect(items[readState + 1]).toBe(screen.getByTestId("header-create-automation"));
+    expect(items[readState + 1]).toHaveTextContent(/^Create automation$/);
+
+    fireEvent.click(screen.getByTestId("header-create-automation"));
+    expect(screen.getByTestId("create-automation-dialog")).toHaveAttribute(
+      "data-conversation-id",
+      "conv-1",
+    );
+  });
+
+  it("leaves it out when automations are off", () => {
+    renderWithInfo({ automations_enabled: false, scheduled_task_source_sessions: true });
+    openMenu();
+
+    expect(screen.getByTestId("header-fork-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("header-create-automation")).toBeNull();
+  });
+
+  it("deletes the automation that runs from a session before the session", async () => {
+    renderWithInfo({}, { ...AGENT_SESSION, labels: { "omnigent.scheduled_task_source": "st_1" } });
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("automation-source-delete-notice")).toHaveTextContent(
+        "The automation “Weekly rubric” runs from this session",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Delete both" }));
+
+    await waitFor(() =>
+      expect(mocks.deleteConversation).toHaveBeenCalledWith({ id: "conv-1", deleteBranch: false }),
+    );
+    expect(deleteScheduledTask).toHaveBeenCalledWith("st_1");
+    expect(vi.mocked(deleteScheduledTask).mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.deleteConversation.mock.invocationCallOrder[0],
+    );
   });
 });

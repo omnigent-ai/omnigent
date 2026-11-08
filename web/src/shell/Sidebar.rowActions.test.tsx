@@ -141,6 +141,11 @@ vi.mock("./ForkSessionDialog", () => ({
 // Force a multi-user (non-local) server so the "Shared with me" tab renders —
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
+vi.mock("@/components/scheduled/CreateAutomationFromSessionDialog", () => ({
+  CreateAutomationFromSessionDialog: ({ conversation }: { conversation: { id: string } }) => (
+    <div data-testid="create-automation-dialog" data-conversation-id={conversation.id} />
+  ),
+}));
 vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 // Pin "who am I": ownership (and therefore Leave, which revokes the viewer's
 // own grant) is derived from this id. Unmocked it resolves to null in jsdom,
@@ -272,6 +277,17 @@ function renderSidebar(
       view.rerender(makeUi());
     },
   });
+}
+
+/** Switch the session list to sessions shared with the viewer. */
+function openSharedTab() {
+  // Radix Tabs triggers activate on mousedown (primary button), not click.
+  fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: "mouse",
+  });
+  fireEvent.click(screen.getByTestId("session-filter-shared"));
 }
 
 beforeEach(() => {
@@ -880,16 +896,6 @@ describe("leave a shared session", () => {
   // sidebar without touching the owner's copy.
 
   /** Switch to the "Shared with me" tab, where non-owned rows live. */
-  function openSharedTab() {
-    // Radix Tabs triggers activate on mousedown (primary button), not click.
-    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-      button: 0,
-      ctrlKey: false,
-      pointerType: "mouse",
-    });
-    fireEvent.click(screen.getByTestId("session-filter-shared"));
-  }
-
   it("offers Leave on a shared row and calls the mutation after confirming", () => {
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar();
@@ -1577,6 +1583,64 @@ describe("sharing kill switch", () => {
 
     expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("share-conversation")).not.toHaveAttribute("data-disabled");
+  });
+});
+
+describe("create automation from a session", () => {
+  const AUTOMATION_INFO = {
+    automations_enabled: true,
+    scheduled_task_source_sessions: true,
+  } satisfies Partial<ServerInfo>;
+  const AGENT_SESSION: Conversation = { ...CONV, agent_id: "ag_1" };
+
+  it("offers Create automation right below Mark as unread and opens the dialog for the session", () => {
+    mockConversations([AGENT_SESSION]);
+    renderSidebar(undefined, serverInfo(AUTOMATION_INFO));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    const items = screen.getAllByRole("menuitem");
+    const readState = items.indexOf(screen.getByTestId("mark-unread-conversation"));
+    expect(items[readState + 1]).toBe(screen.getByTestId("create-automation-from-session"));
+    expect(items[readState + 1]).toHaveTextContent(/^Create automation$/);
+
+    fireEvent.click(screen.getByTestId("create-automation-from-session"));
+    expect(screen.getByTestId("create-automation-dialog")).toHaveAttribute(
+      "data-conversation-id",
+      "conv_1",
+    );
+  });
+
+  it.each([
+    [
+      "automations are off",
+      serverInfo({ ...AUTOMATION_INFO, automations_enabled: false }),
+      AGENT_SESSION,
+    ],
+    [
+      "the server can't copy sessions",
+      serverInfo({ ...AUTOMATION_INFO, scheduled_task_source_sessions: false }),
+      AGENT_SESSION,
+    ],
+    [
+      "an automation already runs from the session",
+      serverInfo(AUTOMATION_INFO),
+      { ...AGENT_SESSION, labels: { "omnigent.scheduled_task_source": "st_1" } },
+    ],
+    [
+      "the viewer doesn't own the session",
+      serverInfo(AUTOMATION_INFO),
+      { ...AGENT_SESSION, owner: "someone@example.com", permission_level: 1 },
+    ],
+  ])("leaves it out when %s", (_reason, info, conversation) => {
+    mockConversations([conversation]);
+    renderSidebar(undefined, info);
+    if (conversation.owner) openSharedTab();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("fork-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("create-automation-from-session")).toBeNull();
   });
 });
 

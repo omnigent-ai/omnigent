@@ -74,6 +74,9 @@ class ScheduledTask:
     :param session_id: The session a ``"continue"`` task sends its prompt to.
         ``None`` until its first firing creates one, unless the owner picked an
         existing session.
+    :param source_session_id: The session each firing copies. Every run starts a
+        new session that begins with that session's history. ``None`` for a
+        task whose runs start empty.
     :param workspace: Connected-host directory or managed-sandbox repository URL.
         ``None`` uses the execution target's default workspace.
     :param base_branch: Create a random worktree from this ref for each new
@@ -108,6 +111,7 @@ class ScheduledTask:
     max_cost_usd: float | None = None
     session_mode: str = "new"
     session_id: str | None = None
+    source_session_id: str | None = None
     workspace: str | None = None
     base_branch: str | None = None
     execution_target: str = "connected_host"
