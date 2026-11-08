@@ -86,8 +86,8 @@ export function canCreateAutomationFromSession({
   );
 }
 
-/** Where to land after creating an automation: its page, or the list on servers without one. */
-export function automationCreatedPath(info: ServerInfo | "loading", task: ScheduledTask): string {
+/** An automation's page, or the automations list on servers without automation pages. */
+export function automationPagePath(info: ServerInfo | "loading", task: ScheduledTask): string {
   return isFeatureEnabled(info, "automations_v2")
     ? `/tasks/${encodeURIComponent(task.id)}`
     : "/tasks";

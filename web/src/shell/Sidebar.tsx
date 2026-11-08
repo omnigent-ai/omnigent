@@ -6369,7 +6369,13 @@ function ConversationRowImpl({
               </DialogDescription>
             </DialogHeader>
             {automationSourceOf !== null && (
-              <AutomationSourceDeleteNotice taskId={automationSourceOf} />
+              <AutomationSourceDeleteNotice
+                taskId={automationSourceOf}
+                onNavigate={() => {
+                  setDeleteOpen(false);
+                  setDeleteBranch(false);
+                }}
+              />
             )}
             {gitBranch !== null && (
               <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
@@ -7698,7 +7704,13 @@ function BulkActionBar({
             </DialogDescription>
           </DialogHeader>
           {automationSourceTaskIds.length > 0 && (
-            <AutomationSourcesDeleteNotice taskIds={automationSourceTaskIds} />
+            <AutomationSourcesDeleteNotice
+              taskIds={automationSourceTaskIds}
+              onNavigate={() => {
+                setConfirmDeleteOpen(false);
+                setBranchesToDelete(new Set());
+              }}
+            />
           )}
           {worktreeSelected.length > 0 && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">

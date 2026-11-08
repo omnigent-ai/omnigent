@@ -957,7 +957,7 @@ describe("automations started from this session", () => {
 
     await waitFor(() =>
       expect(screen.getByTestId("automation-source-delete-notice")).toHaveTextContent(
-        "Deleting it also deletes “Weekly rubric”",
+        "Deleting it also deletes the automation “Weekly rubric”.",
       ),
     );
     fireEvent.click(screen.getByRole("button", { name: "Delete both" }));

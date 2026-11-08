@@ -284,7 +284,6 @@ describe("deleting a session an automation runs from", () => {
     vi.mocked(getScheduledTask).mockResolvedValue({
       id: "st_1",
       name: "Weekly rubric",
-      rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
     } as ScheduledTask);
     vi.mocked(deleteScheduledTask).mockReset().mockResolvedValue(undefined);
     mockConversations([AUTOMATION_SOURCE]);
@@ -298,7 +297,7 @@ describe("deleting a session an automation runs from", () => {
     expect(within(dialog).getByText("Delete session and automation?")).toBeInTheDocument();
     await waitFor(() =>
       expect(within(dialog).getByTestId("automation-source-delete-notice")).toHaveTextContent(
-        "This session runs an automationDeleting it also deletes “Weekly rubric”, which runs every day at 9:00 AM.",
+        "This session runs an automationDeleting it also deletes the automation “Weekly rubric”.",
       ),
     );
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete both" }));

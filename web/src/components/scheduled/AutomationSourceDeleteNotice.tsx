@@ -1,9 +1,11 @@
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 import { useQueries } from "@tanstack/react-query";
 import { TriangleAlertIcon } from "lucide-react";
 import { scheduledTaskKey, useScheduledTask } from "@/hooks/useScheduledTasks";
-import { getScheduledTask } from "@/lib/scheduledTasksApi";
-import { describeSchedule } from "@/lib/scheduleText";
+import { automationPagePath } from "@/lib/automationFromSession";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { Link } from "@/lib/routing";
+import { getScheduledTask, type ScheduledTask } from "@/lib/scheduledTasksApi";
 
 /**
  * Amber callout a delete dialog shows when an automation runs from a session it
@@ -32,43 +34,70 @@ function AutomationDeleteCallout({
   );
 }
 
-/** A schedule mid-sentence, e.g. "every day at 9:00 AM"; a raw rule stays as is. */
-function scheduleClause(rrule: string): string {
-  const text = describeSchedule(rrule);
-  return /^[A-Z][a-z]/.test(text) ? text[0].toLowerCase() + text.slice(1) : text;
+/** An automation's name, quoted and linked to its page; following it closes the dialog. */
+function AutomationLink({ task, onNavigate }: { task: ScheduledTask; onNavigate: () => void }) {
+  const info = useServerInfo();
+  return (
+    <>
+      “
+      <Link
+        to={automationPagePath(info, task)}
+        onClick={onNavigate}
+        className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
+      >
+        {task.name}
+      </Link>
+      ”
+    </>
+  );
 }
 
 /** Delete-dialog warning for a session an automation runs from. */
-export function AutomationSourceDeleteNotice({ taskId }: { taskId: string }) {
+export function AutomationSourceDeleteNotice({
+  taskId,
+  onNavigate,
+}: {
+  taskId: string;
+  /** Closes the dialog when the automation's link is followed. */
+  onNavigate: () => void;
+}) {
   const { data: task } = useScheduledTask(taskId);
   return (
     <AutomationDeleteCallout
       title="This session runs an automation"
       testId="automation-source-delete-notice"
     >
+      Deleting it also deletes the automation
       {task?.name ? (
         <>
-          Deleting it also deletes <span className="font-medium">“{task.name}”</span>
-          {task.rrule ? `, which runs ${scheduleClause(task.rrule)}` : ""}.
+          {" "}
+          <AutomationLink task={task} onNavigate={onNavigate} />
         </>
-      ) : (
-        "Deleting it also deletes the automation."
-      )}
+      ) : null}
+      .
     </AutomationDeleteCallout>
   );
 }
 
 /** Bulk-delete warning naming the automations that run from the selected sessions. */
-export function AutomationSourcesDeleteNotice({ taskIds }: { taskIds: string[] }) {
-  const tasks = useQueries({
+export function AutomationSourcesDeleteNotice({
+  taskIds,
+  onNavigate,
+}: {
+  taskIds: string[];
+  /** Closes the dialog when an automation's link is followed. */
+  onNavigate: () => void;
+}) {
+  const queries = useQueries({
     queries: taskIds.map((id) => ({
       queryKey: scheduledTaskKey(id),
       queryFn: () => getScheduledTask(id),
       staleTime: 30_000,
     })),
   });
-  const names = tasks.flatMap((query) => (query.data?.name ? [`“${query.data.name}”`] : []));
+  const tasks = queries.flatMap((query) => (query.data?.name ? [query.data] : []));
   const single = taskIds.length === 1;
+  const allNamed = tasks.length === taskIds.length;
   return (
     <AutomationDeleteCallout
       title={
@@ -78,9 +107,38 @@ export function AutomationSourcesDeleteNotice({ taskIds }: { taskIds: string[] }
       }
       testId="bulk-automation-source-delete-notice"
     >
-      {names.length === taskIds.length
-        ? `Deleting ${single ? "it" : "them"} also deletes ${new Intl.ListFormat("en", { type: "conjunction" }).format(names)}.`
-        : `Deleting ${single ? "it also deletes its automation" : "them also deletes their automations"}.`}
+      {single
+        ? "Deleting it also deletes the automation"
+        : `Deleting them also deletes ${allNamed ? "the automations" : "their automations"}`}
+      {allNamed ? (
+        <>
+          {" "}
+          <AutomationLinks tasks={tasks} onNavigate={onNavigate} />
+        </>
+      ) : null}
+      .
     </AutomationDeleteCallout>
   );
+}
+
+/** Linked automation names as an English list, e.g. “A”, “B” and “C”. */
+function AutomationLinks({
+  tasks,
+  onNavigate,
+}: {
+  tasks: ScheduledTask[];
+  onNavigate: () => void;
+}) {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const parts = new Intl.ListFormat("en", { type: "conjunction" }).formatToParts(
+    tasks.map((task) => task.id),
+  );
+  return parts.map((part, index) => {
+    const task = part.type === "element" ? byId.get(part.value) : undefined;
+    return task ? (
+      <AutomationLink key={task.id} task={task} onNavigate={onNavigate} />
+    ) : (
+      <Fragment key={index}>{part.value}</Fragment>
+    );
+  });
 }

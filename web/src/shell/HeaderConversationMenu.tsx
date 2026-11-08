@@ -620,7 +620,13 @@ export function HeaderConversationMenu({
             </DialogDescription>
           </DialogHeader>
           {automationSourceOf !== null && (
-            <AutomationSourceDeleteNotice taskId={automationSourceOf} />
+            <AutomationSourceDeleteNotice
+              taskId={automationSourceOf}
+              onNavigate={() => {
+                setDeleteOpen(false);
+                setDeleteBranch(false);
+              }}
+            />
           )}
           {gitBranch !== null && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">

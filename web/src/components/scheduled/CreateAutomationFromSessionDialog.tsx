@@ -5,7 +5,7 @@ import { showToast } from "@/components/ui/toast";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useNavigate } from "@/lib/routing";
 import {
-  automationCreatedPath,
+  automationPagePath,
   automationSourceFromConversation,
 } from "@/lib/automationFromSession";
 
@@ -51,7 +51,7 @@ export function CreateAutomationFromSessionDialog({
           void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           showToast("Automation created");
-          navigate(automationCreatedPath(info, task));
+          navigate(automationPagePath(info, task));
         }}
       />
     </Suspense>

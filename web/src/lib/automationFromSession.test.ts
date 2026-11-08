@@ -13,7 +13,7 @@ vi.mock("@/lib/scheduledTasksApi", async (importOriginal) => ({
 }));
 
 import {
-  automationCreatedPath,
+  automationPagePath,
   canCreateAutomationFromSession,
   SCHEDULED_TASK_SOURCE_LABEL_KEY,
   automationSourceTaskId,
@@ -77,18 +77,18 @@ describe("automationSourceTaskId", () => {
   });
 });
 
-describe("automationCreatedPath", () => {
+describe("automationPagePath", () => {
   const task = { id: "st_1" } as scheduledTasksApi.ScheduledTask;
 
   it("opens the new automation's page when detail pages exist", () => {
-    expect(automationCreatedPath({ ...INFO, features: { automations_v2: true } }, task)).toBe(
+    expect(automationPagePath({ ...INFO, features: { automations_v2: true } }, task)).toBe(
       "/tasks/st_1",
     );
   });
 
   it("falls back to the automation list", () => {
-    expect(automationCreatedPath(INFO, task)).toBe("/tasks");
-    expect(automationCreatedPath("loading", task)).toBe("/tasks");
+    expect(automationPagePath(INFO, task)).toBe("/tasks");
+    expect(automationPagePath("loading", task)).toBe("/tasks");
   });
 });
 
