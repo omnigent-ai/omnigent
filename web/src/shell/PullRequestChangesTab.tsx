@@ -444,8 +444,9 @@ function ownChangesSources(
     (isSuccess && !result
       ? new Error("This host can't show a PR's own changes. Update it to use this view.")
       : null);
-  // A paused query (asleep sandbox, no parent yet) isn't loading anything.
   const isLoading = isFetching && !result && !error;
+  // A paused query (asleep sandbox, no parent yet) compared nothing, so it can't claim no changes.
+  const paused = !result && !error && !isFetching;
   return {
     changes: {
       data: result
@@ -457,7 +458,9 @@ function ownChangesSources(
             head_sha: result.head_sha,
             base_sha: result.parent_sha,
           }
-        : undefined,
+        : paused
+          ? { available: false, data: [] }
+          : undefined,
       isLoading,
       error,
     },

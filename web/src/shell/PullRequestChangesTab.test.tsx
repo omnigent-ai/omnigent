@@ -1494,6 +1494,8 @@ describe("PullRequestChangesTab stacked pull requests", () => {
     fireEvent.click(toggle());
 
     expect(screen.queryByText("Loading changes…")).toBeNull();
+    expect(screen.queryByText("No changes since the parent PR.")).toBeNull();
+    expect(screen.getAllByText("Changed files are unavailable.").length).toBeGreaterThan(0);
   });
 
   it("asks to update a host that can't serve the PR's own changes, without loading", () => {
