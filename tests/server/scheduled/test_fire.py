@@ -3970,4 +3970,14 @@ async def test_occurrence_is_busy_only_while_its_continued_session_runs(
         session_id="sess_busy_check" if session_mode == "continue" else None,
         next_run_at=due,
     )
-    assert await check(task) is busy
+    assert await check(task, due) is busy
+
+
+async def test_a_late_poll_counts_the_ten_minutes_from_the_current_time() -> None:
+    due = 1_800_003_600
+    # A Run now went out five minutes before this poll was due.
+    check = _occurrence_busy_check("running", due - 5 * 60)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) is True
+    # Dispatched half an hour late, the poll is sent even though the session looks busy.
+    assert await check(task, due + 30 * 60) is False

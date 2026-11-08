@@ -365,9 +365,10 @@ FireIdentity = Callable[[ScheduledTask], AbstractAsyncContextManager[object]]
 DispatchEnabled = Callable[[], bool]
 # Read before each wait between polls.
 PollInterval = Callable[[], float]
-# Whether a due occurrence can be skipped, unrecorded, because the session it continues is busy.
-# Asked only for trigger automations; passing one also lets them poll every two minutes.
-OccurrenceBusy = Callable[[ScheduledTask], Awaitable[bool]]
+# Whether a due occurrence can be skipped, unrecorded, because the session it continues is
+# busy, given the current time. Asked only for trigger automations; passing one also lets
+# them poll every two minutes.
+OccurrenceBusy = Callable[[ScheduledTask, int], Awaitable[bool]]
 
 
 class FireIdentityRevoked(Exception):
@@ -676,7 +677,7 @@ class PersistentTaskScheduler:
         assert task.next_run_at is not None
         try:
             with workspace_scope(task.workspace_id):
-                busy = await self._occurrence_busy(task)
+                busy = await self._occurrence_busy(task, now)
         except Exception:
             _logger.exception(
                 "Could not check whether task %s's session is busy; sending its prompt", task.id

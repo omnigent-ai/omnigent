@@ -2503,7 +2503,7 @@ async def test_busy_trigger_automation_skips_its_poll_without_a_run(store, caplo
     )
     await scheduler.poll_once()
     await _drain(scheduler)
-    busy.assert_awaited_once_with(task)
+    busy.assert_awaited_once_with(task, task.next_run_at)
     fire.assert_not_awaited()
     assert store.list_runs(task.id)[0] == []
     saved = store.get(task.id)

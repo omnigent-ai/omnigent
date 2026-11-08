@@ -437,19 +437,20 @@ def build_on_fire(
 BUSY_SKIP_MAX_SECONDS = 10 * 60
 
 
-def build_occurrence_busy(deps: FireDeps) -> Callable[[ScheduledTask], Awaitable[bool]]:
+def build_occurrence_busy(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable[bool]]:
     """Build the persistent scheduler's check for skipping a trigger automation's poll.
 
     Only a continue task with a recorded session skips, and only while the session
     shows as running (a turn in progress, or waiting on an approval or question) and
-    its latest run was scheduled less than :data:`BUSY_SKIP_MAX_SECONDS` earlier.
+    its latest run was scheduled less than :data:`BUSY_SKIP_MAX_SECONDS` before *now*,
+    so a late poll still goes out once that much time has passed.
     """
 
-    async def occurrence_busy(task: ScheduledTask) -> bool:
+    async def occurrence_busy(task: ScheduledTask, now: int) -> bool:
         from omnigent.server.routes._sessions.helpers import _session_status_from_cache
 
         session_id = task.session_id
-        if task.session_mode != "continue" or session_id is None or task.next_run_at is None:
+        if task.session_mode != "continue" or session_id is None:
             return False
         # The scheduler polls without the owner's identity, which only a fire assumes, so
         # read the persisted status from session activity, which needs no caller access
@@ -463,7 +464,7 @@ def build_occurrence_busy(deps: FireDeps) -> Callable[[ScheduledTask], Awaitable
         if _session_status_from_cache(session_id, session.live_status) != "running":
             return False
         runs, _ = await asyncio.to_thread(deps.scheduled_task_store.list_runs, task.id, limit=1)
-        return bool(runs) and task.next_run_at - runs[0].scheduled_at < BUSY_SKIP_MAX_SECONDS
+        return bool(runs) and now - runs[0].scheduled_at < BUSY_SKIP_MAX_SECONDS
 
     return occurrence_busy
 

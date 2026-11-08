@@ -195,7 +195,7 @@ prompt starts with the opening sentence of a Jira, Slack, GitHub or Linear
 trigger template, the same check the web form uses. Before claiming its due
 occurrence, the database scheduler skips it while the session shows as running
 (a turn in progress, or waiting on an approval or question) and the task's
-latest run was scheduled less than ten minutes earlier. A skip only advances
+latest run was scheduled less than ten minutes ago. A skip only advances
 `next_run_at`: it writes no run row and logs `scheduled_run_skipped_busy`. The
 status is read from session activity, which needs no caller access check, so the
 poll does not act as the owner. A failed check sends the prompt. Other continued
