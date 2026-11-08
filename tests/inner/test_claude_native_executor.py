@@ -2137,6 +2137,102 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     assert bool(records[0].exc_info) is expect_error_level
 
 
+_TERMINAL_GONE_SUMMARY = (
+    "The Claude Code terminal is no longer running (exit status unknown), so the "
+    "message was not delivered. Relaunch the terminal to continue this conversation."
+)
+
+
+async def _run_turn_after_terminal_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, exit_status: str | None, pane: str
+) -> tuple[ExecutorError, str]:
+    """Fail delivery the way the readiness wait does when the pane is gone."""
+    raised_message = _TERMINAL_GONE_SUMMARY + claude_bridge._format_terminal_failure_tail(pane)
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudeTerminalExited(raised_message, exit_status=exit_status)
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s, expected_close=False: None,
+    )
+    events = [
+        event
+        async for event in ClaudeNativeExecutor(tmp_path / "bridge").run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    return events[0], raised_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_status", "pane", "title"),
+    [
+        (None, "Error: Not logged in · Please run /login", "Agent isn't signed in"),
+        (
+            "1",
+            "Claude Code cannot be run with root privileges for security reasons",
+            "Claude Code can't run as root",
+        ),
+    ],
+)
+async def test_run_turn_explains_a_launch_failure_the_exited_pane_printed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    exit_status: str | None,
+    pane: str,
+    title: str,
+) -> None:
+    """A pane that died on a recognized launch failure reports its diagnosis."""
+    error, _ = await _run_turn_after_terminal_exit(
+        monkeypatch, tmp_path, exit_status=exit_status, pane=pane
+    )
+
+    assert error.code == "required_terminal_exited"
+    assert error.title == title
+    assert error.cause
+    assert error.remediation
+    assert error.undelivered is True
+    # Text-only clients read the diagnosis first; the web card shows the pane as diagnostics.
+    assert error.message == (
+        f"{title}\n\n{error.cause}\n\nTry this: {error.remediation}\n\n"
+        f"{_TERMINAL_GONE_SUMMARY}\n\nLast captured terminal output:\n{pane}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_status", "pane"),
+    [
+        (None, "Error: something unexpected happened"),
+        # /quit leaves the conversation on screen, which can quote any launch error.
+        ("0", "Error: Not logged in · Please run /login"),
+    ],
+)
+async def test_run_turn_keeps_the_generic_exit_when_no_launch_failure_is_recognized(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    exit_status: str | None,
+    pane: str,
+) -> None:
+    error, raised_message = await _run_turn_after_terminal_exit(
+        monkeypatch, tmp_path, exit_status=exit_status, pane=pane
+    )
+
+    assert error.code is None
+    assert error.title is None
+    assert error.message == raised_message
+    assert error.undelivered is True
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["message", "steering", "model"])
 @pytest.mark.parametrize("watchdog", [False, True])

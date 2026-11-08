@@ -163,6 +163,7 @@ class InnerExecutorError(RuntimeError):
     :param message: Human-readable failure text shown to the user.
     :param code: Semantic failure code, or ``None`` for the generic classifier.
     :param title: Short headline for the error card, or ``None``.
+    :param cause: Why it failed, paired with ``title``, or ``None``.
     :param remediation: Concrete next step for the user, or ``None``.
     :param undelivered: ``True`` when the harness never received the message.
     """
@@ -173,12 +174,14 @@ class InnerExecutorError(RuntimeError):
         *,
         code: str | None,
         title: str | None = None,
+        cause: str | None = None,
         remediation: str | None = None,
         undelivered: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.title = title
+        self.cause = cause
         self.remediation = remediation
         self.undelivered = undelivered
 
@@ -512,6 +515,7 @@ class ExecutorAdapter(HarnessApp):
                                 detail if event.code else f"inner executor error: {detail}",
                                 code=event.code,
                                 title=event.title,
+                                cause=event.cause,
                                 remediation=event.remediation,
                                 undelivered=event.undelivered,
                             )
@@ -1306,6 +1310,7 @@ class ExecutorAdapter(HarnessApp):
                 code=exception.code,
                 message=str(exception),
                 title=exception.title,
+                cause=exception.cause,
                 remediation=exception.remediation,
                 undelivered=True if exception.undelivered else None,
             )

@@ -42,6 +42,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_model_picker_values,
     read_transcript_path,
     terminal_dialog_pending,
+    terminal_failure_tail,
 )
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.inner.executor import (
@@ -62,6 +63,7 @@ from omnigent.inner.native_attachments import (
     framework_notices,
 )
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
+from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
 
 _logger = logging.getLogger(__name__)
 
@@ -101,6 +103,34 @@ def _can_hold_refusal(
     if isinstance(exc, ClaudeTerminalDialog):
         return isinstance(exc, ClaudeInputBoxOccupied) or exc.awaits_answer
     return True
+
+
+def _diagnose_terminal_exit(exc: ClaudeTerminalExited) -> FailureDiagnosis | None:
+    """Return the shared diagnosis of the launch failure the exited pane last printed, if any."""
+    status = exc.exit_status
+    return classify_terminal_failure(
+        command="claude",
+        exit_status=int(status) if status and status.isdigit() else None,
+        output=terminal_failure_tail(str(exc)).partition("\n")[2],
+    )
+
+
+def _describe_diagnosed_exit(
+    exc: ClaudeTerminalExited, diagnosis: FailureDiagnosis, cleanup_error: str | None
+) -> str:
+    """Compose the runner's diagnosis-first exit text, with the pane tail as card diagnostics."""
+    summary = describe_exception(exc)
+    pane_tail = terminal_failure_tail(summary)
+    summary = summary.removesuffix(pane_tail)
+    if cleanup_error is not None:
+        summary = f"{summary} Cleanup also failed: {cleanup_error}"
+    parts = [diagnosis.title, "", diagnosis.cause]
+    if diagnosis.remediation:
+        parts.extend(["", f"Try this: {diagnosis.remediation}"])
+    parts.extend(["", summary])
+    if pane_tail:
+        parts.extend(["", "Last captured terminal output:", pane_tail.partition("\n")[2]])
+    return "\n".join(parts)
 
 
 class ClaudeNativeExecutor(Executor):
@@ -480,10 +510,22 @@ class ClaudeNativeExecutor(Executor):
                 extra={"session_id": self._request_session_id},
             )
             cleanup_error = self._reap_failed_turn()
-            message = describe_exception(exc)
-            if cleanup_error is not None:
-                message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message, undelivered=True)
+            # A quit leaves the conversation on screen, which is not a launch failure.
+            diagnosis = None if clean_exit else _diagnose_terminal_exit(exc)
+            if diagnosis is None:
+                message = describe_exception(exc)
+                if cleanup_error is not None:
+                    message = f"{message} Cleanup also failed: {cleanup_error}"
+                yield ExecutorError(message=message, undelivered=True)
+                return
+            yield ExecutorError(
+                message=_describe_diagnosed_exit(exc, diagnosis, cleanup_error),
+                code="required_terminal_exited",
+                title=diagnosis.title,
+                cause=diagnosis.cause,
+                remediation=diagnosis.remediation,
+                undelivered=True,
+            )
             return
         except ClaudePromptTimeout as exc:
             _logger.exception(

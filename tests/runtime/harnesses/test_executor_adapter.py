@@ -581,6 +581,7 @@ def test_build_error_detail_keeps_inner_executor_error_fields() -> None:
         "Codex is waiting for a sign-in in this session's terminal.",
         code="databricks_sign_in_pending",
         title="Codex can't start until you sign in to Databricks",
+        cause="The launcher is waiting for a Databricks sign-in.",
         remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
         undelivered=True,
     )
@@ -591,6 +592,7 @@ def test_build_error_detail_keeps_inner_executor_error_fields() -> None:
     assert detail.undelivered is True
     assert detail.message == "Codex is waiting for a sign-in in this session's terminal."
     assert detail.title == "Codex can't start until you sign in to Databricks"
+    assert detail.cause == "The launcher is waiting for a Databricks sign-in."
     assert detail.remediation is not None
     assert "HQ7M-2KPD" in detail.remediation
 
@@ -620,6 +622,7 @@ async def test_coded_executor_error_is_raised_with_its_code() -> None:
                 message="Codex is waiting for a sign-in in this session's terminal.",
                 code="databricks_sign_in_pending",
                 title="Codex can't start until you sign in to Databricks",
+                cause="The launcher is waiting for a Databricks sign-in.",
                 remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
                 undelivered=True,
             )
@@ -637,6 +640,7 @@ async def test_coded_executor_error_is_raised_with_its_code() -> None:
     assert str(raised.value) == "Codex is waiting for a sign-in in this session's terminal."
     assert raised.value.code == "databricks_sign_in_pending"
     assert raised.value.title == "Codex can't start until you sign in to Databricks"
+    assert raised.value.cause == "The launcher is waiting for a Databricks sign-in."
     assert raised.value.remediation is not None
     assert "HQ7M-2KPD" in raised.value.remediation
     assert raised.value.undelivered is True
