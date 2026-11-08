@@ -96,6 +96,17 @@ describe("reading a sent message", () => {
     expect(readableSentText(sent)).toBe("Ask @auth about @src/a.ts\nthanks");
   });
 
+  it("keeps a session marker the user typed as text when there is no hint", () => {
+    const typed = 'why is [Session: "x" id=y subagent=no] inline?';
+    expect(readableSentText(typed)).toBe(typed);
+    const seen: string[] = [];
+    replaceSentMentions(typed, (m) => {
+      seen.push(m.kind);
+      return "";
+    });
+    expect(seen).toEqual([]);
+  });
+
   it("keeps hint-looking text the user typed mid-message", () => {
     const typed = "why does [Tagged sessions: read] show up?";
     expect(readableSentText(typed)).toBe(typed);

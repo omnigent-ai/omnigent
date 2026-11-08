@@ -182,6 +182,12 @@ def test_humanize_mention_markers_reads_markers_as_names() -> None:
     assert humanize_mention_markers(text) == "Ask @Fix CI about @src/a.py:3-9 and "
 
 
+def test_humanize_mention_markers_keeps_a_typed_session_marker_without_hint() -> None:
+    # Only composer-tagged messages end with the hint; this is the user's text.
+    text = 'why is [Session: "x" id=y subagent=no] inline?'
+    assert humanize_mention_markers(text) == text
+
+
 def test_humanize_mention_markers_keeps_a_hint_typed_mid_message() -> None:
     text = "why does [Tagged sessions: read] show up here?"
     assert humanize_mention_markers(text) == text

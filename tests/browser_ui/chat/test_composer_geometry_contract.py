@@ -426,7 +426,7 @@ def test_slash_rows_follow_the_row_grid(
     assert left == pytest.approx(right, abs=TOLERANCE)
 
 
-def test_mention_chips_follow_the_row_grid(
+def test_mention_tokens_overlay_the_textarea_text(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
@@ -459,15 +459,22 @@ def test_mention_chips_follow_the_row_grid(
         option = page.get_by_role("option", name=re.compile(name))
         expect(option).to_be_visible()
         option.get_by_role("button", name=name).click()
-    chips = [box(page.locator(f"span[title='{name}']").locator("..")) for name in names]
-    for chip in chips[1:]:
-        assert chip["height"] == pytest.approx(chips[0]["height"], abs=TOLERANCE)
-        assert_same_vertical_center(chips[0], chip)
-    gaps = [
-        chips[index + 1]["x"] - chips[index]["x"] - chips[index]["width"] for index in range(2)
-    ]
-    assert gaps[0] == pytest.approx(gaps[1], abs=TOLERANCE)
-    assert chips[0]["x"] == pytest.approx(box(composer)["x"], abs=TOLERANCE)
+    # Picked files are inline tokens; the mirror that paints them as pills must
+    # sit exactly over the textarea so each pill covers its own glyphs.
+    expect(composer).to_have_value("@alpha.md @beta.md @gamma.md ")
+    tokens = page.get_by_test_id("composer-mention-token")
+    expect(tokens).to_have_count(len(names))
+    pills = [box(tokens.nth(index)) for index in range(len(names))]
+    for pill in pills[1:]:
+        assert pill["height"] == pytest.approx(pills[0]["height"], abs=TOLERANCE)
+        assert_same_vertical_center(pills[0], pill)
+    # The first token starts the text, so its pill starts where the textarea's
+    # text does; the mirror is pinned to the textarea's top and height.
+    field = box(composer)
+    assert pills[0]["x"] == pytest.approx(field["x"], abs=TOLERANCE)
+    mirror = box(page.get_by_test_id("composer-highlight-overlay"))
+    for edge in ("y", "height"):
+        assert mirror[edge] == pytest.approx(field[edge], abs=TOLERANCE)
 
 
 @pytest.mark.parametrize("surface", ["landing", "live"])

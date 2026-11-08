@@ -283,24 +283,29 @@ const SENT_ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]([ \t]*(?:\r?\n)*)/g
 const SENT_HINT_RE = /(?:\r?\n)*[ \t]*\[Tagged sessions:[^\]]*\]\s*$/;
 
 /**
- * Rewrite the markers in a sent message with ``render``: drops the tool hint,
- * drops absolute-path upload markers, and passes each session or relative file
- * marker to ``render`` for its replacement text.
+ * Rewrite the markers in a sent message with ``render``: drops the trailing tool
+ * hint, drops absolute-path upload markers, and passes each relative file marker
+ * and, when the hint is present, each session marker to ``render``.
  */
 export function replaceSentMentions(
   text: string,
   render: (mention: SentMention) => string,
 ): string {
-  return text
-    .replace(SENT_HINT_RE, "")
-    .replace(SENT_SESSION_RE, (_m, title: string, id: string, sub: string) =>
-      render({ kind: "session", id, title, isSubagent: sub === "yes" }),
-    )
-    .replace(SENT_ATTACHED_RE, (_m, raw: string, trail: string) => {
-      const path = raw.trim();
-      if (!path || isAbsolutePath(path)) return "";
-      return render({ kind: "file", path }) + trail;
-    });
+  // The composer always ends a message that tags a session with the hint, so a
+  // session marker in a message without it is text the user typed, not a tag.
+  const tagsSessions = SENT_HINT_RE.test(text);
+  const withSessions = tagsSessions
+    ? text
+        .replace(SENT_HINT_RE, "")
+        .replace(SENT_SESSION_RE, (_m, title: string, id: string, sub: string) =>
+          render({ kind: "session", id, title, isSubagent: sub === "yes" }),
+        )
+    : text;
+  return withSessions.replace(SENT_ATTACHED_RE, (_m, raw: string, trail: string) => {
+    const path = raw.trim();
+    if (!path || isAbsolutePath(path)) return "";
+    return render({ kind: "file", path }) + trail;
+  });
 }
 
 /** Sent-message text for reading and copying: markers become ``@name``. */

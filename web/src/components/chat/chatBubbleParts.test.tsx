@@ -255,6 +255,24 @@ describe("UserBubble inline mentions", () => {
   });
 });
 
+describe("UserBubble literal session markers", () => {
+  it("shows a session marker the user typed as text, with no pill", () => {
+    const text = 'why is [Session: "x" id=y subagent=no] inline?';
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{ kind: "user", itemId: "user_literal", content: [{ type: "input_text", text }] }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/why is \[Session: "x" id=y subagent=no\] inline\?/),
+    ).toBeInTheDocument();
+  });
+});
+
 describe("UserBubble literal text", () => {
   it.each(["", "[Attached: docs/a.md]\n\n", "[Attached file: docs/a.md]\r\n\r\n"])(
     "keeps indented bullets as siblings after stripping %j",

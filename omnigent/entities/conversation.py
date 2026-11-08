@@ -57,8 +57,11 @@ def humanize_mention_markers(text: str) -> str:
         ``'Ask [Session: "Fix CI" id=s1 subagent=no] about [Attached: a.py]'``.
     :returns: Readable text, e.g. ``"Ask @Fix CI about @a.py"``.
     """
-    text = _SESSION_MENTION_HINT_RE.sub("", text)
-    text = _SESSION_MENTION_MARKER_RE.sub(lambda match: f"@{match.group(1)}", text)
+    # The composer ends every session-tagging message with the hint, so session
+    # markers in a message without it are the user's own text.
+    if _SESSION_MENTION_HINT_RE.search(text):
+        text = _SESSION_MENTION_HINT_RE.sub("", text)
+        text = _SESSION_MENTION_MARKER_RE.sub(lambda match: f"@{match.group(1)}", text)
     return _INLINE_ATTACHED_RE.sub(_readable_attached, text)
 
 
@@ -439,11 +442,11 @@ def synthesize_conversation_title(
             text = block.get("text")
             if isinstance(text, str):
                 kept_lines = [
-                    humanize_mention_markers(line)
+                    line
                     for line in text.splitlines()
                     if not _ATTACHMENT_MARKER_RE.match(line.strip())
                 ]
-                parts.append("\n".join(kept_lines))
+                parts.append(humanize_mention_markers("\n".join(kept_lines)))
     collapsed = " ".join(" ".join(parts).split())
     if not collapsed:
         return None

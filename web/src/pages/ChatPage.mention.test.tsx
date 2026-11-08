@@ -9,7 +9,7 @@ import type * as UseAgentsModule from "@/hooks/useAgents";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -675,13 +675,23 @@ describe("Composer @-session mentions", () => {
     );
   });
 
-  it("merges server title-search hits for typed text after the debounce", async () => {
+  it("searches only once typing pauses for the debounce, with the latest text", () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
     sessions.searchHits = [sessionRow("s_remote", "Gamma rollout")];
     renderWithTooltips(<Composer {...composerProps()} />);
+    type("@g");
+    act(() => vi.advanceTimersByTime(200));
     type("@gam");
-    expect(screen.queryByTitle("Tag session Gamma rollout")).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.getByTitle("Tag session Gamma rollout")).toBeInTheDocument());
+    act(() => vi.advanceTimersByTime(299));
+    // Rapid typing restarts the 300 ms wait, so nothing has been searched yet.
+    expect(sessions.searchedQueries).toEqual([]);
+    act(() => vi.advanceTimersByTime(1));
     expect(sessions.searchedQueries).toContain("gam");
+    expect(sessions.searchedQueries).not.toContain("g");
+    expect(screen.getByTitle("Tag session Gamma rollout")).toBeInTheDocument();
   });
 
   it("lists sessions above files in a native session and navigates across both", () => {
