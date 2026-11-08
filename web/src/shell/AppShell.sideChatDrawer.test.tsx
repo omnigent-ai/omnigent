@@ -164,7 +164,12 @@ beforeEach(() => {
 });
 
 function NavProbe() {
-  return <Link to="/c/conv_other">Another session</Link>;
+  return (
+    <>
+      <Link to="/c/conv_other">Another session</Link>
+      <Link to="/c/conv_ws">Back to session</Link>
+    </>
+  );
 }
 
 function renderShell(path = "/c/conv_ws") {
@@ -257,6 +262,41 @@ describe("mobile side-chats drawer", () => {
     expect(screen.getByTestId("side-chats-panel-drawer")).toHaveAttribute("data-state", "closed");
   });
 
+  it("reveals a side chat that finished while the user was away, once they return", () => {
+    renderShell();
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+    act(() => signal("conv_ws"));
+
+    fireEvent.click(screen.getByRole("link", { name: "Back to session" }));
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a");
+    expect(rail()).toHaveAttribute("data-state", "open");
+  });
+
+  it("reveals a new side chat that finished starting while the user was away", async () => {
+    let finishStart!: (result: { childSessionId: string }) => void;
+    vi.mocked(createSideChat).mockReturnValue(
+      new Promise((resolve) => {
+        finishStart = resolve;
+      }),
+    );
+    renderShell();
+    openActionsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    fireEvent.click(within(drawer).getByRole("button", { name: "New side chat" }));
+    fireEvent.click(within(drawer).getByRole("button", { name: "Send first message" }));
+
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+    await act(async () => finishStart({ childSessionId: "conv_side_new" }));
+    fireEvent.click(screen.getByRole("link", { name: "Back to session" }));
+
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_new");
+  });
+
   it("stays closed when dismissed while a new side chat is starting", async () => {
     let finishStart!: (result: { childSessionId: string }) => void;
     vi.mocked(createSideChat).mockReturnValue(
@@ -277,6 +317,10 @@ describe("mobile side-chats drawer", () => {
     await act(async () => finishStart({ childSessionId: "conv_side_new" }));
 
     expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(rail()).toHaveAttribute("data-state", "closed");
+    openActionsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_new");
   });
 
   it("stays closed when dismissed while a native side-chat fork is starting", async () => {
@@ -300,6 +344,7 @@ describe("mobile side-chats drawer", () => {
     act(() => signal("conv_ws", "conv_side_native"));
 
     expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(rail()).toHaveAttribute("data-state", "closed");
     openActionsMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
     expect(drawer).toHaveAttribute("data-state", "open");

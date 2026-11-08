@@ -2060,13 +2060,30 @@ function AppShellImpl() {
 
   // A side chat the user just opened must be visible: reveal the surface that
   // shows it — the Workspace rail, or the drawer on a phone. WorkspacePanel
-  // calls this when it takes the one-shot `sideChatToOpen` signal for this
-  // conversation (it holds the side-chat tab state, like the browser tabs).
-  const revealSideChat = useCallback(() => {
+  // owns opening/selecting the tab and clearing the one-shot `sideChatToOpen`
+  // signal (it holds the side-chat tab state, like the browser tabs).
+  const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
+  // Set by WorkspacePanel, whose effect runs first, for a start sent from its own tab.
+  const sideChatShownInPlaceRef = useRef<string | null>(null);
+  const markSideChatShownInPlace = useCallback((childId: string) => {
+    sideChatShownInPlaceRef.current = childId;
+  }, []);
+  useEffect(() => {
+    // Only the parent that owns the side chat reveals it: a fork that resolves
+    // after the user moved to another conversation must not surface over the
+    // one on screen (WorkspacePanel applies the same test before taking the
+    // signal, so it stays queued). Keyed on `conversationId` too, so coming
+    // back to the owner re-runs this and still reveals the tab.
+    if (sideChatToOpen === null || sideChatToOpen.parentId !== conversationId) return;
+    // Revealing it again would reopen a rail or drawer the user closed while it started.
+    if (sideChatShownInPlaceRef.current === sideChatToOpen.childId) {
+      sideChatShownInPlaceRef.current = null;
+      return;
+    }
     setRightPanelOpenAnimated(true);
     // Phones hide the rail, so the side chat opens in its drawer instead.
     if (isMobileViewport()) openSideChatsPanel();
-  }, [openSideChatsPanel, setRightPanelOpenAnimated]);
+  }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
   const canStartSideChat = useCanStartSideChat(serverConversationId, permissionLevel);
   const showSideChats = supportsSideChat(
     useChatStore((s) => s.sessionHarness),
@@ -2940,7 +2957,7 @@ function AppShellImpl() {
                     onShellCreateFailed={clearShellCreatePending}
                     mobileSideChatsOpen={sideChatsPanelOpen}
                     onMobileSideChatsOpenChange={setSideChatsPanelOpen}
-                    onRevealSideChat={revealSideChat}
+                    onSideChatShownInPlace={markSideChatShownInPlace}
                     onHasSideChatTabsChange={setHasSideChatTabs}
                     subagentPanelOpener={openSubagentInPanel}
                   />

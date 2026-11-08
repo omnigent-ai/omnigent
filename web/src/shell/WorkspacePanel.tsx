@@ -809,8 +809,8 @@ interface WorkspacePanelProps {
   mobileSideChatsOpen?: boolean;
   /** Open or close the mobile side-chats drawer. */
   onMobileSideChatsOpenChange?: (open: boolean) => void;
-  /** Show the side chats — the rail, or the drawer on a phone — when one opens from elsewhere. */
-  onRevealSideChat?: () => void;
+  /** Names a side chat started from its tab while on screen, so the shell doesn't reveal it again. */
+  onSideChatShownInPlace?: (childId: string) => void;
   /** Reports whether a side-chat or sub-agent tab is open, so a phone can reach the drawer. */
   onHasSideChatTabsChange?: (hasSideChatTabs: boolean) => void;
   /** Opens a sub-agent from the Agents tab as a rail tab; absent where unsupported (Grid panes). */
@@ -938,7 +938,7 @@ function WorkspacePanelImpl({
   onShellCreateFailed,
   mobileSideChatsOpen = false,
   onMobileSideChatsOpenChange,
-  onRevealSideChat,
+  onSideChatShownInPlace,
   onHasSideChatTabsChange,
   subagentPanelOpener,
 }: WorkspacePanelProps) {
@@ -1126,10 +1126,13 @@ function WorkspacePanelImpl({
   const awaitingPendingIdsRef = useRef<string[]>([]);
   // Generic children started from a pending tab here, until their signal is consumed.
   const startedSideChatIdsRef = useRef(new Set<string>());
+  const signalConversationIdRef = useRef(conversationId);
   // A side chat the server just created (Codex's native fork, or the generic
   // fork) announces itself via `sideChatToOpen`. If a pending tab is awaiting,
-  // rekey it in place; otherwise open a fresh tab and reveal the side chats.
+  // rekey it in place; otherwise open a fresh tab. AppShell reveals the rail.
   useEffect(() => {
+    const returned = signalConversationIdRef.current !== conversationId;
+    signalConversationIdRef.current = conversationId;
     if (sideChatToOpen === null) return;
     // Only the parent that owns this side chat consumes (and clears) the signal
     // — a fork that resolves after the user navigated elsewhere waits for its
@@ -1138,8 +1141,6 @@ function WorkspacePanelImpl({
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
     const subagentId = subagentSessionIdFromTab(childId);
-    // A start sent from a pending tab was already on screen; revealing it again
-    // would reopen a rail or drawer the user closed while it started.
     let startedHere = startedSideChatIdsRef.current.delete(childId);
     if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
       // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
@@ -1160,14 +1161,15 @@ function WorkspacePanelImpl({
       }
     }
     onRightRailTabChange("sidechat");
-    if (!startedHere) onRevealSideChat?.();
+    // A start that finished while the user was in another conversation is still revealed on return.
+    if (startedHere && !returned) onSideChatShownInPlace?.(childId);
     clearSideChatToOpen();
   }, [
     sideChatToOpen,
     conversationId,
     sideChats,
     onRightRailTabChange,
-    onRevealSideChat,
+    onSideChatShownInPlace,
     clearSideChatToOpen,
   ]);
   const sideChatSelected =
