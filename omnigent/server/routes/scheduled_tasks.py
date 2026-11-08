@@ -666,6 +666,8 @@ def create_scheduled_tasks_router(
         )
         from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
 
+        # _require_source_session rejects a session without an agent.
+        assert source.agent_id is not None
         up_to = await asyncio.to_thread(last_finished_response_id, conversation_store, source.id)
         copy = await asyncio.to_thread(
             copy_session,

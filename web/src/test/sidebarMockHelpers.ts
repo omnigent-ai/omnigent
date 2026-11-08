@@ -11,7 +11,7 @@ export function conversationHooksMock() {
     // Same gate as the real hook, so tests drive it through the server info.
     useAutomationsEnabled: () => {
       const info = useServerInfo();
-      return info !== "loading" && info.automations_enabled === true;
+      return info !== "loading" && info.automations_enabled !== false;
     },
     useStopAndDeleteConversation: () => ({
       mutate: vi.fn(),

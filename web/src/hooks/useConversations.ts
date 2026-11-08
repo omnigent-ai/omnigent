@@ -2247,7 +2247,7 @@ export { PROJECT_LABEL_KEY };
  */
 export function useAutomationsEnabled(): boolean {
   const serverInfo = useServerInfo();
-  return serverInfo !== "loading" && serverInfo.automations_enabled === true;
+  return serverInfo !== "loading" && serverInfo.automations_enabled !== false;
 }
 
 /**

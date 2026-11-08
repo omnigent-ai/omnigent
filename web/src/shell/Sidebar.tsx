@@ -5426,7 +5426,7 @@ function ConversationRowImpl({
   const sharingOff = serverInfo !== "loading" && serverInfo.sharing_mode === "off";
   const canCreateAutomation = canCreateAutomationFromSession({
     info: serverInfo,
-    automationsEnabled: serverInfo !== "loading" && serverInfo.automations_enabled === true,
+    automationsEnabled: serverInfo !== "loading" && serverInfo.automations_enabled !== false,
     conversation,
     isOwner,
   });

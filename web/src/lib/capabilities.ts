@@ -240,7 +240,8 @@ export interface ServerInfo {
    * True when the automations feature (recurring scheduled tasks) is enabled
    * for the caller. When false the SPA hides the sidebar Automations tab and
    * every automation entry point (the ``/v1/scheduled-tasks`` API 404s, so
-   * linking to it would be a dead page). Absent ⇒ false.
+   * linking to it would be a dead page). Absent ⇒ true: servers from before
+   * the gate always offered automations.
    */
   automations_enabled?: boolean;
   /** True when scheduled tasks accept the optional random-worktree base ref. */
@@ -446,7 +447,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   dictation_available: false,
   scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
-  automations_enabled: false,
+  automations_enabled: true,
   session_search_scope: false,
   scheduled_task_session_modes: false,
   scheduled_task_source_sessions: false,
@@ -614,7 +615,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           scheduled_task_worktrees: data.scheduled_task_worktrees === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
-          automations_enabled: data.automations_enabled === true,
+          automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,

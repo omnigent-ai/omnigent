@@ -6277,6 +6277,11 @@
             "title": "Scheduled Task Session Modes",
             "type": "boolean"
           },
+          "scheduled_task_source_sessions": {
+            "default": true,
+            "title": "Scheduled Task Source Sessions",
+            "type": "boolean"
+          },
           "scheduled_task_subhour": {
             "default": true,
             "title": "Scheduled Task Subhour",
