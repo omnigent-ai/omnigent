@@ -89,7 +89,7 @@ def test_setting_routes_plain_clicks_in_app(page: Page, seeded_session: tuple[st
     popup.value.close()
     assert page.evaluate("window.__calls") == []
 
-    page.get_by_test_id("settings-button").first.click()
+    page.get_by_test_id("sidebar-profile-settings").first.click()
     toggle = page.get_by_test_id("open-links-in-app-toggle")
     toggle.click()
     expect(toggle).to_have_attribute("aria-checked", "true")

@@ -77,7 +77,7 @@ def test_settings_back_returns_to_conversation(
 
     # Enter Settings from the sidebar footer control. The conversations sidebar
     # stays mounted and swaps its body to the settings section nav.
-    page.get_by_test_id("settings-button").click()
+    page.get_by_test_id("sidebar-profile-settings").click()
     page.wait_for_url("**/settings**", timeout=30_000)
 
     # The settings section nav renders in place of the conversation list.
@@ -106,7 +106,7 @@ def test_single_user_hides_members_and_sharing_settings(
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
-    page.get_by_test_id("settings-button").click()
+    page.get_by_test_id("sidebar-profile-settings").click()
     page.wait_for_url("**/settings**", timeout=30_000)
     # Policies anchors the Admin group in single-user mode; wait for it so the
     # absence assertions run against a rendered nav, not an unmounted one.

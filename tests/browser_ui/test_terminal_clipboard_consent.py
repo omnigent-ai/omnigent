@@ -852,7 +852,7 @@ def test_terminal_clipboard_settings_blocks_selection_copying_after_returning_to
     assert ui.copy_selection("allowed browser selection") == "allowed browser selection"
     _expect_clipboard(ui.page, "allowed browser selection")
 
-    ui.page.get_by_test_id("settings-button").click()
+    ui.page.get_by_test_id("sidebar-profile-settings").click()
     preference = ui.page.get_by_test_id("terminal-clipboard-preference-select")
     expect(preference).to_contain_text("Allow copying" if remember else "Ask before copying")
     preference.click()
