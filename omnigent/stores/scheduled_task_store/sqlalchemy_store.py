@@ -436,6 +436,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if state is not None and state != "deleted":
                 require_active_account(session, row.user_id, generation=row.account_generation)
             schedule_before = (row.rrule, row.timezone, row.state)
+            trigger_before = is_trigger_automation(_to_entity(row))
             changed = False
             if name is not None and row.name != name:
                 row.name = name
@@ -502,7 +503,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             ):
                 row.last_run_conversation_id = last_run_conversation_id
                 changed = True
-            if (row.rrule, row.timezone, row.state) != schedule_before:
+            # Becoming or ceasing to be a trigger changes who picks the next poll.
+            trigger_changed = (
+                self._trigger_poll_seconds is not None
+                and is_trigger_automation(_to_entity(row)) != trigger_before
+            )
+            if (row.rrule, row.timezone, row.state) != schedule_before or trigger_changed:
                 self._refresh_schedule(row, updated_at)
             if changed:
                 row.updated_at = updated_at

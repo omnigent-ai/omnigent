@@ -1533,6 +1533,31 @@ def test_skipping_an_occurrence_advances_the_schedule_without_a_run(
     assert store.list_runs(task.id)[0] == []
 
 
+def test_an_edit_that_changes_trigger_status_moves_the_next_poll(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    trigger_prompt = "This automation watches Slack and starts one Omnigent session per message."
+    store.configure_dispatch(True)
+    store.configure_trigger_polling(120)
+    task = store.create(
+        _uid("trigger"),
+        "trigger",
+        trigger_prompt,
+        "FREQ=HOURLY",
+        None,
+        _uid("agent"),
+        "UTC",
+        host_id=_uid("host"),
+        session_mode="continue",
+    )
+    assert task.next_run_at == task.created_at + 120
+    # Without its opening sentence, the task follows its hourly schedule again.
+    plain = store.update(task.id, prompt="Check the channel.")
+    assert plain.next_run_at - plain.updated_at > 120
+    trigger = store.update(task.id, prompt=trigger_prompt)
+    assert trigger.next_run_at == trigger.updated_at + 120
+
+
 def test_startup_lease_renewal_expiry_and_conditional_reconciliation(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
