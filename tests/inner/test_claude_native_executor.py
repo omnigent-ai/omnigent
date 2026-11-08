@@ -2188,6 +2188,7 @@ async def _run_turn_after_terminal_exit(
             "Claude Code cannot be run with root privileges for security reasons",
             "Claude Code can't run as root",
         ),
+        ("127", "", "Agent command not found"),
     ],
 )
 async def test_run_turn_explains_a_launch_failure_the_exited_pane_printed(
@@ -2208,9 +2209,10 @@ async def test_run_turn_explains_a_launch_failure_the_exited_pane_printed(
     assert error.remediation
     assert error.undelivered is True
     # Text-only clients read the diagnosis first; the web card shows the pane as diagnostics.
+    diagnostics = f"\n\nLast captured terminal output:\n{pane}" if pane else ""
     assert error.message == (
         f"{title}\n\n{error.cause}\n\nTry this: {error.remediation}\n\n"
-        f"{_TERMINAL_GONE_SUMMARY}\n\nLast captured terminal output:\n{pane}"
+        f"{_TERMINAL_GONE_SUMMARY}{diagnostics}"
     )
 
 

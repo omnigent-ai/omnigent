@@ -356,8 +356,6 @@ class ExecutorError(ExecutorEvent):
         fall back to its generic classification of the failure.
     :param title: Short headline for the error card, e.g. ``"Codex is waiting
         for a sign-in"``, or ``None``.
-    :param cause: One or two sentences explaining why it failed, paired with
-        ``title``, or ``None``.
     :param remediation: Concrete next step for the user, e.g. the sign-in link
         and code, or ``None``.
     :param undelivered: ``True`` when the failure happened before the harness
@@ -365,6 +363,8 @@ class ExecutorError(ExecutorEvent):
         prompt that never rendered), so the message never reached the
         transcript and its sender's queued copy is the only record of it.
         ``False`` (default) once the harness may have accepted it.
+    :param cause: One or two sentences explaining why it failed, paired with
+        ``title``, or ``None``.
     """
 
     message: str
@@ -373,9 +373,9 @@ class ExecutorError(ExecutorEvent):
     preserve_session: bool = False
     code: str | None = None
     title: str | None = None
-    cause: str | None = None
     remediation: str | None = None
     undelivered: bool = False
+    cause: str | None = None
 
 
 def _close_stream_quietly(stream: Iterator[ProviderStreamItem]) -> None:
