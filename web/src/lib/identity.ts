@@ -712,3 +712,27 @@ export async function authenticatedFetch(
   }
   return res;
 }
+
+// A light authenticated read the SPA already makes at boot. It reaches the same
+// auth edge as the stream and the sends, so its answer speaks for them.
+const SIGN_IN_PROBE_PATH = "/v1/me";
+
+/**
+ * Whether the sign-in has expired, judged from one request that does not follow
+ * redirects. A redirect to a login page or a 401/403 means a retry cannot renew the
+ * sign-in. The edge answers an invalid session with a redirect, never an HTML 200,
+ * so a 200 (such as a maintenance page) reads as not expired. A failed probe also
+ * reads as not expired, and the caller keeps retrying.
+ */
+export async function isSignInExpired(signal?: AbortSignal): Promise<boolean> {
+  try {
+    const res = await hostFetch(SIGN_IN_PROBE_PATH, {
+      redirect: "manual",
+      cache: "no-store",
+      signal,
+    });
+    return res.type === "opaqueredirect" || res.status === 401 || res.status === 403;
+  } catch {
+    return false;
+  }
+}

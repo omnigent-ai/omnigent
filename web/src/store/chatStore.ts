@@ -81,6 +81,7 @@ import {
   interrupt as interruptSession,
   openSessionStream,
   postEvent,
+  SIGN_IN_EXPIRED_CODE,
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
@@ -167,6 +168,7 @@ import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanM
 import {
   getCurrentAuthorId,
   getCurrentUserId,
+  isSignInExpired,
   resolveSessionHost,
   subscribeIdentity,
 } from "@/lib/identity";
@@ -1959,6 +1961,9 @@ const MAX_TRANSIENT_404_RETRIES = 10;
 // A login page means the sign-in expired, which no retry renews. A maintenance
 // page during a restart looks the same, so give up only after one outlasts a restart.
 const NON_SSE_STREAM_GIVE_UP_MS = 60_000;
+// One failed open can be a blip; a second in a row is worth asking the auth edge
+// whether the sign-in is what failed.
+const SIGN_IN_PROBE_AFTER_FAILED_OPENS = 2;
 
 /**
  * Make `id` the live, active conversation and return setters bound to its entry.
@@ -5241,28 +5246,44 @@ async function bindStream(
     // the reader sees as the transcript shifting seconds after it settled.
     const client = queryClient;
     // Each request retries on its own, so a failed one doesn't repeat the other.
+    // Set once a session read times out, and kept set through later failures: the shared
+    // read it may have joined is still the one that never answers.
+    let sessionReadTimedOut = false;
     const [session, page] = await Promise.all([
       withSnapshotRetries(id, (attempt) =>
         withReadTimeout((signal) => {
+          const queryKey = ["session", id];
+          const joinsSharedRead = client.isFetching({ queryKey, exact: true }) > 0;
+          // A retry after a timeout reads directly rather than rejoin a shared read that
+          // may never answer, and its result seeds the shared cache.
+          if (sessionReadTimedOut && joinsSharedRead) {
+            return getSessionSlim(id, { refreshState: true, signal }).then((fresh) => {
+              client.setQueryData(queryKey, fresh);
+              return fresh;
+            });
+          }
           // An attempt that starts the request drops it on timeout, so the retry reads
-          // afresh instead of joining it. One that joins another caller's request leaves
-          // its cancellation to that caller.
-          const startsRequest = client.isFetching({ queryKey: ["session", id], exact: true }) === 0;
-          if (startsRequest) {
+          // afresh. One that joins another caller's read leaves that read to its caller.
+          if (!joinsSharedRead) {
             signal.addEventListener(
               "abort",
-              () => void client.cancelQueries({ queryKey: ["session", id], exact: true }),
+              () => void client.cancelQueries({ queryKey, exact: true }),
               { once: true },
             );
           }
           return client.fetchQuery({
-            queryKey: ["session", id],
+            queryKey,
             queryFn: ({ signal: querySignal }) =>
               getSessionSlim(id, { refreshState: true, signal: querySignal }),
             staleTime: 0,
             retry: false,
           });
-        }, snapshotLoadDeadlineMs(attempt)),
+        }, snapshotLoadDeadlineMs(attempt)).catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === "TimeoutError") {
+            sessionReadTimedOut = true;
+          }
+          throw error;
+        }),
       ),
       withSnapshotRetries(id, (attempt) =>
         withReadTimeout(
@@ -6679,6 +6700,12 @@ export async function startStreamPump(
           if (isConversationDisposed(id)) break;
           console.warn(`Session ${id}: stream connect failed, will retry`, err);
           failedOpens += 1;
+          // Offline failures are the network, not the sign-in, so only probe while online.
+          if (navigator.onLine && (await streamSignInExpired(id, failedOpens, controller.signal))) {
+            failUnavailableStream(set, null, SIGN_IN_NOTICE);
+            set({ status: "idle" });
+            break;
+          }
           continue;
         }
 
@@ -6741,6 +6768,11 @@ export async function startStreamPump(
           }
           console.warn(`Session ${id}: stream open returned '${contentType}', will retry`);
           failedOpens += 1;
+          if (await streamSignInExpired(id, failedOpens, controller.signal)) {
+            failUnavailableStream(set, null, SIGN_IN_NOTICE);
+            set({ status: "idle" });
+            break;
+          }
           continue;
         }
 
@@ -9790,7 +9822,49 @@ function finalizeActive(
   });
 }
 
-const STREAM_UNAVAILABLE_CODE = "stream_unavailable";
+interface StreamNotice {
+  code: string;
+  title: string;
+  message: string;
+}
+
+/** The stream dropped and retries gave up; reloading the page reconnects it. */
+const CONNECTION_NOTICE: StreamNotice = {
+  code: "stream_unavailable",
+  title: "The live connection to the assistant is unavailable",
+  message: "Reload the page to reconnect.",
+};
+/** The sign-in expired, which only a fresh top-level page can renew. */
+const SIGN_IN_NOTICE: StreamNotice = {
+  code: SIGN_IN_EXPIRED_CODE,
+  title: "Your sign-in expired",
+  message: "Reload the page to sign in again.",
+};
+
+/**
+ * Whether repeated failed opens point at an expired sign-in, which retrying cannot
+ * fix. A probe that never answers reads as not expired, and the loop keeps retrying.
+ */
+async function streamSignInExpired(
+  id: string,
+  failedOpens: number,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (failedOpens < SIGN_IN_PROBE_AFTER_FAILED_OPENS) return false;
+  // AbortSignal.any is missing on older Safari and iOS, so forward both aborts by hand.
+  const probe = new AbortController();
+  const abortProbe = () => probe.abort();
+  signal.addEventListener("abort", abortProbe, { once: true });
+  try {
+    const expired = await withReadTimeout((probeSignal) => {
+      probeSignal.addEventListener("abort", abortProbe, { once: true });
+      return isSignInExpired(probe.signal);
+    }).catch(() => false);
+    return expired && !signal.aborted && !isConversationDisposed(id);
+  } finally {
+    signal.removeEventListener("abort", abortProbe);
+  }
+}
 
 /**
  * Fail the live turn once its stream is gone for good. A status the bubble can
@@ -9798,13 +9872,19 @@ const STREAM_UNAVAILABLE_CODE = "stream_unavailable";
  * null `error` (a login-page give-up) always gets the card. A settled turn keeps
  * its outcome.
  */
-function failUnavailableStream(set: Setter, error: string | null): void {
+function failUnavailableStream(
+  set: Setter,
+  error: string | null,
+  notice: StreamNotice = CONNECTION_NOTICE,
+): void {
   set((s) => {
     const live = s.activeResponse?.state === "streaming" ? s.activeResponse : null;
     const failed =
       live === null ? null : { ...live, state: "failed" as const, error, completedAt: Date.now() };
     const blocks = s.blocks.filter(
-      (block) => block.type !== "error" || block.code !== STREAM_UNAVAILABLE_CODE,
+      (block) =>
+        block.type !== "error" ||
+        (block.code !== CONNECTION_NOTICE.code && block.code !== SIGN_IN_NOTICE.code),
     );
     const hasVisibleFailure =
       failed !== null &&
@@ -9821,10 +9901,7 @@ function failUnavailableStream(set: Setter, error: string | null): void {
       ...(failed !== null ? { activeResponse: failed } : {}),
       blocks: [
         ...blocks,
-        {
-          ...makeClientErrorBlock("Reload the page to reconnect.", STREAM_UNAVAILABLE_CODE),
-          title: "The live connection to the assistant is unavailable",
-        },
+        { ...makeClientErrorBlock(notice.message, notice.code), title: notice.title },
       ],
     };
   });

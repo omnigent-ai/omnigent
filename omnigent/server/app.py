@@ -1882,7 +1882,10 @@ def create_app(
 
     configure_host_sharding(host_sharded)
     # A tunnel this replica retires on purpose is a handoff, not a lost runner.
-    tunnel_registry = TunnelRegistry(on_retire=shutdown_state.note_runner_tunnel_retired)
+    tunnel_registry = TunnelRegistry(
+        on_retire=shutdown_state.note_runner_tunnel_retired,
+        on_work_dispatched=managed_host_keepalive.record_work_dispatched,
+    )
     host_registry = HostRegistry()
     runner_router = RunnerRouter(
         registry=tunnel_registry,
