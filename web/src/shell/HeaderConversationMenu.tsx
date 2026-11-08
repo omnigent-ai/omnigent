@@ -611,7 +611,9 @@ export function HeaderConversationMenu({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete conversation?</DialogTitle>
+            <DialogTitle>
+              {automationSourceOf !== null ? "Delete session and automation?" : "Delete session?"}
+            </DialogTitle>
             <DialogDescription>
               <span className="font-medium break-all">{label}</span> and all of its history will be
               removed. This cannot be undone.

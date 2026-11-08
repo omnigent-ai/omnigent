@@ -102,7 +102,7 @@ describe("optimistic delete session flow", () => {
 
     const dialog = screen.getByRole("dialog");
     // Confirm the delete dialog is the one open (vs. some other surface).
-    expect(within(dialog).getByText("Delete conversation?")).toBeInTheDocument();
+    expect(within(dialog).getByText("Delete session?")).toBeInTheDocument();
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
 
@@ -284,6 +284,7 @@ describe("deleting a session an automation runs from", () => {
     vi.mocked(getScheduledTask).mockResolvedValue({
       id: "st_1",
       name: "Weekly rubric",
+      rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
     } as ScheduledTask);
     vi.mocked(deleteScheduledTask).mockReset().mockResolvedValue(undefined);
     mockConversations([AUTOMATION_SOURCE]);
@@ -294,9 +295,10 @@ describe("deleting a session an automation runs from", () => {
     openDeleteDialog();
 
     const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Delete session and automation?")).toBeInTheDocument();
     await waitFor(() =>
       expect(within(dialog).getByTestId("automation-source-delete-notice")).toHaveTextContent(
-        "The automation “Weekly rubric” runs from this session. Deleting the session also deletes the automation.",
+        "This session runs an automationDeleting it also deletes “Weekly rubric”, which runs every day at 9:00 AM.",
       ),
     );
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete both" }));

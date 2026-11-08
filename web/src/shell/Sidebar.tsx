@@ -327,7 +327,10 @@ import {
 import { useDesktopHostId } from "./RevealInFileManager";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { CreateAutomationFromSessionDialog } from "@/components/scheduled/CreateAutomationFromSessionDialog";
-import { AutomationSourceDeleteNotice } from "@/components/scheduled/AutomationSourceDeleteNotice";
+import {
+  AutomationSourceDeleteNotice,
+  AutomationSourcesDeleteNotice,
+} from "@/components/scheduled/AutomationSourceDeleteNotice";
 import {
   canCreateAutomationFromSession,
   automationSourceTaskId,
@@ -6357,7 +6360,9 @@ function ConversationRowImpl({
             onClick={(e) => e.stopPropagation()}
           >
             <DialogHeader>
-              <DialogTitle>Delete conversation?</DialogTitle>
+              <DialogTitle>
+                {automationSourceOf !== null ? "Delete session and automation?" : "Delete session?"}
+              </DialogTitle>
               <DialogDescription>
                 <span className="font-medium break-all">{label}</span> and all of its history will
                 be removed. This cannot be undone.
@@ -7682,21 +7687,18 @@ function BulkActionBar({
       >
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>Delete {ownedSelected.length} session(s)?</DialogTitle>
+            <DialogTitle>
+              {automationSourceTaskIds.length > 0
+                ? `Delete ${ownedSelected.length} ${ownedSelected.length === 1 ? "session" : "sessions"} and ${automationSourceTaskIds.length} ${automationSourceTaskIds.length === 1 ? "automation" : "automations"}?`
+                : `Delete ${ownedSelected.length} session(s)?`}
+            </DialogTitle>
             <DialogDescription>
               This will permanently delete the selected sessions and all their history. This cannot
               be undone.
             </DialogDescription>
           </DialogHeader>
           {automationSourceTaskIds.length > 0 && (
-            <p
-              className="text-sm text-muted-foreground"
-              data-testid="bulk-automation-source-delete-notice"
-            >
-              {automationSourceTaskIds.length === 1
-                ? "An automation runs from 1 of these sessions. Deleting it also deletes the automation."
-                : `Automations run from ${automationSourceTaskIds.length} of these sessions. Deleting them also deletes those automations.`}
-            </p>
+            <AutomationSourcesDeleteNotice taskIds={automationSourceTaskIds} />
           )}
           {worktreeSelected.length > 0 && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">

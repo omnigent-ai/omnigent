@@ -570,7 +570,7 @@ describe("HeaderConversationMenu", () => {
     view.rerender(menuTree({ conversation: SECOND_CONVERSATION }));
 
     await waitFor(() => {
-      expect(screen.queryByRole("heading", { name: "Delete conversation?" })).toBeNull();
+      expect(screen.queryByRole("heading", { name: "Delete session?" })).toBeNull();
     });
     expect(mocks.deleteConversation).not.toHaveBeenCalled();
 
@@ -957,7 +957,7 @@ describe("automations started from this session", () => {
 
     await waitFor(() =>
       expect(screen.getByTestId("automation-source-delete-notice")).toHaveTextContent(
-        "The automation “Weekly rubric” runs from this session",
+        "Deleting it also deletes “Weekly rubric”",
       ),
     );
     fireEvent.click(screen.getByRole("button", { name: "Delete both" }));
