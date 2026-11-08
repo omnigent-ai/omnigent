@@ -809,6 +809,8 @@ interface WorkspacePanelProps {
   mobileSideChatsOpen?: boolean;
   /** Open or close the mobile side-chats drawer. */
   onMobileSideChatsOpenChange?: (open: boolean) => void;
+  /** Show the side chats — the rail, or the drawer on a phone — when one opens from elsewhere. */
+  onRevealSideChat?: () => void;
   /** Reports whether a side-chat or sub-agent tab is open, so a phone can reach the drawer. */
   onHasSideChatTabsChange?: (hasSideChatTabs: boolean) => void;
   /** Opens a sub-agent from the Agents tab as a rail tab; absent where unsupported (Grid panes). */
@@ -936,6 +938,7 @@ function WorkspacePanelImpl({
   onShellCreateFailed,
   mobileSideChatsOpen = false,
   onMobileSideChatsOpenChange,
+  onRevealSideChat,
   onHasSideChatTabsChange,
   subagentPanelOpener,
 }: WorkspacePanelProps) {
@@ -1121,9 +1124,11 @@ function WorkspacePanelImpl({
   // would cross-assign when two launches overlap; the generic path skips the
   // queue entirely and rekeys its own tab directly (see startPendingSideChat).
   const awaitingPendingIdsRef = useRef<string[]>([]);
+  // Generic children started from a pending tab here, until their signal is consumed.
+  const startedSideChatIdsRef = useRef(new Set<string>());
   // A side chat the server just created (Codex's native fork, or the generic
   // fork) announces itself via `sideChatToOpen`. If a pending tab is awaiting,
-  // rekey it in place; otherwise open a fresh tab. AppShell reveals the rail.
+  // rekey it in place; otherwise open a fresh tab and reveal the side chats.
   useEffect(() => {
     if (sideChatToOpen === null) return;
     // Only the parent that owns this side chat consumes (and clears) the signal
@@ -1133,6 +1138,9 @@ function WorkspacePanelImpl({
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
     const subagentId = subagentSessionIdFromTab(childId);
+    // A start sent from a pending tab was already on screen; revealing it again
+    // would reopen a rail or drawer the user closed while it started.
+    let startedHere = startedSideChatIdsRef.current.delete(childId);
     if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
       // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
       sideChats.select(subagentId);
@@ -1145,14 +1153,23 @@ function WorkspacePanelImpl({
       if (awaiting !== undefined) {
         sideChats.rekey(awaiting, childId);
         useChatStore.getState().clearSideChatComposer(awaiting);
+        startedHere = true;
       } else {
         // Generic already rekeyed its own tab; this just re-selects it (idempotent).
         sideChats.open(childId);
       }
     }
     onRightRailTabChange("sidechat");
+    if (!startedHere) onRevealSideChat?.();
     clearSideChatToOpen();
-  }, [sideChatToOpen, conversationId, sideChats, onRightRailTabChange, clearSideChatToOpen]);
+  }, [
+    sideChatToOpen,
+    conversationId,
+    sideChats,
+    onRightRailTabChange,
+    onRevealSideChat,
+    clearSideChatToOpen,
+  ]);
   const sideChatSelected =
     rightRailTab === "sidechat" &&
     selectedFilePath === null &&
@@ -1232,12 +1249,13 @@ function WorkspacePanelImpl({
       ({ childSessionId }) => {
         // We have the child id here, so rekey THIS pending tab directly — no
         // shared queue, so overlapping launches can't cross-assign. Seeding the
-        // draft fires sideChatToOpen, which then just re-selects + reveals.
+        // draft fires sideChatToOpen, which then just re-selects it.
         sideChats.rekey(pendingId, childSessionId);
         // The pending id is gone; drop its composer entry (and its File refs)
         // now that the text has moved to the real child. Only on success — a
         // failed create keeps it so the user can retry.
         useChatStore.getState().clearSideChatComposer(pendingId);
+        startedSideChatIdsRef.current.add(childSessionId);
         useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
       },
       (err) => {
