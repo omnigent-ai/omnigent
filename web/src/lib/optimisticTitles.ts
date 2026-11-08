@@ -26,9 +26,12 @@ export function synthesizeOptimisticTitle(
   text: string,
   limit: number = OPTIMISTIC_TITLE_LIMIT,
 ): string | null {
-  const keptLines = text.split("\n").filter((line) => !ATTACHMENT_MARKER_RE.test(line.trim()));
-  const readable = readableSentText(keptLines.join("\n"));
-  const collapsed = readable.split(/\s+/).filter(Boolean).join(" ");
+  // Mentions read as "@name" first (absolute upload paths drop out), so only
+  // leftover upload notices are filtered as whole lines.
+  const keptLines = readableSentText(text)
+    .split("\n")
+    .filter((line) => !ATTACHMENT_MARKER_RE.test(line.trim()));
+  const collapsed = keptLines.join(" ").split(/\s+/).filter(Boolean).join(" ");
   if (!collapsed) return null;
   // Code points, not UTF-16 units, so the cap matches Python's len() and
   // never splits a surrogate pair.

@@ -29,6 +29,16 @@ describe("synthesizeOptimisticTitle", () => {
     );
   });
 
+  it("keeps workspace file mentions alone on a line or several to a line", () => {
+    expect(synthesizeOptimisticTitle("[Attached: README.md]")).toBe("@README.md");
+    expect(synthesizeOptimisticTitle("[Attached: a.ts] vs [Attached: b.ts]")).toBe(
+      "@a.ts vs @b.ts",
+    );
+    expect(synthesizeOptimisticTitle("review this\n[Attached: src/app.ts]")).toBe(
+      "review this @src/app.ts",
+    );
+  });
+
   it("reads inline mention markers as @names and drops the session hint", () => {
     const sent =
       'compare [Session: "Fix CI" id=s_1 subagent=no] with [Attached: src/a.ts]' +

@@ -165,19 +165,44 @@ export function sessionMentionMarker(session: SessionMention): string {
   return `[Session: "${title}" id=${session.id} subagent=${session.isSubagent ? "yes" : "no"}]`;
 }
 
+/**
+ * ``base`` if no tagged item uses it yet, else ``base (suffix)`` with the first
+ * free suffix, falling back to a counter. Keeps each token mapped to one target.
+ */
+export function uniqueMentionToken(
+  base: string,
+  taken: readonly string[],
+  suffixes: readonly string[],
+): string {
+  if (!taken.includes(base)) return base;
+  for (const suffix of suffixes) {
+    const candidate = `${base} (${suffix})`;
+    if (!taken.includes(candidate)) return candidate;
+  }
+  for (let n = 2; ; n++) {
+    const candidate = `${base} (${n})`;
+    if (!taken.includes(candidate)) return candidate;
+  }
+}
+
 /** Composer token for a tagged file or folder, e.g. ``@src/``, ``@a.ts:3-9``. */
 export function fileMentionToken(item: MentionItem): string {
-  return `@${mentionItemPath(item)}`;
+  return item.token ?? `@${mentionItemPath(item)}`;
+}
+
+/** A new file tag's token, suffixed ``(file)`` when a tagged session owns the plain one. */
+export function newFileMentionToken(item: MentionItem, taken: readonly string[]): string {
+  return uniqueMentionToken(`@${mentionItemPath(item)}`, taken, ["file"]);
 }
 
 /**
- * Composer token for a tagged session, e.g. ``@Fix CI``. A title already used
- * by another tagged token gets a short id suffix, so each token maps to one
- * session.
+ * Composer token for a tagged session, e.g. ``@Fix CI``. A token another tagged
+ * item already uses gets an id-prefix suffix, lengthened until it is free.
  */
 export function sessionMentionToken(session: SessionMention, taken: readonly string[]): string {
   const base = `@${cleanSessionTitle(session.title) || "Untitled session"}`;
-  return taken.includes(base) ? `${base} (${session.id.slice(0, 6)})` : base;
+  const { id } = session;
+  return uniqueMentionToken(base, taken, [id.slice(0, 6), id.slice(0, 12), id]);
 }
 
 /** A token in composer text and the marker it becomes when the message is sent. */

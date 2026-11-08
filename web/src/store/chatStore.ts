@@ -691,6 +691,8 @@ export interface ComposerAttachment {
   path: string;
   isDir: boolean;
   lineRange?: { start: number; end: number };
+  /** Composer ``@`` token once tagged; unique across tagged files and sessions. */
+  token?: string;
 }
 
 /**

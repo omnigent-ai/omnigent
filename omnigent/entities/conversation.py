@@ -441,12 +441,14 @@ def synthesize_conversation_title(
         if block.get("type") == "input_text":
             text = block.get("text")
             if isinstance(text, str):
+                # Mentions read as "@name" first (absolute upload paths drop out),
+                # so only leftover upload notices are filtered as whole lines.
                 kept_lines = [
                     line
-                    for line in text.splitlines()
+                    for line in humanize_mention_markers(text).splitlines()
                     if not _ATTACHMENT_MARKER_RE.match(line.strip())
                 ]
-                parts.append(humanize_mention_markers("\n".join(kept_lines)))
+                parts.append("\n".join(kept_lines))
     collapsed = " ".join(" ".join(parts).split())
     if not collapsed:
         return None

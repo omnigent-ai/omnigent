@@ -10606,6 +10606,10 @@ describe("NewChatLandingScreen @-file-mention", () => {
     fireEvent.keyDown(input(), { key: "Backspace" });
     expect((input() as HTMLTextAreaElement).value).toBe("");
     expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
+    // Enter right away must not complete the mention that was just deleted.
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect((input() as HTMLTextAreaElement).value).toBe("");
+    expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
   });
 });
 

@@ -5,6 +5,7 @@ import {
   expandMentionTokens,
   findMentionTokens,
   mentionTokenAtCaret,
+  newFileMentionToken,
   presentMentions,
   rankSessionMentions,
   readableSentText,
@@ -45,10 +46,59 @@ describe("mentionTokenAtCaret", () => {
   });
 });
 
-describe("sessionMentionToken", () => {
-  it("adds an id suffix when the title token is already taken", () => {
-    expect(sessionMentionToken(alpha, [])).toBe("@Alpha planning");
-    expect(sessionMentionToken(alpha, ["@Alpha planning"])).toBe("@Alpha planning (s_alph)");
+describe("unique tokens across files and sessions", () => {
+  const readmeSession: SessionMention = { id: "s_readme1", title: "README.md", isSubagent: false };
+  const readmeFile = { path: "README.md", isDir: false };
+  const targets = (text: string, mentions: ReturnType<typeof composerInlineMentions>) =>
+    [...expandMentionTokens(text, mentions).matchAll(/id=(\w+)|Attached: ([^\]]+)/g)].map(
+      (m) => m[1] ?? `file:${m[2]}`,
+    );
+
+  it("suffixes the file when a session already owns the plain token", () => {
+    const sessionToken = sessionMentionToken(readmeSession, []);
+    const fileToken = newFileMentionToken(readmeFile, [sessionToken]);
+    expect([sessionToken, fileToken]).toEqual(["@README.md", "@README.md (file)"]);
+    const mentions = composerInlineMentions(
+      [{ ...readmeFile, token: fileToken }],
+      [{ ...readmeSession, token: sessionToken }],
+      null,
+    );
+    expect(targets(`compare ${sessionToken} with ${fileToken}`, mentions)).toEqual([
+      "s_readme1",
+      "file:README.md",
+    ]);
+  });
+
+  it("suffixes the session when a file already owns the plain token", () => {
+    const fileToken = newFileMentionToken(readmeFile, []);
+    const sessionToken = sessionMentionToken(readmeSession, [fileToken]);
+    expect([fileToken, sessionToken]).toEqual(["@README.md", "@README.md (s_read)"]);
+    const mentions = composerInlineMentions(
+      [{ ...readmeFile, token: fileToken }],
+      [{ ...readmeSession, token: sessionToken }],
+      null,
+    );
+    expect(targets(`compare ${fileToken} with ${sessionToken}`, mentions)).toEqual([
+      "file:README.md",
+      "s_readme1",
+    ]);
+  });
+
+  it("keeps same-title sessions apart even when their ids share a prefix", () => {
+    const sessions = ["abcdef111111a", "abcdef222222b", "abcdef111111c"].map((id) => ({
+      id,
+      title: "Fix",
+      isSubagent: false,
+    }));
+    const taken: string[] = [];
+    const tagged = sessions.map((session) => {
+      const token = sessionMentionToken(session, taken);
+      taken.push(token);
+      return { ...session, token };
+    });
+    expect(taken).toEqual(["@Fix", "@Fix (abcdef)", "@Fix (abcdef111111)"]);
+    const mentions = composerInlineMentions([], tagged, null);
+    expect(targets(taken.join(" and "), mentions)).toEqual(sessions.map((s) => s.id));
   });
 });
 

@@ -116,6 +116,20 @@ def test_to_api_dict_exposes_interrupted_assistant_marker() -> None:
             [{"type": "input_text", "text": "[Attached: /tmp/omnigent/u/img.png]"}],
             None,
         ),
+        # A workspace file mention is part of the prompt, even alone on a
+        # line or several to a line; only absolute upload paths drop out.
+        (
+            [{"type": "input_text", "text": "[Attached: README.md]"}],
+            "@README.md",
+        ),
+        (
+            [{"type": "input_text", "text": "[Attached: a.ts] vs [Attached: b.ts]"}],
+            "@a.ts vs @b.ts",
+        ),
+        (
+            [{"type": "input_text", "text": "review this\n[Attached: src/app.ts]"}],
+            "review this @src/app.ts",
+        ),
         # Composer "@" mentions sit inline: they read as "@name" in the
         # title and the session tool hint is dropped.
         (

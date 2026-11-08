@@ -184,10 +184,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   (`[Attached: path]` or `[Session: "title" id=… subagent=yes|no]`), and a
   tagged session adds one tool hint at the end, so native terminals show the
   markers as typed text. The sent message shows the tokens as inline pills; a
-  session pill opens that session. States: listing still loading (Enter holds),
-  no match (Enter sends the literal text), late results arriving (the
-  highlighted row stays put), Attach to agent from the file viewer (adds a token
-  at the end).
+  session pill opens that session. The new-session composer lists the same
+  sessions (no subagents yet) with the same title search; its files come from
+  the host directory listing only, without the recursive workspace search.
+  States: file listing still loading (Enter holds; a pending session search
+  does not hold it), no match (Enter sends the literal text), late results
+  arriving (the highlighted row stays put), a file and a session with the same
+  name (the later one gets a suffix such as `@README.md (file)`), Attach to
+  agent from the file viewer (adds a token at the end).
 - `dictation`: the microphone button beside the message box dictates speech
   into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
   terminal or code editor. While listening, Enter keeps the dictated text and
@@ -308,6 +312,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   a Retry link.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
   message box; press Enter to keep the text or Escape to discard it.
+- Type `@` mid-sentence and pick a session, a subagent of this session, or (in a
+  native coding-agent session) a file or folder; the pick becomes a pill in the
+  sentence. Send it, then click the session pill in the sent message to open
+  that session. From the file viewer, **Attach to agent** adds a file token to
+  the end of the draft.
 - Send while the agent is working to queue a message, then steer it.
 - With the in-session message box empty, press Up to recall a previous prompt
   (or the last queued message). While writing a draft, Up stops at the top.

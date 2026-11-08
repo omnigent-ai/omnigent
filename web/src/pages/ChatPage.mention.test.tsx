@@ -363,13 +363,11 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(onSend).toHaveBeenCalledWith("[Attached: src/] review the module", undefined);
   });
 
-  it.each([
-    ["claude-native", "check [Attached: src/server.ts] now"],
-    ["pi-native", "check [Attached: src/server.ts] now"],
-    ["cursor-native", "check [Attached: src/server.ts] now"],
-    ["codex-native", "check [Attached file: src/server.ts] now"],
-  ])("delivers the harness-correct marker on %s", (harness, expected) => {
-    useChatStore.setState({ sessionHarness: harness });
+  // Wording per harness is covered by mentionMarkerFor above; this checks the
+  // composer passes the session's harness through.
+  it("delivers the harness-specific marker wording", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const expected = "check [Attached file: src/server.ts] now";
     const onSend = vi.fn();
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
     type("check @src");
@@ -489,6 +487,44 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.getAllByTitle("Attach server.ts")).toHaveLength(1);
   });
 
+  it("dedups a file both listed and returned by the recursive search", () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    ws.searchFiles = [
+      { path: "readme.md", name: "readme.md", type: "file", bytes: 10, modified_at: null },
+      {
+        path: "docs/readme-notes.md",
+        name: "readme-notes.md",
+        type: "file",
+        bytes: 1,
+        modified_at: null,
+      },
+    ];
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@readme");
+    act(() => vi.advanceTimersByTime(300));
+    // The search ran (its deeper hit shows) and the root file appears once.
+    expect(screen.getByTitle("Attach readme-notes.md")).toBeInTheDocument();
+    expect(screen.getAllByTitle("Attach readme.md")).toHaveLength(1);
+  });
+
+  it("gives a file its own token when a tagged session has the same name", () => {
+    const onSend = vi.fn();
+    sessions.loaded = [sessionRow("s_readme", "readme.md")];
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("compare @readme");
+    fireEvent.click(screen.getByTitle("Tag session readme.md"));
+    append("with @readme");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    expect(tokens()).toEqual(["@readme.md", "@readme.md (file)"]);
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toMatch(
+      /^compare \[Session: "readme\.md" id=s_readme subagent=no\] with \[Attached: readme\.md\]\n\n\[Tagged sessions:/,
+    );
+  });
+
   it("keeps the highlighted file when session results land above it", async () => {
     sessions.searchHits = [sessionRow("s_readme", "readme cleanup")];
     renderWithTooltips(<Composer {...composerProps()} />);
@@ -511,15 +547,17 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
     type("see @");
     fireEvent.click(screen.getByTitle("Attach readme.md"));
-    // Caret just after the token (before the auto-inserted space).
+    // Caret just after the token (the trailing space removed), which reopens the
+    // menu for "@readme.md".
     type("see @readme.md");
+    expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
     fireEvent.keyDown(textarea(), { key: "Backspace" });
     expect(textarea().value).toBe("see ");
     expect(tokens()).toEqual([]);
-    append("it");
-    fireEvent.submit(textarea().closest("form")!);
-    // Deleting the token untags the file, so no marker is sent.
-    expect(onSend).toHaveBeenCalledWith("see it", undefined);
+    expect(screen.queryByTitle("Attach readme.md")).not.toBeInTheDocument();
+    // Enter right away sends the text; it must not re-insert the deleted token.
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("see", undefined);
   });
 
   it("dedups re-attaching the same file via '@' to one tag", () => {

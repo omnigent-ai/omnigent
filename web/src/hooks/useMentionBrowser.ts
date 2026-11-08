@@ -1,8 +1,10 @@
 import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
 
 import {
+  detectMentionAt,
   fileMentionToken,
   mentionTokenAtCaret,
+  newFileMentionToken,
   NO_SESSION_MENTIONS,
   type MentionItem,
   type MentionState,
@@ -141,7 +143,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const range = mentionTokenAtCaret(text, ta.selectionStart, mentionTokens);
     if (!range) return false;
     e.preventDefault();
-    setText(text.slice(0, range.start) + text.slice(range.end));
+    const next = text.slice(0, range.start) + text.slice(range.end);
+    setText(next);
+    // The deleted token may have been the active "@" query; recompute it so a
+    // following Enter can't complete a mention that no longer exists.
+    setMention(detectMentionAt(next, range.start));
+    setMentionIndex(-1);
     placeCaret(range.start);
     return true;
   };
@@ -151,11 +158,14 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     // Dedup on the shared attachment key (path + dir-ness + range) — the same
     // identity the store queue uses — so the "@" menu and the file viewer's
     // "Attach to agent" never disagree about what counts as a duplicate.
-    const item: MentionItem = { path, isDir };
-    const itemKey = composerAttachmentKey(item);
-    setMentionedItems((prev) =>
-      prev.some((it) => composerAttachmentKey(it) === itemKey) ? prev : [...prev, item],
-    );
+    const itemKey = composerAttachmentKey({ path, isDir });
+    const existing = mentionedItems.find((it) => composerAttachmentKey(it) === itemKey);
+    const item: MentionItem = existing ?? {
+      path,
+      isDir,
+      token: newFileMentionToken({ path, isDir }, mentionTokens),
+    };
+    if (!existing) setMentionedItems((prev) => [...prev, item]);
     insertToken(mention, fileMentionToken(item));
   };
 

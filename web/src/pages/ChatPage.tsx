@@ -139,6 +139,7 @@ import {
   expandMentionTokens,
   fileMentionToken,
   findMentionTokens,
+  newFileMentionToken,
   presentMentions,
   withSessionMentionHint,
   detectMentionAt,
@@ -3170,28 +3171,39 @@ function ComposerImpl(
       hasPendingInitialMessage);
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
-  // the local mention chips, deduping against what's already tagged, then
-  // clear the store queue so they aren't re-applied. Placed after
+  // tagged items and inline tokens, deduping against what's already tagged,
+  // then clear the store queue so they aren't re-applied. Placed after
   // ``useMentionBrowser`` since it owns ``setMentionedItems``.
+  // Read at drain time without re-running the effect on every keystroke.
+  const mentionedItemsRef = useRef(mentionedItems);
+  mentionedItemsRef.current = mentionedItems;
+  const mentionTokensRef = useRef(mentionTokens);
+  mentionTokensRef.current = mentionTokens;
   useEffect(() => {
     if (pendingComposerAttachments.length === 0) return;
-    setMentionedItems((prev) => {
-      // Dedup against already-tagged chips AND within this batch (accumulate
-      // into ``seen`` as we go) so a duplicated queue can't double-apply.
-      const seen = new Set(prev.map(composerAttachmentKey));
-      const fresh: MentionItem[] = [];
-      for (const a of pendingComposerAttachments) {
-        const k = composerAttachmentKey(a);
-        if (seen.has(k)) continue;
-        seen.add(k);
-        fresh.push(a);
+    // Dedup against already-tagged items AND within this batch, and give each
+    // new item a token no tagged file or session already uses.
+    const known = new Map(mentionedItemsRef.current.map((it) => [composerAttachmentKey(it), it]));
+    const taken = [...mentionTokensRef.current];
+    const fresh: MentionItem[] = [];
+    const tokens: string[] = [];
+    for (const attachment of pendingComposerAttachments) {
+      const key = composerAttachmentKey(attachment);
+      let item = known.get(key);
+      if (!item) {
+        item = { ...attachment, token: newFileMentionToken(attachment, taken) };
+        known.set(key, item);
+        fresh.push(item);
+        taken.push(fileMentionToken(item));
       }
-      return fresh.length > 0 ? [...prev, ...fresh] : prev;
-    });
+      tokens.push(fileMentionToken(item));
+    }
+    if (fresh.length > 0) setMentionedItems((prev) => [...prev, ...fresh]);
     // Each attachment lands as an inline token at the end of the draft.
-    const tokens = [...new Set(pendingComposerAttachments.map(fileMentionToken))];
     editText(null, (prev) => {
-      const missing = tokens.filter((token) => findMentionTokens(prev, [token]).length === 0);
+      const missing = [...new Set(tokens)].filter(
+        (token) => findMentionTokens(prev, [token]).length === 0,
+      );
       if (missing.length === 0) return prev;
       const gap = prev === "" || /\s$/.test(prev) ? "" : " ";
       return `${prev}${gap}${missing.join(" ")} `;
