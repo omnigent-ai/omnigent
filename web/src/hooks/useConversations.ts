@@ -422,27 +422,105 @@ export function isSessionArchiving(id: string): boolean {
   return archivingSessions.has(id);
 }
 
+// ── Moving-session tombstones ─────────────────────────────────────────
+//
+// A move regroups the row optimistically, but a frame or list fetch read
+// before the PATCH committed still carries the old membership and would put
+// the row back in its old folder (or show it in both). Until the server
+// reports the new membership, every fetched or streamed copy of the row
+// gets the move's membership.
+interface MoveTombstone {
+  /** Target folder name; `null` unfiles. */
+  project: string | null;
+  projectId: string | null;
+  /** Legacy label a label-only target is shown through until the PATCH lands. */
+  projectLabel?: string;
+  confirmed: boolean;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+const movingSessions = new Map<string, MoveTombstone>();
+
+function markSessionMoving(id: string, entry: MoveTombstone): void {
+  const previous = movingSessions.get(id);
+  if (previous?.timer !== undefined) clearTimeout(previous.timer);
+  movingSessions.set(id, entry);
+}
+
+function unmarkSessionMoving(id: string, entry?: MoveTombstone): void {
+  const current = movingSessions.get(id);
+  if (current === undefined || (entry !== undefined && current !== entry)) return;
+  if (current.timer !== undefined) clearTimeout(current.timer);
+  movingSessions.delete(id);
+}
+
+/**
+ * The PATCH landed: from now on the server's own membership ends the
+ * tombstone, with a timeout in case no copy of the row is fetched again.
+ */
+function confirmSessionMoving(id: string, entry: MoveTombstone, projectId: string | null): void {
+  if (movingSessions.get(id) !== entry) return;
+  entry.projectId = projectId;
+  entry.projectLabel = undefined;
+  entry.confirmed = true;
+  entry.timer = setTimeout(() => unmarkSessionMoving(id, entry), DELETED_TOMBSTONE_MS);
+}
+
+/**
+ * Give a fetched or streamed row the membership of its in-flight move. Once
+ * the move is confirmed, a row that already reports it releases the tombstone.
+ */
+export function withMoveTombstone<
+  T extends { id: string; project_id?: string | null; labels?: Record<string, string> },
+>(row: T): T {
+  const entry = movingSessions.get(row.id);
+  if (entry === undefined) return row;
+  const label = row.labels?.[PROJECT_LABEL_KEY] || undefined;
+  if ((row.project_id ?? null) === entry.projectId && label === entry.projectLabel) {
+    if (entry.confirmed) unmarkSessionMoving(row.id, entry);
+    return row;
+  }
+  const labels = Object.fromEntries(
+    Object.entries(row.labels ?? {}).filter(([key]) => key !== PROJECT_LABEL_KEY),
+  );
+  if (entry.projectLabel !== undefined) labels[PROJECT_LABEL_KEY] = entry.projectLabel;
+  return { ...row, project_id: entry.projectId, labels };
+}
+
 /** Wipe module-level tombstones between tests. */
 export function clearSessionTombstones(): void {
   unmarkSessionsDeleting();
   unmarkSessionsArchiving();
+  for (const id of [...movingSessions.keys()]) unmarkSessionMoving(id);
 }
 
 /**
- * Apply optimistic delete/archive state to a freshly fetched page.
+ * Apply optimistic delete/archive/move state to a freshly fetched page.
+ *
+ * @param project - The folder the page is scoped to; rows moving out of it are dropped.
  */
 function applySessionTombstones(
   page: ConversationsPage,
   dropArchiving = false,
   originalPage = page,
+  project?: string,
 ): ConversationsPage {
-  if (deletingSessionIds.size === 0 && archivingSessions.size === 0) return page;
+  if (deletingSessionIds.size === 0 && archivingSessions.size === 0 && movingSessions.size === 0)
+    return page;
   let changed = false;
-  let lastArchivingId: string | null = null;
+  let lastDroppedId: string | null = null;
   const data: Conversation[] = [];
-  for (const conv of page.data) {
-    if (isSessionDeleting(conv.id)) {
+  for (const fetched of page.data) {
+    if (isSessionDeleting(fetched.id)) {
       changed = true;
+      continue;
+    }
+    const conv = withMoveTombstone(fetched);
+    if (conv !== fetched) changed = true;
+    const move = movingSessions.get(conv.id);
+    if (project && move !== undefined && move.project !== project) {
+      changed = true;
+      lastDroppedId = conv.id;
       continue;
     }
     if (!isSessionArchiving(conv.id)) {
@@ -451,7 +529,7 @@ function applySessionTombstones(
     }
     changed = true;
     if (dropArchiving) {
-      lastArchivingId = conv.id;
+      lastDroppedId = conv.id;
     } else {
       data.push(conv.archived === true ? conv : { ...conv, archived: true });
     }
@@ -462,7 +540,7 @@ function applySessionTombstones(
     data,
     first_id: data[0]?.id ?? null,
     // Archived anchors remain valid on legacy row-ID backends.
-    last_id: lastIdAfterFiltering(originalPage, data, lastArchivingId),
+    last_id: lastIdAfterFiltering(originalPage, data, lastDroppedId),
   };
 }
 
@@ -601,6 +679,7 @@ export async function fetchConversationsPage({
     ),
     !includeArchived && visibility !== "archived",
     page,
+    project,
   );
 }
 
@@ -2571,16 +2650,26 @@ export function useMoveToProject() {
           ? { ...baseLabels, [PROJECT_LABEL_KEY]: project }
           : baseLabels;
       overlayMembership(row, target?.id ?? null, labels, project === "" ? null : project);
-      return previous;
+      const move: MoveTombstone = {
+        project: project === "" ? null : project,
+        projectId: target?.id ?? null,
+        projectLabel: labels[PROJECT_LABEL_KEY],
+        confirmed: false,
+      };
+      markSessionMoving(id, move);
+      return { ...previous, move };
     },
     onError: (_err, { id }, previous) => {
       if (previous === undefined) return;
+      unmarkSessionMoving(id, previous.move);
       for (const [key, data] of [...previous.conversations, ...previous.projectSessions]) {
         if (data !== undefined) queryClient.setQueryData(key, data);
       }
       restoreOpenSessionRow(queryClient, id, previous.backfill);
     },
-    onSuccess: (updated, { project }) => {
+    onSuccess: (updated, { id, project }, previous) => {
+      if (previous !== undefined)
+        confirmSessionMoving(id, previous.move, updated.project_id ?? null);
       markConversationSeen(updated.id, updated.updated_at);
       // Filing can promote a label-only folder to first-class inside the
       // mutation. Seed the confirmed id into the cached projects list before
@@ -2687,7 +2776,8 @@ async function fetchProjectSessionsPage(
     // eslint-disable-next-line no-await-in-loop
     if (!res.ok) throw await apiErrorFromResponse(res);
     // eslint-disable-next-line no-await-in-loop
-    const page = applySessionTombstones((await res.json()) as ConversationsPage, !archived);
+    const fetched = (await res.json()) as ConversationsPage;
+    const page = applySessionTombstones(fetched, !archived, fetched, project);
     if (!archived) return page;
     const data = page.data.filter((row) => row.archived === true);
     if (data.length || !page.has_more || !page.last_id) return { ...page, data };
