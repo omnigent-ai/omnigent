@@ -544,6 +544,33 @@ def test_merge_mcp_v1_flat_and_v2_servers(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert servers["modern"] == {"type": "remote", "url": "https://m", "codemode": False}
 
 
+def test_task_scoped_merge_excludes_ambient_user_mcp_servers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A local-model bridge must not inherit a global MCP prompt surface."""
+    _user_config(
+        monkeypatch,
+        tmp_path,
+        '{"mcp": {"servers": {'
+        '"aseprite": {"type": "remote", "url": "https://m/aseprite"},'
+        '"blender": {"type": "remote", "url": "https://m/blender"},'
+        '"chrome": {"type": "remote", "url": "https://m/chrome"},'
+        '"context": {"type": "remote", "url": "https://m/context"},'
+        '"meshy": {"type": "remote", "url": "https://m/meshy"},'
+        '"playwright": {"type": "remote", "url": "https://m/playwright"},'
+        '"safari": {"type": "remote", "url": "https://m/safari"},'
+        '"unrelated": {"type": "remote", "url": "https://m/unrelated"}'
+        "}}}",
+    )
+    config: dict[str, object] = {
+        "mcp": {"servers": {"omnigent": {"type": "local", "command": ["relay"]}}}
+    }
+
+    result = maybe_merge_user_provider_config(config, include_user_mcp_servers=False)
+
+    assert result["mcp"] == config["mcp"]
+
+
 def test_merge_forces_codemode_off_on_user_mcp_servers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -980,7 +1007,6 @@ def test_build_opencode_config_minimal_is_ask_all() -> None:
     )
     assert cfg == {
         "$schema": "https://opencode.ai/config.json",
-        "compaction": {"auto": False},
         "permissions": [{"action": "*", "resource": "*", "effect": "ask"}],
     }
 
@@ -1004,7 +1030,7 @@ def test_build_opencode_config_full_v2_shape() -> None:
     }
     assert cfg["plugins"] == ["/b/ucode-auth", "/b/omnigent-policy"]
     assert cfg["instructions"] == ["/x/opencode/AGENTS.md"]
-    assert cfg["compaction"] == {"auto": False}
+    assert "compaction" not in cfg
     for v1_key in ("provider", "permission", "plugin"):
         assert v1_key not in cfg
 

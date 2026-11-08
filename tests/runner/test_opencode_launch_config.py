@@ -123,6 +123,51 @@ async def test_launch_writes_v2_config_with_ask_all_permissions(
     assert launch_env["seeded"] == [bridge_dir]
 
 
+async def test_launch_scopes_mcp_to_agent_and_omnigent_relay(
+    launch_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Ambient MCP tools must not consume a local model's first-turn budget."""
+    user_config_dir = tmp_path / "user-config" / "opencode"
+    user_config_dir.mkdir(parents=True)
+    (user_config_dir / "opencode.jsonc").write_text(
+        json.dumps(
+            {
+                "mcp": {
+                    "servers": {
+                        name: {"type": "remote", "url": f"https://mcp.test/{name}"}
+                        for name in (
+                            "aseprite",
+                            "blender",
+                            "chrome-devtools",
+                            "context7",
+                            "meshy",
+                            "playwright",
+                            "safari",
+                            "unrelated",
+                        )
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
+
+    async def _ensure_relay(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    bridge_dir = await _launch_until_boot(
+        server_client=object(),
+        ensure_comment_relay=_ensure_relay,
+        agent_spec=AgentSpec(spec_version=1, name="minimal", instructions="Be terse."),
+    )
+
+    written = json.loads(
+        (bridge_dir / "xdg-config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
+    )
+    assert set(written["mcp"]["servers"]) == {"omnigent"}
+
+
 async def test_launch_without_server_still_writes_ask_all_config(
     launch_env: dict[str, Any],
 ) -> None:

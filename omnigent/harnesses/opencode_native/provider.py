@@ -197,14 +197,6 @@ def build_opencode_config(
     config: dict[str, object] = {
         "$schema": OPENCODE_CONFIG_SCHEMA,
         "permissions": _permission_rules(permissions),
-        # A native bridge has no assistant output until the runner-side
-        # forwarder observes the first real turn.  OpenCode 2.0.x can compact
-        # immediately after admitting a prompt when a large MCP/instruction
-        # surface fills a small local model's context; a second automatic pass
-        # then fails with "Nothing to compact yet" and aborts that first turn.
-        # Keep automatic compaction off for bridge-owned sessions.  Explicit
-        # compaction remains available through the native control route.
-        "compaction": {"auto": False},
     }
     providers: dict[str, object] = {k: dict(v) for k, v in (extra_providers or {}).items()}
     if gateway is not None:
@@ -944,19 +936,26 @@ def _user_mcp_servers(user: Mapping[str, object]) -> dict[str, object]:
     return servers
 
 
-def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, object]:
+def maybe_merge_user_provider_config(
+    config: dict[str, object], *, include_user_mcp_servers: bool = True
+) -> dict[str, object]:
     """
     Merge the user's global OpenCode config into the synthesized v2 config.
 
     The per-session ``XDG_CONFIG_HOME`` hides ``~/.config/opencode``, so resolve the
     user's config the way OpenCode does (``config.json``, ``opencode.json`` and
     ``opencode.jsonc`` deep-merged, later files win) and carry over its providers,
-    default model, plugins and MCP servers. Both v1
+    default model, plugins and (when explicitly requested) MCP servers. Both v1
     (``provider``, ``plugin``, flat ``mcp``) and v2 (``providers``, ``plugins``,
     ``mcp.servers``) spellings are read; the result uses v2 keys only.
     Synthesized entries always win; the user's model applies only when none is set.
 
     :param config: The synthesized config dict.
+    :param include_user_mcp_servers: Whether to copy ambient user MCP servers.
+        Bridge-owned sessions normally disable this: their declared agent-spec
+        servers plus the Omnigent relay are the complete task-scoped allowlist.
+        Copying an unrelated global tool inventory both weakens that boundary
+        and can exhaust a smaller local model before its first reply.
     :returns: A new dict with the user's entries merged in.
     """
     user = _read_user_opencode_config()
@@ -987,7 +986,7 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
                 plugins.append(plugin)
         result["plugins"] = plugins
 
-    user_servers = _user_mcp_servers(user)
+    user_servers = _user_mcp_servers(user) if include_user_mcp_servers else {}
     if user_servers:
         mcp = result.get("mcp")
         if isinstance(mcp, Mapping) and "servers" not in mcp:

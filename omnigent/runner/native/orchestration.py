@@ -1954,8 +1954,10 @@ async def _auto_create_opencode_terminal(
         extra_providers=extra_providers,
     )
     # The per-session XDG_CONFIG_HOME hides the user's global config; carry over
-    # their providers, default model, plugins and MCP servers (v1 or v2 spelling).
-    config = maybe_merge_user_provider_config(config)
+    # providers, the default model, and plugins, but never ambient user MCP
+    # servers. The agent spec plus the Omnigent relay above are the complete
+    # task-scoped tool allowlist for this bridge-owned session.
+    config = maybe_merge_user_provider_config(config, include_user_mcp_servers=False)
     write_opencode_provider_config(
         xdg_config_home,
         config,
