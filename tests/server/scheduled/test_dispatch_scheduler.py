@@ -2523,3 +2523,35 @@ async def test_idle_or_unknown_session_still_claims_its_occurrence(store, busy) 
     [run] = store.list_runs(task.id)[0]
     assert run.scheduled_at == task.next_run_at
     assert store.get(task.id).next_run_at == task.next_run_at + 120
+
+
+async def test_busy_session_still_gets_the_last_occurrence(store) -> None:
+    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=2;COUNT=2", session_mode="continue")
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    busy = AsyncMock(return_value=True)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, occurrence_busy=busy
+    )
+    for _ in range(2):
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        clock.advance(120)
+    # Only the first occurrence had a later one to defer its prompt to.
+    busy.assert_awaited_once()
+    fire.assert_awaited_once()
+    [run] = store.list_runs(task.id)[0]
+    assert run.scheduled_at == task.next_run_at + 120
+    assert store.get(task.id).state == "completed"
+
+
+async def test_continued_sessions_keep_ten_minutes_without_a_busy_check(store) -> None:
+    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=2", session_mode="continue")
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(return_value=None), now=clock.now)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_not_awaited()
+    assert store.list_runs(task.id)[0] == []
+    assert store.get(task.id).state == "paused"

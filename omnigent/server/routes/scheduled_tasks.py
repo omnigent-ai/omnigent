@@ -56,12 +56,7 @@ from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
 )
-from omnigent.server.scheduled.rrule import (
-    MIN_SUBHOUR_INTERVAL_SECONDS,
-    RRuleSearchError,
-    RRuleValidationError,
-    validate_rrule,
-)
+from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_orchestration import require_owned_session
@@ -80,10 +75,6 @@ _MANAGED_SANDBOX_WITH_HOST_MSG = (
     "a managed_sandbox task runs in a fresh sandbox each fire; do not set host_id"
 )
 _SESSION_ID_WITHOUT_CONTINUE_MSG = "session_id requires session_mode 'continue'"
-# Rollout guard. A scheduler without busy skipping pauses a continued session that runs more
-# often than every ten minutes, so the API keeps that floor until every scheduler has it. A
-# follow-up lowers it to MIN_CONTINUED_INTERVAL_SECONDS when the persistent scheduler runs.
-_API_CONTINUED_MINIMUM_SECONDS = MIN_SUBHOUR_INTERVAL_SECONDS
 # A continued session cannot follow a change to these, so the next run starts a new one.
 _SESSION_BOUND_FIELDS = frozenset(
     {"agent_id", "host_id", "workspace", "base_branch", "execution_target"}
@@ -314,7 +305,6 @@ async def _validate_rrule_or_400(rrule: str, session_mode: str, execution_target
             rrule,
             session_mode=session_mode,
             execution_target=execution_target,
-            continued_minimum=_API_CONTINUED_MINIMUM_SECONDS,
         )
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc

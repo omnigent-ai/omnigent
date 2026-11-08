@@ -196,7 +196,9 @@ approval or question) and the task's latest run was scheduled less than ten
 minutes earlier. A skip only advances `next_run_at`: it writes no run row and
 logs `scheduled_run_skipped_busy`. The status is read from session activity,
 which needs no caller access check, so the poll does not act as the owner. A
-failed check sends the prompt. Legacy timers and Run now never skip.
+failed check sends the prompt. Legacy timers and Run now never skip. Neither
+does the last occurrence of a schedule that ends (`COUNT` or `UNTIL`), because a
+skip only defers the prompt to the next occurrence.
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run
@@ -580,10 +582,12 @@ replicas reject short schedules; older schedulers can pause them as invalid.
 Keep the existing scheduler mode unchanged during the version upgrade.
 
 The database scheduler accepts continued-session schedules down to two minutes,
-because it skips their occurrences while the session is busy. The API and the
-legacy timers keep the ten-minute minimum for continued sessions until every
-scheduler replica skips busy sessions; an older scheduler pauses a shorter
-continued schedule as invalid.
+because it skips their occurrences while the session is busy. Everything else
+keeps the ten-minute minimum for continued sessions: the legacy timers, a
+database scheduler with a custom `on_fire` hook (it has no busy check), and the
+API until every scheduler replica skips busy sessions. A scheduler that keeps
+ten minutes, including an older one, pauses a shorter continued schedule as
+invalid.
 
 Updates validate the proposed recurrence, session mode and target outside the
 database transaction, then compare their saved values under the task row lock.

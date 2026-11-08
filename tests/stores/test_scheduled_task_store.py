@@ -1427,6 +1427,9 @@ def test_dispatch_rejects_edited_snapshot(store: SqlAlchemyScheduledTaskStore, e
         )
         is None
     )
+    assert not store.skip_scheduled_occurrence(
+        task, now=task.next_run_at, next_run_at=task.next_run_at + 3600
+    )
     assert store.get(task.id) == updated
     assert store.list_runs(task.id)[0] == []
 
@@ -1503,6 +1506,7 @@ def test_dispatch_mutations_require_workspace_scope(store: SqlAlchemyScheduledTa
         )
         is None
     )
+    assert not store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 3600)
     with workspace_scope(task.workspace_id):
         run = store.claim_scheduled_run(
             task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120

@@ -18,7 +18,13 @@ from omnigent.db.db_models import workspace_scope
 from omnigent.debug_logging import current_session_id_scope, debug_event, log_attributes_scope
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, ScheduledTaskSchedulerConfig
-from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.rrule import (
+    MIN_CONTINUED_INTERVAL_SECONDS,
+    MIN_SUBHOUR_INTERVAL_SECONDS,
+    RRuleSearchError,
+    RRuleValidationError,
+    validate_rrule,
+)
 from omnigent.server.scheduled.schedule import (
     host_ownership_key,
     manual_trigger_key,
@@ -359,6 +365,7 @@ DispatchEnabled = Callable[[], bool]
 # Read before each wait between polls.
 PollInterval = Callable[[], float]
 # Whether a due occurrence can be skipped, unrecorded, because the session it continues is busy.
+# Passing one also lets continued sessions run every two minutes instead of every ten.
 OccurrenceBusy = Callable[[ScheduledTask], Awaitable[bool]]
 
 
@@ -705,6 +712,12 @@ class PersistentTaskScheduler:
                 task.rrule,
                 session_mode=task.session_mode,
                 execution_target=task.execution_target,
+                # Without busy skipping, a continued session keeps the ten-minute floor.
+                continued_minimum=(
+                    MIN_CONTINUED_INTERVAL_SECONDS
+                    if self._occurrence_busy is not None
+                    else MIN_SUBHOUR_INTERVAL_SECONDS
+                ),
             )
         except RRuleSearchError:
             raise
@@ -917,6 +930,7 @@ class PersistentTaskScheduler:
                     next_run = await asyncio.to_thread(next_scheduled_time, task, now)
                     if self._stopped:
                         return
+                    # A skip defers the prompt to the next occurrence, so the last one is sent.
                     if next_run is not None and await self._skip_busy_occurrence(
                         task, now=now, next_run_at=next_run
                     ):

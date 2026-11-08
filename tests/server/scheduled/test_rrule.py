@@ -14,8 +14,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from omnigent.server.scheduled.rrule import (
+    MIN_CONTINUED_INTERVAL_SECONDS,
     MIN_INTERVAL_SECONDS,
-    MIN_SUBHOUR_INTERVAL_SECONDS,
     RRuleValidationError,
     get_next_fire_time,
     validate_rrule,
@@ -430,12 +430,9 @@ def test_legacy_search_horizon_remains_midnight_based() -> None:
 
 @pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox", None])
 @pytest.mark.parametrize("session_mode", ["new", "continue"])
-@pytest.mark.parametrize("minutes", [1, 2, 5, 9, 10, 11, 15, 30, 59, 60])
+@pytest.mark.parametrize("minutes", [1, 5, 9, 10, 11, 15, 30, 59, 60])
 def test_minimum_interval_depends_on_execution(execution_target, session_mode, minutes):
-    if session_mode == "continue":
-        minimum = 2
-    else:
-        minimum = 10 if execution_target == "connected_host" else 60
+    minimum = 10 if execution_target == "connected_host" or session_mode == "continue" else 60
     options = {
         "execution_target": execution_target,
         "session_mode": session_mode,
@@ -449,21 +446,20 @@ def test_minimum_interval_depends_on_execution(execution_target, session_mode, m
 
 
 @pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
-@pytest.mark.parametrize("minutes", [2, 9, 10])
-def test_callers_without_busy_skipping_keep_ten_minutes_for_continued_sessions(
-    execution_target, minutes
-):
+@pytest.mark.parametrize("minutes", [1, 2, 9])
+def test_busy_skipping_lowers_only_the_continued_session_floor(execution_target, minutes):
+    rule = f"FREQ=MINUTELY;INTERVAL={minutes}"
     options = {
         "execution_target": execution_target,
-        "session_mode": "continue",
-        "continued_minimum": MIN_SUBHOUR_INTERVAL_SECONDS,
+        "continued_minimum": MIN_CONTINUED_INTERVAL_SECONDS,
     }
-    rule = f"FREQ=MINUTELY;INTERVAL={minutes}"
-    if minutes < 10:
-        with pytest.raises(RRuleValidationError, match="Minimum interval is 10 minutes"):
-            validate_rrule(rule, **options)
+    if minutes < 2:
+        with pytest.raises(RRuleValidationError, match="Minimum interval is 2 minutes"):
+            validate_rrule(rule, session_mode="continue", **options)
     else:
-        assert validate_rrule(rule, **options).rule == rule
+        assert validate_rrule(rule, session_mode="continue", **options).rule == rule
+    with pytest.raises(RRuleValidationError):
+        validate_rrule(rule, session_mode="new", **options)
 
 
 @pytest.mark.parametrize(
@@ -476,9 +472,8 @@ def test_callers_without_busy_skipping_keep_ten_minutes_for_continued_sessions(
     ],
 )
 def test_continued_session_checks_actual_gaps(rule, allowed):
-    options = {"session_mode": "continue", "continued_minimum": MIN_SUBHOUR_INTERVAL_SECONDS}
     if allowed:
-        assert validate_rrule(rule, **options).rule == rule
+        assert validate_rrule(rule, session_mode="continue").rule == rule
     else:
         with pytest.raises(RRuleValidationError, match="Minimum interval is 10 minutes"):
-            validate_rrule(rule, **options)
+            validate_rrule(rule, session_mode="continue")
