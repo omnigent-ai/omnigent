@@ -1588,6 +1588,34 @@ describe("InboxPage bulk actions", () => {
       ]),
     );
   });
+
+  it("declines a ready native prompt at its attempt and skips one already being delivered", async () => {
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([conversation({ id: "sess_native", title: "Kiro Session" })]),
+    );
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [
+        rawElicitation("eli_ready", "Run ls", {
+          native_delivery: { state: "ready", attempt: "first" },
+        }),
+        rawElicitation("eli_sending", "Run pwd", {
+          native_delivery: { state: "sending", attempt: "first", action: "accept" },
+        }),
+      ],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+    await screen.findAllByTestId("inbox-item");
+    selectTab("Awaiting response");
+
+    fireEvent.click(screen.getByRole("button", { name: "Decline 1 awaiting response…" }));
+    fireEvent.click(screen.getByRole("button", { name: "Decline 1" }));
+
+    expect(sessionsApi.approve).toHaveBeenCalledOnce();
+    expect(sessionsApi.approve).toHaveBeenCalledWith("sess_native", "eli_ready", {
+      action: "decline",
+      _meta: { native_delivery_attempt: "first" },
+    });
+  });
 });
 
 describe("InboxPage filter tabs", () => {

@@ -542,7 +542,12 @@ export function InboxPage() {
   ]
     .filter(Boolean)
     .join(" ");
-  const declinable = visibleApprovals.filter((item) => liveVerdict(item) === undefined);
+  // A native prompt mid-delivery already carries a decision; its card only offers a retry.
+  const declinable = visibleApprovals.filter(
+    (item) =>
+      liveVerdict(item) === undefined &&
+      (item.elicitation.nativeDelivery?.state ?? "ready") === "ready",
+  );
 
   // Clears exactly these items; Undo restores them and nothing that arrived since.
   const markEntriesRead = (
@@ -584,12 +589,20 @@ export function InboxPage() {
     });
   };
 
-  // Declines the confirmed prompts that are still pending; one answered meanwhile is skipped.
+  // Declines the confirmed prompts still open, using their current delivery attempt;
+  // one answered meanwhile is skipped.
   const declineAll = (targets: InboxItem[]) => {
-    const pendingIds = new Set(declinable.map(({ elicitation }) => elicitation.elicitationId));
-    const submissions = targets
-      .filter(({ elicitation }) => pendingIds.has(elicitation.elicitationId))
-      .map((item) => submitVerdict(item, item.elicitation.elicitationId, "decline"))
+    const targetIds = new Set(targets.map(({ elicitation }) => elicitation.elicitationId));
+    const submissions = declinable
+      .filter(({ elicitation }) => targetIds.has(elicitation.elicitationId))
+      .map((item) => {
+        const { elicitationId, nativeDelivery } = item.elicitation;
+        // Same attempt stamp the card adds to a native verdict.
+        const meta = nativeDelivery
+          ? { native_delivery_attempt: nativeDelivery.attempt }
+          : undefined;
+        return submitVerdict(item, elicitationId, "decline", undefined, meta);
+      })
       .filter((submission) => submission !== undefined);
     if (submissions.length === 0) return;
     void Promise.all(submissions).then((results) => {
