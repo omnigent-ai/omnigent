@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Callable
 
 import pytest
 
+from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
+    SERVER_CAP_TMUX_READINESS,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -78,6 +81,8 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
+    frame_for_server,
+    parse_server_capabilities,
     workspace_missing_message,
 )
 
@@ -1185,6 +1190,92 @@ def test_harness_readiness_frame_round_trip() -> None:
     assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
 
 
+def test_tmux_unavailable_readiness_survives_hello_and_live_refresh() -> None:
+    """A native harness blocked on tmux reaches the server instead of being dropped."""
+    configured = {"claude-native": "tmux-unavailable", "claude-sdk": True}
+    hello = decode_host_frame(
+        encode_host_frame(
+            HostHelloFrame(
+                version="0.1.0",
+                frame_protocol_version=1,
+                name="laptop",
+                configured_harnesses=configured,
+            )
+        )
+    )
+    refresh = decode_host_frame(
+        encode_host_frame(HostHarnessReadinessFrame(configured_harnesses=configured))
+    )
+    assert isinstance(hello, HostHelloFrame)
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert hello.configured_harnesses == configured
+    assert refresh.configured_harnesses == configured
+
+
+_ReadinessFrame = (
+    HostHelloFrame
+    | HostHarnessReadinessFrame
+    | HostInstallHarnessResultFrame
+    | HostRefreshHarnessesResultFrame
+    | HostHarnessLoginCompletedFrame
+    | HostHarnessLogoutResultFrame
+    | HostStoreSecretResultFrame
+)
+# Every frame class frame_for_server rewrites, built around one readiness map.
+_READINESS_FRAME_FACTORIES: dict[
+    str, Callable[[dict[str, HarnessAvailability]], _ReadinessFrame]
+] = {
+    "hello": lambda configured: HostHelloFrame(
+        version="0.1.0", frame_protocol_version=1, name="laptop", configured_harnesses=configured
+    ),
+    "readiness": lambda configured: HostHarnessReadinessFrame(configured_harnesses=configured),
+    "install_result": lambda configured: HostInstallHarnessResultFrame(
+        request_id="req_1", status="ok", configured_harnesses=configured
+    ),
+    "refresh_result": lambda configured: HostRefreshHarnessesResultFrame(
+        request_id="req_1", status="ok", configured_harnesses=configured
+    ),
+    "login_completed": lambda configured: HostHarnessLoginCompletedFrame(
+        login_id="login_1", success=True, configured_harnesses=configured
+    ),
+    "logout_result": lambda configured: HostHarnessLogoutResultFrame(
+        request_id="req_1", status="ok", configured_harnesses=configured
+    ),
+    "store_secret_result": lambda configured: HostStoreSecretResultFrame(
+        request_id="req_1", status="ok", configured_harnesses=configured
+    ),
+}
+
+
+@pytest.mark.parametrize("frame_kind", sorted(_READINESS_FRAME_FACTORIES))
+@pytest.mark.parametrize(
+    ("server_capabilities", "expected_native"),
+    [(frozenset(), True), (frozenset({SERVER_CAP_TMUX_READINESS}), "tmux-unavailable")],
+    ids=["older-server", "tmux-aware-server"],
+)
+def test_frame_for_server_down_maps_tmux_for_older_servers(
+    frame_kind: str, server_capabilities: frozenset[str], expected_native: bool | str
+) -> None:
+    """An older server gets the pre-tmux-check ``True``; a tmux-aware server gets the new state."""
+    frame = _READINESS_FRAME_FACTORIES[frame_kind](
+        {"claude-native": "tmux-unavailable", "codex": True}
+    )
+
+    sent = frame_for_server(frame, server_capabilities)
+
+    assert type(sent) is type(frame)
+    assert isinstance(sent, _ReadinessFrame)
+    assert sent.configured_harnesses == {"claude-native": expected_native, "codex": True}
+    assert frame.configured_harnesses == {"claude-native": "tmux-unavailable", "codex": True}
+    # The rewritten frame must still encode for the wire.
+    encode_host_frame(sent)
+
+
+def test_parse_server_capabilities_tolerates_spacing_and_absence() -> None:
+    assert parse_server_capabilities(None) == frozenset()
+    assert parse_server_capabilities(" tmux_readiness , future ,") == {"tmux_readiness", "future"}
+
+
 def test_hello_frame_gateway_inference_round_trip() -> None:
     original = HostHelloFrame(
         version="0.1.0",
@@ -1249,8 +1340,8 @@ def test_harness_readiness_frame_without_gateway_inference_is_none() -> None:
     assert decoded.gateway_inference is None
 
 
-def test_harness_readiness_frame_rejects_unknown_availability() -> None:
-    """Unknown readiness states cannot partially replace the live map."""
+def test_harness_readiness_frame_drops_unknown_availability_per_entry() -> None:
+    """A newer host's unknown state reads as not ready without losing the frame's other updates."""
     encoded = json.dumps(
         {
             "kind": "host.harness_readiness",
@@ -1258,10 +1349,24 @@ def test_harness_readiness_frame_rejects_unknown_availability() -> None:
                 "pi": "future-state",
                 "codex": "needs-auth",
             },
+            "gateway_inference": {"codex": True},
         }
     )
 
-    with pytest.raises(ValueError, match="unsupported availability state"):
+    decoded = decode_host_frame(encoded)
+
+    assert isinstance(decoded, HostHarnessReadinessFrame)
+    assert decoded.configured_harnesses == {"codex": "needs-auth"}
+    assert decoded.gateway_inference == {"codex": True}
+
+
+def test_harness_readiness_frame_rejects_only_unknown_availability() -> None:
+    """A frame with no decodable entry cannot replace the live map with an empty one."""
+    encoded = json.dumps(
+        {"kind": "host.harness_readiness", "configured_harnesses": {"pi": "future-state"}}
+    )
+
+    with pytest.raises(ValueError, match="non-empty"):
         decode_host_frame(encoded)
 
 

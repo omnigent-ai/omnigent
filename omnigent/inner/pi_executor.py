@@ -65,6 +65,7 @@ from omnigent.harnesses.pi_native.credentials import (
 )
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
+from omnigent.inner.pi_settings import PI_CONTEXT_FILE_NAMES
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
 from omnigent.models.model_metadata import ModelWireAPI
@@ -84,6 +85,7 @@ from omnigent.pi_prompt import pi_prompt_args
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.types import RetryPolicy
+from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.json_types import JsonValue
 from omnigent.util.reasoning_effort import (
@@ -1021,7 +1023,9 @@ def _build_models_json(
     for provider_config in config["providers"].values():
         if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
             provider_config["headers"] = gateway_attribution_headers(
-                PI_AGENT, via_ug=is_ug_route(provider_config["baseUrl"])
+                PI_AGENT,
+                via_ug=is_ug_route(provider_config["baseUrl"]),
+                client_surface=harness_client_surface(),
             )
     return config
 
@@ -1861,17 +1865,6 @@ def _resolve_pi_skill_args(
     return []
 
 
-# Bundle-root context-file candidates, in Pi's own precedence order
-# (mirrors Pi's cwd-based project context loader).
-_PI_BUNDLE_CONTEXT_FILE_CANDIDATES = (
-    "AGENTS.override.md",
-    "AGENTS.md",
-    "AGENTS.MD",
-    "CLAUDE.md",
-    "CLAUDE.MD",
-)
-
-
 def _pi_extension_dir_entries(ext_dir: pathlib.Path) -> list[pathlib.Path]:
     """Resolve one extension directory to its entry-point file(s)."""
     manifest_path = ext_dir / "package.json"
@@ -1978,7 +1971,7 @@ def _read_pi_bundle_context(bundle_dir: pathlib.Path | None) -> str | None:
     """Read the first readable bundle context file in Pi's precedence order."""
     if bundle_dir is None:
         return None
-    for candidate in _PI_BUNDLE_CONTEXT_FILE_CANDIDATES:
+    for candidate in PI_CONTEXT_FILE_NAMES:
         context_file = bundle_dir / candidate
         if not context_file.is_file():
             continue
