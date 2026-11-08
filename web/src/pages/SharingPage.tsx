@@ -398,6 +398,44 @@ export function SharingPage() {
                   </BlockedBy>
                 </div>
               </SettingsGroup>
+              {state?.peer_session_messaging_enabled !== undefined && (
+                <SettingsGroup title="Agent messaging" testId="settings-group-agent-messaging">
+                  <div className="flex items-center justify-between gap-4">
+                    <SettingsLabel
+                      label="Message other sessions"
+                      labelId="peer-messaging-label"
+                      descriptionId="peer-messaging-description"
+                      descriptionClassName="max-md:block"
+                      className="flex-1"
+                      description={
+                        <>
+                          Let agents send messages to other sessions owned by the same user. Changes
+                          apply immediately; child-session messaging is unchanged.
+                          {!state.peer_session_messaging_editable && (
+                            <span className="mt-1 block">
+                              Disabled by this deployment and can&apos;t be changed here.
+                            </span>
+                          )}
+                        </>
+                      }
+                    />
+                    <Switch
+                      checked={state.peer_session_messaging_enabled}
+                      onCheckedChange={(enabled) => {
+                        setError(null);
+                        setMode.mutate(
+                          { peer_session_messaging: enabled },
+                          { onError: (err) => setError(err.message) },
+                        );
+                      }}
+                      disabled={!state.peer_session_messaging_editable || setMode.isPending}
+                      aria-labelledby="peer-messaging-label"
+                      aria-describedby="peer-messaging-description"
+                      componentId="settings.sharing.peer_session_messaging"
+                    />
+                  </div>
+                </SettingsGroup>
+              )}
             </div>
             {error && <p className="mt-3 text-ui text-destructive">{error}</p>}
           </>

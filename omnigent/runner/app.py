@@ -160,7 +160,7 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.runner.resource_routes import register_resource_routes
-from omnigent.runner.session_history import build_session_history
+from omnigent.runner.session_history import build_session_history, is_cancellation_marker
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
@@ -1575,7 +1575,9 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
-    def _native_pane_shows_live_work(terminals: Any, session_id: str, terminal_name: str) -> bool:
+    def _native_pane_shows_live_work(
+        terminals: Any, session_id: str, terminal_name: str, *, include_pane_activity: bool = True
+    ) -> bool:
         """Whether a native pane shows the live work the pane reaper spares it for.
 
         A pane parked on a permission prompt is quiet and can read ``idle``, and a
@@ -1585,14 +1587,19 @@ def create_runner_app(
         :param terminals: Terminal registry holding the pane instance.
         :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
         :param terminal_name: Native harness terminal name, e.g. ``"claude"``.
-        :returns: ``True`` when a permission hook is parked or the pane shows recent
-            input or output.
+        :param include_pane_activity: Whether recent pane input or output counts.
+            Viewing a pane (attach, resize, a redraw) produces both, so callers
+            asking about agent work rather than pane liveness pass ``False``.
+        :returns: ``True`` when a permission hook is parked or, with
+            *include_pane_activity*, the pane shows recent input or output.
         """
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
 
         if approval_wait_is_fresh(session_id):
             return True
+        if not include_pane_activity:
+            return False
         instance = terminals.get(session_id, terminal_name, "main")
         if instance is None:
             return False
@@ -1600,7 +1607,13 @@ def create_runner_app(
             return True
         return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
 
-    def _has_active_work() -> bool:
+    # Sessions whose Claude pane reports a background shell still running after
+    # its turn ended. Real work: it keeps the runner and its sandbox up, but only
+    # while that session's native pane exists, so a lost "stopped" edge cannot
+    # pin either.
+    _sessions_with_background_shell: set[str] = set()
+
+    def _has_active_work(*, include_pane_activity: bool = True) -> bool:
         if _active_turns:
             return True
         if _claude_prompt_waiters:
@@ -1626,7 +1639,11 @@ def create_runner_app(
                 ):
                     continue
                 session_ids.add(session_id)
-                if _native_pane_shows_live_work(terminals, session_id, name):
+                if session_id in _sessions_with_background_shell:
+                    return True
+                if _native_pane_shows_live_work(
+                    terminals, session_id, name, include_pane_activity=include_pane_activity
+                ):
                     return True
         if process_manager is not None and any(
             process_manager.has_active_turn(session_id) for session_id in session_ids
@@ -1646,6 +1663,10 @@ def create_runner_app(
         return is_native_harness(_session_harness_name(session_id))
 
     app.state.has_active_work = _has_active_work
+    # Agent work only, for keeping a managed sandbox awake: a native pane's recent
+    # input or output also comes from someone just viewing it. A prompt typed into
+    # the pane still counts once the harness reports its turn in flight.
+    app.state.has_sandbox_work = lambda: _has_active_work(include_pane_activity=False)
 
     def _drain_session_streams() -> None:
         for queue in list(_session_event_queues.values()):
@@ -1653,8 +1674,17 @@ def create_runner_app(
 
     app.state.drain_session_streams = _drain_session_streams
 
+    # Monotonic time of the newest published agent-work event, so a turn that
+    # starts and ends between two busy checks still counts. ``session.*`` events
+    # (status edges, plain-shell output, resource changes) are notifications, and
+    # a tunnel reconnect republishes every status, so they are left out.
+    _last_event_published_at: list[float | None] = [None]
+    app.state.last_event_published_at = lambda: _last_event_published_at[0]
+
     def _publish_event(session_id: str, event: Mapping[str, object]) -> None:
         event_body = cast(_JsonObject, event)
+        if not str(event_body.get("type", "")).startswith("session."):
+            _last_event_published_at[0] = time.monotonic()
         queue = _session_event_queues.get(session_id)
         if queue is None:
             queue = asyncio.Queue()
@@ -1878,6 +1908,10 @@ def create_runner_app(
     )
 
     def _publish_session_background(session_id: str, running: bool) -> None:
+        if running:
+            _sessions_with_background_shell.add(session_id)
+        else:
+            _sessions_with_background_shell.discard(session_id)
         background_reports.report(session_id, running)
 
     resource_registry.set_session_background_publisher(_publish_session_background)
@@ -3318,8 +3352,13 @@ def create_runner_app(
             last = history[-1]
             last_type = last.get("type")
             last_role = last.get("role")
+            # A turn the user stopped ends on its cancellation marker: nothing to resume.
             needs_turn = (
-                (last_type == "message" and last_role == "user")
+                (
+                    last_type == "message"
+                    and last_role == "user"
+                    and not is_cancellation_marker(last)
+                )
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )

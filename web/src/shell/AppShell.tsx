@@ -855,6 +855,7 @@ function AppShellImpl() {
       workspace: activeSession.workspace ?? null,
       agent_id: activeSession.agentId,
       agent_name: activeSession.agentName,
+      family: activeSession.family,
       git_branch: activeSession.gitBranch ?? null,
     };
   }, [activeConv, activeSession, activeSessionMatchesRoute, isKnownTopLevel, permissionLevel]);
@@ -2686,10 +2687,11 @@ function AppShellImpl() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
-            {/* The header action cluster lives HERE on the macOS shell, not in
-          the sidebar, so its controls hold one fixed position beside the
-          traffic lights. Current shells put Settings in the profile footer;
-          older shells retain it here. */}
+            {/* The sidebar toggle and Back/Forward live HERE on the macOS shell
+          so they hold one fixed position beside the traffic lights no matter
+          what the sidebar does. Search sits with the wordmark while the sidebar
+          is open and joins this cluster when it collapses; Settings is in the
+          profile footer. */}
             {/* Hidden on /settings: the settings nav replaces the session list
           INSIDE the sidebar, and its "Back" row is the only way out. Leaving a
           collapse toggle up here would let the user hide the one exit and strand
@@ -2707,6 +2709,8 @@ function AppShellImpl() {
                   // it show "Collapse" while a click actually expanded — the
                   // icon/tooltip lied until the sidebar was really open.
                   expanded={sidebarOpen}
+                  showSearch={!sidebarOpen}
+                  onOpenSearch={handleOpenSearch}
                   onToggle={() => {
                     cancelTitleBarPeek();
                     // Mirrors the ⌘⌥[ hotkey: a peeking sidebar counts as open,
@@ -2718,7 +2722,6 @@ function AppShellImpl() {
                     }
                     setSidebarPeek(false);
                   }}
-                  onOpenSearch={handleOpenSearch}
                   showSettings={false}
                   // Dwell-to-peek moves here with the button: on mac this cluster
                   // replaces ChatHeader's collapsed-state toggle, which is where

@@ -1279,34 +1279,23 @@ html[data-electron-mac][data-electron-full-screen] {
    *
    * The sidebar starts at the window's top edge rather than below the lights, so
    * no band of empty canvas sits above it. The title-bar row itself is NOT the
-   * sidebar's header row: the window furniture (lights + the Search/Settings/
-   * toggle cluster) is owned by AppShell and positioned over this top strip, so
-   * it stays put when the sidebar collapses or peeks. What remains here is to
-   * strip the sidebar's now-redundant header chrome — its wordmark and its own
-   * copy of the cluster — and reclaim the empty row. */
+   * sidebar's header row: the window furniture (lights + the persistent action
+   * cluster) is owned by AppShell and positioned over this top strip, so
+   * it stays put when the sidebar collapses or peeks. The sidebar wordmark sits
+   * with Search in its normal-height row directly below that strip. */
   html[data-electron-mac] .conversations-sidebar {
     margin-top: 0;
   }
-  /* No brand mark on the desktop shell: the lights own the window's top-left.
-   * `display: none` rather than removing it from the JSX so the browser keeps
-   * the wordmark (and its click-to-home link) untouched. */
-  html[data-electron-mac] .sidebar-brand {
-    display: none;
-  }
-  /* The sidebar's own cluster is hidden here because an identical one renders in
-   * the title-bar strip (AppShell), where it survives the sidebar collapsing to
-   * w-0/inert and the peek card's inset-2 offset. Scoped to
-   * .conversations-sidebar so it can never match the AppShell copy. Hidden
-   * rather than removed from the JSX so every other platform keeps the
-   * in-sidebar cluster untouched. */
+  /* Hide the standard cluster: Search gets its own copy beside the wordmark,
+   * while the toggle and Back/Forward render in AppShell's persistent title bar. */
   html[data-electron-mac] .conversations-sidebar [data-testid="sidebar-header-actions"] {
     display: none;
   }
-  /* Reserve the full drag strip so the session list starts below the
-   * window furniture and stays outside the drag region. */
+  /* Reserve the drag strip above the normal 3rem brand row so the wordmark and
+   * session list stay clear of the window furniture. */
   html[data-electron-mac] .sidebar-header-row {
-    height: var(--mac-titlebar-height);
-    padding: 0;
+    height: calc(var(--mac-titlebar-height) + 3rem);
+    padding: var(--mac-titlebar-height) 1rem 0;
   }
   /* The chat header's own open-sidebar button is redundant here: the title-bar
    * cluster's toggle is always present (collapsed included) and carries the same
@@ -1360,8 +1349,8 @@ html[data-electron-mac] .electron-sidebar-header-actions {
   display: flex;
   align-items: center;
 }
-/* Keep Collapse and Search beside the traffic lights while the sidebar is open,
- * and dock only the Back/Forward pair at its right edge. */
+/* Keep Collapse beside the traffic lights while the sidebar is open, and dock
+ * the Back/Forward pair at its right edge. */
 html[data-electron-mac] .app-shell[data-sidebar-open] .electron-sidebar-header-actions {
   right: calc(100% - var(--app-sidebar-width) + 0.75rem);
 }
@@ -2934,6 +2923,23 @@ html[data-electron-mac] .breadcrumb-folder {
     animation: none;
   }
 }
+
+.new-project-working-directory-content {
+  overflow: hidden;
+}
+.new-project-working-directory-content[data-state="open"] {
+  animation: turn-fold-expand 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+.new-project-working-directory-content[data-state="closed"] {
+  animation: turn-fold-collapse 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .new-project-working-directory-content[data-state="open"],
+  .new-project-working-directory-content[data-state="closed"] {
+    animation: none;
+  }
+}
+
 /* The summary row grows in over the same beat as the trace shrinks.
    Inserting it at full height first jolted the bubble ~40px TALLER
    before the collapse began, which read as two separate motions; row
