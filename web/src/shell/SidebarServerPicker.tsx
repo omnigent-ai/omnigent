@@ -101,15 +101,15 @@ function serverKey(url: string): string | null {
  * Native shells keep the existing server switcher. Browsers and older shells
  * show the current origin without offering unsupported switching actions.
  */
+/** The page's own origin, for browsers and shells that return no picker data. */
+function currentOriginPicker(): ServerPickerInfo {
+  return { currentOrigin: window.location.origin, recentServers: [] };
+}
+
 export function SidebarServerPicker() {
   const nativeServerPicker = supportsNativeServerPicker();
   const [info, setInfo] = useState<ServerPickerInfo | null>(() =>
-    nativeServerPicker
-      ? null
-      : {
-          currentOrigin: window.location.origin,
-          recentServers: [],
-        },
+    nativeServerPicker ? null : currentOriginPicker(),
   );
   const viewerId = useViewerId();
   const serverInfo = useServerInfo();
@@ -117,12 +117,13 @@ export function SidebarServerPicker() {
 
   useEffect(() => {
     if (!nativeServerPicker) {
-      setInfo({ currentOrigin: window.location.origin, recentServers: [] });
+      setInfo(currentOriginPicker());
       return;
     }
     let cancelled = false;
+    // Without picker data the footer still renders, so Settings stays reachable.
     void getServerPicker().then((result) => {
-      if (!cancelled) setInfo(result);
+      if (!cancelled) setInfo(result ?? currentOriginPicker());
     });
     return () => {
       cancelled = true;

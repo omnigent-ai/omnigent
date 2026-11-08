@@ -85,6 +85,15 @@ describe("SidebarServerPicker", () => {
     expect(getServerPicker).not.toHaveBeenCalled();
   });
 
+  it("keeps the footer and Settings when the native shell returns no picker data", async () => {
+    getServerPicker.mockResolvedValue(null);
+    renderPicker();
+
+    expect(await screen.findByTestId("sidebar-server-picker")).toBeInTheDocument();
+    expect(screen.getByText(window.location.host)).toBeInTheDocument();
+    expect(screen.getByTestId("sidebar-profile-settings")).toHaveAttribute("href", "/settings");
+  });
+
   it("shows the current host on the row and lists recents in the menu", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "http://localhost:8000",
