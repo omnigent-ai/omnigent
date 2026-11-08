@@ -488,10 +488,13 @@ def infer_checkout_pr(session_id: str, checkout: str) -> None:
                 _CHECKED_CHECKOUTS.popitem(last=False)
         registry = SessionPrRegistry(session_id)
         for resolution in _workspace_providers(checkout):
-            _associate_discovered_pr(
-                checkout, registry, _discovery_info(checkout, resolution), time.time()
-            )
-    except Exception:  # noqa: BLE001 — optional inference must never affect the tool call
+            candidate = _discovery_info(checkout, resolution)
+            pr = candidate.get("pr")
+            # Recording again would demote a PR the session already attached or worked on.
+            if isinstance(pr, dict) and any(e.url == pr.get("url") for e in registry.list()):
+                continue
+            _associate_discovered_pr(checkout, registry, candidate, time.time())
+    except Exception:  # optional inference must never affect the tool call
         _logger.warning("Could not infer the PR of %s", checkout, exc_info=True)
 
 

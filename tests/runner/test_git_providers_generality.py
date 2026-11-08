@@ -16,7 +16,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier, Event
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import pytest
@@ -753,3 +753,35 @@ def test_a_checkout_outside_the_workspace_infers_its_pushed_branch_pr(
     assert facet.calls == ["workspace_info", "on_inferred_pr"]
     [entry] = SessionPrRegistry("session").list()
     assert (entry.url, entry.relationship, entry.source) == (MR, "inferred", "branch")
+
+
+@pytest.mark.parametrize("relationship", ["attached", "worked_on"])
+def test_checkout_inference_keeps_an_existing_association(
+    facet: FakeGitLabFacet, repo: str, relationship: Literal["attached", "worked_on"]
+) -> None:
+    facet.branch_pr = MR
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(MR)], relationship=relationship, source="test"
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "c",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/topic", "HEAD"], cwd=repo, check=True
+    )
+    pr_resource.infer_checkout_pr("session", repo)
+    [entry] = SessionPrRegistry("session").list()
+    assert entry.relationship == relationship
