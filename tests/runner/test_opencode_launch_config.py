@@ -14,7 +14,7 @@ import omnigent.harnesses.opencode_native.provider as provider
 import omnigent.runner._entry as runner_entry
 import omnigent.runner.native.orchestration as orchestration
 from omnigent.runner.resource_registry import SessionResourceRegistry
-from omnigent.spec import AgentSpec
+from omnigent.spec import AgentSpec, MCPServerConfig
 
 
 class _StopBeforeBoot(Exception):
@@ -166,6 +166,42 @@ async def test_launch_scopes_mcp_to_agent_and_omnigent_relay(
         (bridge_dir / "xdg-config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
     )
     assert set(written["mcp"]["servers"]) == {"omnigent"}
+
+
+async def test_launch_retains_agent_declared_mcp_server(
+    launch_env: dict[str, Any],
+) -> None:
+    """Scoping drops ambient servers, not the current agent's declared tool."""
+
+    async def _ensure_relay(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    bridge_dir = await _launch_until_boot(
+        server_client=object(),
+        ensure_comment_relay=_ensure_relay,
+        agent_spec=AgentSpec(
+            spec_version=1,
+            name="declared-tool",
+            instructions="Be terse.",
+            mcp_servers=[
+                MCPServerConfig(
+                    name="task-tool",
+                    transport="http",
+                    url="https://mcp.test/task-tool",
+                )
+            ],
+        ),
+    )
+
+    written = json.loads(
+        (bridge_dir / "xdg-config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
+    )
+    assert set(written["mcp"]["servers"]) == {"omnigent", "task-tool"}
+    assert written["mcp"]["servers"]["task-tool"] == {
+        "type": "remote",
+        "url": "https://mcp.test/task-tool",
+        "codemode": False,
+    }
 
 
 async def test_launch_without_server_still_writes_ask_all_config(
