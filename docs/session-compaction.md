@@ -27,6 +27,11 @@ Each harness records the boundary differently:
 A transcript can be compacted more than once, so the boundary that matters is
 the **last** one: everything before it is already folded into that baseline.
 
+When Codex cold-resumes from a snapshot, Omnigent replaces the image blocks that
+snapshot storage omitted — in messages and in function tool results alike — with
+text placeholders, so the provider never receives the storage marker as an image
+URL.
+
 ## Importing Claude Code transcripts
 
 `load_claude_session` (`omnigent/session_import/local.py`) mirrors the agent's

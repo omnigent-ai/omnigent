@@ -469,7 +469,14 @@ describe("ServerSelectorV2", () => {
   });
 
   it("can retry Arca or Continue anyway after Arca startup fails", async () => {
-    const onConnectRunner = vi.fn().mockResolvedValue({ ok: false, error: "Arca failed" });
+    const errorMessage = "Arca setup didn't complete.";
+    const errorAction = "Check Arca Companion, finish browser sign-in, and try again.";
+    const onConnectRunner = vi.fn().mockResolvedValue({
+      ok: false,
+      error: `${errorMessage} ${errorAction}`,
+      errorMessage,
+      errorAction,
+    });
     const onInstallCli = vi.fn();
     let finishConnect: (result: { error?: string }) => void = () => {};
     const onConnect = vi
@@ -488,13 +495,15 @@ describe("ServerSelectorV2", () => {
       onConnect,
       getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
     });
-    expect(await screen.findByText("Arca failed")).toBeInTheDocument();
+    expect(await screen.findByText(errorMessage)).toBeInTheDocument();
+    expect(screen.getByText(errorAction)).toHaveClass("text-cyan-700");
     expect(onConnect).not.toHaveBeenCalled();
     const skip = screen.getByRole("button", { name: "Continue anyway" });
     expect(skip.nextElementSibling).toBe(screen.getByRole("button", { name: "Retry" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(await screen.findByText("Arca failed")).toBeInTheDocument();
+    expect(await screen.findByText(errorMessage)).toBeInTheDocument();
+    expect(screen.getByText(errorAction)).toBeInTheDocument();
     expect(onConnectRunner).toHaveBeenCalledTimes(2);
     fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
     await waitFor(() =>
@@ -502,7 +511,7 @@ describe("ServerSelectorV2", () => {
     );
     expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
-    expect(screen.queryByText("Arca failed")).not.toBeInTheDocument();
+    expect(screen.queryByText(errorMessage)).not.toBeInTheDocument();
 
     act(() => finishConnect({ error: "Server unavailable" }));
     expect(await screen.findByText("Server unavailable")).toBeInTheDocument();

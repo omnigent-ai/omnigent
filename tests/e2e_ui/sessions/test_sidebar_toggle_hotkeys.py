@@ -1,10 +1,10 @@
-"""E2E: ⌘⌥[ toggles the left sidebar; ⌘⌥] focuses or closes the right.
+"""E2E: in a browser, ⌘⌥[ toggles the left sidebar and ⌘⌥] the right.
 
 Covers ``useSidebarToggleHotkeys`` (``web/src/hooks/useSidebarToggleHotkeys.ts``),
 wired in ``AppShell``: a window-level keydown listener flips the left
-(Conversations) sidebar on ⌘/Ctrl + ⌥/Alt + ``[``. The right (Workspace) rail
-opens or focuses on ⌘/Ctrl + ⌥/Alt + ``]`` and closes when focus is inside its
-tab strip. The hook matches the physical ``e.code``
+(Conversations) sidebar on ⌘/Ctrl + ⌥/Alt + ``[`` and the right (Workspace)
+rail on ⌘/Ctrl + ⌥/Alt + ``]`` (the desktop app uses ⌘B / ⇧⌘B instead; see
+the hook). The hook matches the physical ``e.code``
 (``BracketLeft`` / ``BracketRight``) rather than the character, because ⌥ on
 macOS turns ``[``/``]`` into ``“``/``‘`` — only a code match survives the
 modifier. CI runs Linux chromium, so this presses the ``Control+Alt`` chord
@@ -13,14 +13,13 @@ modifier. CI runs Linux chromium, so this presses the ``Control+Alt`` chord
 Two design points this exercises end-to-end that the unit test cannot:
 
 - the listener is bound at the window, so the chord fires *even while the
-  composer is focused* (a sibling of the ⌘↑/↓ session-switch and ⌘↵ approve
-  hotkeys). We focus the composer with an unsent draft, then collapse the
-  Conversations sidebar with the chord, and assert the draft is untouched —
+  composer is focused* (like the ⌘↵ approve hotkey). We focus the composer
+  with an unsent draft, then collapse the Conversations sidebar with the
+  chord, and assert the draft is untouched —
   proving the chord toggled the panel without stealing the keystroke or
   navigating away.
-- the right-rail shortcut focuses the numbered permanent tabs before closing,
-  so its advertised shortcut sequence works while preserving a keyboard-only
-  close path.
+- the right-rail shortcut toggles in one press, and reopening puts focus on
+  the rail's tab strip for keyboard use.
 
 No LLM turn is needed — this is pure client-side keyboard + layout state — so
 it skips the nightly/real-agent markers the approval suites carry. The seeded
@@ -84,17 +83,12 @@ def test_sidebar_toggle_hotkeys(
     page.keyboard.press(_LEFT_CHORD)
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
 
-    # From outside the rail, ⌘⌥] keeps it open and focuses a permanent tab so
-    # the following numbered shortcut can select a workspace view.
-    page.keyboard.press(_RIGHT_CHORD)
-    expect(workspace).to_be_visible()
-    expect(workspace.locator("[data-workspace-tab]:focus")).to_have_count(1)
-
-    # With focus already inside the tab strip, the same chord closes it.
+    # ⌘⌥] is a plain toggle too: with focus outside the rail, it closes the
+    # open Workspace rail in one press.
     page.keyboard.press(_RIGHT_CHORD)
     expect(workspace).to_have_count(0)
 
-    # The chord brings it back and restores focus to the tab strip.
+    # The chord brings it back with focus on its tab strip.
     page.keyboard.press(_RIGHT_CHORD)
     expect(workspace).to_be_visible()
     expect(workspace.locator("[data-workspace-tab]:focus")).to_have_count(1)

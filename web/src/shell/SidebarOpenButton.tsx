@@ -1,6 +1,6 @@
 import { ArrowLeftIcon, MenuIcon, PanelLeftIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Button } from "@/components/ui/button";
+import { MobileHeaderButton } from "./MobileHeaderButton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 
@@ -55,7 +55,7 @@ export function SidebarOpenButton({
       }}
     >
       <TooltipTrigger asChild>
-        <Button
+        <MobileHeaderButton
           type="button"
           variant="ghost"
           size={size}
@@ -66,7 +66,7 @@ export function SidebarOpenButton({
             onOpenSidebar(false);
           }}
           // macOS uses the persistent titlebar cluster in place of this button.
-          className={`chat-header-sidebar-toggle pointer-events-auto border-none text-muted-foreground hover:text-foreground ${size === "icon-xs" ? "max-md:size-11" : ""}`}
+          className={`chat-header-sidebar-toggle mobile-touch-target pointer-events-auto border-none text-muted-foreground hover:text-foreground ${size === "icon-xs" ? "max-md:size-11" : ""}`}
           onPointerEnter={onPeekSidebar}
           onPointerDown={cancelPeek}
           onPointerLeave={cancelPeek}
@@ -78,7 +78,7 @@ export function SidebarOpenButton({
           ) : (
             <PanelLeftIcon className="size-4" />
           )}
-        </Button>
+        </MobileHeaderButton>
       </TooltipTrigger>
       <TooltipContent side="bottom">{label}</TooltipContent>
     </Tooltip>

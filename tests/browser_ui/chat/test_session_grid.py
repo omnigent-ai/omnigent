@@ -161,6 +161,10 @@ def test_session_grid_drag_persist_live_updates_and_close(
             "**/resources/terminals/terminal_tui_main/attach*", attach_terminal
         )
         sessions[3].update_session(permission_level=1)
+        for session in sessions[:2]:
+            session.update_session(
+                family={"id": "grid-0", "representative_id": "grid-0", "pinned": False}
+            )
         browser_contract.json(
             "/v1/info", {"single_user": True, "features": {"grid_sessions_display_ui": True}}
         )
@@ -188,6 +192,9 @@ def test_session_grid_drag_persist_live_updates_and_close(
             """() => document.querySelector('[data-grid-session="grid-0"]').getBoundingClientRect()
                 .right <= document.querySelector('aside[aria-label="Workspace"]')
                 .getBoundingClientRect().left"""
+        )
+        expect(page.locator('aside [data-sidebar-session-id="grid-1"]')).to_have_attribute(
+            "data-sibling-session", "true"
         )
         _drag_session(page, "grid-1", "grid-0", "right")
         expect(page).to_have_url(re.compile(r"/grid/[^/]+$"))
