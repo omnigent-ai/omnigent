@@ -34,13 +34,15 @@ import {
   useHostFilesystem,
 } from "@/hooks/useHostFilesystem";
 import { toast } from "sonner";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
   const actual = await importOriginal<typeof ReactRouterDomModule>();
   return { ...actual, useNavigate: () => navigateMock };
 });
-vi.mock("@/lib/sessionsApi", () => ({
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
   fetchSessionRepositoryBranches: vi.fn(),
   forkSession: vi.fn(),
   launchRunner: vi.fn(),

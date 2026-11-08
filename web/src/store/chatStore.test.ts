@@ -3293,6 +3293,56 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(client.isFetching({ queryKey: ["session", "conv_joined_load"], exact: true })).toBe(1);
     });
 
+    it("recovers a load stuck on a shared read that never answers, even past a transient 503", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_stuck_join", []);
+      // Another caller's read of the same session, which the server never answers.
+      void client.fetchQuery({
+        queryKey: ["session", "conv_stuck_join"],
+        queryFn: () => new Promise(() => {}),
+      });
+      // The first direct read after the timeout gets a temporary 503; later reads succeed.
+      let directReads = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input).split("?")[0];
+        if (path === "/v1/sessions/conv_stuck_join" && (init?.method ?? "GET") === "GET") {
+          directReads += 1;
+          if (directReads === 1) return mockResponse({}, { ok: false, status: 503 });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      void useChatStore.getState().switchTo("conv_stuck_join");
+      await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS - 1_000);
+      expect(conversationRegistry.peek("conv_stuck_join")!.getState()).toMatchObject({
+        loadingConversation: true,
+      });
+
+      await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS);
+      expect(directReads).toBeGreaterThanOrEqual(2);
+      expect(conversationRegistry.peek("conv_stuck_join")!.getState()).toMatchObject({
+        loadingConversation: false,
+        conversationLoadError: null,
+      });
+    });
+
+    it("reads a session once when its load joins a shared read that answers", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_shared_read", []);
+      void client.fetchQuery({
+        queryKey: ["session", "conv_shared_read"],
+        queryFn: () => getSessionSlim("conv_shared_read", { refreshState: true }),
+      });
+
+      void useChatStore.getState().switchTo("conv_shared_read");
+      await vi.advanceTimersByTimeAsync(100);
+
+      const sessionReads = fetchMock.mock.calls.filter(
+        ([input]) => String(input).split("?")[0] === "/v1/sessions/conv_shared_read",
+      );
+      expect(sessionReads).toHaveLength(1);
+    });
+
     it("fails a missing session at once", async () => {
       seedSession("conv_missing", []);
       const { gets } = failSnapshots("conv_missing", [404, 404, 404]);
@@ -14961,13 +15011,17 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     );
   });
 
-  // An expired sign-in answers every API read with the login page, not just the stream.
+  // The stream and the API reads answer with the login page, but the sign-in probe
+  // reads JSON. The 60 s give-up is then the fallback, and it shows the connection card.
   it("fails a streaming reply with one connection card after persistent login pages", async () => {
     const response = assistantMessage("resp_unavailable_visible", "Partial reply");
     seedSession("conv_unavailable_visible", [response]);
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      return url.includes("/v1/") ? loginPageResponse() : defaultFetchHandler(input, init);
+      const isProbe = url.endsWith("/v1/me");
+      return url.includes("/v1/") && !isProbe
+        ? loginPageResponse()
+        : defaultFetchHandler(input, init);
     });
     const controller = new AbortController();
     useChatStore.setState({
@@ -16825,6 +16879,95 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await vi.advanceTimersByTimeAsync(100_000);
     expect(errorBlocks()).toEqual([expect.objectContaining({ code: "stream_unavailable" })]);
 
+    controller.abort();
+    await loop;
+  });
+
+  it.each([
+    ["a login page", () => loginPageResponse()],
+    ["a failed connection", () => Promise.reject(new TypeError("Failed to fetch"))],
+  ])(
+    "gives up with a sign-in notice once the probe reports the sign-in expired after %s",
+    async (_answer, answerStream) => {
+      seedSession("conv_expired_probe", []);
+      let opens = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/v1/me")) return mockResponse({}, { ok: false, status: 401 });
+        if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+          opens += 1;
+          return answerStream();
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: "conv_expired_probe", abortController: controller });
+
+      const loop = startStreamPump("conv_expired_probe", controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await loop;
+
+      const state = useChatStore.getState();
+      // Stopped on the probe's answer, well before the 60 s login-page window.
+      expect(opens).toBeLessThan(5);
+      expect(state.status).toBe("idle");
+      expect(state.blocks.filter((block) => block.type === "error")).toEqual([
+        expect.objectContaining({
+          code: "sign_in_expired",
+          title: "Your sign-in expired",
+          message: "Reload the page to sign in again.",
+        }),
+      ]);
+    },
+  );
+
+  it("keeps the reconnect loop going when the sign-in probe never answers", async () => {
+    seedSession("conv_probe_hangs", []);
+    let opens = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/me")) {
+        // Never answers, but rejects on abort like a real fetch.
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        });
+      }
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        opens += 1;
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_probe_hangs", abortController: controller });
+
+    const loop = startStreamPump("conv_probe_hangs", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    // The probe is bounded by its read deadline, so the loop keeps opening streams.
+    expect(opens).toBeGreaterThan(4);
+    expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual([]);
+    controller.abort();
+    await loop;
+  });
+
+  it("keeps retrying a failed connect while the sign-in probe cannot reach the server", async () => {
+    seedSession("conv_probe_down", []);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/me") || /\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_probe_down", abortController: controller });
+
+    const loop = startStreamPump("conv_probe_down", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(70_000);
+
+    // An unanswered probe is no evidence of an expired sign-in, so no notice appears.
+    expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual([]);
     controller.abort();
     await loop;
   });
