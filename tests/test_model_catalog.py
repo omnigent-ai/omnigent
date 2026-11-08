@@ -1607,11 +1607,15 @@ def _seed_cli_login_catalogs(*, codex_pinned: bool) -> None:
 
     :param codex_pinned: Whether the Codex launch pins the built-in provider.
     """
-    from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+    from omnigent.harnesses.claude_native.main import (
+        claude_catalog_fingerprint,
+        resolve_native_claude_config,
+    )
     from omnigent.models import model_catalog_store
 
+    claude_config = resolve_native_claude_config(spec=None, refresh_models=False)
     catalogs = {
-        ("claude-native", claude_catalog_fingerprint(None)): [
+        ("claude-native", claude_catalog_fingerprint(claude_config)): [
             {"id": "sonnet", "model": "claude-sonnet-5-5", "isDefault": True},
             {"id": "opus", "model": "claude-opus-5-5"},
         ],
@@ -1702,6 +1706,14 @@ def test_cli_login_rows_replay_native_probe_catalogs(
     spawn_pin = _build_codex_spawn_env(_worker_spec("codex")).get("HARNESS_CODEX_MODEL_PROVIDER")
     assert spawn_pin == ("openai" if codex_pinned else None)
     _seed_cli_login_catalogs(codex_pinned=codex_pinned)
+    if subscribed:
+        from omnigent.models import model_catalog_store
+
+        model_catalog_store.write_catalog(
+            "claude-native",
+            claude_native.claude_catalog_fingerprint(None),
+            [{"id": "claude-opus-api-key-only"}],
+        )
 
     def _no_launch_resolution(**_kwargs: object) -> None:
         raise AssertionError("listing must not resolve (or discover) native launches")

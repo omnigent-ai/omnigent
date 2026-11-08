@@ -1541,8 +1541,10 @@ def _cli_login_probe_listing(
         if cli == "codex":
             return _codex_login_probe_listing(spec)
         from omnigent.harnesses.claude_native.main import (
+            ClaudeNativeUcodeConfig,
             claude_ambient_transport,
             claude_catalog_fingerprint,
+            managed_claude_gateway_signal,
         )
         from omnigent.onboarding.harness_readiness import _claude_token_env_configured
 
@@ -1566,8 +1568,13 @@ def _cli_login_probe_listing(
         # Such routes share the CLI-login catalog key but not its model ids.
         if claude_ambient_transport().leaves_login() or not _claude_probe_runs_sdk_cli():
             return None
+        launch_config = (
+            ClaudeNativeUcodeConfig(env={}, subscription_auth=True)
+            if provider.kind == SUBSCRIPTION_KIND and not managed_claude_gateway_signal()[1]
+            else None
+        )
         return _probe_catalog_listing(
-            "claude-native", claude_catalog_fingerprint(None), "Claude Code"
+            "claude-native", claude_catalog_fingerprint(launch_config), "Claude Code"
         )
     except Exception:  # an unresolvable launch keeps the existing row
         _logger.debug(

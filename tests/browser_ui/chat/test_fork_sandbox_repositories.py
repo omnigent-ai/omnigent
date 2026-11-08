@@ -25,7 +25,7 @@ def _sandbox_source(chat: ChatSessionContract) -> list[dict[str, Any]]:
     """Seed a multi-repo source and capture its fork request without provisioning."""
     chat.update_session(
         title="Delivery checkout improvements",
-        host_id=None,
+        host_id="source-sandbox",
         workspace="/workspace",
         labels={"omnigent.sandbox.repo": " ".join(_REPOSITORIES)},
     )
@@ -63,6 +63,7 @@ def _sandbox_source(chat: ChatSessionContract) -> list[dict[str, Any]]:
             "single_user": True,
             "needs_setup": False,
             "managed_sandboxes_enabled": True,
+            "sibling_sessions": True,
             "session_fork_workspaces": True,
             "sandbox_provider": "agent_sandbox",
             "sandbox_providers": ["agent_sandbox", "modal"],
@@ -76,8 +77,24 @@ def _sandbox_source(chat: ChatSessionContract) -> list[dict[str, Any]]:
             "installable_harnesses": [],
         },
     )
-    contract.json("/v1/hosts", {"hosts": []})
+    contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": host_id,
+                    "name": host_id,
+                    "owner": "test",
+                    "status": "online",
+                    "sandbox_provider": "agent_sandbox",
+                }
+                for host_id in ("source-sandbox", "unrelated-sandbox")
+            ]
+        },
+    )
     contract.json("/v1/sessions", lambda _: list_payload([chat.session_snapshot()]))
+    contract.json("/v1/hosts/source-sandbox/worktrees", list_payload([]))
+    contract.json("/v1/hosts/source-sandbox/filesystem", {"path": "/", "entries": []})
     contract.json(
         "/health",
         {"sessions": {chat.session_id: {"runner_online": True, "host_online": True}}},
@@ -171,6 +188,14 @@ def test_sandbox_fork_edits_multiple_repositories_and_branches(
     page.goto(chat.url)
     _open_fork(page, chat.session_id, entry)
     dialog = page.get_by_test_id("fork-session-dialog")
+    dialog.get_by_test_id("fork-session-host-select").click()
+    same_sandbox = page.get_by_role("option", name="Same sandbox online")
+    expect(same_sandbox).to_be_visible()
+    expect(page.get_by_test_id("fork-session-host-option-unrelated-sandbox")).to_have_count(0)
+    same_sandbox.click()
+    expect(dialog.get_by_test_id("fork-session-reuse-dir-hint")).to_be_visible()
+    dialog.get_by_test_id("fork-session-host-select").click()
+    page.get_by_test_id("fork-session-sandbox-option").click()
     expect(dialog.get_by_test_id("fork-session-sandbox-repo-row")).to_have_count(2)
     expect(dialog.get_by_role("combobox", name="Branch for acme/delivery-api")).to_have_text(
         "feature/checkout"
