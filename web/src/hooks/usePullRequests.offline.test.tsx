@@ -15,7 +15,12 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import { usePullRequestInfo, usePullRequestInfos, usePullRequestStack } from "./usePullRequests";
+import {
+  isMissingRoute,
+  usePullRequestInfo,
+  usePullRequestInfos,
+  usePullRequestStack,
+} from "./usePullRequests";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -141,5 +146,46 @@ describe("usePullRequestStack", () => {
     expect(url.pathname).toBe("/v1/sessions/conv_stack/resources/github/stack");
     expect(url.searchParams.get("pr_url")).toBe(prUrl);
     expect(url.searchParams.get("head_sha")).toBe("a".repeat(40));
+  });
+
+  it("reports a 404 that names its reason instead of hiding it as an older host", async () => {
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ error: { message: "workspace directory does not exist on host" } }),
+    } as Response);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(
+      () =>
+        usePullRequestStack(
+          "conv_stack_gone",
+          "https://github.com/org/repo/pull/2",
+          "a".repeat(40),
+          true,
+        ),
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect((result.current.error as Error).message).toBe(
+      "workspace directory does not exist on host",
+    );
+  });
+});
+
+describe("isMissingRoute", () => {
+  it.each(["Not Found", "Resource not found", "Resource 'github' not found", "404 Not Found"])(
+    "treats %s as a route an older host lacks",
+    (message) => expect(isMissingRoute(message)).toBe(true),
+  );
+
+  it("keeps a 404 that names its reason", () => {
+    expect(isMissingRoute("Session has no filesystem; GitHub API unavailable.")).toBe(false);
   });
 });

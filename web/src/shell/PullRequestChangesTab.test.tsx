@@ -1476,12 +1476,24 @@ describe("PullRequestChangesTab stacked pull requests", () => {
     renderTab({
       conversationId: "stack-loading",
       stack: { data: { parent } },
-      stackDiff: { data: undefined, error: null, isSuccess: false },
+      stackDiff: { data: undefined, error: null, isSuccess: false, isLoading: true },
     });
 
     fireEvent.click(toggle());
 
     expect(screen.getByText("Loading changes…")).toBeInTheDocument();
+  });
+
+  it("doesn't wait on a paused comparison, as while the sandbox sleeps", () => {
+    renderTab({
+      conversationId: "stack-paused",
+      stack: { data: { parent } },
+      stackDiff: { data: undefined, error: null, isSuccess: false, isLoading: false },
+    });
+
+    fireEvent.click(toggle());
+
+    expect(screen.queryByText("Loading changes…")).toBeNull();
   });
 
   it("asks to update a host that can't serve the PR's own changes, without loading", () => {
@@ -1515,7 +1527,7 @@ describe("PullRequestChangesTab stacked pull requests", () => {
 
   it.each([
     ["no parent", { data: { parent: null } }],
-    ["a failed lookup", { data: undefined, error: new Error("GitHub could not look it up") }],
+    ["a failed lookup", { data: { parent }, error: new Error("GitHub could not look it up") }],
     ["no lookup", undefined],
   ])("shows no stack row for %s", (_name, stack) => {
     renderTab({ conversationId: `stack-none-${_name}`, stack, stackDiff: ownOnly([], "") });

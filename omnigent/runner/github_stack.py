@@ -235,13 +235,17 @@ def pr_stack(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[str
             if not (described and described != head_sha and described in commits):
                 described = None
             try:
-                parent = _commit_parent(
-                    root,
-                    reference,
-                    head_repository=_text(pr, "head", "repo", "full_name") or reference.repository,
-                    commits=commits,
-                    head_sha=head_sha,
-                )
+                # GitHub lists only a long PR's oldest commits; walking those could
+                # name a grandparent, so only a list that reaches the head is walked.
+                if head_sha in commits:
+                    parent = _commit_parent(
+                        root,
+                        reference,
+                        head_repository=_text(pr, "head", "repo", "full_name")
+                        or reference.repository,
+                        commits=commits,
+                        head_sha=head_sha,
+                    )
             except ValueError:
                 # The description link needs no lookup, so it still answers a failed walk.
                 if described is None:
@@ -311,6 +315,6 @@ def pr_stack_diff(
     }
     if result["has_more"]:
         result["warning"] = (
-            f"The provider lists at most {MAX_COMPARE_FILES} files; some files are not shown."
+            f"The provider lists at most {MAX_COMPARE_FILES} files; some files may not be shown."
         )
     return result

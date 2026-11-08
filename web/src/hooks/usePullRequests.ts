@@ -809,6 +809,11 @@ export interface PullRequestStackDiff {
   parent_sha: string;
 }
 
+/** Whether a 404 is the bare "not found" of a host or server that predates the route. */
+export function isMissingRoute(message: string): boolean {
+  return /^(404\b.*|(resource( '\w+')? )?not found)$/i.test(message.trim());
+}
+
 async function fetchPinnedPullRequestResource<T>(
   conversationId: string,
   resource: string,
@@ -817,8 +822,11 @@ async function fetchPinnedPullRequestResource<T>(
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/${resource}?${new URLSearchParams(query)}`,
   );
-  // A host or server that predates stacks has no route.
-  if (res.status === 404) return null;
+  if (res.status === 404) {
+    const error = await errorFromResponse(res);
+    if (isMissingRoute(error.message)) return null;
+    throw error;
+  }
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }

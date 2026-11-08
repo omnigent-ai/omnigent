@@ -209,6 +209,7 @@ export function PullRequestFileSection({
   forceMount = false,
   bypassLargeDiffGate = false,
   highlight = null,
+  hideDraft = false,
 }: {
   file: PullRequestChangedFile;
   /** Parsed per-file diff from the whole-PR patch; absent for binary/unparsed. */
@@ -231,6 +232,8 @@ export function PullRequestFileSection({
   bypassLargeDiffGate?: boolean;
   /** The active find match; painted and centred, apart from the reader's selection. */
   highlight?: FindHighlight | null;
+  /** Keep a saved draft out of a view it doesn't belong to, without discarding it. */
+  hideDraft?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   // The force flags latch, so a section stays mounted and ungated after the reader moves on.
@@ -316,7 +319,7 @@ export function PullRequestFileSection({
     !pureRename &&
     seen &&
     (fileDiff.unifiedLineCount <= LARGE_DIFF_THRESHOLD || showLargeDiff);
-  const anchor = composer.draft.anchor;
+  const anchor = hideDraft ? null : composer.draft.anchor;
   const showGutterUtility = !!threadContext.canCreate && (!anchor || composer.stale);
   const showDraftInline = !!anchor && !composer.stale && renderingDiff;
   const { annotations, unplaced } = useMemo(() => {

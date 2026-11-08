@@ -434,6 +434,7 @@ function ownChangesSources(
   result: PullRequestStackDiff | null | undefined,
   fetchError: unknown,
   isSuccess: boolean,
+  isFetching: boolean,
 ): {
   changes: ChangedFilesSource;
   prDiff: PatchSource;
@@ -443,7 +444,8 @@ function ownChangesSources(
     (isSuccess && !result
       ? new Error("This host can't show a PR's own changes. Update it to use this view.")
       : null);
-  const isLoading = !result && !error;
+  // A paused query (asleep sandbox, no parent yet) isn't loading anything.
+  const isLoading = isFetching && !result && !error;
   return {
     changes: {
       data: result
@@ -522,10 +524,13 @@ export function PullRequestChangesTab({
   const stackDiffResult = stackDiff?.data;
   const stackDiffError = stackDiff?.error;
   const stackDiffSuccess = !!stackDiff?.isSuccess;
+  const stackDiffLoading = !!stackDiff?.isLoading;
   const ownSources = useMemo(
     () =>
-      ownChangesOnly ? ownChangesSources(stackDiffResult, stackDiffError, stackDiffSuccess) : null,
-    [ownChangesOnly, stackDiffResult, stackDiffError, stackDiffSuccess],
+      ownChangesOnly
+        ? ownChangesSources(stackDiffResult, stackDiffError, stackDiffSuccess, stackDiffLoading)
+        : null,
+    [ownChangesOnly, stackDiffResult, stackDiffError, stackDiffSuccess, stackDiffLoading],
   );
   const changes: ChangedFilesSource = ownSources?.changes ?? fullChanges;
   const prDiff: PatchSource = ownSources?.prDiff ?? fullDiff;
@@ -1327,6 +1332,7 @@ export function PullRequestChangesTab({
                 threads={threadsByFile.get(file.path) ?? []}
                 threadContext={threadContext}
                 matchingRevision={matchingRevision}
+                hideDraft={ownChangesOnly}
               />
             ))
           )}

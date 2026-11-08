@@ -1,17 +1,21 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { FileDiffMetadata } from "@pierre/diffs";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type { PullRequestChangedFile } from "@/hooks/usePullRequests";
 import { LARGE_DIFF_THRESHOLD, PullRequestFileSection } from "./PullRequestFileSection";
 
+const composerDraft = vi.hoisted(() => ({ anchor: null as unknown }));
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   ...(await importOriginal<typeof UsePullRequestsModule>()),
   usePullRequestReviewThreadComposer: () => ({
-    draft: { pending: false, anchor: null },
+    draft: { pending: false, body: "", error: null, anchor: composerDraft.anchor },
     stale: false,
     selectLines: vi.fn(),
     cancel: vi.fn(),
+    setBody: vi.fn(),
+    post: vi.fn(),
   }),
 }));
 // Like @pierre/diffs: rows live in an open shadow root and are rebuilt on every
@@ -96,8 +100,11 @@ function renderSection(
       {...overrides}
     />
   );
-  const result = render(element(props));
-  return { onToggleCollapsed, rerender: (next: typeof props) => result.rerender(element(next)) };
+  const provided = (overrides: typeof props) => (
+    <TooltipProvider>{element(overrides)}</TooltipProvider>
+  );
+  const result = render(provided(props));
+  return { onToggleCollapsed, rerender: (next: typeof props) => result.rerender(provided(next)) };
 }
 
 class FakeHighlight {
@@ -115,6 +122,20 @@ describe("PullRequestFileSection overrides", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    composerDraft.anchor = null;
+  });
+
+  it("hides a saved draft while asked to and shows it again afterwards", () => {
+    composerDraft.anchor = { side: "RIGHT", line: 4, head_sha: "", base_sha: "" };
+    const draft = () => screen.queryByRole("region", { name: "New review conversation" });
+    const { rerender } = renderSection();
+    expect(draft()).toBeInTheDocument();
+
+    rerender({ hideDraft: true });
+    expect(draft()).toBeNull();
+
+    rerender({ hideDraft: false });
+    expect(draft()).toBeInTheDocument();
   });
 
   it("mounts the diff when forced and keeps it mounted after the flag clears", () => {

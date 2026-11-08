@@ -200,6 +200,19 @@ def test_commit_walk_is_one_bounded_query(monkeypatch: pytest.MonkeyPatch) -> No
     assert request["variables"]["c0"] == commits[-2]
 
 
+def test_commit_list_that_stops_before_the_head_is_not_walked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub lists only a long PR's oldest commits, which may omit the nearest parent."""
+    grandparent = "f" * 40
+    oldest = [f"{index:040x}" for index in range(1, 250)] + [grandparent]
+    fake = FakeGitHub(pr=_pr(), commits=oldest, associated={grandparent: [_pull(40, grandparent)]})
+    _install(monkeypatch, fake)
+
+    assert github_stack.pr_stack("/workspace", _PR, head_sha=_HEAD)["parent"] is None
+    assert fake.graphql == []
+
+
 def test_description_stack_link_is_the_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     body = (
         "Adds the thing.\n\n## \N{PANCAKES} Stacked PR\n"

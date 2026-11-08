@@ -210,6 +210,7 @@ Component coverage for these helpers and views lives in
   after a reload) or the head changes.
 - **This PR only is GitHub-only and lookup-based.** The parent is looked up when the
   Changes tab opens and reused for five minutes per head. The commit walk checks at most
-  the PR's newest 100 commits. A parent in another repository is not found.
+  the PR's newest 100 commits and is skipped when GitHub's 250-commit list stops
+  before the head. A parent in another repository is not found.
 - **Canvas requires its release feature.** Check it is enabled before using the
   `canvas` entry.
