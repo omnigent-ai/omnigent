@@ -17,6 +17,7 @@ import httpx
 import yaml
 from fastapi import FastAPI
 
+from omnigent.host.frames import HostFrame, decode_host_frame
 from omnigent.onboarding.sandboxes import (
     RemoteCommandResult,
     RemoteProcess,
@@ -24,7 +25,9 @@ from omnigent.onboarding.sandboxes import (
 )
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import session_stream
+from omnigent.server.host_registry import HostConnection
 from omnigent.server.smart_routing import RoutingResult, RoutingSettings
+from tests.budgets import budget
 
 # Sentinel ready event so a stream collector's registration is a
 # deterministic sync point (first delivered item) rather than a
@@ -1187,3 +1190,38 @@ def policy_tool_call_request(
             "context": {},
         },
     }
+
+
+async def sent_to_host(
+    conn: HostConnection,
+    request: asyncio.Task[httpx.Response],
+    *,
+    timeout: float | None = None,
+) -> HostFrame:
+    """Wait for the frame a host route sends while ``request`` is in flight.
+
+    A host route looks up the host's owner in a worker thread before it sends,
+    and on a loaded test machine that can take seconds. So this waits for the
+    frame for as long as it takes, up to ``timeout`` (default ``budget(30)``,
+    scaled by ``OMNIGENT_TEST_TIMEOUT_SCALE``). If the request ends first, the
+    route answered without asking the host, and the assertion says what it
+    answered.
+    """
+    if timeout is None:
+        timeout = budget(30.0)
+    sent = asyncio.ensure_future(conn.outbound_queue.get())
+    try:
+        await asyncio.wait({sent, request}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        if not sent.done():
+            sent.cancel()
+    if sent.done() and not sent.cancelled():
+        frame = sent.result()
+        assert frame is not None, "the host's connection closed instead of sending"
+        return decode_host_frame(frame.data)
+    if request.done():
+        response = request.result()
+        raise AssertionError(
+            f"the route answered {response.status_code} without asking the host: {response.text}"
+        )
+    raise AssertionError(f"the route didn't ask the host within {timeout:g}s")

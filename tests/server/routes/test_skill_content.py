@@ -16,7 +16,6 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostSkillContentFrame,
     HostSkillContentResultFrame,
-    decode_host_frame,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes.skill_content import (
@@ -24,6 +23,7 @@ from omnigent.server.routes.skill_content import (
     request_host_skill_content,
 )
 from omnigent.stores.host_store import HostStore
+from tests.server.helpers import sent_to_host
 
 _HOST_ID = "a828988dc0b441fb8d04dad3761773b9"
 _URL = f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/skills/toolkit%3Alint"
@@ -96,7 +96,7 @@ async def test_owner_gets_skill_content(
         task = asyncio.create_task(
             client.get(_URL, params={"source_id": "a" * 64}, headers={"x-test-user": "owner"})
         )
-        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
+        frame = await sent_to_host(conn, task)
         assert isinstance(frame, HostSkillContentFrame)
         assert frame.harness == "claude-native"
         assert frame.name == "toolkit:lint"

@@ -25,6 +25,7 @@ from omnigent.server.routes.mcp_servers import (
     request_host_mcp_servers,
 )
 from omnigent.stores.host_store import HostStore
+from tests.server.helpers import sent_to_host
 
 _HOST_ID = "a828988dc0b441fb8d04dad3761773b9"
 _GITHUB = {"name": "github", "harness": "claude", "transport": "stdio", "scope": "user"}
@@ -86,7 +87,7 @@ async def test_owner_gets_host_inventory(
         task = asyncio.create_task(
             client.get(f"/v1/hosts/{_HOST_ID}/mcp-servers", headers={"x-test-user": "owner"})
         )
-        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
+        frame = await sent_to_host(conn, task)
         assert isinstance(frame, HostMcpServersFrame)
         result.request_id = frame.request_id
         conn.pending_mcp_servers[frame.request_id].set_result(result)
@@ -122,7 +123,7 @@ async def test_account_state_reaches_the_caller_through_the_tunnel(mcp_app) -> N
         task = asyncio.create_task(
             client.get(f"/v1/hosts/{_HOST_ID}/mcp-servers", headers={"x-test-user": "owner"})
         )
-        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
+        frame = await sent_to_host(conn, task)
         assert isinstance(frame, HostMcpServersFrame)
         # Round-trip the host's answer so the decoder's allow-list is in the path.
         answered = decode_host_frame(
