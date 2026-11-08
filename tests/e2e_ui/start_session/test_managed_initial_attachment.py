@@ -115,3 +115,54 @@ async def _drive(rig: ManagedReplicas, model_url: str, agent_name: str) -> None:
             await client.post(f"{rig.a}/__test/provision/release")
             if browser.is_connected():
                 await browser.close()
+
+
+@pytest.mark.timeout(240)
+def test_failed_launch_hands_the_message_and_attachment_to_a_new_session(
+    managed_replicas: ManagedReplicas,
+) -> None:
+    """A launch that never comes online leaves the first message recoverable."""
+    run_in_fresh_loop(_drive_failed_launch(managed_replicas))
+
+
+async def _drive_failed_launch(rig: ManagedReplicas) -> None:
+    async with async_playwright() as playwright, httpx.AsyncClient(timeout=10) as client:
+        # The reserved host ID routes this attachment create to replica B.
+        (await client.post(f"{rig.b}/__test/provision/fail")).raise_for_status()
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        try:
+            await page.goto(rig.ui)
+            agents = (await client.get(f"{rig.a}/v1/agents")).json()["data"]
+            agent_id = next(agent["id"] for agent in agents if agent["name"] == "routing_probe")
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
+            await page.get_by_test_id("new-chat-landing-file-input").set_input_files(
+                {"name": "context.txt", "mimeType": "text/plain", "buffer": _FILE}
+            )
+            await page.get_by_test_id("new-chat-landing-input").fill(_PROMPT)
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await expect(page).to_have_url(re.compile(r"/c/[a-f0-9]+"), timeout=30_000)
+            await _poll(client, f"{rig.b}/__test/state", lambda body: body["provisioning"])
+            (await client.post(f"{rig.b}/__test/provision/release")).raise_for_status()
+
+            # Live, then after a reload: the message stays, marked undelivered.
+            prompt = page.locator('[data-testid="message-bubble"][data-role="user"]').filter(
+                has_text=_PROMPT
+            )
+            for reloaded in (False, True):
+                if reloaded:
+                    await page.reload()
+                await expect(page.get_by_test_id("message-undelivered")).to_be_visible(
+                    timeout=60_000
+                )
+                await expect(prompt).to_have_count(1)
+                await page.screenshot(path=str(rig.logs / f"undelivered-{reloaded}.png"))
+
+            await page.get_by_role("button", name="Copy message to new session").click()
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_value(_PROMPT)
+            await expect(page.get_by_role("button", name="Remove context.txt")).to_be_visible()
+            await page.screenshot(path=str(rig.logs / "new-session-prefilled.png"))
+        finally:
+            await client.post(f"{rig.b}/__test/provision/release")
+            await browser.close()
