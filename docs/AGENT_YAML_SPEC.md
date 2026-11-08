@@ -43,7 +43,7 @@ of the agent YAML.
 | `instructions` | Optional | Inline instructions or a path to an instructions file. If set, it takes precedence over `prompt`. |
 | `executor` | Recommended | Harness, model, and auth settings. |
 | `tools` | Optional | MCP tools, Python function tools, sub-agents, handoffs, or inherited tools. |
-| `policies` | Optional | Guardrails that inspect requests, responses, tool calls, or tool results. |
+| `policies` | Optional | Guardrails that inspect requests, responses, tool calls, or tool results. In a `config.yaml` bundle, nest them under `guardrails:` instead; see [Policies](#policies). |
 | `params` | Optional | Typed user parameters available to tools/skills. |
 | `os_env` | Optional | Enables local OS tools such as file reads, writes, edits, and shell commands. |
 | `terminals` | Optional | Named interactive terminal environments the agent can launch. |
@@ -952,6 +952,22 @@ policies:
     factory_params:
       allowed_hosts:
         - example.cloud.databricks.com
+```
+
+Top-level `policies:` (and `labels:` / `ask_timeout:`) belong to this
+single-file format. A `config.yaml` directory bundle (`spec_version: 1`) reads
+them only from a `guardrails:` block; a top-level `policies:` there is ignored
+without an error, so the agent runs with no policies:
+
+```yaml
+spec_version: 1
+name: hello_agent
+# ...
+guardrails:
+  policies:
+    pii_guard:
+      type: function
+      handler: my_package.policies.pii_guard
 ```
 
 ## Terminals
