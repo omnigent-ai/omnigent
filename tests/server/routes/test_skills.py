@@ -227,7 +227,7 @@ async def test_presession_catalog_matches_filtered_invocations(
         ],
     )
     monkeypatch.setattr(app.state.agent_cache, "load", lambda *a, **kw: SimpleNamespace(spec=spec))
-    from omnigent.server.routes.builtin_agents import _to_agent_object as builtin_agent_object
+    from omnigent.server.routes.builtin_agents import agent_to_object as builtin_agent_object
     from omnigent.server.routes.sessions.routes_permissions import (
         _to_agent_object as session_agent_object,
     )
@@ -291,7 +291,7 @@ async def test_agent_object_without_loadable_bundle_keeps_user_settings(
         raise RuntimeError("bundle unavailable")
 
     monkeypatch.setattr(app.state.agent_cache, "load", fail_load)
-    from omnigent.server.routes.builtin_agents import _to_agent_object as builtin_agent_object
+    from omnigent.server.routes.builtin_agents import agent_to_object as builtin_agent_object
     from omnigent.server.routes.sessions.routes_permissions import (
         _to_agent_object as session_agent_object,
     )

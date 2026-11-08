@@ -54,6 +54,8 @@ export interface AvailableAgent {
   // these under Agents whatever their harness: an installed agent on a native
   // CLI is still the user's agent, not a harness row.
   mine?: true;
+  // Available through a shared automation; copying creates a recipient-owned agent.
+  shared?: true;
   // Session id used to fetch the full agent spec on hover. Only set on
   // session-discovered agents (custom uploads); absent on catalog agents
   // whose full data is already present from GET /v1/agents.

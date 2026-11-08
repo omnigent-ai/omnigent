@@ -124,12 +124,15 @@ describe("partitionPickerEntries", () => {
     expect(agents.map((a) => a.name)).toEqual(["polly"]);
   });
 
-  it("keeps the user's own agents under Agents even on a native harness", () => {
-    // One of these would otherwise pass for a harness row.
-    const { harnesses, agents } = partitionPickerEntries([
-      agent({ name: "my-claude", harness: "claude-native", mine: true }),
-    ]);
-    expect(harnesses).toEqual([]);
-    expect(agents.map((a) => a.name)).toEqual(["my-claude"]);
-  });
+  it.each(["mine", "shared"] as const)(
+    "keeps %s agents under Agents even on a native harness",
+    (kind) => {
+      // One of these would otherwise pass for a harness row.
+      const { harnesses, agents } = partitionPickerEntries([
+        agent({ name: "my-claude", harness: "claude-native", [kind]: true }),
+      ]);
+      expect(harnesses).toEqual([]);
+      expect(agents.map((a) => a.name)).toEqual(["my-claude"]);
+    },
+  );
 });

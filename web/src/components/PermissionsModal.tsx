@@ -460,7 +460,7 @@ interface AddUserFieldProps {
  * a free-text suggestion combobox. Free typing is always allowed; suggestions
  * are an aid, not a constraint.
  */
-function AddUserField({ value, onChange, disabled }: AddUserFieldProps) {
+export function AddUserField({ value, onChange, disabled }: AddUserFieldProps) {
   // Read once: the host installs config eagerly before first render, so the
   // branch is stable for the lifetime of the modal.
   const searchUsers = getOmnigentUserSearch();

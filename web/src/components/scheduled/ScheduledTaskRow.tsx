@@ -19,6 +19,7 @@ import { useId, useMemo, useState, type ComponentType, type ReactNode } from "re
 import {
   CirclePlayIcon,
   MoreHorizontalIcon,
+  Share2Icon,
   PauseIcon,
   PencilIcon,
   PlayIcon,
@@ -54,6 +55,7 @@ export function ScheduledTaskRow({
   onPauseToggle,
   onRunNow,
   onDelete,
+  onShare,
   busy,
 }: {
   task: ScheduledTask;
@@ -66,6 +68,7 @@ export function ScheduledTaskRow({
   onPauseToggle: (task: ScheduledTask) => void;
   onRunNow: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
+  onShare?: (task: ScheduledTask) => void;
   busy: boolean;
 }) {
   const navigate = useNavigate();
@@ -129,7 +132,16 @@ export function ScheduledTaskRow({
     </>
   );
 
-  const menuItemProps = { task, paused, triggerMode, onEdit, onPauseToggle, onRunNow, onDelete };
+  const menuItemProps = {
+    task,
+    paused,
+    triggerMode,
+    onEdit,
+    onPauseToggle,
+    onRunNow,
+    onDelete,
+    onShare,
+  };
 
   const card = (
     <div
@@ -241,6 +253,7 @@ function TaskMenuItems({
   onPauseToggle,
   onRunNow,
   onDelete,
+  onShare,
 }: {
   Item: ComponentType<TaskMenuItemProps>;
   task: ScheduledTask;
@@ -250,10 +263,17 @@ function TaskMenuItems({
   onPauseToggle: (task: ScheduledTask) => void;
   onRunNow: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
+  onShare?: (task: ScheduledTask) => void;
 }) {
   const { trackClick } = useOmnigentAnalytics();
   return (
     <>
+      {onShare && (
+        <Item onSelect={() => onShare(task)} data-testid="task-share">
+          <Share2Icon className="size-4" />
+          Share
+        </Item>
+      )}
       {!triggerMode && (
         <Item
           onSelect={() => {

@@ -13,6 +13,8 @@ import {
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
+  getSharedScheduledTask,
+  scheduledTaskCopyInput,
   listScheduledTaskRuns,
   listScheduledTasks,
   listAutomationFailures,
@@ -395,4 +397,37 @@ describe("random worktree setting", () => {
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ base_branch: baseBranch });
     expect(task.baseBranch).toBe(baseBranch);
   });
+});
+
+it("keeps shared custom-agent metadata and sends its source authorization when copying", async () => {
+  fetchMock.mockResolvedValueOnce(
+    mockResponse({
+      ...TASK_WIRE,
+      agent_id: "custom-agent",
+      shared_agent: {
+        id: "custom-agent",
+        name: "Research brief",
+        description: "Custom rules",
+        harness: "codex",
+        skills: [],
+      },
+    }),
+  );
+  const shared = await getSharedScheduledTask(TASK_WIRE.id);
+  expect(shared.sharedAgent).toMatchObject({
+    id: "custom-agent",
+    display_name: "Research brief",
+    harness: "codex",
+    shared: true,
+  });
+  expect(shared.sharedAgent?.mine).toBeUndefined();
+  fetchMock.mockResolvedValueOnce(
+    mockResponse({ ...TASK_WIRE, id: "copy", agent_id: "copied-agent" }),
+  );
+  const copy = await createScheduledTask(scheduledTaskCopyInput(shared));
+  expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toMatchObject({
+    shared_task_id: TASK_WIRE.id,
+    agent_id: "custom-agent",
+  });
+  expect(copy.agentId).toBe("copied-agent");
 });

@@ -67,7 +67,7 @@ _USER_AGENTS_PAGE_LIMIT = 50
 _IN_USE_COUNT_CAP = 100
 
 
-def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
+def agent_to_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     """
     Convert a runtime Agent entity to an API-layer AgentObject.
 
@@ -483,7 +483,7 @@ def create_builtin_agents_router(
             )
             return AgentList(
                 data=[
-                    _to_agent_object(a, agent_cache) for a in page.data if a.name not in suppressed
+                    agent_to_object(a, agent_cache) for a in page.data if a.name not in suppressed
                 ],
                 first_id=page.first_id,
                 last_id=page.last_id,
@@ -503,7 +503,7 @@ def create_builtin_agents_router(
             after=after,
         )
         data = await asyncio.to_thread(
-            lambda: [_to_agent_object(a, agent_cache) for a in page.data]
+            lambda: [agent_to_object(a, agent_cache) for a in page.data]
         )
         return AgentList(
             data=data, first_id=page.first_id, last_id=page.last_id, has_more=page.has_more
@@ -531,7 +531,7 @@ def create_builtin_agents_router(
             )
         ):
             raise OmnigentError(f"Agent not found: {agent_id!r}", code=ErrorCode.NOT_FOUND)
-        summary = await asyncio.to_thread(_to_agent_object, agent, agent_cache)
+        summary = await asyncio.to_thread(agent_to_object, agent, agent_cache)
         return AgentDetailObject(**summary.model_dump(), user_owned=agent.kind == "user")
 
     # Multipart is CORS-safelisted, so a cross-site form post needs the Origin check.
@@ -576,7 +576,7 @@ def create_builtin_agents_router(
             bundle_bytes=bundle_bytes,
         )
         # Loads (extracts) the just-written bundle; keep it off the event loop.
-        return await asyncio.to_thread(_to_agent_object, agent, agent_cache)
+        return await asyncio.to_thread(agent_to_object, agent, agent_cache)
 
     @router.delete("/agents/{agent_id}")
     async def remove_agent(

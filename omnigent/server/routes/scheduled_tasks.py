@@ -26,7 +26,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from omnigent.db.account_authority import account_generation, current_account_user
+from omnigent.db.account_authority import (
+    account_generation,
+    current_account_user,
+    target_account_scope,
+)
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import (
@@ -34,8 +38,15 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runtime import pending_elicitations
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, bind_host_is_loopback
-from omnigent.server.bundles import agent_for_user
+from omnigent.server.auth import (
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+    AuthProvider,
+    SharingMode,
+    bind_host_is_loopback,
+    local_single_user_enabled,
+)
+from omnigent.server.bundles import agent_for_user, agent_needs_own_copy
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
 from omnigent.server.routes._auth_helpers import require_user
@@ -51,6 +62,7 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_from_cache,
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
+from omnigent.server.routes.builtin_agents import agent_to_object
 from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
 from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
@@ -63,6 +75,7 @@ from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.scheduled_task_permission_store import ScheduledTaskPermissionStore
 from omnigent.stores.scheduled_task_store import AutomationFailure, ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
@@ -117,6 +130,8 @@ class CreateScheduledTaskRequest(BaseModel):
     execution_target: str = "connected_host"
     # One of the caller's projects to file fired sessions into.
     project_id: str | None = None
+    # Authorizes only the agent bound to this shared automation, checked at save time.
+    shared_task_id: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
@@ -126,10 +141,17 @@ class CreateScheduledTaskRequest(BaseModel):
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
         if self.session_id is not None and self.session_mode != "continue":
             raise ValueError(_SESSION_ID_WITHOUT_CONTINUE_MSG)
+        if self.shared_task_id is not None and self.session_id is not None:
+            raise ValueError("An automation copy must start without an existing session")
         _validate_worktree_target(
             self.base_branch, self.execution_target, self.host_id, self.workspace
         )
         return self
+
+
+class ShareScheduledTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    user_id: str = Field(min_length=1, max_length=128)
 
 
 class UpdateScheduledTaskRequest(BaseModel):
@@ -388,6 +410,7 @@ def require_scheduled_task_agent_origin(
 def create_scheduled_tasks_router(
     store: ScheduledTaskStore,
     *,
+    task_permissions: ScheduledTaskPermissionStore | None = None,
     agent_store: AgentStore,
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None = None,
@@ -440,6 +463,7 @@ def create_scheduled_tasks_router(
         reasoning_effort: str | None,
         permission_mode: str | None,
         execution_target: str = "connected_host",
+        shared_agent: Agent | None = None,
     ) -> tuple[Agent, str | None, str | None, str | None]:
         """Validate inputs that scheduled tasks persist into future sessions.
 
@@ -457,7 +481,7 @@ def create_scheduled_tasks_router(
         fire.
         """
         user_id = None if owner == RESERVED_USER_LOCAL else owner
-        agent = await validate_session_agent(
+        agent = shared_agent or await validate_session_agent(
             user_id=user_id,
             agent_id=agent_id,
             agent_store=agent_store,
@@ -548,6 +572,15 @@ def create_scheduled_tasks_router(
             agent_for_user, agent_store, artifact_store, agent, owner_id
         )
 
+    def _task_owner_can_share_agent(agent: Agent, task: ScheduledTask) -> bool:
+        # Using an installed agent in a session also gives it a session_id.
+        # Ownership, not session usage, authorizes sharing its bundle with a task.
+        return (
+            not agent.operator_authored
+            and task.user_id is not None
+            and agent.created_by == task.user_id
+        )
+
     def _owns_task(task: ScheduledTask, owner: str | None) -> bool:
         return (
             task.state != "deleted"
@@ -609,6 +642,25 @@ def create_scheduled_tasks_router(
         await _validate_rrule_or_400(body.rrule, body.session_mode, body.execution_target)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        shared_agent = None
+        if body.shared_task_id is not None:
+            source = await _shared_task(request, body.shared_task_id)
+            if body.agent_id == source.agent_id:
+                source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
+                if source_agent is None:
+                    raise OmnigentError("Shared agent not found", code=ErrorCode.NOT_FOUND)
+                if _task_owner_can_share_agent(source_agent, source):
+                    shared_agent = source_agent
+                if (
+                    shared_agent is not None
+                    and agent_needs_own_copy(shared_agent, owner_id)
+                    and (artifact_store is None or not agent_store.supports_user_agents)
+                ):
+                    raise OmnigentError(
+                        "This server cannot copy custom agents; choose another agent",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
             owner=owner,
@@ -619,8 +671,8 @@ def create_scheduled_tasks_router(
             reasoning_effort=body.reasoning_effort,
             permission_mode=permission_mode,
             execution_target=body.execution_target,
+            shared_agent=shared_agent,
         )
-        owner_id = None if owner == RESERVED_USER_LOCAL else owner
         project_owner = _project_owner(owner)
         # Known before the task exists, since a sandbox session must run on the
         # sandbox host derived from it.
@@ -680,6 +732,8 @@ def create_scheduled_tasks_router(
         except Exception as exc:
             if bound.id != agent.id:
                 agent_store.delete(bound.id)
+                if artifact_store is not None:
+                    artifact_store.delete(bound.bundle_location)
             if isinstance(exc, RRuleSearchError):
                 raise OmnigentError(
                     "Could not calculate the next run time for this schedule. "
@@ -769,6 +823,121 @@ def create_scheduled_tasks_router(
             data=failures,
             next_cursor=f"{next_cursor[0]}:{next_cursor[1]}" if next_cursor else None,
         )
+
+    def _sharing_store(
+        request: Request, *, new_grant: bool = False
+    ) -> ScheduledTaskPermissionStore:
+        if (
+            task_permissions is None
+            or permission_store is None
+            or auth_provider is None
+            or local_single_user_enabled()
+        ):
+            raise HTTPException(status_code=404, detail="Automation sharing is unavailable")
+        if new_grant and request.app.state.sharing_mode() == SharingMode.OFF:
+            raise OmnigentError("Sharing is disabled on this server", code=ErrorCode.FORBIDDEN)
+        return task_permissions
+
+    def _definition(request: Request, task: ScheduledTask) -> dict[str, Any]:
+        # Share only configuration; runtime session IDs and run metadata stay private.
+        fields = CreateScheduledTaskRequest.model_fields.keys() - {"session_id", "shared_task_id"}
+        agent = agent_store.get(task.agent_id)
+        shared_agent = None
+        if (
+            agent is not None
+            and _task_owner_can_share_agent(agent, task)
+            and artifact_store is not None
+            and agent_store.supports_user_agents
+            and agent_cache is not None
+        ):
+            shared_agent = agent_to_object(agent, agent_cache).model_dump(
+                include={"id", "name", "description", "harness", "skills"}
+            )
+        hosts = getattr(request.app.state, "host_store", None)
+        host = hosts.get_host(task.host_id) if hosts is not None and task.host_id else None
+        project = (
+            project_store.get(task.project_id, user_id=task.user_id)
+            if project_store is not None and task.project_id
+            else None
+        )
+        return {
+            "id": task.id,
+            "owner_user_id": task.user_id,
+            "agent_name": agent.name if agent else None,
+            "shared_agent": shared_agent,
+            "host_name": host.name if host else None,
+            "project_name": project.name if project else None,
+            **{field: getattr(task, field) for field in fields},
+        }
+
+    async def _shared_task(request: Request, task_id: str) -> ScheduledTask:
+        shares = _sharing_store(request)
+        owner = _owner(request)
+        allowed = await asyncio.to_thread(shares.can_read, task_id, owner)
+        task = await asyncio.to_thread(store.get, task_id) if allowed else None
+        if task is None or task.state == "deleted":
+            raise OmnigentError("Shared automation not found", code=ErrorCode.NOT_FOUND)
+        return task
+
+    @router.get("/scheduled-tasks/shared")
+    async def list_shared_tasks(request: Request) -> dict[str, Any]:
+        shares = _sharing_store(request)
+        owner = _owner(request)
+        ids = await asyncio.to_thread(shares.shared_task_ids, owner)
+
+        def definitions() -> list[dict[str, Any]]:
+            tasks = [store.get(task_id) for task_id in ids]
+            return [
+                _definition(request, task)
+                for task in tasks
+                if task is not None and task.state != "deleted" and task.user_id != owner
+            ]
+
+        return {"scheduled_tasks": await asyncio.to_thread(definitions)}
+
+    @router.get("/scheduled-tasks/shared/{scheduled_task_id}")
+    async def get_shared_task(request: Request, scheduled_task_id: str) -> dict[str, Any]:
+        task = await _shared_task(request, scheduled_task_id)
+        return await asyncio.to_thread(_definition, request, task)
+
+    @router.get("/scheduled-tasks/{scheduled_task_id}/permissions")
+    async def list_task_permissions(request: Request, scheduled_task_id: str) -> dict[str, Any]:
+        shares = _sharing_store(request)
+        owner = _owner(request)
+        _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        return {"user_ids": await asyncio.to_thread(shares.recipients, scheduled_task_id)}
+
+    @router.put("/scheduled-tasks/{scheduled_task_id}/permissions")
+    async def share_task(
+        request: Request,
+        scheduled_task_id: str,
+        body: ShareScheduledTaskRequest,
+    ) -> dict[str, str]:
+        shares = _sharing_store(request, new_grant=True)
+        owner = _owner(request)
+        _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        recipient = body.user_id.strip()
+        if recipient in {owner, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC, ""}:
+            raise OmnigentError(
+                "Choose another person to share with", code=ErrorCode.INVALID_INPUT
+            )
+        assert permission_store is not None
+        target = await asyncio.to_thread(permission_store.get_user, recipient)
+        if target is None:
+            raise OmnigentError("User not found", code=ErrorCode.INVALID_INPUT)
+        with target_account_scope(recipient, target.account_generation):
+            await asyncio.to_thread(shares.grant, scheduled_task_id, owner, recipient)
+        return {"user_id": recipient}
+
+    @router.delete("/scheduled-tasks/{scheduled_task_id}/permissions/{user_id}")
+    async def unshare_task(
+        request: Request, scheduled_task_id: str, user_id: str
+    ) -> dict[str, bool]:
+        shares = _sharing_store(request)
+        owner = _owner(request)
+        _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        await asyncio.to_thread(shares.revoke, scheduled_task_id, user_id)
+        return {"deleted": True}
 
     @router.get("/scheduled-tasks/{scheduled_task_id}")
     async def get_scheduled_task(
@@ -1144,6 +1313,8 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         _require_owned(scheduled_task_id, owner_id)
         await asyncio.to_thread(store.delete, scheduled_task_id)
+        if task_permissions is not None:
+            await asyncio.to_thread(task_permissions.delete_for_task, scheduled_task_id)
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False

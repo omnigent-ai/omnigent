@@ -925,3 +925,39 @@ def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
             "id",
         ],
     }
+
+
+def test_sharing_migration_preserves_tasks_on_upgrade_and_rollback(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'sharing.db'}"
+    config = _build_alembic_config(uri)
+    command.upgrade(config, "f1c7a9e2b406")
+    engine = sa.create_engine(uri)
+    task_id = uuid4().hex
+    with engine.begin() as connection:
+        connection.execute(
+            SqlScheduledTask.__table__.insert().values(
+                id=task_id,
+                name="Existing private task",
+                prompt="Hello",
+                rrule="FREQ=DAILY",
+                agent_id=uuid4().hex,
+                user_id="alice",
+                created_at=1,
+            )
+        )
+    command.upgrade(config, "b6d2e4f8a901")
+    inspector = sa.inspect(engine)
+    assert inspector.get_pk_constraint("scheduled_task_permissions")["constrained_columns"] == [
+        "workspace_id",
+        "scheduled_task_id",
+        "user_id",
+    ]
+    assert inspector.get_foreign_keys("scheduled_task_permissions") == []
+    with engine.connect() as connection:
+        assert connection.scalar(sa.text("SELECT COUNT(*) FROM scheduled_task_permissions")) == 0
+        assert connection.scalar(sa.select(SqlScheduledTask.name)) == "Existing private task"
+    command.downgrade(config, "f1c7a9e2b406")
+    assert "scheduled_task_permissions" not in sa.inspect(engine).get_table_names()
+    with engine.connect() as connection:
+        assert connection.scalar(sa.select(SqlScheduledTask.name)) == "Existing private task"
+    engine.dispose()

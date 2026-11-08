@@ -20,12 +20,14 @@ import { showToast } from "@/components/ui/toast";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
+import { ShareScheduledTaskDialog } from "@/components/scheduled/ShareScheduledTaskDialog";
+import { SharedAutomations } from "@/components/scheduled/SharedAutomations";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import { AUTOMATION_TEMPLATES } from "@/components/scheduled/automationTemplates";
 import { SESSION_LINK_ID_PLACEHOLDER } from "@/components/scheduled/triggerTemplates";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
-import { useNavigate, useRebasePath, useSearchParams } from "@/lib/routing";
+import { useNavigate, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import {
   useDeleteScheduledTask,
@@ -46,7 +48,14 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
   { value: "paused", label: "Paused" },
 ];
 
-export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }) {
+export function TasksPage({
+  templatesOnly = false,
+  sharedOnly = false,
+}: {
+  templatesOnly?: boolean;
+  sharedOnly?: boolean;
+}) {
+  const { sharedTaskId } = useParams<{ sharedTaskId: string }>();
   const newTaskButtonRef = useRef<HTMLButtonElement>(null);
   const introButtonRef = useRef<HTMLButtonElement>(null);
   // The guide shows once by itself; each click on the info button reopens it.
@@ -66,11 +75,17 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const [filter, setFilter] = useState<FilterTab>("all");
   const [manualOpen, setManualOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
+  const [sharingTask, setSharingTask] = useState<ScheduledTask | null>(null);
   const [templateId, setTemplateId] = useState<string | null>(null);
   const selectedTemplate = AUTOMATION_TEMPLATES.find((template) => template.id === templateId);
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const view = templatesOnly || searchParams.get("view") === "templates" ? "templates" : "yours";
+  const view =
+    templatesOnly || searchParams.get("view") === "templates"
+      ? "templates"
+      : sharedOnly || searchParams.get("view") === "shared"
+        ? "shared"
+        : "yours";
   useOmnigentPageView(view === "templates" ? "tasks.templates" : "tasks");
   const requestedView = useRef<string>(view);
   useEffect(() => {
@@ -82,6 +97,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   // A trigger's manager keeps one session and starts its workers from it, so
   // the templates need "continue in the same session" and session orchestration.
   const info = useServerInfo();
+  const sharingSupported = info !== "loading" && info.scheduled_task_sharing === true;
   const triggersSupported =
     info !== "loading" &&
     info.scheduled_task_session_modes === true &&
@@ -273,9 +289,13 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           if (requestedView.current === value) return;
           requestedView.current = value;
           trackValueChange("tasks.view", "tabs", value, { valueHasNoPii: true });
+          if (sharedOnly) {
+            navigate(value === "yours" ? "/tasks" : `/tasks?view=${value}`);
+            return;
+          }
           setSearchParams((current) => {
             const next = new URLSearchParams(current);
-            if (value === "templates") next.set("view", "templates");
+            if (value !== "yours") next.set("view", value);
             else next.delete("view");
             return next;
           });
@@ -310,6 +330,11 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           <TabsTrigger value="templates" className="h-8 flex-none px-3">
             Templates
           </TabsTrigger>
+          {sharingSupported && (
+            <TabsTrigger value="shared" className="h-8 flex-none px-3">
+              Shared automations
+            </TabsTrigger>
+          )}
         </TabsList>
         <TabsContent value="yours" className="mt-4">
           <div className="mb-4 flex flex-col gap-5">
@@ -386,6 +411,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   onPauseToggle={handlePauseToggle}
                   onRunNow={handleRunNow}
                   onDelete={handleDelete}
+                  onShare={sharingSupported ? setSharingTask : undefined}
                 />
               ))}
             </div>
@@ -401,9 +427,22 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
             <p className="py-8 text-ui text-muted-foreground">{templatesFallbackText}</p>
           )}
         </TabsContent>
+        <TabsContent value="shared" className="mt-4">
+          {sharingSupported ? (
+            <SharedAutomations
+              sharedTaskId={sharedTaskId ?? null}
+              onCopied={() => navigate("/tasks")}
+            />
+          ) : (
+            <p>Automation sharing is not available on this server.</p>
+          )}
+        </TabsContent>
       </Tabs>
 
       {createDialog}
+      {sharingTask && (
+        <ShareScheduledTaskDialog task={sharingTask} onClose={() => setSharingTask(null)} />
+      )}
     </PageScroll>
   );
 }

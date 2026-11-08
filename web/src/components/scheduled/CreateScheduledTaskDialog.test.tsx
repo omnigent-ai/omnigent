@@ -4972,3 +4972,99 @@ describe("automation random worktree", () => {
     );
   });
 });
+
+it("creates a copy preserving configuration without editing or continuing the source", async () => {
+  const onCreated = vi.fn();
+  render(
+    <CapabilitiesProvider
+      info={{
+        ...SERVER_INFO_OFFLINE_FALLBACK,
+        features: { automations_v2: true },
+        scheduled_task_projects: true,
+        scheduled_task_session_modes: true,
+      }}
+    >
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        onCreated={onCreated}
+        initialTask={scheduledTask({
+          name: "Copied brief",
+          agentId: "ag_claude_native",
+          hostId: "host_1",
+          workspace: "/home/me/repo",
+          projectId: "proj_1",
+          modelOverride: "sonnet",
+          permissionMode: "acceptEdits",
+          sessionMode: "continue",
+          sessionId: "original-session",
+          maxCostUsd: 3,
+        })}
+        copyIssues={["Choose settings for this copy."]}
+      />
+    </CapabilitiesProvider>,
+  );
+  expect(screen.getByRole("heading", { name: "Copy automation" })).toBeInTheDocument();
+  expect(screen.getByText("Choose settings for this copy.")).toBeInTheDocument();
+  fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+  await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+  expect(mutateAsync).toHaveBeenCalledWith(
+    expect.objectContaining({
+      name: "Copied brief",
+      prompt: "Summarize overnight activity",
+      agentId: "ag_claude_native",
+      hostId: "host_1",
+      workspace: "/home/me/repo",
+      projectId: "proj_1",
+      timezone: "America/Los_Angeles",
+      rrule: "FREQ=DAILY;BYHOUR=8;BYMINUTE=30",
+      modelOverride: "sonnet",
+      sessionMode: "continue",
+      permissionMode: "acceptEdits",
+      maxCostUsd: 3,
+    }),
+  );
+  expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionId");
+  expect(updateMutateAsync).not.toHaveBeenCalled();
+  expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  expect(onCreated).toHaveBeenCalledTimes(1);
+});
+
+it("keeps a shared custom agent selected and includes the source share when saving", async () => {
+  const sharedAgent = {
+    id: "shared-custom",
+    name: "Research brief",
+    display_name: "Research brief",
+    description: "Custom research instructions",
+    harness: "claude-native",
+    skills: [],
+    shared: true as const,
+  };
+  render(
+    <CapabilitiesProvider info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_projects: true }}>
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialTask={scheduledTask({
+          id: "source-task",
+          agentId: sharedAgent.id,
+          sharedAgent,
+          hostId: "host_1",
+          workspace: null,
+          projectId: null,
+          modelOverride: null,
+        })}
+      />
+    </CapabilitiesProvider>,
+  );
+  expect(screen.getByTestId("task-agent-picker")).toHaveTextContent("Research brief");
+  fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+  await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+  expect(mutateAsync).toHaveBeenCalledWith(
+    expect.objectContaining({
+      sharedTaskId: "source-task",
+      agentId: "shared-custom",
+      hostId: "host_1",
+    }),
+  );
+});

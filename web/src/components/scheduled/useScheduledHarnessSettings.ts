@@ -31,6 +31,7 @@ export function useScheduledHarnessSettings(
   sandbox: boolean,
   model: string,
   enabled: boolean,
+  sharedAgent = false,
 ) {
   const info = useServerInfo();
   const harness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent?.harness ?? null;
@@ -51,7 +52,7 @@ export function useScheduledHarnessSettings(
   const sandboxModels = useSandboxModelOptions(
     provider,
     harness,
-    agent?.id ?? null,
+    sharedAgent ? null : (agent?.id ?? null),
     getCurrentUserId(),
     enabled && sandbox && sandboxCatalogOffered,
   );
@@ -139,6 +140,7 @@ export function useScheduledHarnessSettings(
     else catalogMessage = "No model choices are available. Default uses the agent's configuration.";
   }
   return {
+    loading,
     harness,
     supportsModel,
     models,

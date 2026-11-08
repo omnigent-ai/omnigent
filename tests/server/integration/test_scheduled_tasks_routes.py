@@ -44,12 +44,15 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.scheduled_task_permission_store.sqlalchemy_store import (
+    SqlAlchemyScheduledTaskPermissionStore,
+)
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
-from tests.server.helpers import FakeSandboxLauncher
+from tests.server.helpers import FakeSandboxLauncher, build_agent_bundle
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("frozen_recurrence_clock")]
 
@@ -94,6 +97,7 @@ def _build_app(
     *,
     persistent: bool = False,
     local_single_user: bool = False,
+    auth_enabled: bool = True,
     projects: bool = True,
     automations: bool | Callable[[], bool] | None = None,
 ) -> FastAPI:
@@ -107,15 +111,20 @@ def _build_app(
         conversation_store=SqlAlchemyConversationStore(db_uri),
         artifact_store=artifact_store,
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
-        permission_store=SqlAlchemyPermissionStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri) if auth_enabled else None,
         scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
+        scheduled_task_permission_store=SqlAlchemyScheduledTaskPermissionStore(db_uri),
         # A real host store so pinned-host create authorization (existence +
         # ownership) resolves against actual host rows. Without it,
         # ``app.state.host_store`` is None and the route skips the check.
         host_store=HostStore(db_uri),
         project_store=SqlAlchemyProjectStore(db_uri) if projects else None,
         automations=automations,
-        auth_provider=UnifiedAuthProvider(source="header", local_single_user=local_single_user),
+        auth_provider=(
+            UnifiedAuthProvider(source="header", local_single_user=local_single_user)
+            if auth_enabled
+            else None
+        ),
         feature_flags=resolve_feature_flags(
             {"OMNIGENT_FEATURES": "automations_v2" if persistent else "-automations_v2"}
         ),
@@ -130,8 +139,13 @@ def _build_app(
 
 @pytest.fixture()
 def auth_app(
-    runtime_init: None, db_uri: str, tmp_path: Path, request: pytest.FixtureRequest
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> FastAPI:
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
     app = _build_app(db_uri, tmp_path, persistent=getattr(request, "param", False))
     _make_user(db_uri)
     _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
@@ -3418,3 +3432,391 @@ async def test_concurrent_schedule_edits_reject_stale_validation(
     )
     assert retry.status_code == 400, retry.text
     assert "Minimum interval is 60 minutes" in retry.text
+
+
+@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
+async def test_selected_person_sharing_and_independent_copy(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    execution_target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    _make_user(db_uri, "bob@example.com")
+    source = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            headers=_headers(),
+            json=_create_body(
+                host_id=None,
+                workspace=None,
+                session_mode="continue",
+                max_cost_usd=2.5,
+                execution_target=execution_target,
+            ),
+        )
+    ).json()
+    task_id = source["id"]
+    SqlAlchemyScheduledTaskStore(db_uri).update(task_id, session_id=uuid.uuid4().hex)
+    _seed_run(db_uri, task_id, uuid.uuid4().hex, status="succeeded", conversation_id=None)
+    path = f"/v1/scheduled-tasks/{task_id}"
+    shares = path + "/permissions"
+    bob = _headers("bob@example.com")
+    assert (
+        await auth_client.get(f"/v1/scheduled-tasks/shared/{task_id}", headers=bob)
+    ).status_code == 404
+    granted = await auth_client.put(
+        shares, headers=_headers(), json={"user_id": "bob@example.com"}
+    )
+    assert granted.status_code == 200, granted.text
+    assert (await auth_client.get(shares, headers=_headers())).json() == {
+        "user_ids": ["bob@example.com"]
+    }
+    shared = (await auth_client.get("/v1/scheduled-tasks/shared", headers=bob)).json()[
+        "scheduled_tasks"
+    ]
+    assert [task["id"] for task in shared] == [task_id]
+    definition = (
+        await auth_client.get(f"/v1/scheduled-tasks/shared/{task_id}", headers=bob)
+    ).json()
+    assert definition["prompt"] == source["prompt"]
+    assert definition["max_cost_usd"] == 2.5
+    assert definition["agent_name"] == CLAUDE_NATIVE_AGENT_NAME
+    assert (
+        not {
+            "session_id",
+            "last_run_at",
+            "last_run_conversation_id",
+            "next_run_at",
+            "delegation_ref",
+            "state",
+        }
+        & definition.keys()
+    )
+    for suffix in ("", "/runs", "/permissions"):
+        assert (await auth_client.get(path + suffix, headers=bob)).status_code == 404
+    assert (
+        await auth_client.patch(path, headers=bob, json={"name": "changed"})
+    ).status_code == 404
+    assert (await auth_client.post(path + "/run", headers=bob)).status_code == 404
+    assert (await auth_client.delete(path, headers=bob)).status_code == 404
+    assert (
+        await auth_client.put(shares, headers=bob, json={"user_id": "alice@example.com"})
+    ).status_code == 404
+    assert (
+        await auth_client.get("/v1/scheduled-tasks/shared", headers=_headers("eve@example.com"))
+    ).json() == {"scheduled_tasks": []}
+    copy_body = {
+        key: value
+        for key, value in definition.items()
+        if key in scheduled_tasks_routes.CreateScheduledTaskRequest.model_fields
+    }
+    copy_body["shared_task_id"] = task_id
+    validation = AsyncMock(wraps=scheduled_tasks_routes.validate_session_agent)
+    monkeypatch.setattr(scheduled_tasks_routes, "validate_session_agent", validation)
+    copied = await auth_client.post("/v1/scheduled-tasks", headers=bob, json=copy_body)
+    assert copied.status_code == 200, copied.text
+    validation.assert_awaited_once()
+    assert validation.call_args.kwargs["agent_id"] == source["agent_id"]
+    new = copied.json()
+    assert new["id"] != task_id
+    assert new["owner_user_id"] == "bob@example.com"
+    assert new["agent_id"] == source["agent_id"]
+    assert new["execution_target"] == execution_target
+    assert new["session_id"] is None and new["last_run_at"] is None
+    assert new["session_mode"] == "continue" and new["max_cost_usd"] == 2.5
+    assert (await auth_client.get(f"/v1/scheduled-tasks/{new['id']}/runs", headers=bob)).json()[
+        "runs"
+    ] == []
+    assert (
+        await auth_client.delete(shares + "/bob@example.com", headers=_headers())
+    ).status_code == 200
+    assert (await auth_client.get("/v1/scheduled-tasks/shared", headers=bob)).json() == {
+        "scheduled_tasks": []
+    }
+    assert (
+        await auth_client.get(f"/v1/scheduled-tasks/shared/{task_id}", headers=bob)
+    ).status_code == 404
+    assert (
+        await auth_client.get(f"/v1/scheduled-tasks/{new['id']}", headers=bob)
+    ).status_code == 200
+
+
+async def test_sharing_policy_recipients_and_deleted_sources(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+) -> None:
+    from omnigent.server.auth import SharingMode
+
+    _make_user(db_uri, "bob@example.com")
+    source = (
+        await auth_client.post("/v1/scheduled-tasks", headers=_headers(), json=_create_body())
+    ).json()
+    path = f"/v1/scheduled-tasks/{source['id']}"
+    for recipient in ("__public__", "local", "alice@example.com", "missing@example.com", " "):
+        assert (
+            await auth_client.put(
+                path + "/permissions", headers=_headers(), json={"user_id": recipient}
+            )
+        ).status_code == 400
+    auth_app.state.sharing_mode = lambda: SharingMode.OFF
+    assert (
+        await auth_client.put(
+            path + "/permissions", headers=_headers(), json={"user_id": "bob@example.com"}
+        )
+    ).status_code == 403
+    auth_app.state.sharing_mode = lambda: SharingMode.READ_ONLY
+    assert (
+        await auth_client.put(
+            path + "/permissions", headers=_headers(), json={"user_id": "bob@example.com"}
+        )
+    ).status_code == 200
+    # Copying someone's host pin still goes through ordinary create authorization.
+    definition = (
+        await auth_client.get(
+            f"/v1/scheduled-tasks/shared/{source['id']}", headers=_headers("bob@example.com")
+        )
+    ).json()
+    copy_body = {
+        key: value
+        for key, value in definition.items()
+        if key in scheduled_tasks_routes.CreateScheduledTaskRequest.model_fields
+    }
+    assert (
+        await auth_client.post(
+            "/v1/scheduled-tasks", headers=_headers("bob@example.com"), json=copy_body
+        )
+    ).status_code == 403
+    assert (await auth_client.delete(path, headers=_headers())).status_code == 200
+    assert (
+        await auth_client.get("/v1/scheduled-tasks/shared", headers=_headers("bob@example.com"))
+    ).json() == {"scheduled_tasks": []}
+    assert SqlAlchemyScheduledTaskPermissionStore(db_uri).recipients(source["id"]) == []
+
+
+@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
+@pytest.mark.parametrize("used_in_session", [False, True])
+async def test_shared_custom_agent_copy_is_owned_and_independent(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    tmp_path: Path,
+    execution_target: str,
+    used_in_session: bool,
+) -> None:
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    _make_user(db_uri, "bob@example.com")
+    bob = _headers("bob@example.com")
+    agents = SqlAlchemyAgentStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    bundle = build_agent_bundle(
+        "private-brief",
+        description="Owner's custom instructions",
+        skills=[
+            {
+                "name": "summarize",
+                "description": "Summarize work",
+                "content": "Keep the original rules.",
+            }
+        ],
+        sub_agents=[{"name": "researcher", "description": "Find supporting evidence"}],
+    )
+    installed = await auth_client.post(
+        "/v1/agents",
+        headers=_headers(),
+        files={"bundle": ("bundle.tar.gz", bundle, "application/gzip")},
+    )
+    assert installed.status_code == 200, installed.text
+    agent_id = installed.json()["id"]
+    if used_in_session:
+        session_id = _owned_session(db_uri, agent_id=agent_id)
+        assert agents.get(agent_id).session_id == session_id
+        assert (await auth_client.get(f"/v1/sessions/{session_id}", headers=bob)).status_code in (
+            403,
+            404,
+        )
+    body = _create_body(
+        agent_id=agent_id, host_id=None, workspace=None, execution_target=execution_target
+    )
+    created = await auth_client.post("/v1/scheduled-tasks", headers=_headers(), json=body)
+    assert created.status_code == 200, created.text
+    source_id = created.json()["id"]
+    copy_body = {**body, "shared_task_id": source_id}
+    assert (
+        await auth_client.post("/v1/scheduled-tasks", headers=bob, json=copy_body)
+    ).status_code == 404
+    granted = await auth_client.put(
+        f"/v1/scheduled-tasks/{source_id}/permissions",
+        headers=_headers(),
+        json={"user_id": "bob@example.com"},
+    )
+    assert granted.status_code == 200
+    definition = await auth_client.get(f"/v1/scheduled-tasks/shared/{source_id}", headers=bob)
+    assert definition.status_code == 200
+    assert definition.json()["shared_agent"]["id"] == agent_id
+    assert definition.json()["shared_agent"]["name"] == "private-brief"
+    assert "bundle_location" not in definition.json()["shared_agent"]
+    assert (await auth_client.get(f"/v1/agents/{agent_id}", headers=bob)).status_code == 404
+    assert (
+        await auth_client.post("/v1/scheduled-tasks", headers=bob, json=body)
+    ).status_code == 404
+    assert (
+        await auth_client.post(
+            "/v1/scheduled-tasks", headers=_headers("eve@example.com"), json=copy_body
+        )
+    ).status_code == 404
+
+    unrelated = agents.create_user_agent(
+        uuid.uuid4().hex,
+        "unshared",
+        agents.get(agent_id).bundle_location,
+        owner="alice@example.com",
+    )
+    assert (
+        await auth_client.post(
+            "/v1/scheduled-tasks", headers=bob, json={**copy_body, "agent_id": unrelated.id}
+        )
+    ).status_code == 404
+    assert (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            headers=bob,
+            json={**copy_body, "session_mode": "continue", "session_id": uuid.uuid4().hex},
+        )
+    ).status_code == 422
+
+    before = {path for path in (tmp_path / "artifacts").rglob("*") if path.is_file()}
+    rejected = await auth_client.post(
+        "/v1/scheduled-tasks", headers=bob, json={**copy_body, "project_id": uuid.uuid4().hex}
+    )
+    assert rejected.status_code == 404
+    assert not agents.list_user_agents("bob@example.com").data
+    assert {path for path in (tmp_path / "artifacts").rglob("*") if path.is_file()} == before
+
+    copied = await auth_client.post("/v1/scheduled-tasks", headers=bob, json=copy_body)
+    assert copied.status_code == 200, copied.text
+    new = copied.json()
+    assert new["agent_id"] != agent_id
+    assert new["owner_user_id"] == "bob@example.com"
+    owned = agents.get(new["agent_id"])
+    assert owned is not None and owned.created_by == "bob@example.com" and owned.kind == "user"
+    assert owned.session_id is None
+    assert owned.bundle_location != agents.get(agent_id).bundle_location
+    assert artifacts.get(owned.bundle_location) == bundle
+    assert (await auth_client.get(f"/v1/agents/{owned.id}", headers=bob)).status_code == 200
+    assert len(agents.list_user_agents("bob@example.com").data) == 1
+    assert new["session_id"] is None and new["last_run_at"] is None
+
+    # Reinstalling and removing the owner's bundle cannot change the recipient's snapshot.
+    updated = await auth_client.post(
+        "/v1/agents",
+        headers=_headers(),
+        files={
+            "bundle": (
+                "bundle.tar.gz",
+                build_agent_bundle("private-brief", description="Changed rules"),
+                "application/gzip",
+            )
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert artifacts.get(owned.bundle_location) == bundle
+    await auth_client.delete(
+        f"/v1/scheduled-tasks/{source_id}/permissions/bob@example.com", headers=_headers()
+    )
+    assert (
+        await auth_client.post("/v1/scheduled-tasks", headers=bob, json=copy_body)
+    ).status_code == 404
+    agents.delete(agent_id)
+    assert artifacts.get(owned.bundle_location) == bundle
+    assert (
+        await auth_client.patch(
+            f"/v1/scheduled-tasks/{new['id']}",
+            headers=bob,
+            json={"agent_id": owned.id, "prompt": "My own instructions"},
+        )
+    ).status_code == 200
+
+
+@pytest.mark.parametrize("agent_owner", ["eve@example.com", None])
+async def test_shared_task_preserves_other_owners_session_agent_access(
+    auth_client: httpx.AsyncClient, db_uri: str, tmp_path: Path, agent_owner: str | None
+) -> None:
+    from omnigent.server.auth import LEVEL_READ
+    from omnigent.server.bundles import bundle_location
+
+    _make_user(db_uri, "bob@example.com")
+    agents = SqlAlchemyAgentStore(db_uri)
+    bundle = build_agent_bundle("session-agent")
+    agent_id = uuid.uuid4().hex
+    location = bundle_location(agent_id, bundle)
+    LocalArtifactStore(str(tmp_path / "artifacts")).put(location, bundle)
+    agents.create_user_agent(agent_id, "session-agent", location, owner=agent_owner)
+    session_id = _owned_session(db_uri, agent_id=agent_id)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        headers=_headers(),
+        json=_create_body(agent_id=agent_id, session_mode="continue", session_id=session_id),
+    )
+    assert created.status_code == 200, created.text
+    source_id = created.json()["id"]
+    assert created.json()["agent_id"] == agent_id
+    assert (
+        await auth_client.put(
+            f"/v1/scheduled-tasks/{source_id}/permissions",
+            headers=_headers(),
+            json={"user_id": "bob@example.com"},
+        )
+    ).status_code == 200
+    bob = _headers("bob@example.com")
+    definition = await auth_client.get(f"/v1/scheduled-tasks/shared/{source_id}", headers=bob)
+    assert definition.status_code == 200
+    assert definition.json()["shared_agent"] is None
+    body = _create_body(shared_task_id=source_id, agent_id=agent_id, host_id=None, workspace=None)
+    denied = await auth_client.post("/v1/scheduled-tasks", headers=bob, json=body)
+    assert denied.status_code in (403, 404)
+    assert not agents.list_user_agents("bob@example.com").data
+
+    SqlAlchemyPermissionStore(db_uri).grant("bob@example.com", session_id, LEVEL_READ)
+    copied = await auth_client.post("/v1/scheduled-tasks", headers=bob, json=body)
+    assert copied.status_code == 200, copied.text
+    assert copied.json()["agent_id"] != agent_id
+    assert agents.get(copied.json()["agent_id"]).created_by == "bob@example.com"
+
+
+@pytest.mark.parametrize("auth_enabled", [False, True])
+async def test_sharing_routes_unavailable_without_multi_user_auth(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    mock_llm: ControllableMockClient,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_enabled: bool,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1" if auth_enabled else "0")
+    app = _build_app(db_uri, tmp_path, auth_enabled=auth_enabled, local_single_user=auth_enabled)
+    async with _serve(app, mock_llm, tmp_path) as client:
+        info = await client.get("/v1/info")
+        assert info.json()["scheduled_task_sharing"] is False
+        created = await client.post(
+            "/v1/scheduled-tasks", json=_create_body(host_id=None, workspace=None)
+        )
+        assert created.status_code == 200, created.text
+        task_id = created.json()["id"]
+        for path in (
+            "/v1/scheduled-tasks/shared",
+            f"/v1/scheduled-tasks/shared/{task_id}",
+            f"/v1/scheduled-tasks/{task_id}/permissions",
+        ):
+            assert (await client.get(path)).status_code == 404
+        assert (
+            await client.put(
+                f"/v1/scheduled-tasks/{task_id}/permissions",
+                json={"user_id": "bob@example.com"},
+            )
+        ).status_code == 404
+        assert (
+            await client.delete(f"/v1/scheduled-tasks/{task_id}/permissions/bob@example.com")
+        ).status_code == 404

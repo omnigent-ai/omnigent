@@ -7,6 +7,7 @@
 // row — no patch-in-place gymnastics are needed here.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { USER_AGENTS_QUERY_KEY } from "./useAvailableAgents";
 import {
   createScheduledTask,
   deleteScheduledTask,
@@ -171,8 +172,10 @@ export function useCreateScheduledTask() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (input: CreateScheduledTaskInput) => createScheduledTask(input),
-    onSuccess: () => {
+    onSuccess: (_task, input) => {
       void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+      if (input.sharedTaskId)
+        void queryClient.invalidateQueries({ queryKey: USER_AGENTS_QUERY_KEY });
     },
   });
 }
