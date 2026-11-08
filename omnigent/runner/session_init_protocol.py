@@ -54,6 +54,9 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # Resume an interrupted child task in its existing native session.
     resume_interrupted_turn: bool = False
     recovery_id: str | None = None
+    # The relay lets a pane-inferred status only annotate a running turn; an older
+    # server would let it reopen one a hook just closed.
+    accepts_inferred_status: bool = False
 
 
 def build_runner_session_init_payload(
@@ -78,6 +81,7 @@ def build_runner_session_init_payload(
         suppress_recovery_turn=suppress_recovery_turn,
         resume_interrupted_turn=resume_interrupted_turn,
         recovery_id=(recovery_id or uuid4().hex) if resume_interrupted_turn else None,
+        accepts_inferred_status=True,
         snapshot=RunnerSessionInitSnapshot(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,
