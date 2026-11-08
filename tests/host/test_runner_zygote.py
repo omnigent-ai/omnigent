@@ -9,26 +9,35 @@ daemon's Popen fallback are all covered.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import importlib.util
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import Mock
 
+import psutil
 import pytest
 
 import omnigent
+from omnigent.host.connect import HostProcess
+from omnigent.host.identity import HostIdentity
 from omnigent.host.runner_zygote import (
     _ZYGOTE_LOST_EXIT_CODE,
     ZygoteManager,
     ZygoteRunnerProc,
     ZygoteUnavailable,
 )
+from omnigent.inner import _proc
 from omnigent.runner import _zygote
 from omnigent.runner._zygote import (
     _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR,
@@ -88,6 +97,72 @@ def _wait_exit(proc: ZygoteRunnerProc, timeout: float = 10.0) -> int:
             return code
         time.sleep(0.05)
     raise AssertionError("forked runner did not exit in time")
+
+
+@pytest.mark.parametrize("pong", [True, False], ids=["ready", "failed-start"])
+def test_concurrent_start_waits_for_initial_ping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pong: bool
+) -> None:
+    """Prewarming and launching must agree on whether startup actually succeeded."""
+    # A scripted subprocess covers a refused ping without importing the runner.
+    executable = tmp_path / "delayed-zygote"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import os, socket\n"
+        "sock = socket.socket(fileno=int(os.environ['OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD']))\n"
+        "sock.recv(4096)\n"
+        f"sock.sendall({(json.dumps({'pong': pong}) + chr(10)).encode()!r})\n"
+        "while sock.recv(4096):\n"
+        "    pass\n"
+    )
+    executable.chmod(0o700)
+    manager = ZygoteManager(python_executable=str(executable), log_path=tmp_path / "zygote.log")
+    first_unlock = threading.Event()
+    continue_start = threading.Event()
+    control_lock = manager._lock
+
+    class PauseFirstUnlock:
+        """Force the competing start into the first control-lock release window."""
+
+        paused = False
+
+        def __enter__(self):
+            control_lock.acquire()
+
+        def __exit__(self, *_exc):
+            pause = not self.paused
+            self.paused = True
+            control_lock.release()
+            if pause:
+                first_unlock.set()
+                assert continue_start.wait(timeout=10)
+
+    monkeypatch.setattr(manager, "_lock", PauseFirstUnlock())
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(manager.start)
+        try:
+            assert first_unlock.wait(timeout=5)
+            second_entered = threading.Event()
+
+            def start_again() -> None:
+                second_entered.set()
+                manager.start()
+
+            second = pool.submit(start_again)
+            assert second_entered.wait(timeout=5)
+            with pytest.raises(TimeoutError):
+                second.result(timeout=0.05)
+            continue_start.set()
+            for started in (first, second):
+                if pong:
+                    started.result(timeout=5)
+                else:
+                    with pytest.raises(ZygoteUnavailable, match="did not answer ping"):
+                        started.result(timeout=5)
+            assert manager.is_running() is pong
+        finally:
+            continue_start.set()
+            manager.stop()
 
 
 def test_import_graph_is_single_threaded() -> None:
@@ -218,6 +293,98 @@ def test_failed_deferred_preload_does_not_stop_the_zygote(monkeypatch) -> None:
     monkeypatch.setattr(builtins, "__import__", _failing_import)
 
     _zygote._import_deferred_graph()  # must not raise
+
+
+def test_threaded_deferred_preload_preserves_children_and_refuses_new_forks(
+    tmp_path: Path,
+) -> None:
+    """Optional preload must not orphan existing runners when it becomes unsafe to fork."""
+    marker = tmp_path / "preloaded"
+    script = "\n".join(
+        [
+            "import os, socket, threading",
+            "from pathlib import Path",
+            "from omnigent.runner import _zygote as z",
+            "z._import_runner_graph()",
+            "z._exit_unless_single_threaded()",
+            "def preload_with_thread():",
+            "    stop = threading.Event()",
+            "    threading.Thread(target=stop.wait, name='optional-preload-worker', "
+            "daemon=True).start()",
+            f"    Path({str(marker)!r}).write_text(str(next(iter(server._live))))",
+            # The real server is the subject; the optional import is the fault boundary.
+            "z._import_deferred_graph = preload_with_thread",
+            "sock = socket.socket(fileno=int(os.environ[z.ZYGOTE_CONTROL_FD_ENV_VAR]))",
+            "server = z._ZygoteServer(sock)",
+            "server.serve()",
+        ]
+    )
+    client, server = socket.socketpair()
+    client.settimeout(10)
+    requests = [
+        {"cmd": "ping"},
+        {
+            "cmd": "fork",
+            "env": _sleep_env(60),
+            "cwd": str(tmp_path),
+            "log_path": str(tmp_path / "runner.log"),
+        },
+    ]
+    # Queue both requests before startup so a child exists before deferred loading.
+    client.sendall(b"".join(json.dumps(r).encode() + b"\n" for r in requests))
+    parent = subprocess.Popen(
+        [sys.executable, "-c", script],
+        env={**os.environ, _zygote.ZYGOTE_CONTROL_FD_ENV_VAR: str(server.fileno())},
+        pass_fds=(server.fileno(),),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    server.close()
+    replies = client.makefile("rb")
+    child_pid = None
+    child_reaped = False
+
+    def exchange(request: dict) -> dict:
+        client.sendall(json.dumps(request).encode() + b"\n")
+        line = replies.readline()
+        assert line, "forkserver exited while an existing runner still depended on it"
+        return json.loads(line)
+
+    try:
+        assert json.loads(replies.readline()) == {"pong": True}
+        child_pid = json.loads(replies.readline())["pid"]
+        deadline = time.monotonic() + 10
+        while not marker.exists():
+            assert time.monotonic() < deadline, "optional preload did not run"
+            time.sleep(0.01)
+        assert exchange({"cmd": "ping"}) == {"pong": True}
+        assert parent.poll() is None
+        assert exchange({"cmd": "poll", "pid": child_pid}) == {"returncode": None}
+        for command in ["fork", "fork_harness"]:
+            reply = exchange({"cmd": command, "env": _fork_env(0), "cwd": str(tmp_path)})
+            assert "single-threaded" in reply["error"]
+            assert "pid" not in reply
+        os.kill(child_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while (reply := exchange({"cmd": "poll", "pid": child_pid}))["returncode"] is None:
+            assert time.monotonic() < deadline, "existing child was not reaped"
+            time.sleep(0.01)
+        child_reaped = True
+        assert reply == {"returncode": -signal.SIGKILL}
+    finally:
+        if not child_reaped and child_pid is None and marker.exists():
+            child_pid = int(marker.read_text())
+        if not child_reaped and child_pid is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGKILL)
+        replies.close()
+        client.close()
+        try:
+            parent.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            parent.kill()
+            parent.wait(timeout=5)
 
 
 def test_manager_starts_and_pings(manager: ZygoteManager) -> None:
@@ -378,6 +545,120 @@ def test_signal_of_exited_runner_is_a_safe_noop(manager: ZygoteManager, tmp_path
     proc.kill()
 
 
+def test_stop_forked_runner_does_not_wait_for_control_lock(
+    manager: ZygoteManager, tmp_path: Path
+) -> None:
+    """Stopping a runner must not join another forkserver control exchange."""
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    try:
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            with manager._lock:
+                stopped = workers.submit(HostProcess._stop_runner_proc, proc)
+                stopped.result(timeout=2)
+                assert not _proc.process_alive(proc.pid)
+                assert proc.returncode is None
+        assert _wait_exit(proc) == -signal.SIGTERM
+    finally:
+        proc.kill()
+        _wait_exit(proc)
+
+
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_stop_forked_runner_waits_for_exit_without_consuming_its_status(ignore_term: bool) -> None:
+    """The OS wait must handle zombies and escalate a runner ignoring TERM."""
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, sys; "
+            + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if ignore_term else "")
+            + "print('ready', flush=True); sys.stdin.buffer.read()",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline() == b"ready\n"
+        proc = ZygoteRunnerProc(child.pid, ZygoteManager())
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            stopped = workers.submit(HostProcess._stop_runner_proc, proc)
+            stopped.result(timeout=8)
+        assert not _proc.process_alive(child.pid)
+        assert proc.returncode is None
+        assert child.wait(timeout=1) == -(signal.SIGKILL if ignore_term else signal.SIGTERM)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+        if child.stdin is not None:
+            child.stdin.close()
+        if child.stdout is not None:
+            child.stdout.close()
+
+
+def test_stop_forked_runner_preserves_cached_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc = ZygoteRunnerProc(os.getpid(), ZygoteManager())
+    proc.returncode = 7
+    monkeypatch.setattr("psutil.Process.terminate", lambda _self: pytest.fail("already exited"))
+
+    HostProcess._stop_runner_proc(proc)
+
+    assert proc.returncode == 7
+
+
+@pytest.mark.parametrize("already_gone", [False, True], ids=["reused", "gone-before-handle"])
+def test_stop_forked_runner_does_not_signal_a_missing_identity(
+    monkeypatch: pytest.MonkeyPatch, already_gone: bool
+) -> None:
+    original_process = Mock()
+    original_process.is_running.return_value = False
+    process_factory = Mock(return_value=original_process)
+    if already_gone:
+        process_factory.side_effect = psutil.NoSuchProcess(123)
+    monkeypatch.setattr("psutil.Process", process_factory)
+    proc = ZygoteRunnerProc(123, ZygoteManager())
+    process_factory.side_effect = AssertionError("must not recapture a recycled PID")
+
+    HostProcess._stop_runner_proc(proc)
+
+    original_process.terminate.assert_not_called()
+    original_process.kill.assert_not_called()
+    assert proc.returncode is None
+
+
+def test_stop_forked_runner_reports_a_signal_permission_failure(
+    monkeypatch: pytest.MonkeyPatch, managed_child
+) -> None:
+    manager, child = managed_child
+    proc = ZygoteRunnerProc(child.pid, manager)
+    monkeypatch.setattr(
+        "psutil.Process.terminate", Mock(side_effect=psutil.AccessDenied(proc.pid))
+    )
+
+    with pytest.raises(psutil.AccessDenied):
+        HostProcess._stop_runner_proc(proc)
+
+
+@pytest.mark.asyncio
+async def test_abandoned_forked_spawn_consumes_its_exit_status(
+    manager: ZygoteManager, tmp_path: Path
+) -> None:
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    host = HostProcess(
+        identity=HostIdentity(host_id="host-abandoned", name="test"),
+        server_url="http://localhost:8000",
+    )
+    spawn = asyncio.get_running_loop().create_future()
+    spawn.set_result((proc, tmp_path / "runner.log"))
+    try:
+        await host._stop_abandoned_spawn(spawn)
+        assert proc.returncode == -signal.SIGTERM
+        assert not _proc.process_alive(proc.pid)
+        assert manager.poll(proc.pid) is None
+    finally:
+        proc.kill()
+
+
 def test_poll_after_stop_reports_live_runner_as_none(manager: ZygoteManager, tmp_path) -> None:
     """A still-live runner polls as None once the zygote is stopped.
 
@@ -396,6 +677,109 @@ def test_poll_after_stop_reports_live_runner_as_none(manager: ZygoteManager, tmp
         proc.kill()
 
 
+@pytest.mark.parametrize("exit_before_restart", [False, True])
+def test_old_runner_exit_is_detected_after_zygote_restart(
+    manager: ZygoteManager, tmp_path: Path, exit_before_restart: bool
+) -> None:
+    """A new forkserver cannot supply exit status for the old one's children."""
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "old.log"), str(tmp_path))
+    manager.stop()
+    try:
+        if exit_before_restart:
+            proc.kill()
+        manager.start()
+        if not exit_before_restart:
+            assert proc.poll() is None
+            proc.kill()
+
+        deadline = time.monotonic() + 10
+        while _proc.process_alive(proc.pid):
+            assert time.monotonic() < deadline, "old runner did not exit"
+            time.sleep(0.01)
+        assert proc.poll() == _ZYGOTE_LOST_EXIT_CODE
+        assert proc.wait(timeout=1) == _ZYGOTE_LOST_EXIT_CODE
+
+        fresh = manager.fork_runner(_fork_env(7), str(tmp_path / "new.log"), str(tmp_path))
+        assert _wait_exit(fresh) == 7
+    finally:
+        proc.kill()
+
+
+def test_cached_runner_exit_survives_zygote_restart(manager: ZygoteManager, tmp_path) -> None:
+    proc = manager.fork_runner(_fork_env(3), str(tmp_path / "old.log"), str(tmp_path))
+    assert _wait_exit(proc) == 3
+    manager.stop()
+    manager.start()
+    assert proc.poll() == 3
+
+
+@pytest.mark.parametrize("actual_exit", [0, 7, -signal.SIGTERM])
+def test_concurrent_poll_preserves_known_exit(
+    monkeypatch: pytest.MonkeyPatch, actual_exit: int
+) -> None:
+    """A late unavailable-control fallback cannot replace a real exit reply."""
+    monkeypatch.setattr(psutil, "Process", Mock(return_value=Mock()))
+    manager = ZygoteManager()
+    proc = ZygoteRunnerProc(123, manager)
+    actual_reply_ready = threading.Event()
+    release_actual_reply = threading.Event()
+    second_poll_ready = threading.Event()
+    release_fallback = threading.Event()
+    poll_lock = getattr(proc, "_poll_lock", threading.Lock())
+    exchanges: list[str] = []
+
+    class ObservePollLock:
+        def __enter__(self):
+            if not poll_lock.acquire(blocking=False):
+                second_poll_ready.set()
+                poll_lock.acquire()
+
+        def __exit__(self, *_exc):
+            poll_lock.release()
+
+    class PausedExitReply(dict):
+        def get(self, key, default=None):
+            # The manager's exchange lock has already been released here.
+            actual_reply_ready.set()
+            assert release_actual_reply.wait(timeout=5)
+            return super().get(key, default)
+
+    def exchange(request, *, zygote_generation=None):
+        with manager._lock:
+            exchanges.append(request["cmd"])
+            if len(exchanges) == 1:
+                return PausedExitReply(returncode=actual_exit)
+            raise ZygoteUnavailable("control lost after the real exit reply")
+
+    def runner_alive(pid):
+        assert pid == 123
+        second_poll_ready.set()
+        assert release_fallback.wait(timeout=5)
+        return False
+
+    # The lock observation and fallback provide the same barrier on old/new code.
+    monkeypatch.setattr(proc, "_poll_lock", ObservePollLock(), raising=False)
+    monkeypatch.setattr(manager, "_exchange", exchange)
+    monkeypatch.setattr(_proc, "process_alive", runner_alive)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        try:
+            first = workers.submit(proc.poll)
+            assert actual_reply_ready.wait(timeout=5)
+            second = workers.submit(proc.poll)
+            assert second_poll_ready.wait(timeout=5)
+            release_actual_reply.set()
+            assert first.result(timeout=5) == actual_exit
+            assert proc.returncode == actual_exit
+            release_fallback.set()
+
+            assert second.result(timeout=5) == actual_exit
+            assert proc.returncode == actual_exit
+            assert exchanges == ["poll"]
+        finally:
+            release_actual_reply.set()
+            release_fallback.set()
+
+
 def test_fork_after_stop_raises_unavailable(manager: ZygoteManager, tmp_path) -> None:
     """Forking after stop() raises ZygoteUnavailable so the daemon can fall back.
 
@@ -405,6 +789,95 @@ def test_fork_after_stop_raises_unavailable(manager: ZygoteManager, tmp_path) ->
     manager.stop()
     with pytest.raises(ZygoteUnavailable):
         manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"), str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("initial_reply", "late_reply"),
+    [
+        (b"", b'{"pid":123456}\n'),
+        (b'{"pid":', b"123456}\n"),
+        (b"invalid\n", b'{"pid":123456}\n'),
+        (b"[]\n", b'{"pid":123456}\n'),
+        (b"\xff\n", b'{"pid":123456}\n'),
+    ],
+    ids=["timeout", "partial-timeout", "malformed", "non-object", "invalid-utf8"],
+)
+def test_failed_control_channel_never_assigns_a_late_reply(
+    tmp_path: Path, initial_reply: bytes, late_reply: bytes
+) -> None:
+    """A concurrent launch must not receive an earlier fork's delayed PID."""
+    client, peer = socket.socketpair()
+    manager = ZygoteManager()
+    manager._sock = client
+    client.settimeout(0.02)
+    try:
+        peer.sendall(initial_reply)
+        with pytest.raises(ZygoteUnavailable):
+            manager.fork_runner(_fork_env(0), str(tmp_path / "first.log"), str(tmp_path))
+        assert json.loads(peer.recv(65536))["cmd"] == "fork"
+        peer.sendall(late_reply)
+
+        with pytest.raises(ZygoteUnavailable):
+            manager.fork_runner(_fork_env(0), str(tmp_path / "second.log"), str(tmp_path))
+        peer.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            peer.recv(1)
+        assert client.fileno() >= 0
+    finally:
+        manager.stop()
+        peer.close()
+
+
+def test_failed_control_channel_preserves_live_children(
+    manager: ZygoteManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Losing control replies cannot stop the shared parent or fail live runners."""
+    child = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    original_socket = manager._sock
+    try:
+        with monkeypatch.context() as fault:
+
+            def timeout(_socket: socket.socket) -> dict[str, object]:
+                raise TimeoutError("control reply timed out")
+
+            fault.setattr(manager, "_read_reply", timeout)
+            assert child.poll() is None
+
+        assert manager._sock is original_socket
+        assert original_socket is not None and original_socket.fileno() >= 0
+        assert manager.is_running()
+        assert _proc.process_alive(child.pid)
+        assert child.poll() is None
+        with pytest.raises(ZygoteUnavailable):
+            manager.start()
+        child.kill()
+        assert _wait_exit(child) == _ZYGOTE_LOST_EXIT_CODE
+        manager.stop()
+        manager.start()
+        fresh = manager.fork_runner(_fork_env(7), str(tmp_path / "fresh.log"), str(tmp_path))
+        assert _wait_exit(fresh) == 7
+    finally:
+        child.kill()
+
+
+def test_fork_refusal_keeps_control_channel_usable(tmp_path: Path) -> None:
+    """A complete refusal reply leaves later fork replies aligned."""
+    client, peer = socket.socketpair()
+    manager = ZygoteManager()
+    manager._sock = client
+    client.settimeout(1)
+    try:
+        peer.sendall(b'{"error":"fork refused"}\n')
+        with pytest.raises(ZygoteUnavailable, match="fork refused"):
+            manager.fork_runner(_fork_env(0), str(tmp_path / "first.log"), str(tmp_path))
+        assert json.loads(peer.recv(65536))["cmd"] == "fork"
+        peer.sendall(b'{"pid":123456}\n')
+        child = manager.fork_runner(_fork_env(0), str(tmp_path / "second.log"), str(tmp_path))
+        assert child.pid == 123456
+        assert json.loads(peer.recv(65536))["cmd"] == "fork"
+    finally:
+        manager.stop()
+        peer.close()
 
 
 def test_child_env_is_isolated_between_forks(manager: ZygoteManager, tmp_path) -> None:
@@ -451,6 +924,23 @@ def test_forked_runner_runs_in_the_requested_workspace(manager: ZygoteManager, t
     assert _wait_exit(proc) == 0
 
     assert f"cwd={workspace.resolve()}\n" in log.read_text()
+
+
+def test_runner_setup_failure_lands_in_the_runner_log(manager: ZygoteManager, tmp_path) -> None:
+    """A child that fails before the runner starts writes the cause to its own log.
+
+    The host's exit report reads only the runner log, so a setup failure such
+    as a vanished workspace must not leave that log empty.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the child's log.
+    """
+    log = tmp_path / "runner.log"
+
+    proc = manager.fork_runner(_fork_env(0), str(log), str(tmp_path / "gone"))
+
+    assert _wait_exit(proc) == 1
+    assert "FileNotFoundError" in log.read_text()
 
 
 def test_stale_payload_tty_fd_is_cleared_in_child(manager: ZygoteManager, tmp_path) -> None:
@@ -504,6 +994,29 @@ def test_malloc_tuning_is_applied_at_the_zygote_exec(monkeypatch, tmp_path) -> N
 
     assert captured["MALLOC_ARENA_MAX"] == "2"
     assert captured["MALLOC_TRIM_THRESHOLD_"] == "134217728"
+
+
+def test_zygote_exec_starts_its_own_session(monkeypatch, tmp_path) -> None:
+    """The zygote, and so every runner and harness it forks, leaves the daemon's session.
+
+    A hangup of the daemon's terminal would otherwise reach them mid-turn.
+
+    :param monkeypatch: Fixture used to stub the zygote's Popen.
+    :param tmp_path: Temp dir for the zygote log path.
+    """
+    captured: dict[str, object] = {}
+
+    class _FakePopen:
+        pid = 4321
+
+        def __init__(self, argv, env, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    mgr = ZygoteManager(log_path=tmp_path / "zygote.log")
+    mgr._spawn_zygote_process(child_fd=7)
+
+    assert captured["start_new_session"] is True
 
 
 def test_operator_malloc_override_wins_at_the_zygote_exec(monkeypatch, tmp_path) -> None:

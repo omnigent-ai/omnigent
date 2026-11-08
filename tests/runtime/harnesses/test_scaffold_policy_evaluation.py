@@ -283,3 +283,54 @@ def test_policy_verdict_payload_defaults() -> None:
     assert payload.action == "POLICY_ACTION_ALLOW"
     assert payload.reason is None
     assert payload.data is None
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("phase", ["PHASE_LLM_RESPONSE", "PHASE_TOOL_RESULT"])
+async def test_evaluate_policy_ungated_phase_lost_verdict_fails_open_quickly(
+    _turn_ctx: TurnContext,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    """A lost verdict for a phase that never waits on a human does not stall the turn.
+
+    Only TOOL_CALL / LLM_REQUEST / REQUEST can park server-side on an ASK, so
+    the other phases get the short ungated budget instead of the one-day
+    human-wait budget, and they must not hold the idle watchdog open.
+    """
+    import omnigent.runtime.harnesses._scaffold as _scaffold_mod
+
+    monkeypatch.setattr(_scaffold_mod, "_UNGATED_POLICY_EVAL_TIMEOUT_S", 0.05)
+    assert _scaffold_mod._POLICY_EVAL_TIMEOUT_S >= 3600
+
+    ctx = _turn_ctx
+    task = asyncio.create_task(ctx.evaluate_policy(f"poleval_lost_{phase}", phase, {}))
+    await asyncio.sleep(0)
+    assert ctx._pending_human_waits == 0, "ungated phases must not hold the idle watchdog"
+
+    result = await asyncio.wait_for(task, timeout=5)
+    assert result.action == "POLICY_ACTION_ALLOW"
+    assert not ctx._pending_policy_evaluations
+
+
+@pytest.mark.asyncio()
+async def test_evaluate_policy_human_gated_phase_keeps_long_wait(
+    _turn_ctx: TurnContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TOOL_CALL can park on a human ASK, so it keeps the full budget and holds the watchdog."""
+    import omnigent.runtime.harnesses._scaffold as _scaffold_mod
+
+    monkeypatch.setattr(_scaffold_mod, "_UNGATED_POLICY_EVAL_TIMEOUT_S", 0.05)
+
+    ctx = _turn_ctx
+    task = asyncio.create_task(ctx.evaluate_policy("poleval_gated", "PHASE_TOOL_CALL", {}))
+    await asyncio.sleep(0.2)
+    assert not task.done(), "a human-gated evaluation must outlive the ungated budget"
+    assert ctx._pending_human_waits == 1
+
+    ctx._complete_policy_evaluation(
+        "poleval_gated", _scaffold_mod.PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+    )
+    assert (await task).action == "POLICY_ACTION_ALLOW"
+    assert ctx._pending_human_waits == 0

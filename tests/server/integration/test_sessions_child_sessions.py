@@ -23,22 +23,25 @@ import io
 import json
 import re
 import tarfile
+import threading
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
 import httpx
 import pytest
 import yaml
+from fastapi import FastAPI
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.runtime import session_stream
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
-from tests.server.helpers import build_agent_bundle, create_test_agent
+from tests.server.helpers import build_agent_bundle, create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
 
@@ -220,6 +223,8 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     # No outstanding elicitations → 0 (the index is empty for a freshly
     # seeded child that never published an elicitation_request).
     assert row["pending_elicitations_count"] == 0
+    # Set only by ``?descendants=true``; clients use it to tell the modes apart.
+    assert row["depth"] is None
 
 
 async def test_child_sessions_surfaces_durable_failure_error(
@@ -361,6 +366,91 @@ async def test_parent_session_snapshot_replays_child_pending_elicitation(
     assert prompts[0]["elicitation_id"] == "elicit_child_q1"
     assert prompts[0]["params"]["message"] == "Approve child command"
     assert prompts[0]["params"]["target_session_id"] == child.id
+
+
+async def test_late_ancestor_mirror_keeps_child_current_elicitation(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mirror that ran late on its thread must not revert or revive the parent card."""
+    from omnigent.runtime import pending_elicitations
+
+    session = await _create_parent_session(client, agent_name="late-ancestor-mirror")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="kiro:approval",
+        agent_id=session["agent_id"],
+    )
+
+    def request(state: str) -> dict[str, Any]:
+        return {
+            "type": "response.elicitation_request",
+            "elicitation_id": "elicit_child_q1",
+            "params": {"mode": "form", "message": "Approve", "native_delivery": {"state": state}},
+        }
+
+    pending_elicitations.record_publish(child.id, request("ready"))
+    pending_elicitations.record_publish(child.id, request("sending"))
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("sending")
+    )
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("ready")
+    )
+    _, mirrored = pending_elicitations.lookup("elicit_child_q1", conversation_id=session["id"])
+    assert mirrored["params"]["native_delivery"] == {"state": "sending"}
+    assert mirrored["params"]["target_session_id"] == child.id
+
+    pending_elicitations.resolve(child.id, "elicit_child_q1")
+    sessions_module._publish_elicitation_resolved_to_ancestors(
+        conv_store, child.id, "elicit_child_q1"
+    )
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("ready")
+    )
+    assert pending_elicitations.count_for(session["id"]) == 0
+
+    # A late resolved mirror must not clear a card the child asked again.
+    pending_elicitations.record_publish(child.id, request("ready"))
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("ready")
+    )
+    sessions_module._publish_elicitation_resolved_to_ancestors(
+        conv_store, child.id, "elicit_child_q1"
+    )
+    assert pending_elicitations.count_for(session["id"]) == 1
+
+    # A resolution that lands while a request mirror is publishing still wins.
+    original_publish = session_stream.publish
+    entered, release = threading.Event(), threading.Event()
+
+    def paused_publish(conversation_id: str, event: dict[str, Any]) -> int:
+        if conversation_id == session["id"] and event["type"] == "response.elicitation_request":
+            entered.set()
+            assert release.wait(5)
+        return original_publish(conversation_id, event)
+
+    monkeypatch.setattr(session_stream, "publish", paused_publish)
+    request_mirror = threading.Thread(
+        target=sessions_module._publish_elicitation_request_to_ancestors,
+        args=(conv_store, child.id, request("ready")),
+    )
+    request_mirror.start()
+    assert entered.wait(5)
+    pending_elicitations.resolve(child.id, "elicit_child_q1")
+    resolved_mirror = threading.Thread(
+        target=sessions_module._publish_elicitation_resolved_to_ancestors,
+        args=(conv_store, child.id, "elicit_child_q1"),
+    )
+    resolved_mirror.start()
+    resolved_mirror.join(0.2)
+    release.set()
+    request_mirror.join(5)
+    resolved_mirror.join(5)
+    assert pending_elicitations.count_for(session["id"]) == 0
 
 
 async def test_child_sessions_zero_pending_when_index_empty(
@@ -1619,6 +1709,10 @@ async def test_native_subagent_message_uses_native_terminal_forward(
     assert re.fullmatch(r"[0-9a-f]{32}", forwarded_event["delivery_attempt_id"])
     assert isinstance(forwarded_event["input_enqueued_at_ms"], int)
     assert forwarded_event["input_enqueued_at_ms"] > 0
+    from omnigent.runtime import get_agent_store
+
+    parent_agent = get_agent_store().get(parent["agent_id"])
+    assert parent_agent is not None
     assert forwarded == [
         {
             "path": f"/v1/sessions/{child['id']}/resources/terminals",
@@ -1638,6 +1732,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "model": expected_model,
                 "harness": harness,
                 "agent_id": parent["agent_id"],
+                "agent_revision": parent_agent.bundle_location,
                 "pending_id": message_body["pending_id"],
                 "delivery_attempt_id": forwarded_event["delivery_attempt_id"],
                 "input_enqueued_at_ms": forwarded_event["input_enqueued_at_ms"],
@@ -1813,6 +1908,160 @@ async def _create_native_child(client: httpx.AsyncClient, name: str) -> dict[str
     )
     assert child_resp.status_code == 201, child_resp.text
     return child_resp.json()
+
+
+@pytest.mark.parametrize(
+    "effort,reset_model", [("max", "default"), ("default", "off"), (None, "reset")]
+)
+async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    effort: str | None,
+    reset_model: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.side_chat import (
+        CAP_SIDE_CHAT_SETTINGS,
+        EFFORT_RESET_LABEL,
+    )
+    from omnigent.server.routes._sessions.orchestration import _forward_codex_side_chat_turn
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.server.schemas import SessionEventInput
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    register_test_runner(app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS])
+    # The runner advertises a handshake but has no HTTP service in this test.
+    monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+
+    parent = await _create_parent_session(client, agent_name="side-settings")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(parent["id"], {"omnigent.wrapper": "codex-native-ui"})
+    store.update_conversation(
+        parent["id"],
+        model_override="gpt-5.5",
+        reported_model="gpt-5.6-luna",
+        reasoning_effort="high" if effort is not None else None,
+    )
+    store.set_runner_id(parent["id"], "runner_parent")
+    created = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread-side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert created.status_code == 202, created.text
+    child_id = created.json()["child_session_id"]
+    child = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert child["side_chat_settings_supported"] is True
+    assert child["model_override"] == "gpt-5.6-luna"
+    initial_runner = AsyncMock(spec=httpx.AsyncClient)
+    initial_runner.post.return_value = httpx.Response(202)
+    await _forward_codex_side_chat_turn(
+        store.get_conversation(child_id),
+        SessionEventInput(type="message", data={"content": "Untouched follow-up"}),
+        initial_runner,
+    )
+    assert initial_runner.post.call_args.kwargs["json"]["model_override"] == "gpt-5.6-luna"
+    assert child["reasoning_effort"] == ("high" if effort is not None else None)
+    store.update_conversation(parent["id"], model_override="gpt-5.6-luna", reasoning_effort="low")
+    parent_before = store.get_conversation(parent["id"])
+    assert parent_before is not None
+
+    async def no_terminal_change(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("A side-thread setting must not drive a terminal")
+
+    monkeypatch.setattr(routes_core, "_forward_session_change_to_runner", no_terminal_change)
+    saved_effort = None if effort == "default" else effort
+    response = await client.patch(
+        f"/v1/sessions/{child['id']}",
+        json={
+            "model_override": "gpt-6-sol",
+            **({"reasoning_effort": effort} if effort is not None else {}),
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["model_override"] == "gpt-6-sol"
+    assert response.json()["reasoning_effort"] == saved_effort
+    assert response.json()["side_chat_settings_supported"] is True
+    refused_reset = await client.patch(
+        f"/v1/sessions/{child_id}",
+        json={"model_override": reset_model, "reasoning_effort": "low"},
+    )
+    assert refused_reset.status_code == 400, refused_reset.text
+    assert "Choose a specific model" in refused_reset.text
+    after_reset = store.get_conversation(child_id)
+    assert after_reset.model_override == "gpt-6-sol"
+    assert after_reset.reasoning_effort == saved_effort
+    original_upsert = sqlalchemy_store._upsert_labels
+
+    def fail_label_write(*args: Any, **kwargs: Any) -> None:
+        original_upsert(*args, **kwargs)
+        raise RuntimeError("label persistence failed")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(sqlalchemy_store, "_upsert_labels", fail_label_write)
+        with pytest.raises(RuntimeError, match="label persistence failed"):
+            await client.patch(
+                f"/v1/sessions/{child_id}",
+                json={
+                    "model_override": "gpt-5.5",
+                    "reasoning_effort": "low" if effort == "default" else "default",
+                },
+            )
+    after_failure = store.get_conversation(child_id)
+    assert after_failure.model_override == after_reset.model_override
+    assert after_failure.reasoning_effort == after_reset.reasoning_effort
+    assert after_failure.labels == after_reset.labels
+    assert after_failure.labels.get(EFFORT_RESET_LABEL) == (
+        "true" if effort == "default" else "false" if effort is not None else None
+    )
+    repeated = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread-side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert repeated.json()["child_session_id"] == child_id
+    saved = store.get_conversation(child["id"])
+    assert saved is not None
+    forwarded = []
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/v1/sessions/{child['parent_session_id']}/events"
+        forwarded.append(json.loads(request.content))
+        return httpx.Response(202)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(capture), base_url="http://runner"
+    ) as runner:
+        await _forward_codex_side_chat_turn(
+            saved,
+            SessionEventInput(
+                type="message",
+                data={
+                    "content": [{"type": "input_text", "text": "Follow up"}],
+                },
+            ),
+            runner,
+        )
+    assert forwarded == [
+        {
+            "type": "message",
+            "content": [{"type": "input_text", "text": "Follow up"}],
+            "codex_side_thread_id": "thread-side",
+            "model_override": "gpt-6-sol",
+            **({"reasoning_effort": saved_effort} if effort is not None else {}),
+        }
+    ]
+    parent_after = store.get_conversation(child["parent_session_id"])
+    assert parent_after is not None
+    assert parent_after.model_override == parent_before.model_override
+    assert parent_after.reasoning_effort == parent_before.reasoning_effort
 
 
 async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale(
@@ -2342,3 +2591,341 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
     assert child_ids == {child.id}, (
         f"parent's children must be exactly the untouched source, got {child_ids}"
     )
+
+
+@pytest.mark.parametrize("runner_state", ["current", "old", "offline"])
+async def test_side_chat_settings_support_follows_parent_runner_handshake(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_state: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
+
+    registry = app.state.tunnel_registry
+    monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+    supported = runner_state == "current"
+    if runner_state != "offline":
+        register_test_runner(
+            app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS] if supported else []
+        )
+    register_test_runner(
+        app, "runner_stale", capabilities=[] if supported else [CAP_SIDE_CHAT_SETTINGS]
+    )
+    parent = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(parent["id"], {"omnigent.wrapper": "codex-native-ui"})
+    store.set_runner_id(parent["id"], "runner_parent")
+    child = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {
+                "thread_id": "side-thread",
+                "agent_nickname": "Side chat",
+            },
+        },
+    )
+    assert child.status_code == 202, child.text
+    child_id = child.json()["child_session_id"]
+    store.set_runner_id(child_id, "runner_stale")
+    response = await client.get(f"/v1/sessions/{child_id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["side_chat_settings_supported"] is supported
+    assert (await client.get(f"/v1/sessions/{parent['id']}")).json()[
+        "side_chat_settings_supported"
+    ] is False
+    if supported:
+        registry.deregister("runner_parent", retire=False)
+        assert (await client.get(f"/v1/sessions/{child_id}")).json()[
+            "side_chat_settings_supported"
+        ] is False
+        register_test_runner(app, "runner_parent")
+    refused = await client.patch(f"/v1/sessions/{child_id}", json={"reasoning_effort": "low"})
+    assert refused.status_code == 503, refused.text
+    assert store.get_conversation(child_id).reasoning_effort is None
+    register_test_runner(app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS])
+    recovered = await client.patch(f"/v1/sessions/{child_id}", json={"reasoning_effort": "low"})
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["side_chat_settings_supported"] is True
+    assert recovered.json()["reasoning_effort"] == "low"
+
+
+# ── ?descendants=true ────────────────────────────────────
+
+
+def _seed_tree(conv_store: SqlAlchemyConversationStore, root_id: str) -> dict[str, str]:
+    """Seed ``root → a, b``; ``a → a1 → a2 → a3`` and return name → id.
+
+    :param conv_store: Store for the child conversations.
+    :param root_id: Top-level session the tree hangs off.
+    :returns: Ids of the seeded sub-agents by short name.
+    """
+    ids: dict[str, str] = {"root": root_id}
+    for name, parent in [("a", "root"), ("b", "root"), ("a1", "a"), ("a2", "a1"), ("a3", "a2")]:
+        ids[name] = _seed_child(
+            conv_store=conv_store, parent_id=ids[parent], title=f"worker:{name}"
+        ).id
+    return ids
+
+
+async def _walk_levels(
+    client: httpx.AsyncClient, session_id: str, max_depth: int, limit: int = 20
+) -> list[tuple[str, str]]:
+    """Walk the tree one ``child_sessions`` call per node, like older clients.
+
+    :param client: The test HTTP client.
+    :param session_id: Session to walk below.
+    :param max_depth: Levels to walk.
+    :param limit: Children read per node, as the per-level page size.
+    :returns: ``(id, parent_session_id)`` in breadth-first order.
+    """
+    rows: list[tuple[str, str]] = []
+    frontier = [session_id]
+    for _ in range(max_depth):
+        next_frontier: list[str] = []
+        for node in frontier:
+            resp = await client.get(f"/v1/sessions/{node}/child_sessions", params={"limit": limit})
+            assert resp.status_code == 200
+            for row in resp.json()["data"]:
+                rows.append((row["id"], row["parent_session_id"]))
+                next_frontier.append(row["id"])
+        frontier = next_frontier
+    return rows
+
+
+async def test_child_sessions_descendants_returns_the_subtree_in_walk_order(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """One request returns what a per-level walk would, in the same order.
+
+    Failure means the CLI tree, which switches to this request, shows a
+    different hierarchy or order than before.
+    """
+    session = await _create_parent_session(client)
+    ids = _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/child_sessions", params={"descendants": "true"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+
+    rows = [(row["id"], row["parent_session_id"]) for row in body["data"]]
+    assert rows == await _walk_levels(client, session["id"], 3)
+    depths = {row["id"]: row["depth"] for row in body["data"]}
+    # a3 is four levels down, past the default depth of 3.
+    assert depths == {ids["a"]: 1, ids["b"]: 1, ids["a1"]: 2, ids["a2"]: 3}
+    assert body["has_more"] is False
+    assert body["first_id"] == body["data"][0]["id"]
+    assert body["last_id"] == body["data"][-1]["id"]
+
+
+async def test_child_sessions_descendants_from_a_sub_agent_excludes_its_siblings(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Asking below a sub-agent returns only that sub-agent's subtree."""
+    session = await _create_parent_session(client)
+    ids = _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+
+    resp = await client.get(
+        f"/v1/sessions/{ids['a']}/child_sessions", params={"descendants": "true"}
+    )
+    assert resp.status_code == 200
+
+    rows = [(row["id"], row["parent_session_id"], row["depth"]) for row in resp.json()["data"]]
+    assert rows == [(ids["a1"], ids["a"], 1), (ids["a2"], ids["a1"], 2), (ids["a3"], ids["a2"], 3)]
+
+
+async def test_child_sessions_descendants_honours_max_depth_and_limit(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``max_depth`` stops the walk; ``limit`` cuts it and reports ``has_more``."""
+    session = await _create_parent_session(client)
+    ids = _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+    url = f"/v1/sessions/{session['id']}/child_sessions"
+
+    shallow = (await client.get(url, params={"descendants": "true", "max_depth": 1})).json()
+    assert {row["id"] for row in shallow["data"]} == {ids["a"], ids["b"]}
+    assert shallow["has_more"] is False
+
+    deep = (await client.get(url, params={"descendants": "true", "max_depth": 10})).json()
+    assert ids["a3"] in {row["id"] for row in deep["data"]}
+
+    cut = (await client.get(url, params={"descendants": "true", "limit": 2})).json()
+    assert len(cut["data"]) == 2
+    assert cut["has_more"] is True
+
+
+async def test_child_sessions_descendants_pages_with_after(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``after=<last_id>`` continues a cut-off subtree with no repeats or gaps."""
+    session = await _create_parent_session(client)
+    _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+    url = f"/v1/sessions/{session['id']}/child_sessions"
+    whole = (await client.get(url, params={"descendants": "true"})).json()["data"]
+
+    paged: list[dict[str, Any]] = []
+    params: dict[str, Any] = {"descendants": "true", "limit": 2}
+    for _ in range(10):
+        page = (await client.get(url, params=params)).json()
+        paged.extend(page["data"])
+        if not page["has_more"]:
+            break
+        params["after"] = page["last_id"]
+
+    assert [row["id"] for row in paged] == [row["id"] for row in whole]
+
+
+async def test_child_sessions_descendants_rejects_a_cursor_outside_the_subtree(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    session = await _create_parent_session(client)
+    _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/child_sessions",
+        params={"descendants": "true", "after": "ad563e906854634c49e1a6fd2fbb31d4"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "stale_cursor"
+
+
+async def test_child_sessions_descendants_too_big_answers_one_level(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spawn tree past the read cap gets the plain one-level listing, which
+    clients already walk, instead of a partial tree."""
+    from omnigent.server.routes.sessions import routes_items
+
+    monkeypatch.setattr(routes_items, "_SPAWN_TREE_READ_CAP", 2)
+    session = await _create_parent_session(client)
+    ids = _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+    url = f"/v1/sessions/{session['id']}/child_sessions"
+
+    capped = (await client.get(url, params={"descendants": "true"})).json()
+    plain = (await client.get(url)).json()
+
+    assert capped == plain
+    assert {row["id"] for row in capped["data"]} == {ids["a"], ids["b"]}
+    assert all(row["depth"] is None for row in capped["data"])
+
+
+async def test_child_sessions_descendants_ignores_other_trees(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Sub-agents of another session never show up in this session's subtree."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    first = await _create_parent_session(client, agent_name="agent-one")
+    second = await _create_parent_session(client, agent_name="agent-two")
+    mine = _seed_child(conv_store=conv_store, parent_id=first["id"], title="worker:mine")
+    _seed_child(conv_store=conv_store, parent_id=second["id"], title="worker:theirs")
+
+    resp = await client.get(
+        f"/v1/sessions/{first['id']}/child_sessions", params={"descendants": "true"}
+    )
+
+    assert [row["id"] for row in resp.json()["data"]] == [mine.id]
+
+
+async def test_child_sessions_descendants_hides_archived_branches_like_a_walk(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An archived sub-agent and everything below it are left out, as a
+    per-level walk (which lists unarchived children only) leaves them out."""
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    ids = _seed_tree(conv_store, session["id"])
+    conv_store.update_conversation(ids["a1"], archived=True)
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/child_sessions", params={"descendants": "true"}
+    )
+    rows = [(row["id"], row["parent_session_id"]) for row in resp.json()["data"]]
+
+    assert sorted(rows) == sorted(await _walk_levels(client, session["id"], 3))
+    assert {ids["a1"], ids["a2"]}.isdisjoint(row_id for row_id, _ in rows)
+
+
+async def test_child_sessions_descendants_cursor_fails_once_the_tree_outgrows_one_read(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tree that grows past the read cap between pages makes the cursor
+    stale rather than reading it as a one-level cursor, so clients restart."""
+    from omnigent.server.routes.sessions import routes_items
+
+    session = await _create_parent_session(client)
+    _seed_tree(SqlAlchemyConversationStore(db_uri), session["id"])
+    url = f"/v1/sessions/{session['id']}/child_sessions"
+    first = (await client.get(url, params={"descendants": "true", "limit": 2})).json()
+    assert first["has_more"] is True
+
+    monkeypatch.setattr(routes_items, "_SPAWN_TREE_READ_CAP", 2)
+    resp = await client.get(
+        url, params={"descendants": "true", "limit": 2, "after": first["last_id"]}
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "stale_cursor"
+
+
+async def test_child_sessions_descendants_breaks_timestamp_ties_like_a_walk(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Siblings created in the same second come back in the order the store's
+    one-level listing returns them (insertion order on SQLite, id elsewhere),
+    so a per-parent limit keeps the same child and branch as the walk.
+
+    Failure means the SDK's ``child_sessions_tree(limit=...)`` selects a
+    different sub-agent once it switches to ``descendants=true``.
+    """
+    from omnigent_client._sessions import _limit_children_per_parent
+    from sqlalchemy import update
+
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlConversation
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    def seed(parent_id: str, name: str) -> str:
+        return _seed_child(conv_store=conv_store, parent_id=parent_id, title=f"worker:{name}").id
+
+    siblings = [seed(session["id"], f"s{i}") for i in range(6)]
+    # Keep adding until id order and insertion order disagree, so the test
+    # cannot pass by an id tie-break that happens to match insertion order.
+    while sorted(siblings) == siblings or sorted(siblings, reverse=True) == siblings:
+        siblings.append(seed(session["id"], f"s{len(siblings)}"))
+    for sibling in siblings:
+        seed(sibling, f"{sibling[:6]}-child")
+    with conv_store._conv_engine.begin() as conn:
+        conn.execute(
+            update(SqlConversation)
+            .where(SqlConversation.id.in_(siblings))
+            .values(created_at=1_700_000_000)
+        )
+    url = f"/v1/sessions/{session['id']}/child_sessions"
+
+    body = (await client.get(url, params={"descendants": "true"})).json()
+    rows = [(row["id"], row["parent_session_id"]) for row in body["data"]]
+    assert rows == await _walk_levels(client, session["id"], 3)
+
+    kept = _limit_children_per_parent(body["data"], session["id"], 1)
+    walked = await _walk_levels(client, session["id"], 3, limit=1)
+    assert [(row["id"], row["parent_id"]) for row in kept] == walked

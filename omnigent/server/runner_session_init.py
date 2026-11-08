@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -14,9 +15,11 @@ from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory, ErrorCode, ErrorImpact
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.update_check import _read_build_info
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runtime.agent_cache import AgentCache
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.conversation_store import ConversationStore
     from omnigent.stores.file_store import FileStore
@@ -92,17 +95,53 @@ class RunnerSessionInitializer:
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
         agent_store: AgentStore | None = None,
+        agent_cache: AgentCache | None = None,
     ) -> None:
         self._registry = registry
         self._server_version = server_version
+        build_info = _read_build_info()
+        self._diagnostic_context = {
+            "server_version": server_version,
+            "server_commit_sha": build_info[1] if build_info and build_info[1] else "unknown",
+        }
         self._conversation_store = conversation_store
         self._file_store = file_store
         self._agent_store = agent_store
+        self._agent_cache = agent_cache
         self._tasks: dict[
             tuple[str, int, str, str, str | None, bool],
             asyncio.Task[httpx.Response],
         ] = {}
         self._recovery_ids: dict[tuple[str, int, str, str, str | None, bool], str] = {}
+
+    def log_decision(
+        self,
+        conversation: Conversation,
+        *,
+        generation: int,
+        trigger: str,
+        decision: str,
+        **attributes: object,
+    ) -> None:
+        """Record why runtime initialization starts, waits, reuses, or defers."""
+        _logger.info(
+            "Runner session initialization decision: %s",
+            decision,
+            extra=debug_event(
+                "runner_session_init_decision",
+                session_id=conversation.id,
+                runner_id=conversation.runner_id,
+                turn_id=None,
+                user_id=None,
+                runner_generation=generation,
+                init_trigger=trigger,
+                decision=decision,
+                has_agent=conversation.agent_id is not None,
+                archived=conversation.archived,
+                **self._diagnostic_context,
+                **attributes,
+            ),
+        )
 
     def generation_for(self, runner_id: str, runner_client: httpx.AsyncClient) -> int:
         """Identify the current tunnel, or the client for embedded transports."""
@@ -116,6 +155,29 @@ class RunnerSessionInitializer:
         if self.generation_for(runner_id, runner_client) != generation:
             raise ConnectionError("runner tunnel changed during session recovery")
 
+    def is_initialized(self, conversation: Conversation, runner_client: httpx.AsyncClient) -> bool:
+        """Whether initialization accepted this session on its current tunnel."""
+        runner_id, agent_id = conversation.runner_id, conversation.agent_id
+        if runner_id is None or agent_id is None:
+            return False
+        session_key = (
+            runner_id,
+            self.generation_for(runner_id, runner_client),
+            conversation.id,
+            agent_id,
+            conversation.sub_agent_name,
+        )
+        for recovery in (False, True):
+            task = self._tasks.get((*session_key, recovery))
+            if task is None or not task.done() or task.cancelled() or task.exception() is not None:
+                continue
+            response = task.result()
+            if 200 <= response.status_code < 300 and runner_inference_verified(
+                conversation, response
+            ):
+                return True
+        return False
+
     async def initialize(
         self,
         conversation: Conversation,
@@ -126,6 +188,7 @@ class RunnerSessionInitializer:
         resume_interrupted_turn: bool = False,
         generation: int | None = None,
         store_slots: asyncio.Semaphore | None = None,
+        trigger: str = "unspecified",
     ) -> httpx.Response:
         """Initialize once for the current connection and persisted snapshot."""
         runner_id = conversation.runner_id
@@ -135,6 +198,24 @@ class RunnerSessionInitializer:
         if generation is None:
             generation = self.generation_for(runner_id, runner_client)
         self.require_generation(runner_id, runner_client, generation)
+        connection = self._registry.get(runner_id)
+        if (
+            connection is not None
+            and self._agent_store is not None
+            and self._agent_cache is not None
+        ):
+            from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+
+            async with store_slots or nullcontext():
+                await asyncio.to_thread(
+                    require_session_registry_mcp_support,
+                    conversation,
+                    connection.hello.capabilities,
+                    component="runner",
+                    agent_store=self._agent_store,
+                    agent_cache=self._agent_cache,
+                )
+            self.require_generation(runner_id, runner_client, generation)
         key = (
             runner_id,
             generation,
@@ -148,14 +229,17 @@ class RunnerSessionInitializer:
             async with store_slots or nullcontext():
                 agent = await asyncio.to_thread(self._agent_store.get, agent_id)
             if agent is None:
+                self.log_decision(
+                    conversation,
+                    generation=generation,
+                    trigger=trigger,
+                    decision="skip",
+                    reason="agent_removed",
+                    agent_id=agent_id,
+                )
                 # The user removed the agent (`omnigent agent remove`). The runner
                 # could only reject this init; the session reports the removal on
                 # its next message, so this is expected and not worth a failure.
-                _logger.info(
-                    "Not initializing session %s on its runner: its agent %s was removed",
-                    conversation.id,
-                    agent_id,
-                )
                 return httpx.Response(
                     410,
                     json={
@@ -166,7 +250,10 @@ class RunnerSessionInitializer:
                 )
             # Another caller may have started this initialization during the lookup.
             task = self._tasks.get(key)
+        decision = "reuse_completed" if task is not None and task.done() else "join_in_flight"
         if task is None:
+            decision = "start"
+            init_attempt_id = uuid4().hex
             recovery_id = (
                 self._recovery_ids.setdefault(key, uuid4().hex)
                 if resume_interrupted_turn
@@ -212,11 +299,13 @@ class RunnerSessionInitializer:
                     suppress_recovery_turn=suppress_recovery_turn,
                     recovery_id=recovery_id,
                     generation=generation,
+                    trigger=trigger,
+                    init_attempt_id=init_attempt_id,
                 )
 
             task = asyncio.create_task(
                 post_session_init(),
-                name=f"runner-session-init-{conversation.id}",
+                name=f"runner-session-init-{init_attempt_id}",
             )
             self._tasks[key] = task
 
@@ -232,6 +321,13 @@ class RunnerSessionInitializer:
                     self._tasks.pop(key, None)
 
             task.add_done_callback(_drop_failed)
+        self.log_decision(
+            conversation,
+            generation=generation,
+            trigger=trigger,
+            decision=decision,
+            init_attempt_id=task.get_name().removeprefix("runner-session-init-"),
+        )
         try:
             response = await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -281,10 +377,18 @@ class RunnerSessionInitializer:
         suppress_recovery_turn: bool,
         recovery_id: str | None,
         generation: int,
+        trigger: str,
+        init_attempt_id: str,
     ) -> httpx.Response:
         with runner_log_scope(session_id, runner_id):
-            # The flags name the caller: neither set is the tunnel-reconnect
-            # hook, resume is a sub-agent restore, suppress is a message forward.
+            started_at = time.monotonic()
+            diagnostics = {
+                **self._diagnostic_context,
+                "runner_generation": generation,
+                "init_trigger": trigger,
+                "init_attempt_id": init_attempt_id,
+            }
+            # resume/suppress flags describe recovery behavior; init_trigger names the caller.
             _logger.info(
                 "Initializing runner session",
                 extra=debug_event(
@@ -293,6 +397,7 @@ class RunnerSessionInitializer:
                     resume_interrupted_turn=resume_interrupted_turn,
                     suppress_recovery_turn=suppress_recovery_turn,
                     recovery_id=recovery_id,
+                    **diagnostics,
                 ),
             )
             try:
@@ -316,6 +421,8 @@ class RunnerSessionInitializer:
                         exc_type=type(exc).__name__,
                         error_category=ErrorCategory.RUNNER.value,
                         error_impact=ErrorImpact.TRANSIENT.value,
+                        duration_ms=round((time.monotonic() - started_at) * 1000),
+                        **diagnostics,
                     ),
                 )
                 raise
@@ -325,6 +432,8 @@ class RunnerSessionInitializer:
                     extra=debug_event(
                         "runner_session_init_failed",
                         stage="session_init",
+                        duration_ms=round((time.monotonic() - started_at) * 1000),
+                        **diagnostics,
                     ),
                 )
                 raise
@@ -335,6 +444,8 @@ class RunnerSessionInitializer:
                         "runner_session_initialized",
                         stage="session_init",
                         status_code=response.status_code,
+                        duration_ms=round((time.monotonic() - started_at) * 1000),
+                        **diagnostics,
                     ),
                 )
             else:
@@ -355,6 +466,8 @@ class RunnerSessionInitializer:
                         failure_kind="rejected",
                         status_code=response.status_code,
                         response_body=body,
+                        duration_ms=round((time.monotonic() - started_at) * 1000),
+                        **diagnostics,
                     ),
                 )
             return response

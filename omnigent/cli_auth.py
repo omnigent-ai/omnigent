@@ -32,9 +32,10 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from omnigent.process_logging import data_dir
-from omnigent.util.server_url import is_workspace_hosted_url
+from omnigent.util.server_url import ServerUrl, is_workspace_hosted_url
 
 if TYPE_CHECKING:
     import httpx
@@ -258,15 +259,14 @@ def store_databricks_auth(
 
 
 def store_databricks_org_id(server_url: str, org_id: str) -> None:
-    """Persist a workspace selector without replacing existing credentials.
+    """Persist a verified workspace selector without replacing existing credentials.
 
-    URL normalization calls this when a managed server URL carries ``?o=``.
-    Keeping the selector beside the server's existing auth record lets later
-    CLI helpers and child processes rebuild routing headers after the query has
-    been removed from the HTTP base URL.
+    Call after successful authentication and workspace validation. Before that,
+    use :func:`pin_databricks_org_id` to route this process and its children
+    without changing a saved login.
 
     :param server_url: Canonical server API base.
-    :param org_id: Workspace selector parsed from the user-supplied URL.
+    :param org_id: Workspace selector accepted by the server.
     """
     existing = _load_entry(server_url) or {}
     if existing.get("org_id") == org_id:
@@ -602,14 +602,68 @@ def load_databricks_workspace_host(server_url: str) -> str | None:
     return host if isinstance(host, str) and host else None
 
 
+# The ``?o=`` server URL this process and its children are bound to, e.g.
+# ``"https://acct.example.com/api/2.0/omnigent?o=123"``. It overrides the stored
+# record, which every workspace behind that server shares.
+PINNED_DATABRICKS_ORG_ENV_VAR = "OMNIGENT_DATABRICKS_ORG_PIN"
+
+
+def databricks_org_pin(server_url: str, org_id: str | None) -> str:
+    """Return the :data:`PINNED_DATABRICKS_ORG_ENV_VAR` value binding *org_id* to *server_url*.
+
+    :param server_url: The server URL, e.g. ``"https://acct.example.com/api/2.0/omnigent"``.
+    :param org_id: The workspace org id, or ``None`` to freeze selector absence.
+    :returns: e.g. ``"https://acct.example.com/api/2.0/omnigent?o=2850744067564480"``.
+    """
+    # An empty selector is a binding too: descendants must not discover a
+    # different workspace from a later login's shared record.
+    return f"{ServerUrl(api_base=server_url).api_base}?{urlencode({'o': org_id or ''})}"
+
+
+def _pinned_databricks_server(server_url: str) -> ServerUrl | None:
+    """Read a matching process pin, including an explicit empty selector."""
+    pin = os.environ.get(PINNED_DATABRICKS_ORG_ENV_VAR)
+    if not pin:
+        return None
+    try:
+        if "o" not in parse_qs(urlsplit(pin).query, keep_blank_values=True):
+            return None
+        pinned = ServerUrl(api_base=pin)
+        return pinned if pinned.api_base == ServerUrl(api_base=server_url).api_base else None
+    except ValueError:
+        return None
+
+
+def pinned_databricks_org_id(server_url: str) -> str | None:
+    """Return this process's pinned org id when it was pinned for *server_url*.
+
+    :param server_url: The server URL being called.
+    :returns: The pinned org id, or ``None`` when unpinned or pinned to another server.
+    """
+    pinned = _pinned_databricks_server(server_url)
+    return pinned.org_id if pinned is not None else None
+
+
+def pin_databricks_org_id(server_url: str, org_id: str | None) -> None:
+    """Bind this process, and the children it spawns, to *org_id* for *server_url*.
+
+    :param server_url: The server URL, e.g. ``"https://acct.example.com/api/2.0/omnigent"``.
+    :param org_id: The workspace selected for it, or ``None`` to freeze selector absence.
+    """
+    os.environ[PINNED_DATABRICKS_ORG_ENV_VAR] = databricks_org_pin(server_url, org_id)
+
+
 def load_databricks_org_id(server_url: str) -> str | None:
-    """Load the workspace org id from a stored server record.
+    """Load the workspace org id from this process's pin or the stored server record.
 
     :param server_url: The server URL, e.g.
         ``"https://example.databricks.com/api/2.0/omnigent"``.
-    :returns: The org id, e.g. ``"2850744067564480"``, or ``None``
-        when the stored record carries no org id.
+    :returns: The pinned org id (including pinned absence), or the saved org id
+        when this process has no matching pin.
     """
+    pinned = _pinned_databricks_server(server_url)
+    if pinned is not None:
+        return pinned.org_id
     entry = _load_entry(server_url)
     if entry is None:
         return None
@@ -821,6 +875,9 @@ def open_server_client(
         **databricks_request_headers(server_url, bearer_token=bearer_token, host_id=host_id),
     }
     kwargs: dict[str, Any] = {}
+    from omnigent.session_host import route_known_session_request
+
+    kwargs["event_hooks"] = {"request": [route_known_session_request]}
     if timeout is not _TIMEOUT_UNSET:
         kwargs["timeout"] = timeout
     if transport is not None:

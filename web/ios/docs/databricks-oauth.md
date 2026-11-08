@@ -17,10 +17,10 @@ Set these user-defined build settings on the **Omnigent** target in Xcode, or
 pass them to `xcodebuild`. Both Debug and Release expose them in the processed
 Info.plist.
 
-| Build setting                   | Default                                        | Purpose                                                                                                           |
-| ------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `DATABRICKS_OAUTH_CLIENT_ID`    | Empty                                          | Your registered public OAuth client ID. Empty or unresolved values are rejected when native sign-in is requested. |
-| `DATABRICKS_OAUTH_REDIRECT_URL` | `https://login.databricks.com/mobile-redirect` | The exact HTTPS callback registered with that client.                                                             |
+| Build setting                   | Default                                        | Purpose                                                                                                                 |
+| ------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `DATABRICKS_OAUTH_CLIENT_ID`    | `omnigent`                                     | Public OAuth client ID. Override for a different registered client; empty or unresolved values are rejected at sign-in. |
+| `DATABRICKS_OAUTH_REDIRECT_URL` | `https://login.databricks.com/mobile-redirect` | The exact HTTPS callback registered with that client.                                                                   |
 
 These are public configuration, not secrets. Never configure a client secret in
 the app or borrow the Databricks CLI client ID. The redirect must have a path,
@@ -41,9 +41,10 @@ plutil -extract DatabricksOAuthRedirectURL raw \
   /tmp/omnigent-oauth-config-check/Build/Products/Debug-iphonesimulator/Omnigent.app/Info.plist
 ```
 
-A shell environment variable alone is not an Xcode build-setting override. Pass
-settings explicitly to the build command, or set them in the target's build
-configuration. This also applies when using a build wrapper such as Fastlane.
+The default client ID and redirect URL are set in the target's Debug and Release
+build configurations, including Fastlane archives. A shell environment variable
+alone is not an Xcode build-setting override. To use a different client, pass
+settings explicitly to the build command or change the target's build configuration.
 
 ## HTTPS callback association
 
@@ -196,6 +197,11 @@ Unsupported redirects, cookie scopes, login-page landings, and HTTP failures ret
 to setup rather than loading a different workspace or silently retrying sign-in.
 These are client validation rules; verify the deployment's actual cookie-setting
 redirect chain during integration.
+
+On each return to the foreground, a present `DBAUTH` cookie is checked with one
+`GET <workspace>/omnigent/v1/me` (keeping `o`, no redirects followed). A 401 or a
+redirect to a sign-in path runs the same silent recovery; a 403 shows the
+permission error. Network failures, timeouts, and other answers keep the session.
 
 `DatabricksWebStore` uses a stable, named `WKWebsiteDataStore` for the credential
 context: entered origin, optional `o`, and client ID. Different contexts have separate

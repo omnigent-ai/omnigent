@@ -28,6 +28,7 @@ from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.session_history import CANCELLATION_MARKER_TEXT
 from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
 )
@@ -309,6 +310,46 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
         )
 
 
+class _StoppedTurnServerClient(_HistoryServerClient):
+    """History of a turn the user stopped: the request, then Stop's cancellation marker."""
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        del kwargs
+        if url.rstrip("/").endswith("/items"):
+            marker = {
+                "id": "msg_002",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": CANCELLATION_MARKER_TEXT}],
+            }
+            return self._Resp({**_ITEMS_PAGE, "data": [_PENDING_USER_MESSAGE, marker]})
+        return self._Resp({})
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_turn_starts_no_recovery_turn(caplog: pytest.LogCaptureFixture) -> None:
+    """A history ending on Stop's cancellation marker has nothing to resume on reconnect.
+
+    Reconnect host (``retry_session``) relaunches the runner without
+    ``suppress_recovery_turn``; it must not call the model for a turn the user stopped.
+    """
+    app, _pm, harness = _build_sdk_app(_StoppedTurnServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=False),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+        await asyncio.sleep(0.1)
+
+    assert harness.posted_bodies == []
+    (init_row,) = _init_rows(caplog)
+    assert init_row["recovery_turn"] == "none"
+    assert init_row["history_len"] == 2
+
+
 @pytest.mark.asyncio
 async def test_catch_up_turn_hides_browser_tools_without_renderer_evidence() -> None:
     """Reconnect catch-up fails closed when no renderer hint accompanies the item."""
@@ -459,6 +500,75 @@ async def test_newer_turn_finishing_during_initialization_supersedes_recovery() 
         assert _session_histories_ref[SESSION_ID] is history
         await client.post("/v1/sessions", json=payload)
         assert len(harness.posted_bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_in_flight_during_initialization_skips_history_recovery(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner-connect init must not start a second turn for an in-flight forward.
+
+    The server's runner-connect init sends no suppress flag, while the first
+    message for an already-connected runner is forwarded without waiting for
+    it. If init's history load sees that persisted message while the forward
+    is past its active-turn check, a history_resume turn and the forward's turn
+    both reach the harness; a real harness answers the second with 204, which
+    the runner reports as ``turn failed (status 204)``.
+    """
+    from omnigent.runner.app import _session_histories_ref
+
+    # The history cache is module-global; a leftover entry would let the
+    # forward skip the history read this test parks on.
+    _session_histories_ref.pop(SESSION_ID, None)
+    parked = 0
+    init_parked, both_parked, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class PausedHistoryServer(_HistoryServerClient):
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            nonlocal parked
+            response = await super().get(url, **kwargs)
+            if url.endswith(f"/{SESSION_ID}/items") and not release.is_set():
+                parked += 1
+                (init_parked if parked == 1 else both_parked).set()
+                await release.wait()
+            return response
+
+    app, _pm, harness = _build_sdk_app(PausedHistoryServer())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    async with _runner_client(app) as client:
+        init = asyncio.create_task(
+            client.post("/v1/sessions", json=_session_init_payload(suppress_recovery_turn=False))
+        )
+        # Init must hold the first history read so it decides after the forward
+        # has passed its active-turn check but before that turn starts.
+        await asyncio.wait_for(init_parked.wait(), timeout=5)
+        forward = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                params={"stream": "true"},
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": AGENT_ID,
+                    "content": [{"type": "input_text", "text": "hello from history"}],
+                    "persisted_item_id": "msg_001",
+                },
+            )
+        )
+        await asyncio.wait_for(both_parked.wait(), timeout=5)
+        release.set()
+        assert (await init).status_code == 201
+        assert (await forward).status_code == 200
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+
+    assert len(harness.posted_bodies) == 1, (
+        f"expected only the forward's turn; got {len(harness.posted_bodies)} turn-starts"
+    )
+    (init_row,) = _init_rows(caplog)
+    assert init_row["recovery_turn"] == "none"
+    assert init_row["forward_in_flight"] is True
 
 
 @pytest.mark.asyncio

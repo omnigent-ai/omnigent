@@ -17,11 +17,13 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
-from omnigent.entities import Conversation
+from omnigent.entities import Agent, Conversation
+from omnigent.runtime import get_artifact_store
+from omnigent.server.bundles import bundle_location
 from omnigent.server.child_session_recovery import RECOVERY_STORE_CONCURRENCY
 from omnigent.server.routes import runner_tunnel, sessions
-from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from tests.budgets import budget
+from tests.server.helpers import build_agent_bundle
 from tests.server.integration.test_runner_tunnel_route import (
     _RUNNER_ID,
     _TUNNEL_PATH,
@@ -30,6 +32,15 @@ from tests.server.integration.test_runner_tunnel_route import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture
+def agent(app: FastAPI) -> Agent:
+    agent_id = generate_agent_id()
+    bundle = build_agent_bundle("test")
+    location = bundle_location(agent_id, bundle)
+    get_artifact_store().put(location, bundle)
+    return app.state.agent_store.create(agent_id, "test", location)
 
 
 class _AsyncioProxy:
@@ -110,9 +121,8 @@ async def _recover(
 
 
 async def test_multiple_slow_roots_recover_independently_with_descendants(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     hung, slow, healthy = [_create_session(app, agent.id) for _ in range(3)]
     blocked_child = _create_session(
         app, agent.id, kind="sub_agent", parent_conversation_id=hung.id
@@ -163,13 +173,149 @@ async def test_multiple_slow_roots_recover_independently_with_descendants(
     assert not app.state.runner_session_initializer.invalidate_runner(_RUNNER_ID)
 
 
+@pytest.mark.parametrize("cleanup_stage", ["route", "initializer"])
+async def test_replaced_tunnel_cleanup_cannot_settle_a_newer_outage_as_idle(
+    app: FastAPI,
+    agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cleanup_stage: str,
+) -> None:
+    """A retired connection's delayed teardown cannot attest a newer turn was idle."""
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+
+    registry = app.state.tunnel_registry
+    store = app.state.runner_router._conversation_store
+    first_ready, second_ready = asyncio.Event(), asyncio.Event()
+    cleanup_started, release_cleanup = asyncio.Event(), asyncio.Event()
+    real_hook = runner_tunnel._run_connect_hook
+
+    async def delayed_cleanup(hook: Any, connection: Any) -> None:
+        await real_hook(hook, connection)
+        if not first_ready.is_set():
+            first_ready.set()
+            if cleanup_stage == "route":
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup_started.set()
+                    await release_cleanup.wait()
+        else:
+            second_ready.set()
+
+    monkeypatch.setattr(runner_tunnel, "_run_connect_hook", delayed_cleanup)
+    monkeypatch.setattr(sessions, "RUNNER_DISCONNECT_GRACE_S", 0.5)
+    first = await _connect_route(app, _TUNNEL_PATH)
+    second = None
+    conv = None
+    init_task = None
+    init_client = None
+    try:
+        await _send_hello(first, registry, connection_id="old-idle-tunnel")
+        await asyncio.wait_for(first_ready.wait(), budget(2))
+        if cleanup_stage == "initializer":
+            init_started = asyncio.Event()
+
+            async def delayed_runner_request(_: httpx.Request) -> httpx.Response:
+                init_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup_started.set()
+                    await release_cleanup.wait()
+                return httpx.Response(201)
+
+            init_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(delayed_runner_request), base_url="http://runner"
+            )
+            init_conv = store.create_conversation(agent_id=agent.id, runner_id=_RUNNER_ID)
+            init_task = asyncio.create_task(
+                app.state.runner_session_initializer.initialize(
+                    init_conv, init_client, timeout=budget(5)
+                )
+            )
+            await asyncio.wait_for(init_started.wait(), budget(2))
+        await first.send_input(
+            {
+                "type": "websocket.disconnect",
+                "code": 1000,
+                "reason": RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
+            }
+        )
+        await asyncio.wait_for(cleanup_started.wait(), budget(2))
+        if cleanup_stage == "initializer":
+            assert registry.get(_RUNNER_ID) is None
+            # Remove the old session so the replacement only owns the new turn below.
+            await store.delete_conversation(init_conv.id)
+        second = await _connect_route(app, _TUNNEL_PATH)
+        await _send_hello(second, registry, connection_id="new-active-tunnel")
+        await asyncio.wait_for(second_ready.wait(), budget(2))
+        conv = store.create_conversation(agent_id=agent.id, runner_id=_RUNNER_ID)
+        store.set_session_live_status(conv.id, "running")
+        sessions._session_status_cache[conv.id] = "running"
+        await second.send_input({"type": "websocket.disconnect", "code": 1006})
+        await asyncio.wait_for(second.future, budget(2))
+        grace_tasks = {
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{_RUNNER_ID}"
+        }
+        assert len(grace_tasks) == 1
+        release_cleanup.set()
+        await asyncio.wait_for(first.future, budget(2))
+        if init_task is not None:
+            with pytest.raises(ConnectionError, match="initialization was cancelled"):
+                await init_task
+        assert grace_tasks == {
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{_RUNNER_ID}"
+        }
+        await asyncio.wait_for(asyncio.gather(*grace_tasks), budget(3))
+        assert all(not task.cancelled() for task in grace_tasks)
+        assert sessions._session_status_cache[conv.id] == "failed"
+        final = store.get_conversation(conv.id)
+        assert final is not None
+        assert final.labels["omnigent.last_task_error_code"] == "runner_disconnected"
+        failures = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "session_turn_failed"
+            and getattr(record, "session_id", None) == conv.id
+        ]
+        assert len(failures) == 1
+        assert failures[0].attributes["drop_close_code"] == "1006"
+        assert failures[0].attributes["drop_close_reason_category"] == "abnormal"
+    finally:
+        release_cleanup.set()
+        for communicator in (first, second):
+            if communicator is not None and not communicator.future.done():
+                await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+                await communicator.wait(timeout=budget(2))
+        if init_task is not None:
+            init_task.cancel()
+            await asyncio.gather(init_task, return_exceptions=True)
+        if init_client is not None:
+            await init_client.aclose()
+        pending_grace = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{_RUNNER_ID}"
+        ]
+        for task in pending_grace:
+            task.cancel()
+        await asyncio.gather(*pending_grace, return_exceptions=True)
+        if conv is not None:
+            sessions._session_status_cache.pop(conv.id, None)
+            sessions._intentional_stop_sessions.pop(conv.id, None)
+
+
 @pytest.mark.parametrize("superseded", [False, True])
 async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch, superseded: bool
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch, superseded: bool
 ) -> None:
     import omnigent.server.app as server_app
 
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     parent = _create_session(app, agent.id)
     store = app.state.runner_router._conversation_store
     mirrors = []
@@ -253,9 +399,8 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
 
 
 async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     failed, healthy = [_create_session(app, agent.id) for _ in range(2)]
     blocked_child = _create_session(
         app, agent.id, kind="sub_agent", parent_conversation_id=failed.id
@@ -277,7 +422,7 @@ async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(
 
 async def test_failed_binding_batch_does_not_strand_later_roots(
     app: FastAPI,
-    db_uri: str,
+    agent: Agent,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -286,7 +431,6 @@ async def test_failed_binding_batch_does_not_strand_later_roots(
     import omnigent.server.app as server_app
 
     monkeypatch.setattr(server_app, "_RECONNECT_BINDING_BATCH_SIZE", 1)
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     failed, healthy = [_create_session(app, agent.id) for _ in range(2)]
     store = app.state.runner_router._conversation_store
     get_many = store.get_conversations
@@ -327,14 +471,13 @@ async def test_failed_binding_batch_does_not_strand_later_roots(
 @pytest.mark.parametrize("dependent_kind", [None, "child", "mirror"])
 async def test_reconnect_skips_root_rebound_before_initialization(
     app: FastAPI,
-    db_uri: str,
+    agent: Agent,
     monkeypatch: pytest.MonkeyPatch,
     phase: str,
     dependent_kind: str | None,
 ) -> None:
     import omnigent.server.app as server_app
 
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     moved, healthy = [_create_session(app, agent.id) for _ in range(2)]
     store = app.state.runner_router._conversation_store
     dependent = None
@@ -397,13 +540,12 @@ async def test_reconnect_skips_root_rebound_before_initialization(
 
 
 async def test_reconnecting_trees_share_store_budget_without_waiting_for_initialization(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import omnigent.server.app as server_app
     from omnigent.server import child_session_recovery, runner_session_init
     from omnigent.server.routes._sessions import helpers, orchestration
 
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     roots = [_create_session(app, agent.id) for _ in range(12)]
     children = [
         _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=root.id)
@@ -455,9 +597,8 @@ async def test_reconnecting_trees_share_store_budget_without_waiting_for_initial
 
 
 async def test_hosted_child_recovers_independently_while_parent_is_stalled(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     parent = _create_session(app, agent.id)
     hostless, hosted = [
         _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=parent.id)
@@ -493,13 +634,12 @@ async def test_hosted_child_recovers_independently_while_parent_is_stalled(
 @pytest.mark.parametrize("error_type", [httpx.ConnectError, RuntimeError])
 async def test_root_recovery_failure_is_quiet_only_after_tunnel_replacement(
     app: FastAPI,
-    db_uri: str,
+    agent: Agent,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     superseded: bool,
     error_type: type[Exception],
 ) -> None:
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     root = _create_session(app, agent.id)
     caplog.set_level(logging.INFO, logger="omnigent.server.app")
 

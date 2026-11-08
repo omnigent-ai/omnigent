@@ -6,11 +6,15 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
+from collections.abc import Callable
+from types import SimpleNamespace
 
+import anyio
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI
-from sqlalchemy import update
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost
@@ -18,6 +22,8 @@ from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
     CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
+    SERVER_CAP_TMUX_READINESS,
+    SERVER_CAPABILITIES_HEADER,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
@@ -33,20 +39,30 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
+    parse_server_capabilities,
 )
+from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     PongFrame,
     decode_frame,
     encode_frame,
 )
+from omnigent.server import tunnel_handshake
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.managed_hosts import (
+    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
+    parse_sandbox_config,
+)
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.mcp_tools import create_mcp_tools_router
 from omnigent.server.routes.skill_content import create_skill_content_router
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
+from tests.server.helpers import FakeSandboxLauncher
 
 pytestmark = pytest.mark.asyncio
 
@@ -100,6 +116,7 @@ async def _connect_route(
 def _make_hello(
     name: str = "test-laptop",
     runners: list[str] | None = None,
+    connection_id: str | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -113,6 +130,7 @@ def _make_hello(
             frame_protocol_version=1,
             name=name,
             runners=runners or [],
+            connection_id=connection_id,
         )
     )
 
@@ -141,6 +159,7 @@ async def _send_hello_and_wait(
     host_id: str = _HOST_ID,
     name: str = "test-laptop",
     runners: list[str] | None = None,
+    connection_id: str | None = None,
 ) -> None:
     """Send hello and wait for registration.
 
@@ -151,7 +170,7 @@ async def _send_hello_and_wait(
     :param runners: Live runner IDs for the hello frame.
     """
     await communicator.send_input(
-        {"type": "websocket.receive", "text": _make_hello(name, runners)},
+        {"type": "websocket.receive", "text": _make_hello(name, runners, connection_id)},
     )
     await asyncio.wait_for(
         _wait_registered(registry, host_id),
@@ -327,7 +346,7 @@ async def test_host_tunnel_heartbeat_failure_does_not_kill_ping_loop(
 
     monkeypatch.setattr(store, "heartbeat", flaky_heartbeat)
     comm = await _connect_route(app, _TUNNEL_PATH)
-    await _send_hello_and_wait(comm, registry)
+    await _send_hello_and_wait(comm, registry, connection_id="heartbeat-persistence")
     try:
         await _receive_ping_and_pong(comm)
         await _receive_ping_and_pong(comm)
@@ -347,6 +366,7 @@ async def test_host_tunnel_heartbeat_failure_does_not_kill_ping_loop(
             if getattr(record, "event_name", None) == "host_heartbeat_failed"
         ]
         assert failed.attributes["host_id"] == _HOST_ID
+        assert failed.attributes["connection_id"] == "heartbeat-persistence"
         assert failed.attributes["error_type"] == "RuntimeError"
         assert failed.attributes["failure_count"] == 1
         assert failed.attributes["duration_s"] >= 0
@@ -356,15 +376,22 @@ async def test_host_tunnel_heartbeat_failure_does_not_kill_ping_loop(
             if getattr(record, "event_name", None) == "host_heartbeat_recovered"
         ]
         assert recovery.attributes["failure_count"] == failures
+        assert recovery.attributes["connection_id"] == "heartbeat-persistence"
         assert "private-store-error-detail" not in caplog.text
     finally:
         await comm.send_input({"type": "websocket.disconnect", "code": 1000})
         await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
 
 
+@pytest.mark.parametrize(
+    ("managed", "offline_fails"), [(False, False), (True, False), (True, True)]
+)
 async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    managed: bool,
+    offline_fails: bool,
 ) -> None:
     """A slow store write cannot block pings or race the offline transition."""
     import omnigent.server.routes.host_tunnel as tunnel_mod
@@ -373,24 +400,51 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
 
     app, registry, store = host_app
+    token = "blocked-heartbeat-token"
+    if managed:
+        _register_managed(store, host_id=_HOST_ID, token=token)
+        config = ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=FakeSandboxLauncher,
+            token_ttl_s=7200,
+            provider="modal",
+        )
+        app = FastAPI()
+        app.include_router(
+            create_host_tunnel_router(
+                registry, store, sandbox_config=ManagedSandboxDeployment.single(config)
+            ),
+            prefix="/v1",
+        )
+    if offline_fails:
+
+        def fail_offline(_host_id: str, **kwargs) -> None:
+            raise RuntimeError("offline persistence failed")
+
+        monkeypatch.setattr(store, "set_offline", fail_offline)
     original_heartbeat = store.heartbeat
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
     calls = 0
 
-    def slow_heartbeat(host_id: str) -> None:
+    def slow_heartbeat(host_id: str, **kwargs) -> None:
         nonlocal calls
         calls += 1
         started.set()
         release.wait(timeout=budget(5.0))
         try:
-            original_heartbeat(host_id)
+            original_heartbeat(host_id, **kwargs)
         finally:
             finished.set()
 
     monkeypatch.setattr(store, "heartbeat", slow_heartbeat)
-    comm = await _connect_route(app, _TUNNEL_PATH)
+    if managed:
+        comm = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
+        await comm.send_input({"type": "websocket.connect"})
+        assert (await comm.receive_output(timeout=budget(1.0)))["type"] == "websocket.accept"
+    else:
+        comm = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry)
     try:
         assert await asyncio.to_thread(started.wait, budget(1.0))
@@ -398,10 +452,14 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
         await _receive_ping_and_pong(comm)
         assert registry.get(_HOST_ID) is not None
         assert calls == 1
+        with Session(get_or_create_engine(db_uri)) as session:
+            row = session.execute(select(SqlHost).where(SqlHost.host_id == _HOST_ID)).scalar_one()
+            before = (row.updated_at, row.token_expires_at)
 
         await comm.send_input({"type": "websocket.disconnect", "code": 1000})
         await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
-        await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
+        if not offline_fails:
+            await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
         await comm.wait(timeout=budget(2.0))
     finally:
         release.set()
@@ -410,19 +468,29 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
             await comm.wait(timeout=budget(2.0))
 
     await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
-    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
     assert calls == 1
-    assert not store.is_online(_HOST_ID)
+    assert store.is_online(_HOST_ID) == offline_fails
+    if managed:
+        with Session(get_or_create_engine(db_uri)) as session:
+            row = session.execute(select(SqlHost).where(SqlHost.host_id == _HOST_ID)).scalar_one()
+            assert row.token_expires_at == before[1]
+            if offline_fails:
+                assert row.updated_at == before[0]
 
 
+@pytest.mark.parametrize("wall_clock_step", [-3600.0, 0.0, 3600.0])
 async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    wall_clock_step: float,
 ) -> None:
     import omnigent.server.routes.host_tunnel as tunnel_mod
+    from omnigent.server import host_registry
 
     monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 3)
+    caplog.set_level(logging.INFO, logger=tunnel_mod.__name__)
     app, registry, store = host_app
 
     def fail_heartbeat(_host_id: str) -> None:
@@ -430,37 +498,270 @@ async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
 
     monkeypatch.setattr(store, "heartbeat", fail_heartbeat)
     comm = await _connect_route(app, _TUNNEL_PATH)
-    await _send_hello_and_wait(comm, registry)
+    await _send_hello_and_wait(comm, registry, connection_id="host-silent")
+    shifted_clock = SimpleNamespace(
+        time=lambda: time.time() + wall_clock_step, monotonic=time.monotonic
+    )
+    monkeypatch.setattr(tunnel_mod, "time", shifted_clock)
+    monkeypatch.setattr(host_registry, "time", shifted_clock)
     try:
-        while True:
-            message = await comm.receive_output(timeout=budget(2.0))
-            if message["type"] == "websocket.close":
-                assert message["code"] == 4003
-                assert message["reason"] == "ping timeout"
-                break
+        async with asyncio.timeout(budget(2.0)):
+            while True:
+                message = await comm.receive_output(timeout=budget(2.0))
+                if message["type"] == "websocket.close":
+                    assert message["code"] == 4003
+                    assert message["reason"] == "ping timeout"
+                    break
         await comm.wait(timeout=budget(2.0))
         assert registry.get(_HOST_ID) is None
         assert not store.is_online(_HOST_ID)
+        (timeout,) = [
+            r.attributes
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_ping_timeout"
+        ]
+        assert timeout["connection_id"] == "host-silent"
+        # A sleeping or offline host is expected; only a local stall warns.
+        assert timeout["silence_source"] == "peer"
+        assert all(
+            r.levelno == logging.INFO
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_ping_timeout"
+        )
+        assert timeout["app_silence_timeout_s"] == 0.06
+        assert timeout["last_app_ping_sent_age_s"] is not None
+        assert timeout["last_app_pong_received_age_s"] is None
+        (end,) = [
+            r.attributes
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_tunnel"
+            and r.attributes.get("phase") == "disconnected"
+        ]
+        assert end["connection_id"] == "host-silent"
+        assert "host-ping" in end["ended_by"].split(",")
+        assert end["close_requested_code"] == 4003
+        assert end["close_requested_reason"] == "ping timeout"
+        assert end["close_code"] is None  # No peer close event reached ASGI.
     finally:
         await comm.send_input({"type": "websocket.disconnect", "code": 1000})
         await comm.wait(timeout=budget(2.0))
 
 
-async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(db_uri: str) -> None:
+async def test_host_close_retains_blocked_send_before_cleanup(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stuck ASGI send remains visible after teardown cancels the sender."""
+    from omnigent.runner.transports.ws_tunnel import diagnostics
+    from omnigent.server.routes import host_tunnel
+
+    app, registry, _store = host_app
+    monkeypatch.setattr(host_tunnel, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(host_tunnel, "PING_MISS_THRESHOLD", 100_000)
+    monkeypatch.setattr(diagnostics, "_SAMPLE_INTERVAL_S", 0.01)
+    caplog.set_level(logging.INFO, logger=host_tunnel.__name__)
+    send_started = asyncio.Event()
+
+    async def stalled_transport(scope, receive, send):
+        async def send_with_stall(message):
+            if message["type"] == "websocket.send":
+                send_started.set()
+                await asyncio.Event().wait()
+            await send(message)
+
+        await app(scope, receive, send_with_stall)
+
+    comm = await _connect_route(stalled_transport, _TUNNEL_PATH)
+    try:
+        await _send_hello_and_wait(comm, registry, connection_id="host-blocked-send")
+        conn = registry.get(_HOST_ID)
+        assert conn is not None
+        await asyncio.wait_for(send_started.wait(), timeout=budget(2.0))
+
+        # Real pings queue behind the blocked send until the sampler reports it.
+        async def send_reported() -> None:
+            while not any(
+                getattr(r, "event_name", None) == "host_tunnel_health" for r in caplog.records
+            ):
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(send_reported(), timeout=budget(3.0))
+        await comm.send_input({"type": "websocket.disconnect", "code": 1006})
+        await comm.wait(timeout=budget(2.0))
+        (end,) = [
+            r.attributes
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_tunnel"
+            and r.attributes.get("phase") == "disconnected"
+        ]
+        assert end["connection_id"] == "host-blocked-send"
+        assert end["close_code"] == 1006
+        assert end["sends_in_flight"] == 1
+        assert end["oldest_tracked_send_age_s"] > 0
+        assert end["outbound_queue_depth"] >= 1
+        assert end["app_pings_queued"] >= 1
+        assert end["last_app_ping_sent_age_s"] is None
+        assert end["send_cancellations"] == 0
+        assert registry.get(_HOST_ID) is None
+        (health,) = [
+            r.attributes
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_tunnel_health"
+        ]
+        assert health["connection_id"] == "host-blocked-send"
+        assert health["tunnel_side"] == "server"
+        assert health["sends_in_flight"] == 1
+    finally:
+        comm.stop(exceptions=False)
+        await asyncio.gather(comm.future, return_exceptions=True)
+
+
+async def test_host_replacement_names_retirement_without_inventing_close_code(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app, registry, store = host_app
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.host_tunnel")
+    old = await _connect_route(app, _TUNNEL_PATH)
+    new = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        await _send_hello_and_wait(old, registry, connection_id="old-host-socket")
+        await new.send_input(
+            {
+                "type": "websocket.receive",
+                "text": _make_hello(connection_id="new-host-socket"),
+            }
+        )
+        await old.wait(timeout=budget(2.0))
+        conn = registry.get(_HOST_ID)
+        assert conn is not None
+        assert conn.hello.connection_id == "new-host-socket"
+        assert store.is_online(_HOST_ID)
+        (end,) = [
+            r.attributes
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_tunnel"
+            and r.attributes.get("phase") == "disconnected"
+        ]
+        assert end["connection_id"] == "old-host-socket"
+        assert end["ended_by"] == "host-sender"
+        assert end["sender_end_reason"] == "queue_retired"
+        assert end["retirement_reason"] == "replaced"
+        assert end["close_code"] is None
+        assert end["close_requested_code"] is None
+        assert conn.diagnostics.snapshot()["outbound_queue_high_water"] is None
+    finally:
+        await new.send_input({"type": "websocket.disconnect", "code": 1000})
+        await new.wait(timeout=budget(2.0))
+        old.stop(exceptions=False)
+        await asyncio.gather(old.future, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("offline_result", "cancellation"),
+    [
+        ("success", "task"),
+        ("success", "scope"),
+        ("failure", "task"),
+        ("failure", "scope"),
+        ("blocked", "task"),
+        ("blocked", "scope"),
+        ("diagnostics_failure", "task"),
+        ("diagnostics_failure", "scope"),
+        ("diagnostics_blocked", "scope"),
+        ("callback_blocked", "scope"),
+    ],
+)
+async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cancellation: str,
+    offline_result: str,
+) -> None:
+    from omnigent.server.routes import host_tunnel
+
     registry = HostRegistry()
     store = HostStore(db_uri)
     app = FastAPI()
     entered = asyncio.Event()
+    cleanup_completed = asyncio.Event()
+    real_monitoring = TunnelDiagnostics.monitoring
+
+    @contextlib.asynccontextmanager
+    async def observed_monitoring(*args, **kwargs):
+        try:
+            async with real_monitoring(*args, **kwargs):
+                yield
+        finally:
+            # Observe finalization at a cancellation checkpoint, retaining the real monitor.
+            await anyio.lowlevel.checkpoint()
+            if offline_result == "diagnostics_blocked":
+                await asyncio.Event().wait()
+            cleanup_completed.set()
+            if offline_result == "diagnostics_failure":
+                raise RuntimeError("test diagnostics finalization failure")
+
+    monkeypatch.setattr(TunnelDiagnostics, "monitoring", observed_monitoring)
+    offline_started = threading.Event()
+    offline_release = threading.Event()
+    offline_finished = threading.Event()
+    offline_errors: list[Exception] = []
+    real_set_offline = store.set_offline
+    if offline_result in {"failure", "blocked"}:
+
+        def interrupted_offline(host_id: str, **kwargs) -> None:
+            assert host_id == _HOST_ID
+            if offline_result == "failure":
+                raise RuntimeError("test offline persistence failure")
+            offline_started.set()
+            try:
+                assert offline_release.wait(timeout=budget(5.0))
+                real_set_offline(host_id, **kwargs)
+            except Exception as exc:
+                offline_errors.append(exc)
+                raise
+            finally:
+                offline_finished.set()
+
+        # Hold only the persistence boundary; registration and reads remain real.
+        monkeypatch.setattr(store, "set_offline", interrupted_offline)
+    if offline_result in {"blocked", "diagnostics_blocked", "callback_blocked"}:
+        monkeypatch.setattr(
+            host_tunnel, "_DISCONNECT_CLEANUP_TIMEOUT_S", budget(0.5), raising=False
+        )
+    if offline_result == "blocked":
+        # Reconnects within one timestamp tick still need protection from a stale write.
+        frozen_time = now_epoch()
+        monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: frozen_time)
 
     async def on_connect(_host_id: str, _owner: str | None) -> None:
         entered.set()
         await asyncio.Event().wait()
 
+    disconnected: list[str] = []
+
+    async def on_disconnect(host_id: str, _owner: str | None) -> None:
+        await anyio.lowlevel.checkpoint()
+        disconnected.append(host_id)
+        if offline_result == "callback_blocked":
+            await asyncio.Event().wait()
+
     app.include_router(
-        create_host_tunnel_router(registry, store, on_host_connect=on_connect),
+        create_host_tunnel_router(
+            registry, store, on_host_connect=on_connect, on_host_disconnect=on_disconnect
+        ),
         prefix="/v1",
     )
-    comm = await _connect_route(app, _TUNNEL_PATH)
+    cancel_scopes: list[anyio.CancelScope] = []
+
+    async def cancellable_app(scope, receive, send):
+        with anyio.CancelScope() as cancel_scope:
+            cancel_scopes.append(cancel_scope)
+            await app(scope, receive, send)
+
+    comm = await _connect_route(cancellable_app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry)
     await asyncio.wait_for(entered.wait(), timeout=budget(1.0))
     helpers = [
@@ -472,17 +773,62 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(db_u
             f"host-ping:{_HOST_ID}",
             f"host-receive:{_HOST_ID}",
             f"host-heartbeat:{_HOST_ID}",
+            "tunnel-diagnostics",
         }
     ]
-    assert len(helpers) == 4
+    assert len(helpers) == 5
+    replacement = None
     try:
-        comm.future.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await comm.future
+        if cancellation == "task":
+            comm.future.cancel()
+        else:
+            # ASGI middleware can keep cancelling at every await during teardown.
+            cancel_scopes[0].cancel()
+        done, _ = await asyncio.wait({comm.future}, timeout=budget(2.0))
+        assert done
+        if cancellation == "task":
+            with pytest.raises(asyncio.CancelledError):
+                comm.future.result()
+        else:
+            comm.future.result()
+        assert cleanup_completed.is_set() == (offline_result != "diagnostics_blocked")
+        assert disconnected == [_HOST_ID]
         assert all(task.done() for task in helpers)
         assert registry.get(_HOST_ID) is None
-        assert not store.is_online(_HOST_ID)
+        persisted = HostStore(db_uri).get_host(_HOST_ID)
+        assert persisted is not None
+        assert persisted.status == (
+            "online" if offline_result in {"failure", "blocked"} else "offline"
+        )
+        if offline_result == "failure":
+            assert "test offline persistence failure" in caplog.text
+        if offline_result == "blocked":
+            assert await asyncio.to_thread(offline_started.wait, budget(2.0))
+            assert not offline_release.is_set()
+            assert "Timed out cleaning up host" in caplog.text
+            monkeypatch.setattr(store, "set_offline", real_set_offline)
+            replacement = await _connect_route(cancellable_app, _TUNNEL_PATH)
+            await _send_hello_and_wait(replacement, registry, connection_id="replacement")
+            assert store.is_online(_HOST_ID)
+            offline_release.set()
+            assert await asyncio.to_thread(offline_finished.wait, budget(2.0))
+            assert not offline_errors, f"Offline worker failed: {offline_errors}"
+            assert store.is_online(_HOST_ID), "A timed-out write must not retire the reconnect"
+        if offline_result == "diagnostics_failure":
+            assert "test diagnostics finalization failure" in caplog.text
+        if offline_result == "diagnostics_blocked":
+            assert "Timed out closing host" in caplog.text
+        if offline_result == "callback_blocked":
+            assert "on_host_disconnect callback timed out" in caplog.text
     finally:
+        offline_release.set()
+        if offline_started.is_set():
+            assert await asyncio.to_thread(offline_finished.wait, budget(2.0))
+        comm.stop(exceptions=False)
+        await asyncio.gather(comm.future, return_exceptions=True)
+        if replacement is not None:
+            replacement.stop(exceptions=False)
+            await asyncio.gather(replacement.future, return_exceptions=True)
         for task in helpers:
             task.cancel()
         await asyncio.gather(*helpers, return_exceptions=True)
@@ -509,8 +855,28 @@ async def test_host_tunnel_accepts_and_registers(
     assert conn.hello.name == "test-laptop"
 
 
+async def test_host_tunnel_upgrade_advertises_server_capabilities(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """Hosts learn on the upgrade, before their hello, which readiness states this server takes."""
+    app, _registry, _store = host_app
+    communicator = ApplicationCommunicator(app, _websocket_scope(_TUNNEL_PATH))
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=budget(1.0))
+
+    assert accepted["type"] == "websocket.accept"
+    headers = dict(accepted.get("headers") or [])
+    advertised = headers[SERVER_CAPABILITIES_HEADER.lower().encode("ascii")].decode("ascii")
+    assert SERVER_CAP_TMUX_READINESS in parse_server_capabilities(advertised)
+    await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+@pytest.mark.parametrize("code,reason", [(1000, "done"), (1006, ""), (1012, "restart")])
 async def test_host_tunnel_deregisters_on_disconnect(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
+    caplog: pytest.LogCaptureFixture,
+    code: int,
+    reason: str,
 ) -> None:
     """
     Verify that the host is removed from the registry on disconnect.
@@ -519,17 +885,32 @@ async def test_host_tunnel_deregisters_on_disconnect(
     call in the finally block is missing.
     """
     app, registry, _store = host_app
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.host_tunnel")
     comm = await _connect_route(app, _TUNNEL_PATH)
-    await _send_hello_and_wait(comm, registry)
+    await _send_hello_and_wait(comm, registry, connection_id="host-close")
     assert registry.get(_HOST_ID) is not None
 
-    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    await comm.send_input({"type": "websocket.disconnect", "code": code, "reason": reason})
     # Poll until deregistered — a fixed sleep flakes under load (the
     # disconnect handler runs deregister asynchronously and may not
     # complete within a fixed window).
     await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
 
     assert registry.get(_HOST_ID) is None
+    await comm.wait(timeout=budget(2.0))
+    (end,) = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "host_tunnel"
+        and r.attributes.get("phase") == "disconnected"
+    ]
+    assert end["connection_id"] == "host-close"
+    assert end["close_code"] == code
+    assert end["close_reason"] == reason
+    assert end["retirement_reason"] is None
+    assert end["ended_by"] == "host-receive"
+    assert end["tunnel_side"] == "server"
+    assert end["protocol_keepalive_source"] == "unavailable_from_asgi"
 
 
 async def test_host_tunnel_upserts_db_on_connect(
@@ -764,6 +1145,26 @@ async def test_host_tunnel_rejects_non_hello_first_frame(
     assert close.get("code") == 4001
 
 
+async def test_host_tunnel_closes_silent_peer_within_handshake_bound(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An accepted peer that never sends host.hello is closed with retryable 1013."""
+    monkeypatch.setattr(tunnel_handshake, "HELLO_TIMEOUT_S", 0.2)
+    app, registry, store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        close = await comm.receive_output(timeout=budget(5.0))
+        assert close["type"] == "websocket.close"
+        assert close.get("code") == 1013
+        assert registry.get(_HOST_ID) is None
+        assert await asyncio.to_thread(store.get_host, _HOST_ID) is None
+        await asyncio.wait_for(comm.future, budget(1.0))
+    finally:
+        comm.stop(exceptions=False)
+        await asyncio.gather(comm.future, return_exceptions=True)
+
+
 async def test_host_tunnel_routes_launch_result_to_future(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
 ) -> None:
@@ -833,6 +1234,7 @@ async def test_host_tunnel_reassembles_chunked_import_session(
         items=[{"type": "message", "response_id": "r1", "data": {"text": "x" * 400}}],
         title="giant",
         source="claude",
+        archived=True,
     )
     texts = list(encode_import_local_session_frames("req_chunked", 1, session, allow_chunks=True))
     assert len(texts) > 1  # actually exercised the chunk path
@@ -844,6 +1246,7 @@ async def test_host_tunnel_reassembles_chunked_import_session(
     assert kind == "session"
     assert payload["external_session_id"] == "s_giant"
     assert payload["items"] == session.items
+    assert payload["archived"] is True
     assert payload["total"] == 1
 
 
@@ -1300,6 +1703,171 @@ async def test_managed_token_authenticates_as_record_owner(
     assert host.sandbox_id == "sb-tunnel-1"
 
 
+async def test_managed_heartbeat_renews_only_when_due_and_retries_failure(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Routine heartbeats skip renewal, and a failed renewal remains due."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    clock = 100.0
+    monkeypatch.setattr(tunnel_mod, "monotonic", lambda: clock)
+    monkeypatch.setattr(tunnel_mod, "now_epoch", lambda: int(clock))
+    requested = asyncio.Event()
+    completed: asyncio.Queue[tuple[str | None, int | None]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    store = HostStore(db_uri)
+    fail = False
+
+    def heartbeat(
+        host_id: str,
+        *,
+        managed_token: str | None,
+        token_ttl_s: int | None,
+        observed_at: int,
+        cancelled: Callable[[], bool],
+    ) -> None:
+        assert host_id == _HOST_ID
+        assert observed_at == int(clock)
+        assert not cancelled()
+        try:
+            if fail:
+                raise RuntimeError("temporary renewal failure")
+        finally:
+            loop.call_soon_threadsafe(completed.put_nowait, (managed_token, token_ttl_s))
+
+    monkeypatch.setattr(store, "heartbeat", heartbeat)
+    task = asyncio.create_task(
+        tunnel_mod._heartbeat_loop(
+            requested, host_id=_HOST_ID, host_store=store, managed_token="token", token_ttl_s=600
+        )
+    )
+    try:
+        for clock, fail, expected_ttl in [
+            (100, False, 600),
+            (100, False, None),
+            (399, False, None),
+            (400, True, 600),
+            (400, False, 600),
+            (699, False, None),
+            (700, False, 600),
+        ]:
+            requested.set()
+            assert await asyncio.wait_for(completed.get(), timeout=budget(1.0)) == (
+                "token",
+                expected_ttl,
+            )
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.parametrize(
+    ("provider", "launcher_provider"),
+    [
+        (None, "modal"),
+        (None, "daytona"),
+        (None, None),
+        (None, "broken"),
+        ("modal", "modal"),
+        ("daytona", "daytona"),
+    ],
+)
+async def test_managed_heartbeat_renews_token_for_reconnect(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str | None,
+    launcher_provider: str | None,
+) -> None:
+    """An authenticated live tunnel keeps its token usable beyond launch expiry."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+    import omnigent.stores.host_store as store_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+    elapsed = 0.0
+    monkeypatch.setattr(tunnel_mod, "monotonic", lambda: elapsed)
+    token_ttl_s = 600
+    launcher = FakeSandboxLauncher()
+    monkeypatch.setattr(launcher, "provider", launcher_provider)
+
+    def launcher_factory() -> FakeSandboxLauncher:
+        if launcher_provider is None:
+            raise HTTPException(status_code=400, detail="provider unavailable")
+        if launcher_provider == "broken":
+            raise ValueError("invalid launcher configuration")
+        return launcher
+
+    server_url = "https://managed-test.example.com"
+    if provider is None:
+        deployment = ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url=server_url,
+                launcher_factory=launcher_factory,
+                token_ttl_s=token_ttl_s,
+            )
+        )
+    else:
+        providers: list[dict[str, object]] = [{"provider": "daytona"}]
+        if provider == "modal":
+            providers.append({"provider": "modal", "token_ttl_s": token_ttl_s})
+        deployment = parse_sandbox_config(
+            {"server_url": server_url, "token_ttl_s": 1200, "providers": providers}
+        )
+        assert deployment is not None
+    registry, store = HostRegistry(), HostStore(db_uri)
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(registry, store, sandbox_config=deployment), prefix="/v1"
+    )
+    token = "long-lived-sandbox-token"
+    should_renew = provider == "modal" or (provider is None and launcher_provider == "modal")
+    _register_managed(store, host_id=_HOST_ID, token=token)
+    communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
+    await communicator.send_input({"type": "websocket.connect"})
+    assert (await communicator.receive_output(timeout=budget(1.0)))["type"] == "websocket.accept"
+    await _send_hello_and_wait(communicator, registry)
+    try:
+        # Advance past every expiry the initial connection could have issued.
+        renewed_at = now_epoch() + 7 * 24 * 3600
+        elapsed += 7 * 24 * 3600
+        monkeypatch.setattr(store_mod, "now_epoch", lambda: renewed_at)
+        monkeypatch.setattr(tunnel_mod, "now_epoch", lambda: renewed_at)
+        await _wait_updated_at_at_least(store, _HOST_ID, renewed_at)
+        if should_renew:
+            await poll_until_async(
+                lambda: store.resolve_launch_token(_HOST_ID, token) is not None,
+                timeout_s=budget(1.0),
+            )
+        assert (store.resolve_launch_token(_HOST_ID, token) is not None) == should_renew
+        with Session(get_or_create_engine(db_uri)) as session:
+            row = session.execute(select(SqlHost).where(SqlHost.host_id == _HOST_ID)).scalar_one()
+            assert row.token_expires_at is not None
+            if should_renew:
+                assert row.token_expires_at == renewed_at + token_ttl_s
+            else:
+                assert row.token_expires_at < renewed_at
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(2.0))
+
+    reconnected = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
+    await reconnected.send_input({"type": "websocket.connect"})
+    response = await reconnected.receive_output(timeout=budget(1.0))
+    if not should_renew:
+        assert response["type"] == "websocket.close"
+        assert response["code"] == 4004
+        await reconnected.wait(timeout=budget(2.0))
+        return
+    assert response["type"] == "websocket.accept"
+    try:
+        await _send_hello_and_wait(reconnected, registry)
+        assert store.is_online(_HOST_ID)
+    finally:
+        await reconnected.send_input({"type": "websocket.disconnect", "code": 1000})
+        await reconnected.wait(timeout=budget(2.0))
+
+
 async def test_managed_token_is_revalidated_after_websocket_accept(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
 ) -> None:
@@ -1389,6 +1957,8 @@ class _FakeSenderWebSocket:
         record the frame instead.
     :param application_state: Post-raise state, mimicking Starlette's
         synchronous state flip when a concurrent close wins the race.
+    :param client_state: Receive-side state; ``DISCONNECTED`` once the
+        peer's close was received.
     """
 
     def __init__(
@@ -1396,6 +1966,7 @@ class _FakeSenderWebSocket:
         *,
         raises: Exception | None = None,
         application_state: object = None,
+        client_state: object = None,
     ) -> None:
         from starlette.websockets import WebSocketState
 
@@ -1403,6 +1974,7 @@ class _FakeSenderWebSocket:
         self.application_state = (
             application_state if application_state is not None else WebSocketState.CONNECTED
         )
+        self.client_state = client_state if client_state is not None else WebSocketState.CONNECTED
         self.sent: list[str] = []
 
     async def send_text(self, data: str) -> None:
@@ -1424,9 +1996,36 @@ async def test_host_sender_loop_swallows_send_after_close_race() -> None:
         raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
         application_state=WebSocketState.DISCONNECTED,
     )
-    conn = SimpleNamespace(host_id=_HOST_ID, outbound_queue=asyncio.Queue())
-    conn.outbound_queue.put_nowait("frame")
+    conn = SimpleNamespace(
+        host_id=_HOST_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    conn.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     await host_tunnel._sender_loop(ws, conn)  # returns without raising
+
+
+async def test_host_sender_loop_ends_quietly_when_the_peer_close_was_received() -> None:
+    """uvicorn rejects a send once the peer's close was received, even though
+    the server never sent its own close; the receive helper owns that disconnect."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import host_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError(
+            "Unexpected ASGI message 'websocket.send', after sending "
+            "'websocket.close' or response already completed."
+        ),
+        application_state=WebSocketState.CONNECTED,
+        client_state=WebSocketState.DISCONNECTED,
+    )
+    conn = SimpleNamespace(
+        host_id=_HOST_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    conn.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
+    await host_tunnel._sender_loop(ws, conn)  # returns without raising
+    assert conn.sender_end_reason == "send_after_close"
 
 
 async def test_host_sender_loop_reraises_send_failure_while_connected() -> None:
@@ -1442,8 +2041,10 @@ async def test_host_sender_loop_reraises_send_failure_while_connected() -> None:
         raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
         application_state=WebSocketState.CONNECTED,
     )
-    conn = SimpleNamespace(host_id=_HOST_ID, outbound_queue=asyncio.Queue())
-    conn.outbound_queue.put_nowait("frame")
+    conn = SimpleNamespace(
+        host_id=_HOST_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    conn.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     with pytest.raises(RuntimeError):
         await host_tunnel._sender_loop(ws, conn)
 

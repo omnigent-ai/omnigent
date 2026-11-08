@@ -43,6 +43,7 @@ from omnigent.inner.codex_goal_command import (
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
     TextChunk,
@@ -57,6 +58,14 @@ from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigne
 from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+
+
+@pytest.fixture(autouse=True)
+def _isolate_codex_config_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._start_codex_model_discovery_process",
+        AsyncMock(side_effect=OSError("no installed CLI in executor unit tests")),
+    )
 
 
 def _run(coro):
@@ -167,7 +176,9 @@ class _FakeProcess:
         self.stderr = _FakePipe()
         self.returncode: int | None = None
         self.terminated = False
-        self.pid = 12345
+        # Above Linux's PID_MAX_LIMIT (2**22), so the real terminate_tree these
+        # tests reach can never signal a live process on the test machine.
+        self.pid = 2**22 + 1
 
     def terminate(self) -> None:
         self.terminated = True
@@ -870,121 +881,196 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_app_server_run_turn_applies_effort_via_thread_settings_update(self):
-        """Reasoning effort rides thread/settings/update, not turn/start.
-
-        Codex's ``TurnStartParams`` has no ``effort`` field, so an effort set
-        on ``turn/start`` is silently dropped by serde and never takes effect.
-        It must go through ``thread/settings/update`` (whose
-        ``ThreadSettingsUpdateParams`` carries ``effort``) — the same path the
-        TUI ``/model`` picker uses.
-        """
-
-        async def _t():
-            session = _CodexAppServerSession(
-                codex_path="/bin/echo",
-                cwd="/tmp/workspace",
-                env={},
-                tool_executor=None,
-            )
-            session.start = AsyncMock()
-            session._proc = _FakeProcess()
-            session._request = AsyncMock(
-                side_effect=[
-                    {"result": {"thread": {"id": "thread-1"}}},  # thread/start
-                    {"result": {}},  # thread/settings/update
-                    {"result": {"turn": {"id": "turn-1"}}},  # turn/start
-                ]
-            )
-
-            async def _inject_turn_completed() -> None:
-                await asyncio.sleep(0.01)
-                session._events.put_nowait(
-                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
-                )
-
-            inject_task = asyncio.create_task(_inject_turn_completed())
-            # Drive the turn to completion (consume the event stream for its
-            # side effects — the RPCs we assert on below).
-            async for _event in session.run_turn(
-                messages=[{"role": "user", "content": "hi"}],
-                tools=[],
-                system_prompt="",
-                model="gpt-5.4-mini",
-                cwd=".",
-                sandbox="workspace-write",
-                reasoning_effort="high",
-            ):
-                pass
-            await inject_task
-
-            methods = [call.args[0] for call in session._request.await_args_list]
-            # Settings update lands BEFORE the turn starts so the effort applies
-            # to this turn, and turn/start carries no (dropped) effort field.
-            self.assertEqual(methods, ["thread/start", "thread/settings/update", "turn/start"])
-            settings_params = session._request.await_args_list[1].args[1]
-            self.assertEqual(
-                settings_params,
-                {
-                    "threadId": "thread-1",
-                    "effort": "high",
-                    "summary": "detailed",
-                },
-            )
-            turn_params = session._request.await_args_list[2].args[1]
-            self.assertNotIn("effort", turn_params)
-
-        _run(_t())
+        """Explicit effort and Default both update the existing thread."""
+        for configured_default in (None, "xhigh"):
+            with self.subTest(configured_default=configured_default):
+                _run(self._assert_app_server_effort_transitions(configured_default))
 
     def test_app_server_run_turn_falls_back_when_settings_update_is_unsupported(self):
         """Older app-server builds accept effort only on ``turn/start``."""
+        for configured_default in (None, "xhigh"):
+            with self.subTest(configured_default=configured_default):
+                _run(
+                    self._assert_app_server_effort_transitions(
+                        configured_default, supports_settings=False
+                    )
+                )
 
-        async def _t():
+    async def _assert_app_server_effort_transitions(
+        self, configured_default: str | None, *, supports_settings: bool = True
+    ):
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        default_effort = configured_default or "low"
+        server_effort = default_effort
+        applied_efforts = []
+        turn_count = 0
+
+        async def request(method, params):
+            nonlocal server_effort, turn_count
+            if method == "thread/start":
+                self.assertEqual(params["developerInstructions"], "Keep the passphrase.")
+                self.assertEqual(params["dynamicTools"][0]["name"], "remember")
+                return {
+                    "result": {
+                        "thread": {"id": "thread-1"},
+                        "model": "resolved-model",
+                        "reasoningEffort": configured_default,
+                    }
+                }
+            if method == "model/list":
+                self.assertTrue(params["includeHidden"])
+                if not params.get("cursor"):
+                    return {
+                        "result": {
+                            "data": [{"model": "other-model", "defaultReasoningEffort": "high"}],
+                            "nextCursor": "next-page",
+                        }
+                    }
+                self.assertEqual(params["cursor"], "next-page")
+                return {
+                    "result": {
+                        "data": [{"model": "resolved-model", "defaultReasoningEffort": "low"}],
+                        "nextCursor": None,
+                    }
+                }
+            self.assertEqual(params["threadId"], "thread-1")
+            if method == "thread/settings/update":
+                if not supports_settings:
+                    raise RuntimeError(
+                        "{'code': -32600, 'message': 'Invalid request: unknown variant "
+                        "`thread/settings/update`'}"
+                    )
+                self.assertEqual(params["summary"], "detailed")
+                # Codex maps effort with Option::map(Some): null is a no-op.
+                if params.get("effort") is not None:
+                    server_effort = params["effort"]
+                return {"result": {}}
+            self.assertEqual(method, "turn/start")
+            turn_count += 1
+            self.assertEqual(params["input"], [{"type": "text", "text": f"message-{turn_count}"}])
+            if supports_settings:
+                self.assertNotIn("effort", params)
+            elif params.get("effort") is not None:
+                self.assertEqual(params["summary"], "detailed")
+                server_effort = params["effort"]
+            applied_efforts.append(server_effort)
+            turn = {"id": f"turn-{turn_count}"}
+            asyncio.get_running_loop().call_soon(
+                session._events.put_nowait, {"method": "turn/completed", "params": {"turn": turn}}
+            )
+            return {"result": {"turn": turn}}
+
+        session._request = AsyncMock(side_effect=request)
+        messages = []
+        for index, effort in enumerate((None, "high", "high", None, None, "medium", None), 1):
+            messages.append({"role": "user", "content": f"message-{index}"})
+            async for _ in session.run_turn(
+                messages=messages,
+                tools=[
+                    {
+                        "name": "remember",
+                        "description": "Remember",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+                system_prompt="Keep the passphrase.",
+                model=None,
+                cwd=".",
+                sandbox="workspace-write",
+                reasoning_effort=effort,
+            ):
+                pass
+            messages.append({"role": "assistant", "content": "remembered"})
+            self.assertEqual(server_effort, effort or default_effort, f"turn {index}: {effort=}")
+
+        self.assertEqual(
+            applied_efforts,
+            [
+                default_effort,
+                "high",
+                "high",
+                default_effort,
+                default_effort,
+                "medium",
+                default_effort,
+            ],
+        )
+        methods = [call.args[0] for call in session._request.await_args_list]
+        self.assertEqual(methods.count("thread/start"), 1)
+        self.assertEqual(methods.count("thread/settings/update"), 4)
+        self.assertEqual(methods.count("model/list"), 0 if configured_default else 2)
+        self.assertIsNone(session._applied_effort)
+
+    def test_app_server_run_turn_retries_failed_effort_reset(self):
+        """Failed resets must not start with stale effort or mark Default applied."""
+
+        async def _t(failure):
             session = _CodexAppServerSession(
-                codex_path="/bin/echo",
-                cwd="/tmp/workspace",
-                env={},
-                tool_executor=None,
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
             )
             session.start = AsyncMock()
             session._proc = _FakeProcess()
-            session._request = AsyncMock(
-                side_effect=[
-                    {"result": {"thread": {"id": "thread-1"}}},
-                    RuntimeError(
-                        "{'code': -32600, 'message': 'Invalid request: unknown variant "
-                        "`thread/settings/update`'}"
-                    ),
-                    {"result": {"turn": {"id": "turn-1"}}},
-                ]
-            )
+            session.thread_id = "thread-1"
+            session._thread_model = "resolved-model"
+            session._applied_effort = "high"
+            session._default_effort = None if failure == "catalog" else "low"
+            failing = True
 
-            async def _inject_turn_completed() -> None:
-                await asyncio.sleep(0.01)
-                session._events.put_nowait(
-                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+            async def request(method, params):
+                if method == "model/list":
+                    if failing:
+                        return {"result": {"data": [], "nextCursor": "repeated-cursor"}}
+                    return {
+                        "result": {
+                            "data": [{"model": "resolved-model", "defaultReasoningEffort": "low"}]
+                        }
+                    }
+                if method == "thread/settings/update":
+                    self.assertEqual(params["effort"], "low")
+                    if failure == "legacy turn":
+                        raise RuntimeError("unknown variant `thread/settings/update`")
+                    if failing:
+                        raise RuntimeError("settings rejected")
+                    return {"result": {}}
+                self.assertEqual(method, "turn/start")
+                if failing:
+                    raise RuntimeError("turn rejected")
+                if failure == "legacy turn":
+                    self.assertEqual(params["effort"], "low")
+                asyncio.get_running_loop().call_soon(
+                    session._events.put_nowait,
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}},
                 )
+                return {"result": {"turn": {"id": "turn-1"}}}
 
-            inject_task = asyncio.create_task(_inject_turn_completed())
-            async for _event in session.run_turn(
-                messages=[{"role": "user", "content": "hi"}],
-                tools=[],
-                system_prompt="",
-                model="gpt-5.4-mini",
-                cwd=".",
-                sandbox="workspace-write",
-                reasoning_effort="low",
-            ):
-                pass
-            await inject_task
+            session._request = AsyncMock(side_effect=request)
+            turn_args = {
+                "messages": [{"role": "user", "content": "retry"}],
+                "tools": [],
+                "system_prompt": "",
+                "model": None,
+                "cwd": ".",
+                "sandbox": "workspace-write",
+            }
+            with self.assertRaisesRegex(RuntimeError, "Cannot restore|rejected"):
+                _ = [event async for event in session.run_turn(**turn_args)]
+            self.assertEqual(session._applied_effort, "high")
+            self.assertEqual(session.thread_id, "thread-1")
+            if failure != "legacy turn":
+                self.assertNotIn(
+                    "turn/start", [call.args[0] for call in session._request.await_args_list]
+                )
+            failing = False
+            _ = [event async for event in session.run_turn(**turn_args)]
+            self.assertIsNone(session._applied_effort)
 
-            methods = [call.args[0] for call in session._request.await_args_list]
-            self.assertEqual(methods, ["thread/start", "thread/settings/update", "turn/start"])
-            turn_params = session._request.await_args_list[2].args[1]
-            self.assertEqual(turn_params["effort"], "low")
-            self.assertEqual(turn_params["summary"], "detailed")
-            self.assertEqual(session._applied_effort, "low")
-
-        _run(_t())
+        for failure in ("catalog", "settings", "legacy turn"):
+            with self.subTest(failure=failure):
+                _run(_t(failure))
 
     def test_app_server_run_turn_dedupes_unchanged_effort(self):
         """An unchanged effort is not re-sent on a later turn of one thread.
@@ -1167,7 +1253,7 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_signature_change_recreates_app_session(self):
-        async def _t():
+        async def _t(change_model):
             first = _FakeAppSession([[TurnComplete(response="one")]])
             second = _FakeAppSession([[TurnComplete(response="two")]])
             sessions = [first, second]
@@ -1183,13 +1269,16 @@ class TestCodexExecutor(unittest.TestCase):
                     [{"role": "user", "content": "hi", "session_id": "s1"}],
                     [],
                     "",
+                    config=ExecutorConfig(model="first-model", extra={"reasoning_effort": "high"}),
                 )
             ]
             second_events = [
                 e
                 async for e in executor.run_turn(
                     [{"role": "user", "content": "hi", "session_id": "s1"}],
-                    [
+                    []
+                    if change_model
+                    else [
                         {
                             "name": "sleep",
                             "description": "Sleep",
@@ -1197,6 +1286,7 @@ class TestCodexExecutor(unittest.TestCase):
                         }
                     ],
                     "",
+                    config=ExecutorConfig(model="second-model" if change_model else "first-model"),
                 )
             ]
 
@@ -1204,8 +1294,15 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertEqual(second_events[-1].response, "two")
             self.assertTrue(first.closed)
             self.assertFalse(second.closed)
+            self.assertEqual(first.calls[0]["reasoning_effort"], "high")
+            self.assertIsNone(second.calls[0]["reasoning_effort"])
+            self.assertEqual(
+                second.calls[0]["model"], "second-model" if change_model else "first-model"
+            )
 
-        _run(_t())
+        for change_model in (False, True):
+            with self.subTest(change_model=change_model):
+                _run(_t(change_model))
 
     def test_signature_change_cannot_replace_incompletely_cleaned_session(self):
         async def _t():
@@ -4442,6 +4539,305 @@ def test_materialize_codex_provider_config_applies_custom_retry_policy(tmp_path:
     assert provider["stream_idle_timeout_ms"] == 300_000
 
 
+@pytest.mark.parametrize(
+    "private_url,source_defined,selected",
+    [
+        (None, True, True),
+        ("https://private.example.test/v1", True, True),
+        (None, False, True),
+        (None, True, False),
+    ],
+    ids=[
+        "missing-private-provider",
+        "private-provider-wins",
+        "missing-source-provider",
+        "unselected",
+    ],
+)
+def test_materialize_codex_provider_config_backfills_only_missing_selected_provider(
+    tmp_path: Path, private_url: str | None, source_defined: bool, selected: bool
+) -> None:
+    """Host definitions can fill a missing selection without replacing private choices."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    original = '[model_providers.unselected]\nname = "Unselected"\n'
+    if source_defined:
+        original += (
+            '[model_providers.gateway]\nname = "Gateway"\n'
+            'base_url = "https://source.example.test/v1"\nwire_api = "responses"\n'
+        )
+    (source / "config.toml").write_text(original)
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    private_config = (
+        'model = "private-model"\ndeveloper_instructions = "Keep these instructions"\n'
+    )
+    if private_url is not None:
+        private_config += (
+            f'[model_providers.gateway]\nname = "Private"\nbase_url = "{private_url}"\n'
+        )
+    config_path.write_text(private_config)
+    overrides = ['model_provider="gateway"'] if selected else []
+
+    assert materialize_codex_provider_config(private, overrides, source_home=source) == overrides
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    assert config["developer_instructions"] == "Keep these instructions"
+    providers = config.get("model_providers", {})
+    assert "unselected" not in providers
+    if private_url is not None:
+        assert providers["gateway"]["base_url"] == private_url
+        assert providers["gateway"]["name"] == "Private"
+    elif selected and source_defined:
+        assert providers["gateway"]["base_url"] == "https://source.example.test/v1"
+    else:
+        assert "gateway" not in providers
+    assert (source / "config.toml").read_text() == original
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("private_style", ["inline", "standard"])
+def test_materialize_codex_provider_config_backfill_matches_private_table_style(
+    tmp_path: Path, private_style: str
+) -> None:
+    """A copied provider, nested tables included, serializes in the private file's table style."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Gateway"\n'
+        'base_url = "https://source.example.test/v1"\nwire_api = "responses"\n'
+        '[model_providers.gateway.auth]\ncommand = "sh"\nargs = ["-c", "printf token"]\n'
+        '[model_providers.gateway.http_headers]\nX-Trace = "yes"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    if private_style == "inline":
+        config_path.write_text(
+            'model = "private-model"\n'
+            "model_providers = { other = "
+            '{ name = "Other", base_url = "https://other.example.test" } }\n'
+        )
+    else:
+        config_path.write_text(
+            'model = "private-model"\n'
+            '[model_providers.other]\nname = "Other"\nbase_url = "https://other.example.test"\n'
+        )
+    overrides = ['model_provider="gateway"']
+
+    assert materialize_codex_provider_config(private, overrides, source_home=source) == overrides
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    providers = config["model_providers"]
+    assert providers["other"]["name"] == "Other"
+    assert providers["other"]["base_url"] == "https://other.example.test"
+    assert providers["gateway"]["base_url"] == "https://source.example.test/v1"
+    assert providers["gateway"]["auth"]["args"] == ["-c", "printf token"]
+    assert providers["gateway"]["http_headers"]["X-Trace"] == "yes"
+
+
+def test_materialize_codex_provider_config_generated_override_outranks_source_definition(
+    tmp_path: Path,
+) -> None:
+    """A generated table for the selected provider is kept over the host's definition."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Host"\nbase_url = "https://source.example.test/v1"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "config.toml").write_text('model = "private-model"\n')
+    generated = (
+        'model_providers.gateway={name="Generated",'
+        'base_url="https://generated.example.test/v1",wire_api="responses"}'
+    )
+
+    assert materialize_codex_provider_config(
+        private, [generated, 'model_provider="gateway"'], source_home=source
+    ) == ['model_provider="gateway"']
+
+    provider = tomllib.loads((private / "config.toml").read_text())["model_providers"]["gateway"]
+    assert provider["name"] == "Generated"
+    assert provider["base_url"] == "https://generated.example.test/v1"
+
+
+@pytest.mark.parametrize(
+    "private_selection,overrides,expected",
+    [
+        (None, ["model_provider=gateway"], {"gateway"}),
+        (None, ['model_provider="gateway"', "model_provider=other"], {"other"}),
+        ("other", ["model_provider=gateway"], {"gateway"}),
+    ],
+    ids=["bare-value-selects", "last-override-wins", "override-replaces-private-selection"],
+)
+def test_materialize_codex_provider_config_reads_selection_like_codex(
+    tmp_path: Path, private_selection: str | None, overrides: list[str], expected: set[str]
+) -> None:
+    """A bare ``model_provider=name`` selects that provider and the last override wins."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Gateway"\n[model_providers.other]\nname = "Other"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    private_config = 'model = "private-model"\n'
+    if private_selection is not None:
+        private_config += f'model_provider = "{private_selection}"\n'
+    config_path.write_text(private_config)
+
+    assert materialize_codex_provider_config(private, overrides, source_home=source) == overrides
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    assert config.get("model_provider") == private_selection
+    assert set(config["model_providers"]) == expected
+
+
+def test_materialize_codex_provider_config_backfills_the_active_profile_selection(
+    tmp_path: Path,
+) -> None:
+    """Without an override, the private config's active profile decides the selection."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Gateway"\n[model_providers.other]\nname = "Other"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    config_path.write_text(
+        'model = "private-model"\nprofile = "work"\nmodel_provider = "other"\n'
+        '[profiles.work]\nmodel_provider = "gateway"\n'
+    )
+
+    assert materialize_codex_provider_config(private, [], source_home=source) == []
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["profile"] == "work"
+    assert config["model_provider"] == "other"
+    assert set(config["model_providers"]) == {"gateway"}
+
+
+@pytest.mark.parametrize("source_failure", ["toml", "utf8", "read", "stat"])
+def test_materialize_codex_provider_config_skips_unusable_optional_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    source_failure: str,
+) -> None:
+    """A host source failure cannot preempt providers supplied by other Codex layers."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.spec.types import RetryPolicy
+
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    original_private = (
+        'model = "private-model"\n'
+        '[model_providers.existing]\nname = "Private"\nbase_url = "https://private.example.test"\n'
+    )
+    config_path.write_text(original_private)
+    source = tmp_path / "source"
+    source.mkdir()
+    source_path = source / "config.toml"
+    original_source = (
+        b"model_providers = ["
+        if source_failure == "toml"
+        else b"\xff"
+        if source_failure == "utf8"
+        else b""
+    )
+    source_path.write_bytes(original_source)
+    read_text = Path.read_text
+    is_file = Path.is_file
+
+    def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        if path == source_path and source_failure == "read":
+            raise PermissionError("source read unavailable")
+        return read_text(path, encoding=encoding, errors=errors)
+
+    def exists(path: Path) -> bool:
+        if path == source_path and source_failure == "stat":
+            raise OSError("source metadata unavailable")
+        return is_file(path)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(Path, "is_file", exists)
+    overrides = ['model_provider="managed_gateway"']
+
+    assert (
+        materialize_codex_provider_config(
+            private, overrides, source_home=source, retry_policy=RetryPolicy(max_retries=9)
+        )
+        == overrides
+    )
+    assert "skipping unusable Codex source config" in caplog.text
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    assert set(config["model_providers"]) == {"existing"}
+    existing = config["model_providers"]["existing"]
+    assert existing["name"] == "Private"
+    assert existing["base_url"] == "https://private.example.test"
+    assert existing["request_max_retries"] == existing["stream_max_retries"] == 9
+    assert source_path.read_bytes() == original_source
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    "private_config", [b"model_providers = [", b"model_providers = 42\n", b"\xff"]
+)
+def test_materialize_codex_provider_config_preserves_invalid_private_config(
+    tmp_path: Path, private_config: bytes
+) -> None:
+    """A source definition cannot replace malformed private configuration."""
+    import tomlkit
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    config_path.write_bytes(private_config)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text('[model_providers.gateway]\nname = "Gateway"\n')
+
+    with pytest.raises((ValueError, tomlkit.exceptions.TOMLKitError)):
+        materialize_codex_provider_config(
+            private, ['model_provider="gateway"'], source_home=source
+        )
+
+    assert config_path.read_bytes() == private_config
+
+
 def test_materialize_codex_provider_config_leaves_builtin_provider_tables_untouched(
     tmp_path: Path,
 ) -> None:
@@ -4465,6 +4861,157 @@ def test_materialize_codex_provider_config_leaves_builtin_provider_tables_untouc
     assert config["model_providers"]["amazon-bedrock"] == {"aws": {"region": "us-east-1"}}
     gateway = config["model_providers"]["gateway"]
     assert gateway["request_max_retries"] == RetryPolicy().max_retries
+
+
+@pytest.mark.parametrize("ci", [False, True])
+def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ci: bool,
+) -> None:
+    """Unity Gateway providers name Codex and Omnigent (plus ug for its own table)."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import (
+        _databricks_codex_config_overrides,
+        materialize_codex_provider_config,
+    )
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if ci:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"polly-review","run_id":"123"}')
+
+    gateway_url = "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1"
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        f'[model_providers.Databricks]\nbase_url = "{gateway_url}"\n\n'
+        "[model_providers.Databricks.http_headers]\n"
+        'User-Agent = "ucode/0.1.0 codex/0.145.0"\n\n'
+        '[model_providers.other]\nbase_url = "https://openrouter.ai/api/v1"\n'
+    )
+
+    materialize_codex_provider_config(
+        codex_home,
+        _databricks_codex_config_overrides(
+            model="system.ai.gpt-5-5", base_url=gateway_url, auth_command="printf token"
+        ),
+    )
+
+    providers = tomllib.loads((codex_home / "config.toml").read_text())["model_providers"]
+    tags = {}
+    if ci:
+        tags = {"Databricks-Ai-Gateway-Request-Tags": '{"pipeline":"polly-review","run_id":"123"}'}
+    assert providers["Databricks"]["http_headers"] == {
+        **tags,
+        "User-Agent": "ucode/0.1.0 codex/0.145.0",
+        "Databricks-Custom-Coding-Agent": "codex",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+    }
+    assert providers["omnigent_databricks"]["http_headers"] == {
+        **tags,
+        "Databricks-Custom-Coding-Agent": "codex",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+    }
+    assert "http_headers" not in providers["other"]
+
+
+@pytest.mark.parametrize("include_effective_providers", [True, False])
+@pytest.mark.parametrize("inline_providers", [False, True])
+def test_materialize_attributes_effective_gateway_without_copying_credentials(
+    tmp_path: Path,
+    include_effective_providers: bool,
+    inline_providers: bool,
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    resolved_config = (
+        '[model_providers.Managed]\nname = "Managed Gateway"\n'
+        'base_url = "https://ws.cloud.databricks.com/ai-gateway/codex/v1"\n'
+        '[model_providers.Managed.auth]\ncommand = "secret-helper"\n'
+        "[model_providers.Managed.http_headers]\n"
+        'user-agent = "ucode/1 codex/1"\nAuthorization = "Bearer machine-secret"\n'
+        'Databricks-Custom-Client-Surfaces = "ug, inner"\n'
+    )
+    providers = tomllib.loads(resolved_config)["model_providers"]
+    private_home = tmp_path / "codex-home"
+    if inline_providers:
+        private_home.mkdir()
+        (private_home / "config.toml").write_text(
+            'model_providers = { other = { name = "Other", base_url = "https://example.test" } }\n'
+        )
+    materialize_codex_provider_config(
+        private_home, [], effective_providers=providers if include_effective_providers else None
+    )
+    config_path = private_home / "config.toml"
+    if include_effective_providers:
+        written = config_path.read_text()
+        provider = tomllib.loads(written)["model_providers"]["Managed"]
+        assert provider["name"] == "Managed Gateway"
+        assert provider["http_headers"] == {
+            "Databricks-Custom-Coding-Agent": "codex",
+            "Databricks-Custom-Client-Surfaces": "omnigent, ug, inner",
+        }
+        assert "base_url" not in provider
+        assert "auth" not in provider
+        assert "machine-secret" not in written
+    elif inline_providers:
+        assert "Managed" not in tomllib.loads(config_path.read_text())["model_providers"]
+    else:
+        assert not config_path.exists()
+    assert providers == tomllib.loads(resolved_config)["model_providers"]
+
+
+@pytest.mark.parametrize("existing_name", [None, "My Gateway", ""])
+def test_materialize_inherited_gateway_name_preserves_explicit_values(
+    tmp_path: Path, existing_name: str | None
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    private_home = tmp_path / "codex-home"
+    private_home.mkdir()
+    config_path = private_home / "config.toml"
+    config_path.write_text(
+        "[model_providers.Managed]\nrequest_max_retries = 2\n"
+        + (f"name = {json.dumps(existing_name)}\n" if existing_name is not None else "")
+    )
+    materialize_codex_provider_config(
+        private_home,
+        [],
+        effective_providers={
+            "Managed": {
+                "name": "Managed Gateway",
+                "base_url": "https://ws.cloud.databricks.com/ai-gateway/codex/v1",
+            }
+        },
+    )
+    provider = tomllib.loads(config_path.read_text())["model_providers"]["Managed"]
+    assert provider["name"] == ("Managed Gateway" if existing_name is None else existing_name)
+    assert "base_url" not in provider
+
+
+def test_materialize_ignores_non_gateway_effective_providers(
+    tmp_path: Path,
+) -> None:
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    private_home = tmp_path / "codex-home"
+    assert (
+        materialize_codex_provider_config(
+            private_home,
+            [],
+            effective_providers={
+                "Other": {"base_url": "https://ws.cloud.databricks.com/serving-endpoints"}
+            },
+        )
+        == []
+    )
+    assert not (private_home / "config.toml").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -4812,13 +5359,15 @@ async def test_codex_cli_version_times_out_and_kills_proc(
         b"codex-cli 0.140.0-alpha.19\n",
         b"codex-cli 0.140.0\n",
         b"codex-cli 0.141.0\n",
+        b"codex-cli 0.145.9\n",
         b"codex-cli 0.146.1-alpha.1\n",
-        b"codex-cli 0.146.1\n",
-        b"codex-cli 1.0.0\n",
+        b"codex-cli 0.159.2-alpha.1\n",
+        b"codex-cli 0.159.2-dev.1\n",
+        b"codex-cli 0.146.0.post1\n",
         b"dependency 0.146.0 codex-cli 0.146.0\n",
     ],
 )
-async def test_brokered_codex_version_gate_rejects_unknown_wire_versions_before_launch(
+async def test_brokered_codex_version_gate_rejects_old_and_unstable_versions_before_launch(
     monkeypatch: pytest.MonkeyPatch,
     output: bytes,
 ) -> None:
@@ -4831,11 +5380,22 @@ async def test_brokered_codex_version_gate_rejects_unknown_wire_versions_before_
         await _require_brokered_codex_version("/usr/local/bin/codex")
 
 
-async def test_brokered_codex_version_gate_accepts_tested_1460(
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"codex-cli 0.146.0\n",
+        b"codex-cli 0.146.1\n",
+        b"codex-cli 0.154.0\n",
+        b"codex-cli 0.159.2\n",
+        b"codex-cli 1.0.0\n",
+    ],
+)
+async def test_brokered_codex_version_gate_accepts_stable_releases_from_0146(
     monkeypatch: pytest.MonkeyPatch,
+    output: bytes,
 ) -> None:
     async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
-        return _FakeVersionProcess(stdout=b"codex-cli 0.146.0\n")
+        return _FakeVersionProcess(stdout=output)
 
     monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
 
@@ -4948,18 +5508,92 @@ def test_select_codex_skill_dirs_none_and_list(tmp_path: Path) -> None:
 
 def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
     """Bundle and Codex-specific skills take precedence over shared skills."""
-    from omnigent.inner.codex_executor import codex_skill_sources
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
 
     bundle = tmp_path / "bundle"
     (bundle / "skills").mkdir(parents=True)
     home = tmp_path / "home"
     (home / ".codex" / "skills").mkdir(parents=True)
     (home / ".agents" / "skills").mkdir(parents=True)
-    assert codex_skill_sources(bundle, home) == [
+    assert codex_skill_sources(bundle, home) == CodexSkillSources(
+        linked=[bundle / "skills", home / ".codex" / "skills", home / ".agents" / "skills"],
+        native=[],
+    )
+
+
+def test_codex_skill_sources_workspace_repo_scope_order(tmp_path: Path) -> None:
+    """Workspace ``.agents`` skills up to the git root are native, nearest first, never linked."""
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
+
+    bundle = tmp_path / "bundle"
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    workspace = repo / "pkg" / "app"
+    for directory in (
         bundle / "skills",
         home / ".codex" / "skills",
         home / ".agents" / "skills",
-    ]
+        tmp_path / ".agents" / "skills",
+        repo / ".agents" / "skills",
+        workspace / ".agents" / "skills",
+    ):
+        directory.mkdir(parents=True)
+    # A worktree's .git file marks the repository root like a .git directory.
+    (repo / ".git").write_text("gitdir: elsewhere\n")
+    assert codex_skill_sources(bundle, home, workspace=workspace) == CodexSkillSources(
+        linked=[bundle / "skills", home / ".codex" / "skills", home / ".agents" / "skills"],
+        native=[
+            workspace.resolve() / ".agents" / "skills",
+            repo.resolve() / ".agents" / "skills",
+        ],
+    )
+
+
+def test_codex_skill_sources_workspace_outside_repo(tmp_path: Path) -> None:
+    """Outside a repo only the workspace's own dir counts; ``$HOME`` keeps its user rank."""
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
+
+    if any((parent / ".git").exists() for parent in Path(os.path.realpath(tmp_path)).parents):
+        pytest.skip("tmp_path is inside a git checkout; outside-repo scoping can't be exercised")
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "ws"
+    for directory in (
+        home / ".codex" / "skills",
+        home / ".agents" / "skills",
+        tmp_path / ".agents" / "skills",
+        workspace / ".agents" / "skills",
+    ):
+        directory.mkdir(parents=True)
+    host_tiers = [home / ".codex" / "skills", home / ".agents" / "skills"]
+    assert codex_skill_sources(None, home, workspace=workspace) == CodexSkillSources(
+        linked=host_tiers, native=[workspace.resolve() / ".agents" / "skills"]
+    )
+    assert codex_skill_sources(None, home, workspace=home) == CodexSkillSources(
+        linked=host_tiers, native=[]
+    )
+
+
+def test_codex_skill_sources_skips_symlink_loops(tmp_path: Path) -> None:
+    """A looping skills symlink is skipped without hiding the valid workspace or host tiers."""
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
+
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    workspace = repo / "app"
+    for directory in (
+        home / ".codex" / "skills",
+        home / ".agents",
+        repo / ".git",
+        repo / ".agents",
+        workspace / ".agents" / "skills",
+    ):
+        directory.mkdir(parents=True)
+    for looping in (home / ".agents" / "skills", repo / ".agents" / "skills"):
+        looping.symlink_to(looping)
+    assert codex_skill_sources(None, home, workspace=workspace) == CodexSkillSources(
+        linked=[home / ".codex" / "skills"], native=[workspace.resolve() / ".agents" / "skills"]
+    )
 
 
 def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
@@ -4968,8 +5602,8 @@ def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
 
     home = tmp_path / "home"
     (home / ".codex" / "skills").mkdir(parents=True)
-    assert codex_skill_sources(None, home) == [home / ".codex" / "skills"]
-    assert codex_skill_sources(tmp_path / "no-bundle", home) == [home / ".codex" / "skills"]
+    assert codex_skill_sources(None, home).linked == [home / ".codex" / "skills"]
+    assert codex_skill_sources(tmp_path / "no-bundle", home).linked == [home / ".codex" / "skills"]
 
 
 def test_clean_codex_env_honors_extra_allow(monkeypatch):

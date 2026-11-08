@@ -2,20 +2,27 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import shutil
 import subprocess
 import sys
-from collections.abc import AsyncIterator
+import threading
+import time
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, BinaryIO
 
 import httpx
 import pytest
+import uvicorn
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.entities.environment_filesystem import (
+    DirectoryNotEmpty,
     FilesystemPathNotFound,
     InvalidPath,
     PathUnreachable,
@@ -430,6 +437,139 @@ async def test_edit_file(
     assert (workspace / "hello.txt").read_text() == "goodbye world"
 
 
+@pytest.mark.parametrize(
+    "saves,statuses",
+    [
+        pytest.param(
+            [
+                ("PATCH", {"old_text": "hello", "new_text": "goodbye"}),
+                ("PATCH", {"old_text": "goodbye", "new_text": "hello"}),
+            ],
+            [],
+            id="edit-reverted",
+        ),
+        pytest.param(
+            [("PUT", {"content": "changed"}), ("PUT", {"content": "hello world"})],
+            [],
+            id="save-reverted",
+        ),
+        pytest.param(
+            [
+                ("PUT", {"content": "one two"}),
+                ("PATCH", {"old_text": "one", "new_text": "hello"}),
+            ],
+            ["modified"],
+            id="partially-reverted",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_editor_save_restoring_the_original_leaves_changes(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    request: pytest.FixtureRequest,
+    saves: list[tuple[str, dict[str, str]]],
+    statuses: list[str],
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    for step, (method, body) in enumerate(saves, start=1):
+        response = await client.request(method, f"{base}/filesystem/hello.txt", json=body)
+        assert response.status_code == 200, response.text
+        if step < len(saves):
+            assert (await client.get(f"{base}/changes")).json()["data"]
+
+    response = await client.get(f"{base}/changes")
+    assert [entry["status"] for entry in response.json()["data"]] == statuses
+
+
+@pytest.mark.asyncio
+async def test_editor_save_of_a_truncated_original_stays_in_changes(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", 5)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    response = await client.put(f"{base}/filesystem/hello.txt", json={"content": "hello"})
+    assert response.status_code == 200, response.text
+
+    changes = (await client.get(f"{base}/changes")).json()["data"]
+    assert [(entry["path"], entry["status"]) for entry in changes] == [("hello.txt", "modified")]
+    assert (await client.get(f"{base}/diff/hello.txt")).json()["before"] is None
+
+
+@pytest.mark.parametrize(
+    "other_content,saves",
+    [
+        pytest.param(
+            "hello world",
+            [(DEFAULT_ENVIRONMENT_ID, "changed"), ("terminal", "hello world")],
+            id="other-restores-the-same-text",
+        ),
+        pytest.param(
+            "elsewhere",
+            [("terminal", "changed"), (DEFAULT_ENVIRONMENT_ID, "elsewhere")],
+            id="other-saves-first",
+        ),
+        pytest.param(
+            "hello world",
+            [
+                (DEFAULT_ENVIRONMENT_ID, "changed"),
+                ("terminal", None),
+                (DEFAULT_ENVIRONMENT_ID, "hello world"),
+            ],
+            id="other-deletes",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_editor_save_in_another_environment_keeps_the_change(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    other_content: str,
+    saves: list[tuple[str, str | None]],
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    (other_root / "hello.txt").write_text(other_content)
+    other_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process", cwd=str(other_root), sandbox=OSEnvSandboxSpec(type="none")
+        )
+    )
+    assert other_env is not None
+    request.addfinalizer(other_env.close)
+    resolve = registry.resolve_environment
+    monkeypatch.setattr(
+        registry,
+        "resolve_environment",
+        lambda session_id, environment_id, agent_spec=None: (
+            other_env
+            if environment_id == "terminal"
+            else resolve(session_id, environment_id, agent_spec)
+        ),
+    )
+
+    base = "/v1/sessions/conv_test/resources/environments"
+    for environment_id, content in saves:
+        url = f"{base}/{environment_id}/filesystem/hello.txt"
+        if content is None:
+            response = await client.delete(url)
+        else:
+            response = await client.put(url, json={"content": content})
+        assert response.status_code == 200, response.text
+
+    changes = (await client.get(f"{base}/{DEFAULT_ENVIRONMENT_ID}/changes")).json()["data"]
+    assert [(entry["path"], entry["status"]) for entry in changes] == [("hello.txt", "modified")]
+
+
 @pytest.mark.asyncio
 async def test_delete_file(
     client: httpx.AsyncClient,
@@ -472,6 +612,198 @@ async def test_delete_directory_recursive(
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
     assert not (workspace / "src").exists()
+
+
+_FS_URL = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+
+
+_IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+@pytest.fixture
+def outside(tmp_path: Path) -> Path:
+    """A directory beside the workspace holding entries deletes must not reach."""
+    out = tmp_path / "outside"
+    out.mkdir()
+    (out / "victim.txt").write_text("keep me")
+    (out / "nested").mkdir()
+    (out / "nested" / "keep.txt").write_text("keep me")
+    return out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "recursive"), [("link/victim.txt", False), ("link/nested", True)]
+)
+async def test_delete_through_symlinked_parent_leading_outside_is_refused(
+    client: httpx.AsyncClient, workspace: Path, outside: Path, target: str, recursive: bool
+) -> None:
+    (workspace / "link").symlink_to(outside, target_is_directory=True)
+
+    resp = await client.delete(f"{_FS_URL}/{target}", params={"recursive": recursive})
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_path"
+    assert str(outside) not in resp.text
+    assert (outside / "victim.txt").read_text() == "keep me"
+    assert (outside / "nested" / "keep.txt").read_text() == "keep me"
+
+
+@pytest.mark.asyncio
+async def test_delete_through_symlinked_parent_inside_workspace_still_works(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    (workspace / "current").symlink_to(workspace / "src", target_is_directory=True)
+
+    resp = await client.delete(f"{_FS_URL}/current/main.py")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["type"] == "file"
+    assert not (workspace / "src" / "main.py").exists()
+    assert (workspace / "current").is_symlink()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["outside_dir", "outside_file", "dangling"])
+async def test_delete_symlink_leaf_removes_only_the_link(
+    client_with_registry: httpx.AsyncClient, workspace: Path, outside: Path, target: str
+) -> None:
+    pointee = {
+        "outside_dir": outside,
+        "outside_file": outside / "victim.txt",
+        "dangling": outside / "missing",
+    }[target]
+    (workspace / "link").symlink_to(pointee)
+
+    resp = await client_with_registry.delete(f"{_FS_URL}/link")
+    changes = await client_with_registry.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deleted"] is True
+    assert resp.json()["type"] == "symlink"
+    assert not (workspace / "link").is_symlink()
+    assert (outside / "victim.txt").read_text() == "keep me"
+    assert {e["path"]: e["status"] for e in changes.json()["data"]}["link"] == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_delete_empty_directory_without_recursive(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    (workspace / "empty").mkdir()
+
+    resp = await client.delete(f"{_FS_URL}/empty")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["type"] == "directory"
+    assert not (workspace / "empty").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_missing_path_is_404(client: httpx.AsyncClient) -> None:
+    resp = await client.delete(f"{_FS_URL}/src/nope.py")
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "path_not_found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(_IS_ROOT, reason="root bypasses permission checks")
+async def test_delete_refused_by_permissions_is_403(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    sealed = workspace / "sealed"
+    sealed.mkdir()
+    (sealed / "keep.txt").write_text("keep")
+    sealed.chmod(0o500)
+    try:
+        resp = await client.delete(f"{_FS_URL}/sealed/keep.txt")
+    finally:
+        sealed.chmod(0o700)
+
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "permission_denied"
+    assert (sealed / "keep.txt").read_text() == "keep"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(_IS_ROOT, reason="root reads any directory")
+async def test_delete_unlistable_nonempty_directory_is_not_treated_as_empty(
+    client: httpx.AsyncClient, workspace: Path, tmp_path: Path
+) -> None:
+    """Both routes refuse: the workspace one with an atomic rmdir, the
+    absolute one because a failed listing no longer counts as empty."""
+    locked_dirs = [workspace / "locked", tmp_path / "locked"]
+    for locked in locked_dirs:
+        locked.mkdir()
+        (locked / "data.txt").write_text("keep me")
+        locked.chmod(0o000)
+    try:
+        relative = await client.delete(f"{_FS_URL}/locked")
+        absolute = await client.delete(f"{_FS_URL}/%2F{str(tmp_path / 'locked').lstrip('/')}")
+    finally:
+        for locked in locked_dirs:
+            locked.chmod(0o700)
+
+    for resp in (relative, absolute):
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"]["code"] == "directory_not_empty"
+    for locked in locked_dirs:
+        assert (locked / "data.txt").read_text() == "keep me"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "helper_result",
+    [
+        {"error": "os_env helper exception: boom"},
+        {"error": "This environment does not support delete", "code": "unsupported"},
+        {},
+        {"deleted": "yes", "type": "file"},
+    ],
+)
+async def test_unconfirmed_workspace_delete_is_a_failure(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    helper_result: dict[str, object],
+) -> None:
+    async def unconfirmed(*args: object, **kwargs: object) -> dict[str, object]:
+        return helper_result
+
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._run_os_env_async", unconfirmed)
+
+    resp = await client.delete(f"{_FS_URL}/hello.txt")
+
+    assert resp.status_code == 500, resp.text
+    assert resp.json()["error"]["code"] == "resource_error"
+    assert (workspace / "hello.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_absolute_delete_without_exit_status_is_a_failure(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shell launch failure carries an error but no exit code."""
+    import omnigent.runner.environment_filesystem as efs
+
+    real = efs._run_os_env_async
+
+    async def rm_never_runs(method: Any, command: str, *args: Any, **kwargs: Any) -> Any:
+        if command.startswith("rm "):
+            return {"error": "Failed to run shell command: [Errno 12] Cannot allocate memory"}
+        return await real(method, command, *args, **kwargs)
+
+    monkeypatch.setattr(efs, "_run_os_env_async", rm_never_runs)
+    target = tmp_path / "absolute.txt"
+    target.write_text("still here")
+
+    resp = await client.delete(f"{_FS_URL}/%2F{str(target).lstrip('/')}")
+
+    assert resp.status_code == 500, resp.text
+    assert target.exists()
 
 
 # ── shell-injection regression for stat/_stat_via_shell/_check_dir_empty ──
@@ -788,6 +1120,148 @@ async def test_download_under_real_sandbox_refuses_masked_file(
         os_env.close()
 
 
+# Records that it was imported, then fails whatever imported it.
+_WORKSPACE_MODULE_SOURCE = (
+    "try:\n"
+    "    open(__file__ + '.imported', 'w').close()\n"
+    "except OSError:\n"
+    "    pass\n"
+    "raise ImportError(__name__ + ' was loaded from the workspace')\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_type", ["none", *_SANDBOX_BACKENDS])
+async def test_helper_scripts_ignore_workspace_modules(tmp_path: Path, sandbox_type: str) -> None:
+    """Workspace files named like stdlib modules leave every helper script intact."""
+    ws = tmp_path / "workspace"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "main.py").write_text("print('hi')")
+    (ws / "empty").mkdir()
+    planted = [f"{name}.py" for name in ("os", "json", "re", "stat", "collections")]
+    for name in planted:
+        (ws / name).write_text(_WORKSPACE_MODULE_SOURCE)
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type, read_paths=[str(_REPO_ROOT)], write_paths=["."]
+            ),
+        )
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+    try:
+        listing = await fs.list_dir(limit=100, order="asc")
+        assert [e.name for e in listing.data] == sorted(["empty", "src", *planted])
+        found, truncated = await fs.search_files("main")
+        assert ([e.path for e in found], truncated) == (["src/main.py"], False)
+        entry = await fs.stat("src/main.py")
+        assert (entry.type, entry.bytes) == ("file", 11)
+        handle, _resolved, size = await fs.open_download("src/main.py")
+        with handle:
+            assert (handle.read(), size) == (b"print('hi')", 11)
+        with pytest.raises(DirectoryNotEmpty):
+            await fs.delete("src")
+        assert (await fs.delete("empty")).type == "directory"
+        assert not (ws / "empty").exists()
+    finally:
+        os_env.close()
+    assert list(ws.glob("*.imported")) == []
+
+
+# The OS helper inherits the same PYTHONPATH and must keep the real module, so
+# only inline ``-c`` scripts are handed the failing one.
+_PYTHONPATH_JSON_SOURCE = (
+    "import os, sys\n"
+    "if sys.argv[0] == '-c':\n"
+    "    open(__file__ + '.imported', 'w').close()\n"
+    "    raise ImportError('json was loaded from PYTHONPATH')\n"
+    "here = os.path.dirname(os.path.abspath(__file__))\n"
+    "sys.path[:] = [p for p in sys.path if os.path.abspath(p) != here]\n"
+    "del sys.modules[__name__]\n"
+    "import json\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_helper_scripts_ignore_pythonpath_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``PYTHONPATH`` the environment's shell inherits never feeds the helper scripts."""
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "json.py").write_text(_PYTHONPATH_JSON_SOURCE)
+    ws = tmp_path / "workspace"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "main.py").write_text("print('hi')")
+    # An unsandboxed environment's shell inherits the runner's environment.
+    monkeypatch.setenv("PYTHONPATH", str(external))
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+    try:
+        probe = await os_env.shell("printenv PYTHONPATH")
+        assert probe.get("stdout", "").strip() == str(external), probe
+        listing = await fs.list_dir(order="asc")
+        assert [e.name for e in listing.data] == ["src"]
+        found, _truncated = await fs.search_files("main")
+        assert [e.path for e in found] == ["src/main.py"]
+        assert (await fs.stat("src/main.py")).bytes == 11
+        with pytest.raises(DirectoryNotEmpty):
+            await fs.delete("src")
+    finally:
+        os_env.close()
+    assert not (external / "json.py.imported").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_type", _SANDBOX_BACKENDS)
+async def test_workspace_delete_under_real_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str,
+) -> None:
+    """The helper's delete op runs inside the sandbox with the same results."""
+    ws = tmp_path / "workspace"
+    (ws / "full").mkdir(parents=True)
+    (ws / "full" / "a.txt").write_text("a")
+    (ws / "empty").mkdir()
+    (ws / "file.txt").write_text("x")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.txt").write_text("keep me")
+    (ws / "link").symlink_to(outside)
+    monkeypatch.setenv("PYTHONPATH", f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type, read_paths=[str(_REPO_ROOT)], write_paths=[str(ws)]
+            ),
+        )
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+    try:
+        assert (await fs.delete("file.txt")).type == "file"
+        assert (await fs.delete("empty")).type == "directory"
+        with pytest.raises(DirectoryNotEmpty):
+            await fs.delete("full")
+        assert (await fs.delete("full", recursive=True)).type == "directory"
+        with pytest.raises(InvalidPath):
+            await fs.delete("link/victim.txt")
+        assert (await fs.delete("link")).type == "symlink"
+    finally:
+        os_env.close()
+    assert list(ws.iterdir()) == []
+    assert (outside / "victim.txt").read_text() == "keep me"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "helper_view",
@@ -1079,6 +1553,7 @@ def app_with_registry(
 
     reg = app.state.filesystem_registry
     # Seed change events via the public API: hello.txt modified, gone.py deleted.
+    reg.seed_snapshot("hello.txt", "before content")
     reg.record_change("hello.txt", "modified", "conv_test")
     reg.record_change("gone.py", "deleted", "conv_test")
     return app
@@ -1162,6 +1637,85 @@ async def test_filesystem_changes_no_events_returns_empty(
     body = resp.json()
     assert body["object"] == "list"
     assert body["data"] == [], "No registry means no changes"
+
+
+async def test_multi_repo_routes_bind_session_git_and_preserve_repository_metadata(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    registry: SessionResourceRegistry,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    for name in ("alpha", "beta"):
+        repo = workspace / name
+        repo.mkdir()
+        (repo / "same.txt").write_text(f"{name} original\n")
+        for argv in (["init"], ["add", "."], ["commit", "-m", "initial"]):
+            subprocess.run(
+                ["git", *argv], cwd=repo, env=_git_env(), check=True, capture_output=True
+            )
+        (repo / "same.txt").write_text(f"{name} changed\n")
+    environment = registry._primary_envs["conv_test"]
+    request.addfinalizer(environment.close)
+    run_git = environment.run_git
+    event_loop_thread = threading.get_ident()
+    calls: list[tuple[str, Path]] = []
+
+    def capture_git(
+        argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert threading.get_ident() != event_loop_thread
+        calls.append((argv[0], cwd))
+        return run_git(argv, cwd, timeout)
+
+    monkeypatch.setattr(environment, "run_git", capture_git)
+    app.state.filesystem_registry.record_change("hello.txt", "modified", "conv_test")
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    response = await client.get(f"{base}/changes")
+    assert response.status_code == 200, response.text
+    entries = {entry["path"]: entry for entry in response.json()["data"]}
+    assert set(entries) == {"alpha/same.txt", "beta/same.txt", "hello.txt"}
+    assert "repository_root" not in entries["hello.txt"]
+    for name in ("alpha", "beta"):
+        assert entries[f"{name}/same.txt"]["repository_root"] == name
+        assert entries[f"{name}/same.txt"]["lines_added"] == 1
+        assert entries[f"{name}/same.txt"]["lines_removed"] == 1
+    assert calls == [
+        (command, workspace / name) for name in ("alpha", "beta") for command in ("status", "diff")
+    ]
+    calls.clear()
+    response = await client.get(f"{base}/diff/beta/same.txt")
+    assert response.status_code == 200, response.text
+    assert response.json()["before"] == "beta original\n"
+    assert response.json()["after"] == "beta changed\n"
+    assert calls == [("status", workspace / "beta"), ("show", workspace / "beta")]
+    assert app.state.filesystem_registry._run_repository_git is None
+
+    # A bounded HEAD-read failure must be an error, not a successful empty original.
+    original = workspace / "beta" / "same.txt"
+    original.write_text("x" * (10 * 1024 * 1024 + 1))
+    for argv in (["add", "."], ["commit", "-m", "large baseline"]):
+        subprocess.run(
+            ["git", *argv], cwd=original.parent, env=_git_env(), check=True, capture_output=True
+        )
+    original.write_text("small replacement\n")
+    response = await client.get(f"{base}/diff/beta/same.txt")
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "git_status_failed"
+
+    for suffix in ("changes", "diff/beta/same.txt"):
+        response = await client.get(
+            f"/v1/sessions/conv_test/resources/environments/missing-terminal/{suffix}"
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "not_found"
+
+    (workspace / "broken" / ".git").mkdir(parents=True)
+    response = await client.get(f"{base}/changes")
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "git_status_failed"
+    assert "Repository 'broken'" in response.json()["error"]["message"]
 
 
 # ── _require_os_env guard: all Phase-3 endpoints ────────────────────────────
@@ -1272,11 +1826,6 @@ async def test_diff_endpoint_returns_before_and_after_for_modified_file(
     :param app_with_registry: Runner app with hello.txt seeded as 'modified'.
     """
 
-    reg = app_with_registry.state.filesystem_registry
-    # Seed the pre-modification snapshot so get_baseline has something to return.
-    # This simulates what the PUT/PATCH handlers do before overwriting the file.
-    reg.seed_snapshot("hello.txt", "before content")
-
     transport = httpx.ASGITransport(app=app_with_registry)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
         resp = await client.get(
@@ -1363,6 +1912,7 @@ async def test_diff_endpoint_returns_null_after_for_deleted_file(
     # Deleted file → after must be null; a non-null value means the endpoint
     # tried to read a file that no longer exists instead of short-circuiting.
     assert body["after"] is None, f"Expected after=None for deleted file, got {body['after']!r}."
+    assert body["baseline_state"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -1511,6 +2061,214 @@ async def test_search_matches(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query,options,lines",
+    [
+        ("needle", {}, [2, 3]),
+        ("needle", {"case_sensitive": "true"}, [3]),
+        (r"n.edle", {"regex": "true"}, [2, 3]),
+        ("n.edle", {}, []),
+        ("--help", {}, [4]),
+        ("  spaced  ", {}, [5]),
+        ("$(touch injected)", {}, [6]),
+        ("needle", {"include": "src/"}, [2, 3]),
+        ("needle", {"include": "missing/**"}, []),
+        ("needle", {"exclude": "src/"}, []),
+        ("needle", {"include": "src/**", "exclude": "*.txt"}, []),
+        ("needle", {"include": "*.{py,txt}, .git/**", "exclude": "ignored.txt"}, [2, 3]),
+        ("needle", {"include": "missing/**, src/**", "exclude": "*.py, ignored.txt"}, [2, 3]),
+        ("needle", {"include": " , ", "exclude": " , "}, [2, 3]),
+        ("needle", {"include": "$(touch injected)"}, []),
+    ],
+)
+async def test_content_search_live_workspace(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    query: str,
+    options: dict[str, str],
+    lines: list[int],
+) -> None:
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    (workspace / "src" / "content.txt").write_text(
+        "first\n😀 Needle\nneedle\n--help\n  spaced  \n$(touch injected)\n"
+    )
+    (workspace / ".gitignore").write_text("ignored.txt\n")
+    (workspace / "ignored.txt").write_text("needle\n")
+    (workspace / ".git" / "hidden-match").write_text("needle\n")
+    (workspace / "binary").write_bytes(b"\x00needle\n")
+    outside = workspace.parent / "outside.txt"
+    outside.write_text("needle\n")
+    (workspace / "link.txt").symlink_to(outside)
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/content-search",
+        params={"q": query, **options},
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert "error" not in result, result
+    assert [(match["path"], match["line"]) for match in result["matches"]] == [
+        ("src/content.txt", line) for line in lines
+    ]
+    if lines and lines[0] == 2:
+        match = result["matches"][0]
+        assert match["column"] == 4  # Monaco columns count UTF-16 code units.
+        assert (match["match_start"], match["match_end"]) == (3, 9)
+    assert result["truncated"] is False
+    assert not (workspace / "injected").exists()
+
+
+@pytest.mark.asyncio
+async def test_content_search_limits_errors_and_hidden_files(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    (workspace / ".hidden.txt").write_text("prefix needle\n" * 4)
+    endpoint = "/v1/sessions/conv_test/resources/environments/default/content-search"
+    response = await client.get(endpoint, params={"q": "needle", "limit": 2})
+    result = response.json()
+    assert len(result["matches"]) == 2, result
+    assert result["matches"][0]["path"] == ".hidden.txt"
+    assert result["truncated"] is True
+    response = await client.get(endpoint, params={"q": "needle", "limit": 4})
+    assert response.json()["truncated"] is False
+    response = await client.get(endpoint, params={"q": "[", "regex": "true"})
+    assert "regex parse error" in response.json()["error"]
+    response = await client.get(endpoint, params={"q": "needle\nsecond"})
+    assert "single-line" in response.json()["error"]
+    for params in ({"q": " "}, {"q": "a" * 4097}, {"q": "a", "limit": 501}):
+        response = await client.get(endpoint, params=params)
+        assert response.status_code == 422
+    for field in ("include", "exclude"):
+        response = await client.get(endpoint, params={"q": "needle", field: "a" * 4097})
+        assert response.status_code == 422
+        for invalid in ("!*.txt", "src/\n", "src/\r", "src/\x00", "["):
+            response = await client.get(endpoint, params={"q": "needle", field: invalid})
+            assert response.json().get("error"), response.text
+    (workspace / ".hidden.txt").write_text("é" * 1000 + "😀 needle tail\n")
+    response = await client.get(endpoint, params={"q": "needle"})
+    match = response.json()["matches"][0]
+    assert match["column"] == 1004
+    assert "needle" in match["text"]
+    assert len(match["text"]) <= 402
+
+
+@pytest.mark.parametrize("mode", ["missing", "timeout", "long-line"])
+def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
+    """Exercise the sandbox script with controlled executables and a short deadline."""
+    from omnigent.runner.content_search import _SEARCH_SCRIPT
+
+    if mode != "missing":
+        executable = tmp_path / "rg"
+        body = (
+            "import time\ntime.sleep(60)\n"
+            if mode == "timeout"
+            else "print('x' * (2 * 1024 * 1024))\n"
+        )
+        executable.write_text(f"#!{sys.executable}\n{body}")
+        executable.chmod(0o755)
+    parameters = (
+        "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
+    )
+    # Record the owned child's PID before the shortened timer can kill it.
+    timer = (
+        "import threading\noriginal_timer = threading.Timer\n"
+        "def shortened_timer(seconds, callback):\n"
+        f"    with open({str(tmp_path / 'pid')!r}, 'w') as marker:\n"
+        "        marker.write(str(process.pid))\n"
+        "    return original_timer(0.2, callback)\n"
+        "threading.Timer = shortened_timer\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", parameters + timer + _SEARCH_SCRIPT],
+        env={**os.environ, "PATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    result = json.loads(completed.stdout)
+    if mode == "missing":
+        assert "Install ripgrep" in result["error"]
+    elif mode == "timeout":
+        assert result["truncated"] is True
+        assert "15 seconds" in result["warning"]
+        with pytest.raises(ProcessLookupError):
+            os.kill(int((tmp_path / "pid").read_text()), 0)
+    else:
+        assert result["matches"] == []
+        assert "very long" in result["warning"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stdout", ["", '{"matches": []}\n[stdout truncated]'])
+async def test_content_search_rejects_invalid_helper_output(
+    registry: SessionResourceRegistry, monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.content_search import search_content
+
+    environment = registry._primary_envs["conv_test"]
+    monkeypatch.setattr(environment, "shell", AsyncMock(return_value={"stdout": stdout}))
+    assert await search_content(environment, "needle") == {
+        "error": "Content search could not run in this workspace. Try again."
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(_IS_ROOT, reason="root bypasses permission checks")
+@pytest.mark.parametrize("unreadable", [".env", ".ignore"])
+async def test_content_search_read_errors_keep_partial_results(
+    client: httpx.AsyncClient, workspace: Path, unreadable: str
+) -> None:
+    (workspace / "readable.txt").write_text("needle\n")
+    denied = workspace / unreadable
+    denied.write_text("readable.txt\n")
+    denied.chmod(0)
+    try:
+        response = await client.get(
+            "/v1/sessions/conv_test/resources/environments/default/content-search",
+            params={"q": "needle"},
+        )
+        result = response.json()
+        assert [match["path"] for match in result["matches"]] == ["readable.txt"], result
+        assert result["truncated"] is True
+        assert "ignore rules could not be read" in result["warning"]
+        assert "include normally ignored files" in result["warning"]
+    finally:
+        denied.chmod(0o600)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_type", _SANDBOX_BACKENDS)
+async def test_content_search_under_real_sandbox_keeps_readable_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandbox_type: str
+) -> None:
+    from omnigent.runner.content_search import search_content
+
+    (tmp_path / ".env").write_text("needle secret\n")
+    (tmp_path / ".ignore").write_text("readable.txt\n")
+    (tmp_path / "readable.txt").write_text("needle\n")
+    monkeypatch.setenv("PYTHONPATH", f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type=sandbox_type, read_paths=[str(_REPO_ROOT)]),
+        )
+    )
+    assert os_env is not None
+    try:
+        result = await search_content(os_env, "needle")
+        assert [match["path"] for match in result["matches"]] == ["readable.txt"], result
+        assert "secret" not in json.dumps(result)
+        if sandbox_type == "darwin_seatbelt":
+            assert result["truncated"] is True
+            assert "could not be read" in result["warning"]
+    finally:
+        os_env.close()
+
+
+@pytest.mark.asyncio
 async def test_search_no_matches_returns_empty_list(
     client: httpx.AsyncClient,
 ) -> None:
@@ -1622,7 +2380,9 @@ async def test_search_invalid_q_returns_422(
 def glob_workspace(tmp_path: Path) -> Path:
     """Workspace with assorted file types/depths for glob filter tests.
 
-    Layout::
+    Layout:
+
+    .. code-block:: text
 
         app.ts
         app.test.ts
@@ -2626,3 +3386,130 @@ async def test_default_read_still_follows_a_symlink_into_a_read_grant(tmp_path: 
             await fs.read("escape/note.txt")
     finally:
         os_env.close()
+
+
+# ── download: file shrinks mid-stream ────────────────────────────────────────
+#
+# ``_fs_download`` announces ``Content-Length`` from the size at open time and
+# then streams chunks from the open descriptor. If the file shrinks underneath
+# it, the read returns empty before the announced length is reached; the
+# transfer must then fail visibly (and be logged) rather than end as a clean,
+# silently truncated response.
+
+_DOWNLOAD_CHUNK = 64 * 1024
+# Three full chunks, so the stream has already sent data when the file shrinks.
+_SHRINK_SIZE = 3 * _DOWNLOAD_CHUNK
+
+
+class _ShrinkingFile:
+    """A download descriptor whose file is truncated on disk after the first read.
+
+    Models a writer rewriting the file while a download streams it: the first
+    chunk is served normally, then the file is emptied, so the next read from
+    the real descriptor hits EOF short of the announced size.
+    """
+
+    def __init__(self, inner: BinaryIO, path: Path) -> None:
+        self._inner = inner
+        self._path = path
+        self.reads = 0
+        self.closed = False
+
+    def read(self, n: int = -1) -> bytes:
+        chunk = self._inner.read(n)
+        self.reads += 1
+        if self.reads == 1:
+            os.truncate(self._path, 0)
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+        self._inner.close()
+
+
+@pytest.fixture
+def shrinking_download(monkeypatch: pytest.MonkeyPatch) -> list[_ShrinkingFile]:
+    """Make every ``open_download`` hand out a :class:`_ShrinkingFile`; collects them."""
+    opened: list[_ShrinkingFile] = []
+    original = CallerProcessFilesystem.open_download
+
+    async def _open(self: CallerProcessFilesystem, path: str) -> tuple[BinaryIO, Path, int]:
+        fobj, resolved, size = await original(self, path)
+        wrapped = _ShrinkingFile(fobj, resolved)
+        opened.append(wrapped)
+        return wrapped, resolved, size  # type: ignore[return-value]
+
+    monkeypatch.setattr(CallerProcessFilesystem, "open_download", _open)
+    return opened
+
+
+@pytest.mark.asyncio
+async def test_download_aborts_and_logs_when_file_shrinks_mid_stream(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    shrinking_download: list[_ShrinkingFile],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A short read ends the stream with an error, not a clean short body."""
+    (workspace / "report.bin").write_bytes(os.urandom(_SHRINK_SIZE))
+    caplog.set_level(logging.WARNING, logger="omnigent.runner.app")
+    url = (
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+        "/filesystem/report.bin?download=true"
+    )
+
+    with pytest.raises(RuntimeError, match=r"report\.bin shrank during download"):
+        await client.get(url)
+
+    (fobj,) = shrinking_download
+    assert fobj.closed, "the descriptor must be released when the stream aborts"
+    record = next(r for r in caplog.records if "shrank while streaming" in r.getMessage())
+    assert f"sent {_DOWNLOAD_CHUNK} of {_SHRINK_SIZE} announced bytes" in record.getMessage()
+    assert "report.bin" in record.getMessage()
+
+
+@pytest.fixture
+def served_app(app: FastAPI) -> Iterator[str]:
+    """Run the runner app under real uvicorn on an ephemeral port; yield its base URL."""
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="critical")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 15
+    while not server.started:
+        if time.monotonic() > deadline:
+            # Stop the daemon thread too, or it outlives the failed fixture.
+            server.should_exit = True
+            raise RuntimeError("runner app did not start")
+        time.sleep(0.05)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    yield f"http://127.0.0.1:{port}"
+    server.should_exit = True
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "uvicorn did not exit within the join timeout"
+
+
+def test_download_over_the_wire_fails_instead_of_truncating(
+    served_app: str,
+    workspace: Path,
+    shrinking_download: list[_ShrinkingFile],
+) -> None:
+    """Through a real HTTP server the client sees a broken transfer, never a short 200 body.
+
+    Only this test needs real uvicorn: the ASGI transport cannot show HTTP
+    framing or the connection drop a client observes.
+    """
+    (workspace / "report.bin").write_bytes(os.urandom(_SHRINK_SIZE))
+    url = (
+        f"{served_app}/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+        "/filesystem/report.bin?download=true"
+    )
+
+    with pytest.raises(httpx.RemoteProtocolError) as excinfo:
+        httpx.get(url, timeout=10)
+
+    # The client must learn the transfer was short. Assert the two byte counts
+    # rather than h11's exact sentence, which may change across versions.
+    message = str(excinfo.value)
+    assert str(_DOWNLOAD_CHUNK) in message
+    assert str(_SHRINK_SIZE) in message

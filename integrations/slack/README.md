@@ -192,13 +192,21 @@ server.
 There is deliberately **no** default for a specific external host id. On an
 authenticated server `/v1/hosts` is owner-scoped, so one user's host is not
 listed for anyone else and could not be pre-selected in a menu that never
-lists it. (On a server with auth disabled every caller shares the reserved
-`local` owner and does see the same hosts — but a default that only works for
-unauthenticated deployments is not one worth shipping.)
+lists it. Servers with authentication disabled share the reserved `local`
+owner across callers and are unsupported by this integration.
 
 ## Authentication
 
-For Omnigent servers with authentication enabled, each Slack user logs in with
+The Slack integration supports accounts, OIDC, and Databricks Apps deployments
+with per-user delegated credentials. For Databricks Apps, set
+`OMNIGENT_SLACK_SERVER_AUTH=databricks` and use the delegated-token setup below.
+Anonymous servers and ordinary header/proxy deployments without delegated-token
+enrollment are unsupported: user operations require an individual delegated
+token even if the target server would accept them without one. Before upgrading
+an unsupported deployment, configure a supported authentication flow, then have
+each Slack user complete `/omnigent` setup again.
+Accounts deployments must also enable the device grant described below.
+Each Slack user logs in with
 their own Omnigent identity — no Omnigent credential ever passes through Slack.
 Login happens inside the single `/omnigent` configuration modal, not a separate
 command.
@@ -219,11 +227,14 @@ otherwise the `/oauth/*` routes are absent and accounts-mode login can't
 complete. If the server sets `OMNIGENT_DEVICE_CLIENT_SECRET`, set the same
 value as the bot's `OMNIGENT_DEVICE_CLIENT_SECRET` so only this authorized
 socket server can drive the device flow.
-- `oidc` **mode** → the server's **cli-login ticket flow** (`/auth/cli-login` +
-`/auth/cli-poll`). The modal shows a login link; the user signs in at *your
-IdP* in their browser. The server hands back its session JWT — the same token
-a browser session gets. There is **no device grant and no refresh token**: the
-session lasts its normal TTL (default 8h), after which the user logs in again.
+- `oidc` **mode** → the server's **PKCE-bound cli-login ticket flow**
+(`/auth/cli-login` + `/auth/cli-poll`). The modal shows a login link and
+confirmation code; the user signs in at *your IdP* in their browser, then
+explicitly approves the request on the server's consent page (checking the
+code matches). The server hands back its session JWT — the same
+token a browser session gets. There is **no device grant and no refresh token**:
+the session lasts its normal TTL (default 8h), after which the user logs in
+again.
 - `header` **/ proxy mode** → identity is asserted by a trusted upstream proxy
 header (e.g. `X-Forwarded-Email`), so the server mints no token and exposes no
 per-user login the auto-detect flow can drive. Two options:
@@ -231,8 +242,8 @@ per-user login the auto-detect flow can drive. Two options:
     `OMNIGENT_SLACK_SERVER_AUTH=databricks` and the bot enrolls each user
     through a web page it serves as its own Databricks App — see
     [Databricks Apps web-auth](#databricks-apps-web-auth) below.
-  - Otherwise run the server in `accounts`/`oidc` mode, or place the bot behind
-    the same identity proxy.
+  - Otherwise run the server in `accounts`/`oidc` mode. A shared identity proxy
+    alone does not provide the individual delegated credentials this bot needs.
 
 Either way the flow is the same from Slack's side:
 

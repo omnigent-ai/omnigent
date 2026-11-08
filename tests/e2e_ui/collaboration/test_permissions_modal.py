@@ -30,6 +30,7 @@ import pytest
 from playwright.sync_api import Browser, Page, expect
 
 from omnigent.runner.identity import token_bound_runner_id
+from tests._helpers.browser import user_page
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
@@ -187,33 +188,19 @@ def _open_share_modal(page: Page) -> None:
     expect(page.get_by_text("Share this session")).to_be_visible()
 
 
-def _install_clipboard_stub(page: Page) -> None:
-    """Provide async clipboard on the public loopback alias.
+def _read_clipboard(page: Page, secure_url: str) -> str:
+    """Read the browser clipboard through a page on the loopback origin.
 
-    Chromium exposes real clipboard access on localhost, but not on the
+    Chromium exposes async clipboard on localhost, but not on the
     public-looking plain-HTTP alias this test uses to keep Share enabled.
     """
-    page.add_init_script(
-        """
-        (() => {
-          let text = "";
-          Object.defineProperty(Navigator.prototype, "clipboard", {
-            configurable: true,
-            get() {
-              return {
-                writeText(value) {
-                  text = String(value);
-                  return Promise.resolve();
-                },
-                readText() {
-                  return Promise.resolve(text);
-                },
-              };
-            },
-          });
-        })();
-        """
-    )
+    page.context.grant_permissions(["clipboard-read"], origin=secure_url)
+    reader = page.context.new_page()
+    try:
+        reader.goto(f"{secure_url}/v1/info")
+        return reader.evaluate("() => navigator.clipboard.readText()")
+    finally:
+        reader.close()
 
 
 def test_single_user_hides_share_button(
@@ -253,46 +240,52 @@ def test_permissions_modal_controls_drive_server_state(
     session_id = multi_user_server.session_id
     grantee = "alice@ui.test"
     page = _admin_page(browser)
-    _install_clipboard_stub(page)
     page.goto(f"{multi_user_server.public_url}/c/{session_id}")
 
     _open_share_modal(page)
     dialog = page.get_by_role("dialog")
 
-    # General access: No access -> Read creates a __public__ grant.
-    public_level = dialog.get_by_role("combobox", name="General access")
-    expect(public_level).to_have_text("No access")
+    # Anyone signed in creates a public Read grant.
+    public_level = dialog.get_by_role("combobox", name="Who can access")
+    expect(public_level).to_have_text("Only added people")
     assert _PUBLIC_USER not in _permissions(base_url, session_id)
     public_level.click()
-    page.get_by_role("option", name="Read", exact=True).click()
-    expect(public_level).to_have_text("Read")
+    page.get_by_role("option", name="Anyone signed in", exact=True).click()
+    expect(public_level).to_have_text("Anyone signed in")
     # Wait for the mutation before cross-checking the grant through the API.
     _wait_for(lambda: _permissions(base_url, session_id).get(_PUBLIC_USER) == _LEVEL_READ)
 
     # ── Copy link: writes a shareable, session-scoped URL ────────────
+    # Plain HTTP has no async clipboard, so this exercises the fallback copy.
+    assert page.evaluate("() => navigator.clipboard === undefined")
     dialog.get_by_role("button", name="Copy link").click()
     expect(dialog.get_by_role("button", name="Copied!")).to_be_visible()
-    clipboard = page.evaluate("() => navigator.clipboard.readText()")
+    clipboard = _read_clipboard(page, base_url)
     assert session_id in clipboard, f"clipboard URL {clipboard!r} missing session id"
     assert re.search(rf"/c/{re.escape(session_id)}\b", clipboard), (
         f"clipboard URL {clipboard!r} is not a /c/<id> session link"
     )
 
+    # Restricted mode reveals the add row and per-person removal controls.
+    public_level.click()
+    page.get_by_role("option", name="Only added people", exact=True).click()
+    _wait_for(lambda: _PUBLIC_USER not in _permissions(base_url, session_id))
+
     # ── Grant a user at Read via the add-user form ───────────────────
     dialog.get_by_placeholder("alice@example.com").fill(grantee)
-    dialog.get_by_role("button", name="Grant").click()
+    dialog.get_by_role("button", name="Add").click()
     # The new row renders the grantee and the REST state agrees at Read.
     expect(dialog.get_by_title(grantee)).to_be_visible()
     _wait_for(lambda: _permissions(base_url, session_id).get(grantee) == _LEVEL_READ)
 
-    # ── Change that user's level Read → Edit via the row select ──────
-    level_select = dialog.get_by_role("combobox", name=f"Permission level for {grantee}")
+    # ── Change collaborator access Read → Edit via the shared selector ──────
+    level_select = dialog.get_by_role("combobox", name="What can they do?")
     level_select.click()
     page.get_by_role("option", name="Edit").click()
     _wait_for(lambda: _permissions(base_url, session_id).get(grantee) == _LEVEL_EDIT)
 
     # ── Revoke the user: row disappears, grant is gone server-side ───
-    dialog.get_by_role("button", name="Revoke").click()
+    dialog.get_by_role("button", name=f"Remove access for {grantee}").click()
     expect(dialog.get_by_title(grantee)).to_have_count(0)
     _wait_for(lambda: grantee not in _permissions(base_url, session_id))
 
@@ -363,20 +356,22 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         json={"runner_id": runner_id},
         timeout=30,
     ).raise_for_status()
-    admin_context = browser.new_context(
-        viewport={"width": 1280, "height": 900},
-        extra_http_headers=admin_headers,
-        record_video_dir=str(tmp_path / "video"),
-        record_video_size={"width": 1280, "height": 900},
-    )
-    member_context = browser.new_context(
-        viewport={"width": 1280, "height": 900},
-        extra_http_headers=member_headers,
-        record_video_dir=str(tmp_path / "video"),
-        record_video_size={"width": 1280, "height": 900},
-    )
-    try:
-        page = admin_context.new_page()
+    with (
+        user_page(
+            browser,
+            headers=admin_headers,
+            viewport={"width": 1280, "height": 900},
+            record_video_dir=str(tmp_path / "video"),
+            record_video_size={"width": 1280, "height": 900},
+        ) as page,
+        user_page(
+            browser,
+            headers=member_headers,
+            viewport={"width": 1280, "height": 900},
+            record_video_dir=str(tmp_path / "video"),
+            record_video_size={"width": 1280, "height": 900},
+        ) as member,
+    ):
         page.goto(f"{multi_user_server.public_url}/settings/sharing")
         ceiling = page.get_by_role("combobox", name="Maximum public permission")
         expect(ceiling).to_have_text("Read", timeout=30_000)
@@ -388,11 +383,16 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         page.goto(f"{multi_user_server.public_url}/c/{session_id}")
         _open_share_modal(page)
         dialog = page.get_by_role("dialog")
-        general = dialog.get_by_role("combobox", name="General access")
-        expect(general).to_have_text("No access")
-        general.click()
+        general = dialog.get_by_role("combobox", name="Who can access")
+        expect(general).to_have_text("Only added people")
+        role = dialog.get_by_role("combobox", name="What can they do?")
+        role.click()
         page.get_by_role("option", name="Edit", exact=True).click()
-        expect(general).to_have_text("Edit")
+        expect(role).to_have_text("Edit")
+        general.click()
+        page.get_by_role("option", name="Anyone signed in", exact=True).click()
+        expect(general).to_have_text("Anyone signed in")
+        expect(role).to_have_text("Edit")
         _wait_for(
             lambda: (
                 _permissions(base_url, session_id, headers=admin_headers).get(_PUBLIC_USER) == 2
@@ -400,12 +400,11 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         )
         page.screenshot(path=str(tmp_path / "public-sharing-desktop.png"))
 
-        member = member_context.new_page()
         member.goto(f"{multi_user_server.public_url}/c/{session_id}")
         composer = member.get_by_placeholder("Send a message…")
         expect(composer).to_be_enabled(timeout=30_000)
         page.screenshot(path=str(tmp_path / "public-sharing-owner.png"))
-        page.get_by_role("button", name="Done", exact=True).click()
+        dialog.get_by_role("button", name="Close", exact=True).click()
         marker = f"public-edit-{secrets.token_hex(4)}"
         composer.fill(f"Reply with exactly this token and nothing else: {marker}")
         member.get_by_role("button", name="Send", exact=True).click()
@@ -447,12 +446,13 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         _open_share_modal(page)
         page.set_viewport_size({"width": 390, "height": 844})
         dialog = page.get_by_role("dialog")
-        general = dialog.get_by_role("combobox", name="General access")
-        expect(general).to_have_text("Read")
+        general = dialog.get_by_role("combobox", name="Who can access")
+        expect(general).to_have_text("Anyone signed in")
+        expect(dialog.get_by_role("combobox", name="What can they do?")).to_have_text("Read")
         page.screenshot(path=str(tmp_path / "public-sharing-mobile.png"))
         assert dialog.evaluate("(el) => el.scrollWidth <= el.clientWidth")
         general.click()
-        page.get_by_role("option", name="No access", exact=True).click()
+        page.get_by_role("option", name="Only added people", exact=True).click()
         _wait_for(
             lambda: _PUBLIC_USER not in _permissions(base_url, session_id, headers=admin_headers)
         )
@@ -464,9 +464,6 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         ) as snapshot:
             member.reload()
         assert snapshot.value.status == 404
-    finally:
-        admin_context.close()
-        member_context.close()
 
 
 def test_multi_user_shows_enabled_share_button(

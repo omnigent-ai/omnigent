@@ -2,8 +2,8 @@
 
 # Omnigent installer.
 #
-# Installs the published `omnigent` wheel from PyPI with uv, wires up PATH,
-# and points you at first-run. The wheel bundles the prebuilt web UI, so the
+# Installs `omnigent[databricks]` from PyPI with uv and the Databricks CLI,
+# wires up PATH, and points you at first-run. The wheel bundles the web UI, so the
 # default install needs no Node/npm and runs no build.
 #
 # Options:
@@ -11,7 +11,8 @@
 #   --repo URL    install from a git checkout instead (builds from source;
 #                 requires Node 22+/npm) — for development
 #   --extra NAME  install an optional-dependency extra (repeatable, or
-#                 comma-separated), e.g. --extra databricks
+#                 comma-separated), in addition to databricks
+#   --no-databricks  omit the default Databricks extra and CLI
 #   --non-interactive, --verbose
 #
 # uv and git (only with --repo) are required; the installer offers to install
@@ -25,10 +26,15 @@ set -eu
 # Published PyPI package, the default install. --version pins a release.
 PACKAGE_NAME="omnigent"
 VERSION=
-# Comma-separated optional-dependency extras to install with the package
-# (e.g. "databricks"), accumulated from one or more --extra flags. Empty =>
-# the base install with no extras.
+# Databricks workspace login is included; --extra adds other integrations.
 EXTRAS=
+INCLUDE_DATABRICKS=true
+DATABRICKS_CLI_VERSION=1.21.0
+# SHA-256 values from this release's official SHA256SUMS manifest.
+DATABRICKS_CLI_SHA256_LINUX_AMD64=5599f6a4c01535142cdb1aa16527ec68e6aa849bd7ce72581ec4ed491e9d16b7
+DATABRICKS_CLI_SHA256_LINUX_ARM64=27440b096de110978ea8621ed936692bf88e6912ddadea810f7cac78850ceb02
+DATABRICKS_CLI_SHA256_DARWIN_AMD64=968946e53e0b197870931c34d103e2e4317002314db6e04a11495af2554415c3
+DATABRICKS_CLI_SHA256_DARWIN_ARM64=5c899a18bb280a33cb1814418fd1352a6a6e5487a2d9eb850c573114885c2f83
 # Set by --repo to install from a git checkout instead (development; builds
 # the web UI from source). Empty => install the published wheel from PyPI.
 REPO_URL=
@@ -80,7 +86,7 @@ print_banner() {
 }
 
 usage() {
-  printf 'Usage: install_oss.sh [--non-interactive] [--verbose] [--version X] [--repo URL] [--extra NAME]\n'
+  printf 'Usage: install_oss.sh [--non-interactive] [--verbose] [--version X] [--repo URL] [--extra NAME] [--no-databricks]\n'
 }
 
 step() {
@@ -173,6 +179,9 @@ parse_args() {
       --verbose)
         VERBOSE=true
         ;;
+      --no-databricks)
+        INCLUDE_DATABRICKS=false
+        ;;
       --repo)
         if [ "$#" -lt 2 ]; then
           usage >&2
@@ -210,6 +219,16 @@ parse_args() {
     esac
     shift
   done
+  if [ "$INCLUDE_DATABRICKS" = true ] && ! has_databricks_extra; then
+    EXTRAS="databricks${EXTRAS:+,$EXTRAS}"
+  fi
+}
+
+has_databricks_extra() {
+  case ",$EXTRAS," in
+    *,databricks,*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 normalize_repo_url() {
@@ -484,13 +503,8 @@ check_bubblewrap() {
 }
 
 install_omnigent() {
-  # Default: the published PyPI wheel (`omnigent`, optionally `omnigent==X`).
-  # The wheel ships the prebuilt web UI, so there is no npm/Node step and no
-  # source build — the fast, reliable path. `--repo` switches INSTALL_URL to a
-  # git ref, which builds from source (and needs npm, checked above).
-  # Extras suffix like "[databricks]" appended to the package name so the
-  # optional-dependency group(s) install alongside the base package. Applies to
-  # every mode below; empty when no --extra was given.
+  # PyPI wheels bundle the web UI; --repo builds it from source with npm.
+  # Extras apply to every install mode, including Databricks by default.
   extras_suffix=
   if [ -n "$EXTRAS" ]; then
     extras_suffix="[$EXTRAS]"
@@ -515,6 +529,78 @@ install_omnigent() {
   # --force so re-running upgrades instead of no-op'ing; -q hides uv's
   # "Installed N executables" summary (the package also ships an `omni` alias).
   run_with_spinner "uv tool install" uv tool install --force -q --python "$PYTHON_VERSION" "$target"
+}
+
+install_databricks_cli() (
+  case "$(uname -s)" in
+    Darwin) databricks_os=darwin ;;
+    Linux) databricks_os=linux ;;
+    *) fail "The Databricks CLI requires macOS or Linux." ;;
+  esac
+  case "$(uname -m)" in
+    x86_64) databricks_arch=amd64 ;;
+    arm64 | aarch64) databricks_arch=arm64 ;;
+    *) fail "Unsupported Databricks CLI architecture: $(uname -m)." ;;
+  esac
+  case "$databricks_os:$databricks_arch" in
+    linux:amd64) databricks_sha256="$DATABRICKS_CLI_SHA256_LINUX_AMD64" ;;
+    linux:arm64) databricks_sha256="$DATABRICKS_CLI_SHA256_LINUX_ARM64" ;;
+    darwin:amd64) databricks_sha256="$DATABRICKS_CLI_SHA256_DARWIN_AMD64" ;;
+    darwin:arm64) databricks_sha256="$DATABRICKS_CLI_SHA256_DARWIN_ARM64" ;;
+  esac
+
+  databricks_tmp="$(mktemp -d "${TMPDIR:-/tmp}/omnigent-databricks.XXXXXX")" || exit 1
+  trap 'rm -rf "$databricks_tmp"' 0
+  trap 'exit 1' 1 2 15
+  databricks_archive="databricks_cli_${DATABRICKS_CLI_VERSION}_${databricks_os}_${databricks_arch}.zip"
+  curl -fsSL "https://github.com/databricks/cli/releases/download/v${DATABRICKS_CLI_VERSION}/${databricks_archive}" \
+    -o "$databricks_tmp/databricks.zip" || exit 1
+
+  # Reuse uv's Python so fresh machines need neither unzip nor sudo.
+  databricks_python="$(uv python find "$PYTHON_VERSION")" || exit 1
+  "$databricks_python" -c '
+import hashlib
+import sys
+import zipfile
+
+with open(sys.argv[1], "rb") as download:
+    digest = hashlib.file_digest(download, "sha256").hexdigest()
+if digest != sys.argv[3]:
+    raise SystemExit("Databricks CLI archive checksum mismatch.")
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    archive.extract("databricks", sys.argv[2])
+' "$databricks_tmp/databricks.zip" "$databricks_tmp" "$databricks_sha256" || exit 1
+  chmod +x "$databricks_tmp/databricks" || exit 1
+  "$databricks_tmp/databricks" auth login --help >/dev/null || exit 1
+  mkdir -p "$1" || exit 1
+  mv "$databricks_tmp/databricks" "$1/databricks" || exit 1
+)
+
+ensure_databricks_cli() {
+  databricks_path="$PATH"
+  if ! path_contains "$1"; then
+    databricks_path="$1:$PATH"
+  fi
+  databricks_cli="$(PATH="$databricks_path" command -v databricks 2>/dev/null || true)"
+  if [ -z "$databricks_cli" ] && { [ -e "$1/databricks" ] || [ -L "$1/databricks" ]; }; then
+    databricks_cli="$1/databricks"
+  fi
+  if [ -n "$databricks_cli" ]; then
+    if ! "$databricks_cli" auth login --help >/dev/null 2>&1; then
+      fail "Databricks CLI at $databricks_cli cannot run auth login. Update it using https://docs.databricks.com/aws/en/dev-tools/cli/install, then rerun this installer, or use --no-databricks to install without workspace login dependencies."
+    fi
+    OMNIGENT_LEDGER_DEP_DATABRICKS=preexisting
+    export OMNIGENT_LEDGER_DEP_DATABRICKS
+    step "Databricks CLI is available at $databricks_cli"
+    return
+  fi
+
+  if ! run_with_spinner "Install Databricks CLI $DATABRICKS_CLI_VERSION" install_databricks_cli "$1"; then
+    fail "Databricks CLI installation failed. Check the error above and rerun this installer."
+  fi
+  OMNIGENT_LEDGER_DEP_DATABRICKS=omnigent
+  export OMNIGENT_LEDGER_DEP_DATABRICKS
+  step "Installed Databricks CLI at $1/databricks"
 }
 
 uv_tool_bin_dir() {
@@ -611,7 +697,11 @@ write_install_ledger() {
     OMNIGENT_LEDGER_PROFILE="$LEDGER_PROFILE"
     export OMNIGENT_LEDGER_PROFILE
   fi
-  if "$cli_path" _internal write-ledger --from-env >/dev/null 2>&1; then
+  ledger_command_path="$PATH"
+  if ! path_contains "$bin_dir"; then
+    ledger_command_path="$bin_dir:$PATH"
+  fi
+  if PATH="$ledger_command_path" "$cli_path" _internal write-ledger --from-env >/dev/null 2>&1; then
     step "Recorded install ledger"
   else
     warn "Could not write install ledger; uninstall can backfill it later."
@@ -662,9 +752,12 @@ print_next_steps() {
   printf '  %somnigent setup\n\n' "$command_prefix"
   printf 'Uninstall the CLI but keep local history and credentials:\n'
   printf '  %somnigent uninstall --yes\n\n' "$command_prefix"
-  printf '%sUsing a Databricks workspace as your model provider? Install the\n' "$DIM"
-  printf 'Databricks CLI (https://docs.databricks.com/aws/en/dev-tools/cli/install)\n'
-  printf 'and add it via: omnigent setup -> Databricks.%s\n' "$RESET"
+  if has_databricks_extra; then
+    printf 'Connect to a Databricks-hosted Omnigent server:\n'
+    printf '  %somnigent login <workspace-url>/omnigent\n\n' "$command_prefix"
+    printf '%sDatabricks dependencies and CLI are installed. To use a workspace\n' "$DIM"
+    printf 'as your model provider, select Databricks in omnigent setup.%s\n' "$RESET"
+  fi
 }
 
 main() {
@@ -681,6 +774,9 @@ main() {
   install_omnigent
   bin_dir="$(uv_tool_bin_dir)"
   verify_omnigent "$bin_dir"
+  if has_databricks_extra; then
+    ensure_databricks_cli "$bin_dir"
+  fi
   maybe_add_bin_to_path "$bin_dir"
   write_install_ledger "$bin_dir"
   print_next_steps "$bin_dir"

@@ -20,14 +20,16 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import telemetry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.scheduled_context import add_scheduled_run_header
 from omnigent.spec import AgentSpec
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
     from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
+    from omnigent.runtime.agent_cache import AgentCache
     from omnigent.server.host_registry import HostRegistry
-    from omnigent.stores import ConversationStore
+    from omnigent.stores import AgentStore, ConversationStore
     from omnigent.stores.host_store import HostStore
 
 
@@ -89,8 +91,19 @@ def routing_host_id(
     :returns: The routing host id, or ``None`` when no host is bound anywhere
         in the chain or the read budget is exhausted.
     """
+    owner = routing_host_session(conv, conversation_store, max_ancestor_reads=max_ancestor_reads)
+    return owner.host_id if owner is not None else None
+
+
+def routing_host_session(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    *,
+    max_ancestor_reads: int = 16,
+) -> Conversation | None:
+    """Return the session owning the routing host and its workspace together."""
     if conv.host_id is not None:
-        return conv.host_id
+        return conv
     reads = 0
     visited = {conv.id}
     current = conv
@@ -127,7 +140,7 @@ def routing_host_id(
         ):
             return None
         if ancestor.host_id is not None:
-            return ancestor.host_id
+            return ancestor
         current = ancestor
 
     # Retain the root fallback when an intermediate parent is missing or cyclic.
@@ -136,7 +149,7 @@ def routing_host_id(
             return None
         root = conversation_store.get_conversation(root_id)
         if root is not None:
-            return root.host_id
+            return root if root.host_id is not None else None
     return None
 
 
@@ -169,11 +182,15 @@ class RunnerRouter:
         conversation_store: ConversationStore,
         host_registry: HostRegistry | None = None,
         host_store: HostStore | None = None,
+        agent_store: AgentStore | None = None,
+        agent_cache: AgentCache | None = None,
     ) -> None:
         self._registry = registry
         self._conversation_store = conversation_store
         self._host_registry = host_registry
         self._host_store = host_store
+        self._agent_store = agent_store
+        self._agent_cache = agent_cache
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._lock = threading.RLock()
 
@@ -294,6 +311,28 @@ class RunnerRouter:
         :returns: ``True`` when the registry has a live session.
         """
         return self._registry.get(runner_id) is not None
+
+    def require_mcp_registry_support(self, conversation: Conversation) -> None:
+        """Validate the connected runner before sending it a registry-backed agent."""
+        from omnigent.host.frames import CAP_MCP_REGISTRY
+
+        connection = self._registry.get(conversation.runner_id) if conversation.runner_id else None
+        if (
+            connection is None
+            or CAP_MCP_REGISTRY in connection.hello.capabilities
+            or self._agent_store is None
+            or self._agent_cache is None
+        ):
+            return
+        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+
+        require_session_registry_mcp_support(
+            conversation,
+            connection.hello.capabilities,
+            component="runner",
+            agent_store=self._agent_store,
+            agent_cache=self._agent_cache,
+        )
 
     async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
         """
@@ -424,6 +463,7 @@ class RunnerRouter:
             client = self._clients.get(runner_id)
             if client is None:
                 client = httpx.AsyncClient(
+                    event_hooks={"request": [add_scheduled_run_header]},
                     transport=WSTunnelTransport(self._registry, runner_id),
                     base_url="http://runner",
                     timeout=httpx.Timeout(5.0, read=None),

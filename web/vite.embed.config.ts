@@ -28,7 +28,7 @@ import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import postcss from "postcss";
-import { defineConfig, type Plugin } from "vite";
+import { defineConfig, transformWithOxc, type Plugin } from "vite";
 
 const SCOPE = ".omnigent-app";
 
@@ -52,7 +52,8 @@ function splitTopLevel(selectorList: string): string[] {
 }
 
 function prefixSelector(selector: string): string {
-  const s = selector.trim();
+  // Tailwind's dark variants must not inherit a dark ancestor from the host.
+  const s = selector.trim().replaceAll(":is(.dark *)", `:is(${SCOPE} .dark *)`);
   if (s === "" || s.startsWith(SCOPE)) return s;
   // Root-level selectors collapse onto the scope element itself.
   const rootMatch = s.match(/^(?::root|html|body)\b(.*)$/);
@@ -206,6 +207,22 @@ function resolveExternalCjsRequire(externals: readonly string[]): Plugin {
   };
 }
 
+// The host's process shim can make rspack miscompile Monaco's guarded Node
+// detection. Resolve the browser-only embed's process reference before rebundling.
+export function forceMonacoBrowserPlatform(): Plugin {
+  return {
+    name: "force-monaco-browser-platform",
+    enforce: "pre",
+    transform(code, id) {
+      if (!id.endsWith("/monaco-editor/esm/vs/base/common/platform.js")) return;
+      return transformWithOxc(code, id, {
+        define: { process: "undefined" },
+        sourcemap: true,
+      });
+    },
+  };
+}
+
 // The worker asset then inherits the regular CDN publicPath and `new Worker(<cross-origin URL>)`
 // throws a SecurityError under managed omnigent — breaking BOTH the pdf.js and Monaco
 // module workers (pdf.js surfaced it first). Rewrite the construction back to the
@@ -297,6 +314,7 @@ export default defineConfig({
     tailwindcss(),
     scopeOmnigentCss(),
     resolveExternalCjsRequire(SHARED_EXTERNALS),
+    forceMonacoBrowserPlatform(),
     inlineWorkerUrlForHost(),
   ],
   resolve: {

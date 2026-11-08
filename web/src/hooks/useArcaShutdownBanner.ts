@@ -9,10 +9,8 @@ import {
   dismissToday,
   isArcaWarningStorageKey,
   isDismissedToday,
-  isOptedOut,
   isWarningWindow,
   markWarnedToday,
-  optOut,
 } from "@/lib/arcaShutdownWarning";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -55,7 +53,7 @@ export function useArcaShutdownBanner() {
 
   return {
     showForHost(hostId: string | null | undefined): boolean {
-      if (!enabled || !hostId || !warningDay || isOptedOut() || isDismissedToday(new Date())) {
+      if (!enabled || !hostId || !warningDay || isDismissedToday(new Date())) {
         return false;
       }
       const storedId = readArcaHostId();
@@ -67,7 +65,6 @@ export function useArcaShutdownBanner() {
       );
     },
     dismissToday: () => dismissToday(new Date()),
-    optOut,
     day: warningDay,
   };
 }

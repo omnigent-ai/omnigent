@@ -415,6 +415,8 @@ async def test_unarchive_skips_stop(
     session_id = session["id"]
 
     await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+    # Finish setup's detached stop before observing the unarchive operation.
+    await _drain_detached_stops()
 
     mock_stop = AsyncMock()
     _sessions_common._session_status_cache[session_id] = "running"

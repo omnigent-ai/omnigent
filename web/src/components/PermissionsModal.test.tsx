@@ -5,6 +5,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo, SharingMode } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { PermissionsModal } from "./PermissionsModal";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 vi.mock("@/hooks/useSharing", () => ({
   usePublicSharingMaxLevel: () => ({ data: undefined }),
@@ -23,7 +24,8 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
 }));
-vi.mock("@/lib/sessionsApi", () => ({
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
   updateSession: vi.fn(),
 }));
 
@@ -140,12 +142,21 @@ function createSharingWrapper(mode: SharingMode) {
   return createInfoWrapper({ sharing_mode: mode });
 }
 
-async function chooseGeneralAccess(name: "No access" | "Read" | "Edit") {
-  const trigger = await screen.findByRole("combobox", { name: "General access" });
+async function chooseGeneralAccess(name: "Only added people" | "Anyone signed in") {
+  const trigger = await screen.findByRole("combobox", { name: "Who can access" });
   await waitFor(() => expect(trigger).toBeEnabled());
   trigger.focus();
   fireEvent.keyDown(trigger, { key: "Enter" });
   fireEvent.click(await screen.findByRole("option", { name }));
+}
+
+async function chooseSharedRole(name: "Read" | "Edit") {
+  const trigger = screen.getByRole("combobox", { name: "What can they do?" });
+  await waitFor(() => expect(trigger).toBeEnabled());
+  trigger.focus();
+  fireEvent.keyDown(trigger, { key: "Enter" });
+  fireEvent.click(await screen.findByRole("option", { name }));
+  await waitFor(() => expect(trigger).toBeEnabled());
 }
 
 beforeEach(() => {
@@ -166,6 +177,39 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("PermissionsModal", () => {
+  it.each(["Who can access", "What can they do?"])(
+    "anchors the %s menu below the start of its trigger",
+    async (label) => {
+      listMock.mockResolvedValue([
+        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 2 },
+      ]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createSharingWrapper("on"),
+      });
+
+      const trigger = await screen.findByRole("combobox", { name: label });
+      await waitFor(() => expect(trigger).toBeEnabled());
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+
+      const menu = await screen.findByRole("listbox");
+      await waitFor(() => {
+        expect(menu).toHaveAttribute("data-side", "bottom");
+        expect(menu).toHaveAttribute("data-align", "end");
+      });
+      expect(
+        within(menu).getByRole("option", {
+          name: label === "Who can access" ? "Only added people" : "Read",
+        }),
+      ).toBeInTheDocument();
+
+      fireEvent.keyDown(menu, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByRole("listbox")).not.toBeInTheDocument());
+      await waitFor(() => expect(trigger).toHaveFocus());
+    },
+  );
+
   it("fetches and displays grants when opened", async () => {
     listMock.mockResolvedValue([
       { user_id: "alice@example.com", conversation_id: "conv_abc", level: 3 },
@@ -196,7 +240,7 @@ describe("PermissionsModal", () => {
     const input = screen.getByPlaceholderText("alice@example.com");
     fireEvent.change(input, { target: { value: "carol@example.com" } });
 
-    const grantBtn = screen.getByRole("button", { name: /grant/i });
+    const grantBtn = screen.getByRole("button", { name: /^add$/i });
     fireEvent.click(grantBtn);
 
     await waitFor(() => {
@@ -216,7 +260,7 @@ describe("PermissionsModal", () => {
 
     await waitFor(() => expect(screen.getByText("bob@example.com")).toBeInTheDocument());
 
-    const revokeBtn = screen.getByRole("button", { name: /revoke/i });
+    const revokeBtn = screen.getByRole("button", { name: /^Remove access for /i });
     fireEvent.click(revokeBtn);
 
     await waitFor(() => {
@@ -257,8 +301,8 @@ describe("PermissionsModal", () => {
 
   it("renders the owner as non-editable with no revoke control", async () => {
     listMock.mockResolvedValue([
-      { user_id: "owner@example.com", conversation_id: "conv_abc", level: 4 },
       { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
+      { user_id: "owner@example.com", conversation_id: "conv_abc", level: 4 },
     ]);
 
     render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
@@ -269,10 +313,13 @@ describe("PermissionsModal", () => {
 
     // Owner level is fixed text, not a dropdown, and exposes no revoke button.
     expect(screen.getByText("Owner")).toBeInTheDocument();
-    const revokeButtons = screen.queryAllByRole("button", { name: /revoke/i });
+    expect(
+      within(screen.getByRole("list", { name: "People with access" })).getAllByRole("listitem")[0],
+    ).toHaveTextContent("owner@example.com");
+    const revokeButtons = screen.queryAllByRole("button", { name: /^Remove access for /i });
     expect(revokeButtons).toHaveLength(1); // only bob's row is revocable
-    // Exactly one editable permission dropdown (bob); owner has none.
-    expect(screen.getAllByRole("combobox")).toHaveLength(3); // general + bob + grant form
+    // One shared role selector and one access selector; rows have no dropdowns.
+    expect(screen.getAllByRole("combobox")).toHaveLength(2); // access + shared role
   });
 
   it("toggles public access via grant/revoke of __public__ sentinel", async () => {
@@ -285,7 +332,7 @@ describe("PermissionsModal", () => {
 
     await waitFor(() => expect(listMock).toHaveBeenCalled());
 
-    await chooseGeneralAccess("Read");
+    await chooseGeneralAccess("Anyone signed in");
 
     await waitFor(() => {
       expect(grantMock).toHaveBeenCalledWith("conv_abc", "__public__", 1);
@@ -304,7 +351,7 @@ describe("PermissionsModal", () => {
 
     const input = screen.getByPlaceholderText("alice@example.com");
     fireEvent.change(input, { target: { value: "rice" } });
-    fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
 
     await waitFor(() => {
       expect(screen.getByText("'rice' needs manage permission")).toBeInTheDocument();
@@ -328,13 +375,11 @@ describe("PermissionsModal", () => {
 
     await waitFor(() => expect(screen.getByText("mallory@example.com")).toBeInTheDocument());
 
-    // Exactly two dropdowns exist: bob's row + the add-grant form. If this
-    // count is 3, the pre-existing manage grant regressed from a fixed label
-    // back to an editable (and thus Manage-bearing) select.
-    const triggers = screen
-      .getAllByRole("combobox")
-      .filter((trigger) => trigger.getAttribute("aria-label") !== "General access");
-    expect(triggers).toHaveLength(2);
+    // Manage remains a fixed label and is never a grantable role. Per-person
+    // rows render no level selectors, so the shared role is the only one.
+    const triggers = screen.getAllByRole("combobox", { name: "What can they do?" });
+    expect(triggers).toHaveLength(1);
+    expect(screen.getAllByRole("combobox")).toHaveLength(2);
     // The manage grant's level is still visible to the viewer as static text.
     expect(screen.getByText("Manage")).toBeInTheDocument();
 
@@ -416,6 +461,50 @@ describe("PermissionsModal", () => {
     });
   });
 
+  it.each([
+    [
+      "denies clipboard write",
+      {
+        writeText: vi
+          .fn()
+          .mockRejectedValue(new DOMException("Write permission denied.", "NotAllowedError")),
+      },
+    ],
+    ["is unavailable on an insecure origin", undefined],
+  ])("copies the link and confirms when the async clipboard %s", async (_case, clipboard) => {
+    listMock.mockResolvedValue([]);
+    const copiedText = vi.fn();
+    Object.assign(navigator, { clipboard });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn((command: string) => {
+        if (command !== "copy") return false;
+        const event = new Event("copy", { bubbles: true, cancelable: true }) as ClipboardEvent;
+        Object.defineProperty(event, "clipboardData", {
+          value: { setData: (_type: string, text: string) => copiedText(text) },
+        });
+        document.dispatchEvent(event);
+        if (!event.defaultPrevented && document.activeElement instanceof HTMLTextAreaElement) {
+          copiedText(document.activeElement.value);
+        }
+        return true;
+      }),
+    });
+
+    try {
+      render(<PermissionsModal sessionId="conv_xyz" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: /copy link/i }));
+
+      expect(await screen.findByRole("button", { name: /copied!/i })).toBeInTheDocument();
+      expect(copiedText).toHaveBeenCalledWith(`${window.location.origin}/c/conv_xyz`);
+    } finally {
+      delete (document as { execCommand?: unknown }).execCommand;
+    }
+  });
+
   it("surfaces a server error from a failed revoke", async () => {
     // WHY: revoke failures (e.g. insufficient permission) must render the
     // server message via the onError path, mirroring the grant error path.
@@ -429,7 +518,7 @@ describe("PermissionsModal", () => {
     });
 
     await waitFor(() => expect(screen.getByText("bob@example.com")).toBeInTheDocument());
-    fireEvent.click(screen.getByRole("button", { name: /revoke/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Remove access for /i }));
 
     await waitFor(() => {
       expect(screen.getByText("cannot revoke last owner")).toBeInTheDocument();
@@ -520,6 +609,52 @@ describe("PermissionsModal", () => {
       );
     });
 
+    it("disables the combobox for a workspace that cannot be shared", async () => {
+      listMock.mockResolvedValue([]);
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice"
+          open
+          onOpenChange={() => {}}
+        />,
+        { wrapper: createSharingWrapper("restricted_read_only") },
+      );
+      await waitFor(() => expect(listMock).toHaveBeenCalled());
+
+      const input = screen.getByPlaceholderText("alice@example.com");
+      expect(input).toHaveAttribute("role", "combobox");
+      expect(input).toBeDisabled();
+    });
+
+    it("closes open suggestions when the workspace becomes unshareable", async () => {
+      listMock.mockResolvedValue([]);
+      const { rerender } = render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice/project"
+          open
+          onOpenChange={() => {}}
+        />,
+        { wrapper: createSharingWrapper("restricted_read_only") },
+      );
+      const input = screen.getByPlaceholderText("alice@example.com");
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "al" } });
+      await waitFor(() => expect(screen.getByRole("listbox")).toBeInTheDocument());
+
+      rerender(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice"
+          open
+          onOpenChange={() => {}}
+        />,
+      );
+      expect(input).toBeDisabled();
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    });
+
     it("renders the field as a combobox and shows suggestions while typing", async () => {
       listMock.mockResolvedValue([]);
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
@@ -583,7 +718,7 @@ describe("PermissionsModal", () => {
       ).toBeInTheDocument();
       // Off short-circuits before the grant-list query and hides all controls.
       expect(listMock).not.toHaveBeenCalled();
-      expect(screen.queryByRole("button", { name: /grant/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^add$/i })).not.toBeInTheDocument();
       expect(screen.queryByRole("switch")).not.toBeInTheDocument();
     });
 
@@ -595,9 +730,9 @@ describe("PermissionsModal", () => {
       });
 
       await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
-      expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^add$/i })).toBeInTheDocument();
       expect(
-        screen.getByText("Invite others to view or collaborate on this session."),
+        screen.getByText(/This Omnigent server allows Read and Edit access for added people\./),
       ).toBeInTheDocument();
       expect(screen.queryByText(/Please be careful when sharing/)).not.toBeInTheDocument();
       expect(
@@ -615,19 +750,14 @@ describe("PermissionsModal", () => {
       await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
       expect(
         screen.getByText(
-          "This server allows read-only sharing — invite others to view this session.",
-        ),
-      ).toBeInTheDocument();
-      expect(
-        screen.getByText(
-          "Please be careful when sharing. Read access will allow for reading of all session outputs.",
+          /This Omnigent server allows read-only sharing\. Invite others to read this session\./,
         ),
       ).toBeInTheDocument();
       // Read grants are still allowed, so the Grant control stays.
-      expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
-      // The add-form level select must offer only Read (Edit is hidden). With no
-      // grants there is exactly one combobox (the add-form select).
-      const trigger = screen.getByRole("combobox", { name: "New user permission" });
+      expect(screen.getByRole("button", { name: /^add$/i })).toBeInTheDocument();
+      // The shared role selector offers only Read on read-only servers.
+      const trigger = screen.getByRole("combobox", { name: "What can they do?" });
+      await waitFor(() => expect(trigger).toBeEnabled());
       trigger.focus();
       fireEvent.keyDown(trigger, { key: "Enter" });
       const listbox = await screen.findByRole("listbox");
@@ -645,16 +775,12 @@ describe("PermissionsModal", () => {
       await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
       expect(
         screen.getByText(
-          "This server allows read-only sharing — invite others to view this session.",
+          /This Omnigent server allows read-only sharing\. Invite others to read this session\./,
         ),
       ).toBeInTheDocument();
-      expect(
-        screen.getByText(
-          "Please be careful when sharing. Read access will allow for reading of all session outputs.",
-        ),
-      ).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
-      const trigger = screen.getByRole("combobox", { name: "New user permission" });
+      expect(screen.getByRole("button", { name: /^add$/i })).toBeInTheDocument();
+      const trigger = screen.getByRole("combobox", { name: "What can they do?" });
+      await waitFor(() => expect(trigger).toBeEnabled());
       trigger.focus();
       fireEvent.keyDown(trigger, { key: "Enter" });
       const listbox = await screen.findByRole("listbox");
@@ -677,13 +803,14 @@ describe("PermissionsModal", () => {
         { wrapper: createSharingWrapper("restricted_read_only") },
       );
       expect(screen.queryByText(/This session's working directory/)).not.toBeInTheDocument();
+      await waitFor(() => expect(screen.getByLabelText("User ID")).toBeEnabled());
       fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
-      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
       await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob", 1));
     });
 
     it.each(["/home/alice", "/Users/bob", "/var/home/carol", "/root", "/"])(
-      "explains the restriction for %s before any submission",
+      "disables new grants and explains the restriction for %s",
       async (workspace) => {
         listMock.mockResolvedValue([]);
         render(
@@ -700,13 +827,52 @@ describe("PermissionsModal", () => {
 
         const warning = screen.getByText(/This session's working directory/);
         expect(warning).toHaveClass("text-destructive");
+        const grantButton = screen.getByRole("button", { name: /^add$/i });
+        expect(screen.getByLabelText("User ID")).toBeDisabled();
+        expect(screen.getByRole("combobox", { name: "What can they do?" })).toBeDisabled();
+        expect(grantButton).toHaveAccessibleDescription(warning.textContent ?? "");
+        // A user id in the field must not re-enable Grant: submitting would be
+        // a silent no-op because handleGrant bails out for blocked workspaces.
         fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
-        fireEvent.click(screen.getByRole("button", { name: /grant/i }));
-        expect(screen.getByRole("combobox", { name: "General access" })).toBeDisabled();
+        expect(grantButton).toBeDisabled();
+        fireEvent.click(grantButton);
+        expect(screen.getByRole("combobox", { name: "Who can access" })).toBeDisabled();
         await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
         expect(grantMock).not.toHaveBeenCalled();
       },
     );
+
+    it("rejects a form submission once the workspace becomes unshareable", async () => {
+      listMock.mockResolvedValue([]);
+      const { rerender } = render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice/project"
+          open
+          onOpenChange={() => {}}
+        />,
+        { wrapper: createSharingWrapper("restricted_read_only") },
+      );
+      await waitFor(() => expect(screen.getByLabelText("User ID")).toBeEnabled());
+      fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
+      expect(screen.getByRole("button", { name: /^add$/i })).toBeEnabled();
+
+      rerender(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice"
+          open
+          onOpenChange={() => {}}
+        />,
+      );
+      const grantButton = screen.getByRole("button", { name: /^add$/i });
+      expect(grantButton).toBeDisabled();
+      // Submit the form directly: a disabled button never reaches handleGrant,
+      // so this is what exercises its own guard.
+      fireEvent.submit(grantButton.closest("form")!);
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+      expect(grantMock).not.toHaveBeenCalled();
+    });
 
     it.each(["on", "read_only"] as const)(
       "does not block home directories in %s mode",
@@ -724,8 +890,9 @@ describe("PermissionsModal", () => {
             wrapper: createSharingWrapper(mode),
           },
         );
+        await waitFor(() => expect(screen.getByLabelText("User ID")).toBeEnabled());
         fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
-        fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+        fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
         await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob", 1));
         expect(screen.queryByText(/This session's working directory/)).not.toBeInTheDocument();
       },
@@ -749,10 +916,16 @@ describe("PermissionsModal", () => {
           wrapper: createSharingWrapper("restricted_read_only"),
         },
       );
-      fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
-      await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "bob"));
-      await chooseGeneralAccess("No access");
+      await screen.findByText("bob");
+      expect(screen.queryByRole("button", { name: /^Remove access for / })).not.toBeInTheDocument();
+      listMock.mockResolvedValue([
+        { conversation_id: "conv_abc", user_id: "alice", level: 4 },
+        { conversation_id: "conv_abc", user_id: "bob", level: 2 },
+      ]);
+      await chooseGeneralAccess("Only added people");
       await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
+      fireEvent.click(await screen.findByRole("button", { name: "Remove access for bob" }));
+      await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "bob"));
       expect(grantMock).not.toHaveBeenCalled();
     });
   });
@@ -767,9 +940,19 @@ describe("PermissionsModal", () => {
 
       await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
       // The user-grant UI stays; only the public toggle is gone.
-      expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
-      expect(screen.queryByText("General access")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^add$/i })).toBeInTheDocument();
+      const access = screen.getByRole("combobox", { name: "Who can access" });
+      expect(access).toHaveTextContent("Only added people");
       expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+      await waitFor(() => expect(access).toBeEnabled());
+      access.focus();
+      fireEvent.keyDown(access, { key: "Enter" });
+      const listbox = await screen.findByRole("listbox");
+      expect(
+        within(listbox)
+          .getAllByRole("option")
+          .map((o) => o.textContent),
+      ).toEqual(["Only added people"]);
     });
 
     it("shows the Public access toggle when public sharing is enabled", async () => {
@@ -780,8 +963,8 @@ describe("PermissionsModal", () => {
       });
 
       await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
-      expect(screen.getByText("General access")).toBeInTheDocument();
-      expect(screen.getByRole("combobox", { name: "General access" })).toBeInTheDocument();
+      expect(screen.getByText("Who can access")).toBeInTheDocument();
+      expect(screen.getByRole("combobox", { name: "Who can access" })).toBeInTheDocument();
     });
 
     it("grants public Edit only when the server explicitly permits it", async () => {
@@ -790,18 +973,21 @@ describe("PermissionsModal", () => {
       render(<PermissionsModal sessionId="conv_abc" open onOpenChange={() => {}} />, {
         wrapper: createInfoWrapper({ public_sharing_max_level: "edit" }),
       });
-      await chooseGeneralAccess("Edit");
+      await chooseSharedRole("Edit");
+      await chooseGeneralAccess("Anyone signed in");
       await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "__public__", 2));
     });
 
     it.each([undefined, "read"] as const)(
-      "offers only No access and Read for a %s ceiling",
+      "offers only Read in public mode for a %s ceiling",
       async (level) => {
-        listMock.mockResolvedValue([]);
+        listMock.mockResolvedValue([
+          { user_id: "__public__", conversation_id: "conv_abc", level: 2 },
+        ]);
         render(<PermissionsModal sessionId="conv_abc" open onOpenChange={() => {}} />, {
           wrapper: createInfoWrapper({ public_sharing_max_level: level }),
         });
-        const trigger = screen.getByRole("combobox", { name: "General access" });
+        const trigger = screen.getByRole("combobox", { name: "What can they do?" });
         await waitFor(() => expect(trigger).toBeEnabled());
         trigger.focus();
         fireEvent.keyDown(trigger, { key: "Enter" });
@@ -810,7 +996,7 @@ describe("PermissionsModal", () => {
           within(listbox)
             .getAllByRole("option")
             .map((option) => option.textContent),
-        ).toEqual(["No access", "Read"]);
+        ).toEqual(["Read"]);
       },
     );
 
@@ -822,9 +1008,53 @@ describe("PermissionsModal", () => {
       render(<PermissionsModal sessionId="conv_abc" open onOpenChange={() => {}} />, {
         wrapper: createInfoWrapper({ public_sharing_enabled: false }),
       });
-      await chooseGeneralAccess("No access");
+      await chooseGeneralAccess("Only added people");
       await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
     });
+  });
+
+  it("shows mixed existing access and applies the shared role without changing owner or manager grants", async () => {
+    listMock.mockResolvedValue([
+      { user_id: "owner@example.com", conversation_id: "conv_abc", level: 4 },
+      { user_id: "manager@example.com", conversation_id: "conv_abc", level: 3 },
+      { user_id: "reader@example.com", conversation_id: "conv_abc", level: 1 },
+      { user_id: "editor@example.com", conversation_id: "conv_abc", level: 2 },
+    ]);
+    grantMock.mockResolvedValue({
+      user_id: "reader@example.com",
+      conversation_id: "conv_abc",
+      level: 2,
+    });
+    render(<PermissionsModal sessionId="conv_abc" open onOpenChange={() => {}} />, {
+      wrapper: createSharingWrapper("on"),
+    });
+    await screen.findByText("reader@example.com");
+    expect(screen.getByRole("combobox", { name: "What can they do?" })).toHaveTextContent(
+      "Mixed access",
+    );
+    expect(grantMock).not.toHaveBeenCalled();
+    await chooseSharedRole("Edit");
+    expect(grantMock.mock.calls).toEqual([["conv_abc", "reader@example.com", 2]]);
+    expect(screen.getByText("Owner")).toBeInTheDocument();
+    expect(screen.getByText("Manage")).toBeInTheDocument();
+  });
+
+  it("keeps the session restricted when applying the public permission cap fails", async () => {
+    listMock.mockResolvedValue([
+      { user_id: "editor@example.com", conversation_id: "conv_abc", level: 2 },
+    ]);
+    grantMock.mockRejectedValue(new Error("Permission update failed"));
+    render(<PermissionsModal sessionId="conv_abc" open onOpenChange={() => {}} />, {
+      wrapper: createInfoWrapper({ public_sharing_max_level: "read" }),
+    });
+    await chooseGeneralAccess("Anyone signed in");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Permission update failed");
+    expect(grantMock.mock.calls).toEqual([["conv_abc", "editor@example.com", 1]]);
+    expect(screen.getByRole("combobox", { name: "Who can access" })).toHaveTextContent(
+      "Only added people",
+    );
+    expect(screen.queryByText("Everyone")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "User ID" })).toBeInTheDocument();
   });
 
   describe("share QR code", () => {
@@ -932,6 +1162,10 @@ describe("PermissionsModal", () => {
       await waitFor(() => expect(listMock).toHaveBeenCalled());
       const toggle = within(screen.getByTestId("share-workspace-files")).getByRole("switch");
       expect(toggle).toHaveAttribute("aria-checked", "false");
+      expect(
+        screen.queryByText(/People with Read access can browse files/),
+      ).not.toBeInTheDocument();
+      expect(toggle).not.toHaveAttribute("aria-describedby");
 
       fireEvent.click(toggle);
       await waitFor(() =>
@@ -939,26 +1173,54 @@ describe("PermissionsModal", () => {
       );
     });
 
-    it("turns sharing off when it is already on", async () => {
+    it.each([
+      { label: "a project workspace", workspace: "/repo", mode: "on" as SharingMode },
+      {
+        label: "a blocked home directory",
+        workspace: "/home/alice",
+        mode: "restricted_read_only" as SharingMode,
+      },
+    ])("turns sharing off when it is already on for $label", async ({ workspace, mode }) => {
       listMock.mockResolvedValue([]);
       useSessionMock.mockReturnValue({
-        session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: true }),
+        session: sessionWith({ workspace, shareWorkspaceFiles: true }),
         isLoading: false,
         error: null,
       });
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
-        wrapper: createInfoWrapper({}),
+        wrapper: createSharingWrapper(mode),
       });
 
       await waitFor(() => expect(listMock).toHaveBeenCalled());
       const toggle = within(screen.getByTestId("share-workspace-files")).getByRole("switch");
       expect(toggle).toHaveAttribute("aria-checked", "true");
+      expect(toggle).toBeEnabled();
+      expect(screen.getByText(/People with Read access can browse files/)).toBeInTheDocument();
+      expect(toggle).toHaveAccessibleDescription(/People with Read access can browse files/);
 
       fireEvent.click(toggle);
       await waitFor(() =>
         expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: false }),
       );
+    });
+
+    it("blocks turning sharing on for a blocked home directory", async () => {
+      listMock.mockResolvedValue([]);
+      useSessionMock.mockReturnValue({
+        session: sessionWith({ workspace: "/home/alice", shareWorkspaceFiles: false }),
+        isLoading: false,
+        error: null,
+      });
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createSharingWrapper("restricted_read_only"),
+      });
+
+      await waitFor(() => expect(listMock).toHaveBeenCalled());
+      const toggle = within(screen.getByTestId("share-workspace-files")).getByRole("switch");
+      expect(toggle).toHaveAttribute("aria-checked", "false");
+      expect(toggle).toBeDisabled();
     });
   });
 });

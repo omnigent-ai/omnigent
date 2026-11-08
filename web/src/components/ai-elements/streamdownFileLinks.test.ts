@@ -5,7 +5,13 @@
 // FileViewer renderer and which are still left to harden untouched.
 
 import { describe, expect, it } from "vitest";
-import { markWorkspaceFileLinks, WORKSPACE_FILE_LINK_ATTR } from "./streamdown-security";
+import {
+  markWorkspaceFileLinks,
+  rewriteFileUriLinks,
+  shortFileCitationLabel,
+  splitWorkspaceFileCitation,
+  WORKSPACE_FILE_LINK_ATTR,
+} from "./streamdown-security";
 
 interface TestNode {
   type: string;
@@ -25,6 +31,18 @@ function markHref(href: string): Record<string, unknown> {
     type: "root",
     children: [{ type: "element", tagName: "p", children: [node] }],
   };
+  markWorkspaceFileLinks()(tree);
+  return node.properties ?? {};
+}
+
+/** Runs the file-URI rewrite and then the marking pass, in their configured order. */
+function rewriteThenMarkHref(href: string): Record<string, unknown> {
+  const node = anchor(href);
+  const tree: TestNode = {
+    type: "root",
+    children: [{ type: "element", tagName: "p", children: [node] }],
+  };
+  rewriteFileUriLinks()(tree);
   markWorkspaceFileLinks()(tree);
   return node.properties ?? {};
 }
@@ -64,6 +82,8 @@ describe("markWorkspaceFileLinks", () => {
     // `notes.md:12` parses as scheme "notes.md:" if you only look for a colon.
     expectHandedOver(markHref("docs/notes.md:12"), "docs/notes.md:12");
     expectHandedOver(markHref("notes.md:12:7"), "notes.md:12:7");
+    expectHandedOver(markHref("notes.md:12-18"), "notes.md:12-18");
+    expectHandedOver(markHref("Makefile:12"), "Makefile:12");
   });
 
   it.each([
@@ -75,11 +95,71 @@ describe("markWorkspaceFileLinks", () => {
     expectHandedOver(markHref(path), path);
   });
 
+  it("decodes a percent-encoded href so the stored path matches the file on disk", () => {
+    // A link to a file with spaces/`+` in its name arrives percent-encoded;
+    // left encoded, the FileViewer lookup can never match the real filename.
+    expectHandedOver(
+      markHref("customer-notes/SAP%20-%20MLflow%20Labeling%20+%20Review%20Queues.md"),
+      "customer-notes/SAP - MLflow Labeling + Review Queues.md",
+    );
+  });
+
+  it("decodes a percent-encoded path while preserving its line fragment", () => {
+    expectHandedOver(markHref("docs/My%20Notes.md#L12"), "docs/My Notes.md#L12");
+    expectHandedOver(markHref("docs/My%20Notes.md:12:7"), "docs/My Notes.md:12:7");
+  });
+
+  it.each([
+    ["docs/report.md%23L12", "encoded # would read as a line fragment"],
+    ["docs/report.md%3A12", "encoded : would read as a line number"],
+  ])("keeps %s encoded rather than decoding it into a citation (%s)", (href) => {
+    // The opener re-splits the stored path, so a decoded `report.md#L12` would
+    // open `report.md` at line 12 — a different file. Left encoded, the
+    // literal filename fails its lookup exactly as it did before.
+    expectHandedOver(markHref(href), href);
+  });
+
+  it("keeps a malformed-encoding href rather than dropping the link", () => {
+    // A lone `%` is a legal filename character but invalid percent-encoding;
+    // decodeURIComponent throws on it, so the raw href is kept.
+    expectHandedOver(markHref("docs/50%-done.md"), "docs/50%-done.md");
+  });
+
+  describe("after rewriteFileUriLinks", () => {
+    it("decodes a file: URI exactly once, so a literal-percent filename survives", () => {
+      // `rewriteFileUriLinks` runs first in the configured plugin order. A file
+      // literally named `report%20final.md` is linked as `report%2520final.md`;
+      // decoding in both passes would open `report final.md` instead.
+      expectHandedOver(
+        rewriteThenMarkHref("file:///ws/report%2520final.md"),
+        "/ws/report%20final.md",
+      );
+    });
+
+    it("decodes a file: URI with spaces once and keeps its line fragment", () => {
+      expectHandedOver(rewriteThenMarkHref("file:///ws/My%20Notes.md#L12"), "/ws/My Notes.md#L12");
+    });
+
+    it("decodes a basename citation once after its colon suffix is rewritten", () => {
+      expectHandedOver(rewriteThenMarkHref("My%20Notes.md:12"), "My Notes.md#L12");
+    });
+
+    it("keeps a basename citation's line range when its colon suffix is rewritten", () => {
+      expectHandedOver(rewriteThenMarkHref("Main.scala:68-72"), "Main.scala#L68-L72");
+    });
+  });
+
   it.each([
     ["https://example.com/docs.md", "external URL"],
     ["http://localhost:3000/x.md", "plain http URL"],
     ["//cdn.example.com/x.md", "protocol-relative URL"],
     ["mailto:someone@example.com", "mailto"],
+    ["tel:555-1234", "phone number shaped like a line range"],
+    ["SMS:555-0100", "uppercase phone scheme"],
+    ["skype:555-1234", "scheme without an extension before a range"],
+    ["geo:1-2", "short scheme shaped like a line range"],
+    ["mailto:555-1234", "mail scheme shaped like a line range"],
+    ["Makefile:12-18", "extensionless name before a range stays a link"],
     ["#section-two", "in-page anchor"],
     ["javascript:alert(1)", "script scheme"],
     ["docs/page.md?raw=1", "path carrying a query"],
@@ -114,5 +194,54 @@ describe("markWorkspaceFileLinks", () => {
     markWorkspaceFileLinks()({ type: "root", children: [img, bare] });
     expect(img.properties).toEqual({ src: "x.png" });
     expect(bare.properties).toEqual({});
+  });
+});
+
+describe("splitWorkspaceFileCitation", () => {
+  it.each([
+    ["src/Main.scala:68-72", "src/Main.scala", 68, 72],
+    ["src/Main.scala#L68-L72", "src/Main.scala", 68, 72],
+    ["src/Main.scala#L68-72", "src/Main.scala", 68, 72],
+    ["src/Main.scala#L68C3-L72C9", "src/Main.scala", 68, 72],
+  ])("reads the range in %s", (text, path, line, endLine) => {
+    expect(splitWorkspaceFileCitation(text)).toMatchObject({ path, line, endLine });
+  });
+
+  it.each([
+    "src/Main.scala:68",
+    "src/Main.scala:68:4",
+    "src/Main.scala:72-68",
+    "src/Main.scala#L5-L5",
+  ])("reports no range for %s", (text) => {
+    const citation = splitWorkspaceFileCitation(text);
+    expect(citation.path).toBe("src/Main.scala");
+    expect(citation).not.toHaveProperty("endLine");
+  });
+
+  it("does not read a colon range with columns, which only the hash form supports", () => {
+    expect(splitWorkspaceFileCitation("src/Main.scala:12:3-15:2")).not.toHaveProperty("endLine");
+  });
+
+  it("drops the range of an invalid zero start line", () => {
+    expect(splitWorkspaceFileCitation("src/Main.scala:0-5")).toEqual({
+      path: "src/Main.scala",
+      line: null,
+      hasPosition: true,
+    });
+  });
+});
+
+describe("shortFileCitationLabel", () => {
+  it.each([
+    ["/repo/sql/core/SQLFunctionExpression.scala:68-72", "SQLFunctionExpression.scala:68-72"],
+    ["src/Main.scala#L41", "Main.scala#L41"],
+    ["~/ws/docs/notes.md", "notes.md"],
+    ["docs/My Notes.md:3:1", "My Notes.md:3:1"],
+  ])("labels %s by its file name", (text, label) => {
+    expect(shortFileCitationLabel(text)).toBe(label);
+  });
+
+  it.each(["README.md", "README.md:12", "docs/"])("has no shorter label for %s", (text) => {
+    expect(shortFileCitationLabel(text)).toBeNull();
   });
 });

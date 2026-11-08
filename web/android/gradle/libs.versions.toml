@@ -1,15 +1,14 @@
-# Versions are pinned to the compileSdk-36 / Gradle-9.3 / JDK-17 toolchain this
-# module builds against. AGP 9.x and the newest androidx libs are required for
-# compileSdk 36+, so these versions move together rather than one at a time.
+# AndroidX Core requires compileSdk 37; AGP 9.4 requires Gradle 9.6 or newer.
+# CI runs Gradle and Robolectric on JDK 21; app bytecode targets Java 17.
 [versions]
-agp = "9.1.1"
-androidxCore = "1.18.0"
+agp = "9.4.1"
+androidxCore = "1.19.1"
 androidxActivity = "1.12.4"
 androidxWebkit = "1.15.0"
-# AppCompat 1.8.x is currently in preview; stick with the latest stable 1.7.x.
-androidxAppcompat = "1.7.1"
+androidxBrowser = "1.10.0"
+androidxAppcompat = "1.8.0"
 junit = "4.13.2"
-robolectric = "4.16.1"
+robolectric = "4.17"
 androidxTestCore = "1.7.0"
 androidxTestRunner = "1.7.0"
 androidxTestRules = "1.7.0"
@@ -17,13 +16,14 @@ androidxTestExtJunit = "1.3.0"
 espresso = "3.7.0"
 uiautomator = "2.4.0"
 # Gradle Play Publisher 4.x supports AGP 9.x; 3.x does not.
-playPublisher = "4.0.0"
+playPublisher = "4.1.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "androidxCore" }
 androidx-activity = { group = "androidx.activity", name = "activity-ktx", version.ref = "androidxActivity" }
 androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "androidxAppcompat" }
 androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "androidxWebkit" }
+androidx-browser = { group = "androidx.browser", name = "browser", version.ref = "androidxBrowser" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
 androidx-test-core = { group = "androidx.test", name = "core", version.ref = "androidxTestCore" }

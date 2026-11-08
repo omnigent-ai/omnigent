@@ -1,6 +1,6 @@
 // Cmd+Enter (Ctrl+Enter on Win/Linux) accepts the pending harness approval
-// prompt — the keyboard equivalent of clicking "Accept" on an ApprovalCard.
-// Bind ONCE at the app shell.
+// prompt — the keyboard equivalent of clicking "Accept" on an ApprovalCard —
+// and Esc declines it, as in the Claude Code terminal UI. Bind ONCE at the app shell.
 //
 // Runs in the CAPTURE phase so it can intercept the keystroke before the
 // composer's own Enter-to-send handler (which fires during bubble and would
@@ -22,11 +22,93 @@
 // prompt that mounted moments earlier.
 
 import { useEffect } from "react";
+import { create } from "zustand";
 
 import { schemaFields } from "@/components/blocks/ElicitationSchemaForm";
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
-import type { ElicitationBlock } from "@/lib/blocks";
+import { ENTER_KEY, ESC_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { useIsEmbedded } from "@/lib/embedded";
+import { getEmbedRoot } from "@/lib/host";
+import {
+  hasCommandModifier,
+  isFocusInDialogOrMenu,
+  isEscapeOwnerOpen,
+  isKeyOwningOverlayOpen,
+  isMacPlatform,
+  isTextEntry,
+} from "@/lib/hotkeys";
+import type { AnyBlock, ElicitationBlock } from "@/lib/blocks";
 import { useChatStore } from "@/store/chatStore";
+
+/** Glyphs for the chord this hook matches; shown on the Approve button it would press. */
+export const APPROVE_KEYS = [MOD_KEY, ENTER_KEY] as const;
+/** Glyph for the key that declines; shown on the Reject button it would press. */
+export const DECLINE_KEYS = [ESC_KEY] as const;
+
+/**
+ * Whether Esc belongs to something else: an open dialog or modal, menu, composer
+ * suggestion list, /btw answer, open panel or dictation that closes on Escape, or a
+ * text field other than the chat composer.
+ */
+function escapeBelongsElsewhere(target: EventTarget | null): boolean {
+  if (isFocusInDialogOrMenu() || document.querySelector("[data-btw-overlay]") !== null) return true;
+  // A fullscreen view or the model/effort preview can be open with focus left outside it.
+  if (isKeyOwningOverlayOpen()) return true;
+  if (isEscapeOwnerOpen()) return true;
+  if (!(target instanceof HTMLElement)) return false;
+  const composer = target.closest<HTMLElement>("[data-composer-card]:not([data-side-chat])");
+  if (composer) return composer.dataset.suggestionsOpen === "true";
+  return isTextEntry(target);
+}
+
+/** How many mounted shells bind the chord; the standalone approval page has none. */
+const useApproveHotkeyBindings = create<{ count: number }>(() => ({ count: 0 }));
+
+// Pending prompts with a card in the open chat. Esc declines only one of these, so it
+// can't decline the chat's prompt from Settings, or from its copy in Inbox.
+const promptsOnScreen = new Map<string, number>();
+
+/** Marks a pending prompt's card as shown in the open chat while it is mounted. */
+export function useApprovalPromptOnScreen(elicitationId: string, pending: boolean): void {
+  useEffect(() => {
+    if (!pending) return;
+    promptsOnScreen.set(elicitationId, (promptsOnScreen.get(elicitationId) ?? 0) + 1);
+    return () => {
+      const count = (promptsOnScreen.get(elicitationId) ?? 1) - 1;
+      if (count > 0) promptsOnScreen.set(elicitationId, count);
+      else promptsOnScreen.delete(elicitationId);
+    };
+  }, [elicitationId, pending]);
+}
+
+/**
+ * The prompt ⌘↵ would approve and Esc would decline: the newest pending prompt
+ * in the open chat, when it takes a plain verdict and has been delivered. A
+ * newer form or an unconfirmed delivery hides every older approval.
+ */
+export function approveHotkeyTarget(blocks: readonly AnyBlock[]): string | null {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (!isPendingElicitation(block)) continue;
+    if (block.nativeDelivery && block.nativeDelivery.state !== "ready") return null;
+    const takesAPlainVerdict =
+      !block.askUserQuestion && schemaFields(block.requestedSchema).length === 0;
+    return takesAPlainVerdict ? block.elicitationId : null;
+  }
+  return null;
+}
+
+function isPendingElicitation(block: AnyBlock | undefined): block is ElicitationBlock {
+  return block?.type === "elicitation" && block.status === "pending";
+}
+
+/** Whether ⌘↵ and Esc act on this prompt, so its buttons can name them. */
+export function useApprovesOnHotkey(elicitationId: string, pending: boolean): boolean {
+  const bound = useApproveHotkeyBindings((state) => state.count > 0);
+  const target = useChatStore(
+    (state) => pending && approveHotkeyTarget(state.blocks) === elicitationId,
+  );
+  return bound && target;
+}
 
 /**
  * Whether the keystroke landed in a text field that holds a draft — the
@@ -54,8 +136,24 @@ export function isDraftingTarget(target: EventTarget | null): boolean {
 }
 
 export function useApproveHotkey(isMac = isMacPlatform()): void {
+  const isEmbedded = useIsEmbedded();
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
+      // Embedded, keys from the host page around the app aren't the app's.
+      const embedRoot = getEmbedRoot();
+      if (isEmbedded && (!embedRoot || !e.composedPath().includes(embedRoot))) return;
+      if (e.key === "Escape") {
+        if (e.repeat || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+        if (escapeBelongsElsewhere(e.target)) return;
+        const { blocks, submitApproval } = useChatStore.getState();
+        const target = approveHotkeyTarget(blocks);
+        if (target === null || !promptsOnScreen.has(target)) return;
+        // Ahead of the composer's Esc-to-stop: declining is what Esc means here.
+        e.preventDefault();
+        e.stopPropagation();
+        void submitApproval(target, "decline");
+        return;
+      }
       // Platform command modifier, not Alt/Shift (mirrors the session-switch guard):
       // only ⌘↵ on macOS and only Ctrl+↵ on Win/Linux.
       if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
@@ -67,27 +165,20 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       if (isDraftingTarget(e.target)) return;
 
       const { blocks, submitApproval } = useChatStore.getState();
-      // Newest-first: accept the most recent still-pending prompt that takes a
-      // plain verdict. Skip AskUserQuestion (needs an explicit choice).
-      // The newest pending prompt is the one on screen. Searching past it for
-      // an older binary one would accept something the person cannot see while
-      // they are filling in a form.
-      const newest = [...blocks]
-        .reverse()
-        .find((b): b is ElicitationBlock => b.type === "elicitation" && b.status === "pending");
-      if (!newest) return;
-      const takesAPlainVerdict =
-        !newest.askUserQuestion && schemaFields(newest.requestedSchema).length === 0;
-      if (!takesAPlainVerdict) return;
-      const pending = newest;
+      const target = approveHotkeyTarget(blocks);
+      if (target === null) return;
 
       // Intercept before the composer's Enter-to-send handler runs.
       e.preventDefault();
       e.stopPropagation();
-      void submitApproval(pending.elicitationId, "accept");
+      void submitApproval(target, "accept");
     };
 
     window.addEventListener("keydown", handler, true);
-    return () => window.removeEventListener("keydown", handler, true);
-  }, [isMac]);
+    useApproveHotkeyBindings.setState((state) => ({ count: state.count + 1 }));
+    return () => {
+      window.removeEventListener("keydown", handler, true);
+      useApproveHotkeyBindings.setState((state) => ({ count: state.count - 1 }));
+    };
+  }, [isMac, isEmbedded]);
 }

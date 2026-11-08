@@ -17,6 +17,8 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     record_hook_event,
 )
+from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _start_recording_server,
@@ -56,6 +58,101 @@ async def test_handback_provenance_is_transported_outside_message_content(candid
     assert "subagent_return_id" not in captured[0]["data"]["item_data"]
     assert "agent_message_candidate" not in captured[0]["data"]["item_data"]
     assert forwarder._external_conversation_item_event(item) == captured[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("character,encoded_bytes", [("x", 1), ("\x00", 6), ("€", 3)])
+async def test_forwarder_caps_tool_output_before_request_body_limit(
+    tmp_path: Path, character: str, encoded_bytes: int
+) -> None:
+    """Oversized tool results reach the server without blocking later transcript items."""
+    output = character * (MAX_SESSION_EVENT_REQUEST_BYTES // encoded_bytes + 1)
+    records = [
+        {
+            "type": "user",
+            "uuid": "tool-result",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": output}],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "after-tool",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        },
+    ]
+    transcript = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(transcript, encoding="utf-8")
+    bridge_dir = tmp_path / "bridge"
+    delivered: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        # An early body rejection may close the upload before its HTTP error arrives.
+        if len(request.content) > MAX_SESSION_EVENT_REQUEST_BYTES:
+            raise httpx.ReadError("request body rejected", request=request)
+        delivered.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=forwarder.TranscriptForwardState(
+                transcript_path=transcript_path, line_cursor=0, byte_offset=0
+            ),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+
+    assert [event["data"]["source_id"] for event in delivered] == [
+        "tool-result:0:function_call_output",
+        "after-tool:0:message",
+    ]
+    assert delivered[0]["data"]["item_data"] == {
+        "call_id": "call-1",
+        "output": cap_tool_output(output),
+    }
+    assert "output truncated by omnigent" in delivered[0]["data"]["item_data"]["output"]
+    assert delivered[1]["data"]["item_data"]["content"] == [
+        {"type": "output_text", "text": "done"}
+    ]
+    assert state.byte_offset == len(transcript.encode("utf-8"))
+    assert forwarder._read_forward_state(bridge_dir) == state
+    assert not (bridge_dir / "dead_letter.jsonl").exists()
+    assert transcript_path.read_text(encoding="utf-8") == transcript
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", ["small", None, {"content": "structured"}])
+async def test_tool_output_upload_preserves_uncapped_data(output: object) -> None:
+    """Small output and malformed non-string values retain their existing wire shape."""
+    data = {"call_id": "call-1", "output": output}
+    item = ClaudeTranscriptItem(
+        source_id="tool-result",
+        item_type="function_call_output",
+        data=data,
+        response_id="turn-1",
+        subagent_return_id="child-1",
+    )
+    captured: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(202)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        await forwarder._post_external_conversation_item(client, session_id="parent", item=item)
+    assert captured == [forwarder._external_conversation_item_event(item)]
+    assert item.data is data
+    assert item.data["output"] == output
 
 
 class _CountingAuth(httpx.Auth):
@@ -218,8 +315,24 @@ async def test_forwarder_uses_auth_to_refresh_token_per_request(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "response_body", "rejection_reason"),
+    [
+        (
+            422,
+            {"detail": "event batch exceeds count or size limit"},
+            "event batch exceeds count or size limit",
+        ),
+        (400, {"detail": "invalid_input"}, "invalid_input"),
+        (422, {"detail": [{"input": "private transcript content"}]}, None),
+        (422, {"detail": "private transcript content"}, None),
+    ],
+)
 async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     tmp_path: Path,
+    status_code: int,
+    response_body: dict[str, Any],
+    rejection_reason: str | None,
 ) -> None:
     """
     Permanent item rejections eventually advance the transcript cursor.
@@ -267,7 +380,7 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
         assert isinstance(payload, dict)
         requests.append(payload)
         if payload["type"] == "external_conversation_item":
-            return httpx.Response(422, json={"error": "bad item"})
+            return httpx.Response(status_code, json=response_body)
         return httpx.Response(202, json={})
 
     transport = httpx.MockTransport(_handle_request)
@@ -307,6 +420,12 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     context = requests[-1]["data"].pop("failure_context")
     assert context["failure_source"] == "forwarder_delivery"
     assert context["detail_source"] == "forwarder_delivery_error"
+    assert context["http_status"] == status_code
+    assert context.get("forwarder_rejection_reason") == rejection_reason
+    attributes = forwarder.failure_log_attributes(context)
+    assert attributes["http_status"] == str(status_code)
+    assert attributes.get("forwarder_rejection_reason") == rejection_reason
+    assert "private transcript content" not in json.dumps(attributes)
     assert context["failure_id"]
     assert "poison-item:0:message" in context["forwarder_source_id"]
     assert requests[-1]["data"] == {

@@ -9,7 +9,7 @@ The behavior under test:
 - A session's **owner** sees it, with the
   kebab's **Rename** and **Share** items **enabled**.
 - A **non-owner the session is shared with** (even at EDIT) sees it under the
-  **"Shared sessions"** filter, with **Rename** and **Share** **disabled**
+  **"Shared with me"** filter, with **Rename** and **Share** **disabled**
   ("Only the session owner can …"). Editing shared *content* still happens in
   the open session — that path reads the real level from the single-session
   snapshot and is unaffected — but the sidebar affordances are owner-only.
@@ -40,11 +40,13 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
     spawn_multi_user_server,
 )
+from tests.e2e_ui.sessions._sidebar_helpers import choose_session_filter
 
 # Edit access (2) is the interesting non-owner case: it proves the sidebar gates
 # on ownership, not level — an EDIT holder still can't rename/share from the
@@ -52,7 +54,6 @@ from tests.e2e_ui.collaboration._multi_user_server import (
 _LEVEL_EDIT = 2
 
 _FILTER = '[data-testid="session-filter"]'
-_FILTER_SHARED = '[data-testid="session-filter-shared"]'
 
 
 @pytest.fixture(scope="module")
@@ -106,9 +107,7 @@ def test_owner_sees_session_under_my_sessions_with_enabled_actions(
     """
     server = multi_user_server
     sid = server.session_id
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": ADMIN_EMAIL})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": ADMIN_EMAIL}) as page:
         page.goto(f"{server.public_url}/c/{sid}")
 
         # Owned → shows under the default "My sessions" filter.
@@ -128,8 +127,6 @@ def test_owner_sees_session_under_my_sessions_with_enabled_actions(
         # not just cosmetic), exactly as the context-menu test asserts.
         page.get_by_test_id("rename-conversation").click()
         expect(page.get_by_test_id("rename-conversation-input")).to_be_visible(timeout=15_000)
-    finally:
-        ctx.close()
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
@@ -137,11 +134,11 @@ def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
     browser: Browser,
     multi_user_server: MultiUserServer,
 ) -> None:
-    """A non-owner (granted EDIT): "Shared sessions" filter, Rename + Share disabled.
+    """A non-owner (granted EDIT): "Shared with me" filter, Rename + Share disabled.
 
     The behavior this PR introduces: an EDIT grant is enough to open and edit
     the session, but the sidebar's Rename/Share are owner-only — so a shared
-    session shows under the "Shared sessions" filter, and its
+    session shows under the "Shared with me" filter, and its
     kebab Rename/Share are disabled regardless of the granted level.
     """
     server = multi_user_server
@@ -149,16 +146,13 @@ def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
     viewer_email = f"viewer-{uuid.uuid4().hex[:6]}@ui.test"
     _grant(server, viewer_email, _LEVEL_EDIT)
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{sid}")
 
         # The shared session is not the viewer's own, so the default "My
-        # sessions" filter hides it; it shows under the "Shared sessions" filter.
+        # sessions" filter hides it; it shows under the "Shared with me" filter.
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
-        page.locator(_FILTER).click()
-        page.locator(_FILTER_SHARED).click()
+        choose_session_filter(page, "shared")
         expect(_row(page, sid)).to_be_visible(timeout=30_000)
 
         _open_row_menu(page, sid)
@@ -170,5 +164,3 @@ def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
         expect(page.get_by_test_id("share-conversation")).to_have_attribute(
             "data-disabled", re.compile(r".*")
         )
-    finally:
-        ctx.close()

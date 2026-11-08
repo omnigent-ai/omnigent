@@ -20,10 +20,12 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    delegated_path_allowed,
 )
 from omnigent.server.routes import _auth_helpers
 from omnigent.server.routes._auth_helpers import (
     can_mutate_session_agent,
+    require_access,
     require_access_and_level,
     require_agent_owner,
 )
@@ -319,6 +321,36 @@ async def test_missing_conversation_raises_404(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("combined", [False, True])
+@pytest.mark.parametrize("permissions_enabled", [False, True])
+async def test_provisional_session_never_reaches_stores(
+    perm_store: SqlAlchemyPermissionStore,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    combined: bool,
+    permissions_enabled: bool,
+) -> None:
+    """Client-only route IDs must not reach stores with numeric session keys."""
+
+    def unexpected_lookup(*args: object, **kwargs: object) -> None:
+        pytest.fail("A provisional session reached a backing store")
+
+    monkeypatch.setattr(perm_store, "resolve_access", unexpected_lookup)
+    monkeypatch.setattr(conv_store, "get_conversation", unexpected_lookup)
+    monkeypatch.setattr(_auth_helpers, "check_session_access", unexpected_lookup)
+    check = require_access_and_level if combined else require_access
+    with pytest.raises(OmnigentError) as exc:
+        await check(
+            ALICE,
+            "temp:0123456789abcdef0123456789abcdef",
+            LEVEL_READ,
+            perm_store if permissions_enabled else None,
+            conv_store,
+        )
+    assert exc.value.code == ErrorCode.NOT_FOUND
+
+
+@pytest.mark.asyncio
 async def test_access_check_shares_a_single_pool_checkout(
     perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
 ) -> None:
@@ -431,3 +463,8 @@ def test_agent_owner_legacy_null_is_admin_only(
     perm_store.ensure_user(BOB)
     perm_store.set_admin(BOB, True)
     require_agent_owner(BOB, agent, perm_store)
+
+
+def test_delegated_runner_credentials_allow_gateway_only():
+    assert delegated_path_allowed("/v1/mcp/tracker")
+    assert not delegated_path_allowed("/v1/mcp-registry/services/tracker/connection")

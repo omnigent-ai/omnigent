@@ -49,6 +49,7 @@ from omnigent.inner.tools import (
     _schema_from_callable,
 )
 from omnigent.llms.routing import infer_harness_from_model as _infer_harness_from_model
+from omnigent.spec.parser import parse_tool_groups
 from omnigent.spec.types import (
     AgentSpec,
     ExecutorAuth,
@@ -392,6 +393,8 @@ def _mcp_server_to_mcp_tool(config: MCPServerConfig) -> MCPTool:
         required field for its declared transport (a programmatic
         construction path that bypassed the validator).
     """
+    if config.transport == "registry":
+        return MCPTool(registry=True, tools=config.tools)
     if config.transport == "stdio":
         if config.command is None:
             raise OmnigentError(
@@ -1146,6 +1149,11 @@ def agent_def_to_agent_spec(
     # spec-side parser does so a typo here surfaces the same
     # error regardless of which spec format the user is on.
     skills_filter = _translate_skills_filter_from_yaml(raw_yaml)
+    # ``tool_groups:`` is not on AgentDef either; parse it from the raw YAML
+    # with the native parser so both dialects reject the same typos.
+    tool_groups = parse_tool_groups(
+        raw_yaml.get("tool_groups") if raw_yaml else None, spawn=agent_def.spawn
+    )
 
     return AgentSpec(
         spec_version=_SYNTHETIC_SPEC_VERSION,
@@ -1163,6 +1171,7 @@ def agent_def_to_agent_spec(
         terminals=terminals,
         timers=agent_def.timers,
         spawn=agent_def.spawn,
+        tool_groups=tool_groups,
         # AgentDef.agent_session_sharing is the raw YAML string
         # ("none"/"non-public"/"public"); map it to the SharePolicy enum
         # AgentSpec expects.
@@ -1836,6 +1845,24 @@ def _translate_mcp_tool_from_def(
         ``databricks_server`` shape is caught upstream by
         :func:`_fail_on_unsupported_tool`).
     """
+    if tool.registry:
+        if any(
+            (
+                tool.url,
+                tool.command,
+                tool.args,
+                tool.env,
+                tool.headers,
+                tool.profile,
+                tool.databricks_server,
+                tool.tool_name,
+            )
+        ):
+            raise OmnigentError(
+                "registry MCP tools cannot override server connection settings",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return MCPServerConfig(name=tool_name, transport="registry", tools=tool.tools)
     if tool.url is not None:
         return MCPServerConfig(
             name=tool_name,

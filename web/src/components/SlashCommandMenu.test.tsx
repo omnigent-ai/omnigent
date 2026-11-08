@@ -1,7 +1,18 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
+  cleanup,
+  createEvent,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  type McpServerRow,
   matchSlashCommandInvocation,
+  BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
   skillDisplayNames,
   skillMenuDescription,
@@ -9,6 +20,13 @@ import {
 } from "./SlashCommandMenu";
 
 afterEach(cleanup);
+
+describe("builtin command matching", () => {
+  it("matches /new by its command name rather than a display alias", () => {
+    expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "n")).toContain("/new");
+    expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "sess")).not.toContain("/new");
+  });
+});
 
 describe("matchSlashCommandInvocation", () => {
   const commands = [
@@ -50,6 +68,8 @@ describe("skill discovery state", () => {
   it("keeps Commands usable while the Skills section loads", () => {
     const onSelect = vi.fn();
     render(<SlashCommandMenu {...props} skillsStatus="loading" onSelect={onSelect} />);
+    expect(screen.getByTestId("slash-command-menu")).toHaveClass("menu-surface", "w-full");
+    expect(screen.getByTestId("slash-command-menu")).not.toHaveClass("w-[28rem]");
     expect(screen.getByText("Commands")).toBeVisible();
     expect(screen.getByText("Skills")).toBeVisible();
     expect(screen.getByRole("status")).toHaveTextContent("Loading skills…");
@@ -107,9 +127,218 @@ describe("skill discovery state", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Skills unavailable while disconnected.");
   });
 
+  it("explains an incomplete catalog instead of calling it empty and offers retry", () => {
+    const onRetrySkills = vi.fn();
+    const warning = "Codex plugin skills unavailable: `codex plugin list` exited 1: Error: broken";
+    const { rerender } = render(
+      <SlashCommandMenu
+        {...props}
+        skillsStatus="ready"
+        skillsWarnings={[warning]}
+        onRetrySkills={onRetrySkills}
+      />,
+    );
+    expect(screen.getByText("Skills")).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent(warning);
+    expect(screen.queryByText("No skills available")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(onRetrySkills).toHaveBeenCalledOnce();
+
+    // Skills that were read still list alongside the explanation and its Retry.
+    rerender(
+      <SlashCommandMenu
+        {...props}
+        commands={{ ...props.commands, "/review": "Review code" }}
+        skillsStatus="ready"
+        skillsWarnings={[warning]}
+        onRetrySkills={onRetrySkills}
+      />,
+    );
+    expect(screen.getByTestId("slash-menu-item-review")).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent(warning);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeVisible();
+
+    // A filter that matches nothing still says so, next to the explanation.
+    rerender(
+      <SlashCommandMenu
+        {...props}
+        query="zzz"
+        commands={{ ...props.commands, "/review": "Review code" }}
+        skillsStatus="ready"
+        skillsWarnings={[warning]}
+        onRetrySkills={onRetrySkills}
+      />,
+    );
+    const rows = screen.getAllByRole("status").map((row) => row.textContent ?? "");
+    expect(rows.some((text) => text.includes(warning))).toBe(true);
+    expect(rows.some((text) => text.includes("No matching skills"))).toBe(true);
+  });
+
   it("preserves the existing empty-menu behavior when discovery state is absent", () => {
     const { container } = render(<SlashCommandMenu {...props} commands={{}} />);
     expect(container).toBeEmptyDOMElement();
+  });
+});
+
+describe("full skill descriptions", () => {
+  const triage =
+    "Given the current conversation's context (a bug, error, crash, regression, test failure, " +
+    "or feature-compatibility issue), file a ticket with reproduction steps and the owning team.";
+  const commands = { "/help": "Show help", "/triage": triage, "/review": "Review code" };
+  const description = (name: string) => screen.getByTestId(`slash-menu-description-${name}`);
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function advanceTimers(milliseconds: number) {
+    act(() => {
+      vi.advanceTimersByTime(milliseconds);
+    });
+  }
+
+  /** Make a row's one-line description report overflow, as layout would when it is cut off. */
+  function overflowDescription(name: string, scrollWidth: number) {
+    const element = description(name);
+    Object.defineProperty(element, "clientWidth", { configurable: true, value: 200 });
+    Object.defineProperty(element, "scrollWidth", { configurable: true, value: scrollWidth });
+  }
+
+  it("shows a cut-off description in full in a hover tooltip after a short delay", () => {
+    render(<SlashCommandMenu {...props} commands={commands} activeIndex={0} />);
+    overflowDescription("triage", 900);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    // A pointer passing over rows shouldn't flash tooltips; the menu waits 400 ms.
+    advanceTimers(399);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+    advanceTimers(1);
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toHaveTextContent(triage);
+  });
+
+  it("keeps the full hover delay on a cut-off row after resting on a row that fits", () => {
+    render(<SlashCommandMenu {...props} commands={commands} activeIndex={0} />);
+    overflowDescription("review", 200);
+    overflowDescription("triage", 900);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-review"));
+    advanceTimers(500);
+    fireEvent.pointerLeave(screen.getByTestId("slash-menu-item-review"));
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    advanceTimers(399);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+    advanceTimers(1);
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toHaveTextContent(triage);
+  });
+
+  it("shows a cut-off description once the keyboard highlight rests on its row", () => {
+    const { rerender } = render(
+      <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
+    );
+    overflowDescription("triage", 900);
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
+    advanceTimers(399);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+    advanceTimers(1);
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toHaveTextContent(triage);
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+  });
+
+  it("rechecks the highlighted row when its description changes", () => {
+    const fitting = { ...commands, "/triage": "File a ticket" };
+    const { rerender } = render(<SlashCommandMenu {...props} commands={fitting} activeIndex={1} />);
+    overflowDescription("triage", 200);
+    advanceTimers(400);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+    overflowDescription("triage", 900);
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
+    advanceTimers(400);
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toHaveTextContent(triage);
+    overflowDescription("triage", 200);
+    rerender(<SlashCommandMenu {...props} commands={fitting} activeIndex={1} />);
+    advanceTimers(400);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+  });
+
+  it("drops a pending tooltip when the highlight moves on before the delay ends", () => {
+    const { rerender } = render(
+      <SlashCommandMenu {...props} commands={commands} activeIndex={1} />,
+    );
+    overflowDescription("triage", 900);
+    advanceTimers(200);
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
+    advanceTimers(500);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+  });
+
+  it("drops a pending hover when the highlight moves and keeps one tooltip open", () => {
+    const { rerender } = render(
+      <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
+    );
+    overflowDescription("triage", 900);
+    overflowDescription("review", 900);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    advanceTimers(200);
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
+    advanceTimers(300);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+    advanceTimers(100);
+    expect(screen.getByTestId("slash-menu-tooltip-review")).toBeInTheDocument();
+    // A new hover replaces the highlighted row's tooltip instead of opening beside it.
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    advanceTimers(400);
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toBeInTheDocument();
+    expect(screen.queryByTestId("slash-menu-tooltip-review")).toBeNull();
+  });
+
+  it("pages an overflowing tooltip with plain PageUp and PageDown only", () => {
+    render(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
+    overflowDescription("triage", 900);
+    advanceTimers(400);
+    const tooltip = screen.getByTestId("slash-menu-tooltip-triage");
+    const scrollBy = vi.fn();
+    Object.assign(tooltip, { scrollBy });
+    tooltip.style.lineHeight = "16px";
+    Object.defineProperty(tooltip, "clientHeight", { configurable: true, value: 254 });
+    Object.defineProperty(tooltip, "scrollHeight", { configurable: true, value: 900 });
+    // fireEvent returns false when a listener prevented the key's default action.
+    expect(fireEvent.keyDown(document.body, { key: "PageDown" })).toBe(false);
+    expect(fireEvent.keyDown(document.body, { key: "PageUp" })).toBe(false);
+    expect(fireEvent.keyDown(document.body, { key: "PageDown", shiftKey: true })).toBe(true);
+    const consumed = createEvent.keyDown(document.body, { key: "PageDown" });
+    consumed.preventDefault();
+    fireEvent(document.body, consumed);
+    Object.defineProperty(tooltip, "scrollHeight", { configurable: true, value: 254 });
+    expect(fireEvent.keyDown(document.body, { key: "PageDown" })).toBe(true);
+    expect(scrollBy.mock.calls).toEqual([[{ top: 222 }], [{ top: -222 }]]);
+  });
+
+  it("closes a hover tooltip when the highlight moves between other rows", () => {
+    const { rerender } = render(
+      <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
+    );
+    overflowDescription("triage", 900);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    advanceTimers(400);
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toBeInTheDocument();
+    // The pointer stays on the row, so only the highlight change can close it.
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+  });
+
+  it("shows no tooltip for a description that already fits", () => {
+    const { rerender } = render(
+      <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
+    );
+    overflowDescription("review", 200);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-review"));
+    advanceTimers(500);
+    expect(screen.queryByTestId("slash-menu-tooltip-review")).toBeNull();
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
+    advanceTimers(500);
+    expect(screen.queryByTestId("slash-menu-tooltip-review")).toBeNull();
   });
 });
 
@@ -183,5 +412,135 @@ describe("skill display name matching", () => {
     ]);
     // Without labels, the display name is not searchable.
     expect(rankedSlashCommandNames(commands, "simplified", new Set())).toEqual([]);
+  });
+});
+
+describe("/mcp panel connection state", () => {
+  const menuProps = { query: "", activeIndex: -1, onSelect: vi.fn(), commands: {} };
+
+  function renderPanel(overrides: Partial<Parameters<typeof SlashCommandMenu>[0]>) {
+    return render(
+      <MemoryRouter>
+        <SlashCommandMenu {...menuProps} showMcpServers {...overrides} />
+      </MemoryRouter>,
+    );
+  }
+
+  it("labels connected and sign-in-required rows and leaves stateless rows unlabeled", () => {
+    renderPanel({
+      mcpServers: [
+        { name: "github", description: "GitHub tools", connection: "connected" },
+        { name: "tracker", connection: "sign-in-required", signIn: { kind: "inline" } },
+        { name: "gone", connection: "unavailable" },
+        { name: "local-files" },
+      ],
+      onMcpSignIn: vi.fn(),
+    });
+    expect(screen.getByTestId("mcp-server-row-github")).toHaveTextContent("Connected");
+    expect(screen.getByTestId("mcp-server-row-tracker")).toHaveTextContent("Sign-in required");
+    expect(screen.getByTestId("mcp-server-row-gone")).toHaveTextContent(
+      "Not available to your account",
+    );
+    expect(screen.getByTestId("mcp-server-row-local-files")).toHaveTextContent(/^local-files$/);
+    // Only the row that needs it offers the action.
+    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(1);
+  });
+
+  it("runs the inline sign-in for the row and shows its progress and failure", () => {
+    const onMcpSignIn = vi.fn();
+    const row: McpServerRow = {
+      name: "tracker",
+      connection: "sign-in-required",
+      signIn: { kind: "inline" },
+    };
+    const panel = (extra: Partial<Parameters<typeof SlashCommandMenu>[0]> = {}) => (
+      <MemoryRouter>
+        <SlashCommandMenu
+          {...menuProps}
+          showMcpServers
+          mcpServers={[row]}
+          onMcpSignIn={onMcpSignIn}
+          {...extra}
+        />
+      </MemoryRouter>
+    );
+    const { rerender } = render(panel());
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(onMcpSignIn).toHaveBeenCalledWith("tracker");
+
+    rerender(panel({ mcpAuthorizingName: "tracker" }));
+    expect(screen.getByRole("button", { name: "Signing in…" })).toBeDisabled();
+
+    rerender(
+      panel({
+        mcpSignInError: { name: "tracker", message: "Sign-in cancelled. Try again when ready." },
+      }),
+    );
+    expect(
+      within(screen.getByTestId("mcp-server-row-tracker")).getByRole("alert"),
+    ).toHaveTextContent("Sign-in cancelled");
+    expect(screen.getByRole("button", { name: "Sign in" })).not.toBeDisabled();
+  });
+
+  it("opens a host-managed sign-in page in a new tab", () => {
+    renderPanel({
+      mcpServers: [
+        {
+          name: "linear",
+          connection: "sign-in-required",
+          signIn: { kind: "url", url: "https://auth.example.com/start" },
+        },
+      ],
+      onMcpSignIn: vi.fn(),
+    });
+    const link = screen.getByRole("link", { name: "Sign in" });
+    expect(link).toHaveAttribute("href", "https://auth.example.com/start");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+  });
+
+  it("disables every Sign in while one is running, labelling only the active row", () => {
+    renderPanel({
+      mcpServers: [
+        { name: "tracker", connection: "sign-in-required", signIn: { kind: "inline" } },
+        { name: "wiki", connection: "sign-in-required", signIn: { kind: "inline" } },
+      ],
+      onMcpSignIn: vi.fn(),
+      mcpAuthorizingName: "tracker",
+    });
+    // A second popup would silently abort the first, so no row invites one.
+    expect(screen.getByRole("button", { name: "Signing in…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeDisabled();
+  });
+
+  it("offers nothing to click when a row needs sign-in but names no way to do it", () => {
+    // A host server whose manager reported no usable URL: the state is still worth
+    // showing, but the panel has no sign-in to run for it.
+    renderPanel({
+      mcpServers: [{ name: "linear", connection: "sign-in-required" }],
+      onMcpSignIn: vi.fn(),
+    });
+    expect(screen.getByTestId("mcp-server-row-linear")).toHaveTextContent("Sign-in required");
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+    expect(screen.queryByRole("link", { name: /Sign in/ })).toBeNull();
+  });
+
+  it("sends a token- or workspace-based service to Settings instead of a popup", () => {
+    renderPanel({
+      mcpServers: [
+        {
+          name: "wiki",
+          connection: "sign-in-required",
+          signIn: { kind: "settings", href: "/settings/mcp" },
+        },
+      ],
+      onMcpSignIn: vi.fn(),
+    });
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+    expect(screen.getByRole("link", { name: "Sign in from Settings" })).toHaveAttribute(
+      "href",
+      "/settings/mcp",
+    );
   });
 });

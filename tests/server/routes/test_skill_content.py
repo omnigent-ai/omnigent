@@ -96,7 +96,7 @@ async def test_owner_gets_skill_content(
         task = asyncio.create_task(
             client.get(_URL, params={"source_id": "a" * 64}, headers={"x-test-user": "owner"})
         )
-        frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
+        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
         assert isinstance(frame, HostSkillContentFrame)
         assert frame.harness == "claude-native"
         assert frame.name == "toolkit:lint"

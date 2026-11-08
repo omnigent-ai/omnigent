@@ -46,8 +46,14 @@ export interface Agent {
   harness?: string | null;
   /** MCP server declarations from the agent spec. Empty when none configured. */
   mcp_servers?: McpServerSummary[];
+  /** Whether a claude-sdk session loads the user's Claude settings and user-scope MCP
+   * servers; false when the spec's `skills: none` runs the CLI with no setting sources.
+   * Absent on older servers, which the web reads as true. */
+  loads_user_settings?: boolean;
   /** Whether the active session's agent bundle can be edited through the UI. */
   mcp_servers_editable?: boolean;
+  /** Whether managed MCP services can be selected for the active session. */
+  mcp_registry_editable?: boolean;
   /** Guardrails policies declared on the agent. Empty when none configured. */
   policies?: PolicySummary[];
   /** Terminal names declared in the spec's `terminals:` block, in
@@ -75,7 +81,9 @@ interface AgentObjectWire {
   description?: string | null;
   harness?: string | null;
   mcp_servers?: McpServerSummary[];
+  loads_user_settings?: boolean;
   mcp_servers_editable?: boolean;
+  mcp_registry_editable?: boolean;
   policies?: PolicySummary[];
   terminals?: string[];
 }
@@ -96,7 +104,9 @@ async function fetchSessionAgent(sessionId: string): Promise<Agent> {
     description: json.description,
     harness: json.harness ?? null,
     mcp_servers: json.mcp_servers,
+    loads_user_settings: json.loads_user_settings,
     mcp_servers_editable: json.mcp_servers_editable,
+    mcp_registry_editable: json.mcp_registry_editable,
     policies: json.policies,
     terminals: json.terminals,
   };
@@ -121,7 +131,7 @@ export function useSessionAgent(sessionId: string | null) {
 
 export interface UpsertMcpServerInput {
   name: string;
-  transport: "http" | "stdio";
+  transport: "http" | "stdio" | "registry";
   description?: string | null;
   url?: string | null;
   headers?: Record<string, string> | null;

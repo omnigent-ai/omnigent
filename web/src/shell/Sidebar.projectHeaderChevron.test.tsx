@@ -80,6 +80,8 @@ describe("project folder header icon/chevron", () => {
       "sidebar-compact-text",
       "text-foreground",
     );
+    // Project names sit heavier than the regular-weight session rows below.
+    expect(within(header).getByText("My Project")).toHaveClass("font-medium");
 
     const folder = header.querySelector(".lucide-folder") as HTMLElement;
     expect(folder).not.toBeNull();
@@ -144,29 +146,36 @@ describe("project folder header icon/chevron", () => {
       .getAllByRole("link", { name: "new session" })
       .find((link) => link.getAttribute("href") === "/?project=My%20Project")!;
     const empty = action.closest(".sidebar-row")!;
+    expect(empty.parentElement).toHaveClass("pl-6");
     expect(empty).toHaveClass(
-      "ml-8",
-      "mr-2",
       "sidebar-row",
+      "sidebar-compact-text",
       "h-auto",
       "min-h-0",
-      "px-0",
-      "py-1",
-      "pb-2",
+      "w-full",
+      "px-2",
+      "py-1.5",
       "md:py-1",
-      "md:pb-2",
       "justify-center",
       "rounded-[var(--radius-otto-button)]",
-      "items-start",
       "text-left",
+      "text-muted-foreground",
     );
-    expect(empty).not.toHaveClass("border", "border-dashed", "items-center", "text-center");
-    // Both sentences share one body-tier text block.
-    expect(empty).not.toHaveClass("min-h-9", "text-sm");
+    expect(empty).not.toHaveClass(
+      "ml-8",
+      "mr-2",
+      "border",
+      "border-dashed",
+      "items-center",
+      "text-center",
+      "px-0",
+      "pb-2",
+      "md:pb-2",
+    );
     const message = empty.querySelector("p")!;
-    expect(message).toHaveClass("text-ui", "text-muted-foreground");
+    expect(message).not.toHaveClass("text-ui");
     const body = message.querySelector("span")!;
-    expect(body).toHaveClass("text-ui");
+    expect(body).not.toHaveClass("text-ui");
     expect(body).toHaveTextContent("No sessions. Start a new session.");
     expect(body).toContainElement(action);
     expect(message).toContainElement(action);
@@ -197,4 +206,16 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(chevron)).not.toMatch(/md:hidden/);
     expect(classOf(chevron)).toMatch(/md:group-hover:opacity-100/);
   });
+});
+
+it("opens New project without toggling the Projects header", () => {
+  renderSidebar();
+  const projects = headerButton("Projects");
+  const expanded = projects.getAttribute("aria-expanded");
+  fireEvent.click(projects);
+  expect(projects.getAttribute("aria-expanded")).not.toBe(expanded);
+  const afterToggle = projects.getAttribute("aria-expanded");
+  fireEvent.click(screen.getByRole("button", { name: "New project" }));
+  expect(screen.getByRole("dialog", { name: "New project" })).toBeVisible();
+  expect(projects.getAttribute("aria-expanded")).toBe(afterToggle);
 });

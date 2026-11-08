@@ -14,29 +14,46 @@ the runner-side wiring that the e2e test cannot pinpoint when it fails.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
+import logging
 import shutil
+import subprocess
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from unittest.mock import DEFAULT, AsyncMock, Mock
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.entities.session_resources import SessionResourceView, terminal_resource_view
+from omnigent.entities.session_resources import (
+    SessionResourceView,
+    terminal_resource_id,
+    terminal_resource_view,
+)
+from omnigent.harnesses.claude_native import bridge
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
 )
 from omnigent.inner.datamodel import TerminalEnvSpec
-from omnigent.runner import create_runner_app
-from omnigent.spec.types import AgentSpec, ToolsConfig
-from omnigent.terminals import TerminalListEntry
+from omnigent.runner import create_runner_app, native_file_observer
+from omnigent.runner.native import ResolvedSpec
+from omnigent.runner.native import orchestration as native_runtime
+from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
+from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig, ToolsConfig
+from omnigent.terminals import TerminalListEntry, TerminalRegistry
+from omnigent.terminals.pane_reaper import PaneRef
+from tests.debug_log_helpers import capture_debug_rows
+from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 # Matches ``_TOOL_RELAY_FILE`` in ``omnigent.harnesses.claude_native.bridge``.
@@ -80,9 +97,23 @@ class _StubResourceRegistry:
         """
         self._terminal_activity_publisher = publisher
 
+    def set_session_background_publisher(
+        self,
+        publisher: Callable[[str, bool], None],
+    ) -> None:
+        """
+        Accept the background-shell publisher installed by the runner app.
+
+        The stub never launches a real terminal, so the callback stays unused.
+        :returns: None.
+        """
+        del publisher
+
     def set_session_status_publisher(
         self,
         publisher: Callable[[str, str], None],
+        *,
+        accepts_inferred_status: Callable[[], bool] | None = None,
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.
@@ -91,9 +122,14 @@ class _StubResourceRegistry:
         callback (unused) to satisfy ``create_runner_app``'s wiring.
 
         :param publisher: Callable ``(session_id, status) -> None``.
+        :param accepts_inferred_status: Unused server capability check.
         :returns: None.
         """
+        del accepts_inferred_status
         self._session_status_publisher = publisher
+
+    def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
+        self._session_failure_publisher = publisher
 
     def set_terminal_exit_publisher(
         self,
@@ -109,6 +145,13 @@ class _StubResourceRegistry:
 
     def note_terminal_control_request(self, session_id: str, action: str) -> None:
         """No terminal is running, so control requests have no lifecycle evidence."""
+
+    def note_session_turn_started(self, session_id: str) -> None:
+        """No terminal is running, so turns have no lifecycle evidence."""
+
+    def uses_copy_on_write(self, session_id: str) -> bool:
+        """The stub has no sandbox environment."""
+        return False
 
     def compute_default_env_root(self, session_id: str, agent_spec: Any) -> str:
         """
@@ -265,7 +308,7 @@ def _skip_tools_changed_notification(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def app(tmp_path: Path) -> FastAPI:
+def app(tmp_path: Path, request: pytest.FixtureRequest) -> FastAPI:
     """
     Build a runner app with a non-spawning resource registry stub.
 
@@ -275,6 +318,7 @@ def app(tmp_path: Path) -> FastAPI:
     return create_runner_app(
         resource_registry=_StubResourceRegistry(tmp_path),
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=tmp_path if getattr(request, "param", False) else None,
     )
 
 
@@ -342,11 +386,50 @@ async def _launch_terminal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scheduled", [False, True])
 async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
     relay_env: _RelayEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    scheduled: bool,
 ) -> None:
-    """A bridge_inject_dir launch writes tool_relay.json with the relay tools."""
-    resp = await _launch_terminal(relay_env.client, relay_env.session_id, bridge_inject_dir=True)
+    """The session relay and its notifier must not retain the launching occurrence."""
+    started = bridge.start_tool_relay
+    notified = threading.Event()
+
+    def start(**kwargs):
+        logging.getLogger("omnigent.runner.test").info("session relay started")
+        return started(**kwargs)
+
+    def notify(*args, **kwargs):
+        logging.getLogger("omnigent.runner.test").info("session relay notified")
+        notified.set()
+
+    monkeypatch.setattr(bridge, "start_tool_relay", start)
+    monkeypatch.setattr(bridge, "post_tools_changed", notify)
+    if scheduled:
+        relay_env.client.headers[SCHEDULED_RUN_HEADER] = json.dumps(
+            {
+                "task_id": "task",
+                "run_id": "run",
+                "task_workspace_id": 7,
+                "scheduled_at": 1000,
+                "target": "connected_host",
+                "session_mode": "continue",
+            }
+        )
+    with capture_debug_rows("runner") as rows:
+        resp = await _launch_terminal(
+            relay_env.client, relay_env.session_id, bridge_inject_dir=True
+        )
+        assert await asyncio.to_thread(notified.wait, 5)
+    relay_env.client.headers.pop(SCHEDULED_RUN_HEADER, None)
+    probes = [
+        row
+        for row in rows
+        if row["message"] in {"session relay started", "session relay notified"}
+    ]
+    assert len(probes) == 2
+    assert all("run_id" not in row["attributes"] for row in probes)
     assert resp.status_code == 200, f"terminal launch failed: {resp.text}"
 
     relay_file = relay_env.bridge_dir / _TOOL_RELAY_FILE
@@ -379,6 +462,8 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_get_history",
         "sys_session_get_info",
         "sys_session_rename",
+        "sys_session_message",
+        "ui_open_file",
         "sys_agent_list",
         "sys_agent_get",
         "sys_agent_download",
@@ -400,10 +485,175 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "conversation_id" in tools_by_name["sys_session_get_history"]["parameters"]["properties"]
     )
     assert "path" in tools_by_name["sys_os_read"]["parameters"]["properties"]
+    assert tools_by_name["sys_session_message"]["parameters"]["required"] == [
+        "session_id",
+        "message",
+    ]
+    assert tools_by_name["ui_open_file"]["parameters"]["required"] == ["path"]
+    assert tools_by_name["ui_open_file"]["parameters"]["additionalProperties"] is False
     # A url + token prove the localhost relay HTTP server actually started
     # (start_tool_relay bound a socket), not just that a file was written.
     assert info["url"].startswith("http://127.0.0.1:")
     assert info["token"]
+
+
+@pytest.mark.parametrize("app", [True], indirect=True)
+async def test_native_observer_uses_first_original_and_skips_git_reads(
+    relay_env: _RelayEnv,
+    app: FastAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    resources = SessionResourceRegistry(runner_workspace=tmp_path)
+    environment = resources.resolve_environment(relay_env.session_id, "default")
+    request.addfinalizer(environment.close)
+    monkeypatch.setattr(
+        app.state.session_resource_registry,
+        "resolve_environment",
+        resources.resolve_environment,
+        raising=False,
+    )
+    start = Mock(wraps=bridge.start_tool_relay)
+    read_file = environment.read
+    read = AsyncMock(wraps=read_file)
+    resolve = Mock(wraps=native_file_observer.resolve_native_original)
+    monkeypatch.setattr(bridge, "start_tool_relay", start)
+    monkeypatch.setattr(environment, "read", read)
+    monkeypatch.setattr(native_file_observer, "resolve_native_original", resolve)
+    response = await _launch_terminal(
+        relay_env.client, relay_env.session_id, bridge_inject_dir=True
+    )
+    assert response.status_code == 200, response.text
+    observe = start.call_args.kwargs["file_change_observer"]
+
+    async def patch_file(path: str, patch: str, started: asyncio.Event | None = None) -> None:
+        if started is not None:
+            started.set()
+        await observe(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "apply_patch",
+                "tool_input": {
+                    "changes": [{"path": path, "kind": {"type": "update"}, "diff": patch}]
+                },
+            }
+        )
+
+    registry = app.state.filesystem_registry
+    events: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    app.state.session_event_queues[relay_env.session_id] = events
+    for path in ("failed.txt", "continued.txt"):
+        (tmp_path / path).write_text("first\n")
+    read.side_effect = [OSError("helper startup failed"), DEFAULT]
+    await observe(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "changes": [
+                    {"path": path, "kind": "update", "diff": "@@ -1 +1 @@\n-old\n+first\n"}
+                    for path in ("failed.txt", "continued.txt")
+                ]
+            },
+        }
+    )
+    read.side_effect = None
+    # The recovered original adds a read of the patched text for the revert check.
+    assert read.await_count == 3
+    assert resolve.call_count == 1
+    for path in ("failed.txt", "continued.txt"):
+        record = registry.get_changed_file(relay_env.session_id, path)
+        assert record is not None and record["status"] == "modified"
+    assert registry.get_baseline("continued.txt") == "old\n"
+    assert events.get_nowait() == {
+        "type": "session.changed_files.invalidated",
+        "session_id": relay_env.session_id,
+        "environment_id": "default",
+    }
+    read.reset_mock()
+    resolve.reset_mock()
+    (tmp_path / "failed.txt").write_text("second\n")
+    await patch_file("failed.txt", "@@ -1 +1 @@\n-first\n+second\n")
+    read.assert_not_awaited()
+    resolve.assert_not_called()
+    assert not registry.needs_snapshot("failed.txt")
+    assert registry.get_baseline("failed.txt") is None
+
+    first_read_started = asyncio.Event()
+    release_first_read = asyncio.Event()
+    second_event_started = asyncio.Event()
+
+    async def gated_read(*args: Any, **kwargs: Any) -> Any:
+        result = await read_file(*args, **kwargs)
+        if not first_read_started.is_set():
+            first_read_started.set()
+            await release_first_read.wait()
+        return result
+
+    read.side_effect = gated_read
+    for path, first_patch, original in (
+        ("known.txt", "@@ -1 +1 @@\n-old\n+first\n", "old\n"),
+        ("unknown.txt", "incomplete patch", None),
+    ):
+        first_read_started.clear()
+        release_first_read.clear()
+        second_event_started.clear()
+        reads_before = read.await_count
+        (tmp_path / path).write_text("first\n")
+        tasks = [asyncio.create_task(patch_file(path, first_patch))]
+        try:
+            await asyncio.wait_for(first_read_started.wait(), timeout=5)
+            (tmp_path / path).write_text("second\n")
+            tasks.append(
+                asyncio.create_task(
+                    patch_file(path, "@@ -1 +1 @@\n-first\n+second\n", second_event_started)
+                )
+            )
+            await asyncio.wait_for(second_event_started.wait(), timeout=5)
+            assert read.await_count == reads_before + 1
+        finally:
+            release_first_read.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+        assert app.state.filesystem_registry.get_baseline(path) == original
+        record = app.state.filesystem_registry.get_changed_file(relay_env.session_id, path)
+        assert record is not None and record["status"] == "modified"
+    assert resolve.call_count == 2
+    assert read.await_count == 4
+    for call in read.await_args_list:
+        assert call.kwargs == {"max_bytes": 1_048_576, "regular_only": True}
+    subprocess.run(["git", "init", str(tmp_path / "repo")], check=True, capture_output=True)
+    await patch_file("repo/file.txt", "@@ -1 +1 @@\n-old\n+new\n")
+    assert resolve.call_count == 2
+    assert read.await_count == 4
+
+    for path in ("known.txt", "unknown.txt"):
+        (tmp_path / path).write_text("old\n")
+        await patch_file(path, "@@ -1 +1 @@\n-second\n+old\n")
+    assert registry.get_changed_file(relay_env.session_id, "known.txt") is None
+    record = registry.get_changed_file(relay_env.session_id, "unknown.txt")
+    assert record is not None and record["status"] == "modified"
+
+    edit = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "tool_input": {}}
+    (tmp_path / "edited.txt").write_text("after\n")
+    await observe(
+        {**edit, "tool_response": {"filePath": "edited.txt", "originalFile": "before\n"}}
+    )
+    record = registry.get_changed_file(relay_env.session_id, "edited.txt")
+    assert record is not None and record["status"] == "modified"
+    (tmp_path / "edited.txt").write_text("before\n")
+    await observe({**edit, "tool_response": {"filePath": "edited.txt", "originalFile": "after\n"}})
+    assert registry.get_changed_file(relay_env.session_id, "edited.txt") is None
+
+    # A truncated or base64 read of these files would equal their original.
+    for path, original, content in (
+        ("grown.txt", "x" * 1_048_576, b"x" * 1_048_577),
+        ("binary.txt", "AAE=", b"\0\1"),
+    ):
+        (tmp_path / path).write_bytes(content)
+        await observe({**edit, "tool_response": {"filePath": path, "originalFile": original}})
+        record = registry.get_changed_file(relay_env.session_id, path)
+        assert record is not None and record["status"] == "modified"
 
 
 @pytest.mark.asyncio
@@ -460,6 +710,98 @@ async def test_repeated_terminal_launch_keeps_single_relay(relay_env: _RelayEnv)
     )
 
 
+class _ReapableStubResourceRegistry(_StubResourceRegistry):
+    """Stub with a terminal registry, so the runner wires its idle pane reaper."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        super().__init__(tmp_path)
+        self.terminal_registry = TerminalRegistry()  # type: ignore[assignment]
+
+    async def close_terminal(self, session_id: str, terminal_id: str) -> bool:
+        """The stub launched no pane, so there is nothing to close."""
+        del session_id, terminal_id
+        return True
+
+
+@pytest.mark.asyncio
+async def test_idle_pane_reap_closes_comment_relay(tmp_path: Path) -> None:
+    """Reaping an idle pane closes its relay; the next launch starts a fresh one."""
+    app = create_runner_app(
+        resource_registry=_ReapableStubResourceRegistry(tmp_path),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    pane = PaneRef(
+        session_id, terminal_resource_id("claude", "main"), "claude", tmp_path / "tmux.sock"
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        try:
+            resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
+            assert resp.status_code == 200, resp.text
+            relay_url = json.loads(relay_file.read_text())["url"]
+
+            await reaper._reap(pane)
+            # A surviving relay keeps a listening socket per reaped session
+            # until the session is deleted, exhausting the runner's descriptors.
+            assert not relay_file.exists(), "tool_relay.json survived the idle reap"
+            with pytest.raises(httpx.ConnectError):
+                async with httpx.AsyncClient() as probe:
+                    await probe.get(relay_url, timeout=2.0)
+
+            resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
+            assert resp.status_code == 200, resp.text
+            # The relay binds from a fixed port range, so the new one may reuse the port.
+            async with httpx.AsyncClient() as probe:
+                await probe.get(json.loads(relay_file.read_text())["url"], timeout=2.0)
+        finally:
+            with contextlib.suppress(httpx.HTTPError):
+                await client.delete(f"/v1/sessions/{session_id}")
+            shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_claude_launch_starts_the_comment_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every Claude launch starts the relay, including the Terminal view's re-create
+    of a reaped pane, which runs no turn that would start it."""
+    launched: list[str] = []
+    relay_starts: list[str] = []
+
+    async def launch(session_id: str, *args: object, **kwargs: object) -> str:
+        del args, kwargs
+        launched.append(session_id)
+        if session_id == "conv_launch_fails":
+            raise RuntimeError("tmux launch failed")
+        return "terminal view"
+
+    async def ensure_comment_relay(session_id: str, **kwargs: object) -> None:
+        del kwargs
+        relay_starts.append(session_id)
+
+    monkeypatch.setattr(native_runtime, "_auto_create_claude_terminal", launch)
+    for session_id in ("conv_relaunched", "conv_launch_fails"):
+        ctx = native_runtime.NativeLaunchContext(
+            session_id=session_id,
+            resource_registry=_StubResourceRegistry(tmp_path),  # type: ignore[arg-type]
+            publish_event=lambda *_args: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+            ensure_comment_relay=ensure_comment_relay,
+        )
+        with contextlib.suppress(RuntimeError):
+            await native_runtime._launch_claude(ctx)
+    await asyncio.gather(*native_runtime._CLAUDE_RELAY_START_TASKS)
+
+    assert launched == ["conv_relaunched", "conv_launch_fails"]
+    assert relay_starts == ["conv_relaunched"], "the relay must start only after a launch"
+
+
 @pytest.mark.asyncio
 async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
     tmp_path: Path,
@@ -504,6 +846,7 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
             *,
             json: dict[str, Any],
             timeout: float = 60.0,
+            headers: dict[str, str] | None = None,
         ) -> httpx.Response:
             """Record the request and return a valid MCP tools/call response.
 
@@ -821,6 +1164,19 @@ async def test_relay_policy_evaluate_truncates_long_upstream_error(
             raise httpx.RequestError("x" * 5000)
 
     loop = asyncio.get_running_loop()
+    logging_started = asyncio.Event()
+    release_logging = threading.Event()
+    logging_finished = threading.Event()
+
+    def blocked_warning(*args: object, **kwargs: object) -> None:
+        loop.call_soon_threadsafe(logging_started.set)
+        try:
+            assert release_logging.wait(15), "error response waited for diagnostic logging"
+        finally:
+            logging_finished.set()
+
+    warning = Mock(side_effect=blocked_warning)
+    monkeypatch.setattr(bridge._logger, "warning", warning)
     relay = start_tool_relay(
         bridge_dir=bridge_dir,
         tools=[],
@@ -842,6 +1198,8 @@ async def test_relay_policy_evaluate_truncates_long_upstream_error(
                 timeout=5.0,
             )
 
+        await asyncio.wait_for(logging_started.wait(), timeout=5)
+        assert not logging_finished.is_set(), "response must arrive before logging finishes"
         assert resp.status_code == 502
         body = resp.text
         # The actionable prefix + leading cause survive; the tail is elided.
@@ -851,7 +1209,11 @@ async def test_relay_policy_evaluate_truncates_long_upstream_error(
         assert body.endswith("...")
         # Bounded well under the raw 5000-char reason.
         assert len(body) < 500
+        warning.assert_called_once()
+        assert isinstance(warning.call_args.kwargs["exc_info"], httpx.RequestError)
+        assert str(warning.call_args.kwargs["exc_info"]) == "x" * 5000
     finally:
+        release_logging.set()
         relay.close()
 
 
@@ -1041,8 +1403,9 @@ def _sub_agent_enum(relay_file: Path) -> set[str]:
 def _switch_app(
     tmp_path: Path,
     server_client: _SwitchableServerClient,
-    specs: dict[str, AgentSpec],
+    specs: dict[str, AgentSpec | ResolvedSpec],
     resource_registry: _StubResourceRegistry | None = None,
+    process_manager: _FakeProcessManager | None = None,
 ) -> FastAPI:
     """
     Build a runner app that resolves each agent id to a distinct spec.
@@ -1052,14 +1415,18 @@ def _switch_app(
     :param specs: Agent id → spec the resolver hands back.
     :param resource_registry: Registry stub. ``None`` builds the default
         non-spawning one.
+    :param process_manager: Optional scripted harness process manager.
     :returns: The runner FastAPI app.
     """
 
-    async def spec_resolver(agent_id: str, session_id: str | None) -> AgentSpec | None:
+    async def spec_resolver(
+        agent_id: str, session_id: str | None
+    ) -> AgentSpec | ResolvedSpec | None:
         del session_id
         return specs.get(agent_id)
 
     return create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
         resource_registry=resource_registry or _StubResourceRegistry(tmp_path),
         server_client=server_client,  # type: ignore[arg-type]  # duck-typed for test
         spec_resolver=spec_resolver,
@@ -1088,6 +1455,220 @@ async def _reset_state(client: httpx.AsyncClient, session_id: str) -> None:
     """
     resp = await client.post(f"/v1/sessions/{session_id}/reset-state")
     assert resp.status_code == 200, f"reset-state failed: {resp.text}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["registry", "http"])
+@pytest.mark.parametrize("fail_once", [False, True])
+async def test_native_relay_discovers_session_mcp_tools_through_gateway(
+    tmp_path: Path,
+    transport: Literal["registry", "http"],
+    fail_once: bool,
+) -> None:
+    """Native relays recover discovery on turns and withdraw tools on agent changes."""
+    requests: list[str] = []
+
+    class GatewayClient(_SwitchableServerClient):
+        """Return per-service schemas for registry tools and session schemas otherwise."""
+
+        async def post(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
+            """Simulate discovery success or a temporary gateway outage."""
+            if kwargs.get("json", {}).get("method") != "tools/list":
+                return self._Response({})
+            requests.append(url)
+            if fail_once and len(requests) == 1:
+                raise httpx.ConnectError("gateway unavailable")
+            return self._Response(
+                {
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "get_me" if transport == "registry" else "github__get_me",
+                                "description": "Read the connected profile",
+                                "inputSchema": {"type": "object", "properties": {}},
+                            }
+                        ]
+                    }
+                }
+            )
+
+    server_client = GatewayClient("with-mcp")
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        mcp_servers=[
+            MCPServerConfig(
+                name="github",
+                transport=transport,
+                url="https://mcp.example.com" if transport == "http" else None,
+            )
+        ],
+    )
+    turn_finished = asyncio.Event()
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ],
+        stream_finished=turn_finished,
+    )
+    app = _switch_app(
+        tmp_path,
+        server_client,
+        {
+            "with-mcp": ResolvedSpec(spec=spec, workdir=tmp_path),
+            "without-mcp": _spec_without_terminals(),
+        },
+        process_manager=_FakeProcessManager(harness_client),
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                await _launch_bridged(client, session_id)
+                names = _relay_tool_names(relay_file)
+                assert ("github__get_me" in names) is not fail_once
+                assert "list_comments" in names
+                assert requests == [
+                    "/v1/mcp/github"
+                    if transport == "registry"
+                    else f"/v1/sessions/{session_id}/mcp"
+                ]
+
+                await _launch_bridged(client, session_id)
+                assert len(requests) == 1
+                assert _relay_tool_names(relay_file) == names
+
+                response = await client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "with-mcp",
+                        "content": [{"type": "input_text", "text": "Try again"}],
+                    },
+                )
+                assert response.status_code == 202, response.text
+                await asyncio.wait_for(turn_finished.wait(), timeout=5.0)
+                assert len(harness_client.posted_bodies) == 1
+                assert {"github__get_me", "list_comments"} <= _relay_tool_names(relay_file)
+                discovery_count = len(requests)
+                assert discovery_count > 1
+
+                server_client.agent_id = "without-mcp"
+                await _reset_state(client, session_id)
+                await _launch_bridged(client, session_id)
+                assert "github__get_me" not in _relay_tool_names(relay_file)
+                assert len(requests) == discovery_count
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_revision", [None, "bundle.zip"])
+@pytest.mark.parametrize("harness_name", ["claude-native", "kiro-native", "pi-native"])
+async def test_native_revision_refreshes_relay_before_turn_without_reset(
+    tmp_path: Path,
+    initial_revision: str | None,
+    harness_name: str,
+) -> None:
+    """Same-agent selection edits replace relay tools before native message delivery."""
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_id = f"bridge_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(bridge_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    tools_at_delivery: list[set[str]] = []
+
+    class GatewayClient(_SwitchableServerClient):
+        async def post(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
+            if kwargs.get("json", {}).get("method") == "tools/list":
+                return self._Response(
+                    {"result": {"tools": [{"name": "status", "inputSchema": {"type": "object"}}]}}
+                )
+            return self._Response({})
+
+    class RecordingHarness(_ScriptedHarnessClient):
+        def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+            tools_at_delivery.append(_relay_tool_names(relay_file))
+            return super().stream(method, url, json=json, timeout=timeout)
+
+    harness = RecordingHarness(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    manager = _FakeProcessManager(harness)
+    base_spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness_name}),
+    )
+    specs: dict[str, AgentSpec | ResolvedSpec] = {
+        "same-agent": ResolvedSpec(spec=base_spec, workdir=tmp_path)
+    }
+    app = _switch_app(
+        tmp_path, GatewayClient("same-agent", bridge_id), specs, process_manager=manager
+    )
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                # Seed the shared relay; native CLI startup is outside this test.
+                await _launch_bridged(client, session_id)
+                initial_relay = json.loads(relay_file.read_text())
+                for revision, service in (
+                    (initial_revision, None),
+                    ("bundle.zip:mcp:alpha", "alpha"),
+                    (None, "alpha"),
+                    ("bundle.zip:mcp:beta", "beta"),
+                    ("bundle.zip", None),
+                ):
+                    specs["same-agent"] = ResolvedSpec(
+                        spec=AgentSpec(
+                            spec_version=1,
+                            executor=base_spec.executor,
+                            mcp_servers=[MCPServerConfig(name=service, transport="registry")]
+                            if service is not None
+                            else [],
+                        ),
+                        workdir=tmp_path,
+                    )
+                    message: dict[str, Any] = {
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "same-agent",
+                        "content": [{"type": "input_text", "text": "Check status"}],
+                    }
+                    if revision is not None:
+                        message["agent_revision"] = revision
+                    prior_deliveries = len(tools_at_delivery)
+                    response = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+                    assert response.status_code == 202, response.text
+                    turn = app.state.active_turns.get(session_id)
+                    if turn is not None:
+                        await asyncio.wait_for(turn, timeout=5.0)
+                    assert len(tools_at_delivery) == prior_deliveries + 1
+                    names = tools_at_delivery[-1]
+                    assert names & {"alpha__status", "beta__status"} == (
+                        {f"{service}__status"} if service is not None else set()
+                    )
+                    assert "list_comments" in names
+                    assert manager.get_client_calls[-1][1] == harness_name
+                    current_relay = json.loads(relay_file.read_text())
+                    assert current_relay["url"] == initial_relay["url"]
+                    assert current_relay["token"] == initial_relay["token"]
+                assert manager.released == []
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
 
 
 @pytest.mark.asyncio
@@ -1178,6 +1759,7 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> Non
         async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
             await _launch_bridged(c, session_id)
             assert (dir_a / _TOOL_RELAY_FILE).exists(), "no relay written for the first bridge"
+            old_relay = json.loads((dir_a / _TOOL_RELAY_FILE).read_text())
 
             server_client.agent_id = agent_b
             server_client.bridge_id = bridge_b
@@ -1193,6 +1775,14 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> Non
             assert not (dir_a / _TOOL_RELAY_FILE).exists(), (
                 "the previous bridge directory kept a stale relay advertisement"
             )
+            async with httpx.AsyncClient(trust_env=False) as relay_client:
+                with pytest.raises(httpx.ConnectError):
+                    await relay_client.post(
+                        f"{old_relay['url']}/tool",
+                        headers={"Authorization": f"Bearer {old_relay['token']}"},
+                        json={"name": "list_comments", "arguments": {}},
+                        timeout=2.0,
+                    )
     finally:
         with contextlib.suppress(httpx.HTTPError):
             async with httpx.AsyncClient(
@@ -1254,15 +1844,11 @@ async def test_agent_switch_rebuilds_same_named_tool_schema(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> None:
-    """A failed bridge-injected launch withdraws the relay that launch installed.
-
-    The rollback used to be gated on "was a relay already present", which a
-    relay left over from the previous agent makes true — so the relay this
-    launch built for the new agent stayed bound and advertised even though
-    the terminal never came up. Rollback is keyed on the relay instance
-    instead, so what this launch installed is what it removes.
-    """
+@pytest.mark.parametrize("switch_bridge", [False, True])
+async def test_failed_launch_rolls_back_only_new_relay(
+    tmp_path: Path, switch_bridge: bool
+) -> None:
+    """Failed launches retain an updated existing relay but close a newly started one."""
     agent_a, agent_b = "ag_first", "ag_second"
     server_client = _SwitchableServerClient(agent_a)
     registry = _FailingResourceRegistry(tmp_path)
@@ -1277,6 +1863,8 @@ async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> 
     bridge_dir = bridge_dir_for_bridge_id(session_id)
     prepare_bridge_dir(session_id, workspace=tmp_path)
     relay_file = bridge_dir / _TOOL_RELAY_FILE
+    next_bridge_id = f"bridge_{uuid.uuid4().hex[:12]}" if switch_bridge else session_id
+    next_bridge_dir = prepare_bridge_dir(next_bridge_id, workspace=tmp_path)
 
     try:
         transport = httpx.ASGITransport(app=app)
@@ -1285,15 +1873,18 @@ async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> 
             assert relay_file.exists()  # precondition: agent A's relay is up
 
             server_client.agent_id = agent_b
+            server_client.bridge_id = next_bridge_id
             await _reset_state(c, session_id)
 
             registry.fail_launch = True
             failed = await _launch_terminal(c, session_id, bridge_inject_dir=True)
             assert failed.status_code == 500
 
-            assert not relay_file.exists(), (
-                "the relay this failed launch installed stayed bound and advertised"
-            )
+            if switch_bridge:
+                assert not relay_file.exists()
+                assert not (next_bridge_dir / _TOOL_RELAY_FILE).exists()
+            else:
+                assert _sub_agent_enum(relay_file) == {"beta"}
     finally:
         with contextlib.suppress(httpx.HTTPError):
             async with httpx.AsyncClient(
@@ -1301,3 +1892,4 @@ async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> 
             ) as c:
                 await c.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
+        shutil.rmtree(next_bridge_dir, ignore_errors=True)

@@ -44,6 +44,10 @@ export interface CommentsPanelProps {
   onClickComment: (comment: Comment) => void;
   /** When false, "Address All" is disabled (no agent registered). */
   canAddress: boolean;
+  /** Draft comments "Address All" sends, including other files'. Defaults to `comments.length`. */
+  addressCount?: number;
+  /** Files those drafts come from. Defaults to 1. */
+  addressFileCount?: number;
   addressPending: boolean;
   /**
    * When false, the add-comment form and all edit/delete buttons are hidden
@@ -81,6 +85,8 @@ export function CommentsPanel({
   onDeleteComment,
   onClickComment,
   canAddress,
+  addressCount = comments.length,
+  addressFileCount = 1,
   addressPending,
   canEdit = true,
   pendingBodyRef,
@@ -161,6 +167,11 @@ export function CommentsPanel({
       : comment.status === "draft" &&
         activeSelectionStart === comment.start_index &&
         activeSelectionEnd === comment.end_index;
+  // This panel lists only the open file's drafts, so name the wider scope when there is one.
+  const addressesOtherFiles = addressCount > comments.length;
+  const addressScope =
+    `Sends ${addressCount} draft comment${addressCount === 1 ? "" : "s"} ` +
+    `from ${addressFileCount} file${addressFileCount === 1 ? "" : "s"}`;
 
   return (
     <div
@@ -179,17 +190,35 @@ export function CommentsPanel({
       <div className="flex h-11 shrink-0 items-center justify-between px-3 border-b border-border">
         <span className="text-sm font-semibold">Comments</span>
         {tab === "open" && (
-          <Button
-            type="button"
-            variant="outline"
-            size="xs"
-            className="rounded-full px-3 gap-1.5"
-            disabled={!canAddress || comments.length === 0 || addressPending}
-            onClick={onAddressAll}
-          >
-            <WandSparklesIcon className="size-3.5" />
-            Address All
-          </Button>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  className="rounded-full px-3 gap-1.5"
+                  disabled={!canAddress || addressCount === 0 || addressPending}
+                  onClick={onAddressAll}
+                >
+                  <WandSparklesIcon className="size-3.5" />
+                  {addressesOtherFiles ? (
+                    `Address All (${addressCount})`
+                  ) : (
+                    <>
+                      Address All
+                      {addressCount > 0 && (
+                        <span className="rounded-full bg-muted px-1.5 text-[10px] tabular-nums">
+                          {addressCount}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </Button>
+              </TooltipTrigger>
+              {addressesOtherFiles && <TooltipContent>{addressScope}</TooltipContent>}
+            </Tooltip>
+          </TooltipProvider>
         )}
       </div>
 
@@ -209,7 +238,7 @@ export function CommentsPanel({
               )}
               onClick={() => setTab(t)}
             >
-              {t === "open" ? "Open" : "Addressed"}
+              {t === "open" ? "Open" : "Sent"}
               {count > 0 && (
                 <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums">
                   {count}
@@ -307,7 +336,7 @@ export function CommentsPanel({
           )
         ) : addressedComments.length === 0 ? (
           <div className="flex items-center justify-center p-8 text-sm text-muted-foreground">
-            No addressed comments.
+            No sent comments.
           </div>
         ) : (
           <div className="space-y-2 p-3">
@@ -399,7 +428,7 @@ function CommentCard({
     if (!editing) setEditBody(c.body);
   }, [c.id, c.body, editing]);
 
-  const statusLabel = c.status === "addressed" ? "Addressed" : null;
+  const statusLabel = c.status === "addressed" ? "Sent" : null;
 
   function startEdit() {
     setEditBody(c.body);
@@ -470,7 +499,7 @@ function CommentCard({
             <button
               type="button"
               aria-expanded={expanded}
-              className="cursor-pointer text-[10px] font-medium text-blue-600 hover:underline dark:text-blue-400"
+              className="cursor-pointer text-[10px] font-medium text-link hover:underline"
               onClick={(e) => {
                 e.stopPropagation();
                 setExpanded((v) => !v);

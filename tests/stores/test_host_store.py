@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from sqlalchemy import event, update
+from sqlalchemy import event, insert, update
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlHost, workspace_scope
-from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.db.account_authority import account_authority_scope
+from omnigent.db.db_models import SqlHost, SqlUser, current_workspace_id, workspace_scope
+from omnigent.db.utils import get_or_create_engine, now_epoch, run_write_transaction
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import (
@@ -46,6 +50,221 @@ def _set_updated_at(db_uri: str, host_id: str, value: int) -> None:
     with Session(engine) as session:
         session.execute(update(SqlHost).where(SqlHost.host_id == host_id).values(updated_at=value))
         session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("archived", [False, True])
+@pytest.mark.parametrize("split_database", [False, True])
+async def test_session_delete_keeps_shared_sandbox_until_last_binding(
+    host_store: HostStore, db_uri: str, archived: bool, split_database, tmp_path, monkeypatch
+) -> None:
+    host_id = uuid.uuid4().hex
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="alice",
+        token="shared-token",
+        provider="modal",
+        sandbox_id="shared-sandbox",
+        token_expires_at=now_epoch() + 1000,
+    )
+    conversations = SqlAlchemyConversationStore(
+        db_uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
+    )
+    first = conversations.create_conversation(host_id=host_id, workspace="/work")
+    other = conversations.create_conversation(host_id=host_id, workspace="/work")
+    if archived:
+        conversations.update_conversation(other.id, archived=True)
+    snapshot = host_store.get_host(host_id)
+    assert snapshot is not None
+    assert host_store.delete_host(host_id, keep_if_bound=True, expected_host=snapshot) is None
+    assert await conversations.delete_conversation(first.id)
+    assert host_store.get_host(host_id) is not None
+    assert conversations.get_conversation(other.id).host_id == host_id
+    assert await conversations.delete_conversation(other.id, preserve_host_binding=host_id)
+    assert conversations.get_conversation(other.id) is None
+    assert host_store.delete_host(host_id, keep_if_bound=True) is None
+    with pytest.raises(OmnigentError, match="must reuse its host"):
+        conversations.create_conversation(
+            conversation_id=other.id, workspace="/wrong-host", labels={"rejected": "1"}
+        )
+    assert conversations.get_conversation(other.id) is None
+    conversations.create_conversation(
+        conversation_id=other.id, host_id=host_id, workspace="/replacement"
+    )
+    assert "rejected" not in conversations.get_conversation(other.id).labels
+    assert host_store.resolve_launch_token(host_id, "shared-token") is not None
+    assert await conversations.delete_conversation(other.id)
+    assert host_store.get_host(host_id) is None
+    pending = host_store.get_host(host_id, include_deleted=True)
+    assert pending is not None and pending.deleted_at is not None
+    assert pending.sandbox_id == "shared-sandbox"
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "_DELETE_LABEL_BATCH_SIZE", 2)
+    deleted_labels = []
+
+    def capture_cleanup(_connection, cursor, statement, _parameters, _context, _many):
+        if statement.startswith("DELETE FROM conversation_labels"):
+            deleted_labels.append(cursor.rowcount)
+
+    event.listen(conversations._conv_engine, "after_cursor_execute", capture_cleanup)
+    try:
+        with pytest.raises(OmnigentError, match="being deleted"):
+            conversations.create_conversation(
+                conversation_id=first.id,
+                host_id=host_id,
+                workspace="/work",
+                labels={f"label-{index}": "1" for index in range(7)},
+            )
+    finally:
+        event.remove(conversations._conv_engine, "after_cursor_execute", capture_cleanup)
+    assert deleted_labels == [2, 2, 2, 1]
+    assert conversations.get_conversation(first.id) is None
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+@pytest.mark.parametrize("uploaded_agent", [False, True])
+def test_last_session_delete_races_new_binding(
+    tmp_path, split_database, uploaded_agent, monkeypatch
+):
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "_DELETE_METADATA_BATCH_SIZE", 2)
+    uri = f"sqlite:///{tmp_path / 'metadata.db'}"
+    conversations = SqlAlchemyConversationStore(
+        uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
+    )
+    hosts = HostStore(uri)
+    host_id = uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="alice",
+        token="shared-token",
+        provider="modal",
+        sandbox_id="shared-sandbox",
+        token_expires_at=now_epoch() + 1000,
+    )
+    first = conversations.create_conversation(host_id=host_id, workspace="/work")
+    for _ in range(3):
+        conversations.create_conversation(
+            parent_conversation_id=first.id, host_id=host_id, workspace="/work"
+        )
+    barrier = threading.Barrier(2)
+    batches = 0
+
+    def observe_batches(maker, operation, write):
+        nonlocal batches
+        result = run_write_transaction(maker, operation, write)
+        if operation == "delete_conversation_metadata":
+            batches += 1
+            if batches == 1:
+                assert hosts.get_host(host_id) is not None
+                barrier.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(sqlalchemy_store, "run_write_transaction", observe_batches)
+
+    def admit(*, race=True):
+        if race:
+            barrier.wait(timeout=5)
+        try:
+            if uploaded_agent:
+                return conversations.create_session_with_agent(
+                    agent_id=uuid.uuid4().hex,
+                    agent_description=None,
+                    agent_name="new",
+                    agent_bundle_location="/tmp/test-bundle",
+                    host_id=host_id,
+                    workspace="/work",
+                    labels={"test": "1"},
+                ).conversation.id
+            return conversations.create_conversation(
+                host_id=host_id, workspace="/work", labels={"test": "1"}
+            ).id
+        except OmnigentError as exc:
+            assert exc.code == ErrorCode.CONFLICT
+            return None
+
+    def remove():
+        assert asyncio.run(conversations.delete_conversation(first.id))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        admitted = pool.submit(admit)
+        removed = pool.submit(remove)
+        survivor = admitted.result(timeout=15)
+        removed.result(timeout=15)
+    assert batches == 2
+    remaining = conversations.list_conversations(limit=10).data
+    assert [row.id for row in remaining] == ([survivor] if survivor else [])
+    if survivor:
+        assert hosts.get_host(host_id) is not None
+        assert hosts.resolve_launch_token(host_id, "shared-token") is not None
+        assert asyncio.run(conversations.delete_conversation(survivor))
+    assert hosts.get_host(host_id) is None
+    assert admit(race=False) is None
+    assert conversations.list_conversations(limit=10).data == []
+
+
+def test_mysql_teardown_observes_binding_committed_after_snapshot(db_uri: str) -> None:
+    engine = get_or_create_engine(db_uri)
+    if engine.dialect.name != "mysql":
+        pytest.skip("Requires MySQL REPEATABLE READ snapshots")
+    hosts = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="alice",
+        token="shared-token",
+        provider="modal",
+        sandbox_id="shared-sandbox",
+        token_expires_at=now_epoch() + 1000,
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    first = conversations.create_conversation(host_id=host_id, workspace="/work")
+    admitted = []
+
+    def admit_after_snapshot(connection, cursor, statement, parameters, context, executemany):
+        if "SELECT DISTINCT omnigent_conversation_metadata.host_id" in statement and not admitted:
+            assert connection.get_isolation_level() == "REPEATABLE READ"
+            admitted.append(conversations.create_conversation(host_id=host_id, workspace="/work"))
+
+    event.listen(engine, "after_cursor_execute", admit_after_snapshot)
+    try:
+        assert asyncio.run(conversations.delete_conversation(first.id))
+    finally:
+        event.remove(engine, "after_cursor_execute", admit_after_snapshot)
+    assert len(admitted) == 1
+    assert conversations.get_conversation(admitted[0].id).host_id == host_id
+    assert hosts.get_host(host_id).sandbox_id == "shared-sandbox"
+    assert hosts.resolve_launch_token(host_id, "shared-token") is not None
+
+
+def test_automatic_cleanup_cannot_delete_replacement_generation(
+    host_store: HostStore,
+) -> None:
+    host_id = uuid.uuid4().hex
+    stale = host_store.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="alice",
+        token="old-token",
+        provider="modal",
+        sandbox_id="old",
+        token_expires_at=now_epoch() + 1000,
+    )
+    host_store.replace_managed_host_sandbox(
+        host_id=host_id,
+        user_id="alice",
+        token="replacement-token",
+        provider="modal",
+        sandbox_id="replacement",
+        token_expires_at=now_epoch() + 1000,
+    )
+    assert host_store.delete_host(host_id, keep_if_bound=True, expected_host=stale) is None
+    assert host_store.get_host(host_id).sandbox_id == "replacement"
 
 
 @pytest.mark.parametrize("provider", [None, "kubernetes", "agent_sandbox", "modal", "lakebox"])
@@ -398,6 +617,7 @@ def test_reown_host_id_across_owner_change_preserves_conversation_binding(
 
 def test_reown_disabled_rejects_foreign_owner_claiming_host_id(
     host_store: HostStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Without reown opt-in, a different owner cannot claim a host_id.
 
@@ -413,6 +633,14 @@ def test_reown_disabled_rejects_foreign_owner_claiming_host_id(
     host_store.upsert_on_connect(
         host_id="5d23e459b50e20479abf5d3fa8e2f936", name="alice-box", user_id="alice@example.com"
     )
+    attempts = 0
+
+    def count_attempts(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return run_write_transaction(*args, **kwargs)
+
+    monkeypatch.setattr("omnigent.stores.host_store.run_write_transaction", count_attempts)
 
     with pytest.raises(IntegrityError):
         host_store.upsert_on_connect(
@@ -420,6 +648,7 @@ def test_reown_disabled_rejects_foreign_owner_claiming_host_id(
             name="bob-box",
             user_id="bob@example.com",
         )
+    assert attempts == 1
 
     # Alice still owns host_x; Bob got nothing.
     assert [h.user_id for h in host_store.list_hosts(user_id="alice@example.com")] == [
@@ -459,6 +688,69 @@ def test_set_offline_noop_for_unknown_host(
     host_store.set_offline("aababcc3941edb738172734a9ab7bb8c")
 
 
+def test_reconnect_waits_for_offline_transaction(
+    host_store: HostStore, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reconnect must read the status after a pending offline write commits."""
+    now = now_epoch()
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: now)
+    host_id = uuid.uuid4().hex
+    workspace_id = current_workspace_id()
+    host_store.upsert_on_connect(host_id, "laptop", "alice@example.test")
+    offline_written = threading.Event()
+    release_offline = threading.Event()
+    reconnect_started = threading.Event()
+    reconnect_finished = threading.Event()
+    worker_ids: dict[str, int] = {}
+    engine = get_or_create_engine(db_uri)
+
+    def delay_offline_commit(_session, _flush_context) -> None:
+        if threading.get_ident() == worker_ids.get("offline"):
+            offline_written.set()
+            assert release_offline.wait(timeout=10)
+
+    def observe_reconnect(_connection, _cursor, statement, _parameters, _context, _many) -> None:
+        if threading.get_ident() == worker_ids.get("reconnect"):
+            sql = statement.upper()
+            if "FROM HOSTS" in sql or sql.startswith("BEGIN IMMEDIATE"):
+                reconnect_started.set()
+
+    def disconnect() -> None:
+        worker_ids["offline"] = threading.get_ident()
+        with workspace_scope(workspace_id):
+            host_store.set_offline(host_id)
+
+    def reconnect() -> Host:
+        worker_ids["reconnect"] = threading.get_ident()
+        with workspace_scope(workspace_id):
+            try:
+                return host_store.upsert_on_connect(host_id, "laptop", "alice@example.test")
+            finally:
+                reconnect_finished.set()
+
+    event.listen(Session, "after_flush", delay_offline_commit)
+    event.listen(engine, "before_cursor_execute", observe_reconnect)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            disconnected = executor.submit(disconnect)
+            try:
+                assert offline_written.wait(timeout=10)
+                connected = executor.submit(reconnect)
+                assert reconnect_started.wait(timeout=10)
+                returned_before_commit = reconnect_finished.wait(timeout=0.5)
+            finally:
+                release_offline.set()
+            disconnected.result(timeout=10)
+            assert connected.result(timeout=10).status == "online"
+    finally:
+        release_offline.set()
+        event.remove(Session, "after_flush", delay_offline_commit)
+        event.remove(engine, "before_cursor_execute", observe_reconnect)
+
+    assert host_store.is_online(host_id)
+    assert not returned_before_commit
+
+
 def test_heartbeat_advances_updated_at_without_changing_status(
     host_store: HostStore,
     db_uri: str,
@@ -493,6 +785,185 @@ def test_heartbeat_noop_for_unknown_host(host_store: HostStore) -> None:
     A heartbeat can race a just-deregistered host; it must not raise.
     """
     host_store.heartbeat("aababcc3941edb738172734a9ab7bb8c")
+
+
+@pytest.mark.parametrize(("expires_in", "token_ttl_s"), [(30, 60), (3600, 60), (30, None)])
+@pytest.mark.parametrize(
+    "write_state", ["ready", "delayed", "observed", "cancelled-before", "cancelled-after"]
+)
+def test_managed_heartbeat_renews_connected_host_token(
+    host_store: HostStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    expires_in: int,
+    token_ttl_s: int | None,
+    write_state: str,
+) -> None:
+    """Renewal uses observed liveness and stops when its tunnel is abandoned."""
+    host_id = uuid.uuid4().hex
+    started_at = now_epoch()
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="connected-sandbox",
+        user_id="alice@example.com",
+        token="launch-token",
+        provider="kubernetes",
+        sandbox_id="sandbox",
+        token_expires_at=started_at + expires_in,
+    )
+    connected = host_store.upsert_on_connect(
+        host_id, "connected-sandbox", "alice@example.com", managed_token="launch-token"
+    )
+    heartbeat_at = started_at + 40
+    current_time = heartbeat_at + (1000 if write_state == "observed" else 0)
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: current_time)
+    if expires_in < 40:
+        assert host_store.resolve_launch_token(host_id, "launch-token") is None
+
+    def delayed_transaction(*args, **kwargs):
+        nonlocal current_time
+        current_time += 1000
+        return run_write_transaction(*args, **kwargs)
+
+    if write_state == "delayed":
+        monkeypatch.setattr(
+            "omnigent.stores.host_store.run_write_transaction", delayed_transaction
+        )
+    cancelled = threading.Event()
+    if write_state == "cancelled-before":
+        cancelled.set()
+    statements: list[str] = []
+
+    def record_statement(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+        if write_state == "cancelled-after" and statement.startswith("UPDATE hosts"):
+            cancelled.set()
+
+    engine = get_or_create_engine(db_uri)
+    event.listen(engine, "after_cursor_execute", record_statement)
+    try:
+        host_store.heartbeat(
+            host_id,
+            managed_token="launch-token",
+            token_ttl_s=token_ttl_s,
+            observed_at=heartbeat_at if write_state == "observed" else None,
+            cancelled=cancelled.is_set,
+        )
+    finally:
+        event.remove(engine, "after_cursor_execute", record_statement)
+    if token_ttl_s is None:
+        operations = [statement.split()[0] for statement in statements]
+        assert [operation for operation in operations if operation not in {"PRAGMA", "BEGIN"}] == (
+            [] if write_state == "cancelled-before" else ["UPDATE"]
+        )
+
+    expected_expiry = started_at + expires_in
+    if token_ttl_s is not None and not cancelled.is_set():
+        expected_expiry = max(expected_expiry, heartbeat_at + token_ttl_s)
+    with Session(get_or_create_engine(db_uri)) as session:
+        row = session.get(SqlHost, (current_workspace_id(), host_id))
+        assert row is not None
+        assert row.token_expires_at == expected_expiry
+        assert row.updated_at == (connected.updated_at if cancelled.is_set() else heartbeat_at)
+    assert (host_store.resolve_launch_token(host_id, "launch-token") is not None) == (
+        expected_expiry >= current_time
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["replace", "revoke", "detach", "delete", "offline", "workspace", "delete-owner", "new-owner"],
+)
+def test_managed_heartbeat_cannot_restore_stale_authority(
+    host_store: HostStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    host_id = uuid.uuid4().hex
+    workspace_id = current_workspace_id()
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(SqlUser).values(
+                workspace_id=workspace_id,
+                id="alice@example.com",
+                account_generation="original-owner",
+            )
+        )
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="stale-sandbox",
+        user_id="alice@example.com",
+        token="old-token",
+        provider="kubernetes",
+        sandbox_id="old-sandbox",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host = host_store.upsert_on_connect(
+        host_id, "stale-sandbox", "alice@example.com", managed_token="old-token"
+    )
+    if change == "replace":
+        host_store.replace_managed_host_sandbox(
+            host_id=host_id,
+            user_id=host.user_id,
+            token="new-token",
+            provider="kubernetes",
+            sandbox_id="new-sandbox",
+            token_expires_at=now_epoch() + 3600,
+        )
+        host_store.upsert_on_connect(host_id, host.name, host.user_id, managed_token="new-token")
+    elif change == "revoke":
+        host_store.revoke_launch_token(host_id)
+    elif change == "detach":
+        assert host_store.detach_stale_managed_sandbox(
+            host_id, sandbox_id="old-sandbox", expected_updated_at=host.updated_at
+        )
+    elif change == "delete":
+        host_store.delete_host(host_id)
+    elif change == "offline":
+        host_store.set_offline(host_id)
+    elif change in {"delete-owner", "new-owner"}:
+        with engine.begin() as connection:
+            connection.execute(
+                update(SqlUser)
+                .where(SqlUser.workspace_id == workspace_id, SqlUser.id == host.user_id)
+                .values(
+                    {"deleted_at": now_epoch()}
+                    if change == "delete-owner"
+                    else {"account_generation": "replacement-owner"}
+                )
+            )
+    with Session(engine) as session:
+        row = session.get(SqlHost, (workspace_id, host_id))
+        assert row is not None
+        before = (row.token_hash, row.token_expires_at, row.updated_at)
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: before[2] + 40)
+
+    if change in {"delete-owner", "new-owner"}:
+        with pytest.raises(OmnigentError, match="authority has been revoked"):
+            host_store.heartbeat(host_id, managed_token="old-token", token_ttl_s=7200)
+    else:
+        with workspace_scope(workspace_id + 1 if change == "workspace" else workspace_id):
+            for token_ttl_s in (None, 7200):
+                host_store.heartbeat(host_id, managed_token="old-token", token_ttl_s=token_ttl_s)
+
+    with Session(engine) as session:
+        row = session.get(SqlHost, (workspace_id, host_id))
+        assert row is not None
+        assert (row.token_hash, row.token_expires_at, row.updated_at) == before
+
+
+@pytest.mark.parametrize(
+    ("managed_token", "token_ttl_s"), [(None, 60), ("token", 0), ("token", -1)]
+)
+def test_managed_heartbeat_rejects_invalid_renewal(
+    host_store: HostStore, managed_token: str | None, token_ttl_s: int
+) -> None:
+    with pytest.raises(ValueError):
+        host_store.heartbeat(
+            uuid.uuid4().hex, managed_token=managed_token, token_ttl_s=token_ttl_s
+        )
 
 
 def test_is_online_true_for_fresh_online_host(host_store: HostStore) -> None:
@@ -739,6 +1210,312 @@ def test_upsert_conflict_preserves_created_at(
     assert fetched[0].updated_at >= original_created
 
 
+_RESERVED_HOST_ID = "ab" * 16
+
+
+def _reserve(
+    host_store: HostStore, *, owner: str = "alice@example.test", provider: str = "modal"
+) -> Host | None:
+    return host_store.reserve_sandbox_host(
+        host_id=_RESERVED_HOST_ID, name="managed-host", user_id=owner, provider=provider
+    )
+
+
+def test_reservation_is_durable_offline_and_tokenless(host_store: HostStore, db_uri: str) -> None:
+    reserved = _reserve(host_store)
+    assert reserved is not None
+    assert reserved == HostStore(db_uri).get_host(_RESERVED_HOST_ID)
+    assert reserved.user_id == "alice@example.test"
+    assert reserved.sandbox_provider == "modal"
+    assert reserved.sandbox_id is None
+    assert not host_store.is_online(_RESERVED_HOST_ID)
+    with Session(get_or_create_engine(db_uri)) as session:
+        row = session.get(SqlHost, (current_workspace_id(), _RESERVED_HOST_ID))
+        assert row is not None
+        assert row.token_hash is None
+        assert row.token_expires_at is None
+    assert _reserve(host_store) == reserved
+
+
+def test_reservation_preserves_live_host_and_credentials(host_store: HostStore) -> None:
+    host_store.register_managed_host(
+        host_id=_RESERVED_HOST_ID,
+        name="existing-host",
+        user_id="alice@example.test",
+        token="launch-token",
+        provider="modal",
+        sandbox_id="existing-environment",
+        token_expires_at=now_epoch() + 3600,
+    )
+    connected = host_store.upsert_on_connect(
+        _RESERVED_HOST_ID,
+        "existing-host",
+        "alice@example.test",
+        configured_harnesses={"codex": True},
+        managed_token="launch-token",
+    )
+    assert _reserve(host_store) == connected
+    assert host_store.resolve_launch_token(_RESERVED_HOST_ID, "launch-token") == connected
+    assert host_store.is_online(_RESERVED_HOST_ID)
+
+
+def test_reservation_rejects_another_owner(host_store: HostStore) -> None:
+    connected = host_store.upsert_on_connect(
+        _RESERVED_HOST_ID, "existing-host", "alice@example.test"
+    )
+    with pytest.raises(ValueError, match="different user"):
+        _reserve(host_store, owner="bob@example.com")
+    assert host_store.get_host(_RESERVED_HOST_ID) == connected
+
+
+@pytest.mark.parametrize("existing_kind", ["external", "managed", "deleted"])
+def test_reservation_refuses_name_owned_by_another_identity(
+    host_store: HostStore, existing_kind: str
+) -> None:
+    other_id = "cd" * 16
+    original = host_store.upsert_on_connect(other_id, "managed-host", "alice@example.test")
+    if existing_kind != "external":
+        original = host_store.bind_sandbox(other_id, provider="modal", sandbox_id="other")
+    if existing_kind == "deleted":
+        host_store.delete_host(other_id)
+        original = None
+    assert _reserve(host_store) is None
+    assert host_store.get_host(_RESERVED_HOST_ID) is None
+    assert host_store.get_host(other_id) == original
+
+
+def test_reservation_is_workspace_scoped(host_store: HostStore) -> None:
+    first = _reserve(host_store)
+    with workspace_scope(current_workspace_id() + 1):
+        second = _reserve(host_store, owner="bob@example.com")
+        assert second is not None
+        assert second.user_id == "bob@example.com"
+    assert host_store.get_host(_RESERVED_HOST_ID) == first
+
+
+def test_reservation_and_binding_reject_conflicting_sandbox(host_store: HostStore) -> None:
+    _reserve(host_store)
+    bound = host_store.bind_sandbox(
+        _RESERVED_HOST_ID, provider="modal", sandbox_id="existing-environment"
+    )
+    assert bound is not None
+    assert _reserve(host_store, provider="kubernetes") is None
+    assert _reserve(host_store) == bound
+    assert (
+        host_store.bind_sandbox(
+            _RESERVED_HOST_ID, provider="modal", sandbox_id="other-environment"
+        )
+        is None
+    )
+    assert (
+        host_store.bind_sandbox(
+            _RESERVED_HOST_ID, provider="kubernetes", sandbox_id="existing-environment"
+        )
+        is None
+    )
+    assert host_store.get_host(_RESERVED_HOST_ID) == bound
+
+
+def test_reservation_cannot_revive_deleted_host(host_store: HostStore) -> None:
+    _reserve(host_store)
+    host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="environment")
+    assert host_store.delete_host(_RESERVED_HOST_ID) is not None
+    assert _reserve(host_store) is None
+    assert (
+        host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="environment")
+        is None
+    )
+    assert host_store.get_host(_RESERVED_HOST_ID) is None
+
+
+def test_stale_request_cannot_reserve_host(host_store: HostStore) -> None:
+    with account_authority_scope("alice@example.test", "revoked-generation"):
+        with pytest.raises(OmnigentError, match="authority has been revoked"):
+            _reserve(host_store)
+    assert host_store.get_host(_RESERVED_HOST_ID) is None
+
+
+@pytest.mark.parametrize("operation", ["reserve", "bind"])
+def test_sandbox_metadata_cannot_cross_account_generation(
+    host_store: HostStore, db_uri: str, operation: str
+) -> None:
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(SqlUser).values(
+                workspace_id=current_workspace_id(),
+                id="alice@example.test",
+                account_generation="old-generation",
+            )
+        )
+    reserved = _reserve(host_store)
+    with engine.begin() as connection:
+        connection.execute(
+            update(SqlUser)
+            .where(
+                SqlUser.workspace_id == current_workspace_id(), SqlUser.id == "alice@example.test"
+            )
+            .values(account_generation="new-generation")
+        )
+    with pytest.raises(OmnigentError, match="authority has been revoked"):
+        if operation == "reserve":
+            _reserve(host_store)
+        else:
+            host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="environment")
+    assert host_store.get_host(_RESERVED_HOST_ID) == reserved
+
+
+def test_connection_racing_reservation_keeps_managed_classification(host_store: HostStore) -> None:
+    workspace_id = current_workspace_id()
+    barrier = threading.Barrier(2)
+
+    def connect() -> None:
+        with workspace_scope(workspace_id):
+            barrier.wait(timeout=5)
+            host_store.upsert_on_connect(
+                _RESERVED_HOST_ID,
+                "managed-host",
+                "alice@example.test",
+                configured_harnesses={"codex": True},
+            )
+
+    def reserve() -> None:
+        with workspace_scope(workspace_id):
+            barrier.wait(timeout=5)
+            assert _reserve(host_store) is not None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        connected = executor.submit(connect)
+        reserved = executor.submit(reserve)
+        connected.result(timeout=10)
+        reserved.result(timeout=10)
+    host = host_store.get_host(_RESERVED_HOST_ID)
+    assert host is not None
+    assert host.sandbox_provider == "modal"
+    assert host.configured_harnesses == {"codex": True}
+    assert host_store.is_online(_RESERVED_HOST_ID)
+
+
+@pytest.mark.parametrize("loser", ["reservation", "connection"])
+def test_insert_conflict_retry_adopts_the_competing_row(
+    host_store: HostStore, monkeypatch: pytest.MonkeyPatch, loser: str
+) -> None:
+    """
+    Reservation and connect both insert when the host row is missing. SQLite
+    serializes writers, so the lost race is injected: the loser's first
+    transaction fails after the other side committed, and its retry must adopt
+    that row rather than raise or insert a duplicate.
+    """
+    operation = "reserve_sandbox_host" if loser == "reservation" else "upsert_host_on_connect"
+    attempts: list[str] = []
+
+    def connect() -> Host:
+        return host_store.upsert_on_connect(
+            _RESERVED_HOST_ID,
+            "managed-host",
+            "alice@example.test",
+            configured_harnesses={"codex": True},
+        )
+
+    def lose_first_attempt(session_maker, operation_name, callback, **kwargs):
+        if operation_name == operation:
+            attempts.append(operation_name)
+            if len(attempts) == 1:
+                if loser == "reservation":
+                    connect()
+                else:
+                    assert _reserve(host_store) is not None
+                raise IntegrityError(
+                    "UNIQUE constraint failed: hosts.workspace_id, hosts.host_id",
+                    params={"host_id": _RESERVED_HOST_ID},
+                    orig=Exception("duplicate primary key"),
+                )
+        return run_write_transaction(session_maker, operation_name, callback, **kwargs)
+
+    monkeypatch.setattr("omnigent.stores.host_store.run_write_transaction", lose_first_attempt)
+    host = _reserve(host_store) if loser == "reservation" else connect()
+    assert attempts == [operation, operation]
+    assert host is not None
+    assert host.status == "online"
+    assert host.sandbox_provider == "modal"
+    assert host.configured_harnesses == {"codex": True}
+    assert host_store.get_host(_RESERVED_HOST_ID) == host
+
+
+@pytest.mark.parametrize("connection_state", ["offline", "stale", "live"])
+@pytest.mark.parametrize("retry_dialect", [None, "mysql", "cockroachdb"])
+def test_binding_preserves_connection_liveness(
+    host_store: HostStore,
+    db_uri: str,
+    connection_state: str,
+    retry_dialect: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if connection_state != "offline":
+        host_store.upsert_on_connect(_RESERVED_HOST_ID, "managed-host", "alice@example.test")
+    if connection_state == "stale":
+        _set_updated_at(db_uri, _RESERVED_HOST_ID, 1)
+    reserved = _reserve(host_store)
+    assert reserved is not None
+    attempts = 0
+
+    class ConcurrencyFailure(Exception):
+        sqlstate = "40001"
+
+    def fail_first_flush(session, _context):
+        nonlocal attempts
+        if any(
+            isinstance(row, SqlHost) and row.sandbox_id == "environment" for row in session.dirty
+        ):
+            attempts += 1
+            if attempts == 1:
+                raise DBAPIError("UPDATE hosts", {}, ConcurrencyFailure(1213, "deadlock"), False)
+
+    # Inject the server's concurrency error after a real write, retaining rollback and retry.
+    engine = get_or_create_engine(db_uri)
+    with monkeypatch.context() as patch:
+        if retry_dialect is not None:
+            patch.setattr(engine.dialect, "name", retry_dialect)
+            event.listen(Session, "after_flush", fail_first_flush)
+        try:
+            bound = host_store.bind_sandbox(
+                _RESERVED_HOST_ID, provider="modal", sandbox_id="environment"
+            )
+        finally:
+            if retry_dialect is not None:
+                event.remove(Session, "after_flush", fail_first_flush)
+    assert attempts == (0 if retry_dialect is None else 2)
+    assert bound is not None
+    if connection_state == "live":
+        assert bound.updated_at == reserved.updated_at
+        assert bound.status == "online"
+    else:
+        assert bound.updated_at >= reserved.updated_at
+        assert bound.status == "offline"
+    assert host_store.is_online(_RESERVED_HOST_ID) == (connection_state == "live")
+    connected = host_store.upsert_on_connect(
+        _RESERVED_HOST_ID, "managed-host", "alice@example.test"
+    )
+    assert connected.sandbox_provider == "modal"
+    assert connected.sandbox_id == "environment"
+    assert host_store.is_online(_RESERVED_HOST_ID)
+
+
+def test_binding_cannot_reactivate_sandbox_pending_termination(host_store: HostStore) -> None:
+    assert host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="old") is None
+    _reserve(host_store)
+    bound = host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="old")
+    assert bound is not None
+    assert host_store.detach_stale_managed_sandbox(
+        _RESERVED_HOST_ID, sandbox_id="old", expected_updated_at=bound.updated_at
+    )
+    assert host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="old") is None
+    replacement = host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="new")
+    assert replacement is not None
+    assert replacement.sandbox_id == "new"
+    assert replacement.terminating_sandbox_id == "old"
+
+
 # ── Managed-host credential methods ────────────────────────
 
 
@@ -923,7 +1700,12 @@ def test_delete_host_hides_row_and_retains_cleanup_tombstone(db_uri: str) -> Non
         assert session.get(SqlHost, (0, "dcf4eb5fc0b04985ec45f79cfda95566")) is None
 
 
-def test_stale_completion_removes_host_deleted_after_detach(db_uri: str) -> None:
+@pytest.mark.parametrize("cleanup_before_delete", [False, True])
+def test_stale_completion_removes_host_deleted_after_detach(
+    db_uri: str, cleanup_before_delete: bool
+) -> None:
+    from omnigent.db.db_models import SqlPreference
+
     store = HostStore(db_uri)
     host_id = "405a78021f6648e5ae887350047f76b5"
     original = store.register_managed_host(
@@ -935,24 +1717,41 @@ def test_stale_completion_removes_host_deleted_after_detach(db_uri: str) -> None
         sandbox_id="detach-delete-sandbox",
         token_expires_at=now_epoch() + 3600,
     )
+    assert store.claim_managed_recovery(original, "recovery-token")
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.add(
+            SqlPreference(
+                workspace_id=current_workspace_id(),
+                user_id="__host_lifecycle__",
+                key="retained_sandbox:" + host_id,
+                value="deleted-task",
+            )
+        )
+        session.commit()
     assert store.detach_stale_managed_sandbox(
         host_id,
         sandbox_id="detach-delete-sandbox",
         expected_updated_at=original.updated_at,
     )
+    if cleanup_before_delete:
+        assert store.mark_sandbox_terminated(host_id, sandbox_id="detach-delete-sandbox")
     deleted = store.delete_host(host_id)
     assert deleted is not None
-    assert deleted.deleted_at is not None
-    assert deleted.terminating_sandbox_id == "detach-delete-sandbox"
+    if not cleanup_before_delete:
+        assert deleted.deleted_at is not None
+        assert deleted.terminating_sandbox_id == "detach-delete-sandbox"
+        assert store.mark_sandbox_terminated(host_id, sandbox_id="detach-delete-sandbox")
 
-    assert store.mark_sandbox_terminated(
-        host_id,
-        sandbox_id="detach-delete-sandbox",
-    )
-
-    engine = get_or_create_engine(db_uri)
     with Session(engine) as session:
         assert session.get(SqlHost, (0, host_id)) is None
+        for prefix in ("recovery:", "retained_sandbox:"):
+            assert (
+                session.get(
+                    SqlPreference, (current_workspace_id(), "__host_lifecycle__", prefix + host_id)
+                )
+                is None
+            )
 
 
 def test_replace_managed_host_sandbox_cannot_recreate_missing_host(db_uri: str) -> None:
@@ -1484,3 +2283,158 @@ def test_replace_managed_host_sandbox_refuses_cross_owner(db_uri: str) -> None:
     assert resolved.sandbox_id == "sb-m7"
     # Bob's token never armed Alice's host: it does not match the stored digest.
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
+
+
+def test_recovery_fences_expired_attempts_and_connected_hosts(
+    host_store: HostStore, monkeypatch
+) -> None:
+    started_at = now_epoch()
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: started_at)
+    host = host_store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="shared",
+        user_id="alice",
+        token="initial",
+        provider="modal",
+        sandbox_id="old",
+        token_expires_at=now_epoch() + 1000,
+    )
+    with pytest.raises(ValueError, match="no longer available"):
+        host_store.managed_recovery_result(host.host_id)
+    assert host_store.claim_managed_recovery(host, "first")
+    assert not host_store.claim_managed_recovery(host, "second")
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: started_at + 30)
+    assert host_store.update_managed_recovery(host.host_id, "first")
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: started_at + 61)
+    assert host_store.managed_recovery_result(host.host_id) is None
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: started_at + 91)
+    with pytest.raises(ValueError, match="failed or expired"):
+        host_store.managed_recovery_result(host.host_id)
+    assert host_store.claim_managed_recovery(host, "second")
+    assert not host_store.update_managed_recovery(host.host_id, "first", finished=True)
+    with pytest.raises(ValueError, match="superseded"):
+        host_store.replace_managed_host_sandbox(
+            host_id=host.host_id,
+            user_id="alice",
+            token="loser",
+            provider="modal",
+            sandbox_id="loser",
+            token_expires_at=now_epoch() + 1000,
+            recovery_token="first",
+        )
+    replacement = host_store.replace_managed_host_sandbox(
+        host_id=host.host_id,
+        user_id="alice",
+        token="winner",
+        provider="modal",
+        sandbox_id="winner",
+        token_expires_at=now_epoch() + 1000,
+        recovery_token="second",
+    )
+    assert replacement is not None
+    host_store.upsert_on_connect(host_id=host.host_id, name=host.name, user_id="alice")
+    assert not host_store.detach_stale_managed_sandbox(
+        host.host_id,
+        sandbox_id="winner",
+        expected_updated_at=replacement.updated_at,
+        expected_token="winner",
+    )
+    assert host_store.resolve_launch_token(host.host_id, "winner") is not None
+    assert host_store.update_managed_recovery(
+        host.host_id, "second", finished=True, workspace="/recovered", sandbox_id="winner"
+    )
+    assert not host_store.claim_managed_recovery(host, "late-sibling")
+    assert not host_store.update_managed_recovery(host.host_id, "second")
+    assert not host_store.update_managed_recovery(host.host_id, "second", finished=True)
+    assert host_store.managed_recovery_result(host.host_id) == ("/recovered", "winner")
+    assert host_store.claim_managed_recovery(replacement, "next-recovery")
+    assert host_store.update_managed_recovery(host.host_id, "next-recovery", finished=True)
+    assert not host_store.update_managed_recovery(host.host_id, "next-recovery")
+    with pytest.raises(ValueError, match="failed or expired"):
+        host_store.managed_recovery_result(host.host_id)
+
+
+@pytest.mark.asyncio
+async def test_deleted_automation_session_retains_reusable_sandbox(
+    db_uri: str, monkeypatch
+) -> None:
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationMetadata
+    from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store._DELETE_METADATA_BATCH_SIZE", 2
+    )
+
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    task = tasks.create(
+        scheduled_task_id=uuid.uuid4().hex,
+        timezone="UTC",
+        name="daily",
+        prompt="check",
+        rrule="FREQ=DAILY",
+        user_id="alice",
+        agent_id=uuid.uuid4().hex,
+        session_mode="continue",
+    )
+    host_store = HostStore(db_uri)
+    host_id = continued_sandbox_host_id(task.id, current_workspace_id())
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="automation",
+        user_id="alice",
+        token="retained",
+        provider="modal",
+        sandbox_id="retained",
+        token_expires_at=now_epoch() + 1000,
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    session = conversations.create_conversation(
+        host_id=host_id,
+        workspace="/work",
+        labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id},
+    )
+    for _ in range(2):
+        conversations.create_conversation(
+            parent_conversation_id=session.id, host_id=host_id, workspace="/work"
+        )
+    engine = get_or_create_engine(db_uri)
+    concurrent = []
+
+    def delete_after_snapshot(connection, cursor, statement, parameters, context, executemany):
+        if (
+            "SELECT DISTINCT omnigent_conversation_metadata.host_id" in statement
+            and not concurrent
+        ):
+            concurrent.append(True)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                assert executor.submit(
+                    lambda: asyncio.run(conversations.delete_conversation(other.id))
+                ).result(timeout=10)
+
+    if engine.dialect.name == "mysql":
+        other = conversations.create_conversation(
+            host_id=host_id,
+            workspace="/work",
+            labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id},
+        )
+        event.listen(engine, "after_cursor_execute", delete_after_snapshot)
+    try:
+        assert await conversations.delete_conversation(session.id)
+    finally:
+        if engine.dialect.name == "mysql":
+            event.remove(engine, "after_cursor_execute", delete_after_snapshot)
+    with engine.connect() as connection:
+        assert not connection.execute(
+            select(SqlConversationMetadata.id).where(SqlConversationMetadata.host_id == host_id)
+        ).all()
+    if engine.dialect.name == "mysql":
+        assert concurrent == [True]
+    assert host_store.delete_host(host_id, keep_if_bound=True) is None
+    assert host_store.get_host(host_id) is not None
+    tasks.delete(task.id)
+    retained_host = host_store.get_host(host_id, include_deleted=True)
+    assert retained_host is not None and retained_host.deleted_at is not None

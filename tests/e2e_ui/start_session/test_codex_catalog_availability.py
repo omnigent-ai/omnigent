@@ -130,7 +130,7 @@ async def _drive_catalog_availability(
             await expect(picker).to_have_attribute("aria-label", "Codex, Model Default")
             await expect(picker).to_contain_text("Default")
             await expect(picker).not_to_contain_text("Models unavailable")
-            default = models.get_by_role("menuitemcheckbox", name="Harness default", exact=True)
+            default = models.get_by_role("menuitemcheckbox", name="Default", exact=True)
             await expect(default).to_have_attribute("aria-checked", "true")
             await expect(models.get_by_role("menuitemcheckbox")).to_have_count(3)
             await models.get_by_role(

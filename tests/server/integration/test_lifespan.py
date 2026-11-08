@@ -10,12 +10,59 @@ lifespan exits.
 from __future__ import annotations
 
 import asyncio
+import threading
+from pathlib import Path
+from unittest.mock import Mock
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
+from tests.budgets import budget
+
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.mark.parametrize("ci", [True, False])
+async def test_lifespan_usage_telemetry_uses_server_ci_environment(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ci: bool,
+) -> None:
+    """Server CI suppresses usage telemetry without a runner or host opt-out."""
+    import omnigent.telemetry.client as telemetry
+    from omnigent.telemetry.environment import CI_ENV_VARS
+    from omnigent.telemetry.events import SessionStoppedEvent
+
+    for name in CI_ENV_VARS | {
+        "OMNIGENT_ANALYTICS",
+        "DISABLE_TELEMETRY",
+        "OMNIGENT_DISABLE_TELEMETRY",
+        "DO_NOT_TRACK",
+    }:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    if ci:
+        monkeypatch.setenv("CI", "true")
+    monkeypatch.setattr(telemetry, "_CLIENT", None)
+    monkeypatch.setattr(telemetry, "_IS_DISABLED_CACHE", [None])
+    client_factory = Mock()
+    monkeypatch.setattr(telemetry, "TelemetryClient", client_factory)
+    installation_id = Mock(return_value="server-installation")
+    monkeypatch.setattr("omnigent.telemetry.installation_id.get_installation_id", installation_id)
+    event = SessionStoppedEvent("server-installation", "test-session", None)
+
+    async with app.router.lifespan_context(app):
+        telemetry.emit(event)
+        if ci:
+            assert telemetry.get_client() is None
+            client_factory.assert_not_called()
+            installation_id.assert_not_called()
+        else:
+            client_factory.assert_called_once_with()
+            client_factory.return_value._ensure_started.assert_called_once_with()
+            client_factory.return_value.emit.assert_called_once_with(event)
 
 
 async def test_lifespan_shutdown_invokes_registry_shutdown(
@@ -116,5 +163,14 @@ async def test_lifespan_starts_periodic_metrics_otel_publisher(
         fake_publisher,
     )
 
+    threads_before = set(threading.enumerate())
     async with app.router.lifespan_context(app):
         await asyncio.wait_for(publisher_started.wait(), timeout=1.0)
+        watchdogs = [
+            thread
+            for thread in set(threading.enumerate()) - threads_before
+            if thread.name == "omnigent-event-loop-watchdog"
+        ]
+        assert len(watchdogs) == 1
+    watchdogs[0].join(timeout=budget(3))
+    assert not watchdogs[0].is_alive()

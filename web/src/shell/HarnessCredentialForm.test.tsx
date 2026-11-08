@@ -102,6 +102,17 @@ describe("HarnessCredentialForm", () => {
     expect(screen.queryByTestId("harness-credential-adopt")).toBeNull();
   });
 
+  it("never offers a Databricks detection result for adopt", () => {
+    detected = [
+      { family: "databricks", source: "isaac CLI", env_var: null },
+      { family: "databricks", source: "Databricks profile DEFAULT", env_var: "DATABRICKS_TOKEN" },
+    ];
+    render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);
+
+    expect(screen.queryByTestId("harness-credential-adopt")).toBeNull();
+    expect(screen.queryByText(/isaac CLI|Databricks profile/)).toBeNull();
+  });
+
   it("offers a Pi (anthropic-family) credential to adopt", () => {
     // Pi resolves to the anthropic family, so an ANTHROPIC_API_KEY is adoptable.
     detected = [
@@ -230,6 +241,31 @@ describe("HarnessCredentialForm", () => {
     // The form stays open on a not-ready result; the entered key must not linger
     // in the field while the user tries another option.
     expect(keyInput.value).toBe("");
+  });
+
+  it("hands a save that leaves only tmux missing to the parent", () => {
+    // "tmux-unavailable" means the credential worked and tmux is the last
+    // blocker, so the form closes and the parent shows the tmux step.
+    mutateMock.mockImplementation((_input, opts?: { onSuccess?: (r: unknown) => void }) =>
+      opts?.onSuccess?.({
+        object: "harness_credential",
+        harness: "codex-native",
+        configured_harnesses: { "codex-native": "tmux-unavailable" },
+      }),
+    );
+    const onDone = vi.fn();
+    render(
+      <HarnessCredentialForm harness="codex-native" host={HOST} command={null} onDone={onDone} />,
+    );
+    fireEvent.change(screen.getByTestId("harness-credential-key"), { target: { value: "sk-x" } });
+    fireEvent.click(screen.getByTestId("harness-credential-save"));
+    expect(showToastMock).toHaveBeenCalledWith(
+      "Saved. codex-native still needs tmux 3.3 or newer on corey-laptop.",
+    );
+    expect(showToastMock).not.toHaveBeenCalledWith(expect.stringContaining("is ready on"));
+    expect(onDone).toHaveBeenCalledWith(
+      expect.objectContaining({ configured_harnesses: { "codex-native": "tmux-unavailable" } }),
+    );
   });
 
   it("surfaces a sticky error toast when the write is rejected", () => {

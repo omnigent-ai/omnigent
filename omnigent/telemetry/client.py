@@ -78,27 +78,10 @@ from typing import TYPE_CHECKING, TypedDict, cast
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
+from omnigent.telemetry.environment import is_disabled_by_env
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
-
-# CI / test environment variable names that indicate telemetry should be off.
-_CI_ENV_VARS = frozenset(
-    {
-        "CI",
-        "GITHUB_ACTIONS",
-        "PYTEST_CURRENT_TEST",
-        "CIRCLECI",
-        "JENKINS_URL",
-        "TRAVIS",
-        "GITLAB_CI",
-        "TF_BUILD",
-        "BITBUCKET_BUILD_NUMBER",
-        "CODEBUILD_BUILD_ARN",
-        "BUILDKITE",
-        "TEAMCITY_VERSION",
-    }
-)
 
 _BATCH_SIZE = 50
 _BATCH_INTERVAL_S = 10.0
@@ -273,7 +256,7 @@ def is_disabled() -> bool:
     1. ``OMNIGENT_ANALYTICS=0``
     2. ``DISABLE_TELEMETRY=true`` or ``OMNIGENT_DISABLE_TELEMETRY=true``
     3. ``DO_NOT_TRACK=1``
-    4. Any CI environment variable from :data:`_CI_ENV_VARS`
+    4. Any CI or pytest environment marker
     5. ``telemetry: false`` in ``~/.omnigent/config.yaml``
 
     Always returns a ``bool``; never raises.
@@ -290,14 +273,7 @@ def is_disabled() -> bool:
 
 def _compute_is_disabled() -> bool:
     """Compute whether telemetry is disabled (uncached)."""
-    if os.environ.get("OMNIGENT_ANALYTICS", "").strip() == "0":
-        return True
-    for var in ("DISABLE_TELEMETRY", "OMNIGENT_DISABLE_TELEMETRY"):
-        if os.environ.get(var, "").strip().lower() in ("1", "true", "yes"):
-            return True
-    if os.environ.get("DO_NOT_TRACK", "").strip() == "1":
-        return True
-    if any(var in os.environ for var in _CI_ENV_VARS):
+    if is_disabled_by_env(os.environ):
         return True
     return _config_telemetry_disabled()
 

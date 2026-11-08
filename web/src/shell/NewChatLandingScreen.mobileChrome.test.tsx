@@ -35,16 +35,21 @@ import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 
 import type { Host } from "@/hooks/useHosts";
 import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen } from "./NewChatDialog";
+import { MobileHeaderButtonGroup } from "./MobileHeaderButton";
+import { MobileHeaderControlsProvider, MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
 
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ hash: "", state: null }),
   useNavigate: () => vi.fn(),
   useSearchParams: () => [new URLSearchParams(), vi.fn()],
 }));
@@ -61,7 +66,10 @@ vi.mock("@/hooks/useHosts", () => ({
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));
-vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: vi.fn(),
+  prefetchAvailableAgentDetails: vi.fn(),
+}));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: () => ({ data: undefined }),
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
@@ -109,7 +117,16 @@ function renderLanding(): void {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(<NewChatLandingScreen />, {
     wrapper: ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={{ ...SERVER_INFO_OFFLINE_FALLBACK }}>
+          <MobileHeaderControlsProvider>
+            <MobileHeaderButtonGroup>
+              <MobileHeaderControlsSlot sessionId={null} />
+            </MobileHeaderButtonGroup>
+            {children}
+          </MobileHeaderControlsProvider>
+        </CapabilitiesProvider>
+      </QueryClientProvider>
     ),
   });
 }
@@ -139,16 +156,67 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen keyboard behaviour", () => {
-  it("focuses the composer on desktop so typing can start immediately", () => {
+  it("focuses the composer on desktop so typing can start immediately", async () => {
     renderLanding();
 
     expect(document.activeElement).toBe(screen.getByTestId("new-chat-landing-input"));
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    expect(composer).toContainElement(screen.getByTestId("new-chat-landing-host-chip"));
+    expect(composer).toContainElement(await screen.findByTestId("new-chat-landing-agent-select"));
   });
 
-  it("leaves the composer unfocused on a phone, so arriving never raises the keyboard", () => {
+  it("keeps mobile launch controls in the header without focusing or losing the draft", async () => {
     setViewport(true);
     renderLanding();
 
     expect(document.activeElement).not.toBe(screen.getByTestId("new-chat-landing-input"));
+    const header = screen.getByTestId("mobile-header-controls-slot");
+    expect(header).toHaveClass("no-drag", "pointer-events-auto");
+    const host = screen.getByTestId("new-chat-landing-host-chip");
+    const harness = await screen.findByTestId("new-chat-landing-agent-select");
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    expect(composer).toHaveAttribute("data-mobile-composer", "collapsed");
+    fireEvent.focus(host);
+    expect(composer).toHaveAttribute("data-mobile-composer", "collapsed");
+    expect(header).toContainElement(host);
+    expect(header).toContainElement(harness);
+    expect(screen.queryByTestId("new-chat-landing-actions-menu")).not.toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-composer")).not.toContainElement(host);
+    const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
+    expect(header).not.toContainElement(workspace);
+    expect(screen.getByTestId("new-chat-landing-composer-surface")).not.toContainElement(workspace);
+
+    const add = screen.getByRole("button", { name: "Add" });
+    fireEvent.focus(add);
+    expect(composer).toHaveAttribute("data-mobile-composer", "collapsed");
+    fireEvent.pointerDown(add, { button: 0, ctrlKey: false, pointerType: "mouse" });
+    const addMenu = await screen.findByTestId("new-chat-landing-add-menu");
+    expect(addMenu).toBeVisible();
+    expect(composer).toHaveAttribute("data-mobile-composer", "collapsed");
+    fireEvent.keyDown(addMenu, { key: "Escape" });
+    await waitFor(() => expect(add).toHaveAttribute("aria-expanded", "false"));
+    expect(composer).toHaveAttribute("data-mobile-composer", "collapsed");
+
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.focus(input);
+    expect(composer).toHaveAttribute("data-mobile-composer", "expanded");
+    fireEvent.change(input, { target: { value: "Keep this draft" } });
+    fireEvent.pointerDown(host, { button: 0, ctrlKey: false, pointerType: "mouse" });
+    const hostMenu = await screen.findByTestId("new-chat-landing-host-menu");
+    expect(within(hostMenu).getByTestId("new-chat-landing-host-host_1")).toHaveTextContent(
+      "laptop",
+    );
+    fireEvent.keyDown(hostMenu, { key: "Escape" });
+    await waitFor(() => expect(host).toHaveAttribute("aria-expanded", "false"));
+
+    fireEvent.pointerDown(harness, { button: 0, ctrlKey: false, pointerType: "mouse" });
+    const harnessMenu = await screen.findByRole("menu");
+    expect(within(harnessMenu).getByText("Agents")).toBeVisible();
+    fireEvent.keyDown(harnessMenu, { key: "Escape" });
+    await waitFor(() => expect(harness).toHaveAttribute("aria-expanded", "false"));
+
+    fireEvent.click(workspace);
+    expect(await screen.findByTestId("new-chat-landing-workspace-open-folder")).toBeVisible();
+    expect(input).toHaveValue("Keep this draft");
   });
 });

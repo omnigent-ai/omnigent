@@ -117,6 +117,115 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
     }
 
 
+@pytest.mark.asyncio
+async def test_forwarder_logs_a_repeating_loop_failure_once_until_it_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A poll failing the same way over and over logs one traceback, not one per poll.
+
+    This fails if every retry while host credentials are unavailable writes
+    another ERROR traceback, which floods the runner log.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "after-repeated-loop-errors",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "after repeated loop errors"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    original_forward = forwarder._forward_available_items
+    failures_left = 5
+
+    async def _failing_forward_available_items(
+        **kwargs: Any,
+    ) -> forwarder.TranscriptForwardState:
+        """
+        Raise the same error a few times, then delegate to the real forwarder.
+
+        :param kwargs: Keyword arguments passed by
+            :func:`forward_claude_transcript_to_session`.
+        :returns: Updated transcript forward state.
+        """
+        nonlocal failures_left
+        if failures_left:
+            failures_left -= 1
+            raise RuntimeError("workspace credentials unavailable")
+        return await original_forward(**kwargs)
+
+    monkeypatch.setattr(
+        forwarder,
+        "_forward_available_items",
+        _failing_forward_available_items,
+    )
+    caplog.set_level(logging.INFO, logger="omnigent.harnesses.claude_native.forwarder")
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        request = await _get_recorded_item_request(server)
+        # The streak ends once the delivering poll finishes.
+        async with asyncio.timeout(5.0):
+            # Match the loop's own line: the item POST can also log a
+            # "forward sync recovered after" line first.
+            while "forwarder loop recovered after" not in caplog.text:
+                await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    failure_records = [
+        record for record in caplog.records if "forwarder loop failed" in record.getMessage()
+    ]
+    assert len(failure_records) == 1
+    assert failure_records[0].exc_info is not None
+    assert "recovered after 5 failures; session=conv_abc" in caplog.text
+    assert request["body"]["data"]["item_data"]["content"] == [
+        {"type": "output_text", "text": "after repeated loop errors"}
+    ]
+
+
+def test_loop_retry_delay_doubles_per_failure_up_to_a_bound() -> None:
+    """Consecutive loop failures back off from the poll interval to a fixed cap."""
+    assert forwarder._loop_retry_delay_s(0.25, 0) == 0.25
+    assert forwarder._loop_retry_delay_s(0.25, 1) == 0.5
+    assert forwarder._loop_retry_delay_s(0.25, 3) == 2.0
+    assert forwarder._loop_retry_delay_s(0.25, 1000) == forwarder._LOOP_FAILURE_MAX_BACKOFF_S
+
+
 # ── supervise_forwarder ────────────────────────────────────────────
 
 

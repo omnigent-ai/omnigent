@@ -9,18 +9,19 @@ import {
   dismissToday,
   isArcaWarningStorageKey,
   isDismissedToday,
-  isOptedOut,
   isWarnedToday,
   isWarningWindow,
   markWarnedToday,
 } from "@/lib/arcaShutdownWarning";
 import { copyText } from "@/lib/clipboard";
+import { ArcaExtendActions, useCanExtendArca } from "./ArcaExtendActions";
 
 const OVERNIGHT_COMMAND = "arca extend overnight";
 
 export function ArcaShutdownToast() {
   const { data: hosts } = useHosts();
   const now = useNow();
+  const desktopExtend = useCanExtendArca();
   const [visibility, setVisibility] = useState(() => document.visibilityState);
   const [, refresh] = useReducer((value: number) => value + 1, 0);
   const shownToastId = useRef<string | null>(null);
@@ -28,7 +29,6 @@ export function ArcaShutdownToast() {
   const hasOnlineArcaHost = hosts?.some(
     (host) => host.status === "online" && isArcaHost(host, storedId),
   );
-  const optedOut = isOptedOut();
   const dismissedToday = isDismissedToday(now);
 
   useEffect(() => {
@@ -52,18 +52,39 @@ export function ArcaShutdownToast() {
       toast.dismiss(shownToastId.current);
       shownToastId.current = null;
     }
-    if (!isWarningWindow(now) || !hasOnlineArcaHost || optedOut || dismissedToday) {
+    if (!isWarningWindow(now) || !hasOnlineArcaHost || dismissedToday) {
       if (shownToastId.current) toast.dismiss(shownToastId.current);
       shownToastId.current = null;
       return;
     }
-    if (visibility !== "visible" || isWarnedToday(now)) return;
+    if (visibility !== "visible" || isWarnedToday(now) || desktopExtend === null) return;
 
     markWarnedToday(now);
     shownToastId.current = id;
     toast("Arca shuts down at about 6 PM", {
       id,
-      description: (
+      description: desktopExtend ? (
+        <ArcaExtendActions
+          day={dateKey(now)}
+          onSuccess={() => dismissToday(new Date())}
+          fallback={(mode) => {
+            const command = `arca extend ${mode}`;
+            return (
+              <button
+                type="button"
+                onClick={() =>
+                  void copyText(command).then(
+                    () => toast.success("Copied"),
+                    () => toast.error("Could not copy command"),
+                  )
+                }
+              >
+                Copy {command}
+              </button>
+            );
+          }}
+        />
+      ) : (
         <span>
           Run <code>{OVERNIGHT_COMMAND}</code> on your laptop to keep it running.
         </span>
@@ -77,22 +98,24 @@ export function ArcaShutdownToast() {
         cancelButton: "!m-0",
         actionButton: "!m-0 justify-self-start",
       },
-      action: {
-        label: "Copy command",
-        onClick: (event) => {
-          event.preventDefault();
-          void copyText(OVERNIGHT_COMMAND).then(
-            () => {
-              toast.dismiss(id);
-              toast.success("Copied");
+      action: desktopExtend
+        ? undefined
+        : {
+            label: "Copy command",
+            onClick: (event) => {
+              event.preventDefault();
+              void copyText(OVERNIGHT_COMMAND).then(
+                () => {
+                  toast.dismiss(id);
+                  toast.success("Copied");
+                },
+                () => toast.error("Could not copy command"),
+              );
             },
-            () => toast.error("Could not copy command"),
-          );
-        },
-      },
+          },
       cancel: { label: "Not now", onClick: () => dismissToday(new Date()) },
     });
-  }, [now, hasOnlineArcaHost, optedOut, dismissedToday, visibility]);
+  }, [now, hasOnlineArcaHost, dismissedToday, visibility, desktopExtend]);
 
   return null;
 }

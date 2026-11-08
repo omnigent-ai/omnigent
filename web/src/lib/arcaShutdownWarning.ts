@@ -2,7 +2,6 @@ import { ARCA_HOST_ID_STORAGE_KEY } from "./arcaHost";
 
 const DISMISSED_KEY = "omnigent:arca-shutdown:dismissed";
 const WARNED_KEY = "omnigent:arca-shutdown:warned";
-const OPTED_OUT_KEY = "omnigent:arca-shutdown:opted-out";
 export const ARCA_WARNING_PREFERENCES_CHANGED = "omnigent:arca-shutdown:preferences-changed";
 // Tab-local fallback keeps preferences usable when localStorage throws, as in private mode.
 const unavailableStorage = new Map<string, string>();
@@ -13,11 +12,7 @@ const LAST_WORKWEEK_OFFER_DAY = 3;
 
 export function isArcaWarningStorageKey(key: string | null): boolean {
   return (
-    key === null ||
-    key === DISMISSED_KEY ||
-    key === WARNED_KEY ||
-    key === OPTED_OUT_KEY ||
-    key === ARCA_HOST_ID_STORAGE_KEY
+    key === null || key === DISMISSED_KEY || key === WARNED_KEY || key === ARCA_HOST_ID_STORAGE_KEY
   );
 }
 
@@ -62,10 +57,14 @@ export function isDismissedToday(now: Date): boolean {
 }
 
 export function dismissToday(now: Date): void {
-  write(DISMISSED_KEY, dateKey(now));
+  persistDismissalToday(now);
   if (typeof window !== "undefined") {
     window.dispatchEvent(new Event(ARCA_WARNING_PREFERENCES_CHANGED));
   }
+}
+
+export function persistDismissalToday(now: Date): void {
+  write(DISMISSED_KEY, dateKey(now));
 }
 
 export function isWarnedToday(now: Date): boolean {
@@ -74,15 +73,4 @@ export function isWarnedToday(now: Date): boolean {
 
 export function markWarnedToday(now: Date): void {
   write(WARNED_KEY, dateKey(now));
-}
-
-export function isOptedOut(): boolean {
-  return read(OPTED_OUT_KEY) === "true";
-}
-
-export function optOut(): void {
-  write(OPTED_OUT_KEY, "true");
-  if (typeof window !== "undefined") {
-    window.dispatchEvent(new Event(ARCA_WARNING_PREFERENCES_CHANGED));
-  }
 }

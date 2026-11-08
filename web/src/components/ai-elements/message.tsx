@@ -9,7 +9,7 @@ import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
-import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode, RefObject } from "react";
+import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
 import {
   cloneElement,
   createContext,
@@ -24,20 +24,27 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import {
+  Block,
+  CodeBlock,
+  CodeBlockDownloadButton,
   Streamdown,
   StreamdownContext,
   TableCopyDropdown,
   TableDownloadDropdown,
+  useIsCodeFenceIncomplete,
+  type BlockProps,
   type ControlsConfig,
   type StreamdownProps,
 } from "streamdown";
 
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
 import { mermaidOptionsForTheme } from "./MermaidError";
+import { FullscreenIcon, isMermaidPre, MermaidBlock, MERMAID_NO_FULLSCREEN } from "./MermaidBlock";
 
 import {
   CHAT_LINK_SAFETY,
   FILE_LINK_STREAMDOWN_REHYPE_PLUGINS,
+  GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS,
   SECURE_STREAMDOWN_REHYPE_PLUGINS,
   STREAMDOWN_PLUGINS,
 } from "./streamdown-security";
@@ -81,7 +88,7 @@ export const MessageContent = ({ children, className, ...props }: MessageContent
 export type MessageActionsProps = ComponentProps<"div">;
 
 export const MessageActions = ({ className, children, ...props }: MessageActionsProps) => (
-  <div className={cn("flex items-center gap-3", className)} {...props}>
+  <div className={cn("flex items-center gap-3 mobile-app:gap-0", className)} {...props}>
     {children}
   </div>
 );
@@ -105,7 +112,11 @@ export const MessageAction = ({
       size={size}
       type="button"
       variant={variant}
-      className={cn("text-muted-foreground hover:text-foreground", className)}
+      className={cn(
+        "mobile-touch-target mobile-app:[&_svg]:size-5!",
+        "text-muted-foreground hover:text-foreground",
+        className,
+      )}
       {...props}
     >
       {children}
@@ -315,14 +326,39 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
    * Opt-in: only callers that supply that override may set it.
    */
   markFileLinks?: boolean;
+  /** Show images hosted as GitHub attachments, e.g. in a PR description; others stay blocked. */
+  allowGitHubAttachmentImages?: boolean;
+  /** The text is still growing, so its last code fence may be open. */
+  isStreaming?: boolean;
 };
 
-// Streamdown's mermaid fullscreen portals its overlay to `document.body`, which
-// in the embed sits outside the `.omnigent-app` theme scope, so the overlay
-// renders unstyled/invisible. Disable it and render our own fullscreen (portaled
-// via `getEmbedRoot()`, see MermaidFullscreen) instead. Download/copy/panZoom
-// keep Streamdown's defaults.
-const MERMAID_NO_FULLSCREEN = { fullscreen: false } as const;
+// Up to three spaces of indent; a tab counts as four columns, so it never does.
+const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)/;
+
+/**
+ * Whether the text ends inside a code fence. A closing fence repeats the opening
+ * character at least as many times, with only whitespace after it.
+ */
+export function hasOpenCodeFence(text: string): boolean {
+  let open: string | null = null;
+  for (const line of text.split("\n")) {
+    const [, fence, rest = ""] = FENCE_LINE.exec(line) ?? [];
+    if (fence === undefined) continue;
+    if (open === null) open = fence;
+    else if (fence[0] === open[0] && fence.length >= open.length && rest.trim() === "") open = null;
+  }
+  return open !== null;
+}
+
+const StreamingTextContext = createContext(false);
+
+// Streamdown marks a block's open fence only while `isAnimating`, which also
+// disables its copy and download buttons, so mark it here for streaming text.
+function StreamingTextBlock(props: BlockProps) {
+  const isStreaming = useContext(StreamingTextContext);
+  const isIncomplete = props.isIncomplete || (isStreaming && hasOpenCodeFence(props.content));
+  return <Block {...props} isIncomplete={isIncomplete} />;
+}
 
 function getChatCodeControls(controls: StreamdownProps["controls"]): StreamdownProps["controls"] {
   if (typeof controls === "object" && controls !== null) {
@@ -392,19 +428,6 @@ const CodeCheckIcon = (props: CodeHeaderIconProps) => (
     <path
       clipRule="evenodd"
       d="M15.5607 3.99999L15.0303 4.53032L6.23744 13.3232C5.55403 14.0066 4.44599 14.0066 3.76257 13.3232L4.2929 12.7929L3.76257 13.3232L0.969676 10.5303L0.439346 9.99999L1.50001 8.93933L2.03034 9.46966L4.82323 12.2626C4.92086 12.3602 5.07915 12.3602 5.17678 12.2626L13.9697 3.46966L14.5 2.93933L15.5607 3.99999Z"
-      fill="currentColor"
-      fillRule="evenodd"
-    />
-  </svg>
-);
-
-// Reproduced from Streamdown 2.5's own "View fullscreen" / "Exit fullscreen"
-// glyphs so our button matches the download/copy icons in the same mermaid bar.
-const CodeFullscreenIcon = (props: CodeHeaderIconProps) => (
-  <svg fill="none" height={16} viewBox="0 0 16 16" width={16} {...props}>
-    <path
-      clipRule="evenodd"
-      d="M1 5.25V6H2.5V5.25V2.5H5.25H6V1H5.25H2C1.44772 1 1 1.44772 1 2V5.25ZM5.25 14.9994H6V13.4994H5.25H2.5V10.7494V9.99939H1V10.7494V13.9994C1 14.5517 1.44772 14.9994 2 14.9994H5.25ZM15 10V10.75V14C15 14.5523 14.5523 15 14 15H10.75H10V13.5H10.75H13.5V10.75V10H15ZM10.75 1H10V2.5H10.75H13.5V5.25V6H15V5.25V2C15 1.44772 14.5523 1 14 1H10.75Z"
       fill="currentColor"
       fillRule="evenodd"
     />
@@ -500,7 +523,7 @@ function ChatTable({ children, className, node: _node, ...props }: ChatTableProp
               title="View fullscreen"
               type="button"
             >
-              <CodeFullscreenIcon />
+              <FullscreenIcon />
             </button>
           )}
         </div>
@@ -605,122 +628,7 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
   );
 }
 
-// A mermaid fence renders as a diagram with Streamdown's own toolbar
-// (download / copy / fullscreen), so our wrap+copy overlay is meaningless there
-// (word wrap does nothing to an SVG, copy duplicates) and its buttons collide
-// with that toolbar. Detect it the same way CodeViewer does — the `<code>` child
-// carries `language-mermaid` — and skip the overlay for those blocks.
-function isMermaidPre(children: ReactNode): boolean {
-  return (
-    isValidElement<{ className?: string }>(children) &&
-    (children.props.className?.split(/\s+/).includes("language-mermaid") ?? false)
-  );
-}
-
-// Full-screen view of a mermaid diagram. Streamdown's own fullscreen is disabled
-// (see getChatCodeControls) because it portals its overlay to `document.body`,
-// outside the embed's `.omnigent-app` theme scope, where it renders unstyled.
-// We clone the already-rendered inline SVG into our own overlay portaled to
-// `getEmbedRoot() ?? document.body` — the same target CodeViewer uses — so it
-// inherits theme tokens embedded and standalone alike. Cloning the live SVG
-// (rather than re-rendering through Streamdown) avoids re-running Mermaid and
-// keeps the block chrome (label, borders, toolbar) out of the fullscreen view.
-// Escape or a backdrop click closes it.
-function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | null> }) {
-  const [svgMarkup, setSvgMarkup] = useState<string | null>(null);
-  const close = useCallback(() => setSvgMarkup(null), []);
-
-  const openFullscreen = useCallback(() => {
-    // The rendered diagram is Mermaid's own <svg id="mermaid-…"> — scope to it so
-    // we don't clone a toolbar/zoom-control icon (all 16×16 <svg>s in the block).
-    const svg = blockRef.current?.querySelector('svg[id^="mermaid-"]');
-    setSvgMarkup(svg ? svg.outerHTML : null);
-  }, [blockRef]);
-
-  useEffect(() => {
-    if (svgMarkup == null) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [svgMarkup, close]);
-
-  const overlay =
-    svgMarkup != null
-      ? createPortal(
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-background/95 backdrop-blur-sm"
-            // Close on a click that lands on the backdrop or the padding around
-            // the diagram, but not one that bubbles up from the diagram itself —
-            // hence the `target === currentTarget` gate on both this backdrop and
-            // the inner wrapper (which must stay size-full so the SVG's own
-            // width="100%" resolves against a real box rather than collapsing).
-            onClick={(e) => {
-              if (e.target === e.currentTarget) close();
-            }}
-            role="presentation"
-          >
-            <Button
-              aria-label="Exit fullscreen"
-              className="absolute top-4 right-4"
-              onClick={close}
-              size="icon-sm"
-              title="Exit fullscreen"
-              type="button"
-              variant="ghost"
-            >
-              <CodeFullscreenIcon />
-            </Button>
-            <div
-              className="flex size-full items-center justify-center p-8 [&>svg]:h-auto [&>svg]:max-h-full [&>svg]:w-auto [&>svg]:max-w-full"
-              // The cloned SVG is Mermaid's own trusted, already-sanitized render.
-              dangerouslySetInnerHTML={{ __html: svgMarkup }}
-              onClick={(e) => {
-                if (e.target === e.currentTarget) close();
-              }}
-              role="presentation"
-            />
-          </div>,
-          getEmbedRoot() ?? document.body,
-        )
-      : null;
-
-  return (
-    <>
-      <Button
-        aria-label="View fullscreen"
-        className={CODE_BLOCK_OVERLAY_BUTTON_CLASS}
-        onClick={openFullscreen}
-        size="icon-sm"
-        title="View fullscreen"
-        type="button"
-        variant="ghost"
-      >
-        <CodeFullscreenIcon />
-      </Button>
-      {overlay}
-    </>
-  );
-}
-
-// A mermaid block: Streamdown's diagram (with its download/copy toolbar, its
-// broken fullscreen disabled) plus our own fullscreen button in a matching pill.
-// The `.chat-mermaid` rule nudges Streamdown's bar left so the two rows sit side
-// by side — a continuous [download copy] [fullscreen] row at the top-right.
-function ChatMermaidBlock({ block }: { block: ReactNode }) {
-  const blockRef = useRef<HTMLDivElement>(null);
-  return (
-    <div ref={blockRef} className="chat-mermaid relative">
-      {block}
-      <div className="absolute top-2 right-2 z-20 flex items-center rounded-md border border-sidebar bg-sidebar/80 px-1.5 py-1 supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur">
-        <MermaidFullscreen blockRef={blockRef} />
-      </div>
-    </div>
-  );
-}
-
-function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
   const getCode = useCallback(() => code, [code]);
   // Soft-wrap long lines by default so users don't have to scroll horizontally
@@ -728,20 +636,27 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   // horizontal-scroll view for when column alignment matters.
   const [wrap, setWrap] = useState(true);
   const toggleWrap = useCallback(() => setWrap((w) => !w), []);
+  const isMermaid = isMermaidPre(children);
+  const fenceOpen = useIsCodeFenceIncomplete();
+  // A diagram drawn from a fence that is still streaming redraws on every update,
+  // so in streaming text its source shows while the fence is open and stays until
+  // the diagram draws. The fence's language can arrive after the fence opens.
+  const isStreaming = useContext(StreamingTextContext);
+  const [streamed, setStreamed] = useState(false);
+  const [showsSource, setShowsSource] = useState(false);
+  if (isMermaid && isStreaming && !streamed) {
+    setStreamed(true);
+    setShowsSource(true);
+  }
+  const hideSource = useCallback(() => setShowsSource(false), []);
+  const { lineNumbers } = useContext(StreamdownContext);
   const block = isValidElement(children)
     ? cloneElement(children, { "data-block": "true" } as Record<string, unknown>)
     : children;
 
-  // Mermaid renders its own toolbar (download/copy); we replace Streamdown's
-  // broken fullscreen with our own button (portaled correctly), positioned as
-  // the last item in that toolbar's row. Word-wrap/copy don't apply to a diagram.
-  if (isMermaidPre(children)) {
-    return <ChatMermaidBlock block={block} />;
-  }
-
-  return (
+  const codeBlock = (body: ReactNode) => (
     <div className={cn("chat-code-block relative", wrap && "chat-code-wrap")}>
-      {block}
+      {body}
       {/* Match Streamdown's action-pill height and reserve its rightmost slot
           for download. All controls stay anchored to the header. */}
       <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
@@ -750,13 +665,54 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
       </div>
     </div>
   );
+
+  if (!isMermaid) return codeBlock(block);
+
+  // Mermaid renders its own toolbar (download/copy); we replace Streamdown's
+  // broken fullscreen with our own button (portaled correctly), positioned as
+  // the last item in that toolbar's row. Word-wrap/copy don't apply to a diagram.
+  if (!streamed) return <MermaidBlock block={block} />;
+
+  const drawing = showsSource && !fenceOpen;
+  return (
+    // Clip rather than hide the overflow, so the code block's margins still collapse.
+    <div className={cn("relative", drawing && "overflow-clip")}>
+      {showsSource &&
+        codeBlock(
+          <CodeBlock
+            code={code}
+            language="mermaid"
+            isIncomplete={fenceOpen}
+            lineNumbers={lineNumbers}
+          >
+            <CodeBlockDownloadButton code={code} language="mermaid" />
+          </CodeBlock>,
+        )}
+      {!fenceOpen && (
+        <MermaidBlock
+          block={block}
+          // The diagram draws behind its source, clipped to it, then takes its place.
+          className={drawing ? "invisible absolute inset-x-0 top-0" : undefined}
+          onDrawn={drawing ? hideSource : undefined}
+        />
+      )}
+    </div>
+  );
 }
 
 export const MessageResponse = memo(
-  ({ className, components, controls, markFileLinks = false, ...props }: MessageResponseProps) => {
+  ({
+    className,
+    components,
+    controls,
+    markFileLinks = false,
+    allowGitHubAttachmentImages = false,
+    isStreaming = false,
+    ...props
+  }: MessageResponseProps) => {
     const themeMode = useResolvedThemeMode();
     const messageComponents = useMemo(
-      () => ({ ...components, pre: ChatCodeBlockPre, table: ChatTable }),
+      () => ({ ...components, pre: components?.pre ?? ChatCodeBlockPre, table: ChatTable }),
       [components],
     );
 
@@ -765,28 +721,35 @@ export const MessageResponse = memo(
 
     return (
       <MarkdownErrorBoundary source={props.children}>
-        {/* Streamdown is memoized and its comparator ignores the mermaid prop,
-            so remount on theme change to recolor already-rendered diagrams. */}
-        <Streamdown
-          key={themeMode}
-          // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-          className={cn(
-            "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-            className,
-          )}
-          plugins={STREAMDOWN_PLUGINS}
-          // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-          // instead of Streamdown's default "Open external link?" modal.
-          linkSafety={CHAT_LINK_SAFETY}
-          {...props}
-          components={messageComponents}
-          controls={messageControls}
-          mermaid={mermaidOptions}
-          // Block remote image fetches that can exfiltrate data through URLs.
-          rehypePlugins={
-            markFileLinks ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS : SECURE_STREAMDOWN_REHYPE_PLUGINS
-          }
-        />
+        <StreamingTextContext.Provider value={isStreaming}>
+          {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+              so remount on theme change to recolor already-rendered diagrams. */}
+          <Streamdown
+            key={themeMode}
+            // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+            className={cn(
+              "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+              className,
+            )}
+            plugins={STREAMDOWN_PLUGINS}
+            // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+            // instead of Streamdown's default "Open external link?" modal.
+            linkSafety={CHAT_LINK_SAFETY}
+            {...props}
+            BlockComponent={StreamingTextBlock}
+            components={messageComponents}
+            controls={messageControls}
+            mermaid={mermaidOptions}
+            // Block remote image fetches that can exfiltrate data through URLs.
+            rehypePlugins={
+              markFileLinks
+                ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
+                : allowGitHubAttachmentImages
+                  ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
+                  : SECURE_STREAMDOWN_REHYPE_PLUGINS
+            }
+          />
+        </StreamingTextContext.Provider>
       </MarkdownErrorBoundary>
     );
   },

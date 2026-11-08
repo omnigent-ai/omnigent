@@ -509,6 +509,14 @@ Fields:
     redraw a bubble the person stopped. Empty for non-native sessions,
     which already carry the message in `items`.
 
+  failed_inputs (array, default `[]`)
+    Saved startup inputs (see `initial_input` below) that were never
+    delivered, e.g. because the managed sandbox host did not come online.
+    Same `{pending_id, content, created_by?}` shape as `pending_inputs`, in
+    submission order. File blocks keep their `file_id`, so attachments stay
+    downloadable from this session. Clients show these as undelivered
+    messages; a `retry_session` that redelivers them removes them.
+
   todos (array, default `[]`)
     Current native Plan/TODO list reported by a harness.
     Each item: `{content: string, status: "pending"|"in_progress"|"completed",
@@ -548,7 +556,11 @@ Request parts:
 
   metadata (JSON string, required)
     Session metadata. Shape matches `SessionCreateMetadata`:
-    `{title?: string | null, labels?: object, reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
+    `{title?: string | null, labels?: object, reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null, model_override?: string | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
+    `model_override` and `reasoning_effort` are session-level and win over
+    the uploaded bundle's `executor.model` / `executor.reasoning_effort`, as on
+    the JSON create. Servers that accept `model_override` here report
+    `session_bundle_model_override` in `GET /v1/info`; older ones reject it.
     `terminal_launch_args` carries pass-through CLI args for a native
     terminal wrapper, e.g. `["--permission-mode", "bypassPermissions"]`
     (same field as the JSON create path below). Unknown fields fail with 400.
@@ -597,6 +609,39 @@ This preserves the existing sessions API contract for clients that
 already uploaded or registered an agent. The response is the full
 `SessionResponse` shape with `id` set to the new conversation id.
 
+  initial_input (object or null)
+    When `/v1/info` advertises `durable_initial_input: true`, managed creates
+    can include one user `message` or SDK skill `slash_command` event. For example:
+    `{"type":"message","data":{"role":"user","content":[{"type":"input_text","text":"Run the tests"}]}}`.
+    The server saves the input before accepting the create (a create whose input
+    can't be saved is refused and leaves no session), then dispatches it
+    through the normal event handler on the replica holding the new host.
+    Closing the creating browser after acceptance does not cancel delivery.
+    Do not also POST that input to `/events`. `initial_items` keeps its existing
+    history-seeding behavior and cannot be combined with `initial_input`.
+    Attribution comes from the authenticated creator; EDIT permission and input
+    policies are checked again at dispatch. Pending input appears in the session
+    snapshot's `pending_inputs`. Additional messages sent to `/events` during
+    startup are also saved and acknowledged immediately, in submission order,
+    unless the launch already failed or the bound host is gone; those take the
+    ordinary error or relaunch path.
+    Up to 100 pending inputs are accepted per session; excess sends are refused.
+
+    Pending messages use the existing conversation items and status fields.
+    SDK dispatch activates them into ordinary history; native transcript echoes
+    replace their pending rows. The normal SDK history recovery is unchanged.
+    A failure before submission retains the saved input for `retry_session`.
+    After native submission, recovery restores receipt matching without resending
+    the prompt: a missing acknowledgement cannot prove it was not executed.
+    `interrupt` and `stop_session` cancel inputs that have not been submitted,
+    keeping them out of runner recovery history and forks.
+
+    To include files, send `multipart/form-data` with the same JSON request in a
+    `metadata` part and repeated `initial_files` file parts. Upload validation,
+    quotas and session file ownership match the ordinary file upload endpoint.
+    Bundled managed creates can also include `initial_input` in their metadata
+    and `initial_files` alongside the agent bundle.
+
   host_type (string, "external" | "managed", default "external")
     How the session's host is obtained. `"external"` (the default,
     and the pre-existing behavior): the session runs on
@@ -605,8 +650,19 @@ already uploaded or registered an agent. The response is the full
     `"managed"`: the SERVER provisions a sandbox host from its
     `sandbox:` config (see `omnigent/server/managed_hosts.py`),
     starts `omnigent host` inside it, binds the session to it, and
-    launches the runner there. With `"managed"`, `host_id` and
-    `workspace` must NOT be set (422) — the server chooses both.
+    launches the runner there. With `"managed"`, `workspace` must
+    NOT be set (422) — the server chooses it — and `host_id`, when
+    set, names the NEW sandbox host rather than an existing one: 32
+    lowercase hex characters, sent only when `GET /v1/info` reports
+    `request_managed_sandbox_host_id`, so the caller can route the
+    session's requests by it before the host connects. It is recorded
+    in the `omnigent.sandbox.requested_host_id` label until the host
+    binds; null lets the server mint one. A malformed id, or one on a
+    child (`parent_session_id`) create, is a 422; an id that names an
+    existing host, or whose `managed-<first 8 hex>` name one of the
+    caller's hosts already uses, is a 409 `already_exists`, raised
+    before the session is created. JSON creates only: the multipart
+    bundle create does not take it.
     Provisioning runs in the BACKGROUND: the create returns
     immediately with `host_id` / `workspace` null, and they appear
     on `GET /v1/sessions/{id}` once the sandbox host registers. A
@@ -649,6 +705,8 @@ already uploaded or registered an agent. The response is the full
 
 400 Bad Request - invalid terminal_launch_args (count / length bounds)
 404 Not Found - no agent with that id
+409 Conflict - a managed create's host_id names an existing host, or
+  its `managed-<first 8 hex>` name is already taken
 422 Unprocessable Entity - invalid request body
 
 ### List Sessions
@@ -948,6 +1006,30 @@ Request body matches `SessionEventInput`:
                                   Omnigent server runs the compaction itself
                                   (summarises history, persists a
                                   `compaction` item). Payload: `{}`.
+      - "clear"                 — run the harness's own `/clear` in a
+                                  native session's terminal. Forwarded to
+                                  the bound runner, which types `/clear`
+                                  for claude-native and codex-native
+                                  sessions (and relaunches opencode-native
+                                  in place); the harness then moves the
+                                  terminal onto a fresh session that live
+                                  viewers follow via `session.superseded`.
+                                  For claude-sdk (servers reporting
+                                  `session_claude_sdk_clear` in
+                                  `/v1/info`), the server checks the
+                                  caller owns the top-level session, asks
+                                  the runner to drop its live SDK client
+                                  with `continue_in_new_session: true`
+                                  (an older runner's 204 is accepted), and
+                                  continues the work in an empty session
+                                  on the same host, workspace and runner,
+                                  returning its id as `session_id`. A
+                                  running or starting turn is a 400; a
+                                  clear already moving the session is a
+                                  409, as is a message sent meanwhile. A
+                                  runner leaves an unmarked claude-sdk
+                                  clear unsupported (204). Other harnesses
+                                  get a 400. Payload: `{}`.
       - "stop_session"          — terminate the live session without
                                   deleting the conversation (owner-only;
                                   requires LEVEL_OWNER). Forwarded
@@ -968,7 +1050,12 @@ Request body matches `SessionEventInput`:
       - "external_conversation_item"
                                 — internal terminal-observed item
                                   envelope; appends/broadcasts without
-                                  starting a duplicate task
+                                  starting a duplicate task. Requires
+                                  LEVEL_OWNER or the session's bound
+                                  runner credential, also in batches;
+                                  editors and managers receive `403`.
+                                  Integrations that posted as an editor
+                                  must post as the owner or via the runner.
       - "external_output_text_delta"
                                 — internal terminal-observed assistant
                                   text delta; publishes a transient
@@ -983,6 +1070,18 @@ Request body matches `SessionEventInput`:
                                   publishes a `session.status` event with
                                   data `{status: "running" | "waiting" |
                                   "idle" | "failed"}`
+      - "external_background_work"
+                                — internal runner report of work that
+                                  outlives a turn; publishes no status edge.
+                                  Payload: at least one of `{running: bool,
+                                  background_task_count: int}`, with optional
+                                  `background_tasks` detail for the count.
+                                  `running` sets the session list's
+                                  `background_work_running`. The count
+                                  publishes a `session.background_tasks`
+                                  event for the composer; `0` clears it. A
+                                  runner the session is no longer bound to
+                                  gets 403.
       - "subagent.status"        — internal transcript-inactivity observation.
                                   Payload: `{idle: true}`; only literal `true`
                                   is accepted. Uses the existing idle publisher
@@ -1084,6 +1183,10 @@ A client *may* adopt the id onto its live optimistic bubble for id-based
 dedupe; the first-party web client deliberately does NOT (it keeps a
 client temp id for React-key stability and relies on a stable key +
 FIFO matching), so adoption is optional, not required.
+
+A failed transcript append restores pending inputs with their prior delivery
+uncertainty, including entries that expired while persistence was in flight.
+A later mirror cannot report a possibly recorded input as definitely undelivered.
 
 **Interrupt is dual-path on purpose.** Posting `{"type": "interrupt"}`
 is exposed as an event for API uniformity, but it does NOT enter the
@@ -1193,19 +1296,40 @@ Request body matches `SessionForkRequest`:
     server's `sandbox_providers`); null takes the server's first.
     Only valid with `host_type: "managed"` (422 otherwise).
 
+  host_id (string | null, optional)
+    Id for the fork's new sandbox host: 32 lowercase hex characters,
+    sent only when `GET /v1/info` reports
+    `request_managed_sandbox_host_id`. Recorded in the
+    `omnigent.sandbox.requested_host_id` label until the host binds;
+    null lets the server mint one. Only valid with
+    `host_type: "managed"` (422 otherwise).
+
   workspace (string | null, optional)
     Git repository URL, optionally `#<branch>`, cloned into the
-    fork's sandbox as its working directory. Omitting the field
-    inherits the repository the source session recorded, so cloning
-    a sandbox session lands the fork in the same checkout; an
+    fork's sandbox as its working directory. Omitting both workspace
+    fields inherits every repository the source session recorded, so
+    cloning a sandbox session preserves all of its checkouts; an
     explicit null gives the fork an empty sandbox. Only valid with
     `host_type: "managed"` (422 otherwise) — an external fork's
     directory is chosen when it binds a host.
 
-    The source's recorded-repository label is never copied onto the
-    fork: the fork records whichever repository it actually resolved
+  workspaces (array of strings | null, optional)
+    Repository URLs, each optionally `#<branch>`, replacing the source's
+    selection. Send only when `GET /v1/info` reports
+    `session_fork_workspaces: true`; older servers reject this field.
+    Without it, use `workspace` for zero/one repository, omit both fields
+    to inherit unchanged repositories, and require a server upgrade for
+    changes to a multi-repository selection.
+    Accepts up to 10 repositories. Several repositories require
+    a sandbox provider with `multi_repo` support and are cloned as siblings;
+    the session starts in their parent directory. Sending `[]` or null
+    starts an empty sandbox. Mutually exclusive with `workspace`, including
+    explicit nulls. Only valid with `host_type: "managed"` (422 otherwise).
+
+    The source's recorded-repository labels are never copied onto the
+    fork: the fork records whichever repositories it actually resolved
     (none, for an empty sandbox or an external fork), so a later
-    sandbox relaunch re-clones the fork's own repository rather than
+    sandbox relaunch re-clones the fork's own repositories rather than
     the source's.
 
 201 Created — body matches `SessionResponse` (status "idle",
@@ -1214,12 +1338,16 @@ Request body matches `SessionForkRequest`:
 400 Bad Request — source session is a sub-agent session, has
   no agent binding, up_to_response_id names no response in
   the source session, or a managed fork asks for a sandbox this
-  server has not configured
+  server has not configured, or requests multiple repositories on a
+  provider that supports only one
 404 Not Found — no session with that source_id, or the source's
   agent row is missing
-422 Unprocessable Entity — sandbox_provider / workspace without
-  `host_type: "managed"`, or a managed workspace that is not a
-  repository URL
+409 Conflict — host_id names an existing host, or its
+  `managed-<first 8 hex>` name is already taken
+422 Unprocessable Entity — host_id / sandbox_provider / workspace(s) without
+  `host_type: "managed"`, a malformed host_id, or a managed
+  workspace that is not a repository URL, both workspace fields supplied,
+  or more than 10 repositories in workspaces
 ```
 
 Creates a new session by deep-copying every item from the source
@@ -1239,6 +1367,24 @@ The response is a full `SessionResponse` snapshot of the fork — same
 shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
+
+### Read Fork Repository Branch Suggestions
+
+`GET /v1/sessions/{session_id}/resources/repository-branches` requires session
+read access and returns the managed repositories in their original launch order:
+
+```json
+{"repositories": [{"url": "https://github.com/org/repo", "branch": "feature", "pushed": true}]}
+```
+
+Repository URLs and checkout paths come from server-owned launch metadata; this
+endpoint accepts no paths or URLs. It inspects the existing workspace through
+the runner or connected host without waking a sandbox, fetching, or changing Git
+state. `pushed` means the current branch exists at its original clone URL, not
+that all local commits or working-tree changes are pushed. It is `false` only
+when the remote confirms the branch is absent. Detached HEADs, an unavailable
+workspace, or a failed remote check produce `null` values so clients can retain
+the original selection. Non-managed sessions return an empty repository list.
 
 ### Stream Session
 
@@ -1308,6 +1454,7 @@ stream and surface queue/interrupt semantics.
 | `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
 | `session.collaboration_mode` | `SessionCollaborationModeEvent` | `{type, conversation_id, mode: string}` |
 | `session.codex_approval_mode` | `SessionCodexApprovalModeEvent` | `{type, conversation_id, approval_mode: "ask-for-approval" \| "approve-for-me" \| "full-access" \| "read-only"}` |
+| `session.background_tasks` | `SessionBackgroundTasksEvent` | `{type, conversation_id, background_task_count: int, background_tasks: BackgroundTaskInfo[]}` |
 | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |
 | `session.interrupted` | `SessionInterruptedEvent` | `{type, data: {requested_at, queued_item_id?: null}}` (nested envelope) |
 | `session.created` | `SessionCreatedEvent` | `{type, conversation_id: <parent>, child_conversation_id, agent_id, ...}` — emitted on the PARENT session's stream when a sub-agent is spawned. |

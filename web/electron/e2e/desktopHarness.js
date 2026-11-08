@@ -28,6 +28,8 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 
+const applicationsByWindow = new WeakMap();
+
 /** Repo root: web/electron/e2e → ../../.. */
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 /** The Electron app package root (its package.json `main` is src/main.js). */
@@ -366,8 +368,10 @@ function startDisplayCapture(recordDir, display) {
  *   e.g. a scratch `HOME` so credential files stay out of the real one.
  * @param {string[]} [opts.preload] Modules the main process requires before
  *   `main.js`, e.g. a stand-in system browser that must exist from launch.
+ * @param {boolean} [opts.waitForShell] `false` returns right after launch with
+ *   `window: null`, for journeys whose shell may never load a page.
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
- *   window: import("playwright").Page, userDataDir: string,
+ *   window: import("playwright").Page | null, userDataDir: string,
  *   stopDisplayCapture: () => Promise<void> }>} `stopDisplayCapture` must be
  *   awaited before `saveRecording` (it finalizes the composited capture; a
  *   no-op when no display capture ran).
@@ -393,7 +397,11 @@ async function launchDesktop(opts) {
   const profileBootstrap = path.join(userDataDir, "isolate-profile.cjs");
   fs.writeFileSync(
     profileBootstrap,
-    `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n`,
+    `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n` +
+      `const mod = require(${JSON.stringify(path.join(APP_ROOT, "src/browserViewRegistry.js"))});\n` +
+      `const create = mod.createBrowserViewRegistry;\n` +
+      `global.omnigentTestBrowserRegistries = [];\n` +
+      `mod.createBrowserViewRegistry = (...args) => { const registry = create(...args); global.omnigentTestBrowserRegistries.push(registry); return registry; };\n`,
   );
   const preloads = (opts.preload ?? []).flatMap((file) => ["-r", file]);
   const args = ["-r", profileBootstrap, ...preloads, APP_ROOT, `--user-data-dir=${userDataDir}`];
@@ -431,6 +439,10 @@ async function launchDesktop(opts) {
     await stopDisplayCapture();
     throw err;
   }
+  // Journeys whose shell window may never commit a document locate it themselves.
+  if (opts.waitForShell === false) {
+    return { electronApp, window: null, userDataDir, stopDisplayCapture };
+  }
   // If locating the shell fails after launch succeeds, close the app so the
   // Electron process isn't orphaned (the caller never got a handle to close).
   let window;
@@ -460,6 +472,7 @@ async function launchDesktop(opts) {
     await stopDisplayCapture();
     throw err;
   }
+  applicationsByWindow.set(window, electronApp);
   return { electronApp, window, userDataDir, stopDisplayCapture };
 }
 
@@ -514,7 +527,49 @@ function saveRecording(recordDir, name) {
   return saved;
 }
 
+/** Main-process test setup; this capability is never exposed to a renderer. */
+async function execInBrowserView(window, conversationId, js) {
+  const electronApp = applicationsByWindow.get(window);
+  if (!electronApp) throw new Error("Unknown desktop test window");
+  return electronApp.evaluate(
+    async (_electron, { conversationId: viewId, js: script }) => {
+      const entry = global.omnigentTestBrowserRegistries
+        .map((registry) => registry.get(viewId))
+        .find(Boolean);
+      if (!entry) return { ok: false, error: "No browser view" };
+      try {
+        const result = await entry.view.webContents.executeJavaScript(script, false);
+        return { ok: true, result };
+      } catch (error) {
+        return { ok: false, error: String(error) };
+      }
+    },
+    { conversationId, js },
+  );
+}
+
+/** Create a local fixture through main's test driver, outside renderer IPC. */
+async function openBrowserFixture(window, conversationId, url) {
+  const application = applicationsByWindow.get(window);
+  if (!application) throw new Error("Unknown desktop test window");
+  return application.evaluate(
+    (_electron, { conversationId: viewId, url: target }) => {
+      const registry = global.omnigentTestBrowserRegistries[0];
+      const { ok, error } = registry.openOrNavigate(viewId, target, {
+        x: 40,
+        y: 80,
+        width: 900,
+        height: 520,
+      });
+      return { ok, error };
+    },
+    { conversationId, url },
+  );
+}
+
 module.exports = {
+  execInBrowserView,
+  openBrowserFixture,
   APP_ROOT,
   REPO_ROOT,
   WEB_UI_DIST,

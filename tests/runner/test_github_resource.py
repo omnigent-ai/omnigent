@@ -26,6 +26,7 @@ from omnigent.runner.github_resource import (
     github_info,
     github_pr_diff,
 )
+from omnigent.runner.session_prs import PullRequestRef
 
 
 def _stub_gh(
@@ -154,16 +155,22 @@ def test_github_info_pr_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch)
     assert info["pr"]["head_ref"] == "alice/feature"
     assert info["pr"]["is_draft"] is True
     assert info["base_ref"] == "main"
-    assert any(c[:2] == ("pr", "view") for c in calls)
+    assert info["pr"]["checks_supported"] is True
+    assert sum(c[:2] == ("pr", "view") for c in calls) == 1
     assert not any(c[:2] == ("pr", "list") for c in calls)
 
 
 def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A branch with no PR yields ``pr``/``base_ref`` null (bare ``gh pr view`` empty)."""
+    """A branch with no PR yields ``pr``/``base_ref`` null (bare ``gh pr view`` empty).
+
+    gh's "no pull requests" failure names no refused field, so it is not retried.
+    """
+    calls: list[tuple[str, ...]] = []
 
     def fake_gh(
         argv: Sequence[str], *, cwd: str, token: str | None = None
     ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
         head = tuple(argv[:2])
         if head == ("auth", "status"):
             return (0, "", "")
@@ -179,6 +186,7 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     info = github_info(str(repo))
     assert info["pr"] is None
     assert info["base_ref"] is None
+    assert sum(c[:2] == ("pr", "view") for c in calls) == 1
 
 
 def test_github_info_pr_via_commit_fork_fallback(
@@ -323,6 +331,118 @@ def test_resolve_pr_via_commit_rejects_closed_only(
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
     assert github_resource._resolve_pr_via_commit(str(repo)) is None
+
+
+def test_resolve_pr_via_commit_skips_checkout_on_up_to_date_base(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fork whose default branch lags lists others' open PRs for the base tip.
+
+    Only a branch with commits beyond the base branch has a PR of its own.
+    """
+    _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
+    _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
+    _run(["git", "update-ref", "refs/remotes/upstream/main", "main"], repo)
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if argv[0] == "api" and argv[1].startswith("repos/acme-dev/repo/commits/"):
+            row = {
+                "number": 270,
+                "state": "open",
+                "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+            }
+            return (0, json.dumps([row]), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+    _run(["git", "checkout", "-q", "main"], repo)
+    assert github_resource._resolve_pr_via_commit(str(repo)) is None
+
+
+@pytest.mark.parametrize(
+    ("lookup_remote", "mirror"),
+    [
+        pytest.param("origin", "mirror", id="origin-lookup"),
+        pytest.param("fork", "origin", id="tracking-remote-lookup"),
+    ],
+)
+def test_resolve_pr_via_commit_ignores_same_named_repo_on_another_host(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, lookup_remote: str, mirror: str
+) -> None:
+    """A same-named repo on another host is not the PR's base, so it can't hide the PR."""
+    _run(["git", "remote", "add", lookup_remote, "git@github.com:acme-dev/repo.git"], repo)
+    _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
+    _run(["git", "remote", "add", mirror, "git@gitlab.com:acme/repo.git"], repo)
+    _run(["git", "remote", "add", "mirror-fork", "git@gitlab.com:acme-dev/repo.git"], repo)
+    for branch in ("feature", "main"):
+        _run(["git", "config", f"branch.{branch}.remote", lookup_remote], repo)
+    _run(["git", "update-ref", "refs/remotes/upstream/main", "main"], repo)
+    _run(["git", "update-ref", f"refs/remotes/{mirror}/main", "feature"], repo)
+    row = {
+        "number": 270,
+        "state": "open",
+        "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+    }
+    _stub_gh(monkeypatch, {("api",): (0, json.dumps([row]), "")})
+
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+    _run(["git", "checkout", "-q", "main"], repo)
+    assert github_resource._resolve_pr_via_commit(str(repo)) is None
+
+
+@pytest.mark.parametrize(
+    ("base_remote", "lookalike_ref"),
+    [
+        pytest.param(None, None, id="no-base-remote"),
+        pytest.param("upstream", None, id="no-tracking-ref"),
+        pytest.param("upstream", "refs/heads/refs/remotes/upstream/main", id="lookalike-branch"),
+    ],
+)
+def test_resolve_pr_via_commit_keeps_open_pr_without_base_tracking_ref(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, base_remote: str | None, lookalike_ref: str | None
+) -> None:
+    """Without a local tracking ref of the PR's base branch, an open row is still accepted."""
+    _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
+    if base_remote:
+        _run(["git", "remote", "add", base_remote, "git@github.com:acme/repo.git"], repo)
+    if lookalike_ref:
+        _run(["git", "update-ref", lookalike_ref, "main"], repo)
+    _run(["git", "checkout", "-q", "main"], repo)
+    row = {
+        "number": 270,
+        "state": "open",
+        "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+    }
+    _stub_gh(monkeypatch, {("api",): (0, json.dumps([row]), "")})
+
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+
+
+def test_resolve_pr_via_commit_picks_later_open_pr_after_skipping_one(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row skipped because its base branch has the commit doesn't stop a later row matching."""
+    _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
+    _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
+    _run(["git", "update-ref", "refs/remotes/upstream/main", "feature"], repo)
+    rows = [
+        {
+            "number": 270,
+            "state": "open",
+            "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+        },
+        {
+            "number": 271,
+            "state": "open",
+            "base": {"ref": "release", "repo": {"full_name": "acme/repo"}},
+        },
+    ]
+    _stub_gh(monkeypatch, {("api",): (0, json.dumps(rows), "")})
+
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (271, "acme/repo")
 
 
 def test_resolve_pr_via_commit_none_without_repo(
@@ -520,6 +640,8 @@ def test_github_changed_files_maps_pr_file_statuses(monkeypatch: pytest.MonkeyPa
     assert by_path["src/fileA.py"]["status"] == "modified"
     assert by_path["fileB.py"]["status"] == "deleted"
     assert by_path["new/name.py"]["status"] == "renamed"
+    assert by_path["new/name.py"]["previous_path"] == "old/name.py"
+    assert by_path["src/fileA.py"]["previous_path"] is None
     # Line counts and the display name come straight from the PR file entry.
     assert by_path["newfile.py"]["lines_added"] == 1
     assert by_path["src/fileA.py"]["name"] == "fileA.py"
@@ -753,6 +875,28 @@ def test_github_pr_diff_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     assert github_pr_diff("/root") == {"object": "session.github.pr_diff", "patch": ""}
 
 
+@pytest.mark.parametrize(
+    ("command", "response", "load", "message"),
+    [
+        (("pr", "diff"), (1, "", "timeout"), github_pr_diff, "could not load the PR diff"),
+        (
+            ("api",),
+            (1, "", "denied"),
+            github_changed_files,
+            "could not load the PR's changed files",
+        ),
+        (("api",), (0, "invalid", ""), github_changed_files, "invalid changed-file list"),
+        (("api",), (0, "{}", ""), github_changed_files, "invalid changed-file list"),
+    ],
+)
+def test_github_diff_failures_are_not_empty_successes(
+    monkeypatch: pytest.MonkeyPatch, command, response, load, message: str
+) -> None:
+    _stub_gh(monkeypatch, {("pr", "view"): (0, '{"number":7}', ""), command: response})
+    with pytest.raises(ValueError, match=message):
+        load("/root")
+
+
 def test_github_pr_diff_resolves_number_then_diffs(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -776,6 +920,207 @@ def test_github_pr_diff_resolves_number_then_diffs(
     assert result == {"object": "session.github.pr_diff", "patch": patch}
     # The diff was fetched by the resolved number, never a bare 'gh pr diff'.
     assert [c for c in calls if c[:2] == ("pr", "diff")] == [("pr", "diff", "9")]
+
+
+# ── Pull request commits ─────────────────────────────────────────────────────
+
+_PR = PullRequestRef.from_url("https://github.com/example/two/pull/42")
+_HEAD, _BASE = "a" * 40, "b" * 40
+_COMMIT_ONE, _COMMIT_TWO = "1" * 40, "2" * 40
+
+
+def _commit_entry(sha: str, message: str) -> dict[str, object]:
+    return {
+        "sha": sha,
+        "commit": {"message": message, "author": {"name": "Ada", "date": "2026-11-01T10:00:00Z"}},
+    }
+
+
+def _stub_pr_commits(
+    monkeypatch: pytest.MonkeyPatch, *, head: str, total: int, pages: list[object]
+) -> list[list[str]]:
+    """Answer the PR's REST payload and its commit pages; returns the recorded gh argv."""
+    calls: list[list[str]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(list(argv))
+        if argv[-1] == "repos/example/two/pulls/42":
+            pr = {"head": {"sha": head}, "base": {"sha": _BASE}, "commits": total}
+            return 0, json.dumps(pr), ""
+        return 0, json.dumps(pages), ""
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
+    return calls
+
+
+def test_github_pr_commits_list_oldest_first_with_title_and_author(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pages = [
+        [_commit_entry(_COMMIT_ONE, "  Add the feature \n\nLonger body")],
+        [_commit_entry(_COMMIT_TWO, "Fix typo")],
+    ]
+    calls = _stub_pr_commits(monkeypatch, head=_HEAD, total=2, pages=pages)
+
+    result = github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
+
+    assert result == {
+        "object": "list",
+        "has_more": False,
+        "data": [
+            {
+                "object": "session.github.commit",
+                "sha": _COMMIT_ONE,
+                "title": "Add the feature",
+                "author": "Ada",
+                "date": "2026-11-01T10:00:00Z",
+            },
+            {
+                "object": "session.github.commit",
+                "sha": _COMMIT_TWO,
+                "title": "Fix typo",
+                "author": "Ada",
+                "date": "2026-11-01T10:00:00Z",
+            },
+        ],
+    }
+    listing = next(call for call in calls if "--paginate" in call)
+    assert listing[-1] == "repos/example/two/pulls/42/commits?per_page=100"
+    assert "--slurp" in listing
+
+
+def test_github_pr_commits_cap_at_250_keeping_the_first_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = [_commit_entry(f"{index:040x}", f"Commit {index}") for index in range(255)]
+    _stub_pr_commits(monkeypatch, head=_HEAD, total=255, pages=[entries[:100], entries[100:]])
+
+    result = github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
+
+    assert [item["sha"] for item in result["data"]] == [f"{index:040x}" for index in range(250)]
+    assert result["has_more"] is True
+
+
+def test_github_pr_commits_refuse_a_moved_head_before_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _stub_pr_commits(monkeypatch, head="c" * 40, total=1, pages=[])
+
+    with pytest.raises(ValueError, match="pull request changed"):
+        github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
+    assert not any(call[-1].endswith("/commits?per_page=100") for call in calls)
+
+
+def test_github_pr_commits_refuse_a_head_that_moves_while_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heads = iter([_HEAD, "c" * 40])
+    calls: list[list[str]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(list(argv))
+        if argv[-1] == "repos/example/two/pulls/42":
+            pr = {"head": {"sha": next(heads)}, "base": {"sha": _BASE}, "commits": 1}
+            return 0, json.dumps(pr), ""
+        return 0, json.dumps([[_commit_entry(_COMMIT_ONE, "Add")]]), ""
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
+
+    with pytest.raises(ValueError, match="pull request changed"):
+        github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
+    assert any(call[-1].endswith("/commits?per_page=100") for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ((1, "", "timeout"), "could not load the PR's commits"),
+        ((0, "not json", ""), "invalid commit list"),
+        ((0, json.dumps({"object": "list"}), ""), "invalid commit list"),
+    ],
+)
+def test_github_pr_commits_listing_failures_are_not_empty_successes(
+    monkeypatch: pytest.MonkeyPatch, response: tuple[int, str, str], message: str
+) -> None:
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if argv[-1] == "repos/example/two/pulls/42":
+            return 0, json.dumps({"head": {"sha": _HEAD}, "base": {"sha": _BASE}}), ""
+        return response
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
+
+    with pytest.raises(ValueError, match=message):
+        github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
+
+
+def _stub_commit_patch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    listed: list[str],
+    patch_response: tuple[int, str, str],
+) -> list[list[str]]:
+    """Answer the commit listing with ``listed`` shas and the diff with ``patch_response``."""
+    calls: list[list[str]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(list(argv))
+        if argv[-1].endswith("/commits?per_page=100"):
+            return 0, json.dumps([[_commit_entry(sha, "Commit") for sha in listed]]), ""
+        return patch_response
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
+    return calls
+
+
+def test_github_commit_patch_reads_one_commit_as_a_diff(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _stub_commit_patch(
+        monkeypatch, listed=[_COMMIT_ONE], patch_response=(0, "diff --git a/x b/x\n", "")
+    )
+
+    result = github_resource._pr_commit_patch("/root", _PR, commit_sha=_COMMIT_ONE)
+
+    assert result == {"object": "session.github.pr_diff", "patch": "diff --git a/x b/x\n"}
+    assert calls[-1] == [
+        "api",
+        "--hostname",
+        "github.com",
+        "-H",
+        "Accept: application/vnd.github.diff",
+        f"repos/example/two/commits/{_COMMIT_ONE}",
+    ]
+
+
+def test_github_commit_patch_refuses_a_commit_outside_the_pull_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _stub_commit_patch(
+        monkeypatch, listed=[_COMMIT_ONE], patch_response=(0, "other repo commit", "")
+    )
+
+    with pytest.raises(ValueError, match="not part of the selected pull request"):
+        github_resource._pr_commit_patch("/root", _PR, commit_sha=_COMMIT_TWO)
+    assert not any("/commits/" in call[-1] for call in calls)
+
+
+def test_github_commit_patch_failure_is_not_an_empty_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_commit_patch(monkeypatch, listed=[_COMMIT_ONE], patch_response=(1, "", "not found"))
+
+    with pytest.raises(ValueError, match="could not load the commit's diff"):
+        github_resource._pr_commit_patch("/root", _PR, commit_sha=_COMMIT_ONE)
 
 
 # ── Account selection ────────────────────────────────────────────────────────
@@ -912,18 +1257,24 @@ def test_summarize_checks_mixed() -> None:
         {"context": "legacy-ok", "state": "SUCCESS", "targetUrl": "t"},
         {"context": "legacy-wait", "state": "PENDING"},
         {"context": "legacy-err", "state": "ERROR"},
+        {"name": "cancelled job", "status": "COMPLETED", "conclusion": "CANCELLED"},
+        {"name": "skipped job", "status": "COMPLETED", "conclusion": "SKIPPED"},
     ]
     result = _summarize_checks(rollup)
     assert result["passing"] == 2
     assert result["failing"] == 2
     assert result["pending"] == 2
-    assert result["total"] == 6
+    assert result["cancelled"] == 1
+    assert result["skipped"] == 1
+    assert result["total"] == 8
     # Per-check details carry the job name, bucket, and link (name falls back to
     # context / workflowName; url falls back to targetUrl).
     assert {"name": "unit", "bucket": "passing", "url": "u"} in result["runs"]
     assert {"name": "e2e", "bucket": "failing", "url": None} in result["runs"]
     assert {"name": "bench", "bucket": "pending", "url": None} in result["runs"]
     assert {"name": "legacy-ok", "bucket": "passing", "url": "t"} in result["runs"]
+    assert {"name": "cancelled job", "bucket": "cancelled", "url": None} in result["runs"]
+    assert {"name": "skipped job", "bucket": "skipped", "url": None} in result["runs"]
 
 
 def test_summarize_checks_empty() -> None:
@@ -932,31 +1283,39 @@ def test_summarize_checks_empty() -> None:
         "passing": 0,
         "failing": 0,
         "pending": 0,
+        "cancelled": 0,
+        "skipped": 0,
         "total": 0,
         "runs": [],
     }
 
 
+@pytest.mark.parametrize("lookup", ["workspace", "reference"])
 def test_github_info_includes_body_and_comments(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, monkeypatch: pytest.MonkeyPatch, lookup: str
 ) -> None:
-    """The PR carries its description and its shaped conversation comments.
-
-    ``body`` feeds the Summary tab's description; ``comments`` its list. A
-    minimized/collapsed comment is dropped (as GitHub hides it), and each entry
-    is flattened to ``{author, body, created_at, url}``.
-    """
+    """Both PR paths include comments, reviews, commits and actual force-push times."""
     view = {
         "number": 8,
         "title": "t",
         "state": "OPEN",
-        "url": "u",
+        "url": "https://github.com/o/r/pull/8",
         "isDraft": False,
         "author": {"login": "a"},
         "baseRefName": "main",
         "headRefName": "feature",
         "statusCheckRollup": [],
         "body": "## Summary\nDoes things.",
+        "reviews": [
+            {
+                "author": {"login": "other-reviewer"},
+                "body": "Looks good overall",
+                "submittedAt": "2026-09-05T07:45:00Z",
+                "state": "COMMENTED",
+            },
+            {"author": {"login": "silent-reviewer"}, "body": ""},
+            {"author": {"login": "draft-reviewer"}, "body": "not submitted"},
+        ],
         "comments": [
             {
                 "author": {"login": "reviewer"},
@@ -974,6 +1333,33 @@ def test_github_info_includes_body_and_comments(
             },
         ],
     }
+    timeline = {
+        "nodes": [
+            {
+                "__typename": "HeadRefForcePushedEvent",
+                "id": "force-push",
+                "actor": {"login": "pusher"},
+                "createdAt": "2026-09-05T08:00:00Z",
+                "beforeCommit": {"oid": "a" * 40},
+                "afterCommit": {
+                    "oid": "b" * 40,
+                    "url": "https://github.com/o/r/commit/" + "b" * 40,
+                },
+            },
+            {
+                "__typename": "PullRequestCommit",
+                "id": "commit",
+                "url": "https://github.com/o/r/pull/8/commits/b",
+                "commit": {
+                    "oid": "b" * 40,
+                    "messageHeadline": "Update implementation",
+                    "committedDate": "2026-09-05T07:40:00Z",
+                    "author": {"name": "Commit Author", "user": {"login": "author"}},
+                },
+            },
+        ],
+        "pageInfo": {"hasPreviousPage": False},
+    }
 
     def fake_gh(
         argv: Sequence[str], *, cwd: str, token: str | None = None
@@ -985,22 +1371,66 @@ def test_github_info_includes_body_and_comments(
             return (0, json.dumps({"nameWithOwner": "o/r"}), "")
         if head == ("pr", "view"):
             return (0, json.dumps(view), "")
+        if argv[:4] == ["api", "--hostname", "github.com", "graphql"]:
+            query = next(arg for arg in argv if arg.startswith("query="))
+            assert "PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT" in query
+            assert "pushedDate" not in query
+            assert "afterCommit { oid url }" in query
+            assert argv[argv.index("--cache") + 1] == "30s"
+            assert "includeComments=false" in argv
+            assert "comments(last: 100) @include(if: $includeComments)" in query
+            return (
+                0,
+                json.dumps({"data": {"repository": {"pullRequest": {"timelineItems": timeline}}}}),
+                "",
+            )
         return (1, "", "no stub")
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
     monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
 
-    info = github_info(str(repo))
+    info = (
+        github_info(str(repo))
+        if lookup == "workspace"
+        else github_resource._reference_info(str(repo), PullRequestRef.from_url(view["url"]))
+    )
     assert info["pr"]["body"] == "## Summary\nDoes things."
-    # The minimized comment is dropped; the survivor is flattened to snake_case.
     assert info["pr"]["comments"] == [
         {
             "author": "reviewer",
             "body": "nice",
             "created_at": "2026-09-05T07:32:02Z",
             "url": "https://example.com/c/1",
-        }
+        },
+        {
+            "author": "other-reviewer",
+            "body": "Looks good overall",
+            "created_at": "2026-09-05T07:45:00Z",
+            "url": "https://github.com/o/r/pull/8",
+        },
     ]
+    assert not info["pr"].get("comments_partial")
+    assert info["pr"]["timeline_events"] == [
+        {
+            "id": "commit",
+            "kind": "commit",
+            "author": "author",
+            "created_at": "2026-09-05T07:40:00Z",
+            "url": "https://github.com/o/r/pull/8/commits/b",
+            "sha": "b" * 40,
+            "message": "Update implementation",
+        },
+        {
+            "id": "force-push",
+            "kind": "force_push",
+            "author": "pusher",
+            "created_at": "2026-09-05T08:00:00Z",
+            "url": "https://github.com/o/r/commit/" + "b" * 40,
+            "sha": "b" * 40,
+            "previous_sha": "a" * 40,
+        },
+    ]
+    assert info["pr"]["timeline_partial"] is False
 
 
 def test_github_info_empty_body_is_null(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1040,7 +1470,7 @@ def test_github_info_empty_body_is_null(repo: Path, monkeypatch: pytest.MonkeyPa
 
 
 def test_shape_comments_filters_minimized_and_caps() -> None:
-    """Minimized comments drop out and the list caps at ``_MAX_COMMENTS``."""
+    """Minimized comments drop out and the merged list caps at ``_MAX_COMMENTS``."""
     raw: list[dict[str, object]] = [
         {"author": {"login": "min"}, "body": "x", "isMinimized": True},
     ]
@@ -1056,6 +1486,68 @@ def test_shape_comments_filters_minimized_and_caps() -> None:
         {"author": None, "body": "hi", "created_at": None, "url": None}
     ]
     assert github_resource._shape_comments(None) == []
+    assert github_resource._shape_comments(
+        raw[:1] + raw[1 : github_resource._MAX_COMMENTS],
+        [{"author": {"login": "early"}, "body": "review", "submittedAt": "a"}],
+        pr_url="https://github.com/o/r/pull/8",
+    )[0] == {
+        "author": "early",
+        "body": "review",
+        "created_at": "a",
+        "url": "https://github.com/o/r/pull/8",
+    }
+    assert github_resource._comments_payload({"comments": [], "url": "u"}) == {
+        "comments": [],
+        "comments_partial": True,
+        "timeline_events": [],
+        "timeline_partial": True,
+    }
+    payload = github_resource._comments_payload({"comments": raw, "reviews": []})
+    assert len(payload["comments"]) == github_resource._MAX_COMMENTS
+    assert payload["comments_partial"] is True
+
+    visible = [{"body": f"comment {i}"} for i in range(60)]
+    empty_reviews = [{"body": "", "submittedAt": "2026-01-01"} for _ in range(41)]
+    payload = github_resource._comments_payload({"comments": visible, "reviews": empty_reviews})
+    assert len(payload["comments"]) == 60
+    assert "comments_partial" not in payload
+
+
+@pytest.mark.parametrize("missing", [None, "malformed"])
+def test_timeline_handles_deleted_users_and_commits(missing) -> None:
+    payload = github_resource._timeline_payload(
+        {
+            "nodes": [
+                None,
+                {"__typename": "PullRequestCommit", "id": "missing", "commit": None},
+                {
+                    "__typename": "PullRequestCommit",
+                    "id": "commit",
+                    "commit": {"author": {"name": "Git Author", "user": missing}},
+                },
+                {
+                    "__typename": "PullRequestCommit",
+                    "id": "no-author",
+                    "commit": {"author": missing},
+                },
+                {
+                    "__typename": "HeadRefForcePushedEvent",
+                    "id": "force-push",
+                    "actor": missing,
+                    "beforeCommit": missing,
+                    "afterCommit": missing,
+                },
+            ],
+            "pageInfo": {"hasPreviousPage": False},
+        },
+    )
+    commit, no_author, force_push = payload["timeline_events"]
+    assert commit["author"] == "Git Author"
+    assert no_author["author"] is None
+    assert force_push["author"] is None
+    assert force_push["sha"] is None and force_push["previous_sha"] is None
+    assert force_push["url"] is None
+    assert payload["timeline_partial"] is True
 
 
 def test_gh_scrubs_env_tokens_in_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1114,3 +1606,292 @@ def test_gh_applies_account_token(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(env, dict)
     assert env["GH_TOKEN"] == "chosen-tok"
     assert "GITHUB_TOKEN" not in env
+
+
+_CHECKS_FORBIDDEN = (
+    "GraphQL: Resource not accessible by personal access token "
+    "(repository.pullRequests.nodes.0.statusCheckRollup.nodes.0.commit.statusCheckRollup)"
+)
+
+_PR_WITHOUT_CHECKS = {
+    "number": 42,
+    "title": "Add thing",
+    "state": "OPEN",
+    "url": "https://github.com/acme/repo/pull/42",
+    "isDraft": False,
+    "author": {"login": "contributor"},
+    "baseRefName": "main",
+    "headRefName": "feature",
+    "headRefOid": "a" * 40,
+    "baseRefOid": "b" * 40,
+    "headRepository": {"id": "R_1", "name": "repo"},
+    "headRepositoryOwner": {"id": "U_1", "login": "contributor"},
+    "body": "Description",
+    "comments": [],
+    "reviews": [
+        {
+            "author": {"login": "second-reviewer"},
+            "body": "Please update the docs",
+            "submittedAt": "2026-10-16T17:30:38Z",
+        }
+    ],
+}
+
+
+def _gh_without_checks_permission(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """Stub ``gh`` signed in with a fine-grained PAT.
+
+    GitHub refuses ``statusCheckRollup`` to such a token, so only a ``pr view``
+    that asks for it fails; every other read succeeds.
+    """
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        if list(argv[:2]) == ["auth", "status"]:
+            me = {"login": "contributor", "active": True, "state": "success"}
+            return (0, json.dumps({"hosts": {"github.com": [me]}}), "")
+        if list(argv[:2]) == ["repo", "view"]:
+            return (0, json.dumps({"nameWithOwner": "acme/repo"}), "")
+        if list(argv[:3]) == ["repo", "set-default", "--view"]:
+            return (0, "acme/repo\n", "")
+        if list(argv[:2]) == ["pr", "view"]:
+            fields = argv[argv.index("--json") + 1].split(",")
+            if "statusCheckRollup" in fields:
+                return (1, "", _CHECKS_FORBIDDEN)
+            data = {
+                name: _PR_WITHOUT_CHECKS[name] for name in fields if name in _PR_WITHOUT_CHECKS
+            }
+            return (0, json.dumps(data), "")
+        if argv[0] == "api" and "/commits/" in argv[1] and argv[1].endswith("/pulls"):
+            row = {"number": 42, "state": "open", "base": {"repo": {"full_name": "acme/repo"}}}
+            return (0, json.dumps([row]), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    return calls
+
+
+def test_github_info_resolves_pr_when_checks_field_is_forbidden(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The branch's PR still resolves when only its check runs are unreadable."""
+    _run(["git", "remote", "add", "origin", "https://github.com/acme/repo.git"], repo)
+    calls = _gh_without_checks_permission(monkeypatch)
+
+    info = github_info(str(repo))
+    assert info["authenticated"] is True
+    assert info["pr"] is not None, calls
+    assert info["pr"]["number"] == 42
+    assert info["pr"]["title"] == "Add thing"
+    assert info["base_ref"] == "main"
+    assert not (info["pr"].get("checks") or {}).get("total")
+    assert info["pr"]["checks_supported"] is False
+    # The refused call is retried once without the field; no commit fallback runs.
+    assert [c[-1] for c in calls if c[:2] == ("pr", "view")] == [
+        github_resource._PR_VIEW_FIELDS,
+        github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", ""),
+    ]
+    assert not any(c[0] == "api" and "/commits/" in c[1] for c in calls)
+
+
+def test_reference_info_keeps_auth_when_checks_field_is_forbidden(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A linked PR whose checks are unreadable renders instead of reporting a sign-in problem."""
+    monkeypatch.setattr(github_resource._config, "github_account_preference", lambda _key: None)
+    calls = _gh_without_checks_permission(monkeypatch)
+    reference = PullRequestRef.from_url("https://github.com/acme/repo/pull/42")
+
+    info = github_resource._reference_info(str(repo), reference)
+    assert info["authenticated"] is True
+    assert info["pr"] is not None, calls
+    assert info["pr"]["title"] == "Add thing"
+    assert info["pr"]["head_sha"] == "a" * 40
+    assert info["pr"]["head_repository_url"] == "https://github.com/contributor/repo"
+    assert not (info["pr"].get("checks") or {}).get("total")
+    assert info["pr"]["checks_supported"] is False
+    assert info["pr"]["body"] == "Description"
+    assert info["pr"]["comments"] == [
+        {
+            "author": "second-reviewer",
+            "body": "Please update the docs",
+            "created_at": "2026-10-16T17:30:38Z",
+            "url": "https://github.com/acme/repo/pull/42",
+        }
+    ]
+
+
+def test_review_field_unavailable_keeps_issue_comments(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older gh still shows issue comments and marks the feed incomplete."""
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if argv[:2] != ["pr", "view"]:
+            return (1, "", "no stub")
+        fields = argv[argv.index("--json") + 1].split(",")
+        if "reviews" in fields:
+            return (1, "", 'Unknown JSON field: "reviews"')
+        data = dict(_PR_WITHOUT_CHECKS)
+        data.pop("reviews")
+        data["comments"] = [{"author": {"login": "owner"}, "body": "hello"}]
+        return (0, json.dumps(data), "")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+    reference = PullRequestRef.from_url("https://github.com/acme/repo/pull/42")
+    info = github_resource._reference_info(str(repo), reference)
+    assert info["pr"]["comments"][0]["body"] == "hello"
+    assert info["pr"]["comments_partial"] is True
+
+
+def test_commit_fallback_fetch_retries_without_forbidden_checks_field(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The explicit ``-R`` fetch after a commit lookup gets the same retry."""
+    _run(["git", "remote", "add", "origin", "https://github.com/acme/repo.git"], repo)
+    calls = _gh_without_checks_permission(monkeypatch)
+    gh = github_resource._gh
+
+    def branch_lookup_misses(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if list(argv[:3]) == ["pr", "view", "--json"]:
+            calls.append(tuple(argv))
+            return (1, "", 'no pull requests found for branch "feature"')
+        return gh(argv, cwd=cwd, token=token)
+
+    monkeypatch.setattr(github_resource, "_gh", branch_lookup_misses)
+
+    info = github_info(str(repo))
+    assert info["pr"]["number"] == 42
+    assert info["pr"]["checks_supported"] is False
+    assert [c[-1] for c in calls if c[:3] == ("pr", "view", "42")] == [
+        github_resource._PR_VIEW_FIELDS,
+        github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", ""),
+    ]
+
+
+@pytest.mark.parametrize("failure", [None, "api", "enterprise_auth", "invalid_json"])
+def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatch, failure):
+    old = [{"body": f"old-{i}", "createdAt": "2026-01-01"} for i in range(100)]
+    latest = [{"body": f"new-{i}", "createdAt": "2026-10-26"} for i in range(100)]
+    calls = []
+    host = "ghe.example.com" if failure == "enterprise_auth" else "github.com"
+    monkeypatch.setattr(github_resource, "_list_accounts", lambda _root: (False, []))
+
+    def gh(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[:2] == ["pr", "view"]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "url": f"https://{host}/acme/widgets/pull/17",
+                        "comments": old,
+                        "reviews": [],
+                    }
+                ),
+                "",
+            )
+        if failure == "invalid_json":
+            return 0, "{", ""
+        if failure:
+            return 1, "", "rate limited"
+        return (
+            0,
+            json.dumps(
+                {
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "comments": {"nodes": latest},
+                                "timelineItems": {
+                                    "nodes": [],
+                                    "pageInfo": {"hasPreviousPage": True},
+                                },
+                            }
+                        }
+                    }
+                }
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    data = github_resource._gh_pr_view(
+        ["17", "-R", "acme/widgets"],
+        "url,comments,reviews",
+        cwd="/workspace",
+        token="selected-token",
+    )
+    assert data is not None
+    assert data["comments"] == (old if failure else latest)
+    payload = github_resource._comments_payload(data)
+    assert payload["timeline_events"] == []
+    assert payload["timeline_partial"] is True
+    assert len(calls) == (1 if failure == "enterprise_auth" else 2)
+    if failure == "enterprise_auth":
+        return
+    assert calls[1][0][:4] == ["api", "--hostname", "github.com", "graphql"]
+    assert "--cache" not in calls[1][0]
+    assert "includeComments=true" in calls[1][0]
+    assert "number=17" in calls[1][0]
+    assert calls[1][1]["token"] == "selected-token"
+    assert github_resource._comments_payload(data)["comments_partial"] is True
+    shaped = github_resource._shape_comments(old + latest)
+    assert len(shaped) == 100
+    assert shaped[-1]["body"] == "new-99"
+
+
+@pytest.mark.parametrize("fields", ["title,url", "reviewRequests,latestReviews"])
+def test_metadata_only_reads_do_not_load_timeline(monkeypatch, fields):
+    calls = []
+
+    def gh(argv, **_kwargs):
+        calls.append(argv)
+        return 0, json.dumps({"url": "https://github.com/o/r/pull/8", "title": "title"}), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    assert github_resource._gh_pr_view([], fields, cwd="/workspace") is not None
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("pr_url", "head", "owner", "expected"),
+    [
+        (
+            "https://github.com/acme/repo/pull/1",
+            {"id": "R_1", "name": "repo"},
+            {"id": "U_1", "login": "acme"},
+            "https://github.com/acme/repo",
+        ),
+        (
+            "https://github.com/acme/repo/pull/1",
+            {"id": "R_2", "name": "repo-fork"},
+            {"id": "U_2", "login": "contributor"},
+            "https://github.com/contributor/repo-fork",
+        ),
+        (
+            "https://ghe.example.com/acme/repo/pull/1",
+            {"id": "R_2", "name": "repo"},
+            {"id": "U_2", "login": "contributor"},
+            "https://ghe.example.com/contributor/repo",
+        ),
+        # gh reports a deleted fork as null.
+        ("https://github.com/acme/repo/pull/1", None, None, None),
+        ("https://github.com/acme/repo/pull/1", {"id": "R_2", "name": "repo"}, None, None),
+    ],
+)
+def test_head_repository_url(
+    pr_url: str, head: object, owner: object, expected: str | None
+) -> None:
+    reference = PullRequestRef.from_url(pr_url)
+    assert github_resource._head_repository_url(reference, head, owner) == expected

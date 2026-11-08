@@ -6,9 +6,22 @@
 // uses pointerDown on the trigger (matching the TasksPage tests).
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ScheduledTaskRow } from "./ScheduledTaskRow";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import type * as RoutingModule from "@/lib/routing";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+
+// Capture navigate() calls; the row uses `@/lib/routing`'s useNavigate, which
+// falls back to react-router-dom. Mocking it lets us assert the target without
+// a full router history.
+const navigate = vi.fn();
+vi.mock("@/lib/routing", async (importOriginal) => {
+  const actual = await importOriginal<typeof RoutingModule>();
+  return { ...actual, useNavigate: () => navigate };
+});
 
 function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
   return {
@@ -24,9 +37,12 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    sessionMode: "new",
+    sessionId: null,
     workspace: null,
     hostId: null,
     executionTarget: "connected_host",
+    projectId: null,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -44,6 +60,7 @@ const NOW = new Date("2026-03-10T12:00:00Z");
 function renderRow(
   t: ScheduledTask,
   handlers: Partial<Parameters<typeof ScheduledTaskRow>[0]> = {},
+  { detailPage = false }: { detailPage?: boolean } = {},
 ) {
   const props = {
     task: t,
@@ -55,11 +72,25 @@ function renderRow(
     busy: false,
     ...handlers,
   };
-  render(<ScheduledTaskRow {...props} />);
+  render(
+    <CapabilitiesProvider
+      info={{
+        ...FALLBACK_SERVER_INFO,
+        features: { automations_v2: detailPage },
+      }}
+    >
+      <MemoryRouter>
+        <ScheduledTaskRow {...props} />
+      </MemoryRouter>
+    </CapabilitiesProvider>,
+  );
   return props;
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  navigate.mockReset();
+});
 
 describe("next-run text (server-sourced, relative delta)", () => {
   it("renders the relative next-run with a 'Next run' prefix when nextRunAt is set", () => {
@@ -102,5 +133,118 @@ describe("⋯ menu actions", () => {
   it("disables the menu trigger while the row is busy", () => {
     renderRow(task(), { busy: true });
     expect(screen.getByTestId("task-row-menu")).toBeDisabled();
+  });
+});
+
+describe("card-body navigation", () => {
+  it("navigates to the task's detail page when the card body is clicked", () => {
+    const t = task({ id: "st_42" });
+    renderRow(t, {}, { detailPage: true });
+    fireEvent.click(screen.getByTestId("task-row-open"));
+    expect(navigate).toHaveBeenCalledWith("/tasks/st_42");
+  });
+
+  it("keeps the card body inert while the detail page is behind its release flag", () => {
+    renderRow(task({ id: "st_42" }));
+    expect(screen.queryByTestId("task-row-open")).toBeNull();
+    fireEvent.click(screen.getByText("Nightly triage"));
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("opening the ⋯ menu does NOT navigate", () => {
+    renderRow(task({ id: "st_42" }), {}, { detailPage: true });
+    // Radix opens on pointerdown; the trigger stops propagation so the
+    // card-body navigation never fires.
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("selecting a menu item dispatches its callback without navigating", () => {
+    const onRunNow = vi.fn();
+    const t = task({ id: "st_42" });
+    renderRow(t, { onRunNow }, { detailPage: true });
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("task-run-now"));
+    expect(onRunNow).toHaveBeenCalledWith(t);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+});
+
+describe("last-run failure warning", () => {
+  it.each(["active", "paused"] as const)("shows a red warning on a %s automation", (state) => {
+    renderRow(task({ state, lastRunStatus: "failed" }), {}, { detailPage: true });
+    const warning = screen.getByRole("img", { name: "Last run failed" });
+    expect(warning).toHaveClass("text-status-red");
+    expect(warning).toHaveAttribute("title", "Last run failed");
+    expect(screen.getByTestId("task-row-open")).toHaveAccessibleDescription("Last run failed");
+    expect(screen.getByTestId("task-row-open")).toHaveAttribute("aria-describedby", warning.id);
+    fireEvent.click(warning);
+    expect(navigate).toHaveBeenCalledWith("/tasks/st_1");
+  });
+
+  it.each([null, "succeeded", "running", "skipped"] as const)(
+    "does not warn for %s",
+    (lastRunStatus) => {
+      renderRow(task({ lastRunStatus }));
+      expect(screen.queryByRole("img", { name: "Last run failed" })).toBeNull();
+    },
+  );
+
+  it("also warns when the detail page is disabled", () => {
+    renderRow(task({ state: "paused", lastRunStatus: "failed" }));
+    expect(screen.getByRole("img", { name: "Last run failed" })).toBeInTheDocument();
+  });
+});
+
+it.each(["continue", "new"] as const)(
+  "uses trigger controls only for continued templates: %s",
+  async (sessionMode) => {
+    renderRow(
+      task({
+        prompt: "This automation watches Slack and starts one Omnigent session",
+        sessionMode,
+        nextRunAt: "2026-03-10T14:00:00Z",
+      }),
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(await screen.findByTestId("task-edit")).toBeInTheDocument();
+    if (sessionMode === "continue") {
+      expect(screen.getByTestId("task-schedule-line")).toHaveTextContent(
+        "Runs when new items match",
+      );
+      expect(screen.queryByTestId("task-next-run")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("task-run-now")).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByTestId("task-next-run")).toBeInTheDocument();
+      expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
+    }
+  },
+);
+
+describe("right-click context menu", () => {
+  it("opens the same actions on right-click and dispatches the selection", () => {
+    const onDelete = vi.fn();
+    const t = task();
+    renderRow(t, { onDelete });
+    fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"));
+    expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.getByTestId("task-pause-toggle").textContent).toBe("Pause");
+    fireEvent.click(screen.getByTestId("task-delete"));
+    expect(onDelete).toHaveBeenCalledWith(t);
+  });
+
+  it("opens on the clickable card body without navigating", () => {
+    renderRow(task({ id: "st_42" }), {}, { detailPage: true });
+    fireEvent.contextMenu(screen.getByTestId("task-row-open"));
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("does not open while the row is busy", () => {
+    renderRow(task(), { busy: true });
+    fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"));
+    expect(screen.queryByTestId("task-run-now")).toBeNull();
   });
 });

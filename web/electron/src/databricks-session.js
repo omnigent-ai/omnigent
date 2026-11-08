@@ -10,6 +10,8 @@
 
 "use strict";
 
+const { diagnostics } = require("./diagnostics");
+
 const { net } = require("electron");
 const {
   runInteractiveLogin,
@@ -300,6 +302,12 @@ async function mintSessionCookie(
         const id =
           response.headers?.["x-databricks-request-id"] ?? response.headers?.["x-request-id"];
         if (typeof id === "string" && /^[a-zA-Z0-9._:-]{1,128}$/.test(id)) requestId = id;
+        diagnostics.record("databricks_bridge", {
+          origin,
+          phase: phase === "session-create" ? "session_create" : "workspace_landing",
+          status: response.statusCode,
+          requestId,
+        });
         console.log("[omnigent] databricks session: bridge response", {
           origin,
           phase,
@@ -378,6 +386,7 @@ async function mintSessionCookie(
     if (!minted) {
       throw new Error(`${SESSION_CREATE_PATH}: no new DBAUTH cookie stored`);
     }
+    diagnostics.record("databricks_session", { origin, outcome: "signed_in" });
     console.log(`[omnigent] databricks session: signed in to ${origin}`);
   } finally {
     ses.cookies.removeListener("changed", onCookieChanged);

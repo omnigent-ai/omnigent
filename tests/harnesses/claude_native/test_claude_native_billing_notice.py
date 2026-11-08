@@ -29,6 +29,7 @@ https://code.claude.com/docs/en/auto-mode-classifier-billing
 Enter to continue · Esc to cancel
 """
 _NOTICE = f"Earlier tool output\n{_RULE}\n{_BODY}"
+_CONSENT = _NOTICE.replace("Enter to continue · Esc to cancel", "y to continue · n to cancel")
 _COMPOSER = f"{_RULE}\n❯ draft message\n{_RULE}\n? for shortcuts\n"
 _PERMISSION = f"{_RULE}\nDo you want to run this command?\nEnter to select · Esc to cancel\n"
 
@@ -108,6 +109,52 @@ def test_notice_matches_wrapped_text_and_gateway(width: int, gateway: str) -> No
 )
 def test_other_surfaces_and_transcript_quotes_do_not_match(pane: str) -> None:
     assert not bridge.auto_mode_billing_notice_visible(pane)
+
+
+@pytest.mark.parametrize("width", [25, 80, 160])
+def test_billing_consent_is_pending_instead_of_an_informational_notice(width: int) -> None:
+    pane = f"{_RULE}\n{textwrap.fill(_CONSENT.split(_RULE, 1)[1], width=width)}\n"
+    assert bridge._user_prompt_visible(pane)
+    assert not bridge.auto_mode_billing_notice_visible(pane)
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _NOTICE,
+        _CONSENT.replace(_RULE, ""),
+        _CONSENT.replace("billed as before", "billed at a new rate"),
+        _CONSENT.replace("https://code.claude.com/docs/en/auto-mode-classifier-billing", ""),
+        _CONSENT.replace("y to continue · n to cancel", "y to approve · n to cancel"),
+        _CONSENT + _COMPOSER,
+        f"{_RULE}\nAn unrelated choice\ny to continue · n to cancel\n",
+    ],
+)
+def test_billing_consent_requires_the_exact_live_prompt(pane: str) -> None:
+    assert not bridge._user_prompt_visible(pane)
+
+
+@pytest.mark.parametrize("operation", ["message", "slash-command", "permission-mode", "readiness"])
+def test_billing_consent_refuses_input_without_answering(
+    monkeypatch: pytest.MonkeyPatch, bridge_dir: Path, clock: _Clock, operation: str
+) -> None:
+    sends = _terminal(monkeypatch, [_CONSENT])
+    with pytest.raises(bridge.ClaudeUserPromptPending) as caught:
+        if operation == "message":
+            bridge.inject_user_message(bridge_dir, content="Keep the original request")
+        elif operation == "slash-command":
+            bridge.inject_slash_command(bridge_dir, command="/compact")
+        elif operation == "permission-mode":
+            bridge.set_permission_mode(bridge_dir, mode="auto")
+        else:
+            bridge._wait_for_claude_prompt_ready("/tmp/test.sock", "claude:0.0", timeout_s=30)
+    assert "billing choice" in str(caught.value)
+    assert "Open the terminal" in str(caught.value)
+    assert "resend your message" in str(caught.value)
+    assert bridge.has_pending_user_prompt(bridge_dir)
+    assert not bridge.acknowledge_auto_mode_billing_notice(bridge_dir)
+    sends.assert_not_called()
+    assert clock.now < 1
 
 
 def test_acknowledges_notice_once_then_leaves_draft_untouched(
@@ -379,6 +426,7 @@ def test_permission_mode_change_acknowledges_notice_before_or_during_switch(
 
     monkeypatch.setattr(bridge, "_capture_pane", capture)
     monkeypatch.setattr(bridge, "_run_tmux", send)
+    monkeypatch.setattr(bridge, "_claude_pane_state", lambda *_: bridge._ClaudePaneState(True))
     assert bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0) == "auto"
     assert keys.count("BTab") == 1
     assert keys.count("Enter") >= 1

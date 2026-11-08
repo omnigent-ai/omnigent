@@ -15,6 +15,7 @@ from omnigent.runner.app import _build_spawn_env_from_spec
 from omnigent.runtime import get_agent_cache, get_agent_store, get_conversation_store
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
+from tests._helpers.providers import isolate_provider_resolution
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -29,9 +30,7 @@ _UNLISTED = "another-model"
 @pytest.fixture(autouse=True)
 def _isolated_provider_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Use synthetic provider configuration without ambient credentials or network discovery."""
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     providers: dict[str, Any] = {}
     for name, default, alternate in (
         ("curated", _DEFAULT, _ALTERNATE),
@@ -346,6 +345,23 @@ async def test_invalid_default_rejects_multipart_create_before_persistence(
     response = await client.post(
         "/v1/sessions",
         data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert response.status_code == 400, response.text
+    assert "configured model list" in response.text
+    assert {conv.id for conv in store.list_conversations().data} == before_ids
+
+
+async def test_unlisted_override_rejects_multipart_create_before_persistence(
+    client: httpx.AsyncClient,
+) -> None:
+    """A multipart create checks ``model_override`` against the ACP list, as JSON creates do."""
+    bundle = build_agent_bundle("listed-acp", executor=_executor(), include_llm=False)
+    store = get_conversation_store()
+    before_ids = {conv.id for conv in store.list_conversations().data}
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": '{"model_override": "' + _UNLISTED + '"}'},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     assert response.status_code == 400, response.text

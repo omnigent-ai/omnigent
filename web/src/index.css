@@ -16,6 +16,30 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
+/* Native shells and browsers whose primary input is touch share this layout. */
+@custom-variant mobile-app {
+  &:where([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    @slot;
+  }
+  @media (pointer: coarse) and (hover: none) {
+    @slot;
+  }
+}
+
+/* CSS-pixel floor for native shells and touch browsers, independent of width. */
+@utility mobile-touch-target {
+  &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  /* Match the native branch's specificity so row resets like min-h-0 can't win. */
+  @media (pointer: coarse) and (hover: none) {
+    &:is(:root, :root *) {
+      min-width: 44px;
+      min-height: 44px;
+    }
+  }
+}
 
 @theme inline {
   --font-heading: var(--font-sans);
@@ -82,9 +106,11 @@
   --color-secondary: var(--secondary);
   --color-primary-foreground: var(--primary-foreground);
   --color-primary: var(--primary);
+  --color-primary-cta-foreground: var(--primary-cta-foreground);
+  --color-primary-cta: var(--primary-cta);
   --color-link: var(--link);
   --color-popover-foreground: var(--popover-foreground);
-  --color-popover: var(--popover);
+  --color-popover: var(--overlay-surface-bg, var(--popover));
   --color-card-foreground: var(--card-foreground);
   --color-card: var(--card);
   /* Opaque form of --card, for card surfaces that must fully hide
@@ -117,18 +143,20 @@
   --shadow-dialog: 0 16px 48px rgb(var(--ui-shadow-neutral-rgb) / 0.2);
 }
 
-/* The two body text steps. Keep these non-inline: `@theme inline` bakes the
- * literal value into each utility, which would make the runtime typography
- * mapping below a no-op. Line heights are unitless so both tiers keep their
- * 1.6 rhythm at every size the Appearance setting allows. */
+/* Keep these non-inline: `@theme inline` bakes values into utilities and
+ * bypasses the runtime typography mapping. Unitless line heights scale with
+ * font size: 1.8 for body text and 1.4 for captions. */
 @theme {
   /* App-default interface/body text — every control, label, and menu item. */
+  --font-weight-normal: 450;
   --text-ui: 1rem;
-  --text-ui--line-height: 1.6;
-  /* Caption tier: captions, descriptions, sub/group titles. Always 0.9 of the
-   * body step, mapped below so it tracks the Appearance setting. */
-  --text-sm: 0.9rem;
-  --text-sm--line-height: 1.6;
+  --text-ui--line-height: 1.8;
+  --text-message: var(--text-ui);
+  --text-message--line-height: 1.8;
+  /* Captions, descriptions, and sub/group titles stay 1px below body text
+   * as the Appearance font size changes. */
+  --text-sm: calc(var(--text-ui) - 1px);
+  --text-sm--line-height: 1.4;
   /* `text-xs` is retired in favour of `text-sm`. Aliased rather than left on
    * Tailwind's 0.75rem, which against the fixed 16px root is a hard 12px that
    * ignores the Appearance setting — the same trap the ramp test guards. Keeps
@@ -137,16 +165,11 @@
   --text-xs--line-height: var(--text-sm--line-height);
 }
 
-/* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —
- * ~#007AFF light, ~#0A84FF dark). Reserved for focus rings, charts,
- * unread state, and the active sidebar highlight; surfaces and primary
- * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
- * describes the older cobalt direction). */
 :root {
   /* User-controlled UI font size (see Appearance settings /
    * lib/uiFontPreferences.ts). Stored as a discrete px value and overridden at
    * runtime on documentElement. It feeds typography tokens only. */
-  --desktop-ui-font-size: 13px;
+  --desktop-ui-font-size: 14px;
   --icon-size-default: 14px;
   --icon-container-default: 16px;
   --ui-shadow-neutral-rgb: 0 0 0;
@@ -158,6 +181,9 @@
   --onboarding-modal-shadow: 0 24px 80px 8px #00000012;
   --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 12%);
   --composer-shadow-focus: 0 0 20px -6px rgb(0 0 0 / 12%);
+  --composer-header-bg: color-mix(in srgb, var(--background) 94%, black);
+  --primary-cta: #11171c;
+  --primary-cta-foreground: #fff;
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -192,7 +218,7 @@
    * that already clears the header also clears the switcher — its size is
    * tracked here for symmetry/introspection but is intentionally NOT added to
    * the content top inset to avoid double-counting the header band. */
-  --omnigent-header-height: 3.5rem; /* web ChatHeader (h-14) */
+  --omnigent-header-height: 3.5rem; /* Default content clearance. */
   --omnigent-safe-top: max(
     env(safe-area-inset-top, 0px),
     var(--omnigent-android-safe-area-top, 0px)
@@ -262,6 +288,28 @@
 }
 
 .dark {
+  --app-shell-bg: var(--background);
+  --session-composer-mask-bg: var(--app-shell-bg);
+  --foreground-tertiary: rgb(245 245 244 / 24%);
+  --sidebar-surface-image:
+    linear-gradient(transparent 35%, rgb(255 255 255 / 6%)),
+    linear-gradient(135deg, rgb(255 255 255 / 4%), transparent 60%);
+  --composer-header-bg: color-mix(in srgb, var(--app-shell-bg) 97%, white);
+  --composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white);
+  --primary-cta: #e8ecf0;
+  --primary-cta-foreground: #11171c;
+  /* Dialogs and menus share a raised variant of the app background. */
+  --overlay-surface-bg: var(--composer-surface-bg);
+  --card-surface-bg: color-mix(
+    in srgb,
+    color-mix(in srgb, var(--card) 95%, white) 75%,
+    transparent
+  );
+  --menu-surface-border: rgb(255 255 255 / 8%);
+  --menu-surface-backdrop-filter: blur(24px) saturate(120%);
+  --segmented-active-bg: rgb(255 255 255 / 12%);
+  --segmented-inactive-bg: transparent;
+  --segmented-trough-bg: rgb(255 255 255 / 6%);
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 0 0 0;
   --onboarding-wizard-background: #131315;
@@ -346,7 +394,7 @@
   gap: 8px;
   border-radius: 8px;
   padding: 2px 6px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -355,7 +403,7 @@
   gap: 4px;
   border-radius: 8px;
   padding: 4px 12px 4px 8px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -391,7 +439,7 @@
   gap: 8px;
   border-radius: 8px;
   padding: 4px 12px 4px 8px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -451,46 +499,292 @@
   min-height: 28px;
 }
 
+/* Density rules above are unlayered, so opted-in app targets need the same cascade priority. */
+:is(.composer-add-menu, .composer-host-menu, .composer-agent-menu) .mobile-touch-target {
+  @apply mobile-touch-target;
+}
+
+@media (width < 48rem) {
+  .composer-add-menu [role="menuitem"].mobile-touch-target {
+    @apply h-7 rounded-md px-2 py-[3px] text-ui leading-4;
+    min-height: 28px;
+    @apply mobile-touch-target;
+  }
+
+  .composer-add-menu [role="menuitem"] svg {
+    width: 16px;
+    height: 16px;
+  }
+}
+
 .composer-agent-menu [role="menuitem"] > svg:last-child {
   margin-left: 0;
 }
 
 .composer-reference-surface {
   border-color: color(srgb 0.129412 0 0.0509804 / 0.1);
-  background-color: rgba(255, 255, 255, 0.8);
+  background-color: color-mix(in srgb, white 80%, var(--background));
   background-image: none;
 }
 
 .dark .composer-reference-surface {
   border-width: 0.5px;
   border-color: color(srgb 0.960784 0.960784 0.956863 / 0.04);
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: var(--composer-surface-bg);
 }
 
-/* --background is the opaque palette canvas; flatten tints over it to mask the stack. */
-.composer-workspace-surface {
-  background:
-    linear-gradient(
-      color-mix(in oklch, var(--muted) 70%, transparent),
-      color-mix(in oklch, var(--muted) 70%, transparent)
-    ),
-    var(--background);
+@media (width < 48rem) {
+  [data-mobile-composer] {
+    --composer-compact-start: 8px;
+    --composer-compact-end: 8px;
+    --composer-morph-duration: 280ms;
+    --composer-morph-easing: cubic-bezier(0.22, 1, 0.36, 1);
+    transition:
+      border-radius var(--composer-morph-duration) var(--composer-morph-easing),
+      box-shadow 150ms ease;
+
+    > [aria-hidden="true"] > .glass-surface {
+      transition:
+        border-radius var(--composer-morph-duration) var(--composer-morph-easing),
+        opacity 260ms ease-out;
+    }
+
+    > .px-3 {
+      padding-inline: 8px;
+    }
+
+    > .mx-3 {
+      margin-inline: 8px;
+    }
+
+    svg:not(.glass-surface *) {
+      width: 20px !important;
+      height: 20px !important;
+      padding: 0;
+    }
+
+    [data-composer-action="microphone"] > span[aria-hidden="true"] {
+      width: 20px;
+      height: 20px;
+    }
+
+    &:has([data-composer-action="add"]) {
+      --composer-compact-start: 56px;
+    }
+
+    &:has([data-composer-action="send"], [data-composer-action="microphone"]) {
+      --composer-compact-end: 56px;
+    }
+
+    &:has([data-composer-action="send"]):has([data-composer-action="microphone"]) {
+      --composer-compact-end: 104px;
+    }
+
+    > [data-composer-input-area] {
+      min-height: 0;
+      padding: 16px 16px 8px;
+      margin-bottom: 0;
+      transition:
+        margin-bottom var(--composer-morph-duration) var(--composer-morph-easing),
+        padding var(--composer-morph-duration) var(--composer-morph-easing);
+    }
+
+    > [data-composer-input-area] > textarea {
+      display: block;
+      min-height: 1lh;
+    }
+
+    > [data-composer-actions] {
+      min-height: 60px;
+      flex-wrap: wrap;
+      padding-block: 8px;
+    }
+
+    [data-composer-action-group="left"] {
+      flex: 1 1 0;
+      flex-wrap: wrap;
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      [data-composer-action-group="left"]
+        > :not([data-composer-action="add"], :has([data-composer-action="add"])),
+      [data-composer-action-group="right"]
+        > :not(
+          [data-composer-action="microphone"],
+          [data-composer-action="send"],
+          :has([data-composer-action="microphone"], [data-composer-action="send"])
+        ) {
+        animation: mobile-composer-controls-enter 220ms var(--composer-morph-easing) 60ms backwards;
+      }
+    }
+
+    [data-composer-action]:is(
+      [data-composer-action="add"],
+      [data-composer-action="microphone"],
+      [data-composer-action="send"],
+      [data-composer-action="permission"]
+    ) {
+      width: 44px;
+      min-width: 44px;
+      height: 44px;
+      min-height: 44px;
+      border-radius: 100%;
+    }
+
+    [data-composer-action="permission"] {
+      gap: 0;
+      padding: 0;
+    }
+
+    [data-composer-permission-label],
+    [data-composer-action="permission"] > svg:last-child {
+      display: none;
+    }
+
+    &[data-composer-hint-placeholder] > [data-composer-input-area] > textarea::placeholder {
+      color: transparent;
+    }
+
+    /* Add opens independently of the compact input layout. */
+    &[data-mobile-composer="collapsed"]:not(
+        :has([data-state="open"]:not([data-composer-action="add"]))
+      ) {
+      border-radius: 30px;
+
+      > [aria-hidden="true"] > .glass-surface {
+        border-radius: 30px !important;
+      }
+
+      > [data-composer-input-area] {
+        z-index: 1;
+        margin-bottom: -60px;
+        padding-block: calc((60px - 1lh) / 2);
+        padding-inline: var(--composer-compact-start) var(--composer-compact-end);
+        pointer-events: none;
+      }
+
+      > [data-composer-input-area] > textarea {
+        min-height: 1lh;
+        height: 1lh !important;
+        overflow: hidden;
+        white-space: nowrap;
+        pointer-events: auto;
+      }
+
+      > [data-composer-input-area] > :not(textarea) {
+        visibility: hidden;
+      }
+
+      > [data-composer-input-area] > textarea::placeholder {
+        color: var(--muted-foreground);
+      }
+
+      [data-composer-action-group="left"] {
+        flex: none;
+      }
+
+      [data-composer-action-group="left"]
+        > :not([data-composer-action="add"], :has([data-composer-action="add"])) {
+        display: none;
+      }
+
+      [data-composer-action-group="right"]
+        > :not(
+          [data-composer-action="microphone"],
+          [data-composer-action="send"],
+          :has([data-composer-action="microphone"], [data-composer-action="send"])
+        ) {
+        display: none;
+      }
+    }
+  }
 }
 
-/* Preserve the translucent dark tray while matching the mock's single warm
-   surface across queued rows and workspace metadata in light themes. */
+@keyframes mobile-composer-controls-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (width < 48rem) and (prefers-reduced-motion: reduce) {
+  [data-mobile-composer],
+  [data-mobile-composer] > [aria-hidden="true"] > .glass-surface,
+  [data-mobile-composer] > [data-composer-input-area] {
+    transition: none;
+  }
+}
+
+.composer-context-bar {
+  position: relative;
+  z-index: 20;
+  width: calc(100% - 24px);
+  margin-inline: 12px;
+  margin-bottom: -0.5px;
+  padding: var(--composer-context-padding-block, 6px) 8px;
+  background-color: var(--composer-header-bg);
+  border: 0.5px solid color-mix(in srgb, var(--foreground) 2%, transparent);
+  border-bottom: none;
+  border-radius: 16px 16px 0 0;
+}
+
+.composer-context-bar.rounded-t-none {
+  border-top-width: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+@media (width < 48rem) {
+  .new-chat-workspace-controls .composer-context-bar {
+    width: auto;
+    max-width: 100%;
+    height: auto;
+    min-height: 44px;
+    margin: 0;
+    padding: 0 0.5rem;
+    flex-wrap: wrap;
+    background: transparent;
+    border: 0;
+    border-radius: 20px;
+  }
+
+  .new-chat-workspace-controls .composer-context-bar > * {
+    max-width: 100%;
+  }
+
+  .new-chat-workspace-controls .composer-context-bar button {
+    min-height: 44px;
+    height: auto;
+    max-width: 100%;
+    justify-content: flex-start;
+    gap: 0.5rem;
+    padding: 0.5rem 0.25rem;
+    font-size: var(--text-ui);
+    line-height: var(--text-ui--line-height);
+    color: var(--muted-foreground);
+  }
+
+  .new-chat-workspace-controls .composer-context-bar button:hover {
+    background-color: transparent;
+    color: var(--foreground);
+  }
+}
+
+/* Queued rows and workspace metadata form one continuous composer surface. */
 .composer-queued-surface {
-  background-color: color-mix(in oklab, var(--tray) 40%, transparent);
+  background-color: var(--composer-header-bg);
+  background-image: none;
 }
 
-:root:not(.dark) .composer-workspace-surface,
-:root:not(.dark) .composer-queued-surface {
-  background:
-    linear-gradient(
-      color-mix(in oklch, var(--muted) 85%, transparent),
-      color-mix(in oklch, var(--muted) 85%, transparent)
-    ),
-    var(--background);
+@media (width < 48rem) {
+  .composer-queued-surface {
+    --icon-container-default: 20px;
+  }
 }
 
 .composer-subagent-surface {
@@ -512,6 +806,11 @@
     color-mix(in oklch, var(--brand-accent) 8%, transparent),
     transparent 70%
   );
+}
+
+/* Only the active grid pane keeps the glow. */
+[data-grid-session][data-active="false"] .side-chat-backdrop {
+  background: none;
 }
 
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
@@ -545,6 +844,88 @@
   padding: 0;
 }
 
+/* Keep glass readable when the browser cannot diffuse the content behind it. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .omni-glass-surface {
+    --omni-glass-background: var(--card-solid);
+  }
+}
+
+/* Mobile icon controls change the glyph's opacity while the surface stays still. */
+@media (width < 48rem) {
+  [data-slot="button"][data-size^="icon"],
+  [data-mobile-icon-button] {
+    --mobile-icon-button-background: transparent;
+    --mobile-icon-button-foreground: var(--foreground);
+    --mobile-icon-button-border: transparent;
+    background-color: var(--mobile-icon-button-background) !important;
+    color: var(--mobile-icon-button-foreground) !important;
+    border-color: var(--mobile-icon-button-border) !important;
+    outline: none !important;
+    box-shadow: none !important;
+
+    &:focus-visible {
+      outline: 2px solid var(--ring) !important;
+      outline-offset: 2px;
+    }
+
+    &[data-variant="default"] {
+      --mobile-icon-button-background: var(--primary-cta);
+      --mobile-icon-button-foreground: var(--primary-cta-foreground);
+    }
+
+    &[data-variant="default"]:disabled {
+      --mobile-icon-button-background: var(--muted);
+      --mobile-icon-button-foreground: var(--muted-foreground);
+    }
+
+    &[data-variant="secondary"] {
+      --mobile-icon-button-background: var(--secondary);
+      --mobile-icon-button-foreground: var(--secondary-foreground);
+    }
+
+    &[data-variant="outline"] {
+      --mobile-icon-button-background: var(--background);
+      --mobile-icon-button-border: var(--border);
+
+      .dark & {
+        --mobile-icon-button-background: var(--input);
+        --mobile-icon-button-border: var(--input);
+      }
+    }
+
+    &[data-variant="destructive"] {
+      --mobile-icon-button-background: color-mix(in srgb, var(--destructive) 10%, transparent);
+      --mobile-icon-button-foreground: var(--destructive);
+
+      .dark & {
+        --mobile-icon-button-background: color-mix(in srgb, var(--destructive) 20%, transparent);
+      }
+    }
+
+    &:not(:disabled, [aria-disabled="true"]):is(:hover, :focus, :active) {
+      opacity: 1 !important;
+    }
+
+    :is(svg, img):not(.glass-surface *) {
+      opacity: 0.7;
+      transition: opacity 150ms ease;
+    }
+
+    &:not(:disabled, [aria-disabled="true"]):is(
+        :hover,
+        :focus,
+        :active,
+        [aria-expanded="true"],
+        [aria-pressed="true"],
+        [data-state="open"]
+      )
+      :is(svg, img):not(.glass-surface *) {
+      opacity: 1;
+    }
+  }
+}
+
 /* The desktop workspace rail stays mounted through its exit so its content
    can fade and slide as one stable sibling of the session surface. */
 .workspace-panel-motion {
@@ -557,9 +938,9 @@
 
 .workspace-panel-motion[data-animate-visibility] {
   transition:
-    width 300ms ease-in-out,
-    opacity 300ms ease-in-out,
-    transform 300ms ease-in-out;
+    width 200ms ease-in-out,
+    opacity 200ms ease-in-out,
+    transform 200ms ease-in-out;
 }
 
 .workspace-panel-motion[data-state="open"] {
@@ -573,11 +954,46 @@
 }
 
 [data-workspace-panel-animate] .chat-header {
-  transition: right 300ms ease-in-out;
+  transition: right 200ms ease-in-out;
+}
+
+/* Sidebars keep their short open/close slide under reduced motion: without it
+   the whole layout jumps a sidebar's width at once. */
+@media (width >= 48rem) and (prefers-reduced-motion: reduce) {
+  .workspace-panel-motion[data-animate-visibility],
+  [data-workspace-panel-animate] .chat-header,
+  .conversations-sidebar[data-sidebar-motion] {
+    transition-duration: 200ms !important;
+  }
 }
 
 [data-workspace-panel-resizing] .chat-header {
   transition: none;
+}
+
+.session-header-glass {
+  isolation: isolate;
+}
+
+.session-header-glass::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0 0 -12px;
+  background: linear-gradient(135deg, rgb(255 255 255 / 48%), rgb(255 255 255 / 22%));
+  -webkit-backdrop-filter: blur(28px) saturate(145%);
+  backdrop-filter: blur(28px) saturate(145%);
+  -webkit-mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+  mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+  pointer-events: none;
+  content: "";
+}
+
+.dark .session-header-glass::before {
+  background: linear-gradient(
+    135deg,
+    rgb(255 255 255 / 6%),
+    color-mix(in srgb, var(--app-shell-bg) 42%, transparent) 60%
+  );
 }
 
 @starting-style {
@@ -590,60 +1006,87 @@
 
 /* The transparent <main> shows the palette canvas through. */
 .app-shell {
-  background: var(--background);
+  background: var(--shell-background, var(--background));
+}
+
+:root:not(.dark) .conversations-sidebar {
+  background: var(--sidebar-background, var(--sidebar));
+}
+
+.dark .app-shell {
+  --sidebar-edge-border: color-mix(in srgb, var(--foreground) 4%, transparent);
+
+  background-color: var(--app-shell-bg) !important;
+  background-image: url("./assets/omnigent-center-glow.svg") !important;
+  background-position: right center;
+  background-repeat: no-repeat;
+  background-size: calc(100% - var(--app-sidebar-width, 0px)) 100%;
+}
+
+.dark .omnigent-native-sidebar-surface,
+.dark .omnigent-sidebar-panel {
+  background-color: var(--sidebar);
+  background-image: var(--sidebar-surface-image);
+  background-position: 0 0;
+  background-size: auto;
+  background-clip: padding-box;
 }
 
 /* A desktop peek floats over the chat instead of pushing it aside, so its
- * gradient layers need an opaque base rather than the translucent card color. */
-:root:not(.dark):not([data-theme]) .conversations-sidebar.is-peek,
-:root:not(.dark)[data-theme] .conversations-sidebar.is-peek,
-.dark:not([data-theme]) .conversations-sidebar.is-peek,
-.dark[data-theme] .conversations-sidebar.is-peek {
+ * gradient needs an opaque base rather than a translucent palette color. */
+:root:not([data-theme]) .conversations-sidebar.is-peek,
+:root[data-theme] .conversations-sidebar.is-peek {
   background-color: var(--card-solid);
 }
 
 /* Edge treatment is mode-specific but palette-independent. */
 html:not(.dark) .conversations-sidebar:not(.is-peek) {
   border-right: none;
-  box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
+  box-shadow: inset -4px 0 6px -4px rgb(0 0 0 / 5%);
 }
 .dark .conversations-sidebar {
-  border-right: 1px solid rgb(255 255 255 / 2%);
-  box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
+  border-right: 1px solid var(--sidebar-edge-border);
+  box-shadow: inset -4px 0 6px -4px rgb(0 0 0 / 5%);
 }
 
-/* Below md the sidebar is a full-screen overlay ON TOP of the chat, so it has
- * to be opaque — the rules above set `background` as a shorthand, which resets
- * background-color and would otherwise let the conversation show through the
- * translucent layers. Restores what Sidebar.tsx's max-md:bg-card-solid does on
- * desktop. Above md the sidebar pushes content aside instead of covering it,
- * so it keeps its translucent canvas there. */
+.dark .workspace-panel-motion {
+  --workspace-panel-border: rgb(255 255 255 / 8%);
+
+  border-left-color: var(--workspace-panel-border);
+}
+
+.dark .workspace-panel-motion .workspace-tab-strip {
+  border-bottom-color: var(--workspace-panel-border);
+}
+
+.dark .workspace-panel-motion .workspace-panel-header-divider {
+  border-color: var(--workspace-panel-border);
+}
+
+/* Mobile drawers use the shared glass layer behind their content. */
 @media (width < 48rem) {
-  :root:not(.dark):not([data-theme]) .conversations-sidebar,
-  :root:not(.dark)[data-theme] .conversations-sidebar,
-  .dark:not([data-theme]) .conversations-sidebar,
-  .dark[data-theme] .conversations-sidebar {
-    background-color: var(--card-solid);
+  :root:not(.dark) .sidebar-glass-surface {
+    --omni-glass-blur: 16px;
+    --omni-glass-brightness: 1;
+  }
+
+  .conversations-sidebar {
+    margin-top: -1px;
+    margin-bottom: -1px;
+    isolation: isolate;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
   }
 }
 
-/* Fade scrolling content before it reaches the transparent header or composer.
- * Both ramps are 32px; the header's control band occupies the first 48px. */
+/* Let conversation content scroll behind the glass header, then fade it into
+ * the composer at the bottom. */
 .chat-scroll-fade {
-  mask-image: linear-gradient(
-    to bottom,
-    transparent 48px,
-    black 80px,
-    black calc(100% - 32px),
-    transparent 100%
-  );
-  -webkit-mask-image: linear-gradient(
-    to bottom,
-    transparent 48px,
-    black 80px,
-    black calc(100% - 32px),
-    transparent 100%
-  );
+  mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
 }
 
 /* A pinned plan already clears the header, so only fade into the composer. */
@@ -652,10 +1095,30 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
 }
 
+@media (width < 48rem) {
+  .session-chat-transcript > [role="log"] {
+    --chat-edge-fade: linear-gradient(
+      to bottom,
+      transparent 0,
+      black max(64px, var(--omnigent-safe-top)),
+      black calc(100% - max(64px, var(--omnigent-safe-bottom))),
+      transparent 100%
+    );
+    -webkit-mask-image: var(--chat-edge-fade);
+    mask-image: var(--chat-edge-fade);
+  }
+
+  [data-chat-surface] .session-chat-transcript {
+    margin-bottom: calc(-1 * var(--session-composer-height, 0px));
+  }
+
+  [data-chat-surface] .chat-conversation-content {
+    padding-bottom: calc(var(--session-composer-height, 0px) + 1.5rem);
+  }
+}
+
 /* Snap target for the "Worked for" fold row (scrollIntoView block:"start").
- * Must land BELOW the fade above: the mask is fully opaque only from 80px,
- * so a smaller margin parks the row in the transparent band — scrolled
- * "to the top" yet invisible. Kept next to the fade so they can't desync. */
+ * Keep it below the overlaid glass header after programmatic navigation. */
 .turn-fold-row {
   scroll-margin-top: 88px;
 }
@@ -681,11 +1144,7 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   );
 }
 
-/* Elevated surfaces — frosted glass effect with backdrop blur.
- * Targets top-level cards only. A bg-card nested inside another bg-card
- * (e.g. FilesPanel inside the workspace panel, toolbars inside the
- * composer) is an interior fill, and re-decorating it with its own
- * border/shadow visually carves the parent card into pieces.
+/* Elevated surfaces — one palette-aware frosted treatment for every bg-card.
  * :not([data-collapsed]) skips closed rails/drawers/sidebars: they
  * collapse to w-0 with their utility borders removed, but this rule's
  * border+shadow would still paint them as a thin glowing strip along the
@@ -697,23 +1156,15 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
  * Both rails (Workspace, Conversations) are excluded — they paint their own
  * canvas layers above, not a glass card. */
 .dark
-  :is(.bg-card, [class*="md:bg-card"]):not(
-    :is(.bg-card, [class*="md:bg-card"]) :is(.bg-card, [class*="md:bg-card"])
-  ):not([data-collapsed]):not([aria-label="Workspace"]):not([aria-label="Conversations"]) {
+  :is(.bg-card, [class*="md:bg-card"]):not([data-collapsed]):not([aria-label="Workspace"]):not(
+    [aria-label="Conversations"]
+  ) {
   /* -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
    * build) collapses the pair and keeps only the last declaration. */
-  -webkit-backdrop-filter: blur(32px) saturate(180%) !important;
-  backdrop-filter: blur(32px) saturate(180%) !important;
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  border-top-color: rgba(255, 255, 255, 0.14);
-  background-image: linear-gradient(
-    135deg,
-    rgba(255, 255, 255, 0.04) 0%,
-    rgba(255, 255, 255, 0) 60%
-  );
-  box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.22),
-    0 1px 3px rgba(0, 0, 0, 0.16);
+  -webkit-backdrop-filter: var(--menu-surface-backdrop-filter) !important;
+  backdrop-filter: var(--menu-surface-backdrop-filter) !important;
+  background-color: var(--card-surface-bg);
+  border: 1px solid var(--menu-surface-border);
 }
 
 /* Side panels (FileViewer, TerminalsPanel, FilesPanelDrawer) manage their own
@@ -739,6 +1190,14 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   background: transparent !important;
 }
 
+/* The workspace rail owns the panel edge. Its full-height tab surfaces must
+ * not pick up a second border from the shared bg-card treatment. */
+.dark
+  aside[aria-label="Workspace"]
+  :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
+  border: none !important;
+}
+
 /* When maximized the workspace panel covers the full content area; use an
  * opaque background so the chat underneath doesn't bleed through. */
 aside[aria-label="Workspace"][data-maximized] {
@@ -750,20 +1209,61 @@ aside[aria-label="Workspace"][data-maximized] {
   pointer-events: none !important;
 }
 
+.dark [data-slot="dialog-content"] {
+  border: 1px solid var(--menu-surface-border);
+}
+
 /* Popovers/menus — same glass treatment */
 .dark [data-slot="popover-content"],
-.dark [data-slot="select-content"],
-.dark [role="menu"],
-.dark [data-radix-popper-content-wrapper] > * {
+.dark [data-slot="select-content"]:not(.menu-surface),
+.dark [role="menu"]:not(.menu-surface),
+.dark [data-radix-popper-content-wrapper] > :not(.menu-surface) {
   /* -webkit- before unprefixed — see comment on the bg-card rule above. */
   -webkit-backdrop-filter: blur(24px) saturate(150%) !important;
   backdrop-filter: blur(24px) saturate(150%) !important;
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-/* macOS Electron needs room for traffic lights and a window drag surface.
- * Mark <html> standalone, or .omnigent-app in the embed: its CSS build maps
- * html selectors to that scope root. */
+:root:not(.dark) .menu-surface {
+  background-color: var(--popover);
+  border: 1px solid rgb(0 0 0 / 8%);
+}
+
+.dark .menu-surface {
+  background-color: var(--overlay-surface-bg);
+  border: 1px solid var(--menu-surface-border);
+  -webkit-backdrop-filter: var(--menu-surface-backdrop-filter);
+  backdrop-filter: var(--menu-surface-backdrop-filter);
+}
+
+@media (width < 48rem) {
+  .mobile-menu-glass,
+  .mobile-menu-glass-layer,
+  .dark [data-radix-popper-content-wrapper] > :is(.mobile-menu-glass, .mobile-menu-glass-layer) {
+    isolation: isolate;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+  }
+
+  .mobile-menu-glass [data-slot="command"] {
+    background: transparent;
+  }
+
+  .dark .mobile-menu-glass-layer .omni-glass-surface {
+    --omni-glass-background: var(--overlay-surface-bg);
+  }
+}
+
+/* Native clearance uses window pixels, independent of rem and page zoom.
+ * The preload supplies zoom; older shells fall back to 100%.
+ * The embed build maps html selectors onto the .omnigent-app scope root. */
+html[data-electron-mac] {
+  --mac-titlebar-height: calc(48px / var(--omnigent-electron-zoom, 1));
+  --mac-traffic-light-width: calc(88px / var(--omnigent-electron-zoom, 1));
+}
 @media (min-width: 48rem) {
   /* Reserve the board's shared sidebar toggle only while navigation is closed. */
   .app-shell:not([data-sidebar-open]) .canvas-page-heading {
@@ -776,34 +1276,23 @@ aside[aria-label="Workspace"][data-maximized] {
    *
    * The sidebar starts at the window's top edge rather than below the lights, so
    * no band of empty canvas sits above it. The title-bar row itself is NOT the
-   * sidebar's header row: the window furniture (lights + the Search/Settings/
-   * toggle cluster) is owned by AppShell and positioned over this top strip, so
-   * it stays put when the sidebar collapses or peeks. What remains here is to
-   * strip the sidebar's now-redundant header chrome — its wordmark and its own
-   * copy of the cluster — and reclaim the empty row. */
+   * sidebar's header row: the window furniture (lights + the persistent action
+   * cluster) is owned by AppShell and positioned over this top strip, so
+   * it stays put when the sidebar collapses or peeks. The sidebar wordmark sits
+   * with Search in its normal-height row directly below that strip. */
   html[data-electron-mac] .conversations-sidebar {
     margin-top: 0;
   }
-  /* No brand mark on the desktop shell: the lights own the window's top-left.
-   * `display: none` rather than removing it from the JSX so the browser keeps
-   * the wordmark (and its click-to-home link) untouched. */
-  html[data-electron-mac] .sidebar-brand {
-    display: none;
-  }
-  /* The sidebar's own cluster is hidden here because an identical one renders in
-   * the title-bar strip (AppShell), where it survives the sidebar collapsing to
-   * w-0/inert and the peek card's inset-2 offset. Scoped to
-   * .conversations-sidebar so it can never match the AppShell copy. Hidden
-   * rather than removed from the JSX so every other platform keeps the
-   * in-sidebar cluster untouched. */
+  /* Hide the standard cluster: Search gets its own copy beside the wordmark,
+   * while Settings and the toggle render in AppShell's persistent title bar. */
   html[data-electron-mac] .conversations-sidebar [data-testid="sidebar-header-actions"] {
     display: none;
   }
-  /* Reserve the full drag strip so the session list starts below the
-   * window furniture and stays outside the drag region. */
+  /* Reserve the drag strip above the normal 3rem brand row so the wordmark and
+   * session list stay clear of the window furniture. */
   html[data-electron-mac] .sidebar-header-row {
-    height: 3rem;
-    padding: 0;
+    height: calc(var(--mac-titlebar-height) + 3rem);
+    padding: var(--mac-titlebar-height) 1rem 0;
   }
   /* The chat header's own open-sidebar button is redundant here: the title-bar
    * cluster's toggle is always present (collapsed included) and carries the same
@@ -813,42 +1302,41 @@ aside[aria-label="Workspace"][data-maximized] {
   html[data-electron-mac] .chat-header-sidebar-toggle {
     display: none;
   }
-  /* Float the peek card below the 3rem drag strip, with the same 0.5rem
+  /* Float the peek card below the 48px drag strip, with the same 0.5rem
    * breathing room as its other edges. The docked sidebar is unaffected. */
   html[data-electron-mac] .conversations-sidebar.is-peek {
-    top: 3.5rem;
+    top: calc(var(--mac-titlebar-height) + 0.5rem);
   }
   /* The peek card already clears the drag strip, so it needs no reserved
    * header row above its content. */
   html[data-electron-mac] .conversations-sidebar.is-peek .sidebar-header-row {
     display: none;
   }
-  /* The settings sidebar swaps the header row for a "Back" row, which would now
-   * sit under the traffic lights. Push it below them — it has no cluster to
-   * align beside the lights, so it clears them vertically instead. */
-  html[data-electron-mac] .settings-sidebar-header {
-    padding-top: 3.5rem;
-  }
+}
+/* The settings sidebar's "Back" row, docked or in the phone drawer, has no
+ * cluster to align beside the lights, so it clears them vertically instead. */
+html[data-electron-mac] .settings-sidebar-header {
+  padding-top: calc(var(--mac-titlebar-height) + 0.5rem);
 }
 /* Match the full desktop header; controls opt out of dragging below. */
 html[data-electron-mac] .electron-drag-strip {
   position: absolute;
   inset: 0 0 auto 0;
-  height: 3rem;
+  height: var(--mac-titlebar-height);
   -webkit-app-region: drag;
 }
 /* Canvas clears the native title bar, including focus
  * and compact conversation states where the board is hidden. */
-[data-electron-mac] .canvas-workspace {
-  margin-top: 3rem;
+html[data-electron-mac] .canvas-workspace {
+  margin-top: var(--mac-titlebar-height);
 }
-/* Pin the cluster beside the lights independently of the sidebar. The top
- * inset centers 1.5rem buttons in the 3rem bar; visually reorder the toggle
- * without changing the Search → Settings → toggle tab order. */
+/* Align to the native lights at y=24px, regardless of the host rem size.
+ * Keep the cluster independent of sidebar open, collapsed, and peek states. */
 html[data-electron-mac] .electron-sidebar-header-actions {
   position: absolute;
-  top: 0.75rem;
-  left: 5.5rem;
+  top: calc(var(--mac-titlebar-height) / 2);
+  left: var(--mac-traffic-light-width);
+  transform: translateY(-50%);
   /* Above the sidebar, which is a positioned sibling at z-index 50 with an
    * opaque gradient background — at any lower layer it paints straight over
    * this cluster (the buttons still measure correctly in the DOM, which is why
@@ -858,38 +1346,35 @@ html[data-electron-mac] .electron-sidebar-header-actions {
   display: flex;
   align-items: center;
 
-  /* Read Collapse · Search · Settings outward from the window controls: pull
-   * the cluster's last button (the toggle) to the front. */
+  /* Read Toggle · Search · Settings outward from the window controls when
+   * collapsed (Search is absent here while the sidebar is open). */
   & > * > *:last-child {
     order: -1;
   }
 }
-/* With the sidebar closed the chat header's left slot reaches the window
- * corner where the traffic lights float and the title-bar cluster
- * (Search/Settings/toggle) sits. Pad the slot past both (same 10.5rem the
- * maximized rail uses below) so the conversation breadcrumb starts to the
- * right of the Settings cog — it then truncates within the header flex and
- * never collides with the right-hand action cluster. Applied to the slot, not
- * the header bar, so that right cluster stays put. */
+/* Clear the fixed native-control area plus the font-relative action cluster
+ * when the collapsed sidebar exposes the chat header at the window edge. */
 html[data-electron-mac] .traffic-light-clearance {
-  padding-left: 10.5rem;
+  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
 }
-/* A maximized workspace rail breaks out to inset-0 (the left sidebar collapses
- * on entry), so its tab strip starts at the window's top-left corner — where
- * the traffic lights float (0–5rem) and the title-bar cluster sits (5rem–10rem,
- * z above the rail). Pad the strip past both so its leftmost tab icon clears
- * them. Only the maximized rail reaches this corner; the docked rail sits right
- * of the sidebar and is untouched.
- *
- * Skip the clearance when the sidebar is reopened over a maximized rail: the
- * sidebar (z above the rail) then covers the window corner, so the lights and
- * cluster sit over IT, not the strip — the strip starts right of the sidebar
- * with nothing to clear, and the padding would shove the tabs into the middle. */
+/* A maximized rail reaches the same window corner while the sidebar is closed.
+ * Once the sidebar opens, the rail starts to its right and needs no clearance. */
 html[data-electron-mac]
   .app-shell:not([data-sidebar-open])
   aside[aria-label="Workspace"][data-maximized]
   .workspace-tab-strip {
-  padding-left: 10.5rem;
+  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
+}
+/* Below md the phone header and drawer carry their own controls, so drop the
+ * title-bar cluster and start those headers right of the lights. */
+@media (width < 48rem) {
+  html[data-electron-mac] .electron-sidebar-header-actions {
+    display: none;
+  }
+  html[data-electron-mac] .traffic-light-clearance,
+  html[data-electron-mac] .sidebar-header-row {
+    padding-left: var(--mac-traffic-light-width);
+  }
 }
 /* Drag regions ignore z-order, so controls and overlays need counter-regions.
  * Scoped from <html> to cover portals outside AppShell on macOS only. */
@@ -971,9 +1456,10 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* Native shells render beneath the status bar at every width. Keep floating
- * chat controls and the pinned Plan tracker below its safe area. */
+ * chat controls and the pinned Plan tracker below its safe area. Wide headers
+ * have too little space around 44px controls to overlap the status-bar inset. */
 :is([data-ios-native], [data-android-native]) .chat-header {
-  top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  top: max(0px, calc(var(--omnigent-safe-top) - var(--omnigent-header-top-overlap, 0px)));
 }
 :is([data-ios-native], [data-android-native]) .chat-plan-accordion {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
@@ -1016,6 +1502,10 @@ html[data-electron-mac] .breadcrumb-folder {
 
 /* Remaining native-shell adjustments are specific to the mobile layout. */
 @media (width < 48rem) {
+  :is([data-ios-native], [data-android-native]) .chat-header {
+    --omnigent-header-top-overlap: 0.5rem;
+  }
+
   /* Slide animation for the mobile drawer. Covers BOTH paths that move the
      panel: the edge-swipe drag settles via an inline `transform`, while the
      button toggle (and the drag's resting open/closed state) is driven by
@@ -1119,7 +1609,7 @@ html[data-electron-mac] .breadcrumb-folder {
 
   [data-ios-native] .chat-composer-form,
   [data-android-native] .chat-composer-form {
-    padding-bottom: calc(0.75rem + var(--omnigent-safe-bottom));
+    padding-bottom: max(16px, var(--omnigent-safe-bottom));
   }
 }
 
@@ -1226,6 +1716,9 @@ html[data-electron-mac] .breadcrumb-folder {
      * documentElement by the Appearance setting / lib/uiFontPreferences.ts)
      * with the system stack as the fallback when it's unset. */
     font-family: var(--ui-font-family, var(--font-sans));
+    font-weight: var(--font-weight-normal);
+    letter-spacing: 0em;
+    -webkit-font-smoothing: antialiased;
     /* Keep the desktop rem grid fixed so font preferences cannot resize icons,
      * controls, spacing, or radii. Typography is mapped separately below. */
     font-size: 16px;
@@ -1252,14 +1745,12 @@ html[data-electron-mac] .breadcrumb-folder {
 @media (width >= 48rem) {
   :root {
     /* The step factors below are Tailwind's rem ratios against a 16px base, so
-     * they need the preference on that scale. Multiplying the raw 13px shrinks
-     * the ramp ~19%, dragging every `font-size: 1em` <code> down with it. */
-    --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 13));
-    /* Body and caption tiers come off the raw preference, not the anchor: the
-     * anchor is the 16px-equivalent grid the title ratios need, and running the
-     * caption factor through it put text-sm at 14.4px against a 13px body —
-     * a caption step larger than the text it captions. */
-    --text-sm: calc(var(--desktop-ui-font-size) * 0.9);
+     * they need the preference on that scale. The default 14px body maps to
+     * the 16px title grid without resizing the fixed rem layout. */
+    --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 14));
+    /* Body and caption sizes use the raw preference; the anchor is only
+     * for title ratios. Captions stay 1px below body text. */
+    --text-sm: calc(var(--desktop-ui-font-size) - 1px);
     --text-ui: var(--desktop-ui-font-size);
     --text-base: var(--desktop-ui-font-size);
     /* Title steps keep the anchor so each stays on its Tailwind ratio. */
@@ -1276,13 +1767,14 @@ html[data-electron-mac] .breadcrumb-folder {
 /* Mobile typography and sidebar geometry. The root remains at the global 16px
  * so rem-based controls and spacing keep the same scale across viewports. */
 @media (width < 48rem) {
-  /* Mobile defaults to 14px when no preference is saved. An inline value from
+  /* Mobile defaults to 15px when no preference is saved. An inline value from
    * the Appearance setting overrides this directly, without rescaling. */
   :root {
-    --desktop-ui-font-size: 14px;
+    --desktop-ui-font-size: 15px;
     --mobile-ui-font-size: var(--desktop-ui-font-size);
+    --omnigent-header-height: 76px;
     --ui-ramp-anchor: var(--mobile-ui-font-size);
-    --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
+    --text-sm: calc(var(--mobile-ui-font-size) - 1px);
     --text-ui: var(--mobile-ui-font-size);
     --text-base: var(--mobile-ui-font-size);
     --text-lg: calc(var(--ui-ramp-anchor) * 1.125);
@@ -1305,6 +1797,17 @@ html[data-electron-mac] .breadcrumb-folder {
     width: var(--sidebar-icon-size-mobile);
     height: var(--sidebar-icon-size-mobile);
     padding: 0;
+  }
+}
+
+.plain-text-fallback.text-message {
+  font-size: var(--text-sm);
+}
+
+/* Plain-text message fallbacks use the body tier on touch and narrow screens. */
+@media (width < 48rem), (pointer: coarse) {
+  .plain-text-fallback.text-message {
+    font-size: var(--text-message);
   }
 }
 
@@ -1346,6 +1849,15 @@ html[data-electron-mac] .breadcrumb-folder {
   --diffs-font-features: "liga" 0, "calt" 0;
 }
 
+/* Share one opaque comment surface so diff selection cannot tint the cards. */
+.pull-request-comment-surface {
+  background-color: var(--card-solid);
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--muted) 20%, transparent),
+    color-mix(in srgb, var(--muted) 20%, transparent)
+  );
+}
+
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
  * hide the native one so both don't show. */
 .transcript-hide-native-scrollbar {
@@ -1356,9 +1868,8 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* The virtualized transcript holds its own read position across history
- * prepends and in-flow changes above the list (Transcript.tsx). Its rows are
- * absolutely positioned, so native anchoring can't see them and would only
- * double-count the in-flow part. */
+ * prepends, row re-measures and changes above the list (Transcript.tsx), so
+ * native anchoring would double-count each of them. */
 [data-virtualized-transcript] {
   overflow-anchor: none;
 }
@@ -1382,6 +1893,10 @@ html[data-electron-mac] .breadcrumb-folder {
 [data-streamdown="table-cell"],
 [data-streamdown="table-header-cell"],
 [data-streamdown="heading-6"] {
+  font-size: 1em;
+}
+
+.text-message [data-streamdown="heading-5"] {
   font-size: 1em;
 }
 
@@ -1474,6 +1989,12 @@ html[data-electron-mac] .breadcrumb-folder {
   overflow-wrap: break-word;
 }
 
+/* Mermaid sizes each label box before the diagram joins the chat prose; an
+ * inherited `wrap-anywhere` re-wraps long words inside it and clips the extra lines. */
+[data-streamdown="mermaid-block"] svg {
+  overflow-wrap: normal;
+}
+
 /* KaTeX lays out radicals/fractions with positioned spans. Wide display math
  * gets its own horizontal scroll surface instead of relying on the surrounding
  * chat bubble to clip or wrap it. (No overflow-y override: with overflow-x
@@ -1515,9 +2036,24 @@ html[data-electron-mac] .breadcrumb-folder {
   margin-bottom: 0;
 }
 
-/* Prose stays readable on wide screens; tables and code use the full column. */
+/* Use the usable chat column so side panels and split views keep narrow prose. */
+.chat-conversation-content {
+  container: chat-column / inline-size;
+}
+
+.is-assistant {
+  --chat-prose-width: 80ch;
+}
+
+@container chat-column (min-width: 64rem) {
+  .is-assistant {
+    --chat-prose-width: 120ch;
+  }
+}
+
+/* Prose shares one limit in ordinary replies and replies with wide content. */
 .chat-markdown > :is(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6) {
-  max-width: 80ch;
+  max-width: var(--chat-prose-width, 80ch);
 }
 
 .chat-markdown :is(ul, ol) {
@@ -1789,19 +2325,9 @@ html[data-electron-mac] .breadcrumb-folder {
   animation: shimmer-sweep var(--shimmer-duration, 2s) linear infinite;
 }
 
-/* Otto working indicator: gentle bob + periodic blink (see OttoIcon.tsx).
+/* Otto working indicator: periodic blink (see OttoIcon.tsx).
  * Opt-in via .otto-working so the mascot can also render static. The global
- * reduced-motion gate below freezes both animations. */
-@keyframes otto-bob {
-  0%,
-  100% {
-    transform: translateY(5%);
-  }
-  50% {
-    transform: translateY(-5%);
-  }
-}
-
+ * reduced-motion gate below freezes the blink. */
 @keyframes otto-blink {
   0%,
   88%,
@@ -1812,10 +2338,6 @@ html[data-electron-mac] .breadcrumb-folder {
   92% {
     transform: scaleY(0.1);
   }
-}
-
-.otto-working {
-  animation: otto-bob 1.6s ease-in-out infinite;
 }
 
 .otto-working .otto-eye {
@@ -1838,14 +2360,16 @@ html[data-electron-mac] .breadcrumb-folder {
  * static-state declarations (class specificity beats * for those visible
  * properties); this universal rule collapses every other transition-* and
  * animate-* timer so users who request reduced motion don't see any
- * sweeping change we forgot to scope. */
+ * sweeping change we forgot to scope. Transitions get 0s, not a tiny
+ * duration: `transition-property` defaults to `all`, so any nonzero duration
+ * lands every style change on every element a frame late. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+    transition-duration: 0s !important;
     scroll-behavior: auto !important;
   }
 }
@@ -2177,11 +2701,18 @@ html[data-electron-mac] .breadcrumb-folder {
 .tiptap-md-content .ProseMirror a {
   color: var(--primary);
   text-decoration: underline;
+  cursor: pointer;
 }
 .tiptap-md-content .ProseMirror hr {
   border: none;
   border-top: 1px solid var(--border);
   margin: 1.5em 0;
+}
+/* Soft line breaks (TipTapSoftBreak.ts) hold a hard-wrapped paragraph's source
+   newlines; their collapsible space reads as a word gap instead of the line
+   break ProseMirror's break-spaces would draw. */
+.tiptap-md-content .ProseMirror .md-soft-break {
+  white-space: normal;
 }
 /* Raw-HTML passthrough blocks (TipTapHtmlPassthrough.ts). Hidden blocks
    (comments, bare wrapper tags) keep the bytes without visual presence;
@@ -2195,6 +2726,18 @@ html[data-electron-mac] .breadcrumb-folder {
   color: var(--muted-foreground);
   font-weight: 500;
   margin: 0.75em 0 0.25em;
+}
+/* Footnote definitions show their source, read-only (see TipTapFootnotes). */
+.tiptap-md-content .ProseMirror .md-footnote-definitions,
+.tiptap-md-content .ProseMirror .md-link-definitions {
+  color: var(--muted-foreground);
+  font-size: 0.875em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0.75em 0;
+}
+.tiptap-md-content .ProseMirror .md-footnote-reference {
+  color: var(--muted-foreground);
 }
 /* GitHub-style images: never overflow the editor column. Explicit <img
    width/height> are applied as inline styles by the node view (see
@@ -2300,12 +2843,16 @@ html[data-electron-mac] .breadcrumb-folder {
 @media (min-width: 48rem) {
   :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
     :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
-    background: var(--custom-light-sidebar);
+    background-color: var(--custom-light-sidebar);
+    background-image: none;
+    -webkit-backdrop-filter: blur(20px) saturate(1.12);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   .dark[data-theme="custom"][data-custom-translucent-sidebar]
     :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
-    background: var(--custom-dark-sidebar);
+    background-color: var(--sidebar);
+    background-image: var(--sidebar-surface-image);
+    -webkit-backdrop-filter: blur(20px) saturate(1.12);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   :root[data-theme="custom"][data-custom-translucent-sidebar]
@@ -2362,6 +2909,23 @@ html[data-electron-mac] .breadcrumb-folder {
     animation: none;
   }
 }
+
+.new-project-working-directory-content {
+  overflow: hidden;
+}
+.new-project-working-directory-content[data-state="open"] {
+  animation: turn-fold-expand 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+.new-project-working-directory-content[data-state="closed"] {
+  animation: turn-fold-collapse 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .new-project-working-directory-content[data-state="open"],
+  .new-project-working-directory-content[data-state="closed"] {
+    animation: none;
+  }
+}
+
 /* The summary row grows in over the same beat as the trace shrinks.
    Inserting it at full height first jolted the bubble ~40px TALLER
    before the collapse began, which read as two separate motions; row
@@ -2377,6 +2941,9 @@ html[data-electron-mac] .breadcrumb-folder {
 .turn-fold-row-enter {
   display: grid;
   grid-template-rows: 0fr;
+}
+/* Starts with the trace's collapse (the fold closes a frame after it mounts). */
+[data-state="closed"] > .turn-fold-row-enter {
   animation: turn-fold-row-in 200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
 .turn-fold-row-enter > * {
@@ -2384,9 +2951,12 @@ html[data-electron-mac] .breadcrumb-folder {
   overflow: hidden;
 }
 @media (prefers-reduced-motion: reduce) {
-  .turn-fold-row-enter {
+  [data-state="closed"] > .turn-fold-row-enter {
     grid-template-rows: 1fr;
     animation: none;
+  }
+  [data-state="closed"] > .turn-fold-row-enter > * {
+    overflow: visible;
   }
 }
 

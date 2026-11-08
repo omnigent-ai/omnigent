@@ -24,6 +24,8 @@ const mocks = vi.hoisted(() => ({
   isAdmin: false,
   customAgentsEnabled: false as boolean | undefined,
   agentInstall: false,
+  enabledConnections: [] as string[],
+  nestedAgents: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -35,6 +37,8 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
       custom_agents_settings_ui: mocks.customAgentsEnabled,
     },
     agent_install: mocks.agentInstall,
+    enabled_connections: mocks.enabledConnections,
+    sibling_sessions: mocks.nestedAgents,
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -70,6 +74,8 @@ beforeEach(() => {
   mocks.isAdmin = false;
   mocks.customAgentsEnabled = false;
   mocks.agentInstall = false;
+  mocks.enabledConnections = [];
+  mocks.nestedAgents = false;
 });
 afterEach(cleanup);
 
@@ -172,6 +178,42 @@ describe("settingsNavGroups", () => {
 });
 
 describe("SettingsSidebarBody", () => {
+  it.each([
+    [true, true, false, true],
+    [true, false, false, false],
+    [false, true, false, false],
+    [false, true, true, true],
+    [false, false, true, false],
+  ])(
+    "gates Admin General by admin=%s, nested agents=%s, single user=%s",
+    (isAdmin, enabled, singleUser, visible) => {
+      mocks.isAdmin = isAdmin;
+      mocks.nestedAgents = enabled;
+      mocks.singleUser = singleUser;
+      renderBody();
+      const entry = screen.queryByTestId("settings-nav-admin");
+      expect(entry !== null).toBe(visible);
+      if (entry) expect(entry).toHaveAttribute("href", "/settings/admin");
+    },
+  );
+
+  it.each([
+    { connections: [], mcp: false, integrations: false },
+    { connections: ["mcp"], mcp: true, integrations: false },
+    { connections: ["github", "mcp"], mcp: true, integrations: true },
+    { connections: ["github"], mcp: false, integrations: true },
+  ])(
+    "separates MCP navigation from sandbox accounts: $connections",
+    ({ connections, mcp, integrations }) => {
+      mocks.enabledConnections = connections;
+      renderBody();
+      expect(!!screen.queryByTestId("settings-nav-mcp")).toBe(mcp);
+      expect(!!screen.queryByTestId("settings-nav-integrations")).toBe(integrations);
+      if (mcp)
+        expect(screen.getByTestId("settings-nav-mcp")).toHaveAttribute("href", "/settings/mcp");
+    },
+  );
+
   it("renders Back as a standard sidebar row without a collapse button", () => {
     renderBody();
     const backLink = screen.getByRole("link", { name: "Back" });
@@ -338,6 +380,14 @@ describe("SettingsSidebarBody", () => {
 });
 
 describe("useSettingsRoute", () => {
+  it.each([false, true])("gates the admin general route on nesting=%s", (enabled) => {
+    mocks.nestedAgents = enabled;
+    expect(routeHook("/settings/admin")).toEqual({
+      inSettings: true,
+      section: enabled ? "admin" : "general",
+    });
+  });
+
   it("treats /settings/members and /settings/policies as in-settings sections on an accounts deploy", () => {
     // The core of the fix: Members / Policies now live UNDER /settings, so the
     // sidebar's `inSettings` gate stays true and the settings nav stays put —
