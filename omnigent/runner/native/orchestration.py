@@ -2003,11 +2003,9 @@ async def _auto_create_opencode_terminal(
     try:
         client = server.client()
         try:
-            # A fresh per-session DB skips the seeded auth.json import, so the
-            # user's API keys reach it through the integration API (best effort).
-            # Keep this before the env keys: on a fresh server connect/key returns
-            # 404 until GET /api/integration (the restore's first call) has loaded
-            # the integrations.
+            # A fresh per-session DB skips the seeded auth.json import, so restore the
+            # user's API keys (best effort). Keep it before the env keys: connect/key
+            # 404s on a fresh server until the restore's GET /api/integration ran.
             session_credentials: frozenset[str] | None = None
             try:
                 session_credentials = await restore_user_api_keys(client)
@@ -2018,10 +2016,9 @@ async def _auto_create_opencode_terminal(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
-            # Keys that live only in the runner's environment reach the
-            # per-session server through its integration API (best effort).
-            # They skip integrations the session already holds; a provider the
-            # user logged in to with OAuth (not copied) can still use its env key.
+            # Keys that live only in the runner's environment reach the per-session
+            # server through its integration API (best effort). They skip integrations
+            # the session holds, so an OAuth-only provider (not copied) can use one.
             stored_ids = (
                 seeded_provider_ids(bridge_dir)
                 if session_credentials is None
