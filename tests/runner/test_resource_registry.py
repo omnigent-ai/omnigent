@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import json
 import logging
 import os
@@ -40,7 +42,7 @@ from omnigent.terminals import TerminalRegistry
 from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import make_test_terminal_instance
 
-# Stands in for Claude's terminal: answers the OSC 7501 probe, then writes one report per key.
+# Stands in for Claude: completes OSC negotiation, reports working, then one report per key.
 _CLAUDE_OSC_PEER_SCRIPT = (
     "import os,sys,tty\n"
     "tty.setraw(0)\n"
@@ -68,8 +70,12 @@ _CLAUDE_OSC_PEER_SCRIPT = (
 )
 
 
-def _claude_osc_peer(path: Path) -> Path:
-    path.write_text(_CLAUDE_OSC_PEER_SCRIPT)
+def _claude_osc_peer(path: Path, *, error_detail: str | None = None) -> Path:
+    script = _CLAUDE_OSC_PEER_SCRIPT
+    if error_detail is not None:
+        report = b"state=error:msg=" + base64.b64encode(error_detail.encode())
+        script = script.replace("b'e':b'state=error'", f"b'e':{report!r}")
+    path.write_text(script)
     return path
 
 
@@ -131,12 +137,28 @@ async def test_claude_program_status_real_launch_and_fallback(
     registry.set_session_status_publisher(
         lambda _, state, reason: statuses.append((state, reason))
     )
+    background: list[bool] = []
+    registry.set_session_background_publisher(lambda _, running: background.append(running))
     spec = _claude_osc_spec(tmp_path, peer, protocol, sandbox_type)
 
     async def wait_status(state: str, reason: str | None = None) -> None:
         async with asyncio.timeout(10):
             while not statuses or statuses[-1] != (state, reason):
                 await asyncio.sleep(0.02)
+
+    async def wait_background(running: bool) -> None:
+        # A resync re-asserts the current value, so only the latest one is checked.
+        with contextlib.suppress(AssertionError):
+            await poll_until_async(lambda: bool(background) and background[-1] is running)
+        assert background and background[-1] is running, background
+
+    def write_status_file(status: str) -> None:
+        previous = status_file.stat().st_mtime if status_file.exists() else None
+        status_file.write_text(json.dumps({"kind": "interactive", "status": status}))
+        if previous is not None:
+            # Consecutive writes must stay observable on coarse-mtime filesystems.
+            mtime = max(status_file.stat().st_mtime, previous + 1)
+            os.utime(status_file, (mtime, mtime))
 
     try:
         await registry.launch_required_terminal(
@@ -168,8 +190,10 @@ async def test_claude_program_status_real_launch_and_fallback(
                 await asyncio.sleep(0.05)
         if protocol != "osc":
             assert reader is None or reader.status is None
-            status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
+            # The turn ends with a background shell still running.
+            write_status_file("shell")
             await wait_status("idle")
+            await wait_background(True)
             return
         assert reader is not None
         async with asyncio.timeout(5):
@@ -201,6 +225,22 @@ async def test_claude_program_status_real_launch_and_fallback(
         for key, state in (("d", "idle"), ("w", "running"), ("i", "idle")):
             await instance.send(keys=key)
             await wait_status(state)
+        for forwarded in ("running", "waiting"):
+            before = len(statuses)
+            registry.note_external_session_status("osc-test", forwarded)
+            async with asyncio.timeout(5):
+                while len(statuses) == before:
+                    await asyncio.sleep(0.02)
+            assert statuses[-1] == ("idle", None)
+            assert not registry.session_turn_is_active("osc-test")
+        # OSC cannot report a background shell; the file's ``shell`` does, as a
+        # separate signal that never moves the session's status.
+        published = len(statuses)
+        write_status_file("shell")
+        await wait_background(True)
+        write_status_file("idle")
+        await wait_background(False)
+        assert len(statuses) == published
         for key in ("c", "u"):
             await instance.send(keys=key)
             await wait_status("idle")  # Falls back to the still-unchanged status file.
@@ -250,8 +290,9 @@ async def test_claude_program_status_real_launch_and_fallback(
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_detail", [None, "API Error: 499"])
 async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_detail: str | None
 ) -> None:
     """A turn whose StopFailure hook never reaches the runner still ends, failed once."""
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
@@ -262,7 +303,17 @@ async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
     registry.set_session_status_publisher(
         lambda _, state, reason: statuses.append((state, reason))
     )
-    spec = _claude_osc_spec(tmp_path, _claude_osc_peer(tmp_path / "peer.py"), "osc", "none")
+    failures: list[tuple[str, str]] = []
+    if error_detail is not None:
+
+        def publish_failure(session_id: str, detail: str) -> None:
+            failures.append((session_id, detail))
+            statuses.append(("failed", None))
+
+        registry.set_session_failure_publisher(publish_failure)
+    spec = _claude_osc_spec(
+        tmp_path, _claude_osc_peer(tmp_path / "peer.py", error_detail=error_detail), "osc", "none"
+    )
     try:
         await registry.launch_required_terminal(
             "osc-test", "claude", "main", spec, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
@@ -275,14 +326,14 @@ async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
         async with asyncio.timeout(5):
             while instance.program_status.child_pid is None:
                 await asyncio.sleep(0.02)
-        await instance.send(keys="w")
         await _wait_for_status_edge(statuses, ("running", None))
         await instance.send(keys="e")
         # No hook edge arrives, so the runner's grace period is what ends the turn.
         await _wait_for_status_edge(statuses, ("failed", None), timeout=15)
         await asyncio.sleep(0.5)
         assert statuses.count(("failed", None)) == 1
-        assert raw_status.call_args_list.count(call("failed", None)) == 1
+        assert raw_status.call_args_list.count(call("failed", None)) == int(error_detail is None)
+        assert failures == ([("osc-test", error_detail)] if error_detail is not None else [])
     finally:
         await terminals.shutdown()
 
@@ -314,7 +365,6 @@ async def test_claude_osc_error_is_not_failed_again_once_the_hook_lands(
         async with asyncio.timeout(5):
             while instance.program_status.child_pid is None:
                 await asyncio.sleep(0.02)
-        await instance.send(keys="w")
         await _wait_for_status_edge(statuses, ("running", None))
         await instance.send(keys="e")
         async with asyncio.timeout(5):
@@ -328,6 +378,15 @@ async def test_claude_osc_error_is_not_failed_again_once_the_hook_lands(
         assert statuses[-1] == ("running", None)
         assert ("failed", None) not in statuses
         assert call("failed", None) not in raw_status.call_args_list
+        epoch = registry.session_activity_epoch("osc-test")
+        before = len(statuses)
+        await instance.send(keys="w")
+        async with asyncio.timeout(5):
+            while len(statuses) == before:
+                await asyncio.sleep(0.02)
+        assert statuses[-1] == ("running", None)
+        assert registry.session_turn_is_active("osc-test")
+        assert registry.session_activity_epoch("osc-test") > epoch
     finally:
         await terminals.shutdown()
 
@@ -868,8 +927,15 @@ class _FakeStatusPoller:
     ``sessions/<pid>.json``.
     """
 
-    def __init__(self, on_status: object) -> None:
+    def __init__(
+        self,
+        on_status: object,
+        on_failure: Callable[[str], None] | None = None,
+        on_background: object = None,
+    ) -> None:
         self._on_status = on_status
+        self._on_failure = on_failure
+        self.on_background = on_background
         self.active = False
         self.blocked_on: str | None = None
         self.ticks = 0
@@ -890,11 +956,18 @@ class _FakeStatusPoller:
         """Simulate the file reporting a new status."""
         self._on_status(status, blocked_on)
 
+    def emit_failure(self, detail: str) -> None:
+        assert self._on_failure is not None
+        self._on_failure(detail)
+
 
 async def _observe_native_with_fake_poller(
     tmp_path: Path,
     session_id: str,
     activity_publisher: Callable[[str, str], None] | None = None,
+    *,
+    failure_publisher: Callable[[str, str], None] | None = None,
+    background_publisher: Callable[[str, bool], None] | None = None,
 ) -> tuple[dict[str, object], list[str], list[_FakeStatusPoller], SessionResourceRegistry]:
     """Observe a claude-native terminal with an injected fake poller.
 
@@ -915,10 +988,22 @@ async def _observe_native_with_fake_poller(
     )
     if activity_publisher is not None:
         registry.set_terminal_activity_publisher(activity_publisher)
+    if failure_publisher is not None:
+        registry.set_session_failure_publisher(failure_publisher)
+    if background_publisher is not None:
+        registry.set_session_background_publisher(background_publisher)
 
-    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
+    def _fake_build(
+        *,
+        session_id: str,
+        instance: object,
+        on_status: object,
+        on_failure: Callable[[str], None],
+        on_replay: Callable[[str, str | None], None],
+        on_background: object = None,
+    ) -> _FakeStatusPoller:
         del session_id, instance
-        poller = _FakeStatusPoller(on_status)
+        poller = _FakeStatusPoller(on_status, on_failure, on_background=on_background)
         pollers.append(poller)
         return poller
 
@@ -953,8 +1038,21 @@ async def _observe_native_with_real_poller(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     session_id: str,
+    *,
+    program_status_path: Path | None = None,
+    instance: TerminalInstance | None = None,
+    published: list[tuple[str, str | None]] | None = None,
+    inferred_edges: list[tuple[str, str | None]] | None = None,
+    accepts_inferred_status: bool = True,
+    background_publisher: Callable[[str, bool], None] | None = None,
 ) -> tuple[Callable[[], None], list[str], SessionResourceRegistry, Path]:
-    """Observe a Claude terminal with a real poller and caller-written status file."""
+    """Observe a Claude terminal with a real poller and caller-written status file.
+
+    :param instance: Terminal to observe; a fresh test terminal when ``None``.
+    :param published: Collects each published ``(status, blocked_on)`` edge.
+    :param inferred_edges: Collects the edges among them published as pane-inferred.
+    :param accepts_inferred_status: Whether the server accepts pane-inferred edges.
+    """
     config_dir = tmp_path / "claude"
     status_file = config_dir / "sessions" / "123.json"
     status_file.parent.mkdir(parents=True)
@@ -964,19 +1062,119 @@ async def _observe_native_with_real_poller(
     )
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
-    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    if instance is None:
+        instance = make_test_terminal_instance("claude", "main", tmp_path)
+    if program_status_path is not None:
+        from omnigent.terminals.program_status import ProgramStatusReader
+
+        instance.program_status = ProgramStatusReader(program_status_path)
     terminal_registry._by_conversation.setdefault(session_id, {})[("claude", "main")] = instance
     watcher = Mock()
     monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
     monkeypatch.setattr(instance, "pane_pid_sync", lambda: 123)
     statuses: list[str] = []
+
+    def _publish(
+        _sid: str, status: str, reason: str | None = None, *, inferred: bool = False
+    ) -> None:
+        statuses.append(status)
+        if published is not None:
+            published.append((status, reason))
+        if inferred_edges is not None and inferred:
+            inferred_edges.append((status, reason))
+
     registry.set_session_status_publisher(
-        lambda _sid, status, _reason=None: statuses.append(status)
+        _publish, accepts_inferred_status=lambda: accepts_inferred_status
     )
+    if background_publisher is not None:
+        registry.set_session_background_publisher(background_publisher)
     await registry.observe_required_terminal(
         session_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
     )
     return watcher.call_args.kwargs["on_tick"], statuses, registry, status_file
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closing", ["terminal", "session"])
+async def test_closing_a_shell_reporting_terminal_clears_its_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, closing: str
+) -> None:
+    """
+    Closing a Claude terminal, or cleaning up its session, clears its background flag.
+
+    Neither path runs the pane's exit callback, and nothing else would report the
+    shells ending with the pane. A watcher read that lands after the close
+    cannot set the flag again.
+    """
+    session_id = "conv_close_shells"
+    reports: list[bool] = []
+    on_tick, _statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path,
+        monkeypatch,
+        session_id,
+        background_publisher=lambda _session_id, running: reports.append(running),
+    )
+    record = {
+        "pid": 123,
+        "sessionId": "claude-close-shells",
+        "kind": "interactive",
+        "status": "shell",
+        "statusUpdatedAt": 1000,
+    }
+    status_file.write_text(json.dumps(record), encoding="utf-8")
+    on_tick()
+    await asyncio.sleep(0)
+    assert reports == [True]
+    late_report = registry._status_pollers[session_id]._on_background
+    assert callable(late_report)
+
+    if closing == "terminal":
+        assert await registry.close_terminal(session_id, "terminal_claude_main")
+    else:
+        await registry.cleanup_session(session_id)
+    await asyncio.sleep(0)
+    # A read that passed the poller's checks before the close publishes after it.
+    late_report(True)
+    await asyncio.sleep(0)
+
+    assert reports == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_closing_a_terminal_spares_a_replacement_launched_meanwhile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A Claude terminal launched while the old one shuts down keeps its status poller.
+
+    The registry frees the slot before the old pane finishes closing, so a
+    replacement can be observed in between; the close retires only its own poller.
+    """
+    session_id = "conv_close_replaced"
+    _, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, session_id)
+    terminals = registry.terminal_registry
+    old = terminals._by_conversation[session_id][("claude", "main")]
+    shutdown_started = asyncio.Event()
+    finish_shutdown = asyncio.Event()
+
+    async def slow_close() -> None:
+        shutdown_started.set()
+        await finish_shutdown.wait()
+
+    monkeypatch.setattr(old, "close", slow_close)
+    closing = asyncio.create_task(registry.close_terminal(session_id, "terminal_claude_main"))
+    await asyncio.wait_for(shutdown_started.wait(), timeout=5.0)
+    replacement = make_test_terminal_instance("claude", "main", tmp_path / "replacement")
+    monkeypatch.setattr(replacement, "start_idle_watcher_thread", lambda *_args, **_kwargs: None)
+    terminals._by_conversation.setdefault(session_id, {})[("claude", "main")] = replacement
+    await registry.observe_required_terminal(
+        session_id, "claude", "main", replacement, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    finish_shutdown.set()
+
+    assert await asyncio.wait_for(closing, timeout=5.0)
+    assert pollers[0].retired and not pollers[1].retired
+    assert registry._status_pollers[session_id] is pollers[1]
 
 
 @pytest.mark.asyncio
@@ -1102,16 +1300,23 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("intervening_event", ["none", "failed-hook", "idle-hook", "new-turn"])
+@pytest.mark.parametrize("with_detail", [False, True])
 async def test_queued_fallback_failure_preserves_newer_turn_state(
-    tmp_path: Path, intervening_event: str
+    tmp_path: Path, intervening_event: str, with_detail: bool
 ) -> None:
     """A pending watcher failure must not replace a hook or end a newer turn."""
     session_id = "conv_queued_failure"
-    _, statuses, pollers, registry = await _observe_native_with_fake_poller(tmp_path, session_id)
+    failures: list[tuple[str, str]] = []
+    _, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, session_id, failure_publisher=lambda sid, detail: failures.append((sid, detail))
+    )
     poller = pollers[0]
     poller.emit("running")
     await asyncio.sleep(0)
-    poller.emit("failed")
+    if with_detail:
+        poller.emit_failure("API Error: 499")
+    else:
+        poller.emit("failed")
     if intervening_event != "none":
         registry.note_external_session_status(
             session_id, "idle" if intervening_event == "idle-hook" else "failed"
@@ -1119,14 +1324,25 @@ async def test_queued_fallback_failure_preserves_newer_turn_state(
     if intervening_event == "new-turn":
         registry.note_session_turn_started(session_id)
     await asyncio.sleep(0)
-    assert statuses == (["running", "failed"] if intervening_event == "none" else ["running"])
+    assert statuses == (
+        ["running", "failed"] if intervening_event == "none" and not with_detail else ["running"]
+    )
+    assert failures == (
+        [(session_id, "API Error: 499")] if intervening_event == "none" and with_detail else []
+    )
     assert registry.session_turn_is_active(session_id) == (intervening_event == "new-turn")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "reason"),
-    [("running", None), ("running", "permission prompt"), ("idle", None), ("failed", None)],
+    ("status", "reason", "with_detail"),
+    [
+        ("running", None, False),
+        ("running", "permission prompt", False),
+        ("idle", None, False),
+        ("failed", None, False),
+        ("failed", None, True),
+    ],
 )
 @pytest.mark.parametrize("replacement", [False, True], ids=["removed", "replaced"])
 @pytest.mark.parametrize("queued_first", [False, True], ids=["late-read", "queued-read"])
@@ -1134,17 +1350,28 @@ async def test_old_terminal_status_cannot_change_its_successor(
     tmp_path: Path,
     status: str,
     reason: str | None,
+    with_detail: bool,
     replacement: bool,
     queued_first: bool,
 ) -> None:
     """A stale watcher must not publish or change activity after its terminal leaves."""
     session_id = "conv_terminal_replaced"
-    _, statuses, pollers, registry = await _observe_native_with_fake_poller(tmp_path, session_id)
+    failures: list[tuple[str, str]] = []
+    _, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, session_id, failure_publisher=lambda sid, detail: failures.append((sid, detail))
+    )
     poller = pollers[0]
     poller.emit("running")
     await asyncio.sleep(0)
+
+    def emit() -> None:
+        if with_detail:
+            poller.emit_failure("API Error: 499")
+        else:
+            poller.emit(status, reason)
+
     if queued_first:
-        poller.emit(status, reason)
+        emit()
     terminals = registry._terminal_registry
     assert terminals is not None
     if replacement:
@@ -1157,11 +1384,101 @@ async def test_old_terminal_status_cannot_change_its_successor(
         registry.note_external_session_status(session_id, "idle")
     current_epoch = registry.session_activity_epoch(session_id)
     if not queued_first:
-        poller.emit(status, reason)
+        emit()
     await asyncio.sleep(0)
     assert statuses == ["running"]
+    assert failures == []
     assert registry.session_turn_is_active(session_id) is replacement
     assert registry.session_activity_epoch(session_id) == current_epoch
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_change", ["none", "removed", "replaced"])
+@pytest.mark.parametrize("queued_first", [False, True], ids=["late-read", "queued-read"])
+async def test_a_replaced_terminal_cannot_report_background_shells(
+    tmp_path: Path, terminal_change: str, queued_first: bool
+) -> None:
+    """
+    An old terminal's background-shell report cannot change its replacement's.
+
+    A terminal that closed with no replacement still clears its own flag.
+    """
+    reports: list[bool] = []
+    _, _, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path,
+        "conv_background_replaced",
+        background_publisher=lambda _session_id, running: reports.append(running),
+    )
+    on_background = pollers[0].on_background
+    assert callable(on_background)
+    if queued_first:
+        on_background(False)
+    terminals = registry.terminal_registry
+    if terminal_change == "replaced":
+        terminals._by_conversation["conv_background_replaced"][("claude", "main")] = (
+            make_test_terminal_instance("claude", "main", tmp_path / "replacement")
+        )
+    elif terminal_change == "removed":
+        closed = terminals._by_conversation["conv_background_replaced"].pop(("claude", "main"))
+        closed.running = False
+    if not queued_first:
+        on_background(False)
+    await asyncio.sleep(0)
+    assert reports == ([] if terminal_change == "replaced" else [False])
+
+
+@pytest.mark.asyncio
+async def test_a_transferred_terminal_clears_the_source_flag_for_good(tmp_path: Path) -> None:
+    """
+    Moving a running pane to another session clears the source session's flag.
+
+    A report the source's watcher had queued before the move cannot restore it,
+    and the target's own watcher reports for the target.
+    """
+    reports: list[tuple[str, bool]] = []
+    _, _, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path,
+        "conv_source",
+        background_publisher=lambda session_id, running: reports.append((session_id, running)),
+    )
+    source_report = pollers[0].on_background
+    assert callable(source_report)
+    source_report(True)
+
+    moved = await registry.transfer_terminal("conv_source", "conv_target", "terminal_claude_main")
+    await asyncio.sleep(0)
+
+    assert moved is not None
+    assert reports == [("conv_source", False)]
+    target_report = pollers[-1].on_background
+    assert callable(target_report) and target_report is not source_report
+    source_report(True)
+    target_report(True)
+    await asyncio.sleep(0)
+    assert reports == [("conv_source", False), ("conv_target", True)]
+
+
+@pytest.mark.asyncio
+async def test_moving_another_terminal_leaves_the_claude_flag_with_the_source(
+    tmp_path: Path,
+) -> None:
+    """Moving a session's other terminal keeps its Claude pane's flag and status poller."""
+    reports: list[tuple[str, bool]] = []
+    _, _, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path,
+        "conv_source",
+        background_publisher=lambda session_id, running: reports.append((session_id, running)),
+    )
+    registry.terminal_registry._by_conversation["conv_source"][("bash", "main")] = (
+        make_test_terminal_instance("bash", "main", tmp_path / "bash")
+    )
+
+    moved = await registry.transfer_terminal("conv_source", "conv_target", "terminal_bash_main")
+    await asyncio.sleep(0)
+
+    assert moved is not None
+    assert reports == []
+    assert registry._status_pollers["conv_source"] is pollers[0]
 
 
 @pytest.mark.asyncio
@@ -1264,28 +1581,643 @@ async def test_queued_turn_republishes_running_after_stop(
     assert not registry.session_turn_is_active(session_id)
 
 
+_CLAUDE_WORKING_PANE = """\
+❯ summarize the repository
+● Reading the files
+✻ Recombobulating… (16s · ↓ 27 tokens)
+──────────────────────────────────────────
+❯\u00a0
+──────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+"""
+_CLAUDE_NOTICE_PANE = """\
+❯ summarize the repository
+●
+✻ Recombobulating… (31s · ↓ 27 tokens)
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What's new in Claude Code
+   Press Enter to continue
+"""
+# Input modes Claude Code 2.1.295 drew mid-reply, with the input box still in use.
+_CLAUDE_SHELL_MODE_PANE = """\
+● word0 word1 word2
+* Jitterbugging… (23s · ↓ 40 tokens)
+──────────────────────────────────────────
+!\u00a0
+──────────────────────────────────────────
+  ! for shell mode
+"""
+_CLAUDE_HISTORY_SEARCH_PANE = """\
+● word0 word1 word2
+✢ Jitterbugging… (29s · ↓ 50 tokens)
+──────────────────────────────────────────
+  Search prompts · everywhere
+                      ╭──────────────────╮
+                      │ Write a reply.   │
+  ❯ 24s ago  Write …  ╰──────────────────╯
+  ╭──────────────────────────────────────╮
+  │ ⌕ Filter history…                    │
+  ╰──────────────────────────────────────╯
+  ↑/↓ to navigate · Enter to use · Esc to cancel · ctrl+s to scope
+"""
+# A 28-column pane, where the footer tip and a draft both wrap.
+_CLAUDE_NARROW_DRAFT_PANE = """\
+  word42 word43 word44
+· Jitterbugging… (45s)
+  ⎿ \u00a0Tip: Use /btw to ask a
+     quick side question
+     without interrupting
+     Claude's current work
+────────────────────────────
+❯\u00a0please also summarize
+  the follow-up items
+  afterwards
+────────────────────────────
+  ⏵⏵ auto mode on
+"""
+
+
+class _HiddenInputBoxSession:
+    """A Claude terminal under a real poller, driven by a fake clock and pane."""
+
+    def __init__(
+        self,
+        tick: Callable[[], None],
+        instance: TerminalInstance,
+        registry: SessionResourceRegistry,
+        status_file: Path,
+        published: list[tuple[str, str | None]],
+        inferred_edges: list[tuple[str, str | None]],
+        clock: dict[str, float],
+    ) -> None:
+        self.registry = registry
+        self.published = published
+        self.inferred_edges = inferred_edges
+        self._tick = tick
+        self._instance = instance
+        self._status_file = status_file
+        self._clock = clock
+
+    def write_claude_status(self, status: str, waiting_for: str | None = None) -> None:
+        record = {"pid": 123, "sessionId": "claude-hidden", "kind": "interactive"}
+        record |= {"status": status, "statusUpdatedAt": int(self._clock["now"] * 1000)}
+        if waiting_for is not None:
+            record["waitingFor"] = waiting_for
+        self._status_file.write_text(json.dumps(record), encoding="utf-8")
+
+    async def tick_at(self, now: float, pane: str, *, drain: bool = True) -> None:
+        self._clock["now"] = now
+        self._instance._remember_pane_snapshot(pane)
+        self._tick()
+        if drain:
+            await asyncio.sleep(0)
+
+
+async def _hidden_input_box_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_id: str,
+    *,
+    during_probe: Callable[[], None] | None = None,
+    accepts_inferred_status: bool = True,
+) -> _HiddenInputBoxSession:
+    """Observe a Claude terminal whose input-box probe can run *during_probe*."""
+    clock = {"now": 100.0}
+    monkeypatch.setattr("omnigent.runner.resource_registry._monotonic", lambda: clock["now"])
+    if during_probe is not None:
+        import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+        real_probe = claude_bridge.claude_pane_input_box_shown
+
+        def probe(pane: str) -> bool:
+            shown = real_probe(pane)
+            during_probe()
+            return shown
+
+        monkeypatch.setattr(claude_bridge, "claude_pane_input_box_shown", probe)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    published: list[tuple[str, str | None]] = []
+    inferred_edges: list[tuple[str, str | None]] = []
+    on_tick, _statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path,
+        monkeypatch,
+        session_id,
+        instance=instance,
+        published=published,
+        inferred_edges=inferred_edges,
+        accepts_inferred_status=accepts_inferred_status,
+    )
+    return _HiddenInputBoxSession(
+        on_tick, instance, registry, status_file, published, inferred_edges, clock
+    )
+
+
 @pytest.mark.asyncio
-async def test_failed_hook_does_not_republish_stale_running_status(
+@pytest.mark.parametrize(
+    ("claude_status", "waiting_for", "expected_reason"),
+    [
+        ("busy", None, "terminal prompt"),
+        # Claude's own reason already tells the person where to look.
+        ("waiting", "dialog open", "dialog open"),
+    ],
+)
+async def test_running_turn_with_hidden_input_box_points_chat_at_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_status: str,
+    waiting_for: str | None,
+    expected_reason: str,
+) -> None:
+    """A surface Claude does not report must not leave chat on a bare spinner."""
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_input_box")
+    published = session.published
+    session.write_claude_status(claude_status, waiting_for)
+
+    await session.tick_at(100.0, _CLAUDE_WORKING_PANE)
+    await session.tick_at(130.0, _CLAUDE_WORKING_PANE)
+    assert published == [("running", waiting_for)]
+
+    # A shorter hidden spell restarts the delay once the box returns.
+    await session.tick_at(131.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(140.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(141.0, _CLAUDE_WORKING_PANE)
+    await session.tick_at(142.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(156.0, _CLAUDE_NOTICE_PANE)
+    assert published == [("running", waiting_for)]
+
+    await session.tick_at(157.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(160.0, _CLAUDE_NOTICE_PANE)
+    assert published[-1] == ("running", expected_reason)
+    assert len(published) == (2 if expected_reason == "terminal prompt" else 1)
+
+    # Answering the prompt restores the input box, and chat drops the alert.
+    await session.tick_at(161.0, _CLAUDE_WORKING_PANE)
+    assert published[-1] == ("running", waiting_for)
+    assert session.registry.session_turn_is_active("conv_hidden_input_box")
+    # Only pane-inferred edges are marked, so the server never lets them reopen a turn.
+    assert session.inferred_edges == (
+        [("running", "terminal prompt"), ("running", None)] if waiting_for is None else []
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pane",
+    [_CLAUDE_SHELL_MODE_PANE, _CLAUDE_HISTORY_SEARCH_PANE, _CLAUDE_NARROW_DRAFT_PANE],
+    ids=["shell-mode", "history-search", "narrow-wrapped"],
+)
+async def test_input_box_in_another_mode_raises_no_terminal_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str
+) -> None:
+    """A person typing in shell mode, the history search or a narrow pane is not blocked."""
+    session_id = "conv_hidden_input_mode"
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
+    session.write_claude_status("busy")
+    for now in (100.0, 116.0, 140.0):
+        await session.tick_at(now, pane)
+    assert session.published == [("running", None)]
+
+    # A real hidden prompt still alerts, and switching to this mode clears it.
+    await session.tick_at(141.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(156.0, _CLAUDE_NOTICE_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
+    await session.tick_at(157.0, pane)
+    assert session.published[1:] == [("running", "terminal prompt"), ("running", None)]
+    assert session.registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+async def test_hidden_input_box_without_structured_status_publishes_no_alert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failed turn stays failed while its busy status file catches up."""
-    session_id = "conv_failed_status"
+    """Pane inference owns status when Claude reports none, so no alert is inferred."""
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_fallback")
+    session.registry.note_external_session_status("conv_hidden_fallback", "running")
+    for now in (100.0, 116.0, 140.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    assert ("running", "terminal prompt") not in session.published
+    assert session.registry.session_turn_is_active("conv_hidden_fallback")
+
+
+@pytest.mark.asyncio
+async def test_blank_pane_capture_raises_no_hidden_input_box_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blank or missing capture says nothing about the input box."""
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_blank_capture")
+    session.write_claude_status("busy")
+    for now in (100.0, 116.0, 140.0):
+        await session.tick_at(now, "")
+    assert session.published == [("running", None)]
+
+
+@pytest.mark.asyncio
+async def test_server_without_inferred_status_support_gets_no_terminal_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older server could let an inferred edge reopen a finished turn, so none is sent."""
+    session = await _hidden_input_box_session(
+        tmp_path, monkeypatch, "conv_hidden_old_server", accepts_inferred_status=False
+    )
+    session.write_claude_status("busy")
+    for now in (100.0, 116.0, 140.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(141.0, _CLAUDE_WORKING_PANE)
+    assert session.published == [("running", None)]
+
+
+@pytest.mark.asyncio
+async def test_failed_input_box_probe_skips_only_that_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A probe that raises leaves the watcher running, so later reads raise and clear the alert."""
+    session_id = "conv_hidden_probe_failure"
+    failing = {"value": False}
+
+    def fail_once() -> None:
+        if failing["value"]:
+            failing["value"] = False
+            raise RuntimeError("pane probe failed")
+
+    session = await _hidden_input_box_session(
+        tmp_path, monkeypatch, session_id, during_probe=fail_once
+    )
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    failing["value"] = True
+    await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+    assert session.published == [("running", None)]
+    await session.tick_at(117.0, _CLAUDE_NOTICE_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
+
+    failing["value"] = True
+    await session.tick_at(118.0, _CLAUDE_WORKING_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
+    await session.tick_at(119.0, _CLAUDE_WORKING_PANE)
+    assert session.published[1:] == [("running", "terminal prompt"), ("running", None)]
+    assert session.registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+async def test_reported_reason_replaces_hidden_input_box_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once Claude names what it waits on, that reason wins over the inferred one."""
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_reason")
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+    assert session.published == [("running", None), ("running", "terminal prompt")]
+
+    session.write_claude_status("waiting", "dialog open")
+    for now in (117.0, 140.0, 170.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    assert session.published[2:] == [("running", "dialog open")]
+
+
+@pytest.mark.asyncio
+async def test_turn_ending_behind_hidden_input_box_alert_stays_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finished turn has nothing to wait on, even while a notice hides the box."""
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_idle")
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
+
+    session.write_claude_status("idle")
+    for now in (117.0, 140.0, 170.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(171.0, _CLAUDE_WORKING_PANE)
+    assert session.published[2:] == [("idle", None)]
+    assert not session.registry.session_turn_is_active("conv_hidden_idle")
+
+
+@pytest.mark.asyncio
+async def test_next_turn_gets_its_own_hidden_input_box_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn that starts between pane reads does not inherit the last turn's timer."""
+    session_id = "conv_hidden_next_turn"
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(114.0, _CLAUDE_NOTICE_PANE)
+    assert session.published == [("running", None)]
+
+    session.registry.note_external_session_status(session_id, "idle")
+    session.registry.note_external_session_status(session_id, "running")
+    await session.tick_at(115.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(129.0, _CLAUDE_NOTICE_PANE)
+    assert ("running", "terminal prompt") not in session.published
+
+    await session.tick_at(130.0, _CLAUDE_NOTICE_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
+
+
+# Status changes that can land between an inference and its delivery, with the edge each leaves.
+_INTERVENING_STATUS_EDGES: dict[str, tuple[str, str | None]] = {
+    "idle": ("idle", None),
+    "failed": ("failed", None),
+    "dialog-open": ("running", "dialog open"),
+    "new-turn": ("running", None),
+}
+
+
+def _change_session_status(
+    registry: SessionResourceRegistry, session_id: str, intervening: str
+) -> None:
+    if intervening == "dialog-open":
+        registry._claim_status_edge(session_id, "running", "dialog open", explicit_activity=True)
+    elif intervening == "new-turn":
+        registry.note_external_session_status(session_id, "idle")
+        registry.note_external_session_status(session_id, "running")
+    else:
+        registry.note_external_session_status(session_id, intervening)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intervening", list(_INTERVENING_STATUS_EDGES))
+@pytest.mark.parametrize("alerting", [False, True], ids=["raise", "clear"])
+async def test_status_change_during_input_box_probe_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, intervening: str, alerting: bool
+) -> None:
+    """A status change that lands while the pane is probed is kept."""
+    session_id = "conv_hidden_probe_race"
+    armed = {"value": False}
+
+    def change_status_mid_probe() -> None:
+        if armed["value"]:
+            armed["value"] = False
+            _change_session_status(session.registry, session_id, intervening)
+
+    session = await _hidden_input_box_session(
+        tmp_path, monkeypatch, session_id, during_probe=change_status_mid_probe
+    )
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    if alerting:
+        await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+        assert session.published[-1] == ("running", "terminal prompt")
+    published_before = len(session.published)
+
+    armed["value"] = True
+    await session.tick_at(117.0, _CLAUDE_WORKING_PANE if alerting else _CLAUDE_NOTICE_PANE)
+    assert session.published[published_before:] == []
+    expected_edge = _INTERVENING_STATUS_EDGES[intervening]
+    assert session.registry._published_status_edge(session_id) == expected_edge
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intervening", list(_INTERVENING_STATUS_EDGES))
+@pytest.mark.parametrize("alerting", [False, True], ids=["raise", "clear"])
+async def test_status_change_before_queued_alert_delivery_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, intervening: str, alerting: bool
+) -> None:
+    """A queued alert change is dropped when the status changes before it is delivered."""
+    session_id = "conv_hidden_delivery_race"
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    if alerting:
+        await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+        assert session.published[-1] == ("running", "terminal prompt")
+    published_before = len(session.published)
+
+    await session.tick_at(
+        117.0, _CLAUDE_WORKING_PANE if alerting else _CLAUDE_NOTICE_PANE, drain=False
+    )
+    _change_session_status(session.registry, session_id, intervening)
+    await asyncio.sleep(0)
+    assert session.published[published_before:] == []
+    expected_edge = _INTERVENING_STATUS_EDGES[intervening]
+    assert session.registry._published_status_edge(session_id) == expected_edge
+
+
+@pytest.mark.asyncio
+async def test_next_turn_clears_a_hidden_input_box_alert_applied_late(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An alert sent as a turn ends can reach chat in the next turn, which clears it at once."""
+    session_id = "conv_hidden_late_alert"
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+    assert session.inferred_edges == [("running", "terminal prompt")]
+
+    # A box still hidden in the new turn waits for that turn's own delay.
+    _change_session_status(session.registry, session_id, "new-turn")
+    for now in (117.0, 131.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    assert session.inferred_edges[1:] == [("running", None)]
+    await session.tick_at(132.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(133.0, _CLAUDE_WORKING_PANE)
+    assert session.inferred_edges[1:] == [
+        ("running", None),
+        ("running", "terminal prompt"),
+        ("running", None),
+    ]
+
+    # Once a clear is sent, later turns have nothing left to clear.
+    _change_session_status(session.registry, session_id, "new-turn")
+    await session.tick_at(134.0, _CLAUDE_NOTICE_PANE)
+    assert len(session.inferred_edges) == 4
+    assert session.registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+async def test_hidden_input_box_delay_restarts_after_inferred_status_support_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reads skipped while the server rejects alerts may have shown the box, so timing restarts."""
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_support_flip")
+    supported = {"value": True}
+    session.registry._accepts_inferred_status = lambda: supported["value"]
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    supported["value"] = False
+    await session.tick_at(105.0, _CLAUDE_WORKING_PANE)
+
+    supported["value"] = True
+    for now in (116.0, 130.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    assert session.published == [("running", None)]
+    await session.tick_at(131.0, _CLAUDE_NOTICE_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alert", ["delivered", "queued"])
+async def test_hidden_input_box_alert_is_raised_again_after_a_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alert: str
+) -> None:
+    """A new server never sees an alert from before a reconnect, so the watcher raises it again."""
+    session_id = "conv_hidden_reconnect"
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
+    supported = {"value": True}
+    session.registry._accepts_inferred_status = lambda: supported["value"]
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(116.0, _CLAUDE_NOTICE_PANE, drain=alert == "delivered")
+
+    supported["value"] = False
+    if alert == "delivered":
+        session.registry.resync_session_statuses()
+    await session.tick_at(117.0, _CLAUDE_NOTICE_PANE)
+    # The new server holds plain running: the resync republished it, or the alert never left.
+    assert session.published[-1] == ("running", None)
+    assert session.registry._published_status_edge(session_id) == ("running", None)
+
+    supported["value"] = True
+    raised = len(session.inferred_edges)
+    await session.tick_at(118.0, _CLAUDE_NOTICE_PANE)
+    assert ("running", "terminal prompt") not in session.inferred_edges[raised:]
+    await session.tick_at(133.0, _CLAUDE_NOTICE_PANE)
+    assert session.inferred_edges[-1] == ("running", "terminal prompt")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["file", "osc"])
+@pytest.mark.parametrize("forwarded", ["running", "waiting"])
+@pytest.mark.parametrize(
+    "intervening", ["none", "failed", "new-turn", "removed", "source-invalidated", "retired"]
+)
+async def test_native_idle_reasserts_a_lost_forwarded_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    forwarded: str,
+    intervening: str,
+) -> None:
+    session_id = "conv_lost_idle"
+    program_status_path = tmp_path / "program-status.json" if source == "osc" else None
     on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
-        tmp_path, monkeypatch, session_id
+        tmp_path, monkeypatch, session_id, program_status_path=program_status_path
     )
-    status_file.write_text(
-        json.dumps({"kind": "interactive", "sessionId": "claude-failed-status", "status": "busy"}),
-        encoding="utf-8",
+    if program_status_path is not None:
+        program_status_path.write_text(
+            json.dumps(
+                {
+                    "relay_pid": os.getpid(),
+                    "pid": 123,
+                    "status": {"state": "idle", "app": "claude-code"},
+                }
+            )
+        )
+    else:
+        status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["idle"]
+
+    registry.note_external_session_status(session_id, forwarded)
+    assert registry.session_turn_is_active(session_id)
+    on_tick()
+    if intervening == "failed":
+        registry.note_external_session_status(session_id, "failed")
+    elif intervening == "new-turn":
+        registry.note_session_turn_started(session_id)
+    elif intervening == "removed":
+        registry.terminal_registry._by_conversation[session_id].pop(("claude", "main"))
+    elif intervening == "source-invalidated":
+        if program_status_path is not None:
+            program_status_path.write_text(
+                json.dumps(
+                    {
+                        "relay_pid": os.getpid(),
+                        "pid": 123,
+                        "status": {"state": "error", "app": "claude-code"},
+                    }
+                )
+            )
+        else:
+            modified = status_file.stat().st_mtime_ns + 1_000_000_000
+            status_file.write_text(json.dumps({"kind": "interactive", "status": "unknown"}))
+            os.utime(status_file, ns=(modified, modified))
+        on_tick()
+    elif intervening == "retired":
+        registry._status_pollers[session_id].retire()
+    epoch = registry.session_activity_epoch(session_id)
+    await asyncio.sleep(0)
+    assert statuses == (["idle", "idle"] if intervening == "none" else ["idle"])
+    assert registry.session_activity_epoch(session_id) == epoch
+    assert registry.session_turn_is_active(session_id) == (
+        intervening in {"new-turn", "removed", "source-invalidated", "retired"}
     )
+    if source == "osc" and intervening == "source-invalidated":
+        poller = registry._status_pollers[session_id]
+        after_grace = poller._clock() + 10
+        monkeypatch.setattr(poller, "_clock", lambda: after_grace)
+        on_tick()
+        await asyncio.sleep(0)
+        assert statuses == ["idle", "failed"]
+        assert not registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["file", "osc"])
+@pytest.mark.parametrize("pending_resync", [False, True])
+async def test_failed_hook_does_not_republish_stale_running_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, pending_resync: bool
+) -> None:
+    """A replay cannot clear failure; a native error-to-work transition can."""
+    session_id = "conv_failed_status"
+    program_status_path = tmp_path / "program-status.json" if source == "osc" else None
+    on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id, program_status_path=program_status_path
+    )
+
+    def write_state(state: str) -> None:
+        if program_status_path is not None:
+            program_status_path.write_text(
+                json.dumps(
+                    {
+                        "relay_pid": os.getpid(),
+                        "pid": 123,
+                        "status": {"state": state, "app": "claude-code"},
+                    }
+                )
+            )
+        else:
+            status_file.write_text(
+                json.dumps(
+                    {
+                        "kind": "interactive",
+                        "sessionId": "claude-failed-status",
+                        "status": "busy" if state == "working" else state,
+                    }
+                )
+            )
+            modified = status_file.stat().st_mtime_ns + 1_000_000_000
+            os.utime(status_file, ns=(modified, modified))
+
+    write_state("working")
     on_tick()
     await asyncio.sleep(0)
     assert statuses == ["running"]
 
+    if pending_resync:
+        registry.note_external_session_status(session_id, "idle")
     registry.note_external_session_status(session_id, "failed")
     on_tick()
     await asyncio.sleep(0)
     assert statuses == ["running"]
     assert not registry.session_turn_is_active(session_id)
+    epoch = registry.session_activity_epoch(session_id)
+
+    write_state("error" if source == "osc" else "idle")
+    on_tick()
+    await asyncio.sleep(0)
+    settled = ["running"] if source == "osc" else ["running", "idle"]
+    assert statuses == settled
+    write_state("working")
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == [*settled, "running"]
+    assert registry.session_turn_is_active(session_id)
+    assert registry.session_activity_epoch(session_id) > epoch
 
 
 @pytest.mark.asyncio
@@ -1791,11 +2723,13 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
     assert "conv_cleanup" in registry._last_session_status
     assert registry.session_activity_epoch("conv_cleanup") > 0
     assert registry.session_turn_is_active("conv_cleanup")
+    assert registry._active_turn_generation("conv_cleanup") == 1
 
     await registry.cleanup_session("conv_cleanup")
 
     assert "conv_cleanup" not in registry._last_session_status
     assert registry.session_activity_epoch("conv_cleanup") == 0
+    assert "conv_cleanup" not in registry._session_turn_generation
     assert not registry.session_turn_is_active("conv_cleanup")
 
 
@@ -1851,6 +2785,7 @@ async def test_transfer_terminal_moves_status_memo(
     assert not registry.session_turn_is_active("conv_src")
     assert registry.session_turn_is_active("conv_dst")
     assert registry.session_activity_epoch("conv_dst") > 0
+    assert "conv_src" not in registry._session_turn_generation
 
 
 def test_get_resource_finds_default() -> None:
@@ -2383,9 +3318,17 @@ async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
         lambda _sid, status, reason=None: edges.append((status, reason))
     )
 
-    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
-        del session_id, instance
-        poller = _FakeStatusPoller(on_status)
+    def _fake_build(
+        *,
+        session_id: str,
+        instance: object,
+        on_status: object,
+        on_failure: Callable[[str], None],
+        on_replay: Callable[[str, str | None], None],
+        on_background: object = None,
+    ) -> _FakeStatusPoller:
+        del session_id, instance, on_background
+        poller = _FakeStatusPoller(on_status, on_failure)
         pollers.append(poller)
         return poller
 
