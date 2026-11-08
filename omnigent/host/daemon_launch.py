@@ -20,9 +20,9 @@ from collections.abc import Iterator
 import click
 import httpx
 
-from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.host.launch_audit import launch_audit_headers
 from omnigent.process_logging import display_log_path, process_log_dir
+from omnigent.util.server_url import url_component
 
 # Steady-state poll cadence while waiting for a daemon-spawned runner to
 # connect its tunnel or for a resource to appear.
