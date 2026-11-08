@@ -437,6 +437,42 @@ def build_on_fire(
     return on_fire
 
 
+# While its session looks busy, a continued session still gets a prompt this often, so a
+# stale "running" status cannot stall the task.
+BUSY_SKIP_MAX_SECONDS = 10 * 60
+
+
+def build_occurrence_busy(deps: FireDeps) -> Callable[[ScheduledTask], Awaitable[bool]]:
+    """Build the persistent scheduler's check for skipping an occurrence.
+
+    Only a continue task with a recorded session skips, and only while the session
+    shows as running (a turn in progress, or waiting on an approval or question) and
+    its latest run was scheduled less than :data:`BUSY_SKIP_MAX_SECONDS` earlier.
+    """
+
+    async def occurrence_busy(task: ScheduledTask) -> bool:
+        from omnigent.server.routes._sessions.helpers import _session_status_from_cache
+
+        session_id = task.session_id
+        if task.session_mode != "continue" or session_id is None or task.next_run_at is None:
+            return False
+        # The scheduler polls without the owner's identity, which only a fire assumes, so
+        # read the persisted status from session activity, which needs no caller access
+        # check. The fire itself still checks the session before it sends anything.
+        activity = await asyncio.to_thread(
+            deps.conversation_store.get_session_activity, [session_id]
+        )
+        session = activity.get(session_id)
+        if session is None:
+            return False
+        if _session_status_from_cache(session_id, session.live_status) != "running":
+            return False
+        runs, _ = await asyncio.to_thread(deps.scheduled_task_store.list_runs, task.id, limit=1)
+        return bool(runs) and task.next_run_at - runs[0].scheduled_at < BUSY_SKIP_MAX_SECONDS
+
+    return occurrence_busy
+
+
 def build_run_now(
     deps: FireDeps,
     *,

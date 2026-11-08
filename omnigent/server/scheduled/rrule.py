@@ -35,6 +35,9 @@ from omnigent.server.scheduled._bounded_rrule import RRuleSearchLimitError, iter
 # Connected hosts and continued sessions avoid provisioning a sandbox per fire.
 MIN_INTERVAL_SECONDS = 60 * 60
 MIN_SUBHOUR_INTERVAL_SECONDS = 10 * 60
+# The persistent scheduler skips a continued session's occurrences while the session is
+# busy (``build_occurrence_busy`` in fire.py), so continued sessions may poll this often.
+MIN_CONTINUED_INTERVAL_SECONDS = 2 * 60
 
 _UTC = ZoneInfo("UTC")
 
@@ -273,13 +276,14 @@ def validate_rrule(
     *,
     session_mode: str = "new",
     execution_target: str | None = None,
+    continued_minimum: int = MIN_CONTINUED_INTERVAL_SECONDS,
 ) -> RRuleTrigger:
     """Parse and validate an RRULE string for use as a recurring trigger.
 
     Beyond syntax, enforces that the rule (a) fires at least twice within the
-    search window and (b) has a minimum gap of at least
-    ten minutes for connected hosts or continued sessions, and one hour for
-    new sandbox sessions, between sampled consecutive fires.
+    search window and (b) has a minimum gap of at least *continued_minimum* for
+    continued sessions, ten minutes for new sessions on connected hosts, and one
+    hour for new sandbox sessions, between sampled consecutive fires.
 
     The interval check samples fires from a fixed UTC anchor, so the verdict is
     deterministic (independent of the wall-clock instant it runs at) and immune
@@ -288,9 +292,12 @@ def validate_rrule(
     :param rule_str: The RFC 5545 recurrence rule string.
     :param tz: Accepted for API compatibility but not used by the interval
         check, which is timezone-agnostic for the cadences we allow.
-    :param session_mode: Continued sessions permit the ten-minute minimum.
+    :param session_mode: Continued sessions permit *continued_minimum*.
     :param execution_target: Connected hosts also permit ten-minute new sessions.
         Omit to retain the conservative new-session hourly floor.
+    :param continued_minimum: Seconds between a continued session's runs. Callers
+        without busy skipping (the API during rollout, the legacy timers) pass
+        :data:`MIN_SUBHOUR_INTERVAL_SECONDS`.
     :returns: An :class:`RRuleTrigger`.
     :raises RRuleValidationError: On bad syntax, never-fires, fires-once, or a
         sub-minimum interval.
@@ -322,8 +329,10 @@ def validate_rrule(
     if count == 1:
         raise RRuleValidationError("RRULE fires only once")
     minimum = (
-        MIN_SUBHOUR_INTERVAL_SECONDS
-        if session_mode == "continue" or execution_target == "connected_host"
+        continued_minimum
+        if session_mode == "continue"
+        else MIN_SUBHOUR_INTERVAL_SECONDS
+        if execution_target == "connected_host"
         else MIN_INTERVAL_SECONDS
     )
     if min_gap < minimum:

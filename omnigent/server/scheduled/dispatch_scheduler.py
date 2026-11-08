@@ -358,6 +358,8 @@ FireIdentity = Callable[[ScheduledTask], AbstractAsyncContextManager[object]]
 DispatchEnabled = Callable[[], bool]
 # Read before each wait between polls.
 PollInterval = Callable[[], float]
+# Whether a due occurrence can be skipped, unrecorded, because the session it continues is busy.
+OccurrenceBusy = Callable[[ScheduledTask], Awaitable[bool]]
 
 
 class FireIdentityRevoked(Exception):
@@ -419,6 +421,7 @@ class PersistentTaskScheduler:
         owned_hosts: OwnedHosts = _owns_every_host,
         dispatch_enabled: DispatchEnabled = _always_enabled,
         poll_interval: PollInterval | None = None,
+        occurrence_busy: OccurrenceBusy | None = None,
         now: Callable[[], float] = time.time,
         poll_seconds: float = DEFAULT_SCHEDULER_CONFIG.poll_seconds,
         renewal_seconds: float = DEFAULT_SCHEDULER_CONFIG.renewal_seconds,
@@ -443,6 +446,7 @@ class PersistentTaskScheduler:
         self._owned_hosts = owned_hosts
         self._dispatch_enabled = dispatch_enabled
         self._poll_interval = poll_interval
+        self._occurrence_busy = occurrence_busy
         self._now = now
         self._poll_seconds = config.poll_seconds
         self._renewal_seconds = config.renewal_seconds
@@ -650,6 +654,49 @@ class PersistentTaskScheduler:
                 )
         if len(tasks) < self._batch_size:
             self._initialization_cursor = None
+
+    async def _skip_busy_occurrence(
+        self, task: ScheduledTask, *, now: int, next_run_at: int
+    ) -> bool:
+        """Advance past a due occurrence, recording no run, while its continued session is busy.
+
+        Returns True when this occurrence must not be claimed. A failed busy check
+        returns False, so the occurrence is sent as it would be without skipping.
+        """
+        if self._occurrence_busy is None:
+            return False
+        assert task.next_run_at is not None
+        try:
+            with workspace_scope(task.workspace_id):
+                busy = await self._occurrence_busy(task)
+        except Exception:
+            _logger.exception(
+                "Could not check whether task %s's session is busy; sending its prompt", task.id
+            )
+            return False
+        if not busy:
+            return False
+        with workspace_scope(task.workspace_id):
+            advanced = await asyncio.to_thread(
+                self._store.skip_scheduled_occurrence, task, now=now, next_run_at=next_run_at
+            )
+        _log_event(
+            _logger.info,
+            "Skipped occurrence %s of task %s: its session is still busy",
+            task.next_run_at,
+            task.id,
+            extra=debug_event(
+                "scheduled_run_skipped_busy",
+                task_id=task.id,
+                task_workspace_id=task.workspace_id,
+                scheduled_at=task.next_run_at,
+                trigger_key=scheduled_trigger_key(task.next_run_at),
+                target=task.execution_target,
+                advanced=advanced,
+            ),
+        )
+        # A task that changed since it was listed is re-read on the next poll.
+        return True
 
     async def _validate_schedule(self, task: ScheduledTask) -> bool:
         try:
@@ -870,6 +917,10 @@ class PersistentTaskScheduler:
                     next_run = await asyncio.to_thread(next_scheduled_time, task, now)
                     if self._stopped:
                         return
+                    if next_run is not None and await self._skip_busy_occurrence(
+                        task, now=now, next_run_at=next_run
+                    ):
+                        continue
                     with workspace_scope(task.workspace_id):
                         run = await asyncio.to_thread(
                             self._store.claim_scheduled_run,

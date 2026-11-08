@@ -1511,6 +1511,24 @@ def test_dispatch_mutations_require_workspace_scope(store: SqlAlchemyScheduledTa
     assert store.transition_starting_run(run, now=lambda: now + 30, status="failed") is None
 
 
+def test_skipping_an_occurrence_advances_the_schedule_without_a_run(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    now = task.next_run_at
+    assert store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 3600) is True
+    assert store.get(task.id).next_run_at == now + 3600
+    assert store.list_runs(task.id)[0] == []
+    # The listed snapshot is now stale, so neither a second skip nor a claim of it acts.
+    assert store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 7200) is False
+    claimed = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 7200, host_id=task.host_id, lease_seconds=120
+    )
+    assert claimed is None
+    assert store.get(task.id).next_run_at == now + 3600
+    assert store.list_runs(task.id)[0] == []
+
+
 def test_startup_lease_renewal_expiry_and_conditional_reconciliation(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:

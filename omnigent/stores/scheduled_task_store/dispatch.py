@@ -74,6 +74,15 @@ class ScheduledTaskDispatchStore(Protocol):
         """
         ...
 
+    def skip_scheduled_occurrence(
+        self, task: ScheduledTask, *, now: int, next_run_at: int
+    ) -> bool:
+        """Advance an unchanged task past its due occurrence without recording a run.
+
+        Returns False, changing nothing, if the task changed since it was listed.
+        """
+        ...
+
     def request_manual_run(
         self, task: ScheduledTask, *, now: int, trigger_key: str, host_id: str | None
     ) -> ScheduledTaskRun | None:

@@ -37,6 +37,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from omnigent.entities import ScheduledTask
 from omnigent.server.scheduled.rrule import (
+    MIN_SUBHOUR_INTERVAL_SECONDS,
     RRuleTrigger,
     RRuleValidationError,
     validate_rrule,
@@ -251,8 +252,12 @@ class ScheduledTaskScheduler:
 
     def _register(self, task: ScheduledTask) -> None:
         """Validate the task's rrule and arm its timer, replacing any existing."""
+        # Legacy timers fire every occurrence, so continued sessions keep the ten-minute floor.
         trigger = validate_rrule(
-            task.rrule, session_mode=task.session_mode, execution_target=task.execution_target
+            task.rrule,
+            session_mode=task.session_mode,
+            execution_target=task.execution_target,
+            continued_minimum=MIN_SUBHOUR_INTERVAL_SECONDS,
         )
         self.remove(task.id)  # replace_existing semantics
         job = _Job(

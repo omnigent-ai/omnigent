@@ -2481,3 +2481,45 @@ async def test_ten_minute_persisted_schedule_by_execution(store, session_mode, e
         executor.assert_not_awaited()
         assert saved.state == "paused"
         assert saved.next_run_at is None
+
+
+async def test_busy_continued_session_skips_its_occurrence_without_a_run(store, caplog) -> None:
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=2", session_mode="continue")
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    busy = AsyncMock(return_value=True)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, occurrence_busy=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    busy.assert_awaited_once_with(task)
+    fire.assert_not_awaited()
+    assert store.list_runs(task.id)[0] == []
+    saved = store.get(task.id)
+    assert saved.state == "active"
+    assert saved.next_run_at == task.next_run_at + 120
+    [skipped] = _events(caplog, "scheduled_run_skipped_busy")
+    assert skipped["scheduled_at"] == task.next_run_at
+    assert skipped["advanced"] is True
+
+
+@pytest.mark.parametrize(
+    "busy",
+    [AsyncMock(return_value=False), AsyncMock(side_effect=RuntimeError("status unavailable"))],
+    ids=["idle", "check-failed"],
+)
+async def test_idle_or_unknown_session_still_claims_its_occurrence(store, busy) -> None:
+    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=2", session_mode="continue")
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, occurrence_busy=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_awaited_once()
+    [run] = store.list_runs(task.id)[0]
+    assert run.scheduled_at == task.next_run_at
+    assert store.get(task.id).next_run_at == task.next_run_at + 120

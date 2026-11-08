@@ -39,12 +39,21 @@ from omnigent.server.routes._host_worktree import (
     worktree_root_fingerprint,
 )
 from omnigent.server.scheduled import fire as fire_mod
-from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+from omnigent.server.scheduled.fire import (
+    BUSY_SKIP_MAX_SECONDS,
+    FireDeps,
+    build_occurrence_busy,
+    build_on_fire,
+    build_run_now,
+)
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    SessionActivity,
+)
 from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
@@ -3922,3 +3931,43 @@ def test_session_unattended_disallowed_mode(
     conv = SimpleNamespace(labels=labels, terminal_launch_args=launch_args)
 
     assert fire_mod.session_unattended_disallowed_mode(conv) == expected
+
+
+def _occurrence_busy_check(live_status: str | None, last_scheduled_at: int | None):
+    """The busy check over one session's persisted status and the task's latest run."""
+    session_id = "sess_busy_check"
+    activity = (
+        {} if live_status is None else {session_id: SessionActivity(0, live_status=live_status)}
+    )
+    runs = [] if last_scheduled_at is None else [Mock(scheduled_at=last_scheduled_at)]
+    sched_store = Mock(list_runs=Mock(return_value=(runs, None)))
+    conversation_store = Mock(get_session_activity=Mock(return_value=activity))
+    return build_occurrence_busy(_deps(sched_store, conversation_store=conversation_store))
+
+
+@pytest.mark.parametrize(
+    ("session_mode", "live_status", "minutes_since_last_run", "busy"),
+    [
+        pytest.param("continue", "running", 2, True, id="turn-in-progress"),
+        pytest.param("continue", "waiting", 9, True, id="waiting-on-approval"),
+        pytest.param(
+            "continue", "running", BUSY_SKIP_MAX_SECONDS // 60, False, id="ten-minute-backstop"
+        ),
+        pytest.param("continue", "idle", 2, False, id="idle"),
+        pytest.param("continue", None, 2, False, id="session-gone"),
+        pytest.param("continue", "running", None, False, id="no-earlier-run"),
+        pytest.param("new", "running", 2, False, id="new-session-each-run"),
+    ],
+)
+async def test_occurrence_is_busy_only_while_its_continued_session_runs(
+    session_mode, live_status, minutes_since_last_run, busy
+) -> None:
+    due = 1_800_003_600
+    last = None if minutes_since_last_run is None else due - minutes_since_last_run * 60
+    check = _occurrence_busy_check(live_status, last)
+    task = _task(
+        session_mode=session_mode,
+        session_id="sess_busy_check" if session_mode == "continue" else None,
+        next_run_at=due,
+    )
+    assert await check(task) is busy
