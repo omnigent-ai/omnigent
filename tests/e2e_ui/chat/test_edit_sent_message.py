@@ -2,7 +2,7 @@
 
 The bubble's Edit button hands its text and attachments to the composer of
 the same pane; the original bubble and history stay. Sending is an ordinary
-new message, steered like any other when the agent is mid-turn. Component
+new message, sent mid-turn like any other while the agent works. Component
 tests cover the input matrix (draft confirmation, pending, other authors,
 read-only, failed downloads); these drive the real server, runner and file
 store through the browser.
@@ -126,12 +126,15 @@ def test_edit_sent_message_with_image_and_send_revision(
     _pause(page)
 
 
-def test_edit_while_agent_runs_does_not_stop_it_and_send_steers(
+def test_edit_while_agent_runs_does_not_stop_it_and_sends_mid_turn(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """Edit mid-turn leaves the turn running; sending the revision steers it."""
+    """Edit mid-turn leaves the turn running, and the revision sends while it runs.
+
+    What the runtime does with a mid-turn message is covered by test_always_steer.
+    """
     base_url, session_id = seeded_session
     original = "edit-e2e-c1 Draft the release announcement"
     revised = "edit-e2e-c2 Draft the release announcement for customers"
@@ -240,7 +243,6 @@ def test_edit_in_side_chat_fills_the_side_chat_composer(
         expect(side_input).to_have_value(question)
         expect(side_input).to_be_focused()
         expect(main_composer).to_have_value("")
-        _pause(page)
         _pause(page)
     finally:
         if not page.is_closed():

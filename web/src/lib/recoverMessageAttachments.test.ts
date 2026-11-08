@@ -32,6 +32,24 @@ describe("recoverMessageAttachments", () => {
     expect(missing).toEqual(["upload.csv", "remote.png"]);
   });
 
+  it("keeps what it recovered when other attachments fail", async () => {
+    vi.spyOn(filesApi, "downloadSessionFile").mockImplementation(async (_session, fileId, name) => {
+      if (fileId === "file_ok") return new File(["ok"], name);
+      throw new Error("404");
+    });
+
+    const { files, missing } = await recoverMessageAttachments("conv_1", [
+      { type: "input_file", file_id: "file_gone", filename: "gone.txt" },
+      { type: "input_file", file_id: "file_ok", filename: "ok.txt" },
+      { type: "input_image", image_url: "data:image/png;base64,%%%", filename: "broken.png" },
+      // A non-string filename from an imported transcript is labelled by its file id.
+      { type: "input_file", file_id: "file_odd", filename: 42 as unknown as string },
+    ]);
+
+    expect(files.map((file) => file.name)).toEqual(["ok.txt"]);
+    expect(missing).toEqual(["gone.txt", "broken.png", "file_odd"]);
+  });
+
   it("can't download without the session it was sent in", async () => {
     const download = vi.spyOn(filesApi, "downloadSessionFile");
     const result = await recoverMessageAttachments(null, [

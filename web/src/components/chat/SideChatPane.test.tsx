@@ -194,31 +194,46 @@ describe("editing a sent side-chat message", () => {
     expect(sentFiles?.map((file) => file.name)).toEqual(["build.log"]);
   });
 
-  it("asks before replacing the side chat's draft", async () => {
+  it("asks before replacing the side chat's draft and downloads only after Replace", async () => {
     seedSentMessage();
-    vi.spyOn(filesApi, "downloadSessionFile").mockRejectedValue(new Error("gone"));
-    useChatStore.setState({
-      sideChatComposers: {
-        [childId]: { text: "", files: [], quotes: [{ id: "q", before: "", text: "quoted" }] },
-      },
-    });
+    const download = vi.spyOn(filesApi, "downloadSessionFile").mockRejectedValue(new Error("gone"));
+    const toasts: unknown[] = [];
+    const recordToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", recordToast);
+    const draft = { text: "", files: [], quotes: [{ id: "q", before: "", text: "quoted" }] };
+    useChatStore.setState({ sideChatComposers: { [childId]: draft } });
     renderPane(<SideChatPane childId={childId} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-    fireEvent.click(
-      within(await screen.findByRole("dialog", { name: "Replace your draft?" })).getByRole(
-        "button",
-        { name: "Replace draft" },
-      ),
-    );
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      fireEvent.click(
+        within(await screen.findByRole("dialog", { name: "Replace your draft?" })).getByRole(
+          "button",
+          { name: "Keep draft" },
+        ),
+      );
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(download).not.toHaveBeenCalled();
+      expect(useChatStore.getState().sideChatComposers[childId]?.quotes).toEqual(draft.quotes);
 
-    await waitFor(() =>
-      expect(screen.getByTestId("side-chat-input")).toHaveValue("Why did this build fail?"),
-    );
-    expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({
-      quotes: [],
-      files: [],
-    });
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+      expect(download).not.toHaveBeenCalled();
+      fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
+
+      await waitFor(() =>
+        expect(screen.getByTestId("side-chat-input")).toHaveValue("Why did this build fail?"),
+      );
+      expect(download).toHaveBeenCalledOnce();
+      expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({
+        quotes: [],
+        files: [],
+      });
+      expect(toasts).toEqual(["Couldn't copy build.log. Attach again before you send."]);
+      await waitFor(() => expect(screen.getByTestId("side-chat-input")).toHaveFocus());
+    } finally {
+      window.removeEventListener("omnigent:toast", recordToast);
+    }
   });
 
   it("is not offered in a read-only side chat", () => {

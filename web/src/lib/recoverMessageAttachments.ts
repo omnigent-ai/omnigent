@@ -1,4 +1,9 @@
-import { imagePreview, PENDING_FILE_PREFIX, type MessageContentBlock } from "@/lib/blocks";
+import {
+  attachmentLabel,
+  imagePreview,
+  PENDING_FILE_PREFIX,
+  type MessageContentBlock,
+} from "@/lib/blocks";
 import { downloadSessionFile } from "@/lib/filesApi";
 
 /**
@@ -18,12 +23,15 @@ export async function recoverMessageAttachments(
   );
   const results = await Promise.allSettled(
     attachments.map(async (block) => {
+      // Imported transcripts can hold any type in these fields.
+      const filename = typeof block.filename === "string" ? block.filename : undefined;
       if (block.type === "input_image") {
         const preview = imagePreview(block);
-        if (preview.kind === "inline") return decodeDataUri(preview.src, block.filename);
+        if (preview.kind === "inline") return decodeDataUri(preview.src, filename);
       }
-      if (sessionId !== null && block.file_id && !block.file_id.startsWith(PENDING_FILE_PREFIX)) {
-        return downloadSessionFile(sessionId, block.file_id, block.filename ?? "attachment");
+      const fileId = typeof block.file_id === "string" ? block.file_id : "";
+      if (sessionId !== null && fileId && !fileId.startsWith(PENDING_FILE_PREFIX)) {
+        return downloadSessionFile(sessionId, fileId, filename ?? "attachment");
       }
       throw new Error("no uploaded file");
     }),
@@ -32,7 +40,7 @@ export async function recoverMessageAttachments(
   const missing: string[] = [];
   results.forEach((result, index) => {
     if (result.status === "fulfilled") files.push(result.value);
-    else missing.push(attachments[index]!.filename ?? "an attachment");
+    else missing.push(attachmentLabel(attachments[index]!));
   });
   return { files, missing };
 }

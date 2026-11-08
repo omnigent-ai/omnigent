@@ -7105,11 +7105,12 @@ describe("Composer — editing a sent message", () => {
 
     act(() => ref.current?.editSentMessage(sentMessage));
     const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    expect(fetchMock).not.toHaveBeenCalled();
     fireEvent.click(within(dialog).getByRole("button", { name: "Keep draft" }));
 
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(textarea()).toHaveValue("half-written thought");
-    // The missing-attachment warning belongs to a load that was applied.
+    expect(fetchMock).not.toHaveBeenCalled();
     expect(toasts).toEqual([]);
 
     act(() => ref.current?.editSentMessage(sentMessage));
@@ -7118,7 +7119,51 @@ describe("Composer — editing a sent message", () => {
     );
 
     await waitFor(() => expect(textarea()).toHaveValue("Summarize these"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(textarea()).toHaveFocus();
     expect(screen.getByText("notes.txt")).toBeInTheDocument();
+  });
+
+  it("keeps the dialog open while a confirmed replacement downloads", async () => {
+    let finishDownload: () => void = () => {};
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishDownload = () => resolve(new Response("meeting notes"));
+        }),
+    );
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+
+    act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
+
+    expect(within(dialog).getByRole("button", { name: "Replacing…" })).toBeDisabled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(textarea()).toHaveValue("half-written thought");
+    await act(async () => finishDownload());
+
+    await waitFor(() => expect(textarea()).toHaveValue("Summarize these"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+  });
+
+  it("dismisses a pending confirmation when the conversation changes", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+    act(() => ref.current?.editSentMessage(sentMessage));
+    await screen.findByRole("dialog", { name: "Replace your draft?" });
+
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    act(() => useChatStore.setState({ conversationId: CONV }));
+
+    await act(async () => {});
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(textarea()).toHaveValue("half-written thought");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("asks about a draft typed while the attachments download", async () => {
@@ -7178,6 +7223,7 @@ describe("Composer — editing a sent message", () => {
     expect(textarea()).toHaveValue("");
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
+    expect(toasts).toEqual(["The composer can't take a message right now."]);
   });
 });
 

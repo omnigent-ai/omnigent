@@ -3685,6 +3685,16 @@ function ComposerImpl(
   // User edits and quote changes leave recall mode.
   const recallingRef = useRef(false);
 
+  // Replace the draft with a message brought back for editing, and focus it.
+  const loadIntoComposer = (text: string, loadedFiles: File[], replyDraft?: StoredReplyDraft) => {
+    replaceText(text, replyDraft);
+    dirtyRef.current = true;
+    resetCursor();
+    recallingRef.current = false;
+    textareaRef.current = tailTextareaRef.current;
+    restoreFiles(loadedFiles);
+    textareaRef.current?.focus();
+  };
   // Reply quotes and edited messages may only land in a composer that can send.
   const acceptsInsertedContent = () =>
     !(disabled || isReadOnly || (unreachable && !sendReconnectsArca) || composerLockedByBtw);
@@ -3693,18 +3703,12 @@ function ComposerImpl(
     canAccept: acceptsInsertedContent,
     hasDraft: () => hasDraft,
     applyDraft: (edited) => {
-      // Same handoff as a queued message's Edit, plus its "@"-mentions.
-      replaceText(edited.text);
-      dirtyRef.current = true;
-      resetCursor();
-      recallingRef.current = false;
-      textareaRef.current = tailTextareaRef.current;
-      restoreFiles(edited.files);
       setMentionedItems(edited.mentions);
       setCommandError(null);
       dismissMention();
-      textareaRef.current?.focus();
+      loadIntoComposer(edited.text, edited.files);
     },
+    focusComposer: () => textareaRef.current?.focus(),
   });
 
   const replyQuoteInsertedRef = useRef(false);
@@ -4149,14 +4153,8 @@ function ComposerImpl(
             // Re-sending re-queues it (busy) or sends it (idle).
             const target = queuedMessages.find((m) => m.queueId === queueId);
             if (!target) return;
-            replaceText(target.text, target.replyDraft);
-            dirtyRef.current = true;
-            resetCursor();
-            recallingRef.current = false;
-            textareaRef.current = tailTextareaRef.current;
-            restoreFiles(target.files ?? []);
             dequeueMessage(queueId);
-            textareaRef.current?.focus();
+            loadIntoComposer(target.text, target.files ?? [], target.replyDraft);
           }}
           onSteer={(queueId) => steerMessage(queueId)}
           onReorder={reorderQueuedMessage}

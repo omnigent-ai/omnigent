@@ -238,6 +238,11 @@ export function SideChatPane({
         quotes: [],
         autoFocus: true,
       })),
+    focusComposer: () =>
+      useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+        ...current,
+        autoFocus: true,
+      })),
   });
 
   // Hide the forked-in history: snapshot the item ids present once hydration

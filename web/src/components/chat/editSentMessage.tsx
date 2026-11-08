@@ -40,25 +40,32 @@ export interface EditedDraft {
  */
 export const EditSentMessageContext = createContext<((message: SentMessage) => void) | null>(null);
 
-/** A recovered message waiting for the user to confirm it may replace their draft. */
+type RecoveredAttachments = Awaited<ReturnType<typeof recoverMessageAttachments>>;
+
+/** A message waiting for the user to confirm it may replace their draft. */
 interface PendingReplacement {
   target: string | null;
-  draft: EditedDraft;
-  missing: string[];
+  message: SentMessage;
+  /** Already downloaded when the draft was typed during the download. */
+  recovered: RecoveredAttachments | null;
+  /** Confirmed, and downloading the attachments. */
+  replacing: boolean;
 }
 
 /**
  * Load a sent message into a composer, confirming first when a draft would be replaced.
  *
- * Attachments download before the draft check, so a draft typed during the
- * download still gets the confirmation. A newer Edit click, a change of
- * `target`, or unmounting drops a load still in flight.
+ * A draft present at click is confirmed before anything downloads; the dialog
+ * stays open while a confirmed download runs. A draft typed during an
+ * unconfirmed download gets the dialog once it finishes. A newer Edit, Keep
+ * draft, a change of `target`, or unmounting drops a download still in flight.
  *
  * @param target - Identifies the draft the composer is showing (its conversation).
  * @param canAccept - Whether the composer can take a message now; read at click
  *   and again before anything is applied.
  * @param hasDraft - Whether the composer holds unsent input.
  * @param applyDraft - Replaces the composer's draft and focuses it.
+ * @param focusComposer - Focuses the composer again once the dialog has closed.
  * @returns `editMessage` for {@link EditSentMessageContext}, and the confirmation
  *   dialog to render.
  */
@@ -67,61 +74,108 @@ export function useEditSentMessage({
   canAccept,
   hasDraft,
   applyDraft,
+  focusComposer,
 }: {
   target: string | null;
   canAccept: () => boolean;
   hasDraft: () => boolean;
   applyDraft: (draft: EditedDraft) => void;
+  focusComposer: () => void;
 }): { editMessage: (message: SentMessage) => void; confirmDialog: ReactNode } {
   const [pending, setPending] = useState<PendingReplacement | null>(null);
-  const latestRef = useRef({ target, canAccept, hasDraft, applyDraft });
-  latestRef.current = { target, canAccept, hasDraft, applyDraft };
+  const latestRef = useRef({ target, canAccept, hasDraft, applyDraft, focusComposer });
+  latestRef.current = { target, canAccept, hasDraft, applyDraft, focusComposer };
   const loadSequenceRef = useRef(0);
+  // Set once a draft is applied, so the closing dialog hands focus to the composer.
+  const appliedRef = useRef(false);
   useEffect(
     () => () => {
       loadSequenceRef.current += 1;
+      setPending(null);
     },
     [target],
   );
 
-  const apply = useCallback((draft: EditedDraft, missing: string[]) => {
+  const apply = useCallback((message: SentMessage, { files, missing }: RecoveredAttachments) => {
     if (missing.length > 0) {
       showToast(`Couldn't copy ${missing.join(", ")}. Attach again before you send.`);
     }
-    latestRef.current.applyDraft(draft);
+    appliedRef.current = true;
+    latestRef.current.applyDraft({ text: message.text, files, mentions: message.mentions });
   }, []);
 
-  const editMessage = useCallback(
-    (message: SentMessage) => {
-      const start = latestRef.current;
-      if (!start.canAccept()) return;
+  const load = useCallback(
+    (message: SentMessage, confirmed: boolean) => {
       const sequence = ++loadSequenceRef.current;
-      setPending(null);
-      void recoverMessageAttachments(message.sessionId, message.content).then(
-        ({ files, missing }) => {
+      const startTarget = latestRef.current.target;
+      recoverMessageAttachments(message.sessionId, message.content)
+        .then((recovered) => {
+          if (sequence !== loadSequenceRef.current) return;
           const latest = latestRef.current;
-          const superseded = sequence !== loadSequenceRef.current || latest.target !== start.target;
-          if (superseded || !latest.canAccept()) return;
-          const draft = { text: message.text, files, mentions: message.mentions };
-          if (latest.hasDraft()) setPending({ target: latest.target, draft, missing });
-          else apply(draft, missing);
-        },
-      );
+          if (latest.target !== startTarget || !latest.canAccept()) {
+            setPending(null);
+          } else if (!confirmed && latest.hasDraft()) {
+            setPending({ target: latest.target, message, recovered, replacing: false });
+          } else {
+            setPending(null);
+            apply(message, recovered);
+          }
+        })
+        .catch(() => {
+          if (sequence !== loadSequenceRef.current) return;
+          setPending(null);
+          showToast("Couldn't load that message into the composer.");
+        });
     },
     [apply],
   );
 
-  const awaitingConfirmation = pending !== null && pending.target === target;
+  const editMessage = useCallback(
+    (message: SentMessage) => {
+      const latest = latestRef.current;
+      appliedRef.current = false;
+      if (!latest.canAccept()) {
+        showToast("The composer can't take a message right now.");
+        return;
+      }
+      if (latest.hasDraft()) {
+        loadSequenceRef.current += 1;
+        setPending({ target: latest.target, message, recovered: null, replacing: false });
+      } else {
+        setPending(null);
+        load(message, false);
+      }
+    },
+    [load],
+  );
+
+  const current = pending !== null && pending.target === target ? pending : null;
   const confirmDialog = (
     <ReplaceDraftDialog
-      open={awaitingConfirmation}
+      open={current !== null}
+      replacing={current?.replacing ?? false}
+      onCloseAutoFocus={(event) => {
+        // The open dialog traps the composer's own focus call.
+        if (!appliedRef.current) return;
+        event.preventDefault();
+        latestRef.current.focusComposer();
+      }}
       onConfirm={() => {
-        setPending(null);
-        if (awaitingConfirmation && latestRef.current.canAccept()) {
-          apply(pending.draft, pending.missing);
+        if (current === null || current.replacing) return;
+        if (!latestRef.current.canAccept()) {
+          setPending(null);
+        } else if (current.recovered !== null) {
+          setPending(null);
+          apply(current.message, current.recovered);
+        } else {
+          setPending({ ...current, replacing: true });
+          load(current.message, true);
         }
       }}
-      onCancel={() => setPending(null)}
+      onCancel={() => {
+        loadSequenceRef.current += 1;
+        setPending(null);
+      }}
     />
   );
   return { editMessage, confirmDialog };
@@ -129,16 +183,20 @@ export function useEditSentMessage({
 
 function ReplaceDraftDialog({
   open,
+  replacing,
+  onCloseAutoFocus,
   onConfirm,
   onCancel,
 }: {
   open: boolean;
+  replacing: boolean;
+  onCloseAutoFocus: (event: Event) => void;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onCancel()}>
-      <DialogContent>
+      <DialogContent onCloseAutoFocus={onCloseAutoFocus}>
         <DialogHeader>
           <DialogTitle>Replace your draft?</DialogTitle>
           <DialogDescription>
@@ -150,7 +208,9 @@ function ReplaceDraftDialog({
           <Button variant="outline" onClick={onCancel}>
             Keep draft
           </Button>
-          <Button onClick={onConfirm}>Replace draft</Button>
+          <Button onClick={onConfirm} disabled={replacing}>
+            {replacing ? "Replacing…" : "Replace draft"}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
