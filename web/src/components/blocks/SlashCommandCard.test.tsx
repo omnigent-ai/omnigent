@@ -8,6 +8,23 @@ import { SlashCommandCard } from "./SlashCommandCard";
 afterEach(cleanup);
 
 describe("SlashCommandCard", () => {
+  it.each(["claude-native-ui", "codex-native-ui"])(
+    "hides the %s namespace in the skill label and tooltip",
+    (agentName) => {
+      render(
+        <SlashCommandCard
+          kind="skill"
+          name={`${agentName}:build-summary`}
+          arguments="src/main.ts"
+          output={null}
+        />,
+      );
+      const card = screen.getByTestId("slash-command-card");
+      expect(card.textContent).toBe("Skill build-summary src/main.ts");
+      expect(card.getAttribute("title")).toBe("Skill build-summary src/main.ts");
+    },
+  );
+
   it("renders the 'Skill' framing + name with no payload", () => {
     render(
       <SlashCommandCard kind="skill" name="dev-productivity:simplify" arguments="" output={null} />,
