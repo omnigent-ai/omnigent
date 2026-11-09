@@ -264,13 +264,11 @@ it.
   Daytona's sandbox boundaries, and the shared org key can enumerate
   and delete any user's sandbox. Same single-tenant-org shape as the
   Modal provider; scope the org to this workload and nothing else.
-- **The launch token's lifetime is 7 days.** Daytona sandboxes have no
-  platform lifetime cap, so the per-launch host token must outlive a
-  long-running sandbox across tunnel reconnects — a longer window than
-  Modal's ~25h. A leaked token is replayable against the server for
-  that window; a relaunch mints a fresh one. Deployments injecting
-  their own launcher can set a shorter `token_ttl_s` on
-  `ManagedSandboxConfig` if their sandboxes are short-lived.
+- **The host token's default validity window is 7 days.** Connected hosts
+  renew the same token halfway through that window, extending the validity
+  of any leaked copy too. Disconnected tokens expire after the last renewal
+  plus that window; a relaunch mints a fresh token. Admins can override the
+  window with [`sandbox.token_ttl_s`](../README.md#run-hosts-in-cloud-sandboxes).
 - **The Tier 1/2 relay workaround is a TLS-terminating MITM.** A relay
   on an allowlisted wildcard domain (`*.vercel.app` / `*.workers.dev`)
   must be an L7 service — it terminates TLS and re-originates, so it

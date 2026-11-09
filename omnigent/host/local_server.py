@@ -277,6 +277,25 @@ def _read_local_server_pid_file() -> tuple[int, int] | None:
         return None
 
 
+def local_server_still_serves(server_url: str) -> bool:
+    """Whether this data dir's recorded local server is alive on *server_url*'s port.
+
+    Probe-free: a ``/health`` answer cannot tell our server from another data
+    dir's server that took the port after ours exited.
+
+    :param server_url: Loopback URL the daemon connected to, e.g.
+        ``"http://127.0.0.1:6767"``.
+    :returns: ``True`` while the pidfile names a live process on that port.
+    """
+    from urllib.parse import urlsplit
+
+    existing = _read_local_server_pid_file()
+    if existing is None:
+        return False
+    pid, port = existing
+    return urlsplit(server_url).port == port and _pid_alive(pid)
+
+
 def local_server_url_if_healthy() -> str | None:
     """Return the URL of a live, reused local server, else ``None``.
 

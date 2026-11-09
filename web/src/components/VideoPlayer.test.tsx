@@ -16,12 +16,14 @@ import {
   downloadWorkspaceFile,
   fetchWorkspaceFileBlob,
   useFileContent,
+  workspaceFileMediaUrl,
 } from "@/hooks/useFileContent";
 
 vi.mock("@/hooks/useFileContent", () => ({
   fetchWorkspaceFileBlob: vi.fn(),
   downloadWorkspaceFile: vi.fn(),
   useFileContent: vi.fn(),
+  workspaceFileMediaUrl: vi.fn(),
 }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
@@ -38,6 +40,8 @@ beforeEach(() => {
   vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
   vi.mocked(parseVideoChapters).mockResolvedValue([]);
   fetchBlob.mockResolvedValue(new Blob(["video"], { type: "video/webm" }));
+  // No host media resolver by default, so playback uses the fetched object URL.
+  vi.mocked(workspaceFileMediaUrl).mockReturnValue(null);
   vi.mocked(useFileContent).mockReturnValue({ data: undefined } as ReturnType<
     typeof useFileContent
   >);
@@ -249,6 +253,18 @@ describe("VideoPlayer", () => {
     unmount();
     expect(video.pause).toHaveBeenCalledOnce();
     expect(revokeUrl).toHaveBeenCalledWith("blob:recording");
+  });
+
+  it("plays from the host's direct media URL on Play without fetching an object URL", () => {
+    // A host whose CSP blocks blob: media (the Databricks workspace) supplies a loadable URL.
+    vi.mocked(workspaceFileMediaUrl).mockReturnValue("/api/demo.webm?download=true");
+    const { container } = render(<VideoPlayer {...props} />);
+    expect(workspaceFileMediaUrl).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
+    expect(workspaceFileMediaUrl).toHaveBeenCalledWith("sess_1", "demo.webm");
+    expect(container.querySelector("video")).toHaveAttribute("src", "/api/demo.webm?download=true");
+    expect(fetchBlob).not.toHaveBeenCalled();
+    expect(createUrl).not.toHaveBeenCalled();
   });
 
   it("keeps download available when loading fails and can retry", async () => {

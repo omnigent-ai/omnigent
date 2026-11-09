@@ -8,8 +8,9 @@
 import { useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { withBasePath } from "@/lib/basePath";
-import { isDatabricksWorkspace } from "@/lib/host";
+import { isDatabricksWorkspace, resolveMediaUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
+import { getSessionHost, isHostKeyless } from "@/lib/sessionHost";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
@@ -59,6 +60,25 @@ function workspaceFileUrl(
     `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${browseLocationSegment(path)}` +
     (params ? `?${params}` : "")
   );
+}
+
+/**
+ * The host's directly loadable URL for a workspace file's raw bytes, or null
+ * when media must be fetched through the authenticated transport instead.
+ *
+ * A `<video src>` load sends no request headers, so the session host's routing
+ * key rides `?omnigent_slice_key=`, as the terminal attach WebSocket does. A
+ * host already proven to route keyless is left unkeyed, matching
+ * `authenticatedFetch`.
+ *
+ * :param conversationId: The session/conversation ID, e.g. ``"sess_abc123"``.
+ * :param path: Workspace-relative or host-absolute file path.
+ */
+export function workspaceFileMediaUrl(conversationId: string, path: string): string | null {
+  const query: Record<string, string> = { download: "true" };
+  const hostId = getSessionHost(conversationId);
+  if (hostId && !isHostKeyless(hostId)) query.omnigent_slice_key = hostId;
+  return resolveMediaUrl(workspaceFileUrl(conversationId, path, query));
 }
 
 /** Read complete media bytes through the host's authenticated transport, with cancellation. */
