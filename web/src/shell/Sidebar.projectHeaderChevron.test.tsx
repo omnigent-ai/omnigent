@@ -80,6 +80,8 @@ describe("project folder header icon/chevron", () => {
       "sidebar-compact-text",
       "text-foreground",
     );
+    // Project names sit heavier than the regular-weight session rows below.
+    expect(within(header).getByText("My Project")).toHaveClass("font-medium");
 
     const folder = header.querySelector(".lucide-folder") as HTMLElement;
     expect(folder).not.toBeNull();

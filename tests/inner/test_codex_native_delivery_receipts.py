@@ -15,6 +15,7 @@ import omnigent.inner.codex_native_executor as native_executor
 from omnigent.harnesses.codex_native.app_server import CodexAppServerClient, CodexParams
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
+    read_bridge_startup_failure,
     read_bridge_state,
     write_bridge_state,
 )
@@ -47,6 +48,9 @@ from omnigent.server.schemas import CreateResponseRequest
         "cancel-read",
         "no-server-id",
         "explicit-rejection",
+        "reply-timeout-exact",
+        "reply-timeout-other-id",
+        "reply-timeout-session-replaced",
     ],
 )
 async def test_native_receipt_requires_exact_delivery_identity(
@@ -57,9 +61,12 @@ async def test_native_receipt_requires_exact_delivery_identity(
     ordering: list[str] = []
     read_waiting = asyncio.Event()
     receipt_file = tmp_path / "native-history.json"
-    confirmed = receipt_kind in {"exact", "native-failed"} or (
+    confirmed = receipt_kind in {"exact", "native-failed", "reply-timeout-exact"} or (
         receipt_kind == "different-turn" and method == "turn/start"
     )
+    reply_timeout = receipt_kind.startswith("reply-timeout-")
+    if reply_timeout:
+        monkeypatch.setattr(native_executor, "_DELIVERY_RPC_TIMEOUT_SECONDS", 0.1, raising=False)
     if receipt_kind == "read-timeout":
         monkeypatch.setattr(native_executor, "_DELIVERY_RECEIPT_TIMEOUT_SECONDS", 0.05)
 
@@ -74,7 +81,7 @@ async def test_native_receipt_requires_exact_delivery_identity(
                 native_id = request["params"].get("clientUserMessageId")
                 if receipt_kind == "old-cli-no-id":
                     native_id = None
-                elif receipt_kind == "same-text-other-id":
+                elif receipt_kind in {"same-text-other-id", "reply-timeout-other-id"}:
                     native_id = "d" * 32
                 receipt_file.write_text(
                     json.dumps(
@@ -114,7 +121,7 @@ async def test_native_receipt_requires_exact_delivery_identity(
                 state = read_bridge_state(tmp_path)
                 assert state is not None
                 state = replace(state, active_turn_id="turn_newer")
-                if receipt_kind == "session-before-read":
+                if receipt_kind in {"session-before-read", "reply-timeout-session-replaced"}:
                     state = replace(state, session_id="conv_other")
                 write_bridge_state(tmp_path, state)
                 if receipt_kind == "explicit-rejection":
@@ -128,6 +135,9 @@ async def test_native_receipt_requires_exact_delivery_identity(
                     )
                     continue
                 ordering.append("rpc_reply_lost")
+                if reply_timeout:
+                    await websocket.wait_closed()
+                    return
                 websocket.transport.abort()
                 return
             result = json.loads(receipt_file.read_text()) if rpc_method == "thread/read" else {}
@@ -196,6 +206,7 @@ async def test_native_receipt_requires_exact_delivery_identity(
         "session-before-read",
         "no-server-id",
         "explicit-rejection",
+        "reply-timeout-session-replaced",
     }
     assert requests.count("thread/read") == int(should_probe)
     if receipt_kind not in {"explicit-rejection", "cancel-read"}:
@@ -208,6 +219,7 @@ async def test_native_receipt_requires_exact_delivery_identity(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_newer"
+    assert read_bridge_startup_failure(tmp_path) is None
 
 
 def _lost_reply_setup(

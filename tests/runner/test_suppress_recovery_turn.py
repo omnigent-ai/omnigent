@@ -28,6 +28,7 @@ from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.session_history import CANCELLATION_MARKER_TEXT
 from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
 )
@@ -307,6 +308,46 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
             "Expected two harness calls total (recovery turn + forward-triggered turn); "
             f"got {len(harness.posted_bodies)}"
         )
+
+
+class _StoppedTurnServerClient(_HistoryServerClient):
+    """History of a turn the user stopped: the request, then Stop's cancellation marker."""
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        del kwargs
+        if url.rstrip("/").endswith("/items"):
+            marker = {
+                "id": "msg_002",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": CANCELLATION_MARKER_TEXT}],
+            }
+            return self._Resp({**_ITEMS_PAGE, "data": [_PENDING_USER_MESSAGE, marker]})
+        return self._Resp({})
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_turn_starts_no_recovery_turn(caplog: pytest.LogCaptureFixture) -> None:
+    """A history ending on Stop's cancellation marker has nothing to resume on reconnect.
+
+    Reconnect host (``retry_session``) relaunches the runner without
+    ``suppress_recovery_turn``; it must not call the model for a turn the user stopped.
+    """
+    app, _pm, harness = _build_sdk_app(_StoppedTurnServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=False),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+        await asyncio.sleep(0.1)
+
+    assert harness.posted_bodies == []
+    (init_row,) = _init_rows(caplog)
+    assert init_row["recovery_turn"] == "none"
+    assert init_row["history_len"] == 2
 
 
 @pytest.mark.asyncio

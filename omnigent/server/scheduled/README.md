@@ -194,7 +194,8 @@ If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run
 never finds a recorded session it cannot continue. Of two first runs, the one that records
-second deletes its unused session and records `skipped`.
+second deletes its unused session and sends its prompt into the recorded session
+through the normal continuation path. Each run keeps its own prompt and run record.
 Sandbox tasks accept an optional repository URL in `workspace`, validated with
 the same repository grammar as a new sandbox session. The selected repository is
 passed to sandbox launch and recorded in the session's repository labels for

@@ -6,11 +6,18 @@ import {
   describeLinearFilter,
   describeSlackFilter,
   isTriggerPrompt,
+  readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerPrompt,
+  slackChannels,
+  slackPeople,
   splitTriggerPrompt,
+  stripScopePrefix,
   splitJqlOrderBy,
+  triggerConditionFields,
   triggerFieldsComplete,
+  updateTriggerWorkerSettings,
+  withTriggerEvent,
   TRIGGER_SOURCES,
   type TriggerCondition,
   type TriggerFields,
@@ -39,6 +46,92 @@ function fields(overrides: Partial<TriggerFields> = {}): TriggerFields {
 const JQL = 'project = "ES" AND labels = "omnigent"';
 
 describe("saved trigger prompts", () => {
+  it.each(TRIGGER_SOURCES)(
+    "edits %s worker settings without changing authored instructions",
+    (source) => {
+      const original = renderTriggerPrompt(source, fields(), {
+        ...CTX,
+        model: "old-model",
+        effort: "high",
+      }).replace("Each run:", "Keep this custom instruction.\n\nEach run:");
+      expect(readTriggerWorkerSettings(original)).toEqual({
+        agentId: null,
+        model: "old-model",
+        effort: "high",
+      });
+      const settings = { agentId: "worker-agent", model: 'model-with-"quotes"', effort: "low" };
+      const updated = updateTriggerWorkerSettings(original, settings)!;
+      expect(readTriggerWorkerSettings(updated)).toEqual(settings);
+      expect(updated).toContain('agent_id "worker-agent", placement "same_host"');
+      expect(updated).toContain('model "model-with-\\"quotes\\"", reasoning_effort "low"');
+      expect(updated).toContain("Keep this custom instruction.");
+      expect(splitTriggerPrompt(updated).userPrompt).toBe(splitTriggerPrompt(original).userPrompt);
+      expect(
+        updateTriggerWorkerSettings(updated, { agentId: null, model: "old-model", effort: "high" }),
+      ).toBe(original);
+      const defaults = updateTriggerWorkerSettings(updated, {
+        agentId: null,
+        model: "",
+        effort: "",
+      })!;
+      expect(readTriggerWorkerSettings(defaults)).toEqual({ agentId: null, model: "", effort: "" });
+      expect(defaults).not.toContain('reasoning_effort "low"');
+    },
+  );
+
+  it("leaves customized or ambiguous worker calls unchanged", () => {
+    const prompt = renderTriggerPrompt("jira", fields(), CTX);
+    const call = prompt.match(/call sys_session_create with [^\n]+?8000 characters\./)![0];
+    for (const customized of [
+      "A handwritten automation.",
+      prompt.replace("agent_id set to your agent ID", "agent_id chosen dynamically"),
+      prompt.replace(call, `${call}\n${call}`),
+      prompt.replace(
+        call,
+        `${call}\n${call.replace("agent_id set to your agent ID", "agent_id chosen dynamically")}`,
+      ),
+      prompt.replace(call, `${call}\nCall sys_session_create with custom arguments.`),
+      prompt.replace(
+        call,
+        `${call}\nFor tickets labeled p0, also invoke sys_session_create with agent_id "ag_oncall", placement "same_host", title "[P0] <ticket key>", model "opus", and a message under 8000 characters.`,
+      ),
+      prompt.replace(
+        call,
+        `${call}\nFor p0 tickets: \`sys_session_create(agent_id="ag_oncall")\`.`,
+      ),
+    ]) {
+      expect(readTriggerWorkerSettings(customized)).toBeNull();
+      expect(
+        updateTriggerWorkerSettings(customized, { agentId: null, model: "", effort: "" }),
+      ).toBeNull();
+    }
+    // The worker's task can quote an API call without changing manager configuration.
+    const quoted = renderTriggerPrompt("jira", fields({ instructions: call }), CTX);
+    expect(readTriggerWorkerSettings(quoted)).toEqual({ agentId: null, model: "", effort: "" });
+  });
+
+  it.each([
+    "Custom, and a message under 8000 characters. <ticket key>",
+    'Custom, model "quoted", reasoning_effort "high" <ticket key>',
+    "Custom sys_session_create reference <ticket key>",
+  ])("preserves a quoted title containing argument-like text: %s", (title) => {
+    const prompt = renderTriggerPrompt("jira", fields(), { ...CTX, model: "old-model" }).replace(
+      'title "Jira <ticket key>"',
+      `title ${JSON.stringify(title)}`,
+    );
+    expect(readTriggerWorkerSettings(prompt)).toEqual({
+      agentId: null,
+      model: "old-model",
+      effort: "",
+    });
+    const settings = { agentId: null, model: "new-model", effort: "high" };
+    const updated = updateTriggerWorkerSettings(prompt, settings);
+    expect(updated).toBe(
+      prompt.replace('model "old-model"', 'model "new-model", reasoning_effort "high"'),
+    );
+    expect(readTriggerWorkerSettings(updated!)).toEqual(settings);
+  });
+
   it.each(TRIGGER_SOURCES)("separates %s instructions and preserves the saved prompt", (source) => {
     const original = renderTriggerPrompt(source, fields(), CTX);
     const parts = splitTriggerPrompt(original);
@@ -135,6 +228,10 @@ describe("triggerFieldsComplete", () => {
   it.each<[string, Partial<TriggerFields>, boolean]>([
     ["scope and instructions, no conditions", { conditions: [] }, true],
     ["blank scope", { scope: "  " }, false],
+    ["equals matches one scope", { scopeOperator: "is", scope: "ES" }, true],
+    ["equals rejects lists", { scopeOperator: "is", scope: "ES, OPS" }, false],
+    ["in accepts one scope", { scopeOperator: "in", scope: "ES" }, true],
+    ["in accepts multiple scopes", { scopeOperator: "in", scope: "ES, OPS" }, true],
     // Commas alone parse to no entries, which would drop GitHub's repo filter.
     ["comma-only scope", { scope: " , ," }, false],
     ["a condition with no value", { conditions: [{ ...LABEL_OMNIGENT, value: " " }] }, false],
@@ -151,6 +248,109 @@ describe("triggerFieldsComplete", () => {
   });
 });
 
+describe("Slack DM triggers", () => {
+  const slack = (overrides: Partial<TriggerFields>) =>
+    fields({ event: "posted", scope: "eng-support", conditions: [], ...overrides });
+
+  it("strips pasted prefixes and renders channels and people", () => {
+    expect(stripScopePrefix("#eng, ##bugs,  #ops", "#")).toBe("eng, bugs,  ops");
+    expect(stripScopePrefix("@alice, bob", "#")).toBe("@alice, bob");
+    expect(stripScopePrefix("ES, OPS", "")).toBe("ES, OPS");
+    expect(slackChannels("eng-support, #bugs, C0123ABCD")).toBe("#eng-support, #bugs, C0123ABCD");
+    expect(slackPeople("alice, @bob, U0123ABCD, carol@example.com, Alice")).toEqual([
+      "@alice",
+      "@bob",
+      "U0123ABCD",
+      "carol@example.com",
+    ]);
+  });
+
+  it("needs at least two people for a group DM, in any operator", () => {
+    const groupOf = (scope: string) =>
+      triggerFieldsComplete(slack({ event: "group_dm", scope, scopeOperator: "is" }), "slack");
+    expect(groupOf("alice")).toBe(false);
+    expect(groupOf("alice, bob")).toBe(true);
+    // Repeats name one person, and a bare prefix names no one.
+    expect(groupOf("alice, @Alice")).toBe(false);
+    expect(groupOf("@, @")).toBe(false);
+    expect(triggerFieldsComplete(slack({ event: "dm", scope: "@" }), "slack")).toBe(false);
+    expect(triggerFieldsComplete(slack({ scope: "#" }), "slack")).toBe(false);
+    expect(triggerFieldsComplete(slack({ event: "dm", scope: "alice" }), "slack")).toBe(true);
+  });
+
+  it("clears the scope and hidden conditions when the event reads them differently", () => {
+    const author: TriggerCondition = { field: "author", operator: "is", value: "alerts-bot" };
+    const text: TriggerCondition = { field: "text", operator: "contains", value: "error" };
+    const channel = slack({ scopeOperator: "in", conditions: [author, text] });
+
+    const dm = withTriggerEvent("slack", channel, "dm");
+    expect(dm).toMatchObject({ event: "dm", scope: "", scopeOperator: "is", conditions: [text] });
+    expect(triggerConditionFields("slack", "dm").map((f) => f.id)).not.toContain("author");
+
+    const group = withTriggerEvent("slack", { ...dm, scope: "alice, bob" }, "group_dm");
+    // Both scopes list people, so the names carry over.
+    expect(group).toMatchObject({ scope: "alice, bob", scopeOperator: "in" });
+
+    // GitHub's events share the repo scope.
+    const github = fields({ event: "issue", scope: "acme/app", scopeOperator: "in" });
+    expect(withTriggerEvent("github", github, "pr")).toMatchObject({
+      scope: "acme/app",
+      scopeOperator: "in",
+    });
+  });
+
+  it("renders a direct-message search from each sender", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      slack({
+        event: "dm",
+        scope: "alice, bob",
+        conditions: [{ field: "text", operator: "contains", value: "error" }],
+      }),
+      CTX,
+    );
+    expect(prompt).toContain(
+      'Watch: new Slack direct messages sent to you by @alice and @bob whose text contains "error"\n',
+    );
+    expect(prompt).toContain(
+      'Use your Slack tools to find each of @alice and @bob by handle, display name or email. A name that matches no one or more than one person counts as no match: say so in your reply. Then read the messages each of them sent you since that time in your one-to-one direct message with them, oldest first. Your own messages and replies inside a thread don\'t start a new session. Only messages whose text contains "error" count.',
+    );
+    expect(prompt).toContain(
+      "say that this automation needs a Slack MCP server that can read your direct messages.",
+    );
+    expect(prompt).toContain('title "Slack <channel> <message ts>"');
+    expect(prompt).toContain("the sender, the direct message's channel ID");
+    const parts = splitTriggerPrompt(prompt);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+  });
+
+  it("renders a group-DM search for exactly the listed members", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      slack({ event: "group_dm", scope: "@alice, bob, carol", scopeOperator: "in" }),
+      CTX,
+    );
+    expect(prompt).toContain(
+      "Watch: new Slack messages in your group DM with @alice, @bob and @carol\n",
+    );
+    expect(prompt).toContain(
+      "Then find the group DM whose members are exactly you and those people; a group DM that also includes anyone else doesn't count.",
+    );
+    expect(prompt).toContain("Every other top-level message counts.");
+    expect(prompt).toContain("the names resolve to fewer than two people besides you");
+    expect(prompt).toContain("that can read your group DMs.");
+  });
+
+  it("prefixes bare channel names with # in a channel trigger", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "eng-support, C0123ABCD", scopeOperator: "in" }),
+      CTX,
+    );
+    expect(prompt).toContain("Watch: new Slack messages in #eng-support, C0123ABCD\n");
+  });
+});
+
 describe("splitJqlOrderBy", () => {
   it.each([
     ["project = ES", "project = ES", ""],
@@ -163,6 +363,12 @@ describe("splitJqlOrderBy", () => {
 });
 
 describe("compileJiraJql", () => {
+  it.each(["is", "in"] as const)("compiles an explicit %s scope operator", (scopeOperator) => {
+    expect(compileJiraJql(fields({ scopeOperator, scope: "ES", conditions: [] }))).toBe(
+      scopeOperator === "is" ? 'project = "ES"' : 'project in ("ES")',
+    );
+  });
+
   const jql = (scope: string, ...conditions: TriggerCondition[]) =>
     compileJiraJql(fields({ scope, conditions }));
 
@@ -327,8 +533,18 @@ describe("isTriggerPrompt", () => {
 });
 
 describe("renderTriggerPrompt", () => {
+  it("covers a four-hour polling interval on the first run", () => {
+    const prompt = renderTriggerPrompt("jira", fields(), {
+      ...CTX,
+      pollingIntervalMinutes: 240,
+    });
+    expect(prompt).toContain("On the first run, use 240 minutes ago and nothing pending.");
+    expect(prompt).toContain("Then search from 5 minutes before the check time");
+  });
+
   it("renders the Jira manager prompt with the JQL, placement, dedupe title and link", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
+    expect(prompt).toContain("On the first run, use one hour ago and nothing pending.");
 
     // Only creation fires: an older ticket that's edited or starts matching later doesn't.
     expect(prompt).toContain(
@@ -369,6 +585,27 @@ describe("renderTriggerPrompt", () => {
       'search for (project = "ES" AND (type = Bug)) AND created >= <that time> ORDER BY created ASC.',
     );
     expect(sorted).not.toContain("ORDER BY created DESC");
+  });
+
+  it.each([true, false])("puts Slack links in the worker result with linkBack=%s", (linkBack) => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      fields({ event: "posted", scope: "#support", linkBack }),
+      CTX,
+    );
+    const [manager, worker] = prompt.split("Instructions for each session:\n");
+    expect(manager).not.toContain("Link-back pending:");
+    expect(manager).not.toContain('Reply "Omnigent session:');
+    expect(worker).toContain(
+      "Reply in the source thread when you have a useful result or a blocker",
+    );
+    expect(worker).toContain("Do not send an acknowledgement or a separate session-link message");
+    expect(worker).toContain(
+      linkBack ? "Include your own session link at the bottom" : "Do not add a session link",
+    );
+    const parts = splitTriggerPrompt(prompt);
+    expect(parts.userPrompt).toBe(fields().instructions);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
   });
 
   it("signs what it posts and stops when it can't reach the service", () => {
@@ -539,7 +776,7 @@ describe("renderTriggerPrompt", () => {
     );
     expect(filtered).toContain("Only messages that are about bug reports count.");
     expect(filtered).toContain('title "Slack <channel> <message ts>"');
-    expect(filtered).toContain("in the thread of each message");
+    expect(filtered).toContain("Reply in the source thread when you have a useful result");
 
     const unfiltered = renderTriggerPrompt(
       "slack",
@@ -601,6 +838,29 @@ describe("renderTriggerPrompt", () => {
     expect(prompt).toContain(
       `-f q='repo:acme/app is:issue label:"won'\\''t fix" created:>=<that time>' -f sort=created`,
     );
+  });
+
+  it("checks repository access in both the GitHub manager and worker instructions", () => {
+    const prompt = renderTriggerPrompt(
+      "github",
+      fields({ event: "issue", scope: "acme/app" }),
+      CTX,
+    );
+    const parts = splitTriggerPrompt(prompt);
+    expect(parts.userPrompt).toBe(fields().instructions);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+    const [manager, worker] = prompt.split("Instructions for each session:\n");
+    for (const instructions of [manager, worker]) {
+      expect(instructions).toContain("gh auth status --hostname github.com");
+      expect(instructions).toContain("gh auth token --hostname github.com --user <account>");
+      expect(instructions).toContain("scope its token to each gh command with GH_TOKEN");
+      expect(instructions).toContain("without printing or recording it");
+      expect(instructions).toContain("Do not use gh auth switch");
+      expect(instructions).toContain(
+        "If no configured account has access, report the blocker without attempting to grant access",
+      );
+      expect(instructions).toContain("do not treat an access failure as no matches");
+    }
   });
 
   it("builds the GitHub search from the repository, event and conditions", () => {

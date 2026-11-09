@@ -11,7 +11,10 @@ import * as hooks from "@/hooks/useScheduledTasks";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
-import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
+import { showToast } from "@/components/ui/toast";
+
+vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn() }));
 
@@ -35,9 +38,11 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialTemplateId,
     sessionLink,
     editingTask,
+    onCreated,
   }: {
     open: boolean;
     onOpenChange: (open: boolean) => void;
+    onCreated?: () => void;
     initialName?: string;
     initialPrompt?: string;
     initialTrigger?: string | null;
@@ -58,6 +63,15 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
       >
         <button type="button" onClick={() => onOpenChange(false)}>
           Close setup
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            onCreated?.();
+            onOpenChange(false);
+          }}
+        >
+          Create setup
         </button>
       </div>
     ) : null,
@@ -117,6 +131,7 @@ beforeEach(() => {
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
+  vi.mocked(showToast).mockReset();
   vi.mocked(hooks.useUpdateScheduledTask).mockReturnValue({
     mutate,
     isPending: false,
@@ -518,6 +533,49 @@ describe("automation view navigation", () => {
   });
 });
 
+describe("after creating an automation", () => {
+  beforeEach(() => setTasks([task()]));
+
+  it("leaves the template gallery for the list of automations", () => {
+    renderPage("/tasks?view=templates");
+    expect(screen.getByRole("region", { name: "Automation templates" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("suggestion-trigger-jira"));
+    expect(showToast).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Create setup" }));
+
+    expect(screen.queryByRole("region", { name: "Automation templates" })).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Your automations" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(showToast).toHaveBeenCalledExactlyOnceWith("Automation created");
+  });
+
+  it("stays on the list when created from the list", () => {
+    renderPage("/tasks");
+    fireEvent.click(screen.getAllByRole("button", { name: "New automation" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Create setup" }));
+    expect(screen.getByRole("tab", { name: "Your automations" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(showToast).toHaveBeenCalledExactlyOnceWith("Automation created");
+  });
+
+  it("clears a filter and search that would hide the new automation", () => {
+    renderPage("/tasks");
+    fireEvent.click(screen.getByTestId("tasks-filter-paused"));
+    fireEvent.change(screen.getByPlaceholderText(/search/i), { target: { value: "zzz" } });
+    selectView("Templates");
+    fireEvent.click(screen.getByTestId("suggestion-trigger-jira"));
+    fireEvent.click(screen.getByRole("button", { name: "Create setup" }));
+
+    expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByPlaceholderText(/search/i)).toHaveValue("");
+  });
+});
+
 describe("template prefill", () => {
   it.each(["empty", "active", "paused"] as const)(
     "opens template setup with an %s list",
@@ -572,6 +630,38 @@ describe("template prefill", () => {
 });
 
 describe("row actions", () => {
+  it.each([
+    [new ScheduledTaskApiError("conflict", 409, "CONFLICT"), "This run is already in progress"],
+    [new ScheduledTaskApiError("server error", 503, null), "Couldn't start the run"],
+    [new TypeError("Failed to fetch"), "Couldn't start the run"],
+  ])("shows Run now feedback for %s", (error, message) => {
+    setTasks([task()]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Run now" }));
+
+    expect(runNowMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
+    expect(showToast).not.toHaveBeenCalled();
+
+    runNowMutate.mock.calls[0][1].onError(error);
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(message);
+  });
+
+  it("confirms Run now with a run history hint only after the request succeeds", () => {
+    setTasks([task()]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Run now" }));
+
+    expect(runNowMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
+    expect(showToast).not.toHaveBeenCalled();
+
+    runNowMutate.mock.calls[0][1].onSuccess();
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      "Run triggered, it will start shortly. Open automation details to check run history.",
+    );
+  });
+
   it("opens edit mode for a task from the row menu", () => {
     setTasks([task({ id: "st_edit", name: "Morning brief" })]);
     renderPage();

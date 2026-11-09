@@ -1429,10 +1429,10 @@ def _build_claude_sdk_spawn_env(
     if retry_payload is not None:
         env["HARNESS_CLAUDE_SDK_RETRY_POLICY"] = retry_payload
     # Permission mode: controls whether Claude asks for approval before
-    # calling native tools. When set to anything other than the default
-    # ``"bypassPermissions"``, the SDK's ``can_use_tool`` callback is
-    # active and approval requests surface via Omnigent elicitation. Read from
-    # Omitted when not set — harness falls back to ``"bypassPermissions"``.
+    # calling native tools. Unless it is ``"bypassPermissions"``, the SDK's
+    # ``can_use_tool`` callback is active and approval requests surface via
+    # Omnigent elicitation. Omitted when not set — the harness falls back to
+    # ``"auto"``.
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = str(permission_mode)
