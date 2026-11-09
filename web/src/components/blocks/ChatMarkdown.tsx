@@ -567,17 +567,34 @@ function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) 
       </FileMentionPill>
     );
   }
-  const Icon = target.isSubagent ? BotIcon : MessageSquareIcon;
+  return (
+    <SessionMentionPill id={target.id} isSubagent={target.isSubagent}>
+      {props.children}
+    </SessionMentionPill>
+  );
+}
+
+/** A session pill (e.g. ``@Fix CI``) that opens session ``id``. */
+export function SessionMentionPill({
+  id,
+  isSubagent,
+  children,
+}: {
+  id: string;
+  isSubagent: boolean;
+  children: React.ReactNode;
+}) {
+  const Icon = isSubagent ? BotIcon : MessageSquareIcon;
   return (
     <a
       data-testid="mention-pill"
-      href={withBasePath(`/c/${encodeURIComponent(target.id)}`)}
+      href={withBasePath(`/c/${encodeURIComponent(id)}`)}
       className={MENTION_PILL_CLASS}
-      title={target.isSubagent ? "Subagent" : "Session"}
+      title={isSubagent ? "Subagent" : "Session"}
       onClick={(event) => event.stopPropagation()}
     >
       <Icon className="size-3 shrink-0" />
-      <span className="truncate">{props.children}</span>
+      <span className="truncate">{children}</span>
     </a>
   );
 }

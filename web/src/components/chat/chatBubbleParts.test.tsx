@@ -4,6 +4,7 @@ import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { MemoryRouter, useLocation } from "react-router-dom";
@@ -252,6 +253,58 @@ describe("UserBubble inline mentions", () => {
       "Ask @auth to compare @src/a.ts with @Alpha *planning*.",
     );
     expect(screen.queryByText(/Tagged sessions/)).not.toBeInTheDocument();
+  });
+});
+
+describe("UserBubble messages from another session", () => {
+  function renderOriginBubble(client: QueryClient, text: string) {
+    render(
+      <QueryClientProvider client={client}>
+        <ConversationScopeContext.Provider value="s_here">
+          <BubbleView
+            bubble={{
+              kind: "user",
+              itemId: "user_origin",
+              content: [{ type: "input_text", text }],
+            }}
+            isLastAssistant={false}
+          />
+        </ConversationScopeContext.Provider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("names a cached sender with a pill and drops the raw prefix", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "s_src"], { title: "Casual greeting", parentSessionId: null });
+    renderOriginBubble(client, "[Message from session s_src]\nhi there");
+    const origin = screen.getByTestId("message-origin");
+    expect(origin.textContent).toBe("From@Casual greeting");
+    expect(screen.getByTestId("mention-pill")).toHaveAttribute("href", "/c/s_src");
+    expect(screen.queryByText(/Message from session/)).not.toBeInTheDocument();
+    expect(screen.getByText("hi there")).toBeInTheDocument();
+    // Served from cache: no session fetch.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("names a subagent of the viewed session from its cached child list", () => {
+    const client = new QueryClient();
+    client.setQueryData(childSessionsQueryKey("s_here"), [
+      { id: "s_kid", title: "researcher:auth", tool: "researcher", session_name: "auth" },
+    ]);
+    renderOriginBubble(client, "[Message from session s_kid]\ndone");
+    expect(screen.getByTestId("mention-pill").textContent).toBe("@auth");
+    expect(screen.getByTestId("mention-pill")).toHaveAttribute("title", "Subagent");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetches an uncached sender once and says 'another session' when it is unreadable", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ detail: "not found" }, 404));
+    renderOriginBubble(new QueryClient(), "[Message from session s_gone]\nhello");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("/v1/sessions/s_gone");
+    expect(screen.getByTestId("message-origin").textContent).toBe("Fromanother session");
+    expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
   });
 });
 

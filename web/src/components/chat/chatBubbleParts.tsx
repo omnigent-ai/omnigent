@@ -18,6 +18,7 @@ import {
   ArrowUpIcon,
   CheckIcon,
   CopyIcon,
+  CornerDownRightIcon,
   FileTextIcon,
   Link2Icon,
   Loader2Icon,
@@ -37,6 +38,7 @@ import {
   type MessageResponseProps,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
+import { SessionMentionPill } from "@/components/blocks/ChatMarkdown";
 import {
   BlockRenderer,
   FilePathAwareMessageResponse,
@@ -61,6 +63,8 @@ import { RunningDot } from "@/components/RunningDot";
 import { cn } from "@/lib/utils";
 import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
+import { splitSessionMessageOrigin } from "@/lib/sessionMessageOrigin";
+import { useSessionLabel } from "@/hooks/useSessionLabel";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
@@ -113,17 +117,47 @@ function sliceByCodePoint(str: string, limit: number): string {
 // value and UserBubble reads it, so the gate lives in one place.
 export const SessionSharedContext = createContext(false);
 
+/** A user message's raw text, minus runtime context and any sender prefix. */
+function userMessageBody(content: MessageContentBlock[]): string {
+  const text = stripAutomationContext(joinTextBlocks(content));
+  return splitSessionMessageOrigin(text)?.body ?? text;
+}
+
 /** A user message's text for reading and copying: mention markers become ``@name``. */
 export function extractUserText(content: MessageContentBlock[]): string {
-  return readableSentText(stripAutomationContext(joinTextBlocks(content))).trimEnd();
+  return readableSentText(userMessageBody(content)).trimEnd();
 }
 
 /** A user message's text for rendering: mention markers become inline pills. */
 function userMarkdownText(content: MessageContentBlock[]): string {
-  return replaceSentMentions(
-    stripAutomationContext(joinTextBlocks(content)),
-    mentionPillMarkdown,
-  ).trimEnd();
+  return replaceSentMentions(userMessageBody(content), mentionPillMarkdown).trimEnd();
+}
+
+/** "From @<sender>" above a message another session sent with ``sys_session_message``. */
+function SessionMessageOriginLine({
+  sourceId,
+  currentSessionId,
+}: {
+  sourceId: string;
+  currentSessionId: string | null;
+}) {
+  const label = useSessionLabel(sourceId, currentSessionId);
+  return (
+    <div
+      data-testid="message-origin"
+      className="mb-1 flex items-center gap-1 text-xs text-muted-foreground"
+    >
+      <CornerDownRightIcon className="size-3 shrink-0" />
+      <span>From</span>
+      {label ? (
+        <SessionMentionPill id={sourceId} isSubagent={label.isSubagent}>
+          @{label.title}
+        </SessionMentionPill>
+      ) : (
+        <span>another session</span>
+      )}
+    </div>
+  );
 }
 
 function joinTextBlocks(content: MessageContentBlock[]): string {
@@ -913,6 +947,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   //   previewed inline).
   const isShellCommand = bubble.shellCommand !== undefined;
   const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  const origin = isShellCommand
+    ? null
+    : splitSessionMessageOrigin(stripAutomationContext(joinTextBlocks(bubble.content)));
   const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
@@ -1038,6 +1075,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                   showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
                 }
               >
+                {origin && (
+                  <SessionMessageOriginLine
+                    sourceId={origin.sourceId}
+                    currentSessionId={sessionId ?? null}
+                  />
+                )}
                 {/* Non-image file chips */}
                 {fileChips.length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
