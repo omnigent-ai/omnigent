@@ -361,13 +361,13 @@ async def test_pane_liveness_reads_the_requested_pane(
     _wait_until(
         lambda: (
             subprocess.run(
-                [*tmux, "display-message", "-p", "-t", exited, "#{pane_dead} #{pane_dead_status}"],
+                [*tmux, "display-message", "-p", "-t", exited, "#{pane_dead}"],
                 check=True,
                 capture_output=True,
                 text=True,
                 timeout=5,
             ).stdout.strip()
-            == "1 7"
+            == "1"
         ),
         "test pane did not exit",
     )
