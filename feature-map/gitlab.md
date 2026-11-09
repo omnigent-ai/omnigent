@@ -2,7 +2,7 @@
 
 GitLab sessions show their merge requests in the shared pull request panel,
 composer controls, and Canvas cards. The execution host's authenticated `glab`
-reads the MR; agent CLI and MCP writes associate it with the session.
+or GitLab token reads the MR; agent CLI and MCP writes associate it with the session.
 
 ## Sub-features
 
@@ -81,6 +81,10 @@ should also recover. This is separate from provider authentication failures.
 - Live auth, fork context, and removal persistence: follow
   [the manual verification steps](../docs/GITLAB.md#limits-and-verification)
   using a permitted test GitLab project and execution-host credentials.
+- Token auth: follow [token setup](../docs/GITLAB.md#token-authentication-without-a-cli)
+  without `gh` or `glab` installed. Open the panel from the rail or composer and
+  confirm the MR loads. An invalid token must show an access hint, not a CLI
+  install prompt. Client and panel component tests cover this without live credentials.
 
 ## Gotchas
 

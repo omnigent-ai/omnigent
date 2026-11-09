@@ -153,11 +153,16 @@ def test_every_harness_is_covered_by_a_real_builder():
 
 
 @pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))
-def test_real_builder_preserves_forge_cli_config_paths(harness, hostile_env, monkeypatch):
-    paths = {"GH_CONFIG_DIR": "/test/gh", "GLAB_CONFIG_DIR": "/test/glab"}
-    monkeypatch.setattr("os.environ", {**hostile_env, **paths})
+def test_real_builder_preserves_forge_cli_settings(harness, hostile_env, monkeypatch):
+    settings = {
+        "GH_CONFIG_DIR": "/test/gh",
+        "GLAB_CONFIG_DIR": "/test/glab",
+        "GITLAB_HOST": "git.example.test:8443",
+        "GLAB_HOST": "git.example.test:8443",
+    }
+    monkeypatch.setattr("os.environ", {**hostile_env, **settings})
     env = SPAWN_ENV_BUILDERS[harness]()
-    assert {name: env.get(name) for name in paths} == paths
+    assert {name: env.get(name) for name in settings} == settings
     assert not (set(env) & CANARY_SECRETS.keys())
 
 
