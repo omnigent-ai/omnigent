@@ -1663,8 +1663,10 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     assert stages[-1] == ("failed", "managed runner did not connect after launch")
 
 
+@pytest.mark.parametrize("replaced", [False, True])
 async def test_managed_launch_fails_when_runner_never_connects(
     monkeypatch: pytest.MonkeyPatch,
+    replaced: bool,
 ) -> None:
     """Initial managed launch settlement also depends on the runner tunnel.
 
@@ -1681,7 +1683,10 @@ async def test_managed_launch_fails_when_runner_never_connects(
     tracker.begin(session_id)
     stages: list[tuple[str, str | None]] = []
     terminated: list[object] = []
-    sentinel_host = object()
+    sentinel_host = SimpleNamespace(
+        sandbox_id="replacement" if replaced else "initial", sandbox_provider="modal"
+    )
+    clear_binding = Mock(return_value=conv)
 
     async def _launch_runner(*_args: object, **_kwargs: object) -> object:
         return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")
@@ -1715,6 +1720,8 @@ async def test_managed_launch_fails_when_runner_never_connects(
         managed=ManagedHostLaunch(
             host_id=host_id,
             workspace="/root/workspace",
+            sandbox_id="initial",
+            sandbox_provider="modal",
         ),
         sandbox_config=ManagedSandboxDeployment.single(
             ManagedSandboxConfig(
@@ -1726,6 +1733,7 @@ async def test_managed_launch_fails_when_runner_never_connects(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            clear_host_binding=clear_binding,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
@@ -1737,7 +1745,10 @@ async def test_managed_launch_fails_when_runner_never_connects(
     assert launch.settled.is_set()
     assert launch.error == "managed runner did not connect after launch"
     assert stages[-1] == ("failed", "managed runner did not connect after launch")
-    assert terminated == [sentinel_host]
+    clear_binding.assert_called_once_with(
+        session_id, expected_host_id=host_id, expected_sandbox_id="initial", clear_profile=False
+    )
+    assert terminated == ([] if replaced else [sentinel_host])
 
 
 async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
@@ -1801,6 +1812,7 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            clear_host_binding=lambda _sid, **_kwargs: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
@@ -1870,6 +1882,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            clear_host_binding=lambda _sid, **_kwargs: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
