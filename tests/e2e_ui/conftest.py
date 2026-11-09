@@ -62,6 +62,7 @@ from tests._helpers.compat import (
     apply_server_env,
     compat_runner_cwd,
     compat_server_cwd,
+    compat_server_python,
     runner_executable,
     server_executable,
 )
@@ -1102,15 +1103,15 @@ def live_server(
         # at that directory so it serves the HEAD bundle instead of whatever
         # stale (or absent) bundle ships in its own site-packages.
         "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
-        # Exercise the MCP sign-in journeys while the release feature remains
-        # disabled by default in production deployments.
-        "OMNIGENT_FEATURES": ",".join(
+    }
+    # Pinned old servers reject feature names introduced after their release.
+    if compat_server_python() is None:
+        env["OMNIGENT_FEATURES"] = ",".join(
             filter(
                 None,
                 [os.environ.get("OMNIGENT_FEATURES", ""), "mcp_server_management"],
             )
-        ),
-    }
+        )
     # In normal runs, prepend the worktree so the server imports from the
     # checked-out source. In compat mode (OMNIGENT_COMPAT_SERVER_PYTHON set),
     # drop PYTHONPATH so the pinned old build in the compat venv resolves
