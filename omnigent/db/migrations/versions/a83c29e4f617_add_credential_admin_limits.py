@@ -31,5 +31,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_column("omnigent_conversation_metadata", "runner_admin_allowed")
-    op.drop_column("device_grants", "admin_allowed")
+    with op.batch_alter_table("omnigent_conversation_metadata") as batch_op:
+        batch_op.drop_column("runner_admin_allowed")
+    with op.batch_alter_table("device_grants") as batch_op:
+        batch_op.drop_column("admin_allowed")
