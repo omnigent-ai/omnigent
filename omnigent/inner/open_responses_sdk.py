@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import pydantic
 
+from omnigent.databricks_ai_gateway import gateway_request_tag_headers
 from omnigent.llms.adapters._content import redact_inline_data_uris
 from omnigent.models import model_catalog
 from omnigent.spec.types import RetryPolicy
@@ -129,6 +130,7 @@ def _get_openai_client(
     if os.environ.get("OPENAI_BASE_URL"):
         return OpenAI(
             base_url=os.environ["OPENAI_BASE_URL"],
+            default_headers=gateway_request_tag_headers(os.environ["OPENAI_BASE_URL"]),
             # Some OpenAI-compatible endpoints (Databricks model serving)
             # don't validate the API key client-side; the SDK still
             # requires a non-empty value, so we supply this documented
@@ -148,6 +150,7 @@ def _get_openai_client(
     if creds is not None:
         return OpenAI(
             base_url=_databricks_openai_base_url(creds.host),
+            default_headers=gateway_request_tag_headers(_databricks_openai_base_url(creds.host)),
             api_key=creds.token,
             **retry_kwargs,
         )
@@ -211,11 +214,34 @@ def _normalize_message_content(
     return str(content)
 
 
+def _recorded_call_id(message: Message) -> str | None:
+    """Return the ``call_id`` a tool history message recorded, if any."""
+    metadata = message.get("metadata")
+    call_id = metadata.get("call_id") if isinstance(metadata, dict) else None
+    return call_id if isinstance(call_id, str) and call_id else None
+
+
+def _tool_output_text(content: object) -> str:
+    """Render a recorded tool output as Responses ``output`` text, inline base64 redacted."""
+    if content is None:
+        return ""
+    redacted = _redact_inline_base64(content)
+    return redacted if isinstance(redacted, str) else json.dumps(redacted)
+
+
 def _convert_messages_to_responses(
     messages: list[Message],
 ) -> list[ResponsesItem]:
     """Convert internal history to Responses API input items for replay/reset."""
     result: list[ResponsesItem] = []
+    # A recorded call is emitted once, with its output right behind it: live
+    # history repeats a call per status, and the API rejects a call without output.
+    outputs_by_id: dict[str, Message] = {}
+    for message in messages:
+        recorded = _recorded_call_id(message)
+        if recorded is not None and message.get("role") == "tool_result":
+            outputs_by_id.setdefault(recorded, message)
+    emitted_ids: set[str] = set()
 
     i = 0
     while i < len(messages):
@@ -260,7 +286,13 @@ def _convert_messages_to_responses(
                 i += 1
                 continue
             tool_args = parsed.get("args", {})
-            call_id = f"call_{i}"
+            recorded_id = _recorded_call_id(msg)
+            if recorded_id is not None and (
+                recorded_id in emitted_ids or recorded_id not in outputs_by_id
+            ):
+                i += 1
+                continue
+            call_id = recorded_id or f"call_{i}"
             result.append(
                 {
                     "type": "function_call",
@@ -272,37 +304,39 @@ def _convert_messages_to_responses(
                 }
             )
 
-            if i + 1 < len(messages) and messages[i + 1].get("role") == "tool_result":
-                i += 1
-                raw_tool_output = messages[i].get("content")
-                if raw_tool_output is None:
-                    output_str = ""
-                elif isinstance(raw_tool_output, str):
-                    output_str = _redact_inline_base64(raw_tool_output)
-                else:
-                    output_str = json.dumps(_redact_inline_base64(raw_tool_output))
+            if recorded_id is not None:
+                emitted_ids.add(recorded_id)
                 result.append(
                     {
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": output_str,
+                        "output": _tool_output_text(outputs_by_id[recorded_id].get("content")),
+                    }
+                )
+            elif (
+                i + 1 < len(messages)
+                and messages[i + 1].get("role") == "tool_result"
+                and _recorded_call_id(messages[i + 1]) is None
+            ):
+                i += 1
+                result.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": _tool_output_text(messages[i].get("content")),
                     }
                 )
 
         elif role == "tool_result":
-            redacted_content = _redact_inline_base64(content)
-            tool_output = (
-                redacted_content
-                if isinstance(redacted_content, str)
-                else json.dumps(redacted_content)
-            )
-            result.append(
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": f"[tool result] {tool_output}",
-                }
-            )
+            # A recorded output already went out with its call.
+            if _recorded_call_id(msg) not in emitted_ids:
+                result.append(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": f"[tool result] {_tool_output_text(content)}",
+                    }
+                )
 
         else:
             result.append(

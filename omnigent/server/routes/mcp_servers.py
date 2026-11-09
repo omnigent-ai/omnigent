@@ -31,17 +31,26 @@ class McpServerSummary(BaseModel):
     :param harness: Harness family that loads it: ``claude``, ``codex``, or ``cursor``.
     :param transport: ``stdio`` for a local process, ``http`` for a remote server.
     :param scope: Config scope; always ``user`` today.
+    :param managed: Whether an organization pins this server for every user on the
+        host (Claude Code's enterprise MCP config), so it is not the user's to edit.
     :param plugin: Plugin that bundles the server, e.g. ``"figma"``.
     :param url_host: Hostname of a remote server, e.g. ``"mcp.linear.app"``.
+    :param auth_status: Account state reported by the host's sign-in manager:
+        ``connected`` or ``sign_in_required``; ``None`` when nothing reports one.
+    :param sign_in_url: Where the user finishes signing in; only with
+        ``sign_in_required``, and only an http(s) URL carrying no credentials.
     """
 
     name: str
     harness: str
     transport: Literal["stdio", "http"]
     scope: Literal["user"]
+    managed: bool = False
     plugin: str | None = None
     source_id: str | None = None
     url_host: str | None = None
+    auth_status: Literal["connected", "sign_in_required"] | None = None
+    sign_in_url: str | None = None
 
 
 class McpServersResponse(BaseModel):

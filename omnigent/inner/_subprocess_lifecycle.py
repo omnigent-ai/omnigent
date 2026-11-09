@@ -43,11 +43,11 @@ async def terminate_subprocess(
         terminate_tree(proc)
         try:
             await asyncio.wait_for(proc.wait(), timeout=terminate_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             kill_tree(proc)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=kill_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.error(
                     "%s pid=%s did not reap within %.2fs after SIGKILL",
                     label,
@@ -65,7 +65,7 @@ async def terminate_subprocess(
         kill_tree(proc)
         try:
             await asyncio.wait_for(proc.wait(), timeout=kill_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(
                 "%s pid=%s remained unreaped after leader exit",
                 label,

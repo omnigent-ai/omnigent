@@ -22,6 +22,7 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
 
@@ -33,6 +34,9 @@ from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
 
 _logger = logging.getLogger(__name__)
 
@@ -216,6 +220,7 @@ def resolve_host_launch(
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
     conversation: Conversation | None = None,
+    sandbox_profiles: SandboxProfileCatalog | None = None,
 ) -> HostLaunchTarget:
     """
     Resolve and authorize a host runner launch.
@@ -281,5 +286,14 @@ def resolve_host_launch(
         )
         if not allowed:
             raise HTTPException(status_code=404, detail="session not found")
+
+    if sandbox_profiles is not None:
+        sandbox_profiles.require_session_host(
+            session_id,
+            host_id,
+            bind=False,
+            sandbox_provider=host.sandbox_provider,
+            user_id=host.user_id,
+        )
 
     return HostLaunchTarget(host=host, conn=conn, conv=conv)

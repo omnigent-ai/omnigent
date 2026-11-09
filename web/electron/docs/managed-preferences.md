@@ -81,6 +81,11 @@ disappears and the box's host row is tagged **Arca instance** (recognized by
 the host id remembered at connect time). Like the server list, the flag is read from
 macOS on demand, so profile changes apply without a restart.
 
+In those same windows, **Run on Arca** replaces connecting a machine over SSH:
+the SSH field under **Connect a host** is hidden and the app refuses an SSH
+connect. Everywhere else, including flagged Macs on a self-hosted server, the
+SSH field stays.
+
 Remote hosts need their own renewable **Omnigent** OAuth grant. Desktop browser
 sign-in and generic Arca credentials do not replace it. During explicit runner
 setup, an authentication-required result starts `isaac omni login <server-url>`

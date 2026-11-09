@@ -8,6 +8,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import { useChatStore } from "@/store/chatStore";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 // Mock the policies data layer so SessionPoliciesSection and AddPolicyDialog
 // render deterministically without network. The add/delete mutations expose
@@ -62,7 +63,10 @@ vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 // AgentInfoContent for codex sessions; stub its routing + fork deps so it
 // renders without a Router/network in jsdom.
 vi.mock("@/lib/routing", () => ({ useNavigate: () => vi.fn() }));
-vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  forkSession: vi.fn(),
+}));
 
 // The version footer reads the server version (capabilities probe) and the
 // per-session host version (health poll). Mock both hooks so the footer
@@ -231,7 +235,11 @@ describe("AgentInfoButton hover behavior", () => {
     mousePointerEnter(screen.getByTestId("agent-info-trigger"));
 
     // The panel is now open — the agent name proves the content mounted.
-    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-info-panel")).toHaveClass(
+      "menu-surface",
+      "rounded-[12px]",
+      "ring-0",
+    );
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
   });
 
@@ -250,10 +258,14 @@ describe("AgentInfoButton hover behavior", () => {
   });
 
   it("closes after the delay once the pointer leaves both the icon and panel", () => {
+    render(<input aria-label="Search file contents" />);
+    const search = screen.getByRole("textbox", { name: "Search file contents" });
+    search.focus();
     renderButton(AGENT_WITH_BOTH);
     const trigger = screen.getByTestId("agent-info-trigger");
     mousePointerEnter(trigger);
     const panel = screen.getByTestId("agent-info-panel");
+    expect(search).toHaveFocus();
 
     mousePointerEnter(panel);
     mousePointerLeave(panel);
@@ -263,6 +275,25 @@ describe("AgentInfoButton hover behavior", () => {
     // ...then closes once it elapses.
     act(() => vi.advanceTimersByTime(2));
     expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+    act(() => vi.runOnlyPendingTimers());
+    expect(search).toHaveFocus();
+  });
+
+  it("keeps an interacted hover preview open and restores focus on dismissal", () => {
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+    mousePointerEnter(trigger);
+    const panel = screen.getByTestId("agent-info-panel");
+    mousePointerLeave(trigger);
+    act(() => panel.focus());
+    mousePointerLeave(panel);
+    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 50));
+    expect(panel).toHaveFocus();
+    expect(panel).toBeInTheDocument();
+    fireEvent.keyDown(panel, { key: "Escape" });
+    act(() => vi.runOnlyPendingTimers());
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+    expect(trigger).toHaveFocus();
   });
 
   it("re-entering the icon during the close delay keeps the panel open", () => {
@@ -288,6 +319,8 @@ describe("AgentInfoButton hover behavior", () => {
 
     fireEvent.click(trigger);
     expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+    act(() => vi.runOnlyPendingTimers());
+    expect(trigger).toHaveFocus();
   });
 
   it("keeps the MCP restart warning after the popover closes and reopens", () => {

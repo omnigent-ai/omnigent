@@ -216,6 +216,15 @@ def test_read_new_items_maps_roles_and_strips_attachments(tmp_path: Path) -> Non
     assert posted[1].item_data["content"] == [{"type": "output_text", "text": "hello"}]
 
 
+def test_message_to_items_keeps_inline_workspace_markers() -> None:
+    # Workspace-relative markers are inline "@file" mentions; only uploads strip.
+    inline = "compare [Attached: a.ts] with [Attached: b.ts]"
+    items = f._message_to_items(
+        7, "user", f"{inline} [Attached: /tmp/up.png]", None, None, None, None, None, "hermes"
+    )
+    assert items[0].item_data["content"] == [{"type": "input_text", "text": inline}]
+
+
 def test_read_new_items_mirrors_reasoning_before_message(tmp_path: Path) -> None:
     """An assistant row with reasoning posts a one-shot reasoning delta before the message."""
     db = tmp_path / "state.db"

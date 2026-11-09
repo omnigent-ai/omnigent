@@ -1,5 +1,23 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
+import {
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  useFoldAssistantNarration,
+} from "./foldNarrationPreferences";
+import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  readHiddenPickerAgents,
+  subscribeHiddenPickerAgents,
+  writeHiddenPickerAgents,
+} from "./pickerEntryVisibility";
+import {
+  PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+  PROJECT_FOLDER_PAGE_SIZE,
+  PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+  useProjectFolderCollapse,
+  useProjectFolderPageSize,
+} from "./projectFolderPaginationPreferences";
 import { applyImportedSettings, collectSettings } from "./settingsPortability";
 import {
   type SessionWorkspaceState,
@@ -105,18 +123,70 @@ it.each([
   expect(readSessionWorkspaceState("browser")).toEqual({ openBrowsers: ["one"] });
 });
 
-describe("composer shortcut portability", () => {
+describe.each([
+  ["composer shortcut", COMPOSER_SEND_SHORTCUT_STORAGE_KEY],
+  ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY],
+])("%s portability", (_label, storageKey) => {
   it("exports, imports, and clears the device-local preference", () => {
-    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
-    expect(collectSettings()?.settings[COMPOSER_SEND_SHORTCUT_STORAGE_KEY]).toBe("true");
+    localStorage.setItem(storageKey, "true");
+    expect(collectSettings()?.settings[storageKey]).toBe("true");
 
     applyImportedSettings({ version: 1, settings: {} });
-    expect(localStorage.getItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(storageKey)).toBeNull();
 
     applyImportedSettings({
       version: 1,
-      settings: { [COMPOSER_SEND_SHORTCUT_STORAGE_KEY]: "true" },
+      settings: { [storageKey]: "true" },
     });
-    expect(localStorage.getItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY)).toBe("true");
+    expect(localStorage.getItem(storageKey)).toBe("true");
   });
+});
+
+it("updates a mounted final-answer fold reader on import", () => {
+  const { result } = renderHook(() => useFoldAssistantNarration());
+  expect(result.current).toBe(false);
+
+  act(() => {
+    applyImportedSettings({
+      version: 1,
+      settings: { [FOLD_ASSISTANT_NARRATION_STORAGE_KEY]: "true" },
+    });
+  });
+  expect(result.current).toBe(true);
+});
+
+it("carries hidden picker entries through export and import and tells an open picker", () => {
+  writeHiddenPickerAgents(new Set(["polly"]));
+  const exported = collectSettings()!;
+  expect(exported.settings[HIDDEN_PICKER_AGENTS_STORAGE_KEY]).toBe('["polly"]');
+  const listener = vi.fn();
+  const unsubscribe = subscribeHiddenPickerAgents(listener);
+
+  applyImportedSettings({ version: 1, settings: {} });
+  expect(readHiddenPickerAgents().size).toBe(0);
+  applyImportedSettings(exported);
+  expect(readHiddenPickerAgents()).toEqual(new Set(["polly"]));
+  expect(listener).toHaveBeenCalledTimes(2);
+  unsubscribe();
+});
+
+it("carries project folder pagination through export and import and updates mounted readers", () => {
+  localStorage.setItem(PROJECT_FOLDER_COLLAPSE_STORAGE_KEY, "false");
+  localStorage.setItem(PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY, "3");
+  const exported = collectSettings()!;
+  expect(exported.settings[PROJECT_FOLDER_COLLAPSE_STORAGE_KEY]).toBe("false");
+  expect(exported.settings[PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY]).toBe("3");
+  const { result } = renderHook(() => [useProjectFolderCollapse(), useProjectFolderPageSize()]);
+  expect(result.current).toEqual([false, 3]);
+
+  act(() => {
+    applyImportedSettings({ version: 1, settings: {} });
+  });
+  expect(localStorage.getItem(PROJECT_FOLDER_COLLAPSE_STORAGE_KEY)).toBeNull();
+  expect(localStorage.getItem(PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY)).toBeNull();
+  expect(result.current).toEqual([true, PROJECT_FOLDER_PAGE_SIZE]);
+  act(() => {
+    applyImportedSettings(exported);
+  });
+  expect(result.current).toEqual([false, 3]);
 });

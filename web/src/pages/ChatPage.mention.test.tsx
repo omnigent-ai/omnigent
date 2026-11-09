@@ -4,10 +4,14 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
+import type * as UseAgentsModule from "@/hooks/useAgents";
+import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -25,6 +29,7 @@ const ws = vi.hoisted(() => ({
   srcEntries: [] as unknown[],
   rootLoading: false,
   dirLoading: false,
+  searchFiles: [] as unknown[],
 }));
 const ROOT_ENTRIES: WorkspaceFile[] = [
   { path: "src", name: "src", type: "directory", bytes: null, modified_at: null },
@@ -39,7 +44,37 @@ function resetWorkspaceMock() {
   ws.srcEntries = SRC_ENTRIES;
   ws.rootLoading = false;
   ws.dirLoading = false;
+  ws.searchFiles = [];
+  sessions.loaded = [];
+  sessions.children = [];
+  sessions.searchHits = [];
+  sessions.searchedQueries = [];
 }
+
+// Session rows for the "@" menu: sidebar-loaded rows, the current session's
+// subagents, and server title-search hits (recorded so tests can assert when
+// the search is skipped).
+const sessions = vi.hoisted(() => ({
+  loaded: [] as unknown[],
+  children: [] as unknown[],
+  searchHits: [] as unknown[],
+  searchedQueries: [] as string[],
+}));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSidebarDataModule>()),
+  useOptionalLoadedConversations: () => ({
+    pages: [{ data: sessions.loaded }],
+    pageParams: [undefined],
+  }),
+}));
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseConversationsModule>()),
+  useSessionSearch: (query: string, _scope: string, options: { enabled?: boolean }) => {
+    const active = (options.enabled ?? true) && query !== "";
+    if (active) sessions.searchedQueries.push(query);
+    return { data: active ? { pages: [{ data: sessions.searchHits }] } : undefined };
+  },
+}));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
@@ -51,6 +86,9 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     useWorkspaceDirectory: (_conv: string | undefined, dirPath: string | null) => ({
       data: dirPath === "src" ? ws.srcEntries : undefined,
       isLoading: ws.dirLoading,
+    }),
+    useWorkspaceFileSearch: (_conv: string | undefined, query: string) => ({
+      data: query ? { files: ws.searchFiles, truncated: false } : undefined,
     }),
   };
 });
@@ -66,9 +104,19 @@ vi.mock("@/hooks/useComposerGitStatus", () => ({
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
 }));
+vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseHarnessInventoryModule>()),
+  useHostMcpServers: () => ({ data: [], isLoading: false, isError: false }),
+}));
+// /mcp reads the session's agent via a TanStack query; stub it (no agent loaded)
+// so bare Composer renders don't need a QueryClientProvider.
+vi.mock("@/hooks/useAgents", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseAgentsModule>()),
+  useSessionAgent: () => ({ data: undefined, isError: false }),
+}));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
-  useChildSessions: () => ({ children: [] }),
+  useChildSessions: () => ({ children: sessions.children }),
 }));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
@@ -98,6 +146,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 }));
 
 import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
+import { SESSION_MENTION_CAP, SESSION_MENTION_HINT } from "@/lib/composerMentions";
 
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
@@ -130,6 +179,16 @@ function textarea() {
 /** Type `text` into the composer with the caret at the end. */
 function type(text: string) {
   fireEvent.change(textarea(), { target: { value: text, selectionStart: text.length } });
+}
+
+/** Append `text` to the draft with the caret at the end. */
+function append(text: string) {
+  type(textarea().value + text);
+}
+
+/** Tokens the composer mirror currently paints as pills. */
+function tokens() {
+  return screen.queryAllByTestId("composer-mention-token").map((token) => token.textContent);
 }
 
 function renderWithTooltips(ui: ReactElement) {
@@ -243,6 +302,29 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
   });
 
+  it("gives Shift+Tab to the open menu before the permission-mode shortcut", async () => {
+    const { setClaudePermissionMode } = useChatStore.getState();
+    // Zustand copies the spy into later states, so put the real setter back.
+    onTestFinished(() =>
+      useChatStore.setState({ setClaudePermissionMode, claudePermissionMode: "" }),
+    );
+    useChatStore.setState({ claudePermissionMode: "default" });
+    const setMode = vi
+      .spyOn(useChatStore.getState(), "setClaudePermissionMode")
+      .mockResolvedValue(undefined);
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    type("@");
+    expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
+
+    fireEvent.keyDown(textarea(), { key: "Tab", shiftKey: true });
+    expect(textarea().value).toBe("@src/ ");
+    expect(setMode).not.toHaveBeenCalled();
+
+    // Attaching a folder closes the menu, so the next press cycles the mode.
+    fireEvent.keyDown(textarea(), { key: "Tab", shiftKey: true });
+    await waitFor(() => expect(setMode).toHaveBeenCalledWith("auto"));
+  });
+
   it("opens a folder to reveal nested files, then delivers the chosen file", () => {
     const onSend = vi.fn();
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
@@ -254,14 +336,16 @@ describe("Composer @-file-mention browser (native sessions)", () => {
 
     // Now inside src: nested files appear.
     fireEvent.click(screen.getByTitle("Attach server.ts"));
-    expect(screen.getByText("@src/server.ts")).toBeInTheDocument();
+    // The token lands in the sentence and the mirror paints it as a pill.
+    expect(textarea().value).toBe("@src/server.ts ");
+    expect(tokens()).toEqual(["@src/server.ts"]);
 
-    type("explain this");
+    append("explain this");
     fireEvent.submit(textarea().closest("form")!);
 
-    // The WHY: the agent reads the on-disk nested file from this exact marker.
-    // No File is uploaded (second arg undefined).
-    expect(onSend).toHaveBeenCalledWith("[Attached: src/server.ts]\n\nexplain this", undefined);
+    // The WHY: the agent reads the on-disk nested file from this exact marker,
+    // in place in the sentence. No File is uploaded (second arg undefined).
+    expect(onSend).toHaveBeenCalledWith("[Attached: src/server.ts] explain this", undefined);
   });
 
   it("attaches a whole folder as a single trailing-slash marker", () => {
@@ -270,33 +354,31 @@ describe("Composer @-file-mention browser (native sessions)", () => {
 
     type("@src");
     fireEvent.click(screen.getByLabelText("Attach whole folder src"));
-    expect(screen.getByText("@src/")).toBeInTheDocument();
+    expect(tokens()).toEqual(["@src/"]);
 
-    type("review the module");
+    append("review the module");
     fireEvent.submit(textarea().closest("form")!);
 
     // A folder is delivered with a trailing "/" so the agent opens the dir.
-    expect(onSend).toHaveBeenCalledWith("[Attached: src/]\n\nreview the module", undefined);
+    expect(onSend).toHaveBeenCalledWith("[Attached: src/] review the module", undefined);
   });
 
-  it.each([
-    ["claude-native", "[Attached: src/server.ts]\n\ngo"],
-    ["pi-native", "[Attached: src/server.ts]\n\ngo"],
-    ["cursor-native", "[Attached: src/server.ts]\n\ngo"],
-    ["codex-native", "[Attached file: src/server.ts]\n\ngo"],
-  ])("delivers the harness-correct marker on %s", (harness, expected) => {
-    useChatStore.setState({ sessionHarness: harness });
+  // Wording per harness is covered by mentionMarkerFor above; this checks the
+  // composer passes the session's harness through.
+  it("delivers the harness-specific marker wording", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const expected = "check [Attached file: src/server.ts] now";
     const onSend = vi.fn();
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
-    type("@src");
+    type("check @src");
     fireEvent.click(screen.getByTitle("Open src"));
     fireEvent.click(screen.getByTitle("Attach server.ts"));
-    type("go");
+    append("now");
     fireEvent.submit(textarea().closest("form")!);
     expect(onSend).toHaveBeenCalledWith(expected, undefined);
   });
 
-  it("drains a file-viewer 'Attach to agent' line range into a chip and marker", () => {
+  it("drains a file-viewer 'Attach to agent' line range into an inline token and marker", () => {
     const onSend = vi.fn();
     // Simulate the file viewer's button having queued a line span.
     useChatStore.setState({
@@ -306,20 +388,18 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     });
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
 
-    // The composer drained the queue into a chip showing the path + lines
-    // (the line span renders in its own node so it never truncates away)...
-    expect(screen.getByText("@bob-max-gain/docker-compose.yml")).toBeInTheDocument();
-    expect(screen.getByText(":2-9")).toBeInTheDocument();
+    // The composer drained the queue into a token with the path + lines...
+    expect(tokens()).toEqual(["@bob-max-gain/docker-compose.yml:2-9"]);
     // ...and the store queue was cleared so it can't double-apply.
     expect(useChatStore.getState().pendingComposerAttachments).toEqual([]);
 
-    type("explain this service");
+    append("explain this service");
     fireEvent.submit(textarea().closest("form")!);
 
     // Delivered as "path:start-end" inside the marker so the agent reads
     // exactly those lines.
     expect(onSend).toHaveBeenCalledWith(
-      "[Attached: bob-max-gain/docker-compose.yml:2-9]\n\nexplain this service",
+      "[Attached: bob-max-gain/docker-compose.yml:2-9] explain this service",
       undefined,
     );
   });
@@ -353,7 +433,7 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     // Row 0 (src, folders-first) is preselected; move to row 1 (readme.md).
     fireEvent.keyDown(ta, { key: "ArrowDown" });
     fireEvent.keyDown(ta, { key: "Enter" });
-    expect(screen.getByText("@readme.md")).toBeInTheDocument();
+    expect(tokens()).toEqual(["@readme.md"]);
   });
 
   it("ArrowUp from the top row wraps to the last row", () => {
@@ -362,28 +442,27 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     // From row 0, ArrowUp wraps to the last row (readme.md), not -1.
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(screen.getByText("@readme.md")).toBeInTheDocument();
+    expect(tokens()).toEqual(["@readme.md"]);
   });
 
   it("Enter on a directory row drills in rather than attaching", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
     // Row 0 is the "src" folder: Enter must open it (reveal nested files), and
-    // must NOT produce a chip — drilling is navigation, not attachment. (The
-    // token becomes "@src/" in the textarea; a chip would instead surface a
-    // "Remove src" button, which must be absent.)
+    // must NOT tag it — drilling is navigation, not attachment, so the typed
+    // "@src/" stays plain text with no pill.
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Remove src")).not.toBeInTheDocument();
+    expect(tokens()).toEqual([]);
   });
 
   it("Tab attaches the highlighted folder as a whole-directory unit", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
-    // Tab on the "src" folder attaches it as a unit (trailing-slash chip),
+    // Tab on the "src" folder attaches it as a unit (trailing-slash token),
     // distinct from Enter's drill-in.
     fireEvent.keyDown(textarea(), { key: "Tab" });
-    expect(screen.getByText("@src/")).toBeInTheDocument();
+    expect(tokens()).toEqual(["@src/"]);
   });
 
   it("Escape closes the mention menu", () => {
@@ -394,28 +473,167 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
   });
 
-  // ── Chip lifecycle + dedup (M8, M2) ──────────────────────────────────────
-
-  it("removes a tagged chip when its ✕ is clicked", () => {
+  it("adds deeper files from the recursive search, deduped and filtered by the live query", async () => {
+    ws.searchFiles = [
+      { path: "src/server.ts", name: "server.ts", type: "file", bytes: 1, modified_at: null },
+      // A stale hit from an earlier, shorter query no longer matches "serv".
+      { path: "src/client.ts", name: "client.ts", type: "file", bytes: 1, modified_at: null },
+    ];
     renderWithTooltips(<Composer {...composerProps()} />);
-    type("@");
-    fireEvent.click(screen.getByTitle("Attach readme.md"));
-    expect(screen.getByText("@readme.md")).toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText("Remove readme.md"));
-    expect(screen.queryByText("@readme.md")).not.toBeInTheDocument();
+    type("@serv");
+    // The root listing has no match; the debounced search supplies the nested file.
+    await waitFor(() => expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument());
+    expect(screen.queryByTitle("Attach client.ts")).not.toBeInTheDocument();
+    expect(screen.getAllByTitle("Attach server.ts")).toHaveLength(1);
   });
 
-  it("dedups re-attaching the same file via '@' to a single chip", () => {
+  it("dedups a file both listed and returned by the recursive search", () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    ws.searchFiles = [
+      { path: "readme.md", name: "readme.md", type: "file", bytes: 10, modified_at: null },
+      {
+        path: "docs/readme-notes.md",
+        name: "readme-notes.md",
+        type: "file",
+        bytes: 1,
+        modified_at: null,
+      },
+    ];
     renderWithTooltips(<Composer {...composerProps()} />);
-    type("@");
-    fireEvent.click(screen.getByTitle("Attach readme.md"));
-    type("@");
-    fireEvent.click(screen.getByTitle("Attach readme.md"));
-    // Same path + dir-ness + (no) range → same identity key → one chip.
-    expect(screen.getAllByText("@readme.md")).toHaveLength(1);
+    type("@readme");
+    act(() => vi.advanceTimersByTime(300));
+    // The search ran (its deeper hit shows) and the root file appears once.
+    expect(screen.getByTitle("Attach readme-notes.md")).toBeInTheDocument();
+    expect(screen.getAllByTitle("Attach readme.md")).toHaveLength(1);
   });
 
-  it("keeps two distinct line ranges of the same file as separate chips", () => {
+  it("gives a file its own token when a tagged session has the same name", () => {
+    const onSend = vi.fn();
+    sessions.loaded = [sessionRow("s_readme", "readme.md")];
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("compare @readme");
+    fireEvent.click(screen.getByTitle("Tag session readme.md"));
+    append("with @readme");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    expect(tokens()).toEqual(["@readme.md", "@readme.md (file)"]);
+    // Deleting the session token leaves only the file; its longer token must not
+    // keep the session tagged (which would still add the session hint).
+    type("compare  with @readme.md (file) ");
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("compare  with [Attached: readme.md]", undefined);
+  });
+
+  it("re-adds a file on 'Attach to agent' when only a longer session token still starts with it", () => {
+    const onSend = vi.fn();
+    sessions.loaded = [sessionRow("s_readme", "readme.md")];
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    // File first, so the session gets the longer, disambiguated token.
+    type("compare @readme");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    append("with @readme");
+    fireEvent.click(screen.getByTitle("Tag session readme.md"));
+    const [fileToken, sessionToken] = tokens();
+    expect(fileToken).toBe("@readme.md");
+    expect(sessionToken.startsWith("@readme.md ")).toBe(true);
+    // Delete the standalone file token, then attach the file again from the viewer.
+    type(`compare  with ${sessionToken} `);
+    act(() => {
+      useChatStore.setState({ pendingComposerAttachments: [{ path: "readme.md", isDir: false }] });
+    });
+    expect(tokens()).toEqual([sessionToken, "@readme.md"]);
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe(
+      'compare  with [Session: "readme.md" id=s_readme subagent=no] [Attached: readme.md]' +
+        `\n\n${SESSION_MENTION_HINT}`,
+    );
+  });
+
+  it("keeps the highlighted file when session results land above it", async () => {
+    sessions.searchHits = [sessionRow("s_readme", "readme cleanup")];
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@readme");
+    // Before the debounced search returns, the file is the top, highlighted row.
+    expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
+    await waitFor(() =>
+      expect(screen.getByTitle("Tag session readme cleanup")).toBeInTheDocument(),
+    );
+    // The session row was inserted above, but the highlight stayed on the file.
+    expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(tokens()).toEqual(["@readme.md"]);
+  });
+
+  // ── Token lifecycle + dedup (M8, M2) ─────────────────────────────────────
+
+  it("Backspace at a token's end deletes the whole token and untags it", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("see @");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    // Caret just after the token (the trailing space removed), which reopens the
+    // menu for "@readme.md".
+    type("see @readme.md");
+    expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Backspace" });
+    expect(textarea().value).toBe("see ");
+    expect(tokens()).toEqual([]);
+    expect(screen.queryByTitle("Attach readme.md")).not.toBeInTheDocument();
+    // Enter right away sends the text; it must not re-insert the deleted token.
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("see", undefined);
+  });
+
+  it("treats a deleted tag's retyped text as literal text", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("see @");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    type("see @readme.md");
+    fireEvent.keyDown(textarea(), { key: "Backspace" });
+    expect(tokens()).toEqual([]);
+    // Typing the same text again, without picking a suggestion, is not a tag.
+    type("Explain the literal text @readme.md here");
+    expect(tokens()).toEqual([]);
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("Explain the literal text @readme.md here", undefined);
+  });
+
+  it("keeps a tag while another of its tokens remains", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("see @");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    append("and @readme");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    expect(tokens()).toEqual(["@readme.md", "@readme.md"]);
+    // Deleting one occurrence leaves the other tagged.
+    type("see and @readme.md ");
+    expect(tokens()).toEqual(["@readme.md"]);
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("see and [Attached: readme.md]", undefined);
+  });
+
+  it("dedups re-attaching the same file via '@' to one tag", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("@");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    append("and @");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    // Same path + dir-ness + (no) range → same identity key → one tag, and
+    // each occurrence of its token becomes the marker.
+    expect(tokens()).toEqual(["@readme.md", "@readme.md"]);
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith(
+      "[Attached: readme.md] and [Attached: readme.md]",
+      undefined,
+    );
+  });
+
+  it("keeps two distinct line ranges of the same file as separate tokens", () => {
     // WHY (M2): the dedup key is path + dir-ness + line range, NOT path alone.
     // A path-only key would silently drop the second range — but two ranges of
     // one file are genuinely distinct attachments the agent should receive.
@@ -426,12 +644,10 @@ describe("Composer @-file-mention browser (native sessions)", () => {
       ],
     });
     renderWithTooltips(<Composer {...composerProps()} />);
-    expect(screen.getAllByText("@a.ts")).toHaveLength(2);
-    expect(screen.getByText(":2-9")).toBeInTheDocument();
-    expect(screen.getByText(":20-30")).toBeInTheDocument();
+    expect(tokens()).toEqual(["@a.ts:2-9", "@a.ts:20-30"]);
   });
 
-  it("collapses identical queued attachments to one chip on drain", () => {
+  it("collapses identical queued attachments to one token on drain", () => {
     // The store dedups on insert, but the drain must also dedup within a batch
     // (and against already-tagged chips) so a duplicated queue can't double up.
     useChatStore.setState({
@@ -441,14 +657,14 @@ describe("Composer @-file-mention browser (native sessions)", () => {
       ],
     });
     renderWithTooltips(<Composer {...composerProps()} />);
-    expect(screen.getAllByText(":2-9")).toHaveLength(1);
+    expect(textarea().value).toBe("@a.ts:2-9 ");
   });
 
   // ── Dismissal + loading feedback (M3, M1, M6) ─────────────────────────────
 
   it("dismisses the menu when the textarea loses focus", () => {
     // WHY (M3): the menu's visibility derives from the caret on change; without
-    // a blur dismiss it lingers when the user clicks a chip ✕ or another field.
+    // a blur dismiss it lingers when the user clicks another field.
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
     expect(screen.getByTitle("Open src")).toBeInTheDocument();
@@ -479,5 +695,303 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     type("ping @nomatch");
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("ping @nomatch", undefined);
+  });
+});
+
+function sessionRow(id: string, title: string | null, extra: Record<string, unknown> = {}) {
+  return { id, object: "conversation", title, created_at: 0, updated_at: 0, labels: {}, ...extra };
+}
+
+describe("Composer @-session mentions", () => {
+  let convSeq = 0;
+  let currentId = "";
+  beforeEach(() => {
+    resetWorkspaceMock();
+    localStorage.clear();
+    currentId = `conv_session_${++convSeq}`;
+    useChatStore.setState({
+      conversationId: currentId,
+      sessionHarness: "claude-sdk",
+      pendingComposerAttachments: [],
+    });
+    sessions.loaded = [
+      sessionRow(currentId, "This session"),
+      sessionRow("s_alpha", "Alpha planning"),
+      sessionRow("s_archived", "Alpha archived", { archived: true }),
+      sessionRow("s_beta", null),
+    ];
+    sessions.children = [
+      {
+        id: "s_child",
+        title: "researcher:auth",
+        task_summary: null,
+        tool: "researcher",
+        session_name: "auth",
+        current_task_status: null,
+        busy: false,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+      },
+    ];
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("collapses sessions into one row on a bare @ and opens the lists from it", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@");
+    // A bare "@" shows only the Sessions row: no session rows, no files on SDK harnesses.
+    expect(screen.getByTestId("session-mention-category-sessions")).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+    expect(screen.queryAllByTestId(/^session-mention-item-/)).toHaveLength(0);
+    expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("session-mention-category-sessions"));
+    // A Subagents row, then the other sessions; the current session and archived
+    // rows are excluded, and untitled rows get a label.
+    expect(screen.getByTestId("session-mention-category-subagents")).toBeInTheDocument();
+    const rowText = () =>
+      screen.getAllByTestId(/^session-mention-item-/).map((row) => row.textContent);
+    expect(rowText()).toEqual(["Alpha planning", "Untitled session"]);
+    fireEvent.click(screen.getByTestId("session-mention-category-subagents"));
+    expect(rowText()).toEqual(["authsubagent"]);
+    // The lists are served from cache alone.
+    expect(sessions.searchedQueries).toEqual([]);
+  });
+
+  it("lists every loaded session when opened but caps typed matches", () => {
+    sessions.loaded = Array.from({ length: 12 }, (_, i) => sessionRow(`s_${i}`, `Plan ${i}`));
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    // All twelve loaded sessions, below the Subagents row.
+    expect(screen.getAllByTestId(/^session-mention-item-/)).toHaveLength(12);
+    type("@plan");
+    // Typing in the open list filters it without a cap.
+    expect(screen.getAllByTestId(/^session-mention-item-/)).toHaveLength(12);
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    // Back at the top level, typed matches are capped inline.
+    expect(screen.getAllByTestId(/^session-mention-item-/)).toHaveLength(SESSION_MENTION_CAP);
+  });
+
+  it("goes up one level with Back or Escape, then Escape closes the menu", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@");
+    fireEvent.click(screen.getByTestId("session-mention-category-sessions"));
+    // An open list hides files.
+    expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("session-mention-back"));
+    expect(screen.getByTestId("session-mention-category-sessions")).toBeInTheDocument();
+    expect(screen.getByTitle("Open src")).toBeInTheDocument();
+    // ArrowRight opens the highlighted category: Sessions, then Subagents.
+    fireEvent.keyDown(textarea(), { key: "ArrowRight" });
+    fireEvent.keyDown(textarea(), { key: "ArrowRight" });
+    expect(screen.queryByTestId("session-mention-category-subagents")).not.toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(screen.getByTestId("session-mention-category-subagents")).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(screen.getByTestId("session-mention-category-sessions")).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(screen.queryByTestId("file-mention-menu")).not.toBeInTheDocument();
+  });
+
+  it("delivers tagged sessions as inline markers plus one tool hint", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("Ask @");
+    // Enter opens Sessions, then Subagents, then tags the first subagent.
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    append("to compare with @alpha");
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+    expect(textarea().value).toBe("Ask @auth to compare with @Alpha planning ");
+    expect(tokens()).toEqual(["@auth", "@Alpha planning"]);
+
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith(
+      'Ask [Session: "auth" id=s_child subagent=yes] to compare with ' +
+        `[Session: "Alpha planning" id=s_alpha subagent=no]\n\n${SESSION_MENTION_HINT}`,
+      undefined,
+    );
+  });
+
+  describe("recalling a queued tagged message", () => {
+    const queuedText = () =>
+      `Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review\n\n${SESSION_MENTION_HINT}`;
+
+    function renderWithQueued(onSend: (text: string) => void) {
+      useChatStore.setState({
+        queuedMessages: [{ queueId: "q_tagged", text: queuedText(), conversationId: currentId }],
+      });
+      renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    }
+
+    it.each([
+      ["Edit", () => fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }))],
+      ["ArrowUp", () => fireEvent.keyDown(textarea(), { key: "ArrowUp" })],
+    ])("restores the tag as a token on %s, so a resend keeps one trailing hint", (_how, recall) => {
+      const onSend = vi.fn();
+      renderWithQueued(onSend);
+      recall();
+      expect(textarea().value).toBe("Ask @Alpha planning to review");
+      expect(tokens()).toEqual(["@Alpha planning"]);
+      append(" today");
+      fireEvent.submit(textarea().closest("form")!);
+      expect(onSend.mock.calls[0]![0]).toBe(
+        `Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review today\n\n${SESSION_MENTION_HINT}`,
+      );
+    });
+
+    it("restores a failed send's tags as tokens, so a resend keeps one trailing hint", () => {
+      const onSend = vi.fn();
+      renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: { conversationId: currentId, text: queuedText(), files: [] },
+        }),
+      );
+      expect(textarea().value).toBe("Ask @Alpha planning to review");
+      expect(tokens()).toEqual(["@Alpha planning"]);
+      append(" today");
+      fireEvent.submit(textarea().closest("form")!);
+      expect(onSend.mock.calls[0]![0]).toBe(
+        `Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review today\n\n${SESSION_MENTION_HINT}`,
+      );
+    });
+
+    it("merges a failed send into newer input without retargeting either tag", () => {
+      const onSend = vi.fn();
+      renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+      // Newer input already tags s_alpha as "@Alpha planning".
+      type("first @alpha");
+      fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+      // A send recovered when the session loaded, which tagged a different
+      // session with the same title, is added after the newer input.
+      const failed =
+        `Ask [Session: "Alpha planning" id=s_other subagent=no] to review\n\n` +
+        SESSION_MENTION_HINT;
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: { conversationId: currentId, text: failed, files: [], recovered: true },
+        }),
+      );
+      expect(tokens()).toEqual(["@Alpha planning", "@Alpha planning (s_othe)"]);
+      fireEvent.submit(textarea().closest("form")!);
+      const sent = onSend.mock.calls[0]![0] as string;
+      expect(sent).toBe(
+        // The picked token keeps the space the composer adds after it.
+        'first [Session: "Alpha planning" id=s_alpha subagent=no] \n\n' +
+          'Ask [Session: "Alpha planning" id=s_other subagent=no] to review\n\n' +
+          SESSION_MENTION_HINT,
+      );
+    });
+
+    it("adds a newly tagged session to a recalled message with one hint", () => {
+      const onSend = vi.fn();
+      renderWithQueued(onSend);
+      fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+      append(" with @aut");
+      fireEvent.click(screen.getByTitle("Tag subagent auth"));
+      fireEvent.submit(textarea().closest("form")!);
+      const sent = onSend.mock.calls[0]![0] as string;
+      expect(sent).toBe(
+        'Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review with ' +
+          `[Session: "auth" id=s_child subagent=yes]\n\n${SESSION_MENTION_HINT}`,
+      );
+      expect(sent.split("[Tagged sessions:")).toHaveLength(2);
+    });
+  });
+
+  it("keeps tagged sessions when the composer remounts with the saved draft", () => {
+    const onSend = vi.fn();
+    const first = renderWithTooltips(<Composer {...composerProps()} />);
+    type("Ask @alpha");
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+    append("to review");
+    // Leaving the page unmounts the composer; the draft is saved per session.
+    first.unmount();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    expect(textarea().value).toBe("Ask @Alpha planning to review");
+    expect(tokens()).toEqual(["@Alpha planning"]);
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe(
+      `Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review\n\n${SESSION_MENTION_HINT}`,
+    );
+  });
+
+  it("inserts a mention picked mid-sentence in place and sends it there", async () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    const draft = "ask @alp to finish it";
+    const caret = "ask @alp".length;
+    fireEvent.change(textarea(), { target: { value: draft, selectionStart: caret } });
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+    expect(textarea().value).toBe("ask @Alpha planning to finish it");
+    // The caret lands after the token and the existing space.
+    await waitFor(() => expect(textarea().selectionStart).toBe("ask @Alpha planning ".length));
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe(
+      `ask [Session: "Alpha planning" id=s_alpha subagent=no] to finish it\n\n${SESSION_MENTION_HINT}`,
+    );
+  });
+
+  it("keeps matching a session title as the query gains a space", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("Ask @alpha");
+    type("Ask @alpha pl");
+    // The typed part of the matching title is tinted, spaces included.
+    expect(screen.getByTestId("mention-match").textContent).toBe("Alpha pl");
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+    expect(textarea().value).toBe("Ask @Alpha planning ");
+    // Once nothing matches, the space ends the token and the menu closes.
+    type("Ask @alpha zz");
+    expect(screen.queryByTestId("file-mention-menu")).not.toBeInTheDocument();
+  });
+
+  it("waits for typing to pause before searching, and searches the latest text", () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    sessions.searchHits = [sessionRow("s_remote", "Gamma rollout")];
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@g");
+    act(() => vi.advanceTimersByTime(200));
+    type("@gam");
+    act(() => vi.advanceTimersByTime(299));
+    // Rapid typing restarts the 300 ms wait, so nothing has been searched yet.
+    expect(sessions.searchedQueries).toEqual([]);
+    act(() => vi.advanceTimersByTime(1));
+    expect(sessions.searchedQueries).toContain("gam");
+    expect(sessions.searchedQueries).not.toContain("g");
+    expect(screen.getByTitle("Tag session Gamma rollout")).toBeInTheDocument();
+  });
+
+  it("lists the Sessions row above files in a native session and navigates across both", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@");
+    expect(screen.getByTestId("session-mention-category-sessions")).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+    // The Sessions row, then the "src" folder.
+    fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(tokens()).toEqual(["@src/"]);
+  });
+
+  it("matches no session for a path-shaped token", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@src/");
+    expect(screen.queryAllByTestId(/^session-mention-item-/)).toHaveLength(0);
+    expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
   });
 });

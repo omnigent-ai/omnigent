@@ -54,8 +54,31 @@ from omnigent.runtime.harnesses.paths import (
     HARNESS_TMP_PARENT_ENV_VAR,
     harness_tmp_parent,
 )
+from omnigent.util.json_serialization import json_dumps_transport_safe
 
 _logger = logging.getLogger(__name__)
+
+
+class _HarnessHttpClient(httpx.AsyncClient):
+    """Keep retained surrogate text encodable at the harness HTTP boundary."""
+
+    def build_request(self, method: str, url: httpx.URL | str, **kwargs: Any) -> httpx.Request:
+        try:
+            return super().build_request(method, url, **kwargs)
+        except UnicodeEncodeError:
+            payload = kwargs.get("json")
+            if payload is None or any(
+                kwargs.get(name) is not None for name in ("content", "data", "files")
+            ):
+                raise
+            headers = httpx.Headers(kwargs.get("headers"))
+            if "Content-Type" not in self.headers:
+                headers.setdefault("Content-Type", "application/json")
+            kwargs["json"] = None
+            kwargs["content"] = json_dumps_transport_safe(payload).encode("utf-8")
+            kwargs["headers"] = headers
+            return super().build_request(method, url, **kwargs)
+
 
 # Per-AP-instance directory holding all per-conversation Unix
 # sockets (POSIX) and the AP_PID sentinel file. Each Omnigent instance gets a
@@ -688,11 +711,7 @@ class HarnessProcessManager:
             # Sweep BEFORE creating our own dir, so a crashed prior instance
             # whose dir uuid happens to collide with ours gets cleaned first.
             await sweep_orphaned_harness_processes(tmp_parent=self._tmp_parent)
-        self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # Write the AP_PID sentinel so other instances' sweeps can tell our
-        # dir is live. The PID-namespace-qualified claim keeps a sweep that
-        # cannot see our PID (e.g. inside an agent sandbox) from deleting it.
-        write_owner_claim(self._instance_dir, filename=_AP_PID_FILE)
+        self._ensure_instance_dir()
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -1036,7 +1055,7 @@ class HarnessProcessManager:
                 entry.client.post(cancel_url, json={"type": "interrupt"}),
                 timeout=timeout_s,
             )
-        except (httpx.HTTPError, asyncio.TimeoutError):
+        except (TimeoutError, httpx.HTTPError):
             _logger.exception(
                 "harness cancel forward failed: conversation_id=%s harness_response_id=%s",
                 conversation_id,
@@ -1247,6 +1266,13 @@ class HarnessProcessManager:
                 self._spawn_locks[conversation_id] = lock
             return lock
 
+    def _ensure_instance_dir(self) -> None:
+        # Temporary-file cleanup may remove either directory after start().
+        # Recreated state needs the same private modes and live-owner claim.
+        self._tmp_parent.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        write_owner_claim(self._instance_dir, filename=_AP_PID_FILE)
+
     async def _spawn_entry(
         self,
         conversation_id: str,
@@ -1273,6 +1299,7 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
+        self._ensure_instance_dir()
         endpoint = _HarnessEndpoint.create(self._instance_dir, conversation_id)
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)
@@ -1355,7 +1382,7 @@ class HarnessProcessManager:
             # tool dispatch round-trips (action_required → AP
             # call_tool → PATCH → resume); use a generous fixed
             # timeout that still surfaces a genuinely-stuck harness.
-            client = httpx.AsyncClient(
+            client = _HarnessHttpClient(
                 transport=endpoint.make_transport(),
                 base_url=endpoint.base_url,
                 # S1 (security): present the per-spawn bearer token (Windows only)

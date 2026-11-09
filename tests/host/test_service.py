@@ -190,6 +190,42 @@ def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:
     ) in unit
 
 
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_service_persists_explicit_host_credentials_privately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system: str
+) -> None:
+    from omnigent.cli import _build_host_daemon_env
+
+    monkeypatch.setattr(
+        service.os,
+        "environ",
+        {
+            "HOME": str(tmp_path),
+            "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
+            "OMNIGENT_DATA_DIR": str(tmp_path / "state"),
+            "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "MY_GATEWAY_TOKEN",
+            "MY_GATEWAY_TOKEN": "synthetic-provider-key",
+            "UNRELATED_SHELL_SECRET": "unrelated-secret",
+        },
+    )
+    monkeypatch.setattr(service.platform, "system", lambda: system)
+    _capture_runs(monkeypatch)
+    installed = service.enable_user_host_service(
+        "https://example.com",
+        environment=_build_host_daemon_env(server_url="https://example.com"),
+    )
+
+    contents = installed.path.read_bytes()
+    if system == "Darwin":
+        assert plistlib.loads(contents)["EnvironmentVariables"]["MY_GATEWAY_TOKEN"] == (
+            "synthetic-provider-key"
+        )
+    else:
+        assert b'Environment="MY_GATEWAY_TOKEN=synthetic-provider-key"' in contents
+    assert b"unrelated-secret" not in contents
+    assert installed.path.stat().st_mode & 0o777 == 0o600
+
+
 def test_disable_systemd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
@@ -228,3 +264,50 @@ def test_service_entry_maps_fatal_host_exit(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(cli, "main", _fatal)
 
     assert service_entry.main() == 0
+
+
+def test_service_entry_waits_while_another_daemon_serves_the_workspace(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A service host next to another URL's daemon for its workspace waits.
+
+    Starting would be refused, and the service manager would restart the host
+    every few seconds; it starts once the other daemon is gone instead.
+    """
+    from types import SimpleNamespace
+
+    from omnigent import cli as cli_module
+    from omnigent.host import service_entry
+
+    monkeypatch.setattr(sys, "argv", ["service-entry", "--server", "https://ws.example.com"])
+    monkeypatch.setattr(cli_module, "_resolve_host_server", lambda server: server)
+    sibling = SimpleNamespace(pid=4242, target="https://other.example.com/api/2.0/omnigent")
+    answers = [sibling, sibling, None]
+    monkeypatch.setattr(cli_module, "_same_workspace_daemon", lambda _url: answers.pop(0))
+    sleeps: list[float] = []
+    monkeypatch.setattr(service_entry.time, "sleep", sleeps.append)
+    hosts: list[list[str]] = []
+    monkeypatch.setattr(cli_module.cli, "main", lambda **kwargs: hosts.append(kwargs["args"]))
+
+    assert service_entry.main() == 0
+
+    assert sleeps == [service_entry._STANDBY_POLL_S] * 2
+    assert hosts == [["host", "--server", "https://ws.example.com", "--non-interactive"]]
+    assert capsys.readouterr().err.count("waiting until it stops") == 1
+
+
+def test_service_entry_local_mode_does_not_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent import cli as cli_module
+    from omnigent.host import service_entry
+
+    monkeypatch.setattr(sys, "argv", ["service-entry", "--local"])
+
+    def _unexpected(_url: str) -> None:
+        raise AssertionError("local mode has no workspace to wait for")
+
+    monkeypatch.setattr(cli_module, "_same_workspace_daemon", _unexpected)
+    hosts: list[list[str]] = []
+    monkeypatch.setattr(cli_module.cli, "main", lambda **kwargs: hosts.append(kwargs["args"]))
+
+    assert service_entry.main() == 0
+    assert hosts == [["host", "--server", "", "--non-interactive"]]

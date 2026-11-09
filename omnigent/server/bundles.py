@@ -121,14 +121,9 @@ def validate_agent_bundle(
     :param bundle_bytes: Raw bytes of the ``.tar.gz`` bundle.
     :param enforce_handler_allowlist: When ``True`` (the default),
         reject any ``type: function`` policy whose handler is not a
-        registered policy handler, before the inner loader
-        can resolve and call it. Callers pass ``False`` only for a
-        trusted single-user/local server, where ``omnigent run`` uploads
-        the operator's own bundle through this same path and custom
-        handlers must keep working (the operator already has code
-        execution, so the restriction would add no security). See the
-        call sites in ``omnigent/server/routes/sessions.py``, which gate
-        this on :func:`omnigent.server.auth.local_single_user_enabled`.
+        registered policy handler, before the inner loader can resolve and
+        call it. HTTP entry points always enforce this, including local
+        single-user servers. ``False`` is for direct trusted in-process callers.
     :returns: The validated :class:`AgentSpec`.
     :raises OmnigentError: If the bundle is invalid, the spec is
         missing a name, or (when *enforce_handler_allowlist*) a policy
@@ -165,11 +160,7 @@ def validate_agent_bundle(
             code=ErrorCode.INVALID_INPUT,
         )
 
-    # Both guards below apply only to untrusted uploads, gated on the same
-    # trust signal as the handler allowlist: a trusted single-user/local server
-    # (enforce_handler_allowlist=False) uploads the operator's OWN bundle, and
-    # the operator legitimately controls cwd and Python callable tools (they
-    # already have code execution), so neither restriction applies there.
+    # HTTP entry points always enforce these uploaded-code boundaries.
     if enforce_handler_allowlist:
         # Terminals and nested agents can override the session working directory.
         _reject_uploaded_escaping_cwd(spec)
@@ -304,6 +295,27 @@ def content_bundle_location(agent_id: str, bundle_bytes: bytes) -> str:
     return f"{agent_id}/{digest}"
 
 
+def _blob_confirmed(artifact_store: ArtifactStore, location: str) -> bool:
+    """
+    Return whether the store confirms a blob at *location*.
+
+    The check only lets a caller skip rewriting a content-addressed blob it
+    already holds, so a failed check reads as unconfirmed: the rewrite is
+    harmless, and its own failure is the one that should reach the caller.
+
+    :returns: ``False`` when the blob is absent or the check failed.
+    """
+    try:
+        return artifact_store.exists(location)
+    except Exception:
+        _logger.warning(
+            "Could not confirm bundle %s in the artifact store; rewriting it",
+            location,
+            exc_info=True,
+        )
+        return False
+
+
 # An MCP edit moves a row off its upload's content, so later uploads of that
 # content take the next id; past this many edited rows they get fresh rows.
 _UPLOADED_AGENT_ATTEMPTS = 3
@@ -359,7 +371,7 @@ def uploaded_agent_for(
         ):
             # The blob can vanish while the row survives (pruned artifacts, a DB
             # restored without its store); this upload holds the same files.
-            if not artifact_store.exists(location):
+            if not _blob_confirmed(artifact_store, location):
                 artifact_store.put(location, bundle_bytes)
             return agent
     return None

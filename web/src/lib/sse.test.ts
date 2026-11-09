@@ -182,6 +182,18 @@ describe("parseEvent — response.output_item.done (message)", () => {
       messageId: "codex:thread_1:turn_1:agentMessage:item_1",
     } satisfies MessageDone);
   });
+
+  it("carries a known assistant phase and drops an unknown one", () => {
+    const item = { id: "it_1", type: "message", response_id: "resp_1", content: [] };
+    const known = parseEvent("response.output_item.done", {
+      item: { ...item, phase: "final_answer" },
+    });
+    expect(known).toMatchObject({ type: "message_done", phase: "final_answer" });
+    const unknown = parseEvent("response.output_item.done", {
+      item: { ...item, phase: "summary" },
+    });
+    expect(unknown).not.toHaveProperty("phase");
+  });
 });
 
 describe("parseEvent — response.output_item.done (reasoning)", () => {

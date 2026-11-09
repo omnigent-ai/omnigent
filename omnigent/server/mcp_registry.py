@@ -322,27 +322,29 @@ class McpRegistry:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         try:
             async with asyncio.timeout(service.timeout):
-                async with httpx.AsyncClient(
-                    headers=headers, follow_redirects=False, timeout=service.timeout
-                ) as client:
-                    async with streamable_http_client(service.url, http_client=client) as (
+                async with (
+                    httpx.AsyncClient(
+                        headers=headers, follow_redirects=False, timeout=service.timeout
+                    ) as client,
+                    streamable_http_client(service.url, http_client=client) as (
                         read,
                         write,
                         _,
-                    ):
-                        async with ClientSession(read, write) as session:
-                            await session.initialize()
-                            if tool is not None:
-                                return await session.call_tool(tool, arguments or {})
-                            tools = []
-                            cursor = None
-                            for _ in range(100):
-                                result = await session.list_tools(cursor=cursor)
-                                tools.extend(t for t in result.tools if t.name in service.tools)
-                                cursor = result.nextCursor
-                                if not cursor:
-                                    return tools
-                            raise ConnectionError("MCP tool catalog exceeded the pagination limit")
+                    ),
+                    ClientSession(read, write) as session,
+                ):
+                    await session.initialize()
+                    if tool is not None:
+                        return await session.call_tool(tool, arguments or {})
+                    tools = []
+                    cursor = None
+                    for _ in range(100):
+                        result = await session.list_tools(cursor=cursor)
+                        tools.extend(t for t in result.tools if t.name in service.tools)
+                        cursor = result.nextCursor
+                        if not cursor:
+                            return tools
+                    raise ConnectionError("MCP tool catalog exceeded the pagination limit")
         except ConnectionError:
             raise
         except Exception as exc:  # noqa: BLE001 — transport errors may contain credentials

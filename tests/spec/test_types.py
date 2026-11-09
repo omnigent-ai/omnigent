@@ -44,6 +44,29 @@ def test_harness_kind(executor: ExecutorSpec, expected: str) -> None:
     assert executor.harness_kind == expected
 
 
+@pytest.mark.parametrize(
+    ("policy", "expected"),
+    [
+        (RetryPolicy(), {"CLAUDE_CODE_MAX_RETRIES": "7", "API_TIMEOUT_MS": "120000"}),
+        (
+            RetryPolicy(max_retries=0, timeout_per_request_s=1.25),
+            {"CLAUDE_CODE_MAX_RETRIES": "0", "API_TIMEOUT_MS": "1250"},
+        ),
+        (
+            RetryPolicy(timeout_per_request_s=1.001),
+            {"CLAUDE_CODE_MAX_RETRIES": "7", "API_TIMEOUT_MS": "1001"},
+        ),
+        (
+            RetryPolicy(timeout_per_request_s=0.0001),
+            {"CLAUDE_CODE_MAX_RETRIES": "7", "API_TIMEOUT_MS": "1"},
+        ),
+        (RetryPolicy(timeout_per_request_s=None), {"CLAUDE_CODE_MAX_RETRIES": "7"}),
+    ],
+)
+def test_claude_cli_retry_environment(policy: RetryPolicy, expected: dict[str, str]) -> None:
+    assert policy.claude_cli.env() == expected
+
+
 def test_retry_policy_to_json_round_trips() -> None:
     """``RetryPolicy.to_json`` -> ``from_json`` produces an
     equal instance.

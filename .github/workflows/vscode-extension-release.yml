@@ -46,7 +46,7 @@ jobs:
   build-and-release:
     # Inert in forks / mirrors — only the canonical repo cuts releases.
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Validate version
