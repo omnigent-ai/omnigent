@@ -4538,6 +4538,8 @@ async def _wait_for_host_bound_runner_client(
                 ):
                     return None
                 if retained_deadline is not None:
+                    if time.monotonic() >= retained_deadline:
+                        return None
                     connect_task = wait_for_connection(
                         max(0.0, retained_deadline - time.monotonic())
                     )

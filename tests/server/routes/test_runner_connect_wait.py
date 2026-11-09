@@ -608,6 +608,8 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
         "response_consumed",
         "ordinary_floor",
         "auth_deadline",
+        "previously_connected_timeout",
+        "previously_connected_success",
     ],
 )
 async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, outcome) -> None:
@@ -639,7 +641,11 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
             clock.now = 150.0
         return current
 
-    retained = None
+    retained = (
+        StartupRunnerWait(runner_id="runner-owned", deadline=10.0, connected=True)
+        if outcome.startswith("previously_connected_")
+        else None
+    )
 
     def pending_item(_session_id, _input_id):
         return SimpleNamespace(
@@ -667,7 +673,9 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
         get_item=pending_item,
         claim_pending_input_runner=claim_runner,
     )
-    saved_input = startup_inputs.StartupInputContext(None, Headers(), None, "input-owned")
+    saved_input = startup_inputs.StartupInputContext(
+        None, Headers(), None, "input-owned", runner_wait=retained
+    )
     extended = asyncio.Event()
     polled = asyncio.Event()
     initial_status = asyncio.Event()
@@ -750,6 +758,12 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
     try:
         async with asyncio.timeout(budget(5)):
             await initial_status.wait()
+            if outcome.startswith("previously_connected_"):
+                clock.now = 20.0 if outcome.endswith("success") else 30.0
+                initial_results.put_nowait(client if outcome.endswith("success") else None)
+                assert await task is (client if outcome.endswith("success") else None)
+                assert waits == [30.0]
+                return
             if outcome in {
                 "unsupported",
                 "unsupported_connected",
