@@ -20,7 +20,7 @@ from omnigent.db.db_models import LABEL_KEY_MAX_LEN, LABEL_VALUE_MAX_LEN
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
+from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.conversation_store import is_internal_label_key
@@ -216,9 +216,9 @@ async def validate_session_agent(
         )
     require_user_agent_visible(agent, user_id)
 
-    # Session-scoped agents belong to a specific session. The caller must have
-    # at least READ access to that owning session — otherwise they can execute
-    # another user's private agent by guessing the raw agent id.
+    # Binding a session-scoped agent into a new session shares its mutable agent
+    # row, so the caller needs EDIT on the owning session. READ would let a
+    # read-only collaborator run, and then change, another user's private agent.
     if agent.session_id is not None:
         # Single-user servers persist the local owner as NULL (scheduled tasks
         # store user_id=None), but session grants are keyed by the "local"
@@ -235,7 +235,7 @@ async def validate_session_agent(
             await require_access(
                 access_user,
                 agent.session_id,
-                LEVEL_READ,
+                LEVEL_EDIT,
                 permission_store,
                 conversation_store,
             )
@@ -243,26 +243,26 @@ async def validate_session_agent(
             if denied.code not in (ErrorCode.FORBIDDEN, ErrorCode.NOT_FOUND):
                 raise
             # Forks of the owner's sessions share the row, so the lookup above
-            # picked one of several roots; READ on any of them is enough.
-            if not await _can_read_another_root(
+            # may pick one of several roots; EDIT on any of them is enough.
+            if not await _can_edit_another_root(
                 agent, access_user, permission_store, conversation_store
             ):
                 raise
     return agent
 
 
-# ponytail: checks the first 50 roots using the agent; a caller who can read only a
+# ponytail: checks the first 50 roots using the agent; a caller who can edit only a
 # later one is refused (forking that session still works).
 _SHARED_AGENT_ROOT_SCAN = 50
 
 
-async def _can_read_another_root(
+async def _can_edit_another_root(
     agent: Any,
     user_id: str | None,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
 ) -> bool:
-    """Whether *user_id* has READ on a session other than ``agent.session_id`` using it."""
+    """Whether *user_id* has EDIT on a session other than ``agent.session_id`` using it."""
     roots = await asyncio.to_thread(
         conversation_store.list_session_roots_for_agent, agent.id, _SHARED_AGENT_ROOT_SCAN
     )
@@ -270,7 +270,7 @@ async def _can_read_another_root(
         if root == agent.session_id:
             continue
         try:
-            await require_access(user_id, root, LEVEL_READ, permission_store, conversation_store)
+            await require_access(user_id, root, LEVEL_EDIT, permission_store, conversation_store)
         except OmnigentError:
             continue
         return True

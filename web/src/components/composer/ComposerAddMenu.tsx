@@ -77,9 +77,9 @@ export function ComposerAddMenu({
 }) {
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
-  const pendingGoalRef = useRef(false);
-  // Opened once the menu has closed, so the menu's focus return can't close it.
-  const pendingLabelsRef = useRef(false);
+  // Run once the menu has closed, so the menu's focus return can't close a
+  // dialog the action opens.
+  const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
   const measure = useCallback(() => {
@@ -139,13 +139,10 @@ export function ComposerAddMenu({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         onCloseAutoFocus={() => {
-          if (pendingGoalRef.current) {
-            pendingGoalRef.current = false;
-            requestAnimationFrame(() => onGoal?.());
-          }
-          if (pendingLabelsRef.current) {
-            pendingLabelsRef.current = false;
-            requestAnimationFrame(() => onLabels?.());
+          const action = pendingActionRef.current;
+          pendingActionRef.current = null;
+          if (action !== null) {
+            requestAnimationFrame(action);
           }
         }}
         side="top"
@@ -204,7 +201,9 @@ export function ComposerAddMenu({
                     <DropdownMenuItem
                       className="mobile-touch-target"
                       data-testid="composer-side-chat-action"
-                      onSelect={onSideChat}
+                      onSelect={() => {
+                        pendingActionRef.current = onSideChat;
+                      }}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <MessagesSquareIcon className="size-3.5" />
@@ -223,7 +222,7 @@ export function ComposerAddMenu({
                       data-testid="composer-goal-action"
                       data-active={goalActive || undefined}
                       onSelect={() => {
-                        pendingGoalRef.current = true;
+                        pendingActionRef.current = onGoal ?? null;
                       }}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
@@ -255,7 +254,7 @@ export function ComposerAddMenu({
                     <DropdownMenuItem
                       data-testid={`${testIdPrefix}-labels-action`}
                       onSelect={() => {
-                        pendingLabelsRef.current = true;
+                        pendingActionRef.current = onLabels;
                       }}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">

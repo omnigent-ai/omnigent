@@ -448,6 +448,13 @@ async def test_explicit_recovery_deduplicates_history_heuristic(
     content = str(harness.posted_bodies[0]["content"])
     assert "hello from history" in content
     assert "Continue the existing task" in content
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    messages = _translate_input_to_messages(harness.posted_bodies[0]["content"])
+    recovery = next(
+        message for message in messages if "Continue the existing task" in str(message["content"])
+    )
+    assert "input_item_id" not in recovery
     # The first init started the continuation; the retry saw the consumed
     # recovery id and started nothing.
     rows = _init_rows(caplog)
