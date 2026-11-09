@@ -1072,7 +1072,7 @@ describe("dbcert refresh IPC", () => {
 
   for (const [what, options] of [
     ["a local server", { serverUrl: "http://localhost:6767", internalFeatures: true }],
-    ["a machine without Databricks-internal features", { serverUrl }],
+    ["a machine without managed features", { serverUrl }],
   ]) {
     it(`refuses ${what}`, async (t) => {
       const h = loadNavigationHarness(options);
@@ -2892,7 +2892,7 @@ describe("managed server preference wiring", () => {
   });
 });
 
-describe("Databricks-internal local-host CLI wiring", () => {
+describe("managed local-host CLI wiring", () => {
   it("selects isaac omni only behind the internal flag and Databricks server gate", () => {
     assert.match(
       liveCode,

@@ -2972,7 +2972,7 @@ def test_databrickscfg_workspace_id_for_host_reads_matching_profile(
             """
             [acme]
             host = https://acme.databricks.com
-            workspace_id = 1965859176160743
+            workspace_id = 4242424242424242
             auth_type = databricks-cli
 
             [no-ws]
@@ -2983,7 +2983,7 @@ def test_databrickscfg_workspace_id_for_host_reads_matching_profile(
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
 
-    assert databrickscfg_workspace_id_for_host("https://acme.databricks.com") == "1965859176160743"
+    assert databrickscfg_workspace_id_for_host("https://acme.databricks.com") == "4242424242424242"
     # A profile without the field, and an unknown host, both resolve to None.
     assert databrickscfg_workspace_id_for_host("https://plain.databricks.com") is None
     assert databrickscfg_workspace_id_for_host("https://other.databricks.com") is None

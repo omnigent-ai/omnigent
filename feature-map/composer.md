@@ -915,7 +915,7 @@ Other connection providers alone do not enable the managed MCP picker.
   a mouse browser alone does not enable it.
 
 - The Arclet dbcert preflight needs both the updated desktop shell and web UI,
-  with Databricks-internal features enabled for the managed server. Browsers,
+  with managed features enabled for the managed server. Browsers,
   older shells, other sandbox providers, and already-connected hosts do not
   perform this laptop check. The existing session banner checks the host's
   certificate instead; refreshing it does not prove new-session gating works.

@@ -2351,7 +2351,7 @@ under `/releases`.
 - [Bug fix] Keep automatically generated session titles in the same language as the request unless another language is explicitly configured. (#6171)
 - [Feature] Use the native Omnigent app on iPad in portrait, landscape, and multitasking layouts. (#6173)
 - [UI] Restyled the workspace "+ → Open new" shell menu — a single "Shell" launches your default shell, with the other types behind a "More shells" flyout. (#6174)
-- [Feature] Desktop: Databricks-internal local host enrollment now uses `isaac omni`, with custom CLI paths disabled by the managed internal-feature policy. (#6175)
+- [Feature] Desktop: managed local host enrollment now uses `isaac omni`, with custom CLI paths disabled by the managed-features policy. (#6175)
 - [Bug fix] `omni host` now shows structured logs in foreground terminals, matching `omni server`. (#6177)
 - [UI] Open About Omnigent to see distinct app and CLI versions and manage desktop updates in one place. (#6178)
 - [UI] Archive or unarchive a conversation straight from a sidebar row on hover, without opening the menu (#6179)

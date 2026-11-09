@@ -388,7 +388,7 @@ function resolveCliPath(configuredPath, deps = {}) {
 
 /**
  * Normalize a CLI invocation. Public paths pass a string (`/path/omnigent`);
- * Databricks-internal host enrollment passes an executable + fixed argv prefix
+ * Managed host enrollment passes an executable + fixed argv prefix
  * (`/usr/local/bin/isaac`, `["omni"]`). Both stay shell-free.
  *
  * @param {string | {

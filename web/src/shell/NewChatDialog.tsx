@@ -2693,7 +2693,7 @@ function NewChatLandingContent({
   // consumed in the menu's onOpenChange) — connecting while the menu is open
   // looks janky. A ref so the close handler sees it synchronously.
   const pendingConnectRef = useRef(false);
-  // Arca (Databricks-internal): the desktop shell reports the MDM flag; when
+  // Arca: the desktop shell reports the MDM flag; when
   // set, the picker offers connecting the user's Arca dev instance as a host.
   const [arcaEnabled, setArcaEnabled] = useState(false);
   const [arcaPreviewRecovery, setArcaPreviewRecovery] = useState(false);
@@ -5769,7 +5769,7 @@ function NewChatLandingContent({
     }
   }
 
-  // Connect the user's Arca dev instance (Databricks-internal sandbox) as a
+  // Connect the user's Arca dev instance as a
   // host, then select it. The bridge runs `arca ssh … isaac omni host
   // --background` and resolves once the remote daemon started; the daemon then
   // registers over its own tunnel moments later, so we poll the host list

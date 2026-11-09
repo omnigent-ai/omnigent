@@ -336,7 +336,7 @@ function managedServerNames() {
 }
 
 /**
- * Whether the MDM-managed Databricks-internal-features flag is set. Read from
+ * Whether the MDM-managed features flag is set. Read from
  * macOS on every call (never persisted), so profile changes apply live.
  */
 function databricksInternalFeaturesEnabled() {
@@ -1931,7 +1931,7 @@ function rememberOnboardingRunner(serverUrl, runner) {
 const ONBOARDING_RUNNER_TTL_MS = 10 * 60 * 1000;
 
 /**
- * CLI command for desktop host enrollment on `serverUrl`. Databricks-internal
+ * CLI command for desktop host enrollment on `serverUrl`. Managed
  * windows use `isaac omni` behind the same effective gate as Arca (MDM flag +
  * Databricks-managed HTTPS server); every other window keeps the configured /
  * auto-detected public Omnigent CLI. Returns null when the selected launcher
@@ -5336,7 +5336,7 @@ function registerIpc() {
   });
 
   // SPA → desktop feature gates the server can't know about, currently just
-  // the MDM-managed Databricks-internal flag (Arca). Scoped per window: the
+  // the MDM-managed features flag (Arca). Scoped per window: the
   // flag reads true only when the window's own server is Databricks-managed
   // (a workspace mount or a Databricks App) — internal features must not
   // light up against arbitrary self-hosted servers. Read fresh per call so
@@ -5394,7 +5394,7 @@ function registerIpc() {
     return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
   });
 
-  // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
+  // SPA → connect the user's Arca instance (a dev sandbox) to
   // the window's server as a host, by running `isaac omni host --background`
   // on the instance over `arca ssh`. Gated three ways: pinned-origin sender,
   // the MDM flag re-checked HERE (the renderer is not trusted to have checked

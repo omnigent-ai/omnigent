@@ -13164,7 +13164,7 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 def _with_default_scheme(server_url: str) -> str:
     """Prepend a scheme to a schemeless server URL, defaulting to https.
 
-    The internal user guide hands out workspace URLs without a scheme
+    The user guide hands out workspace URLs without a scheme
     (e.g. ``example.cloud.databricks.com/omnigent``), so a missing
     scheme defaults to ``https`` to let that URL be pasted verbatim.
     Loopback hosts (``localhost``, ``127.0.0.1``, ``::1``) default to
@@ -13247,7 +13247,7 @@ def _workspace_api_server_url(server: str) -> str:
     if parsed.query or parsed.fragment:
         server = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")).rstrip("/")
         parsed = urlsplit(server)
-    # The internal user guide hands out the workspace web-UI URL
+    # The user guide hands out the workspace web-UI URL
     # (``https://<ws>/omnigent``) for browser access; accept it for login
     # too by expanding its bare root to the API mount. A root that does
     # not answer as a Databricks workspace leaves the pasted URL
@@ -13418,7 +13418,7 @@ def _resolve_server_url(server: str) -> ServerUrl:
     normalization, so they all route through here: strip a trailing slash,
     default a schemeless URL to ``https`` (``http`` for loopback hosts),
     then expand a bare Databricks workspace URL — or the ``/omnigent``
-    web-UI URL the internal user guide hands out — to the
+    web-UI URL the user guide hands out — to the
     ``/api/2.0/omnigent`` mount.
 
     The ``?o=`` workspace selector is captured off the raw input (the

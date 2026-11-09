@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * Arca host connection (Databricks-internal).
+ * Arca host connection.
  *
  * Arca is Databricks' internal sandbox CLI: each user has one EC2 dev
  * instance, `arca ssh <args...>` passes the args through to ssh against it
@@ -10,7 +10,7 @@
  *
  *   isaac omni host --server <url> --background --non-interactive
  *
- * (`isaac` is the Databricks-internal launcher that provides the `omni` CLI
+ * (`isaac` is the launcher that provides the `omni` CLI
  * on Arca instances.)
  *
  * The remote daemon then opens the ordinary outbound host tunnel using the
