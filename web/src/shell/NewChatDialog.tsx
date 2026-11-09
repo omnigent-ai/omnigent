@@ -923,6 +923,14 @@ function harnessWarningMessage(
       </>
     );
   }
+  if (reason === "cli-unresponsive") {
+    return (
+      <>
+        {agentName}&apos;s CLI on {hostName} did not respond to a version check — run it on that
+        machine and finish any setup prompt it shows.
+      </>
+    );
+  }
   return (
     <>
       {agentName} isn&apos;t configured on {hostName} — run <code>omni setup</code> on that machine.
@@ -937,7 +945,8 @@ function harnessWarningMessage(
  * Gated on the setup feature: when OFF, renders the original "run omnigent
  * setup" guidance so the flag-off UI is unchanged. When ON, offers a "Set up
  * <agent>" action that repairs native agents on user hosts in place, or opens
- * the setup checklist for other agents and managed hosts.
+ * the setup checklist for other agents and managed hosts. An unresponsive CLI
+ * keeps its timeout explanation, since setup would not change it.
  */
 function HarnessSetupNotice({
   agentName,
@@ -963,7 +972,7 @@ function HarnessSetupNotice({
       data-testid="new-chat-landing-harness-warning"
     >
       <TriangleAlertIcon className="size-3.5 shrink-0" />
-      {featureEnabled ? (
+      {featureEnabled && reason !== "cli-unresponsive" ? (
         <>
           <span>
             {agentName} isn&apos;t ready on {hostName}.
@@ -3359,12 +3368,17 @@ function NewChatLandingContent({
   // effort, and permission knobs.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
   // Probe only the selected, available harness. Older hosts without readiness
-  // metadata remain eligible, matching the picker's setup warnings.
+  // metadata remain eligible, matching the picker's setup warnings. A CLI that
+  // missed its version check still launches, so its catalog stays loadable.
+  const hostModelsBlocked = (harness: string) => {
+    const unavailableReason = harnessUnavailableReasonOnHost(harness, selectedHost);
+    return unavailableReason !== null && unavailableReason !== "cli-unresponsive";
+  };
   const canLoadHostModels = (harness: string) =>
     selectedNativeHarness === harness &&
     hostSelected &&
     selectedHost?.status === "online" &&
-    !harnessUnconfiguredOnHost(harness, selectedHost);
+    !hostModelsBlocked(harness);
   const {
     data: hostClaudeModelOptions,
     isLoading: hostClaudeModelsLoading,
@@ -3407,7 +3421,7 @@ function NewChatLandingContent({
     (selectedNativeHarness !== harness ||
     loading ||
     hostReadinessPending ||
-    harnessUnconfiguredOnHost(harness, selectedHost) ||
+    hostModelsBlocked(harness) ||
     selectedHostId === null
       ? cached
       : undefined);
@@ -7657,6 +7671,7 @@ function NewChatLandingContent({
                         voiceSnapshotRef.current = message;
                       }}
                       onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
+                      inputRef={textareaRef}
                       onTranscript={dictation.appendFinal}
                       onInterim={dictation.replaceInterim}
                     />
