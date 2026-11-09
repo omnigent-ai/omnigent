@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from omnigent.onboarding.openclaw_config import OpenClawDiscovery, SourceKind
     from omnigent.onboarding.provider_config import ProviderEntry
 
-# _INTERNAL_BETA_DEFAULT_SERVER (internal Databricks Apps host) moved to
+# _INTERNAL_BETA_DEFAULT_SERVER (Databricks Apps host) moved to
 # omnigent.onboarding.internal_beta (excluded from the OSS build); the
 # internal-beta setup branch and the sandbox CLI import it from there.
 # Brand shown for an auto-configured CLI login in the credentials callout —

@@ -7,7 +7,7 @@ const SERVER_URLS_KEY = "serverUrls";
 const SERVER_NAME_PARAM = "omnigentServerName";
 
 /**
- * Managed Preferences key gating Databricks-internal features (e.g. the Arca
+ * Managed Preferences key gating managed features (e.g. the Arca
  * host option). Boolean; anything but an explicit true reads as disabled.
  */
 const DATABRICKS_INTERNAL_FEATURES_KEY = "databricksInternalFeaturesEnabled";
@@ -120,7 +120,7 @@ function getManagedServerNames(options) {
 }
 
 /**
- * Read the Databricks-internal-features flag from effective macOS preferences.
+ * Read the managed-features flag from effective macOS preferences.
  * Fails closed: any missing value, wrong type, non-darwin platform, or read
  * error reads as disabled. Like the managed server list, the value is read on
  * demand and never persisted, so removing the profile disables it immediately.

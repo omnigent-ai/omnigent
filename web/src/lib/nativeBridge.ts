@@ -456,7 +456,7 @@ export interface ArcaConnectResult extends HostActionResult {
  */
 export interface DesktopFeatures {
   /**
-   * Databricks-internal features (e.g. the Arca host option) are enabled.
+   * Managed features (e.g. the Arca host option) are enabled.
    * Already scoped by the shell: true only when the MDM flag is set AND the
    * window's server is Databricks-managed.
    */
@@ -1417,7 +1417,7 @@ export function supportsArcaConnect(): boolean {
 }
 
 /**
- * Connect the user's Arca instance (Databricks-internal sandbox) to the
+ * Connect the user's Arca instance (a dev sandbox) to the
  * window's server as a host, via the desktop shell. The shell asks native
  * consent and runs `arca ssh` — resolving only once the remote host daemon
  * started (or failed). A no-op `{ ok: false }` outside the shell.

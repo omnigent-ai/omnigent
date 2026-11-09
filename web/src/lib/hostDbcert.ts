@@ -1,5 +1,5 @@
 /**
- * dbcert on a session's host (Databricks-internal). Arca boxes and managed
+ * dbcert on a session's host. Arca boxes and managed
  * Arclets hold a copy of the laptop's corp certificate, which Arca Companion
  * syncs, and a laptop host has its own; tools that call internal services
  * fail once it expires. These helpers read and renew it through the

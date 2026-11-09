@@ -533,7 +533,7 @@ def test_codex_config_custom_provider_detected(clean_env) -> None:
 
     This is the exact state ``isaac configure codex`` leaves behind — no
     auth.json at all — which the subscription detection cannot see. Failure
-    means internal users' gateway-configured codex shows as "not configured"
+    means managed users' gateway-configured codex shows as "not configured"
     in setup (the original bug).
     """
     _write_codex_config(clean_env, _ISAAC_STYLE_CODEX_CONFIG)

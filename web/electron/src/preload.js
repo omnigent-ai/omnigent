@@ -243,7 +243,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
   /**
-   * Connect the user's Arca instance (Databricks-internal) to the window's
+   * Connect the user's Arca instance to the window's
    * server as a host, via `arca ssh`. Native consent is asked in the main
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
@@ -262,7 +262,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
   /**
-   * Renew this machine's dbcert (Databricks-internal); Arca Companion copies
+   * Renew this machine's dbcert; Arca Companion copies
    * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
    */
   refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),

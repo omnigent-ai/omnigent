@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * Arca auto-connect (Databricks-internal): when a window loads an eligible
+ * Arca auto-connect: when a window loads an eligible
  * server, make sure the user's Arca instance is connected to it as a host by
  * running the same idempotent `arca ssh … isaac omni host --background` as the
  * manual "Run on Arca" item — without the consent console, at most once per

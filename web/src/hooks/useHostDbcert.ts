@@ -34,7 +34,7 @@ export function useHostDbcert(
   conversationId: string | null | undefined,
   hostId: string | null | undefined,
 ) {
-  // dbcert is Databricks-internal, so only Databricks deployments ask hosts for one.
+  // Only Databricks deployments ask hosts for a dbcert.
   const onDatabricks = isDatabricksWorkspace();
   // Arclets are server-managed sandbox hosts, which the default host list hides.
   const { data: hosts } = useHosts({

@@ -19,7 +19,7 @@
 
   /**
    * Hostnames that resolve to the local machine. A schemeless URL defaults to
-   * https:// (the workspace / remote case the internal user guide documents),
+   * https:// (the workspace / remote case the user guide documents),
    * but these default to http:// — local dev servers are virtually always plain
    * http, and the setup placeholder shows http://localhost.
    */
@@ -256,7 +256,7 @@
    * True when a server URL is hosted by Databricks — a workspace domain
    * (workspace-mounted Omnigent) or a Databricks App. Https-only: a local or
    * self-hosted server is never "Databricks-managed", whatever its hostname
-   * claims. Used to scope Databricks-internal desktop features (e.g. the Arca
+   * claims. Used to scope managed desktop features (e.g. the Arca
    * host option) to Databricks-managed servers.
    *
    * @param {string | null | undefined} rawUrl

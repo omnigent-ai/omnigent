@@ -12,10 +12,10 @@ ai.omnigent.desktop
 
 ## Keys
 
-| Key                                 | Type             | Required | Default | Description                                                                                                                                     |
-| ----------------------------------- | ---------------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `serverUrls`                        | Array of strings | No       | `[]`    | Server URLs to offer, most-preferred first. Each must use `https://`. At most 10.                                                               |
-| `databricksInternalFeaturesEnabled` | Boolean          | No       | `false` | Defaults macOS apps to V2 onboarding and enables Databricks-internal features on supported servers. Only an explicit boolean `true` enables it. |
+| Key                                 | Type             | Required | Default | Description                                                                                                                         |
+| ----------------------------------- | ---------------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `serverUrls`                        | Array of strings | No       | `[]`    | Server URLs to offer, most-preferred first. Each must use `https://`. At most 10.                                                   |
+| `databricksInternalFeaturesEnabled` | Boolean          | No       | `false` | Defaults macOS apps to V2 onboarding and enables managed features on supported servers. Only an explicit boolean `true` enables it. |
 
 A schemeless host is accepted and interpreted as `https://`. Paths are
 preserved, so an administrator can provide a workspace mount directly:
@@ -54,7 +54,7 @@ screen and in the in-app server switcher. They are offered, not enforced:
 Applying or removing a profile is reflected the next time the server switcher
 is opened or the connect screen is loaded.
 
-## Databricks-internal features
+## Managed features
 
 When `databricksInternalFeaturesEnabled` is `true`, macOS apps, including unpackaged
 development, default to V2 onboarding for new and existing profiles. This does not require

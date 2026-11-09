@@ -3767,7 +3767,7 @@ describe("desktop Arclet credential preflight", () => {
   });
 });
 
-describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
+describe("Run on Arca (MDM-gated)", () => {
   beforeEach(() => {
     setupLandingMocks();
     mockHosts([]);
