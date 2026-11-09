@@ -16,6 +16,7 @@ import type {
   BackgroundTaskInfo,
   CodexPersistMode,
   ErrorInfo,
+  FileEditRequest,
   ModelUsage,
   RememberScope,
   Response,
@@ -234,6 +235,8 @@ export interface ElicitationRequest {
    * Optional/null for any other elicitation.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** Claude-native file-edit prompts only: the full tool call, so the card can show a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Producer-supplied extra (codex-native command approvals only):
    * structured command details that let the UI render the approval
@@ -551,6 +554,13 @@ export interface SessionStatusEvent {
 }
 
 /**
+ * Runner's `blockedOn` reason when the agent still reads as working but its
+ * terminal shows something it did not report, e.g. a dialog opened mid-reply.
+ * Inferred from the screen, so the UI words it tentatively.
+ */
+export const TERMINAL_PROMPT_BLOCKED_ON = "terminal prompt";
+
+/**
  * `session.usage` — token-usage update from a terminal-backed runtime.
  *
  * Substitutes for `response.completed` on claude-native sessions
@@ -654,6 +664,18 @@ export interface SessionCodexApprovalModeEvent {
   type: "session_codex_approval_mode";
   conversationId: string;
   approvalMode: string;
+}
+
+/**
+ * `session.background_tasks` — background tasks that changed between turns,
+ * e.g. a codex-native session's background terminals. The count is
+ * authoritative, like the one on a `session.status` edge.
+ */
+export interface SessionBackgroundTasksEvent {
+  type: "session_background_tasks";
+  conversationId: string;
+  backgroundTaskCount: number;
+  backgroundTasks: BackgroundTaskInfo[];
 }
 
 /**
@@ -1034,6 +1056,7 @@ export type StreamEvent =
   | SessionCollaborationModeEvent
   | SessionPermissionModeEvent
   | SessionCodexApprovalModeEvent
+  | SessionBackgroundTasksEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent

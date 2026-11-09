@@ -11,6 +11,7 @@ import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 // Heavy children have their own suites; stub them so this one stays on the
 // dialog's two-call move and its recovery from a half-finished switch.
@@ -63,7 +64,11 @@ vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useRecentWorkspaces", () => ({
   useRecentWorkspaces: () => ({ recent: ["/Users/alice/repo"], addRecent: vi.fn() }),
 }));
-vi.mock("@/lib/sessionsApi", () => ({ launchRunner: vi.fn(), updateSession: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  launchRunner: vi.fn(),
+  updateSession: vi.fn(),
+}));
 // Radix Select uses a portal + pointer events jsdom can't drive; a native
 // <select> keeps the option list assertable.
 vi.mock("@/components/ui/select", () => ({
