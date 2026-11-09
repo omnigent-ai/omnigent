@@ -14,17 +14,19 @@ to customize.
 - `preview`: empty and populated lists show suggested automations in the All
   filter with no search; searches and Active/Paused filters hide the preview.
 - `create`: New automation opens with Trigger type set to Schedule. Choose
-  Jira, Slack, GitHub, or Linear in the same form to configure matching items.
-  Gallery items preselect their integration. Switching types preserves each
+  Jira, Slack, GitHub, Linear, or PagerDuty in the same form to configure matching
+  items; each option shows the service's logo (a clock for Schedule), as do the
+  gallery items. Gallery items preselect their integration. Switching types preserves each
   draft until the dialog closes, including the schedule and any custom prompt edits.
-- `scope`: **equals** matches one project, channel, repository, or team.
+- `scope`: **equals** matches one project, channel, repository, team, or service.
   Choose **in** for a comma-separated list. Equals rejects lists without losing
   the entered values. Slack can watch a channel, direct messages from listed
   senders, or the one group DM with exactly the listed people (two or more; no
   operator). A pink `#` or `@` precedes the input, and pasted prefixes are stripped.
   Switching between channel and people events clears the scope; DMs hide Author.
 - `link-posting`: a checkbox below the trigger controls posting the session link
-  back to Jira, Slack, GitHub, or Linear. Sessions start whether it is checked or not.
+  back to Jira, Slack, GitHub, Linear, or PagerDuty (as an incident note). Sessions
+  start whether it is checked or not.
 - `prompt-editing`: the detail page and edit dialog show Your prompt first. System
   prompt starts collapsed, expands into a read-only preview, and requires Edit
   system prompt to change it. Done editing system prompt returns to the read-only
@@ -99,7 +101,7 @@ to customize.
   Custom schedule remains available for other recurrence patterns.
   The shared modal supports ten-minute connected-host schedules in
   either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
-- `capabilities`: Jira, Slack, GitHub, and Linear templates require session continuity
+- `capabilities`: Jira, Slack, GitHub, Linear, and PagerDuty templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `tools-note`: the form says which tools the agent needs where the task runs,
   except on an Arclet sandbox, which already has them. Neither the template form

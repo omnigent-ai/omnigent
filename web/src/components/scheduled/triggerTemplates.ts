@@ -1,9 +1,15 @@
-// Renders manager prompts for Jira, Slack, GitHub, and Linear trigger automations.
+// Renders manager prompts for Jira, Slack, GitHub, Linear, and PagerDuty trigger automations.
 
-import type { LucideIcon } from "lucide-react";
-import { CircleDotIcon, HashIcon, ListTodoIcon, TicketIcon } from "lucide-react";
+import type { ComponentType } from "react";
+import {
+  GitHubIcon,
+  JiraIcon,
+  LinearIcon,
+  PagerDutyIcon,
+  SlackIcon,
+} from "@/components/icons/IntegrationIcons";
 
-export type TriggerSource = "jira" | "slack" | "github" | "linear";
+export type TriggerSource = "jira" | "slack" | "github" | "linear" | "pagerduty";
 
 /** Where the manager starts each worker: next to itself, or in a new sandbox. */
 export type WorkerPlacement = "same_host" | "managed";
@@ -39,7 +45,7 @@ export interface TriggerFields {
   event: string;
   /**
    * Jira: project keys. Slack: channels, or people for DMs. GitHub: `owner/repo`.
-   * Linear: team keys. Comma-separated.
+   * Linear: team keys. PagerDuty: service names or IDs. Comma-separated.
    */
   scope: string;
   /** Omitted by older callers, which infer membership from the number of values. */
@@ -110,7 +116,8 @@ export interface TriggerEvent {
 
 export interface TriggerTemplate {
   source: TriggerSource;
-  icon: LucideIcon;
+  /** The service's brand mark, drawn in currentColor. */
+  icon: ComponentType<{ className?: string }>;
   iconClassName: string;
   title: string;
   description: string;
@@ -134,7 +141,7 @@ export interface TriggerTemplate {
 export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
   jira: {
     source: "jira",
-    icon: TicketIcon,
+    icon: JiraIcon,
     iconClassName: "text-blue-600 dark:text-blue-400",
     title: "Jira tickets",
     description:
@@ -171,7 +178,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
   },
   slack: {
     source: "slack",
-    icon: HashIcon,
+    icon: SlackIcon,
     iconClassName: "text-purple-600 dark:text-purple-400",
     title: "Slack messages",
     description:
@@ -222,8 +229,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
   },
   github: {
     source: "github",
-    icon: CircleDotIcon,
-    iconClassName: "text-emerald-600 dark:text-emerald-500",
+    icon: GitHubIcon,
+    iconClassName: "text-foreground",
     title: "GitHub",
     description:
       "Watch for new issues or pull requests and start a session to work on matching items.",
@@ -268,7 +275,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
   },
   linear: {
     source: "linear",
-    icon: ListTodoIcon,
+    icon: LinearIcon,
     iconClassName: "text-indigo-600 dark:text-indigo-400",
     title: "Linear issues",
     description: "Watch teams for matching new issues and start a session to work on each one.",
@@ -308,6 +315,45 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     itemPlural: "issues",
     toolsExample: "a Linear MCP server",
   },
+  pagerduty: {
+    source: "pagerduty",
+    icon: PagerDutyIcon,
+    iconClassName: "text-green-600 dark:text-green-500",
+    title: "PagerDuty incidents",
+    description: "Watch services for new incidents and start a session to investigate each one.",
+    name: "PagerDuty incidents",
+    events: [
+      {
+        id: "triggered",
+        label: "Incident triggered",
+        authorAction: "trigger an incident on this service",
+      },
+    ],
+    scopeLabel: "service",
+    scopePlaceholder: "Checkout API, Payments",
+    fields: [
+      { id: "urgency", label: "Urgency", operators: ["is", "is_not"], placeholder: "high" },
+      { id: "priority", label: "Priority", operators: ["is", "is_not"], placeholder: "P1" },
+      { id: "status", label: "Status", operators: ["is", "is_not"], placeholder: "triggered" },
+      {
+        id: "assignee",
+        label: "Assignee",
+        operators: ["is", "is_not"],
+        placeholder: "me, or a name or email",
+      },
+      {
+        id: "title",
+        label: "Title",
+        operators: ["contains", "not_contains"],
+        placeholder: "database",
+      },
+    ],
+    instructionsPlaceholder:
+      "Investigate the incident, find the likely cause and suggest a mitigation.",
+    linkBackLabel: "Add the session link as a note on the incident",
+    itemPlural: "incidents",
+    toolsExample: "a PagerDuty MCP server",
+  },
 };
 
 /** The fields a new trigger starts with: the default event, nothing else filled. */
@@ -322,7 +368,7 @@ export function emptyTriggerFields(source: TriggerSource): TriggerFields {
   };
 }
 
-export const TRIGGER_SOURCES: TriggerSource[] = ["jira", "slack", "github", "linear"];
+export const TRIGGER_SOURCES: TriggerSource[] = ["jira", "slack", "github", "linear", "pagerduty"];
 
 /** The selected event of a template, or its default when `eventId` is unknown. */
 export function triggerEvent(source: TriggerSource, eventId: string): TriggerEvent {
@@ -536,6 +582,7 @@ const SERVICE_NAMES: Record<TriggerSource, string> = {
   slack: "Slack",
   github: "GitHub",
   linear: "Linear",
+  pagerduty: "PagerDuty",
 };
 
 /** The service a template watches, e.g. "Jira". */
@@ -777,12 +824,29 @@ export function describeLinearFilter(fields: TriggerFields): string {
         return `${negated ? "don't have" : "have"} ${value} in the title or description`;
     }
   });
-  if (phrases.length === 0) return "";
-  const joined =
-    phrases.length === 1
-      ? phrases[0]
-      : `${phrases.slice(0, -1).join(", ")} and ${phrases[phrases.length - 1]}`;
-  return `that ${joined}`;
+  return phrases.length === 0 ? "" : `that ${joinAnd(phrases)}`;
+}
+
+/** The PagerDuty condition rows as a clause, e.g. `that have urgency "high"`; "" with none. */
+export function describePagerDutyFilter(fields: TriggerFields): string {
+  const phrases = fields.conditions.map((c) => {
+    const value = `"${c.value.trim()}"`;
+    const negated = c.operator === "is_not" || c.operator === "not_contains";
+    switch (c.field) {
+      case "urgency":
+      case "priority":
+      case "status":
+        return `${negated ? "don't have" : "have"} ${c.field} ${value}`;
+      case "assignee": {
+        // "me" is the owner, whose PagerDuty tools the manager runs with.
+        const who = c.value.trim().toLowerCase() === "me" ? "you" : value;
+        return `${negated ? "aren't" : "are"} assigned to ${who}`;
+      }
+      default:
+        return `${negated ? "don't have" : "have"} ${value} in the title`;
+    }
+  });
+  return phrases.length === 0 ? "" : `that ${joinAnd(phrases)}`;
 }
 
 /** How a run reads search results when the service returns them oldest first. */
@@ -914,6 +978,29 @@ function sourceText(source: TriggerSource, fields: TriggerFields): SourceText {
       title: '"Linear <issue identifier>"',
       details: "the issue's identifier, link, title and description",
       linkBack: (link) => `Comment "${link}" on each issue you started a session for.`,
+    };
+  }
+  if (source === "pagerduty") {
+    const services = scopeList(fields.scope);
+    const one = services.length === 1;
+    const where = one ? `service ${services[0]}` : `services ${services.join(", ")}`;
+    const filter = describePagerDutyFilter(fields);
+    return {
+      watch: () => `Watch: new PagerDuty incidents on ${where}${filter !== "" ? ` ${filter}` : ""}`,
+      search: () =>
+        `Use your PagerDuty tools to find ${one ? "that service" : "each of those services"} by name or ID. A name that matches no service or more than one counts as no match: say so in your reply. Then list the incidents created on ${one ? "it" : "them"} since that time, in any status and not only the ones assigned to you, for example GET /incidents with service_ids[] set to ${one ? "its ID" : "their IDs"}, since set to that time in ISO 8601 and sort_by "created_at:asc".` +
+        (filter !== ""
+          ? ` Only incidents ${filter} count. Pass the conditions the tool can filter on and check the rest against each incident yourself.`
+          : " Every incident counts."),
+      // A tool may not sort by creation, so a partial read can't checkpoint by its last result.
+      readOrder:
+        "Read every page of results, following the offset while more is true, then work through them oldest first. If you can't read every page, start no sessions in this run and keep the previous check time.",
+      createdAt: "created",
+      item: "incident",
+      fence: "pagerduty-incident",
+      title: '"PagerDuty #<incident number>"',
+      details: "the incident's number, link, title, service, urgency, priority and description",
+      linkBack: (link) => `Add a note "${link}" to each incident you started a session for.`,
     };
   }
   const item = GITHUB_ITEMS[fields.event] ?? GITHUB_ITEMS.any;
