@@ -12,9 +12,10 @@ import asyncio
 import dataclasses
 import re
 import time
+from collections.abc import Callable
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.db_models import INBOX_ITEMS_PER_SESSION
@@ -140,6 +141,7 @@ def _parse_cursor(after: str | None) -> tuple[int, str] | None:
 def create_inbox_items_router(
     store: InboxItemStore,
     *,
+    enabled: Callable[[], bool],
     conversation_store: ConversationStore,
     agent_store: AgentStore,
     agent_cache: Any,
@@ -149,6 +151,8 @@ def create_inbox_items_router(
     """Build the Inbox items router.
 
     :param store: Store for Inbox items.
+    :param enabled: Whether this request's caller can use Inbox items; every route
+        returns 404 when it is false.
     :param conversation_store: Store used to load the posting session.
     :param agent_store: Store used to load that session's agent.
     :param agent_cache: Cache used to load the agent's spec.
@@ -156,7 +160,12 @@ def create_inbox_items_router(
     :param auth_provider: Auth provider; ``None`` when auth is off.
     :returns: The configured router.
     """
-    router = APIRouter()
+
+    def require_enabled() -> None:
+        if not enabled():
+            raise HTTPException(status_code=404, detail="not found")
+
+    router = APIRouter(dependencies=[Depends(require_enabled)])
 
     def _owner(request: Request) -> str:
         user_id = require_user(request, auth_provider)

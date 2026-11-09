@@ -59,14 +59,16 @@ def stores(db_uri: str) -> SimpleNamespace:
 
 
 def _app(
-    stores: SimpleNamespace, tmp_path: Path, *, enabled: bool = True, auth: bool = False
+    stores: SimpleNamespace,
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    auth: bool = False,
+    **extra: Any,
 ) -> FastAPI:
-    extra: dict[str, Any] = {}
     if auth:
-        extra = {
-            "auth_provider": UnifiedAuthProvider(source="header", local_single_user=False),
-            "permission_store": stores.permissions,
-        }
+        extra["auth_provider"] = UnifiedAuthProvider(source="header", local_single_user=False)
+        extra["permission_store"] = stores.permissions
     return create_app(
         agent_store=stores.agents,
         file_store=SqlAlchemyFileStore(stores.conversations.storage_location),
@@ -315,3 +317,18 @@ async def test_routes_are_off_without_the_feature(stores: SimpleNamespace, tmp_p
     transport = httpx.ASGITransport(app=_app(stores, tmp_path, enabled=False))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         assert (await c.get("/v1/inbox/items")).status_code == 404
+        assert (await c.get("/v1/info")).json()["proactive_agent_enabled"] is False
+
+
+async def test_a_per_request_gate_turns_the_routes_on_and_off(
+    stores: SimpleNamespace, tmp_path: Path
+) -> None:
+    gate = {"on": False}
+    app = _app(stores, tmp_path, enabled=False, proactive_agent=lambda: gate["on"])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        assert (await c.get("/v1/inbox/items")).status_code == 404
+        gate["on"] = True
+        assert (await c.get("/v1/inbox/items")).status_code == 200
+        assert (await c.get("/v1/info")).json()["proactive_agent_enabled"] is True

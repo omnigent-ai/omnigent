@@ -103,7 +103,6 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "session_orchestration": True,
         "sibling_sessions": False,
         "codex_plan_at_launch": True,
-        "proactive_agent": False,
     }
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
