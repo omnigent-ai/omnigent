@@ -832,3 +832,43 @@ def test_fork_discovery_rejects_same_branch_from_another_source_project(
 def test_diff_preserves_final_line_whitespace(root: str, api: Mock, change: dict) -> None:
     change["diff"] = "@@ -1 +1 @@\n-before\n+after \t\n"
     assert module.PULL_REQUESTS.pr_diff(root, ref())["patch"].endswith("+after \t\n")
+
+
+def test_pinned_reads_echo_the_revisions_they_verified(root: str, api: Mock) -> None:
+    files = module.PULL_REQUESTS.changed_files_at_revision(
+        root, ref(), head_sha=HEAD, base_sha=BASE
+    )
+    assert (files["head_sha"], files["base_sha"]) == (HEAD, BASE)
+    assert [item["path"] for item in files["data"]] == ["src/new.py"]
+
+    diff = module.PULL_REQUESTS.pr_diff_at_revision(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert (diff["head_sha"], diff["base_sha"]) == (HEAD, BASE)
+    assert "+new\n" in diff["patch"]
+
+
+@pytest.mark.parametrize("read", ["changed_files_at_revision", "pr_diff_at_revision"])
+@pytest.mark.parametrize(
+    "moved", [{"head_sha": "d" * 40}, {"base_sha": "e" * 40}], ids=["head", "base"]
+)
+def test_pinned_reads_refuse_a_merge_request_at_other_revisions(
+    root: str, api: Mock, read: str, moved: dict
+) -> None:
+    pins = {"head_sha": HEAD, "base_sha": BASE, **moved}
+    with pytest.raises(ValueError, match="merge request changed"):
+        getattr(module.PULL_REQUESTS, read)(root, ref(), **pins)
+
+
+def test_pinned_read_refuses_a_merge_request_that_moves_during_the_read(
+    root: str, api: Mock, mr: dict
+) -> None:
+    moved = {**mr, "diff_refs": {"head_sha": "d" * 40, "base_sha": BASE}}
+    # Served in order: the check before the read, the read's own lookup, then the check after it.
+    replies = [mr, mr, moved]
+    served = api.object.side_effect
+    api.object.side_effect = lambda path, **query: (
+        replies.pop(0) if "merge_requests" in path else served(path, **query)
+    )
+
+    with pytest.raises(ValueError, match="merge request changed"):
+        module.PULL_REQUESTS.changed_files_at_revision(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert not replies

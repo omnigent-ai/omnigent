@@ -193,6 +193,23 @@ class ReviewThreadsFacet(Protocol):
 
 
 @runtime_checkable
+class PinnedRevisionFacet(Protocol):
+    """Changed files and the whole patch, read at the revisions the panel shows.
+
+    Each read raises ``ValueError`` when the PR's head or base is no longer those
+    revisions, and returns them as ``head_sha`` and ``base_sha``.
+    """
+
+    def changed_files_at_revision(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]: ...
+
+    def pr_diff_at_revision(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]: ...
+
+
+@runtime_checkable
 class CommitsFacet(Protocol):
     """Optional commit history support, gated by :attr:`ProviderCapabilities.commit_history`."""
 

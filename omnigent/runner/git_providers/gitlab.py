@@ -8,7 +8,7 @@ import json
 import re
 import shutil
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -398,6 +398,28 @@ def _content(client: GitLabClient, project: object, path: str, revision: str) ->
         ) from exc
 
 
+def _diff_revisions(mr: dict[str, Any]) -> tuple[str, str]:
+    """Return the merge request's head and merge-base commits, as its ``diff_refs`` report them."""
+    revisions = _object(mr.get("diff_refs"))
+    head, merge_base = revisions.get("head_sha"), revisions.get("base_sha")
+    if (
+        not isinstance(head, str)
+        or not isinstance(merge_base, str)
+        or not _COMMIT.fullmatch(head)
+        or not _COMMIT.fullmatch(merge_base)
+    ):
+        raise ValueError(
+            "GitLab has not prepared the merge request's diff revisions. Refresh to retry."
+        )
+    return head, merge_base
+
+
+def _check_pinned(mr: dict[str, Any], head_sha: str, base_sha: str) -> None:
+    """Raise when the merge request's head or merge base is no longer the pinned pair."""
+    if _diff_revisions(mr) != (head_sha, base_sha):
+        raise ValueError("The merge request changed. Refresh to see its latest revision.")
+
+
 class GitLabPullRequests:
     """Normalize GitLab metadata and exact MR revisions to the shared PR contract."""
 
@@ -491,6 +513,40 @@ class GitLabPullRequests:
             )
         return {"object": PR_DIFF_OBJECT, "patch": "".join(patches)}
 
+    def changed_files_at_revision(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """List the changed files, failing when the merge request isn't at the pinned revisions."""
+        return self._pinned(
+            root, reference, head_sha, base_sha, lambda: self.changed_files(root, reference)
+        )
+
+    def pr_diff_at_revision(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Return the whole patch, failing when the merge request isn't at the pinned revisions."""
+        return self._pinned(
+            root, reference, head_sha, base_sha, lambda: self.pr_diff(root, reference)
+        )
+
+    def _pinned(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        head_sha: str,
+        base_sha: str,
+        read: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Check the pinned revisions before and after ``read``, so its result matches them."""
+        resolved = _resolved(root, reference)
+        if resolved is None:
+            return read()
+        client, ref, mr = resolved
+        _check_pinned(mr, head_sha, base_sha)
+        result = read()
+        _check_pinned(_mr(client, ref), head_sha, base_sha)
+        return {**result, "head_sha": head_sha, "base_sha": base_sha}
+
     def file_diff(
         self,
         root: str,
@@ -526,17 +582,7 @@ class GitLabPullRequests:
                 }
             raise ValueError("No merge request is available for expanded context.")
         client, ref, mr = resolved
-        revisions = _object(mr.get("diff_refs"))
-        head, merge_base = revisions.get("head_sha"), revisions.get("base_sha")
-        if (
-            not isinstance(head, str)
-            or not isinstance(merge_base, str)
-            or not _COMMIT.fullmatch(head)
-            or not _COMMIT.fullmatch(merge_base)
-        ):
-            raise ValueError(
-                "GitLab has not prepared the merge request's diff revisions. Refresh to retry."
-            )
+        head, merge_base = _diff_revisions(mr)
         if (head_sha is not None and head_sha != head) or (
             base_sha is not None and base_sha != merge_base
         ):

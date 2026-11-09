@@ -39,6 +39,7 @@ from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
     CommitsFacet,
+    PinnedRevisionFacet,
     ProviderCapabilities,
     PullRequestFacet,
     ReviewerRef,
@@ -1152,15 +1153,21 @@ def pr_changed_files(
 ) -> dict[str, Any]:
     """List the selected PR's changed files; empty when no provider serves it.
 
-    Providers without :class:`ReviewThreadsFacet` (GitLab, Azure DevOps) ignore
-    ``head_sha``/``base_sha`` and list the current revision.
+    Providers without a pinned-revision facet ignore ``head_sha``/``base_sha`` and list
+    the current revision.
     """
     reference = _default_pr(session_id, pr_url)
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": "list", "data": [], "has_more": False}
-    if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
+    if (
+        reference
+        and (head_sha or base_sha)
+        and isinstance(facet, PinnedRevisionFacet | ReviewThreadsFacet)
+    ):
         head, base = _full_revision(head_sha, base_sha)
+        if isinstance(facet, PinnedRevisionFacet):
+            return facet.changed_files_at_revision(root, reference, head_sha=head, base_sha=base)
         return facet.review_changed_files(root, reference, head_sha=head, base_sha=base)
     return facet.changed_files(root, reference)
 
@@ -1178,8 +1185,14 @@ def pr_diff(
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": PR_DIFF_OBJECT, "patch": ""}
-    if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
+    if (
+        reference
+        and (head_sha or base_sha)
+        and isinstance(facet, PinnedRevisionFacet | ReviewThreadsFacet)
+    ):
         head, base = _full_revision(head_sha, base_sha)
+        if isinstance(facet, PinnedRevisionFacet):
+            return facet.pr_diff_at_revision(root, reference, head_sha=head, base_sha=base)
         return facet.review_diff(root, reference, head_sha=head, base_sha=base)
     return facet.pr_diff(root, reference)
 

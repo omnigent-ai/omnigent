@@ -67,6 +67,7 @@ _PR_LOAD_FAILED = "Azure DevOps could not load the selected PR's file content"
 _UNEXPECTED_RESPONSE = "Azure DevOps returned an unexpected file response"
 _REVISION_LOAD_FAILED = "Azure DevOps could not load the selected file revision"
 _NO_CONTEXT = "Expanded context is unavailable for this file"
+_REVISION_CHANGED = "The pull request changed; refresh to see its latest revision"
 _GIT_TIMEOUT_SECONDS = 30.0
 # REST and background-fetch wait budget, under the runner proxy's ten-second limit.
 _REQUEST_BUDGET_SECONDS = 8.0
@@ -860,6 +861,60 @@ class AzureDevOpsPullRequests:
 
     def on_inferred_pr(self, root: str, reference: PullRequestRef) -> None:
         """Do nothing: Azure DevOps has no per-PR preference to copy."""
+
+    def changed_files_at_revision(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """List the changed files, failing when the PR isn't at the pinned revisions."""
+        return self._pinned(
+            reference, head_sha, base_sha, lambda: self.changed_files(root, reference)
+        )
+
+    def pr_diff_at_revision(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Return the whole patch, failing when the PR isn't at the pinned revisions."""
+        return self._pinned(reference, head_sha, base_sha, lambda: self.pr_diff(root, reference))
+
+    def _pinned(
+        self,
+        reference: PullRequestRef,
+        head_sha: str,
+        base_sha: str,
+        read: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Check the pinned revisions before and after ``read``, so its result matches them.
+
+        Without a repository or token the revisions can't be checked, so the result is
+        returned unpinned and the panel leaves Open disabled.
+        """
+        repo = _reference_repo(reference)
+        token = _token() if repo is not None else None
+        if repo is None or token is None:
+            return read()
+        self._check_pinned(repo, token, reference.number, head_sha, base_sha)
+        result = read()
+        self._check_pinned(repo, token, reference.number, head_sha, base_sha)
+        return {**result, "head_sha": head_sha, "base_sha": base_sha}
+
+    def _check_pinned(
+        self,
+        repo: AzureRepo,
+        token: AzureToken,
+        number: int,
+        head_sha: str,
+        base_sha: str,
+    ) -> None:
+        with self._client(
+            repo.org, token, deadline=time.monotonic() + _REQUEST_BUDGET_SECONDS
+        ) as client:
+            try:
+                pr = _call(client.get_pull_request, repo.project, repo.repo, number)
+            except _RestFailure as exc:
+                raise ValueError(_PR_LOAD_FAILED) from exc
+        current = (_commit(pr, "lastMergeSourceCommit"), _commit(pr, "lastMergeTargetCommit"))
+        if current != (head_sha, base_sha):
+            raise ValueError(_REVISION_CHANGED)
 
     def changed_files(self, root: str, reference: PullRequestRef | None) -> dict[str, Any]:
         """List the files of the PR's latest iteration, compared with the merge base.

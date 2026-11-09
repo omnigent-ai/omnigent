@@ -1540,3 +1540,56 @@ def test_importing_the_facet_loads_neither_httpx_nor_the_rest_client() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_pinned_changed_files_echo_the_verified_revisions(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request())
+    ado_transport.route("GET", f"{PULL}/iterations", json={"value": [{"id": 3}]})
+    ado_transport.route(
+        "GET",
+        f"{PULL}/iterations/3/changes",
+        json={
+            "changeEntries": [
+                {"changeType": "edit", "item": {"path": "/src/app.py", "gitObjectType": "blob"}}
+            ]
+        },
+    )
+
+    result = facet.changed_files_at_revision(
+        str(tmp_path), reference(), head_sha=HEAD, base_sha=BASE
+    )
+
+    assert (result["head_sha"], result["base_sha"]) == (HEAD, BASE)
+    assert [item["path"] for item in result["data"]] == ["src/app.py"]
+
+
+def test_pinned_pr_diff_echoes_the_verified_revisions(
+    facet: AzureDevOpsPullRequests,
+    forge: Forge,
+    ado_transport: RecordingTransport,
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request(head=forge.head_sha, base=forge.base_sha))
+
+    result = facet.pr_diff_at_revision(
+        str(forge.workspace), reference(), head_sha=forge.head_sha, base_sha=forge.base_sha
+    )
+
+    assert (result["head_sha"], result["base_sha"]) == (forge.head_sha, forge.base_sha)
+    assert "diff --git " in result["patch"]
+
+
+@pytest.mark.parametrize("read", ["changed_files_at_revision", "pr_diff_at_revision"])
+def test_pinned_reads_refuse_a_pr_at_other_revisions(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    read: str,
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request(head="c" * 40))
+
+    with pytest.raises(ValueError) as excinfo:
+        getattr(facet, read)(str(tmp_path), reference(), head_sha=HEAD, base_sha=BASE)
+
+    assert str(excinfo.value) == "The pull request changed; refresh to see its latest revision"

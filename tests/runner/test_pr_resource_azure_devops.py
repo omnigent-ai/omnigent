@@ -371,6 +371,26 @@ def test_changed_files_of_a_tracked_pr_come_from_azure_devops(
     assert paths(ado_transport) == [f"{PULL}/iterations", f"{PULL}/iterations/2/changes"]
 
 
+def test_pinned_changes_of_a_tracked_pr_echo_the_verified_revisions(
+    workspace: Path, ado_transport: RecordingTransport
+) -> None:
+    serve_changes(ado_transport)
+    ado_transport.route("GET", PULL, json=pull_request())
+    track(PR_URL)
+
+    result = pr_resource.pr_changed_files(
+        str(workspace), session_id=SESSION, head_sha="a" * 40, base_sha="b" * 40
+    )
+
+    assert result == {
+        "object": "list",
+        "data": CHANGED_FILES,
+        "has_more": False,
+        "head_sha": "a" * 40,
+        "base_sha": "b" * 40,
+    }
+
+
 def test_commit_history_is_refused_for_azure_devops_pull_requests(workspace: Path) -> None:
     track(PR_URL)
 
