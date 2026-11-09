@@ -2729,6 +2729,39 @@ def test_stale_active_turn_mismatch_steer_recovers_to_newer_turn(
     assert state.active_turn_id == "turn_b"
 
 
+def test_steer_ack_does_not_restore_a_turn_completed_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A steer accepted just before its turn ended leaves the bridge idle."""
+
+    class _CompletingSteerClient(_FakeCodexNativeClient):
+        """Complete the steered turn before acknowledging the steer."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Model the forwarder recording ``turn/completed`` ahead of the ack."""
+            type(self).requests.append((method, params))
+            assert method == "turn/steer", method
+            assert clear_active_turn_id_if_matches(tmp_path, "turn_a")
+            return {"result": {"turnId": "turn_a"}}
+
+    _CompletingSteerClient.requests = []
+    _CompletingSteerClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _CompletingSteerClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "follow up")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+
+
 async def test_concurrent_steering_during_turn_start_is_not_dropped(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

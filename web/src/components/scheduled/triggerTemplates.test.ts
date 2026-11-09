@@ -9,10 +9,15 @@ import {
   readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerPrompt,
+  slackChannels,
+  slackPeople,
   splitTriggerPrompt,
+  stripScopePrefix,
   splitJqlOrderBy,
+  triggerConditionFields,
   triggerFieldsComplete,
   updateTriggerWorkerSettings,
+  withTriggerEvent,
   TRIGGER_SOURCES,
   type TriggerCondition,
   type TriggerFields,
@@ -240,6 +245,109 @@ describe("triggerFieldsComplete", () => {
     ["instructions over the cap", { instructions: "x".repeat(MAX_INSTRUCTIONS_CHARS + 1) }, false],
   ])("%s", (_name, overrides, complete) => {
     expect(triggerFieldsComplete(fields(overrides))).toBe(complete);
+  });
+});
+
+describe("Slack DM triggers", () => {
+  const slack = (overrides: Partial<TriggerFields>) =>
+    fields({ event: "posted", scope: "eng-support", conditions: [], ...overrides });
+
+  it("strips pasted prefixes and renders channels and people", () => {
+    expect(stripScopePrefix("#eng, ##bugs,  #ops", "#")).toBe("eng, bugs,  ops");
+    expect(stripScopePrefix("@alice, bob", "#")).toBe("@alice, bob");
+    expect(stripScopePrefix("ES, OPS", "")).toBe("ES, OPS");
+    expect(slackChannels("eng-support, #bugs, C0123ABCD")).toBe("#eng-support, #bugs, C0123ABCD");
+    expect(slackPeople("alice, @bob, U0123ABCD, carol@example.com, Alice")).toEqual([
+      "@alice",
+      "@bob",
+      "U0123ABCD",
+      "carol@example.com",
+    ]);
+  });
+
+  it("needs at least two people for a group DM, in any operator", () => {
+    const groupOf = (scope: string) =>
+      triggerFieldsComplete(slack({ event: "group_dm", scope, scopeOperator: "is" }), "slack");
+    expect(groupOf("alice")).toBe(false);
+    expect(groupOf("alice, bob")).toBe(true);
+    // Repeats name one person, and a bare prefix names no one.
+    expect(groupOf("alice, @Alice")).toBe(false);
+    expect(groupOf("@, @")).toBe(false);
+    expect(triggerFieldsComplete(slack({ event: "dm", scope: "@" }), "slack")).toBe(false);
+    expect(triggerFieldsComplete(slack({ scope: "#" }), "slack")).toBe(false);
+    expect(triggerFieldsComplete(slack({ event: "dm", scope: "alice" }), "slack")).toBe(true);
+  });
+
+  it("clears the scope and hidden conditions when the event reads them differently", () => {
+    const author: TriggerCondition = { field: "author", operator: "is", value: "alerts-bot" };
+    const text: TriggerCondition = { field: "text", operator: "contains", value: "error" };
+    const channel = slack({ scopeOperator: "in", conditions: [author, text] });
+
+    const dm = withTriggerEvent("slack", channel, "dm");
+    expect(dm).toMatchObject({ event: "dm", scope: "", scopeOperator: "is", conditions: [text] });
+    expect(triggerConditionFields("slack", "dm").map((f) => f.id)).not.toContain("author");
+
+    const group = withTriggerEvent("slack", { ...dm, scope: "alice, bob" }, "group_dm");
+    // Both scopes list people, so the names carry over.
+    expect(group).toMatchObject({ scope: "alice, bob", scopeOperator: "in" });
+
+    // GitHub's events share the repo scope.
+    const github = fields({ event: "issue", scope: "acme/app", scopeOperator: "in" });
+    expect(withTriggerEvent("github", github, "pr")).toMatchObject({
+      scope: "acme/app",
+      scopeOperator: "in",
+    });
+  });
+
+  it("renders a direct-message search from each sender", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      slack({
+        event: "dm",
+        scope: "alice, bob",
+        conditions: [{ field: "text", operator: "contains", value: "error" }],
+      }),
+      CTX,
+    );
+    expect(prompt).toContain(
+      'Watch: new Slack direct messages sent to you by @alice and @bob whose text contains "error"\n',
+    );
+    expect(prompt).toContain(
+      'Use your Slack tools to find each of @alice and @bob by handle, display name or email. A name that matches no one or more than one person counts as no match: say so in your reply. Then read the messages each of them sent you since that time in your one-to-one direct message with them, oldest first. Your own messages and replies inside a thread don\'t start a new session. Only messages whose text contains "error" count.',
+    );
+    expect(prompt).toContain(
+      "say that this automation needs a Slack MCP server that can read your direct messages.",
+    );
+    expect(prompt).toContain('title "Slack <channel> <message ts>"');
+    expect(prompt).toContain("the sender, the direct message's channel ID");
+    const parts = splitTriggerPrompt(prompt);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+  });
+
+  it("renders a group-DM search for exactly the listed members", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      slack({ event: "group_dm", scope: "@alice, bob, carol", scopeOperator: "in" }),
+      CTX,
+    );
+    expect(prompt).toContain(
+      "Watch: new Slack messages in your group DM with @alice, @bob and @carol\n",
+    );
+    expect(prompt).toContain(
+      "Then find the group DM whose members are exactly you and those people; a group DM that also includes anyone else doesn't count.",
+    );
+    expect(prompt).toContain("Every other top-level message counts.");
+    expect(prompt).toContain("the names resolve to fewer than two people besides you");
+    expect(prompt).toContain("that can read your group DMs.");
+  });
+
+  it("prefixes bare channel names with # in a channel trigger", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "eng-support, C0123ABCD", scopeOperator: "in" }),
+      CTX,
+    );
+    expect(prompt).toContain("Watch: new Slack messages in #eng-support, C0123ABCD\n");
   });
 });
 
