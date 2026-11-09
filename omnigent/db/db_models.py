@@ -713,6 +713,8 @@ class SqlConversationMetadata(OmnigentBase):
     # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
     # label via the store's dual-read until labels are consolidated.
     project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Independent peers share a stable ID; NULL means a standalone session.
+    family_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     # JSON document of the session's linked pull requests and pending unlinks,
     # kept under 16,384 stored bytes by SessionPullRequestStore; NULL = none
     # reported. Deferred so whole-row reads (e.g. the session list) skip it.
@@ -755,6 +757,7 @@ class SqlConversationMetadata(OmnigentBase):
             "side_chat_parent_id",
             "id",
         ),
+        Index("ix_conversation_metadata_family_id", "workspace_id", "family_id", "id"),
     )
 
 

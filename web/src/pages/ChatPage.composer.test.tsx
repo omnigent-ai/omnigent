@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
@@ -59,8 +60,15 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
     useWorkspaceDirectory: () => ({ data: undefined }),
+    useWorkspaceFileSearch: () => ({ data: undefined }),
   };
 });
+// The "@" menu's session rows read the sidebar cache and a search query; these
+// tests don't open it, so stub the source like the workspace hooks above.
+vi.mock("@/hooks/useSessionMentionEntries", () => ({
+  MENTION_SEARCH_DEBOUNCE_MS: 300,
+  useSessionMentionEntries: () => [],
+}));
 
 // The /mcp panel's registry read and popup sign-in; the MCP cases script both.
 vi.mock("@/lib/mcpRegistry", () => ({
@@ -306,6 +314,23 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
     (key) => key.textContent ?? "",
   );
 }
+
+describe("Composer focus handle", () => {
+  it("takes focus for typing, unless disabled or read-only", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { rerender } = render(<Composer {...composerProps()} ref={ref} />);
+    act(() => ref.current?.focus());
+    expect(textarea()).toHaveFocus();
+
+    textarea().blur();
+    rerender(<Composer {...composerProps({ disabled: true })} ref={ref} />);
+    act(() => ref.current?.focus());
+    expect(textarea()).not.toHaveFocus();
+    rerender(<Composer {...composerProps({ permissionLevel: 1 })} ref={ref} />);
+    act(() => ref.current?.focus());
+    expect(textarea()).not.toHaveFocus();
+  });
+});
 
 describe("Composer Escape interrupt", () => {
   beforeEach(() => {
@@ -3025,7 +3050,7 @@ describe("Composer shared visible controls", () => {
     { permissionLevel: 4, enabled: true },
   ])(
     "lets only the owner change the permission mode (level $permissionLevel)",
-    ({ permissionLevel, enabled }) => {
+    async ({ permissionLevel, enabled }) => {
       useChatStore.setState({
         conversationId: "owner-only-permissions",
         codexApprovalMode: "ask-for-approval",
@@ -3042,8 +3067,8 @@ describe("Composer shared visible controls", () => {
         return;
       }
       expect(chip).toBeDisabled();
-      expect(chip).toHaveAttribute(
-        "title",
+      fireEvent.pointerMove(chip.parentElement!, { pointerType: "mouse" });
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(
         "Only the session owner can change the permission mode",
       );
       fireEvent.keyDown(chip, { key: "ArrowDown" });
@@ -3132,6 +3157,25 @@ describe("Composer permission-mode shortcut", () => {
     await waitFor(() => expect(chip()).toHaveTextContent(label));
     await settled();
   };
+
+  it.each([
+    ["enabled", false, [SHIFT_KEY, "Tab"]],
+    ["disabled", true, []],
+  ])(
+    "lists Shift+Tab on the chip only while the composer is %s",
+    async (_state, disabled, keys) => {
+      useChatStore.setState({
+        conversationId: `chip-${String(disabled)}`,
+        sessionHarness: "claude-native",
+        claudePermissionMode: "default",
+      });
+      renderWithTooltips(
+        <Composer {...composerProps({ showClaudePermissionMode: true, disabled })} />,
+      );
+      fireEvent.pointerMove(chip(), { pointerType: "mouse" });
+      expect(tooltipKeys(await screen.findByRole("tooltip"))).toEqual(keys);
+    },
+  );
 
   it("cycles a Claude session's mode with Shift+Tab and keeps the draft focused", async () => {
     const setMode = spyClaudeSetter();
@@ -5522,6 +5566,109 @@ describe("Composer reply quotes", () => {
     expect(textarea()).toHaveValue(before + tail);
   });
 
+  it("shows Esc in the Interrupt button tooltip while a turn is running", async () => {
+    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Interrupt" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Interrupt");
+    expect(tooltipKeys(tooltip)).toEqual(["Esc"]);
+  });
+
+  it("drops Esc from the Interrupt tooltip while dictation listens, which takes Esc", async () => {
+    const recognizer: { start?: () => void } = {};
+    vi.stubGlobal(
+      "SpeechRecognition",
+      class {
+        lang = "en-US";
+        continuous = false;
+        interimResults = false;
+        start = vi.fn();
+        stop = vi.fn();
+        abort = vi.fn();
+        addEventListener(type: string, handler: () => void) {
+          if (type === "start") recognizer.start = handler;
+        }
+        removeEventListener() {}
+      },
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    const props = composerProps({ status: "streaming", isWorking: true });
+    renderWithTooltips(<Composer {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => recognizer.start?.());
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Interrupt" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Interrupt");
+    expect(tooltipKeys(tooltip)).toEqual([]);
+
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).not.toHaveBeenCalled();
+  });
+
+  it("drops Esc from the Interrupt tooltip while the composer is disabled", async () => {
+    renderWithTooltips(
+      <Composer {...composerProps({ status: "streaming", isWorking: true, disabled: true })} />,
+    );
+    expect(textarea()).toBeDisabled();
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Interrupt" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Interrupt");
+    expect(tooltipKeys(tooltip)).toEqual([]);
+  });
+
+  it("shows the ↑ hint only on the queue tail that an empty composer's ↑ recalls", async () => {
+    useChatStore.setState({
+      status: "streaming",
+      sessionStatus: "running",
+      queuedMessages: [
+        { queueId: "q_1", conversationId: "conv_test", text: "first queued" },
+        { queueId: "q_2", conversationId: "conv_test", text: "second queued" },
+      ],
+    });
+    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    const edits = screen.getAllByRole("button", { name: "Edit queued message" });
+    fireEvent.pointerMove(edits[1]!, { pointerType: "mouse" });
+    expect(tooltipKeys(await screen.findByRole("tooltip"))).toEqual(["↑"]);
+  });
+
+  it("drops the ↑ hint while the composer holds text, since ↑ then moves the caret", async () => {
+    useChatStore.setState({
+      status: "streaming",
+      sessionStatus: "running",
+      queuedMessages: [{ queueId: "q_1", conversationId: "conv_test", text: "queued" }],
+    });
+    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    fireEvent.change(textarea(), { target: { value: "typing" } });
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Edit queued message" }), {
+      pointerType: "mouse",
+    });
+    expect(tooltipKeys(await screen.findByRole("tooltip"))).toEqual([]);
+  });
+
+  it("drops the ↑ hint while the composer is disabled, since it can't take ↑", async () => {
+    useChatStore.setState({
+      status: "streaming",
+      sessionStatus: "running",
+      queuedMessages: [{ queueId: "q_1", conversationId: "conv_test", text: "queued" }],
+    });
+    renderWithTooltips(
+      <Composer {...composerProps({ status: "streaming", isWorking: true, disabled: true })} />,
+    );
+    expect(textarea()).toBeDisabled();
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Edit queued message" }), {
+      pointerType: "mouse",
+    });
+    expect(tooltipKeys(await screen.findByRole("tooltip"))).toEqual([]);
+  });
+
   it("recalls actual cards from history without reclassifying authored Markdown", () => {
     const props = composerProps();
     const ref = createRef<ComponentRef<typeof Composer>>();
@@ -5914,7 +6061,8 @@ describe("Composer reply quotes", () => {
     fireEvent.change(textarea(), { target: { value: "My answer" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     const [text, , replyDraft] = vi.mocked(props.onSend).mock.calls[0]!;
-    expect(text).toBe("[Attached file: src/example.ts]\n\n> Actual card\n\nMy answer");
+    // The drained file is an inline token, so its marker keeps the token's trailing space.
+    expect(text).toBe("[Attached file: src/example.ts] \n\n> Actual card\n\nMy answer");
     expect(serializeReplyDraft(replyDraft!)).toBe(text);
     act(() =>
       useChatStore.setState({
@@ -5923,7 +6071,7 @@ describe("Composer reply quotes", () => {
     );
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Actual card");
     expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue(
-      "[Attached file: src/example.ts]\n\n",
+      "[Attached file: src/example.ts] ",
     );
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toBe(text);
@@ -5947,11 +6095,19 @@ describe("Composer reply quotes", () => {
 
 describe("Composer side-chat entry points", () => {
   beforeEach(() => {
-    setComposerState({ conversationId: "conv_test", skills: [], sessionHarness: "openai-agents" });
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [],
+      sessionHarness: "openai-agents",
+      sideChatToOpen: null,
+      sideChatDrafts: {},
+      sideChatComposers: {},
+    });
   });
   afterEach(() => {
     cleanup();
     composerSessionSnapshot.sideChatAllowed = null;
+    vi.restoreAllMocks();
   });
 
   // An admin has owner level, but only the root session's owner starts side chats.
@@ -5967,6 +6123,68 @@ describe("Composer side-chat entry points", () => {
     fireEvent.change(textarea(), { target: { value: "" } });
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     expect(screen.queryByTestId("composer-side-chat-action") !== null).toBe(offered);
+  });
+
+  it("opens a focused pending tab after the add menu closes", async () => {
+    const authenticatedFetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockImplementation(() => new Promise<Response>(() => {}));
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+
+    await waitFor(() => expect(useChatStore.getState().sideChatToOpen).not.toBeNull());
+    const { sideChatToOpen, sideChatComposers, sideChatDrafts } = useChatStore.getState();
+    expect(sideChatToOpen).toEqual({
+      childId: expect.stringMatching(/^pending:/),
+      parentId: "conv_test",
+    });
+    expect(sideChatComposers[sideChatToOpen!.childId]).toMatchObject({ autoFocus: true });
+    expect(sideChatDrafts[sideChatToOpen!.childId]).toBeUndefined();
+    expect(textarea()).toHaveValue("");
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
+  it("does not open a side chat after its parent changes while the menu closes", async () => {
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    const trigger = screen.getByRole("button", { name: "Add" });
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    const restoredTriggerFocus = vi.fn();
+    trigger.addEventListener("focus", restoredTriggerFocus);
+
+    try {
+      fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+      act(() => useChatStore.setState({ conversationId: "conv_other" }));
+      await waitFor(() => expect(restoredTriggerFocus).toHaveBeenCalled());
+      await act(
+        () =>
+          new Promise<void>((resolve) => {
+            requestAnimationFrame(() => resolve());
+          }),
+      );
+
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      expect(useChatStore.getState().sideChatComposers).toEqual({});
+    } finally {
+      trigger.removeEventListener("focus", restoredTriggerFocus);
+    }
+  });
+
+  it("focuses the native side-chat question after the add menu closes", async () => {
+    const user = userEvent.setup();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+
+    await waitFor(() => expect(textarea()).toHaveValue("/side "));
+    expect(textarea()).toHaveFocus();
+    await user.keyboard("question");
+    expect(textarea()).toHaveValue("/side question");
   });
 });
 
@@ -6788,7 +7006,8 @@ describe("Composer — editing queued messages", () => {
       }),
     );
     if (quoted) act(() => ref.current?.appendReplyQuote("Quoted answer"));
-    fireEvent.change(textarea(), { target: { value: QUEUED_TEXT } });
+    // Keep the drained inline token: deleting it would untag the file.
+    fireEvent.change(textarea(), { target: { value: textarea().value + QUEUED_TEXT } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     const original = useChatStore.getState().queuedMessages[0]!;
     expect(original.text).toContain("[Attached file: src/example.ts]");

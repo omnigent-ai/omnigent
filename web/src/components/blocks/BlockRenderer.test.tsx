@@ -2397,6 +2397,30 @@ describe("BlockRenderer dispatch", () => {
       });
       expect(container.textContent).toContain("CHARLIE");
     });
+
+    it("keeps a Mermaid fence's source while the shown text trails the turn's end", () => {
+      const open = "Flow:\n\n```mermaid\nflowchart LR\n  Alpha --> Beta\n";
+      const view = (text: string, sessionStatus: "running" | "idle") => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={[{ kind: "text", itemId: null, text, final: false, streamKey: "text#0" }]}
+            sessionStatus={sessionStatus}
+          />
+        </FileViewerContext.Provider>
+      );
+      const { rerender, container } = render(view("Flow:", "running"));
+      act(() => rerender(view(open, "running")));
+      // The turn ends within the throttle window, before the fence's close is shown.
+      act(() => rerender(view(`${open}\`\`\`\n\nDone.`, "idle")));
+      expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent(
+        "Alpha --> Beta",
+      );
+      expect(container.querySelector(".chat-mermaid")).toBeNull();
+
+      act(() => vi.advanceTimersByTime(100));
+      expect(container).toHaveTextContent("Done.");
+      expect(container.querySelector(".chat-mermaid")).not.toBeNull();
+    });
   });
 
   // A text block carrying a ~50KB unbroken base64 data URL (an

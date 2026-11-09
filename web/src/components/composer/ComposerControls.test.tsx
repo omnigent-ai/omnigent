@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import {
   ComposerHostTrigger,
   ComposerWorkspaceBar,
@@ -175,6 +176,26 @@ describe("shared composer controls", () => {
     expect(onClick).toHaveBeenCalledOnce();
   });
 
+  it("shows the cycle chord in the permission chip tooltip when it is bound", async () => {
+    const { unmount } = render(
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value="Plan"
+        options={[{ value: "plan", label: "Plan" }]}
+        shortcut={[SHIFT_KEY, "Tab"]}
+        onSelect={vi.fn()}
+      />,
+    );
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Permission mode: Plan" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Permission mode: Plan");
+    const keys = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+    expect(keys.map((key) => key.textContent)).toEqual([SHIFT_KEY, "Tab"]);
+    unmount();
+  });
+
   it("dispatches permission selections through the caller's handler", () => {
     const onSelect = vi.fn();
     render(
@@ -276,14 +297,14 @@ describe("shared composer controls", () => {
         value="Read only"
         harness="codex-native"
         selectedValue="read-only"
-        options={[{ value: "default", label: "Automatic" }]}
+        options={[{ value: "approve-for-me", label: "Approve for me" }]}
         onSelect={vi.fn()}
       />,
     );
     const trigger = screen.getByRole("button", { name: "Permission mode: Read only" });
     expect(trigger).toHaveAttribute("data-permission-concept", "read-only");
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
-    expect(screen.getByRole("menuitemradio", { name: "Automatic" })).toHaveAttribute(
+    expect(screen.getByRole("menuitemradio", { name: "Approve for me" })).toHaveAttribute(
       "data-permission-concept",
       "automatic",
     );

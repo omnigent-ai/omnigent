@@ -1,14 +1,15 @@
 "use client";
 
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
-import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
+import { useVoiceDictationHotkey, VOICE_DICTATION_KEYS } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
-import { isElectronShell } from "@/lib/nativeBridge";
+import { isElectronShell, startSystemDictation, supportsSystemDictation } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { Loader2Icon, MicIcon, SquareIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 
 // Local-only types; speech-input.tsx already augments Window globally.
 interface SpeechRecognitionLike {
@@ -90,6 +91,13 @@ export interface ComposerMicButtonProps {
   /** Fired when Esc ends dictation. The parent should restore the text it
    *  snapshotted in {@link onVoiceStart}, discarding what was dictated. */
   onVoiceDiscard?: () => void;
+  /** Called when a take starts or ends listening; while listening, Enter and Esc
+   *  belong to dictation. */
+  onListeningChange?: (listening: boolean) => void;
+  /** The composer's text box. macOS Dictation types into the focused field, so
+   *  the desktop app's macOS fallback focuses this first; without it there is no
+   *  fallback. */
+  inputRef?: RefObject<HTMLTextAreaElement | null>;
 }
 
 /** getUserMedia permission failures, distinct from transport failures. */
@@ -106,18 +114,25 @@ export const ComposerMicButton = ({
   enableHotkey = false,
   onVoiceStart,
   onVoiceDiscard,
+  onListeningChange,
+  inputRef,
 }: ComposerMicButtonProps) => {
-  // Web Speech is primary whenever the browser has the constructor
-  // (Chrome/Safari, unchanged behavior); with no constructor at all
-  // (Firefox) takes use server dictation when GET /v1/info advertises it.
-  // A constructor is no guarantee of a backend — Electron and plain
-  // Chromium error at runtime with "network" — so a failed Web Speech
-  // take falls back to the server per take (see handleError). Per-take,
-  // not sticky: a transient blip in real Chrome must not permanently
-  // downgrade the page to the local model.
+  // Web Speech is primary wherever its constructor exists; a take that dies with
+  // "network" falls back to the server for that take only (see handleError).
+  // Electron has the constructor but never a backend, so there only the server can serve,
+  // and on macOS a server without dictation hands the take to macOS Dictation.
   const [Ctor] = useState(getRecognitionCtor);
+  const electron = isElectronShell();
+  const [systemDictationBridge] = useState(supportsSystemDictation);
   const serverInfo = useServerInfo();
   const serverAvailable = serverInfo !== "loading" && serverInfo.dictation_available;
+  const systemDictation =
+    electron &&
+    systemDictationBridge &&
+    inputRef !== undefined &&
+    serverInfo !== "loading" &&
+    !serverAvailable;
+  const canDictate = serverAvailable || (Ctor !== null && !electron) || systemDictation;
   // Mirrored into a ref so the mount-time recognition handlers (closed
   // over [Ctor, lang]) see the current probe result.
   const serverAvailableRef = useRef(serverAvailable);
@@ -140,6 +155,13 @@ export const ComposerMicButton = ({
   onVoiceStartRef.current = onVoiceStart;
   const onVoiceDiscardRef = useRef(onVoiceDiscard);
   onVoiceDiscardRef.current = onVoiceDiscard;
+  const onListeningChangeRef = useRef(onListeningChange);
+  onListeningChangeRef.current = onListeningChange;
+  useEffect(() => {
+    if (!isListening) return;
+    onListeningChangeRef.current?.(true);
+    return () => onListeningChangeRef.current?.(false);
+  }, [isListening]);
   // Set by the Esc handler so late results after a discard don't repopulate the
   // composer the parent just reverted. Cleared on the next start.
   const discardingRef = useRef(false);
@@ -176,7 +198,8 @@ export const ComposerMicButton = ({
   const barRefs = useRef<(HTMLSpanElement | null)[]>(BAR_BINS.map(() => null));
 
   useEffect(() => {
-    if (!Ctor) return;
+    // Electron never starts a Web Speech take, so skip the dead recognizer.
+    if (!Ctor || electron) return;
 
     const recognition = new Ctor();
     // Keep listening until the user clicks stop — no auto-stop on silence.
@@ -256,7 +279,7 @@ export const ComposerMicButton = ({
       recognition.stop();
       recognitionRef.current = null;
     };
-  }, [Ctor, lang, reportError]);
+  }, [Ctor, electron, lang, reportError]);
 
   // Auto-stop if the composer goes disabled mid-dictation. Stops the
   // recognizer; the disabledRef guard in handleResult catches any final
@@ -435,6 +458,18 @@ export const ComposerMicButton = ({
   }, [reportError]);
   toggleServerRef.current = toggleServer;
 
+  // macOS owns this take: its own indicator shows listening, and its text
+  // reaches the composer as typing, so none of the take state above is used.
+  const startMacDictation = useCallback(() => {
+    const input = inputRef?.current;
+    if (!input) return;
+    input.focus();
+    void startSystemDictation().then((started) => {
+      if (started) setError(null);
+      else reportError("Voice input isn't available on this device.");
+    });
+  }, [inputRef, reportError]);
+
   const toggle = useCallback(() => {
     // An active (or starting) server take is owned by the server path,
     // whichever mode started it.
@@ -442,13 +477,11 @@ export const ComposerMicButton = ({
       void toggleServer();
       return;
     }
-    // In Electron the SpeechRecognition constructor exists but has no backend,
-    // so a Web Speech take always fails with "network" and only THEN falls back
-    // to the server — a visible ~1s "fail then recover" on every first take.
-    // When the server can serve, go straight to it and skip the doomed attempt.
-    // (Real browsers keep Web Speech primary; it genuinely works there.)
-    if (!Ctor || (serverAvailable && isElectronShell())) {
+    // Electron's SpeechRecognition has no backend, so a Web Speech take there
+    // always fails: go straight to the server, else to macOS Dictation.
+    if (!Ctor || electron) {
       if (serverAvailable) void toggleServer();
+      else if (systemDictation) startMacDictation();
       return;
     }
     // Guard against rapid clicks landing before start/end event fires.
@@ -464,12 +497,21 @@ export const ComposerMicButton = ({
       // user can try again, and let the next event reconcile state.
       transitionRef.current = false;
     }
-  }, [isListening, Ctor, serverAvailable, toggleServer]);
+  }, [
+    isListening,
+    Ctor,
+    electron,
+    serverAvailable,
+    systemDictation,
+    startMacDictation,
+    toggleServer,
+  ]);
 
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
-  // whenever dictation could run (Web Speech OR the server path) and the
-  // composer isn't disabled, so the chord is inert when it can't do anything.
-  useVoiceDictationHotkey(toggle, enableHotkey && (Boolean(Ctor) || serverAvailable) && !disabled);
+  // only while a dictation path can run and the composer isn't disabled, so
+  // the chord is inert when it can't do anything.
+  const hotkeyEnabled = enableHotkey && canDictate && !disabled;
+  useVoiceDictationHotkey(toggle, hotkeyEnabled);
 
   // While listening, Enter commits (end the take, keep the text) and Esc
   // cancels (end the take, discard back to the pre-dictation snapshot). Bound in
@@ -512,7 +554,7 @@ export const ComposerMicButton = ({
     return () => window.removeEventListener("keydown", handler, true);
   }, [isListening, toggle]);
 
-  if (!Ctor && !serverAvailable) return null;
+  if (!canDictate) return null;
 
   // Stable accessible name with aria-pressed signals toggle state to
   // screen readers. Error text takes over the tooltip when set.
@@ -520,49 +562,56 @@ export const ComposerMicButton = ({
   const tooltip = error ?? (connecting ? "Starting voice input…" : a11yLabel);
 
   return (
-    <Button
-      type="button"
-      size="icon"
-      variant="ghost"
-      disabled={disabled}
-      onClick={toggle}
-      aria-pressed={isListening}
-      aria-busy={connecting}
-      aria-label={a11yLabel}
-      data-composer-action="microphone"
-      data-server-dictation-available={serverAvailable}
-      title={tooltip}
-      className={cn(
-        "size-9 mobile-touch-target md:size-8",
-        isListening &&
-          "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
-        error && "text-destructive",
-        className,
-      )}
+    <KeyboardShortcutTooltip
+      label={tooltip}
+      keys={hotkeyEnabled ? VOICE_DICTATION_KEYS : undefined}
     >
-      {connecting ? (
-        <Loader2Icon className="size-4 animate-spin" data-icon-size="16" aria-hidden />
-      ) : isListening ? (
-        // Bars fade out and stop icon fades in on hover OR keyboard focus,
-        // so keyboard users get the stop affordance without needing hover.
-        <span className="relative flex size-4 items-center justify-center" aria-hidden>
-          <span className="flex h-full items-center gap-[2px] transition-opacity group-hover/button:opacity-0 group-focus-visible/button:opacity-0">
-            {BAR_BINS.map(([lo, hi], i) => (
-              <span
-                key={`${lo}-${hi}`}
-                ref={(el) => {
-                  barRefs.current[i] = el;
-                }}
-                className="block h-3 w-[2px] origin-center rounded-full bg-current"
-                style={{ transform: `scaleY(${BAR_BASELINE})` }}
-              />
-            ))}
+      <Button
+        type="button"
+        size="icon"
+        variant="ghost"
+        disabled={disabled}
+        onClick={toggle}
+        aria-pressed={isListening}
+        // While listening, Escape cancels dictation before page-wide shortcuts see it.
+        data-escape-owner={isListening ? "" : undefined}
+        aria-busy={connecting}
+        aria-label={a11yLabel}
+        data-composer-action="microphone"
+        data-server-dictation-available={serverAvailable}
+        data-dictating={isListening || undefined}
+        className={cn(
+          "size-9 mobile-touch-target md:size-8",
+          isListening &&
+            "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
+          error && "text-destructive",
+          className,
+        )}
+      >
+        {connecting ? (
+          <Loader2Icon className="size-4 animate-spin" data-icon-size="16" aria-hidden />
+        ) : isListening ? (
+          // Bars fade out and stop icon fades in on hover OR keyboard focus,
+          // so keyboard users get the stop affordance without needing hover.
+          <span className="relative flex size-4 items-center justify-center" aria-hidden>
+            <span className="flex h-full items-center gap-[2px] transition-opacity group-hover/button:opacity-0 group-focus-visible/button:opacity-0">
+              {BAR_BINS.map(([lo, hi], i) => (
+                <span
+                  key={`${lo}-${hi}`}
+                  ref={(el) => {
+                    barRefs.current[i] = el;
+                  }}
+                  className="block h-3 w-[2px] origin-center rounded-full bg-current"
+                  style={{ transform: `scaleY(${BAR_BASELINE})` }}
+                />
+              ))}
+            </span>
+            <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
           </span>
-          <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
-        </span>
-      ) : (
-        <MicIcon className="size-4" data-icon-size="16" />
-      )}
-    </Button>
+        ) : (
+          <MicIcon className="size-4" data-icon-size="16" />
+        )}
+      </Button>
+    </KeyboardShortcutTooltip>
   );
 };

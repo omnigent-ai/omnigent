@@ -386,6 +386,14 @@ def test_other_turn_error_text_is_displayed_unchanged() -> None:
     assert turn_error_display_message("codex_turn_error", message) == message
 
 
+def test_sized_request_size_rejection_keeps_its_text() -> None:
+    sized = (
+        "exceeds maximum allowed content length. RequestSize(bytes): 33967957, "
+        "Limit(bytes): 33554432"
+    )
+    assert turn_error_display_message("context_length_exceeded", sized) == sized
+
+
 @pytest.mark.parametrize(
     "code",
     # Budget detection runs before the early-return guard, so it applies to

@@ -39,6 +39,14 @@ implements them separately, so a fix for one harness does not reach the others.
   host has not configured can be hidden from the picker. When harness repair is
   enabled, Settings → Harnesses shows the missing credential as an actionable
   card; its Reconfigure control and full-card click replace a separate banner action.
+- `cli-unresponsive`: a host CLI that resolves but does not answer its
+  `--version` check (for example, a wrapper waiting at a setup prompt) reads as
+  "did not respond", not outdated. New Chat keeps the harness selectable with a
+  notice and no **Set up** action, and launches and resumes still start the CLI,
+  so its own prompt shows in the terminal. Settings → Harnesses labels the card
+  **CLI did not respond**. With `harness_install` enabled on a non-sandbox host,
+  the card and its gear open the harness settings, whose warning offers no
+  Install, Update or Reconfigure action and marks the credential **Not checked**.
 - `new-chat-setup`: with `harness_install` enabled, New Chat’s **Set up**
   action opens the shared Reconfigure flow in place for native agents on
   connected user hosts when a fix is available. Missing binaries install before
@@ -77,6 +85,10 @@ implements them separately, so a fix for one harness does not reach the others.
   approval waits from the five-minute execution budget. A pending approval
   stays pending past five minutes; rejection or expiry does not run the tool.
   Cancellation or a disconnected caller releases that call's pending approval.
+- `questions`: Claude's questions show an answer form in chat. An answer
+  submitted during a brief Omnigent outage still reaches Claude. If the web
+  question can't be shown or its wait expires, Claude receives a request to
+  ask in chat text.
 - `devin-questions`: Devin's native question picker appears in Chat and Inbox;
   selected options and custom answers return to the running tool.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
@@ -200,10 +212,11 @@ once both end. While the server runs, the composer shows "1 background task"
 with its command, the same list Codex shows for `/ps` in its terminal.
 Answer an approval in Chat and another from the Inbox: "Needs response" clears
 at once. Block the answer request in the browser's developer tools and answer
-again: the prompt comes back. A prompt shown only in Claude's terminal has no
-reliable manual trigger: Claude's own prompts also get a Chat card within about
-a second, and a dialog the user opens, such as `/model`, leaves Claude
-reporting working during a turn and done after it, so the row does not change.
+again: the prompt comes back. Claude's own terminal prompts also get a Chat
+card within about a second. A dialog the user opens during a turn, such as
+`/model`, leaves Claude reporting working, so after about 15 seconds the row
+shows "May need input" in Needs attention until the dialog closes. Claude
+reports done after the turn, so a dialog opened then leaves the row unchanged.
 
 **Pi Smart Routing:** enable Smart Routing for the session, then send a task
 from Chat or type it into the native Pi terminal. Follow a completed tool call
@@ -272,7 +285,7 @@ Probes run only on expansion.
 
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
-shown for a newly connected or requested host → See more. The modal auto-opens
+shown once for the host desktop onboarding just connected → See more. It opens
 only when the server enables the `import_review` release feature.
 
 **Harness credential repair:** Settings → Harnesses → a needs-auth harness →
@@ -289,6 +302,11 @@ picks tmux up on its next periodic readiness refresh, about a minute later.
 The desktop app keeps the PATH it started with, so if tmux went into a new PATH
 directory, quit and reopen the app. Signing in or saving a credential on a host
 without tmux continues to the same tmux step.
+
+**Unresponsive harness CLI:** put a harness wrapper that never answers
+`--version` first on the host's PATH and restart the host. Open New Chat with
+that agent, then Settings → Harnesses → the **CLI did not respond** card or its
+gear, then send a message in an existing session for that harness.
 
 **Harness account sign-in and switching:** Settings → Harnesses → Codex or
 Claude. Use **Sign in again** on an expired Codex card, or open the configured
@@ -561,12 +579,13 @@ Cross-harness journeys:
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus
   `web/src/shell/settingsNav.test.tsx` and
-  `tests/e2e_ui/onboarding/test_import_review_modal.py::test_import_modal_opens_once_and_links_to_harnesses`.
+  `tests/e2e_ui/onboarding/test_import_review_modal.py::test_import_modal_opens_after_onboarding`.
   Start the isolated instance without release flags. Check the Harnesses sidebar
   link and direct links to the catalog and a harness detail page. Stop it, then
   use `OMNIGENT_FEATURES=import_review verify-env start`; without that feature the
-  import review modal never opens. Connect a new host, then click See more
-  beside Confirm. Check that the modal closes and Harnesses opens. Open Import
+  import review modal never opens. Finish desktop onboarding (or stub the
+  shell's `takeOnboardingRunner` as the E2E does), then click See more beside
+  Confirm. Check that the modal closes and Harnesses opens. Open Import
   sessions and check that only session imports remain. The Harnesses sidebar
   and direct links remain available without the import-review flag. The server
   response contract is covered by
@@ -586,6 +605,13 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
+- **`cli-unresponsive`:**
+  `tests/onboarding/test_harness_readiness.py::test_unanswered_pi_version_probe_is_not_reported_as_outdated`,
+  `tests/host/test_connect.py::test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_answers`,
+  `tests/onboarding/test_harness_install.py::test_missing_harness_cli_lets_a_slow_kimi_through_sub_agent_dispatch`,
+  and the "did not respond" cases in
+  `web/src/pages/settings/SettingsHarnessesSection.test.tsx` and
+  `web/src/shell/NewChatDialog.test.tsx`.
 - **`model-and-effort`, Claude runtime selection (own environment):**
   `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
   uses real Claude catalog discovery, tmux, statusLine and the runner event
@@ -740,6 +766,11 @@ Cross-harness journeys:
   (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_late_settings_ack_still_reaches_an_older_server`).
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
+- **`questions` (`claude-native`):**
+  `tests/e2e_ui/approvals/test_native_claude_question.py::test_native_question_reaches_chat_and_returns_to_claude`
+  sends from both chat and the embedded terminal, answers the web form, and
+  separately injects the server's empty-200 timeout response to check the
+  chat-text fallback.
 - **`approvals`, Claude directory access:**
   `tests/e2e_ui/approvals/test_claude_permission_auto_mode.py::test_permission_card_grants_directories_without_changing_auto_mode`
   checks Chat (including reload), Inbox, and standalone approval links against
@@ -1097,6 +1128,11 @@ Cross-harness journeys:
   failing-operation evidence when tmux exits after readiness. These tests
   exercise the injection used by existing-session and first-message composers;
   CLI typing bypasses the web injection gate. They do not run a vendor model.
+  `tests/harnesses/claude_native/test_claude_native_overdrawn_prompt.py` checks
+  redraw recovery in single and split tmux windows, the requested pane's exit
+  while its neighbor stays alive, a missing target, and a suspended background
+  job staying paused during redraw. It uses a scripted TUI
+  and real tmux; it does not establish browser or vendor-model compatibility.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
   `tests/e2e/test_codex_native_event_stream_disconnect_e2e.py` covers waiting
   consumers, buffered events, explicit close, and startup discovery without a

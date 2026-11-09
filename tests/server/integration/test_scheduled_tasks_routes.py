@@ -751,7 +751,14 @@ async def test_create_rejects_invalid_reasoning_effort(
     [(CLAUDE_NATIVE_AGENT_NAME, "acceptEdits")]
     + [
         (CODEX_NATIVE_AGENT_NAME, mode)
-        for mode in ("default", "full-access", "read-only", "bypass")
+        for mode in (
+            "default",
+            "ask-for-approval",
+            "approve-for-me",
+            "full-access",
+            "read-only",
+            "bypass",
+        )
     ],
 )
 async def test_create_persists_permission_mode(
@@ -773,13 +780,17 @@ async def test_create_persists_permission_mode(
     assert got.status_code == 200
     assert got.json()["permission_mode"] == mode
     if mode == "full-access":
-        changed = await auth_client.patch(
-            f"/v1/scheduled-tasks/{task_id}",
-            json={"permission_mode": "read-only"},
-            headers=_headers(),
-        )
-        assert changed.status_code == 200, changed.text
-        assert changed.json()["permission_mode"] == "read-only"
+        # Patch out of and back into modes that skip approval; read-backs prove each saved.
+        for patched_mode in ("read-only", "bypass"):
+            changed = await auth_client.patch(
+                f"/v1/scheduled-tasks/{task_id}",
+                json={"permission_mode": patched_mode},
+                headers=_headers(),
+            )
+            assert changed.status_code == 200, changed.text
+            assert changed.json()["permission_mode"] == patched_mode
+            reread = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+            assert reread.json()["permission_mode"] == patched_mode
 
 
 @pytest.mark.parametrize("operation", ["create", "update"])
@@ -1505,9 +1516,15 @@ async def test_update_rejects_invalid_reasoning_effort(
 
 
 @pytest.mark.parametrize("claimed", [False, True])
+@pytest.mark.parametrize("shared", [False, True])
 async def test_delete_removes_task(
-    auth_client: httpx.AsyncClient, db_uri: str, claimed: bool
+    auth_client: httpx.AsyncClient, db_uri: str, claimed: bool, shared: bool
 ) -> None:
+    from omnigent.db.db_models import current_workspace_id
+    from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+    from omnigent.stores.host_store import HostStore
+
     _make_user(db_uri)
     created = (
         await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
@@ -1532,8 +1549,39 @@ async def test_delete_removes_task(
             is not None
         )
 
+    hosts = HostStore(db_uri)
+    host_id = continued_sandbox_host_id(task_id, current_workspace_id())
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="automation",
+        user_id="alice@example.com",
+        token="retained",
+        provider="modal",
+        sandbox_id="retained",
+        token_expires_at=2_000_000_000,
+    )
+    hosts.upsert_on_connect(host_id=host_id, name="automation", user_id="alice@example.com")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    session = conversations.create_conversation(
+        host_id=host_id, workspace="/work", labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id}
+    )
+    if shared:
+        peer = conversations.create_conversation(host_id=host_id, workspace="/work")
+        conversations.update_conversation(peer.id, archived=True)
+    assert await conversations.delete_conversation(session.id)
+    assert hosts.get_host(host_id).status == "online"
+
     deleted = await auth_client.delete(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert deleted.status_code == 200, deleted.text
+    retained_host = hosts.get_host(host_id, include_deleted=True)
+    assert retained_host is not None
+    assert (retained_host.deleted_at is None) is shared
+    if shared:
+        assert retained_host.status == "online"
+        assert conversations.get_conversation(peer.id).host_id == host_id
+    else:
+        assert retained_host.sandbox_id == "retained"
+        assert hosts.resolve_launch_token(host_id, "retained") is None
 
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 404
@@ -2990,6 +3038,22 @@ async def test_create_can_continue_a_session_the_owner_picked(
     # The task runs the session's own agent rather than taking a copy.
     assert body["agent_id"] == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
 
+    # A session that skips approval takes only a task that selects such a mode itself.
+    bypassing = _owned_session(
+        db_uri, labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+    )
+    for permission_mode, status in ((None, 400), ("auto", 400), ("bypassPermissions", 200)):
+        picked = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(
+                session_mode="continue", session_id=bypassing, permission_mode=permission_mode
+            ),
+            headers=_headers(),
+        )
+        assert picked.status_code == status, (permission_mode, picked.text)
+        if status == 400:
+            assert "which skips approval" in picked.json()["error"]["message"]
+
 
 async def test_a_picked_session_must_be_the_owners_and_fit_the_task(
     auth_client: httpx.AsyncClient, db_uri: str
@@ -3057,6 +3121,37 @@ async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
 
     assert patched.status_code == 200, patched.text
     assert (patched.json()["agent_id"], patched.json()["session_id"]) == (codex, session_id)
+
+    # Picking a session that skips approval checks the requested mode, else the stored one.
+    full_access = _owned_session(
+        db_uri,
+        agent_id=codex,
+        terminal_launch_args=["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+    )
+    for update, status in (
+        ({"permission_mode": "full-access"}, 200),
+        ({}, 200),
+        ({"permission_mode": "approve-for-me"}, 400),
+        ({"permission_mode": None}, 400),
+    ):
+        picked = await auth_client.patch(
+            f"/v1/scheduled-tasks/{created['id']}",
+            json={"session_id": full_access, **update},
+            headers=_headers(),
+        )
+        assert picked.status_code == status, (update, picked.text)
+        if status == 400:
+            assert "which skips approval" in picked.json()["error"]["message"]
+    # Changing only the mode is checked against the session the task continues.
+    for permission_mode, status in (("approve-for-me", 400), (None, 400), ("bypass", 200)):
+        changed = await auth_client.patch(
+            f"/v1/scheduled-tasks/{created['id']}",
+            json={"permission_mode": permission_mode},
+            headers=_headers(),
+        )
+        assert changed.status_code == status, (permission_mode, changed.text)
+        if status == 400:
+            assert "which skips approval" in changed.json()["error"]["message"]
     assert copies == []
 
 

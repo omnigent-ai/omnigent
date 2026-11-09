@@ -23,6 +23,7 @@ from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
 from omnigent.llms.errors import (
     REQUEST_SIZE_OVERFLOW_GUIDANCE,
+    detect_request_size_overflow,
     is_request_size_rejection,
 )
 
@@ -422,14 +423,18 @@ def classify_native_turn_error(code: str, message: str) -> str:
 def turn_error_display_message(code: str, message: str) -> str:
     """Return the text to show for a classified turn error.
 
-    A request-size rejection is replaced with the context-overflow guidance so the
-    user sees the remedy instead of the gateway's raw response body.
+    The limit-only gateway wording is replaced with the context-overflow guidance. The
+    sized rejection keeps its text, which the UI shows with its byte counts.
 
     :param code: Classified error code, e.g. ``"context_length_exceeded"``.
     :param message: Raw harness error text.
-    :returns: The guidance for a request-size rejection, else ``message`` unchanged.
+    :returns: The guidance for a limit-only request-size rejection, else ``message``.
     """
-    if code == "context_length_exceeded" and is_request_size_rejection(message):
+    if (
+        code == "context_length_exceeded"
+        and detect_request_size_overflow(message) is None
+        and is_request_size_rejection(message)
+    ):
         return REQUEST_SIZE_OVERFLOW_GUIDANCE
     return message
 

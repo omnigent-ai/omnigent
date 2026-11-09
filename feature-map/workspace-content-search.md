@@ -27,8 +27,9 @@ Filename search remains in Files.
   and choose **Content search**; it opens as a full-screen drawer.
 - Keyboard: **Cmd+Shift+F** on macOS (**Ctrl+Shift+F** on Windows/Linux) opens
   the Workspace panel, selects **Content search**, and focuses its input. It
-  also works from the editor and terminal. The tab strip's arrows and numbered
-  shortcuts can select the tab too.
+  also works from the editor and terminal. The tab strip's arrows can select the
+  tab too, and so can its number: **Ctrl+1–9** on macOS (**Alt+1–9** on
+  Windows/Linux, except in a terminal) from anywhere in the app.
 
 ## Driving it with the repro environment
 
