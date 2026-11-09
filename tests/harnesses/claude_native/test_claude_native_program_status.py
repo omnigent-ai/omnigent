@@ -108,7 +108,7 @@ def test_error_fallback_preserves_available_detail(tmp_path: Path, message: str 
     )
     poller.tick()
     assert published == failures == []
-    clock.now = _GRACE_S
+    clock.now = 10.0
     poller.tick()
     poller.resync()
     poller.tick()
