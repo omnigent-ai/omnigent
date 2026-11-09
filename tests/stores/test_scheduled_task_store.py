@@ -1542,9 +1542,24 @@ def test_skipping_an_occurrence_advances_the_schedule_without_a_run(
     assert store.list_runs(task.id)[0] == []
 
 
+@pytest.mark.parametrize(
+    ("now", "poll_in"),
+    [
+        (1_800_000_000 + 30 * 60, 120),
+        # The hourly schedule's next occurrence is sooner than two minutes out, so it wins.
+        (1_800_000_000 + 3600 - 30, 30),
+    ],
+    ids=["half-past", "just-before-the-hour"],
+)
 def test_an_edit_that_changes_trigger_status_moves_the_next_poll(
     store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+    now: int,
+    poll_in: int,
 ) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: now)
     trigger_prompt = "This automation watches Slack and starts one Omnigent session per message."
     store.configure_dispatch(True)
     store.configure_trigger_polling(120)
@@ -1559,17 +1574,17 @@ def test_an_edit_that_changes_trigger_status_moves_the_next_poll(
         host_id=_uid("host"),
         session_mode="continue",
     )
-    assert task.next_run_at == task.created_at + 120
+    assert task.next_run_at == now + poll_in
     # Without its opening sentence, the task follows its hourly schedule again.
     plain = store.update(task.id, prompt="Check the channel.")
-    assert plain.next_run_at == next_scheduled_time(plain, plain.updated_at)
+    assert plain.next_run_at == next_scheduled_time(plain, now)
     trigger = store.update(task.id, prompt=trigger_prompt)
-    assert trigger.next_run_at == trigger.updated_at + 120
+    assert trigger.next_run_at == now + poll_in
     # Starting a new session each run also makes it an ordinary automation.
     plain = store.update(task.id, session_mode="new")
-    assert plain.next_run_at == next_scheduled_time(plain, plain.updated_at)
+    assert plain.next_run_at == next_scheduled_time(plain, now)
     trigger = store.update(task.id, session_mode="continue")
-    assert trigger.next_run_at == trigger.updated_at + 120
+    assert trigger.next_run_at == now + poll_in
 
 
 def test_startup_lease_renewal_expiry_and_conditional_reconciliation(
