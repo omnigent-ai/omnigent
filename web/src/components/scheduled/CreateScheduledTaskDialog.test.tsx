@@ -8,6 +8,7 @@ import { testAgent } from "@/test/agentFixtures";
 // stubbed (its filesystem browsing is out of scope here).
 
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
+import * as timezones from "@/lib/timezones";
 
 import type React from "react";
 import userEvent from "@testing-library/user-event";
@@ -3114,6 +3115,10 @@ describe("automation trigger type", () => {
   );
 
   it("restores schedule and source drafts without carrying conditions between integrations", async () => {
+    // Keep the draft-switching journey independent of the platform's catalog size.
+    vi.spyOn(timezones, "commonTimezones").mockImplementation((current) => [
+      ...new Set(["UTC", "America/New_York", "Europe/London", ...(current ? [current] : [])]),
+    ]);
     async function chooseTimezone(zone: string) {
       await userEvent.click(screen.getByLabelText("Timezone", { exact: true }));
       fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: zone } });
