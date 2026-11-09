@@ -194,6 +194,7 @@ from omnigent.server.routes._sessions.helpers import (
     reconcile_orphaned_running_status,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    HOST_OFFLINE_HOLD_S,
     _best_effort_stop,
     _build_session_list_item,
     _build_session_response,
@@ -204,6 +205,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _ensure_runner_relay_ready,
     _ensure_runner_session_initialized,
     _get_session_snapshot,
+    _host_row_offline,
     _is_native_terminal_session,
     _labels_for_viewer,
     _mark_session_moving,
@@ -2345,16 +2347,31 @@ def register_core_routes(
                     orphan_liveness = await asyncio.to_thread(
                         liveness_lookup, [conv.id for conv in orphan_suspects]
                     )
+                    offline_hosts: dict[str, bool | None] = {}
+                    now = int(time.time())
+                    # Heartbeat expiry and reconnect grace can precede the hold.
+                    hold_stale_before = now - HOST_OFFLINE_HOLD_S - 2 * RUNNER_LIVENESS_TTL_S
                     for conv in orphan_suspects:
                         result = orphan_liveness.get(conv.id)
                         # False means no replica has a tunnel and the heartbeat
                         # expired, so reconnecting runners within grace survive.
                         if result is not None and not result.runner_online:
+                            if result.host_online is False and conv.host_id is not None:
+                                # A sleeping host can resume its runner; a list read
+                                # must not end that bounded wait on another replica.
+                                if conv.host_id not in offline_hosts:
+                                    offline_hosts[conv.host_id] = await _host_row_offline(
+                                        getattr(request.app.state, "host_store", None),
+                                        conv.host_id,
+                                        updated_since=hold_stale_before,
+                                    )
+                                if offline_hosts[conv.host_id] is not False:
+                                    continue
                             await asyncio.to_thread(
                                 reconcile_orphaned_running_status,
                                 conv.id,
                                 conversation_store,
-                                int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                                now - RUNNER_LIVENESS_TTL_S,
                             )
             # Build items after reconciliation so each settled row reads its new
             # status straight from the (now-updated) cache.

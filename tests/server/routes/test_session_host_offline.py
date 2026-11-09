@@ -76,6 +76,46 @@ class _ConversationStore:
         return self._rows.get(session_id)
 
 
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("offline", True),
+        ("old", False),
+        ("online", False),
+        ("managed", False),
+        ("missing", False),
+        ("unreadable", None),
+    ],
+)
+async def test_offline_host_recovery_window(
+    kind: str, expected: bool | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes._sessions.orchestration import _host_row_offline
+
+    host = (
+        None
+        if kind == "missing"
+        else _host(
+            status="online" if kind == "online" else "offline",
+            age_s=1000 if kind == "old" else 0,
+            sandbox_provider="managed" if kind == "managed" else None,
+        )
+    )
+    store = _Store(host)
+    if kind == "unreadable":
+
+        def fail_lookup(_host_id: str) -> None:
+            raise OSError("host lookup unavailable")
+
+        monkeypatch.setattr(store, "get_host", fail_lookup)
+    assert (
+        await _host_row_offline(store, _HOST_ID, updated_since=time.time() - 300)  # type: ignore[arg-type]
+        is expected
+    )
+    if kind == "old":
+        assert await _host_row_offline(store, _HOST_ID) is True  # type: ignore[arg-type]
+
+
 def _state(*, connected: bool, host: Host | None, with_store: bool = True) -> Any:
     return SimpleNamespace(
         host_registry=_Registry(connected),
