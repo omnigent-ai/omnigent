@@ -12,6 +12,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from importlib import import_module
 from itertools import batched, groupby
 from pathlib import Path
@@ -194,6 +195,15 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _RECONNECT_BINDING_BATCH_SIZE = 128
+
+
+@dataclass(frozen=True)
+class _HostOfflineHold:
+    """The outcome and turn ownership captured across one host-offline wait."""
+
+    outcome: str
+    mid_turn_sessions: frozenset[str]
+    session_owners: dict[str, tuple[object, int, str | None, str | None]]
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -4054,6 +4064,22 @@ def create_app(
         if pending is not None and not pending.done():
             pending.cancel()
 
+    def _held_session_owner(session_id: str) -> tuple[object, int, str | None, str | None]:
+        """Identify the local turn and relay observed when its host went offline."""
+        from omnigent.server.routes._sessions.common import (
+            _runner_relay_tasks,
+            _session_active_response_cache,
+            _session_status_cache,
+        )
+
+        relay = _runner_relay_tasks.get(session_id)
+        return (
+            relay,
+            relay.running_event_count if relay is not None else 0,
+            _session_status_cache.get(session_id),
+            _session_active_response_cache.get(session_id),
+        )
+
     async def _mark_disconnected_runner_failed(
         runner_id: str,
         reference_stamp: int | None,
@@ -4167,12 +4193,13 @@ def create_app(
             message="Runner disconnected unexpectedly.",
         )
         hold_started = time.monotonic()
-        hold = None if idle_shutdown else await _hold_for_offline_host(runner_id, affected)
+        held = None if idle_shutdown else await _hold_for_offline_host(runner_id, affected)
+        hold = held.outcome if held is not None else None
         hold_s = None if hold is None else time.monotonic() - hold_started
         relaunch_host_id: str | None = None
         if hold in ("runner_reconnected", "server_shutdown"):
             return
-        if hold is not None:
+        if held is not None:
             # Sessions may have moved, stopped, or gone live elsewhere meanwhile.
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -4185,6 +4212,26 @@ def create_app(
                 for conv in affected:
                     _relinquish_session_live_state(conv.id)
                 return
+            from omnigent.server.routes._sessions.orchestration import (
+                _clear_departed_runner_background_work,
+            )
+
+            unsettled = []
+            for conv in affected:
+                owner = held.session_owners.get(conv.id)
+                if owner is not None and _held_session_owner(conv.id) != owner:
+                    continue
+                if (
+                    conv.id in held.mid_turn_sessions
+                    and conv.runner_id == runner_id
+                    and conv.live_status in ("idle", "failed")
+                ):
+                    # Another replica settled this turn while this replica kept its old cache.
+                    _relinquish_session_live_state(conv.id)
+                    _clear_departed_runner_background_work(conv, int(time.time()))
+                    continue
+                unsettled.append(conv)
+            affected = unsettled
             if hold == "expired":
                 error = ErrorDetail(
                     code="runner_disconnected",
@@ -4303,7 +4350,9 @@ def create_app(
                     "Relaunch after host return failed for session=%s", conv.id, exc_info=True
                 )
 
-    async def _hold_for_offline_host(runner_id: str, affected: "list[Conversation]") -> str | None:
+    async def _hold_for_offline_host(
+        runner_id: str, affected: "list[Conversation]"
+    ) -> _HostOfflineHold | None:
         """Wait for a runner whose user-run host dropped with it mid-turn.
 
         A laptop that sleeps or loses Wi-Fi takes its runner along and usually
@@ -4312,7 +4361,7 @@ def create_app(
         then the caller settles the turn before relaunching its runner.
         A crash report cancels this task and fails the turn as before.
 
-        :returns: ``None`` when nothing was held, else how the hold ended:
+        :returns: ``None`` when nothing was held, else its status snapshots and outcome:
             ``"runner_reconnected"``, ``"server_shutdown"``, ``"expired"``,
             or ``"host_back_without_runner"`` (the host returned without its runner).
         """
@@ -4337,6 +4386,24 @@ def create_app(
         loop = asyncio.get_running_loop()
         started = loop.time()
         deadline = started + HOST_OFFLINE_HOLD_S
+        owners = {conv.id: _held_session_owner(conv.id) for conv in held}
+        # Order the snapshot after local status writes so a later terminal row
+        # cannot merely be persistence lag behind this replica's running edge.
+        saved = await asyncio.wrap_future(
+            session_live_state.submit(
+                "runner_host_hold_snapshot",
+                conversation_store.list_conversations_by_runner_id,
+                runner_id,
+            )
+        )
+        mid_turn_sessions = frozenset(
+            conv.id
+            for conv in saved or []
+            if conv.runner_id == runner_id
+            and conv.live_status in _MID_TURN_STATUSES
+            and conv.id in owners
+            and _held_session_owner(conv.id) == owners[conv.id]
+        )
         host_back_deadline: float | None = None
         outcome = "cancelled"
         for conv in held:
@@ -4398,7 +4465,7 @@ def create_app(
                         held_s=round(loop.time() - started, 3),
                     ),
                 )
-        return outcome
+        return _HostOfflineHold(outcome, mid_turn_sessions, owners)
 
     async def _relay_turn_held_for_host(runner_id: str, session_id: str) -> bool:
         """Whether this replica's disconnect task holds a lost relay's turn for its host."""
