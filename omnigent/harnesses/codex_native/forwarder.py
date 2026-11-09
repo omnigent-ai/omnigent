@@ -6158,7 +6158,9 @@ def _default_collaboration_mode(
         "settings": {
             "model": forwarder_state.model,
             "reasoning_effort": None,
-            "developer_instructions": forwarder_state.developer_instructions,
+            # None selects Codex's built-in mode instructions; a value would replace
+            # them. Configured developer_instructions reach Codex separately.
+            "developer_instructions": None,
         },
     }
 
