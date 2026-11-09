@@ -8122,8 +8122,8 @@ async def _dispatch_skill_slash_command_to_runner(
     response id:
 
     * a visible ``slash_command`` item for the UI transcript;
-    * a hidden ``message`` item with ``is_meta=True`` containing the
-      full skill instructions for runner history replay.
+    * a hidden ``message`` item with ``is_meta=True`` and ``user_authored=True``
+      containing the full skill instructions for runner history replay.
 
     Only the hidden message is sent to the runner as input. The visible
     command is published as ``response.output_item.done`` after the
@@ -8184,6 +8184,7 @@ async def _dispatch_skill_slash_command_to_runner(
             role="user",
             content=meta_content,
             is_meta=True,
+            user_authored=True,
         ),
         created_by=created_by,
     )
@@ -10300,6 +10301,7 @@ async def _remove_session_worktree_best_effort(
     host_registry: Any,
     reason: str,
     conversation_store: ConversationStore | None = None,
+    host_store: HostStore | None = None,
     exclude_conversation_id: str | None = None,
     fail_if_unavailable: bool = False,
     expected_root_fingerprint: str | None = None,
@@ -10349,6 +10351,13 @@ async def _remove_session_worktree_best_effort(
     )
     from omnigent.server.routes._workspace_validation import _is_subpath_of
 
+    if host_store is not None:
+        host = await asyncio.to_thread(host_store.get_host, host_id, include_deleted=True)
+        if host is not None and host.sandbox_provider is not None:
+            # Shared sandbox files live until last-binding teardown, including
+            # admissions racing this optional worktree cleanup.
+            return
+
     # A fork reusing the source's directory, or several sessions attached to
     # one existing worktree, all run in the same cwd. Removing it under them
     # leaves their runners on a deleted directory, so leave a shared worktree
@@ -10368,10 +10377,11 @@ async def _remove_session_worktree_best_effort(
             workspace=cleanup_root,
             exclude_conversation_id=exclude_conversation_id,
             include_subdirectories=True,
+            include_archived=True,
         )
         if shared:
             _logger.info(
-                "Keeping worktree %s (%s): another live session still runs there",
+                "Keeping worktree %s (%s): another session still uses it",
                 worktree_path,
                 reason,
             )
@@ -10901,11 +10911,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
+        FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
 
+    if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in labels):
+        raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
@@ -11048,6 +11061,7 @@ def _persist_stored_session_bundle(
     runner_id: str | None = None,
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
+    git_branch: str | None = None,
     created_by: str | None = None,
 ) -> CreatedSessionResponse:
     """
@@ -11089,6 +11103,7 @@ def _persist_stored_session_bundle(
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
             workspace=metadata.workspace,
+            git_branch=git_branch,
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
@@ -11147,6 +11162,7 @@ def _persist_session_for_uploaded_agent(
     runner_id: str | None = None,
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
+    git_branch: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist a top-level session bound to the agent row of an earlier, identical upload.
@@ -11169,6 +11185,7 @@ def _persist_session_for_uploaded_agent(
             runner_id=runner_id,
             host_id=metadata.host_id,
             workspace=metadata.workspace,
+            git_branch=git_branch,
             terminal_launch_args=metadata.terminal_launch_args,
             project_id=metadata.project_id,
             inference_snapshot=inference_snapshot,

@@ -1242,6 +1242,31 @@ _READINESS_FRAME_FACTORIES: dict[
 
 
 @pytest.mark.parametrize("frame_kind", sorted(_READINESS_FRAME_FACTORIES))
+def test_unresponsive_cli_readiness_stays_decodable_by_older_servers(
+    frame_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older server still applies the other harnesses' readiness in the same update."""
+    frame = _READINESS_FRAME_FACTORIES[frame_kind](
+        {"pi": "cli-unresponsive", "codex": "binary-missing"}
+    )
+    encoded = encode_host_frame(frame)
+    assert decode_host_frame(encoded) == frame
+
+    legacy_payload = json.loads(encoded)
+    legacy_payload.pop("cli_unresponsive_harnesses", None)
+    monkeypatch.setattr(
+        "omnigent.host.frames.is_harness_availability",
+        lambda value: (
+            isinstance(value, bool) or value in ("binary-missing", "needs-auth", "version-too-low")
+        ),
+    )
+    legacy = decode_host_frame(json.dumps(legacy_payload))
+    assert isinstance(legacy, type(frame))
+    assert legacy.configured_harnesses == {"pi": "version-too-low", "codex": "binary-missing"}
+
+
+@pytest.mark.parametrize("frame_kind", sorted(_READINESS_FRAME_FACTORIES))
 @pytest.mark.parametrize(
     ("server_capabilities", "expected_native"),
     [(frozenset(), True), (frozenset({SERVER_CAP_TMUX_READINESS}), "tmux-unavailable")],

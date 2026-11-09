@@ -8,6 +8,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ApiError,
   apiErrorFromResponse,
   parseRetryAfterMs,
   approve,
@@ -449,6 +450,23 @@ describe("createSession", () => {
 });
 
 describe("createBundledSession", () => {
+  it("uploads durable first input and its files with the agent bundle", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ session_id: "conv_bundle" }));
+    const task = {
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "Review this file" }] },
+    };
+    const attachment = new File(["hello"], "task.txt");
+    await createBundledSession(
+      new File([], "agent.tar.gz"),
+      { host_type: "managed", initial_input: task },
+      [attachment],
+    );
+    const form = (fetchMock.mock.calls[0][1] as RequestInit).body as FormData;
+    expect(JSON.parse(form.get("metadata") as string).initial_input).toEqual(task);
+    expect(form.getAll("initial_files")).toEqual([attachment]);
+  });
+
   it("sends the local opt-out header when background titles are disabled", async () => {
     localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
     fetchMock.mockResolvedValueOnce(
@@ -1690,6 +1708,24 @@ describe("postEvent", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual(event);
     expect(out).toEqual({ queued: true, itemId: "ci_123" });
+  });
+
+  it("reports an expired sign-in when the POST is answered with a login page", async () => {
+    // The auth edge's 200 login page: a body that is not JSON, served as text/html.
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+      json: async () => {
+        throw new SyntaxError("Unexpected token '<'");
+      },
+    });
+
+    const error = await postEvent("conv_abc", { type: "clear", data: {} }).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ status: 401, code: "sign_in_expired" });
   });
 
   it("reads the session a claude-sdk clear continued in", async () => {

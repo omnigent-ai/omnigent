@@ -87,7 +87,10 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
-from omnigent.tools.builtins.session_message import SysSessionMessageTool
+from omnigent.tools.builtins.session_message import (
+    SysSessionMessageTool,
+    peer_session_messaging_enabled,
+)
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -616,6 +619,8 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysAddPolicyTool,
             SysPolicyRegistryTool,
         ):
+            if _cls is SysSessionMessageTool and not peer_session_messaging_enabled():
+                continue
             fallback_schema = _string_object_dict(_cls().get_schema())
             if fallback_schema is None:
                 continue
@@ -3618,6 +3623,16 @@ async def _execute_session_create(
             info = await server_client.get("/v1/info")
             info.raise_for_status()
             info_data = info.json()
+            if (
+                info_data.get("sibling_sessions") is True
+                and info_data.get("sibling_session_destinations") == "current_host"
+            ):
+                return json.dumps(
+                    {
+                        "error": "Server policy only allows Add nested agent on the current host; "
+                        "no session was created."
+                    }
+                )
             if selection.get("sandbox_profile_id"):
                 features = info_data.get("features") if isinstance(info_data, dict) else None
                 if not isinstance(features, dict) or features.get("sandbox_profiles") is not True:
@@ -3686,6 +3701,7 @@ async def _execute_session_create(
         handle: dict[str, object] = {
             "conversation_id": data["id"],
             "kind": "default",
+            "family": data.get("family"),
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
@@ -5410,6 +5426,7 @@ async def _session_get_info_via_rest(
             "host_id": snap.get("host_id"),
             "configured_harnesses": configured_harnesses,
             "parent_session_id": snap.get("parent_session_id"),
+            "family": snap.get("family"),
             "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
                 CREATED_BY_SESSION_LABEL_KEY
             ),
@@ -6575,6 +6592,7 @@ async def _collect_global_sessions(
                 "runner_id": r.get("runner_id"),
                 "runner_online": _RUNNER_ONLINE_SIZING_PLACEHOLDER,
                 "parent_session_id": r.get("parent_session_id"),
+                "family": r.get("family"),
                 "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
                     CREATED_BY_SESSION_LABEL_KEY
                 ),
