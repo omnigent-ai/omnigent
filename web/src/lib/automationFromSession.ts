@@ -159,8 +159,9 @@ export function useDeleteSourceAutomations(): (
       }
       if (deleted.length > 0) {
         forgetScheduledTasks(queryClient, deleted);
-        // Sessions kept after a partial failure lost their automation label too.
-        refreshAutomationSourceSession(queryClient);
+        // Sessions kept after a partial failure lost their automation label too,
+        // in the lists and in their own entries.
+        refreshAutomationSourceSession(queryClient, allDeleted ? [] : sessionIds);
       }
       return allDeleted;
     },

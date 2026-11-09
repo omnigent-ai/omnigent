@@ -1418,20 +1418,31 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
-        if task.source_session_id is not None and (
-            await asyncio.to_thread(conversation_store.get_conversation, task.source_session_id)
-            is not None
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+        copy_id = task.source_session_id
+        if copy_id is not None and (
+            await asyncio.to_thread(conversation_store.get_conversation, copy_id) is None
         ):
+            copy_id = None
+        if copy_id is not None:
             # The copy stays, like a run's session, but no longer belongs to an automation.
             # Cleared first: if that fails, the automation and its label stay for a retry.
-            from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
-
             await asyncio.to_thread(
-                conversation_store.delete_label,
-                task.source_session_id,
-                SCHEDULED_TASK_SOURCE_LABEL_KEY,
+                conversation_store.delete_label, copy_id, SCHEDULED_TASK_SOURCE_LABEL_KEY
             )
-        await asyncio.to_thread(store.delete, scheduled_task_id)
+        try:
+            await asyncio.to_thread(store.delete, scheduled_task_id)
+        except Exception:
+            if copy_id is not None:
+                # The automation stays, so its copy goes on naming it.
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        copy_id,
+                        {SCHEDULED_TASK_SOURCE_LABEL_KEY: task.id},
+                    )
+            raise
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False

@@ -3512,8 +3512,9 @@ async def test_a_copy_takes_only_attachments_the_deployment_accepts(
     assert {conv.id for conv in conversations.list_conversations(limit=100).data} == before
 
 
+@pytest.mark.parametrize("failing", ["label clear", "task delete"])
 async def test_deleting_the_automation_keeps_its_copy_as_an_ordinary_session(
-    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, failing: str
 ) -> None:
     from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
 
@@ -3530,12 +3531,16 @@ async def test_deleting_the_automation_keeps_its_copy_as_an_ordinary_session(
     copy = conversations.get_conversation(copy_id)
     assert copy is not None and copy.title == "Daily alerts"
 
-    # A label that won't clear fails the delete with nothing changed, so a retry can finish.
-    def _failing_delete_label(self: Any, *args: Any, **kwargs: Any) -> None:
+    # Either step failing fails the delete with the automation and its label kept,
+    # so a retry can finish.
+    def _unavailable(self: Any, *args: Any, **kwargs: Any) -> None:
         raise RuntimeError("database unavailable")
 
-    with monkeypatch.context() as failing:
-        failing.setattr(SqlAlchemyConversationStore, "delete_label", _failing_delete_label)
+    with monkeypatch.context() as broken:
+        if failing == "label clear":
+            broken.setattr(SqlAlchemyConversationStore, "delete_label", _unavailable)
+        else:
+            broken.setattr(SqlAlchemyScheduledTaskStore, "delete", _unavailable)
         with pytest.raises(RuntimeError):
             await auth_client.delete(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
     still = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())

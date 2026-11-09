@@ -146,6 +146,7 @@ describe("useDeleteSourceAutomations", () => {
     ["the automations gate", new scheduledTasksApi.ScheduledTaskApiError("not found", 404, null)],
   ])("reports a failed delete (%s) so the caller keeps the sessions", async (_reason, error) => {
     deleteScheduledTask.mockResolvedValueOnce(undefined).mockRejectedValueOnce(error);
+    queryClient.setQueryData(["session", "conv_1"], { id: "conv_1", labels: SESSION.labels });
     const result = renderDelete("/c/conv_1");
 
     await act(() =>
@@ -153,8 +154,9 @@ describe("useDeleteSourceAutomations", () => {
     );
 
     expect(queryClient.getQueryData(SCHEDULED_TASKS_KEY)).toEqual([{ id: "st_2" }, { id: "st_3" }]);
-    // The kept session stays open.
+    // The kept session stays open, and its own entry refetches the label it lost.
     expect(result.current.location.pathname).toBe("/c/conv_1");
+    expect(queryClient.getQueryState(["session", "conv_1"])?.isInvalidated).toBe(true);
   });
 
   it.each<[string, string | null, string]>([

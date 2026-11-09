@@ -196,18 +196,19 @@ export function useUpdateScheduledTask() {
 }
 
 /**
- * Refresh the cached session lists, and the session's own entry when known,
+ * Refresh the cached session lists, and the sessions' own entries when known,
  * after an automation adds the session its runs start from or clears its label.
  */
 export function refreshAutomationSourceSession(
   queryClient: QueryClient,
-  sessionId?: string | null,
+  sessionIds?: string | readonly string[] | null,
 ): void {
   for (const root of LIST_ROW_QUERY_ROOTS) {
     void queryClient.invalidateQueries({ queryKey: [root] });
   }
   void queryClient.invalidateQueries({ queryKey: ["projects"] });
-  if (sessionId) void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+  const ids = typeof sessionIds === "string" ? [sessionIds] : (sessionIds ?? []);
+  for (const id of ids) void queryClient.invalidateQueries({ queryKey: ["session", id] });
 }
 
 /**
