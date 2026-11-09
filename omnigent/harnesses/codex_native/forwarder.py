@@ -10,8 +10,10 @@ import json
 import logging
 import re
 import shlex
+import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from contextvars import ContextVar
@@ -272,6 +274,12 @@ _CHILD_DELIVERY_CONCURRENCY = 8
 _CHILD_DELIVERY_LAG_WARNING_SECONDS = 30.0
 # Upper bound on draining queued child events at forwarder shutdown.
 _CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS = 10.0
+# A turn start Chat receives this long after Codex created the turn means Chat is
+# behind the terminal.
+_TURN_START_LAG_WARNING_SECONDS = 30.0
+# Events dropped from one other thread are logged at each power of ten, and warn
+# from this count on, since a thread that busy is losing real output.
+_DROPPED_THREAD_EVENTS_WARNING = 100
 _PLAN_IMPLEMENTATION_QUESTION_ID = "plan_implementation"
 _PLAN_IMPLEMENTATION_TITLE = "Implement this plan?"
 _PLAN_IMPLEMENTATION_YES = "Yes, implement this plan"
@@ -609,6 +617,9 @@ class _CodexForwarderState:
     :param synced_item_keys: Stable item keys already posted to Omnigent this
         connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
         guards replay-vs-live overlap within one forwarder lifetime.
+    :param dropped_thread_events: Events dropped this connection because they
+        belong to neither the forwarder's thread nor a registered child, by
+        Codex thread id, e.g. ``{"thread_other": 12}``.
     :param surfaced_terminal_error_turns: Turn ids whose standalone terminal
         ``error`` notification was already surfaced. Used to suppress a later
         terminal boundary for the same turn.
@@ -727,6 +738,7 @@ class _CodexForwarderState:
         default_factory=lambda: asyncio.Semaphore(_CHILD_DELIVERY_CONCURRENCY)
     )
     synced_item_keys: set[str] = field(default_factory=set)
+    dropped_thread_events: dict[str, int] = field(default_factory=dict)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
@@ -1128,6 +1140,19 @@ class _CodexForwarderState:
         :returns: None.
         """
         self.subscribed_child_threads.add(thread_id)
+
+    def note_dropped_thread_event(self, thread_id: str) -> int:
+        """
+        Count one event dropped because it belongs to another thread.
+
+        :param thread_id: Codex thread id of the dropped event, e.g.
+            ``"thread_other"``.
+        :returns: Events dropped from that thread on this connection,
+            including this one.
+        """
+        dropped = self.dropped_thread_events.get(thread_id, 0) + 1
+        self.dropped_thread_events[thread_id] = dropped
+        return dropped
 
     def note_user_message_posted(self, turn_id: str) -> None:
         """
@@ -3920,7 +3945,7 @@ def _resolve_event_session(
         )
         return parent_session_id, False
     # Drop stale events for threads that are neither the parent nor a child.
-    if _event_targets_different_thread(params, method, expected_thread_id):
+    if _event_targets_different_thread(params, method, expected_thread_id, forwarder_state):
         return None, False
     return parent_session_id, False
 
@@ -3929,14 +3954,20 @@ def _event_targets_different_thread(
     params: _JsonObject,
     method: str,
     expected_thread_id: str | None,
+    forwarder_state: _CodexForwarderState | None = None,
 ) -> bool:
     """
     Return whether an event belongs to a stale Codex thread.
+
+    Drops are counted per thread and logged at each power of ten, so a thread
+    whose output never reaches Chat stays visible without a log row per event.
 
     :param params: Codex notification params.
     :param method: Codex method value, e.g. ``"item/completed"``.
     :param expected_thread_id: Active Codex thread id, e.g.
         ``"thread_123"``.
+    :param forwarder_state: Optional state counting this connection's drops;
+        without it every drop is logged as the first.
     :returns: ``True`` when the event should be ignored as stale.
     """
     event_thread_id = _thread_id_from_params(params)
@@ -3944,13 +3975,42 @@ def _event_targets_different_thread(
         return False
     if event_thread_id == expected_thread_id:
         return False
-    _logger.info(
-        "Codex forwarder ignored stale thread event: method=%s event_thread=%s active_thread=%s",
-        method,
-        event_thread_id,
-        expected_thread_id,
+    dropped = (
+        forwarder_state.note_dropped_thread_event(event_thread_id)
+        if forwarder_state is not None
+        else 1
     )
+    if _is_power_of_ten(dropped):
+        _logger.log(
+            logging.WARNING if dropped >= _DROPPED_THREAD_EVENTS_WARNING else logging.INFO,
+            "Codex forwarder ignored stale thread event: method=%s event_thread=%s "
+            "active_thread=%s dropped=%d",
+            method,
+            event_thread_id,
+            expected_thread_id,
+            dropped,
+            extra=debug_event(
+                "codex_thread_events_dropped",
+                thread_id=event_thread_id,
+                active_thread_id=expected_thread_id,
+                method=method,
+                dropped_events=dropped,
+            ),
+        )
     return True
+
+
+def _is_power_of_ten(count: int) -> bool:
+    """
+    Return whether a positive count is 1, 10, 100, and so on.
+
+    :param count: Positive count, e.g. ``100``.
+    :returns: ``True`` for an exact power of ten.
+    """
+    milestone = 1
+    while milestone < count:
+        milestone *= 10
+    return milestone == count
 
 
 async def _maybe_handle_codex_request(
@@ -8340,6 +8400,23 @@ async def _post_turn_status_edge(
     """
     if edge is None:
         return
+    # Only a live start measures how far Chat trails Codex; other sources are reconciliations.
+    start_lag_seconds = (
+        _codex_id_age_seconds(edge.turn_id) if edge.source == "turn/started" else None
+    )
+    start_lag_ms = round(start_lag_seconds * 1000) if start_lag_seconds is not None else None
+    if start_lag_seconds is not None and start_lag_seconds >= _TURN_START_LAG_WARNING_SECONDS:
+        _logger.warning(
+            "Codex forwarder saw a turn start %.1fs after Codex created the turn: turn_id=%s",
+            start_lag_seconds,
+            edge.turn_id,
+            extra=debug_event(
+                "codex_turn_start_delivery_lag",
+                session_id=session_id,
+                turn_id=edge.turn_id,
+                start_lag_ms=start_lag_ms,
+            ),
+        )
     _logger.info(
         "Codex forwarder publishing turn status: source=%s turn_id=%s status=%s",
         edge.source,
@@ -8353,6 +8430,7 @@ async def _post_turn_status_edge(
             protocol_source=edge.source[:128],
             has_turn_id=edge.turn_id is not None,
             has_error=edge.error is not None,
+            start_lag_ms=start_lag_ms,
             native_error_kind=edge.error.kind if edge.error is not None else None,
             native_error_reason=(
                 "thread_persistence_shutdown"
@@ -9713,6 +9791,27 @@ async def wait_for_thread_started(
             if thread_id is not None:
                 return thread_id
     raise RuntimeError("Codex app-server event stream ended before thread startup.")
+
+
+def _codex_id_age_seconds(codex_id: str | None) -> float | None:
+    """
+    Return how long ago Codex created a time-ordered id.
+
+    Codex turn ids are UUIDv7, whose first 48 bits are the creation time in
+    Unix milliseconds. Codex runs on the forwarder's host, so both share a clock.
+
+    :param codex_id: Codex id, e.g. ``"01a1b226-8a06-72e0-9cbe-04fca97e3638"``.
+    :returns: Age in seconds, or ``None`` when the id is not a UUIDv7.
+    """
+    if codex_id is None:
+        return None
+    try:
+        parsed = uuid.UUID(codex_id)
+    except ValueError:
+        return None
+    if parsed.version != 7:
+        return None
+    return time.time() - (parsed.int >> 80) / 1000
 
 
 def _thread_id_from_params(params: _JsonObject) -> str | None:
