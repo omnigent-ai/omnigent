@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests._helpers.pull_request_ui import open_session_pull_requests
 from tests.e2e_ui.conftest import open_right_rail, stub_session_pull_requests
 from tests.e2e_ui.github.test_github_tab import _INFO, _stub_github
 
@@ -147,12 +148,13 @@ def test_azure_devops_tab_shows_provider_repo_and_pull_request(
     page.goto(f"{base_url}/c/{session_id}")
 
     link = page.get_by_test_id("composer-pr-link")
-    expect(link).to_have_text("!7", timeout=30_000)
+    if not mobile:
+        expect(link).to_have_text("!7", timeout=30_000)
     if entry == "rail":
         open_right_rail(page)
         page.get_by_role("tab", name="Pull Requests", exact=True).click()
     else:
-        link.click()
+        open_session_pull_requests(page, mobile=mobile)
     rail = (
         page.get_by_test_id("github-panel-drawer")
         if mobile

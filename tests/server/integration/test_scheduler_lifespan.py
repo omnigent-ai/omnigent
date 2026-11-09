@@ -39,7 +39,9 @@ from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
 )
 from tests._helpers.polling import poll_until_async
 
-pytestmark = pytest.mark.asyncio
+# Every test here creates RRULE tasks; the frozen clock keeps a stalled CI worker
+# from tripping the production elapsed-time search budget.
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("frozen_recurrence_clock")]
 
 
 def _uid(seed: str) -> str:

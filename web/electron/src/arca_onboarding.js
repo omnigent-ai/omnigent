@@ -27,6 +27,8 @@ function describeSetupFailure(code, stdout, stderr) {
       errorKind: "unreachable",
       error:
         "Arca sign-in couldn't reach the remote command. Check `arca ssh` in a terminal and try again.",
+      errorMessage: "Arca sign-in couldn't reach the remote command.",
+      errorAction: "Check `arca ssh` in a terminal and try again.",
     };
   }
   return {
@@ -35,6 +37,8 @@ function describeSetupFailure(code, stdout, stderr) {
     ...(failure.authError ? { authError: true } : {}),
     error:
       "Arca setup didn't complete. Check Arca Companion, finish browser sign-in, and try again.",
+    errorMessage: "Arca setup didn't complete.",
+    errorAction: "Check Arca Companion, finish browser sign-in, and try again.",
   };
 }
 
@@ -132,6 +136,8 @@ function startArcaSetup(serverUrl, deps = {}) {
               errorKind: "timeout",
               error:
                 "Arca sign-in timed out. Check Arca Companion, finish browser sign-in, and try again.",
+              errorMessage: "Arca sign-in timed out.",
+              errorAction: "Check Arca Companion, finish browser sign-in, and try again.",
             }
           : code === 0
             ? { ok: true, alreadyRunning: /already running/i.test(stdout + stderr) }

@@ -6,7 +6,7 @@ import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testi
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
-import { FileViewerContext } from "@/shell/FileViewerContext";
+import { type FileNavigationGuard, FileViewerContext } from "@/shell/FileViewerContext";
 import type { WorkspacePanel } from "@/shell/WorkspacePanel";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { RearrangeableGrid } from "./GridWorkspace";
@@ -26,6 +26,8 @@ const fixture = vi.hoisted(() => ({
   failedChat: "",
   failedTerminal: "",
   renderError: new Error("Grid surface render failed"),
+  // Set while a cell's viewer holds unsaved edits and is asking to discard them.
+  discardEdits: null as (() => void) | null,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
@@ -112,6 +114,16 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => context.registerNavigationGuard?.(() => {})}>
           Block navigation
         </button>
+        <button
+          type="button"
+          onClick={() =>
+            context.registerNavigationGuard?.((_path, _options, navigate) => {
+              fixture.discardEdits = navigate;
+            })
+          }
+        >
+          Edit file
+        </button>
         <button type="button" onClick={() => context.openFolder?.("/workspace/experimental")}>
           Open folder
         </button>
@@ -168,6 +180,7 @@ afterEach(() => {
   fixture.hostOnline = undefined;
   fixture.failedChat = "";
   fixture.failedTerminal = "";
+  fixture.discardEdits = null;
   vi.restoreAllMocks();
 });
 
@@ -191,6 +204,60 @@ it("opens agent-requested files only in the active workspace and respects naviga
   act(() => emitUiOpenFile({ type: "ui_open_file", path: "blocked.md" }, "first"));
   expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
   expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
+});
+
+/** The shell's file-viewer context, collecting the guards registered with it. */
+function shellFileViewerContext(guards: Set<FileNavigationGuard>) {
+  return {
+    openFile: vi.fn(),
+    registerNavigationGuard: (guard: FileNavigationGuard) => {
+      guards.add(guard);
+      return () => void guards.delete(guard);
+    },
+    openGithubTab: vi.fn(),
+    isChangedPath: () => false,
+    conversationId: undefined,
+    workspaceRoot: null,
+    workspaceHome: null,
+  };
+}
+
+it("asks each cell's viewer before the shell's Close leaves the grid", () => {
+  // Stands in for AppShell: its Close runs every registered guard, then leaves.
+  const shellGuards = new Set<FileNavigationGuard>();
+  const shellContext = shellFileViewerContext(shellGuards);
+  const leave = vi.fn();
+  const closeFromShell = () => {
+    const guards = [...shellGuards];
+    const next = (index: number): void => {
+      const guard = guards[index];
+      if (guard) guard(null, undefined, () => next(index + 1));
+      else leave();
+    };
+    next(0);
+  };
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <FileViewerContext.Provider value={shellContext}>
+          <RearrangeableGrid
+            grid={{ id: "dirty-close", layout: splitGrid("first", "first", "second", "right")! }}
+          />
+        </FileViewerContext.Provider>
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const second = screen.getByRole("region", { name: "second" });
+  fireEvent.click(within(second).getByText("Edit file"));
+
+  // Keep editing: the viewer never calls back, so the grid stays.
+  act(() => closeFromShell());
+  expect(fixture.discardEdits).not.toBeNull();
+  expect(leave).not.toHaveBeenCalled();
+
+  // Discard changes: leaving goes ahead.
+  act(() => fixture.discardEdits?.());
+  expect(leave).toHaveBeenCalledOnce();
 });
 
 it("browses a chat-linked folder in the Files tab of that pane's workspace", () => {

@@ -528,39 +528,88 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
   });
 
-  it("keeps the Canvas project and draft when a temporary create fails", async () => {
-    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
-    projects = [{ id: "proj_alpha", name: "Alpha" }];
-    const previousUrl = window.location.href;
-    navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
-      window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
-    });
-    beginLocalConversationMock.mockReturnValue({
-      tempConvId: "temp:1234567890abcdef1234567890abcdef",
-      pendingMsgTempId: "pend_canvas",
-      createToken: "1234567890abcdef1234567890abcdef",
-    });
-    removeLocalConversationMock.mockReturnValue(true);
-    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "Host unavailable" }), { status: 503 }),
-    );
-    try {
-      renderLanding([], { features: { canvas: true } });
-      await waitForWorkspaceSeed();
-      typeMessage("Keep this Canvas draft");
-      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-      await waitFor(() =>
-        expect(navigateMock).toHaveBeenLastCalledWith({
-          pathname: "/",
-          search: "?canvas=proj_alpha&project=Alpha",
-        }),
-      );
-      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this Canvas draft");
-      expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
-    } finally {
-      window.history.replaceState({}, "", previousUrl);
-    }
-  });
+  it.each([
+    { query: "canvas=proj_alpha&project=Alpha", sourceDeleted: false },
+    { query: "sibling=source", sourceDeleted: false },
+    { query: "sibling=source", sourceDeleted: true },
+  ])(
+    "keeps the composer draft after a temporary create fails: $query, sourceDeleted=$sourceDeleted",
+    async ({ query, sourceDeleted }) => {
+      searchParams = new URLSearchParams(query);
+      projects = [{ id: "proj_alpha", name: "Alpha" }];
+      const previousUrl = window.location.href;
+      navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
+        window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
+      });
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId: "temp:1234567890abcdef1234567890abcdef",
+        pendingMsgTempId: "pend_scoped",
+        createToken: "1234567890abcdef1234567890abcdef",
+      });
+      removeLocalConversationMock.mockReturnValue(true);
+      let resolveCreate!: (response: Response) => void;
+      let sourceUnavailable = false;
+      vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+        if (String(url).startsWith("/v1/sessions/source?")) {
+          if (sourceUnavailable) {
+            return new Response(JSON.stringify({ detail: "Not found" }), { status: 404 });
+          }
+          return new Response(
+            JSON.stringify({
+              id: "source",
+              title: "Source",
+              host_id: "host_1",
+              workspace: SEEDED_WORKSPACE,
+              agent_id: "ag_hello",
+              permission_level: 4,
+              labels: {},
+              items: [],
+            }),
+          );
+        }
+        return new Promise<Response>((resolve) => {
+          resolveCreate = resolve;
+        });
+      });
+      const info = { features: { canvas: true }, sibling_sessions: true };
+      try {
+        renderLanding([], info);
+        await waitForWorkspaceSeed();
+        typeMessage("Keep this scoped draft");
+        fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+          target: { files: [new File(["notes"], "notes.txt", { type: "text/plain" })] },
+        });
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+        await waitFor(() => expect(resolveCreate).toBeDefined());
+        cleanup();
+        sourceUnavailable = sourceDeleted;
+        await act(async () => {
+          resolveCreate(
+            new Response(JSON.stringify({ detail: "Source unavailable" }), { status: 403 }),
+          );
+        });
+        await waitFor(() =>
+          expect(navigateMock).toHaveBeenLastCalledWith({ pathname: "/", search: `?${query}` }),
+        );
+        searchParams = new URLSearchParams(window.location.search);
+        renderLanding([], info);
+        if (sourceDeleted) {
+          expect(await screen.findByText("Source session is unavailable.")).toBeVisible();
+          fireEvent.click(screen.getByRole("button", { name: "Continue in a new session" }));
+          cleanup();
+          searchParams = new URLSearchParams(window.location.search);
+          expect(searchParams.has("sibling")).toBe(false);
+          renderLanding([], info);
+        }
+        await waitForWorkspaceSeed();
+        expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this scoped draft");
+        expect(screen.getByText("notes.txt")).toBeVisible();
+        expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+      } finally {
+        window.history.replaceState({}, "", previousUrl);
+      }
+    },
+  );
 
   it("includes selected registry services in the sandbox creation request", async () => {
     vi.mocked(registryRequest).mockResolvedValue({
