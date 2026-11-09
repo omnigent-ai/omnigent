@@ -275,6 +275,7 @@ import {
 } from "@/lib/smartRoutingAvailability";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
+  isHeadlessCliHarness,
   partitionAgentsByKind,
   partitionPickerEntries,
   selectableSessionAgents,
@@ -1516,6 +1517,9 @@ export function AgentHarnessPicker({
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
+    // Genie's gradient marks the chosen harness; its list row stays mono like
+    // its "Other..." siblings.
+    const ListGlyph = isHeadlessCliHarness(agent) ? iconForAgent(agent) : null;
     const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
     const details = active
       ? triggerDetails
@@ -1556,7 +1560,13 @@ export function AgentHarnessPicker({
           setFocusConfigAgentId((current) => (current === agent.id ? null : current));
         }}
         testId={`new-chat-landing-agent-${agent.id}`}
-        icon={<ComposerAgentIcon agent={agent} />}
+        icon={
+          ListGlyph ? (
+            <ListGlyph className="size-4 shrink-0" aria-hidden="true" />
+          ) : (
+            <ComposerAgentIcon agent={agent} />
+          )
+        }
         label={agent.display_name}
         summary={summary}
         description={blurb}
