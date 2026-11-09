@@ -297,6 +297,11 @@ interface ElectronDesktopApi extends NativeShellApi {
   closeWindow?: () => Promise<boolean>;
   /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
   confirmQuit?: (options: { dontAskAgain: boolean }) => Promise<boolean>;
+  /**
+   * Start macOS Dictation (Edit > Start Dictation…) in the focused field. Only
+   * macOS shells expose it. Resolves whether the shell started it.
+   */
+  startSystemDictation?: () => Promise<boolean>;
   /** The "Show Omnigent from anywhere" shortcut; absent on shells predating it. */
   getGlobalShortcut?: () => Promise<GlobalShortcutStatus | null>;
   /** Saves the shortcut; resolves `{ ok: false, error }` when the shell refuses the chord. */
@@ -814,6 +819,26 @@ export async function closeDesktopWindow(): Promise<boolean> {
     return (await electron.closeWindow()) === true;
   } catch (err) {
     console.warn("[nativeBridge] closeWindow failed:", err);
+    return false;
+  }
+}
+
+/** True when the desktop shell can hand dictation to macOS Dictation. */
+export function supportsSystemDictation(): boolean {
+  return typeof electronApi()?.startSystemDictation === "function";
+}
+
+/**
+ * Start macOS Dictation in the field that has focus, so focus the target first.
+ * Resolves whether the shell started it.
+ */
+export async function startSystemDictation(): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.startSystemDictation) return false;
+  try {
+    return (await electron.startSystemDictation()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] startSystemDictation failed:", err);
     return false;
   }
 }
