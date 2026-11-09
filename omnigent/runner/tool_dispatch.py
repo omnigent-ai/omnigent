@@ -5088,7 +5088,8 @@ _USER_INBOX_LIST_FIELDS = (
     "topic",
     "links",
     "state",
-    "feedback",
+    "resolution",
+    "resolution_action",
     "feedback_text",
     "expires_at",
 )
@@ -5128,6 +5129,19 @@ async def _execute_user_inbox_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
     if not isinstance(args, dict):
         return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+
+    def _server_error(resp: httpx.Response) -> str:
+        if resp.status_code == 404:
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: this server does not support Inbox items "
+                    "(the proactive_agent feature is off or the server is older)"
+                }
+            )
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
+        )
+
     try:
         if tool_name == "sys_user_inbox_post":
             if conversation_id is None:
@@ -5139,9 +5153,7 @@ async def _execute_user_inbox_tool(
                 timeout=30.0,
             )
             if resp.status_code >= 400:
-                return json.dumps(
-                    {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
-                )
+                return _server_error(resp)
             return json.dumps(resp.json())
         created_after = int(time.time()) - USER_INBOX_LIST_WINDOW_DAYS * 86_400
         items: list[_JsonObject] = []
@@ -5155,20 +5167,28 @@ async def _execute_user_inbox_tool(
                 params["after"] = cursor
             resp = await server_client.get("/v1/inbox/items", params=params, timeout=30.0)
             if resp.status_code >= 400:
-                return json.dumps(
-                    {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
-                )
+                return _server_error(resp)
             page = resp.json()
             for item in page.get("data", []):
                 summary = {field: item.get(field) for field in _USER_INBOX_LIST_FIELDS}
                 summary["body_preview"] = str(item.get("body_md") or "")[
                     :_USER_INBOX_BODY_PREVIEW_CHARS
                 ]
+                summary["action_labels"] = [
+                    action.get("label") for action in item.get("actions") or []
+                ]
                 items.append(summary)
             cursor = page.get("next_cursor")
             if not cursor:
                 break
-        return json.dumps({"items": items, "window_days": USER_INBOX_LIST_WINDOW_DAYS})
+        return json.dumps(
+            {
+                "items": items,
+                "window_days": USER_INBOX_LIST_WINDOW_DAYS,
+                # More items exist than were read; the oldest are not listed.
+                "truncated": bool(cursor),
+            }
+        )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"{tool_name} failed: {exc}"})
 

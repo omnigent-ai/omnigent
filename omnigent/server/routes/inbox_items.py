@@ -15,13 +15,16 @@ import time
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from omnigent.db.db_models import INBOX_ITEMS_PER_SESSION
 from omnigent.entities import InboxItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.inbox_chart import InboxChartV1
 from omnigent.server.inbox_dedupe import (
     DedupeInputs,
+    InvalidLinkError,
     canonical_link,
     dedupe_key,
     find_duplicate,
@@ -30,22 +33,37 @@ from omnigent.server.inbox_dedupe import (
 )
 from omnigent.server.routes._agent_origin import require_agent_origin
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._errors import session_not_found
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.inbox_item_store import (
     DuplicateInboxItemError,
     InboxItemStore,
+    InboxItemTooLargeError,
+    InboxSessionCapError,
     NewInboxItem,
 )
 
-# A run that posts more than this is producing noise, not suggestions.
-MAX_ITEMS_PER_SESSION = 10
+MAX_ITEMS_PER_SESSION = INBOX_ITEMS_PER_SESSION
+MAX_ACTIONS_PER_ITEM = 3
+# The unread badge counts up to this many; GET reports when the count is capped.
+UNREAD_COUNT_LIMIT = 100
 _POST_ACTION = "Inbox posts"
 _ITEM_ID = re.compile(r"^[0-9a-f]{32}$")
 
 InboxItemKind = Literal["followup", "info", "reminder"]
 InboxItemState = Literal["unread", "read", "done", "dismissed"]
-InboxItemFeedback = Literal["none", "useful", "not_useful"]
+InboxItemResolution = Literal[
+    "none", "action_taken", "already_done", "useful", "not_relevant", "incorrect", "not_now"
+]
+# The state each resolution moves an item to; "none" reopens it.
+_RESOLUTION_STATE: dict[str, str] = {
+    "none": "read",
+    "action_taken": "done",
+    "already_done": "done",
+    "useful": "dismissed",
+    "not_relevant": "dismissed",
+    "incorrect": "dismissed",
+    "not_now": "dismissed",
+}
 
 
 class InboxItemLink(BaseModel):
@@ -58,6 +76,15 @@ class InboxItemLink(BaseModel):
     label: str | None = Field(default=None, max_length=200)
 
 
+class InboxItemAction(BaseModel):
+    """An agent-defined action: a button that opens a session prefilled with ``prompt``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=60)
+    prompt: str = Field(min_length=1, max_length=4000)
+
+
 class CreateInboxItemRequest(BaseModel):
     """Body for ``POST /v1/inbox/items``."""
 
@@ -67,19 +94,34 @@ class CreateInboxItemRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     body_md: str = Field(min_length=1, max_length=8000)
     links: list[InboxItemLink] = Field(default_factory=list, max_length=10)
+    actions: list[InboxItemAction] = Field(default_factory=list, max_length=MAX_ACTIONS_PER_ITEM)
+    chart: InboxChartV1 | None = None
     topic: str = Field(min_length=1, max_length=100)
-    suggested_prompt: str | None = Field(default=None, max_length=4000)
     expires_at: int | None = Field(default=None, gt=0)
 
 
 class UpdateInboxItemRequest(BaseModel):
-    """Body for ``PATCH /v1/inbox/items/{item_id}``."""
+    """Body for ``PATCH /v1/inbox/items/{item_id}``.
+
+    ``state`` marks an open item read or unread. ``resolution`` closes an item
+    (or reopens it with ``"none"``) and moves its state to match;
+    ``"action_taken"`` also needs ``resolution_action``, the action's index.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    state: InboxItemState | None = None
-    feedback: InboxItemFeedback | None = None
+    state: Literal["unread", "read"] | None = None
+    resolution: InboxItemResolution | None = None
+    resolution_action: int | None = Field(default=None, ge=0, lt=MAX_ACTIONS_PER_ITEM)
     feedback_text: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _check_combination(self) -> UpdateInboxItemRequest:
+        if self.state is not None and self.resolution is not None:
+            raise ValueError("set state or resolution, not both")
+        if (self.resolution == "action_taken") != (self.resolution_action is not None):
+            raise ValueError("resolution_action goes only with resolution action_taken")
+        return self
 
 
 def _item_json(item: InboxItem) -> dict[str, Any]:
@@ -123,9 +165,11 @@ def create_inbox_items_router(
     def _posting_agent(source_session_id: str) -> tuple[str, str | None]:
         """Return the source session's agent id and bundle hash, if it may post."""
         conversation = conversation_store.get_conversation(source_session_id)
-        if conversation is None:
-            raise session_not_found()
-        agent = agent_store.get(conversation.agent_id) if conversation.agent_id else None
+        agent = (
+            agent_store.get(conversation.agent_id)
+            if conversation is not None and conversation.agent_id
+            else None
+        )
         if agent is None:
             raise OmnigentError(
                 "Inbox posts require the session's agent", code=ErrorCode.FORBIDDEN
@@ -144,37 +188,36 @@ def create_inbox_items_router(
     async def create_inbox_item(request: Request, body: CreateInboxItemRequest) -> dict[str, Any]:
         """Post an item to the caller's Inbox, or return the item it repeats."""
         owner = _owner(request)
-        source_session_id = require_agent_origin(
-            request,
-            action=_POST_ACTION,
-            owner=owner,
-            auth_provider=auth_provider,
-            conversation_store=conversation_store,
-            permission_store=permission_store,
-            required=True,
+        source_session_id = await asyncio.to_thread(
+            lambda: require_agent_origin(
+                request,
+                action=_POST_ACTION,
+                owner=owner,
+                auth_provider=auth_provider,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                required=True,
+            )
         )
         assert source_session_id is not None
         agent_id, prompt_version = await asyncio.to_thread(_posting_agent, source_session_id)
 
         links = [link.model_dump(exclude_none=True) for link in body.links]
+        try:
+            primary_link = canonical_link(links[0]) if links else None
+        except InvalidLinkError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         inputs = DedupeInputs(
-            kind=body.kind,
-            primary_link=canonical_link(links[0]) if links else None,
-            topic=normalize_topic(body.topic),
+            kind=body.kind, primary_link=primary_link, topic=normalize_topic(body.topic)
         )
         if not inputs.topic:
             raise OmnigentError("topic must contain a word", code=ErrorCode.INVALID_INPUT)
-        now = int(time.time())
-        match = await asyncio.to_thread(find_duplicate, store, owner, inputs, now=now)
+        match = await asyncio.to_thread(
+            lambda: find_duplicate(store, owner, inputs, now=int(time.time()))
+        )
         log_post_decision(inputs, match)
         if match.existing is not None:
             return {"item": _item_json(match.existing), "duplicate": True}
-        posted = await asyncio.to_thread(store.count_for_session, owner, source_session_id)
-        if posted >= MAX_ITEMS_PER_SESSION:
-            raise OmnigentError(
-                f"This session already posted {MAX_ITEMS_PER_SESSION} Inbox items",
-                code=ErrorCode.INVALID_INPUT,
-            )
         new_item = NewInboxItem(
             user_id=owner,
             source_session_id=source_session_id,
@@ -184,7 +227,8 @@ def create_inbox_items_router(
             title=body.title,
             body_md=body.body_md,
             links=links,
-            suggested_prompt=body.suggested_prompt,
+            actions=[action.model_dump() for action in body.actions],
+            chart=body.chart.stored() if body.chart is not None else None,
             primary_link=inputs.primary_link,
             topic=inputs.topic,
             dedupe_key=dedupe_key(inputs),
@@ -192,13 +236,23 @@ def create_inbox_items_router(
         )
         retire = match.expired.id if match.expired is not None else None
         try:
-            item = await asyncio.to_thread(store.create, new_item, retire_item_id=retire)
+            item = await asyncio.to_thread(lambda: store.create(new_item, retire_item_id=retire))
         except DuplicateInboxItemError:
             # A concurrent post with the same key won the insert.
             existing = await asyncio.to_thread(store.get_by_dedupe_key, owner, new_item.dedupe_key)
             if existing is None:
                 raise
             return {"item": _item_json(existing), "duplicate": True}
+        except InboxSessionCapError as exc:
+            raise OmnigentError(
+                f"This session already posted {MAX_ITEMS_PER_SESSION} Inbox items",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        except InboxItemTooLargeError as exc:
+            raise OmnigentError(
+                "The item's body, links, actions, or chart are too large to store",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
         return {"item": _item_json(item), "duplicate": False}
 
     @router.get("/inbox/items")
@@ -209,22 +263,26 @@ def create_inbox_items_router(
         after: str | None = Query(default=None, max_length=64),
         limit: int = Query(default=50, ge=1, le=100),
     ) -> dict[str, Any]:
-        """List the caller's items, newest first, with the unread count."""
+        """List the caller's items, newest first, with a bounded unread count."""
         owner = _owner(request)
         cursor = _parse_cursor(after)
         items, next_cursor = await asyncio.to_thread(
-            store.list_for_user,
-            owner,
-            states=frozenset(state) if state else None,
-            created_after=created_after,
-            after=cursor,
-            limit=limit,
+            lambda: store.list_for_user(
+                owner,
+                states=frozenset(state) if state else None,
+                created_after=created_after,
+                after=cursor,
+                limit=limit,
+            )
         )
-        unread = await asyncio.to_thread(store.count_unread, owner)
+        unread = await asyncio.to_thread(
+            lambda: store.count_unread(owner, limit=UNREAD_COUNT_LIMIT)
+        )
         return {
             "data": [_item_json(item) for item in items],
             "next_cursor": f"{next_cursor[0]}:{next_cursor[1]}" if next_cursor else None,
             "unread_count": unread,
+            "unread_count_capped": unread >= UNREAD_COUNT_LIMIT,
         }
 
     @router.patch("/inbox/items/{item_id}")
@@ -235,15 +293,27 @@ def create_inbox_items_router(
         owner = _owner(request)
         if _ITEM_ID.match(item_id) is None:
             raise OmnigentError("Inbox item not found", code=ErrorCode.NOT_FOUND)
-        item = await asyncio.to_thread(
-            store.update,
-            item_id,
-            owner,
-            state=body.state,
-            feedback=body.feedback,
-            feedback_text=body.feedback_text,
-            now=int(time.time()),
-        )
+        if body.resolution_action is not None:
+            current = await asyncio.to_thread(store.get, item_id, owner)
+            if current is not None and body.resolution_action >= len(current.actions):
+                raise OmnigentError("No such action on this item", code=ErrorCode.INVALID_INPUT)
+        state = _RESOLUTION_STATE[body.resolution] if body.resolution is not None else body.state
+        try:
+            item = await asyncio.to_thread(
+                lambda: store.update(
+                    item_id,
+                    owner,
+                    state=state,
+                    resolution=body.resolution,
+                    resolution_action=body.resolution_action,
+                    feedback_text=body.feedback_text,
+                    now=int(time.time()),
+                )
+            )
+        except InboxItemTooLargeError as exc:
+            raise OmnigentError(
+                "feedback_text is too large to store", code=ErrorCode.INVALID_INPUT
+            ) from exc
         if item is None:
             raise OmnigentError("Inbox item not found", code=ErrorCode.NOT_FOUND)
         return _item_json(item)

@@ -13,6 +13,14 @@ class DuplicateInboxItemError(Exception):
     """Raised when an insert collides with an existing item's duplicate key."""
 
 
+class InboxSessionCapError(Exception):
+    """Raised when the posting session already holds its maximum number of items."""
+
+
+class InboxItemTooLargeError(Exception):
+    """Raised when a text field exceeds the stored-size limit after compression."""
+
+
 @dataclasses.dataclass(frozen=True)
 class NewInboxItem:
     """Fields for an item to insert; the store assigns ``id`` and timestamps.
@@ -25,7 +33,8 @@ class NewInboxItem:
     :param title: One-line summary.
     :param body_md: Markdown body.
     :param links: Evidence links; the first is the primary link.
-    :param suggested_prompt: Prompt for the Start session action, or ``None``.
+    :param actions: Agent-defined actions, each ``{"label": ..., "prompt": ...}``.
+    :param chart: A validated chart, or ``None``.
     :param primary_link: Canonical form of the first link, or ``None``.
     :param topic: Normalized topic slug.
     :param dedupe_key: Versioned duplicate-detection key.
@@ -40,7 +49,8 @@ class NewInboxItem:
     title: str
     body_md: str
     links: list[dict[str, Any]]
-    suggested_prompt: str | None
+    actions: list[dict[str, str]]
+    chart: dict[str, Any] | None
     primary_link: str | None
     topic: str
     dedupe_key: str
@@ -76,7 +86,10 @@ class InboxItemStore(ABC):
 
     @abstractmethod
     def create(self, item: NewInboxItem, *, retire_item_id: str | None = None) -> InboxItem:
-        """Insert *item* as an unread item.
+        """Insert *item* as an unread item, in one transaction with its admission checks.
+
+        Each session may hold :data:`~omnigent.db.db_models.INBOX_ITEMS_PER_SESSION`
+        items; concurrent posts cannot exceed it.
 
         :param item: The item's fields.
         :param retire_item_id: An expired item holding the same key; its key is
@@ -84,6 +97,8 @@ class InboxItemStore(ABC):
             unique index accepts the new item.
         :returns: The created item.
         :raises DuplicateInboxItemError: If another item already holds the key.
+        :raises InboxSessionCapError: If the session already holds its maximum.
+        :raises InboxItemTooLargeError: If a text field is too large to store.
         """
 
     @abstractmethod
@@ -107,18 +122,11 @@ class InboxItemStore(ABC):
         """
 
     @abstractmethod
-    def count_unread(self, user_id: str) -> int:
-        """Return how many of the owner's items are unread.
+    def count_unread(self, user_id: str, *, limit: int) -> int:
+        """Return how many of the owner's items are unread, counting at most *limit*.
 
         :param user_id: The owner.
-        """
-
-    @abstractmethod
-    def count_for_session(self, user_id: str, source_session_id: str) -> int:
-        """Return how many items the owner received from one session.
-
-        :param user_id: The owner.
-        :param source_session_id: The posting session.
+        :param limit: Largest count to return, which bounds the rows scanned.
         """
 
     @abstractmethod
@@ -128,20 +136,23 @@ class InboxItemStore(ABC):
         user_id: str,
         *,
         state: str | None = None,
-        feedback: str | None = None,
+        resolution: str | None = None,
+        resolution_action: int | None = None,
         feedback_text: str | None = None,
         now: int,
     ) -> InboxItem | None:
         """Apply the owner's response to an item.
 
-        Moving out of ``unread`` stamps ``read_at`` once. Any change of state
-        to ``done`` or ``dismissed``, or any feedback, stamps ``acted_at``.
+        Moving out of ``unread`` stamps ``read_at`` once. Setting a resolution
+        other than ``"none"`` stamps ``acted_at``.
 
         :param item_id: Hex UUID of the item.
         :param user_id: The owner the item must belong to.
         :param state: New state, or ``None`` to keep it.
-        :param feedback: New feedback, or ``None`` to keep it.
+        :param resolution: New resolution, or ``None`` to keep it.
+        :param resolution_action: Index of the action taken, stored with the resolution.
         :param feedback_text: New comment, or ``None`` to keep it.
         :param now: Current epoch seconds.
         :returns: The updated item, or ``None`` if missing or owned by someone else.
+        :raises InboxItemTooLargeError: If *feedback_text* is too large to store.
         """

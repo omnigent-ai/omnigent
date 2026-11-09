@@ -1573,7 +1573,6 @@ def create_app(
     agent_cache: AgentCache,
     runner_tunnel_tokens: frozenset[str] | None = None,
     comment_store: CommentStore | None = None,
-    inbox_item_store: InboxItemStore | None = None,
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
@@ -1614,6 +1613,7 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    inbox_item_store: InboxItemStore | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.

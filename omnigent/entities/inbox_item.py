@@ -23,22 +23,27 @@ class InboxItem:
     :param body_md: Markdown body.
     :param links: Evidence links, each ``{"type": "session" | "pr" | "url",
         "ref": ..., "label": ...}``; the first is the primary link.
-    :param suggested_prompt: Prompt for the session the card's Start
-        session action opens, or ``None``.
+    :param actions: Agent-defined actions, each ``{"label": ..., "prompt": ...}``.
+        Choosing one opens a new session prefilled with its prompt.
+    :param chart: A chart drawn on the card (see :mod:`omnigent.server.inbox_chart`),
+        or ``None``.
     :param primary_link: Canonical form of the first link, or ``None``.
     :param topic: The agent's short slug for what the item is about,
         e.g. ``"rampup-flag"``.
     :param dedupe_key: Versioned duplicate-detection key; see
         :mod:`omnigent.server.inbox_dedupe`.
     :param state: ``"unread"``, ``"read"``, ``"done"``, or ``"dismissed"``.
-    :param feedback: ``"none"``, ``"useful"``, or ``"not_useful"``.
+    :param resolution: How the owner closed the item: ``"none"`` while open,
+        ``"action_taken"``, or a Dismiss reason (``"already_done"``,
+        ``"useful"``, ``"not_relevant"``, ``"incorrect"``, ``"not_now"``).
     :param feedback_text: The user's comment, or ``None``.
     :param created_at: Unix epoch seconds when the item was posted.
     :param read_at: Unix epoch seconds when the user first read it.
     :param acted_at: Unix epoch seconds of the user's last action on it
-        (starting a session, rating, or dismissing).
+        (taking an action or dismissing it).
     :param expires_at: Unix epoch seconds after which a new post with the
         same key creates a fresh item, or ``None`` for never.
+    :param resolution_action: Index into ``actions`` of the action taken, or ``None``.
     """
 
     id: str
@@ -50,14 +55,16 @@ class InboxItem:
     title: str
     body_md: str
     links: list[dict[str, Any]]
-    suggested_prompt: str | None
+    actions: list[dict[str, str]]
+    chart: dict[str, Any] | None
     primary_link: str | None
     topic: str
     dedupe_key: str
     state: str
-    feedback: str
+    resolution: str
     feedback_text: str | None
     created_at: int
     read_at: int | None = None
     acted_at: int | None = None
     expires_at: int | None = None
+    resolution_action: int | None = None
