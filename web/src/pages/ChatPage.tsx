@@ -277,6 +277,8 @@ import {
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { useSandboxLaunchModelOptions } from "@/hooks/useSandboxModelOptions";
+import { useSandboxLaunchSelectionCheck } from "@/hooks/useSandboxLaunchSelectionCheck";
+import { useRememberSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import {
   ComposerConfigSections,
@@ -1024,6 +1026,30 @@ export function ChatPage() {
       : sessionModelOptions;
   const modelsFromLaunchPreview =
     sandboxPreviewOptions !== undefined && codexModelOptions === sandboxPreviewOptions;
+  // Teach the new-session picker what this sandbox's harness really offers,
+  // and drop a launch pick it cannot run once its catalog arrives.
+  const { data: sandboxHostRows } = useHosts({ includeSandbox: true });
+  const sessionSandboxProvider =
+    sandboxHostRows?.find((row) => row.host_id === activeSession?.hostId)?.sandbox_provider ??
+    sandboxStatus?.provider ??
+    null;
+  const sandboxSessionCatalogActive =
+    activeSession != null &&
+    activeConversationId === activeSession.id &&
+    !activeSession.inferenceConfigured;
+  useRememberSandboxSessionCatalog(
+    sessionSandboxProvider,
+    sandboxPreviewHarness,
+    activeSession?.agentId ?? null,
+    sessionModelOptions,
+    sandboxSessionCatalogActive,
+  );
+  useSandboxLaunchSelectionCheck(
+    activeSession?.id ?? null,
+    sandboxPreviewHarness,
+    sessionModelOptions,
+    sandboxSessionCatalogActive,
+  );
 
   // The session is unreachable and a message can't wake it: the host is
   // offline (host-bound) or it isn't host-bound and the runner is down.
