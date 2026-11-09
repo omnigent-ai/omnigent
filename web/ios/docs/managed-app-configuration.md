@@ -80,11 +80,15 @@ When enabled, a connection failure with `NSURLErrorCannotFindHost` or
 
 > Couldn’t reach the server. Check your device’s compliance status in Jamf.
 
-This applies to any server the user connects to in this install. It is a
-troubleshooting hint, not a check of the device's JAMF compliance status. Other
-errors (including timeouts, offline, connection refusal, and TLS failures) keep
-their original messages. When disabled, DNS failures also keep their original
-messages.
+This applies to any server the user connects to in this install, including
+Databricks workspace sign-in (the token and session requests and the workspace
+page load). It is a troubleshooting hint, not a check of the device's JAMF
+compliance status. Other errors (including timeouts, offline, connection refusal,
+and TLS failures) keep their original messages. When disabled, DNS failures also
+keep their original messages. On workspace sign-in, those messages read "Could
+not reach Databricks. Please try again." followed by the error domain and code,
+for example `(NSURLErrorDomain -1001)` for a timeout, and the app logs the same
+code.
 
 Missing or malformed flags (including strings such as `"true"` and integers such
 as `1`) disable the feature without discarding valid preset servers. A declarative
