@@ -141,8 +141,10 @@ import {
   fileMentionToken,
   findMentionTokens,
   newFileMentionToken,
+  mergeTaggedDrafts,
   presentMentions,
   recallSessionMentions,
+  type SessionMention,
   type TaggedMentions,
   withSessionMentionHint,
   detectMentionAt,
@@ -430,6 +432,54 @@ export function splitSlashCommand(
 // Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
 // prefer the last word boundary within 10 chars of the limit so we don't
 // chop a word in half; trimEnd before the ellipsis so we never emit "foo  …".
+/**
+ * A sent, queued or failed message as an editable composer draft: generated
+ * session markers become tokens again and their tags come back with them.
+ */
+function recallComposerDraft(
+  text: string,
+  replyDraft?: StoredReplyDraft,
+): { text: string; replyDraft?: StoredReplyDraft; sessions: SessionMention[] } {
+  if (!replyDraft) {
+    const recalled = recallSessionMentions(text);
+    return { text: recalled.main, sessions: recalled.sessions };
+  }
+  const recalled = recallSessionMentions(
+    replyDraft.text,
+    replyDraft.quotes.map((quote) => quote.before),
+  );
+  const restored: StoredReplyDraft = {
+    ...replyDraft,
+    text: recalled.main,
+    quotes: replyDraft.quotes.map((quote, i) => ({ ...quote, before: recalled.others[i]! })),
+  };
+  return { text: serializeReplyDraft(restored), replyDraft: restored, sessions: recalled.sessions };
+}
+
+/**
+ * ``recalled`` merged into a composer that already holds ``current`` tags: a
+ * recovered tag whose token an existing tag uses gets a new one, in every segment.
+ */
+function mergeRecalledDraft(
+  current: TaggedMentions,
+  recalled: ReturnType<typeof recallComposerDraft>,
+): { text: string; replyDraft?: StoredReplyDraft; mentions: TaggedMentions } {
+  const incoming = { files: [], sessions: recalled.sessions };
+  const rename = (segment: string) =>
+    mergeTaggedDrafts(current, { text: segment, mentions: incoming });
+  const mentions = rename("").mentions ?? current;
+  if (!recalled.replyDraft) return { text: rename(recalled.text).text, mentions };
+  const replyDraft: StoredReplyDraft = {
+    ...recalled.replyDraft,
+    text: rename(recalled.replyDraft.text).text,
+    quotes: recalled.replyDraft.quotes.map((quote) => ({
+      ...quote,
+      before: rename(quote.before).text,
+    })),
+  };
+  return { text: serializeReplyDraft(replyDraft), replyDraft, mentions };
+}
+
 function truncateTitle(raw: string, max = 60): string {
   const points = Array.from(raw);
   if (points.length <= max) return raw;
@@ -3285,16 +3335,21 @@ function ComposerImpl(
     const hasNewerInput = valueRef.current.trim() !== "" || filesRef.current.length > 0;
     const failed = takeFailedSendDraft(failedSendDraft.conversationId, hasNewerInput, true);
     if (!failed) return;
+    // The failed text carries expanded markers; bring its session tags back as tokens.
+    const recalled = recallComposerDraft(failed.text, failed.replyDraft);
     if (hasNewerInput) {
-      const joined = appendReplyDraft(draft, restoreReplyDraft(failed.text, failed.replyDraft));
+      const merged = mergeRecalledDraft(taggedMentionsRef.current, recalled);
+      const joined = appendReplyDraft(draft, restoreReplyDraft(merged.text, merged.replyDraft));
       replaceText(serializeReplyDraft(joined), snapshotReplyDraft(joined));
+      restoreTaggedMentionsRef.current(merged.mentions);
       dirtyRef.current = true;
       return;
     }
     pendingFailedSendRestore.current = failed.stableId
       ? { stableId: failed.stableId, draft }
       : null;
-    replaceText(failed.text, failed.replyDraft);
+    replaceText(recalled.text, recalled.replyDraft);
+    restoreTaggedMentionsRef.current({ files: [], sessions: recalled.sessions });
     textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
     if (failed.files.length > 0) attachmentsRef.current.replaceFiles(failed.files);
@@ -3314,8 +3369,10 @@ function ComposerImpl(
     if (pending?.stableId === restoredSendDraft.stableId && pending.draft === draft) return;
     pendingFailedSendRestore.current = null;
     useChatStore.setState({ restoredSendDraft: null });
+    // Compare with what the restore put in the composer, tokens included.
+    const restoredDraft = recallComposerDraft(restoredSendDraft.text, restoredSendDraft.replyDraft);
     const expected = serializeReplyDraft(
-      restoreReplyDraft(restoredSendDraft.text, restoredSendDraft.replyDraft),
+      restoreReplyDraft(restoredDraft.text, restoredDraft.replyDraft),
     );
     const filesUnedited =
       filesRef.current.length === restoredSendDraft.files.length &&
@@ -4012,23 +4069,9 @@ function ComposerImpl(
   // as editable tokens, so a resend adds one trailing hint instead of keeping a
   // stale one mid-message.
   const restoreRecalledText = (text: string, replyDraft?: StoredReplyDraft) => {
-    if (replyDraft) {
-      const recalled = recallSessionMentions(
-        replyDraft.text,
-        replyDraft.quotes.map((quote) => quote.before),
-      );
-      const restored: StoredReplyDraft = {
-        ...replyDraft,
-        text: recalled.main,
-        quotes: replyDraft.quotes.map((quote, i) => ({ ...quote, before: recalled.others[i]! })),
-      };
-      replaceText(serializeReplyDraft(restored), restored);
-      setMentionedSessions(recalled.sessions);
-    } else {
-      const recalled = recallSessionMentions(text);
-      replaceText(recalled.main);
-      setMentionedSessions(recalled.sessions);
-    }
+    const recalled = recallComposerDraft(text, replyDraft);
+    replaceText(recalled.text, recalled.replyDraft);
+    setMentionedSessions(recalled.sessions);
     setMentionedItems([]);
   };
 

@@ -847,6 +847,50 @@ describe("Composer @-session mentions", () => {
       );
     });
 
+    it("restores a failed send's tags as tokens, so a resend keeps one trailing hint", () => {
+      const onSend = vi.fn();
+      renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: { conversationId: currentId, text: queuedText(), files: [] },
+        }),
+      );
+      expect(textarea().value).toBe("Ask @Alpha planning to review");
+      expect(tokens()).toEqual(["@Alpha planning"]);
+      append(" today");
+      fireEvent.submit(textarea().closest("form")!);
+      expect(onSend.mock.calls[0]![0]).toBe(
+        `Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review today\n\n${SESSION_MENTION_HINT}`,
+      );
+    });
+
+    it("merges a failed send into newer input without retargeting either tag", () => {
+      const onSend = vi.fn();
+      renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+      // Newer input already tags s_alpha as "@Alpha planning".
+      type("first @alpha");
+      fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+      // A send recovered when the session loaded, which tagged a different
+      // session with the same title, is added after the newer input.
+      const failed =
+        `Ask [Session: "Alpha planning" id=s_other subagent=no] to review\n\n` +
+        SESSION_MENTION_HINT;
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: { conversationId: currentId, text: failed, files: [], recovered: true },
+        }),
+      );
+      expect(tokens()).toEqual(["@Alpha planning", "@Alpha planning (s_othe)"]);
+      fireEvent.submit(textarea().closest("form")!);
+      const sent = onSend.mock.calls[0]![0] as string;
+      expect(sent).toBe(
+        // The picked token keeps the space the composer adds after it.
+        'first [Session: "Alpha planning" id=s_alpha subagent=no] \n\n' +
+          'Ask [Session: "Alpha planning" id=s_other subagent=no] to review\n\n' +
+          SESSION_MENTION_HINT,
+      );
+    });
+
     it("adds a newly tagged session to a recalled message with one hint", () => {
       const onSend = vi.fn();
       renderWithQueued(onSend);
