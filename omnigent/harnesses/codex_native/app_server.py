@@ -2763,7 +2763,11 @@ class CodexNativeAppServer:
         effort_catalog_transport = self.listen_url or str(self.socket_path)
         _effort_catalog_cache.pop(effort_catalog_transport, None)
         _effort_catalog_misses.pop(effort_catalog_transport, None)
-        from omnigent.mcp_disabled_servers import SubprocessCodexProbe, plan_codex_launch
+        from omnigent.mcp_disabled_servers import (
+            RELAUNCH_WITHOUT_OVERRIDES_EVENT,
+            SubprocessCodexProbe,
+            plan_codex_launch,
+        )
 
         launch_command = self.app_server_command or (self.codex_path,)
         mcp_plan = await plan_codex_launch(
@@ -2798,8 +2802,10 @@ class CodexNativeAppServer:
                     fallback = mcp_plan.overrides_after_early_exit()
                     if fallback is None or self.proc is None or self.proc.returncode is None:
                         raise
-                    _logger.warning("mcp_disabled_relaunch_without_overrides")
+                    _logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
                     await self.close()
+                    self.certificate_failure = None
+                    clear_certificate_failure(self.bridge_dir)
                     self.config_overrides = list(fallback)
                     if resolved_listen.startswith("unix://"):
                         self.socket_path.unlink(missing_ok=True)

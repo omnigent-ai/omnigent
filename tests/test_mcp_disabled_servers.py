@@ -96,8 +96,36 @@ def test_bad_storage_fails_open_and_logs_once(config_home, content, caplog):
     for _ in range(2):
         assert not is_disabled(ServerKey("claude", "github"))
     assert len(caplog.records) == 1
-    set_disabled(ServerKey("claude", "github"), True)
-    assert is_disabled(ServerKey("claude", "github"))
+    if content is None:
+        set_disabled(ServerKey("claude", "github"), True)
+        assert is_disabled(ServerKey("claude", "github"))
+    else:
+        with pytest.raises(DisabledServerWriteError) as error:
+            set_disabled(ServerKey("claude", "github"), True)
+        assert error.value.code == "io"
+        assert config_home.read_bytes() == content.encode()
+        assert len(caplog.records) == 1
+
+
+def test_unreadable_storage_refuses_write_without_changing_bytes(config_home, monkeypatch):
+    from pathlib import Path
+
+    original = b'{"version":1,"disabled":[{"harness":"codex","server":"keep"}]}'
+    config_home.write_bytes(original)
+    real_open = Path.open
+
+    def denied_open(path, *args, **kwargs):
+        if path == config_home:
+            raise PermissionError("unreadable")
+        return real_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", denied_open)
+        assert not is_disabled(ServerKey("codex", "keep"))
+        with pytest.raises(DisabledServerWriteError) as error:
+            set_disabled(ServerKey("claude", "new"), True)
+        assert error.value.code == "io"
+    assert config_home.read_bytes() == original
 
 
 def test_read_normalization(config_home):
@@ -187,7 +215,7 @@ async def test_codex_no_probe_without_entries(executor, active, tmp_path):
 
 
 @pytest.mark.parametrize("executor", ["codex", "codex-native"])
-async def test_codex_reported_names_only_and_probe_contract(executor, tmp_path):
+async def test_codex_reported_names_only_and_probe_contract(executor, tmp_path, caplog):
     for name in ["github", "missing", "already_off"]:
         set_disabled(ServerKey("codex", name), True)
     probe = FakeCodexProbe({"github": True, "already_off": False})
@@ -214,6 +242,12 @@ async def test_codex_reported_names_only_and_probe_contract(executor, tmp_path):
     assert plan.outcome == "applied"
     assert plan.dropped == ("missing",)
     assert plan.overrides_after_early_exit() == ("base=true",)
+    dropped_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("mcp_disabled_servers_not_reported")
+    ]
+    assert dropped_logs == ["mcp_disabled_servers_not_reported names=('missing',)"]
 
 
 @pytest.mark.parametrize("error", [TimeoutError(), OSError("no CLI"), ValueError("bad json")])
@@ -358,15 +392,18 @@ def test_default_config_home(tmp_path, monkeypatch):
     ]
 
 
-def test_storage_size_boundary_and_replacement_log(config_home, caplog):
+def test_storage_size_boundary_and_write_refusal(config_home, caplog):
     content = json.dumps({"version": 1, "disabled": [{"harness": "claude", "server": "fixture"}]})
     config_home.write_text(content + " " * (65536 - len(content)))
     assert is_disabled(ServerKey("claude", "fixture"))
     config_home.write_text(config_home.read_text() + " ")
     assert not is_disabled(ServerKey("claude", "fixture"))
-    set_disabled(ServerKey("claude", "new"), True)
-    assert "mcp_disabled_servers_replacing_invalid_storage" in caplog.text
-    assert is_disabled(ServerKey("claude", "new"))
+    original = config_home.read_bytes()
+    with pytest.raises(DisabledServerWriteError) as error:
+        set_disabled(ServerKey("claude", "new"), True)
+    assert error.value.code == "io"
+    assert config_home.read_bytes() == original
+    assert "mcp_disabled_servers_replacing_invalid_storage" not in caplog.text
 
 
 @pytest.mark.parametrize(

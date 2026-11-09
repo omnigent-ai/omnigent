@@ -6459,70 +6459,174 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
     _run(_t())
 
 
-@pytest.mark.parametrize("saved", [False, True])
-@pytest.mark.parametrize("active", [None, [], ["codex"]])
-@pytest.mark.parametrize("failures", [0, 1, 2])
-async def test_disabled_mcp_launch_hook_and_early_exit(
-    tmp_path, monkeypatch, caplog, active, failures, saved
-):
+@pytest.fixture
+def disabled_mcp_session(tmp_path, monkeypatch):
     from omnigent import mcp_disabled_servers as disabled
-    from omnigent.errors import HarnessTransportClosedError
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     source_home = tmp_path / "source-codex-home"
     source_home.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(source_home))
-    if saved:
-        disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
+    disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
     probe = AsyncMock(return_value={"fixture": True})
     monkeypatch.setattr(disabled.SubprocessCodexProbe, "effective_servers", probe)
-    hook = AsyncMock(wraps=disabled.plan_codex_launch)
+    plans = []
+    real_plan = disabled.plan_codex_launch
+
+    async def plan(*args, **kwargs):
+        result = await real_plan(*args, **kwargs)
+        plans.append(result)
+        return result
+
+    hook = AsyncMock(side_effect=plan)
     monkeypatch.setattr(disabled, "plan_codex_launch", hook)
+
+    async def prepare(_home, overrides, **_kwargs):
+        return list(overrides)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.prepare_codex_provider_config", prepare
+    )
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd=str(tmp_path),
         env={},
         tool_executor=None,
-        active_harnesses=active,
+        codex_config_overrides=["base=true"],
+        active_harnesses=["codex"],
     )
     spawns = []
+    processes = []
 
     async def spawn(*args, **kwargs):
         spawns.append(args)
-        return _FakeProcess()
+        process = _FakeProcess()
+        processes.append(process)
+        return process
 
-    async def initialize(*args, **kwargs):
-        assert args[0] == "initialize"
-        if len(spawns) <= failures:
-            raise HarnessTransportClosedError("early EOF", replay_safe=True)
-        return {"result": {}}
-
+    initialize = AsyncMock(return_value={"result": {}})
     monkeypatch.setattr(session, "_request", initialize)
     monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    return SimpleNamespace(
+        session=session,
+        spawns=spawns,
+        processes=processes,
+        initialize=initialize,
+        probe=probe,
+        hook=hook,
+        plans=plans,
+    )
+
+
+@pytest.mark.parametrize("error", [BrokenPipeError(), ConnectionResetError(), RuntimeError("EOF")])
+async def test_disabled_mcp_applied_early_exit_relaunches_baseline(
+    disabled_mcp_session, caplog, error
+):
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = disabled_mcp_session
+
+    async def initialize(*_args, **_kwargs):
+        if len(harness.spawns) == 1:
+            harness.processes[-1].returncode = 1
+            raise error
+        return {"result": {}}
+
+    harness.initialize.side_effect = initialize
     try:
-        if failures and (not (active and saved) or failures == 2):
-            with pytest.raises(HarnessTransportClosedError):
-                await session.start()
-        else:
-            await session.start()
-        hook.assert_awaited_once()
-        assert hook.call_args.kwargs["executor"] == "codex"
-        assert hook.call_args.kwargs["active_harnesses"] == active
-        baseline = ["/bin/echo", "app-server"]
-        for override in hook.call_args.args[1]:
-            baseline.extend(["-c", override])
-        expected = (
-            [*baseline, "-c", "mcp_servers.fixture.enabled=false"]
-            if active and saved
-            else baseline
-        )
-        assert list(spawns[0]) == expected
-        assert probe.await_count == bool(active and saved)
-        if failures and active and saved:
-            assert len(spawns) == 2
-            assert list(spawns[1]) == baseline
-            assert caplog.text.count("mcp_disabled_relaunch_without_overrides") == 1
-        else:
-            assert len(spawns) == 1
+        await harness.session.start()
+        assert harness.spawns == [
+            (
+                "/bin/echo",
+                "app-server",
+                "-c",
+                "base=true",
+                "-c",
+                "mcp_servers.fixture.enabled=false",
+            ),
+            ("/bin/echo", "app-server", "-c", "base=true"),
+        ]
+        assert caplog.text.count(RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
+        harness.hook.assert_awaited_once()
+        assert harness.hook.call_args.kwargs["executor"] == "codex"
+        assert harness.hook.call_args.kwargs["active_harnesses"] == ["codex"]
     finally:
-        await session.close()
+        await harness.session.close()
+
+
+async def test_disabled_mcp_second_early_exit_is_final(disabled_mcp_session, caplog):
+    from omnigent.errors import HarnessTransportClosedError
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = disabled_mcp_session
+
+    async def initialize(*_args, **_kwargs):
+        harness.processes[-1].returncode = 1
+        raise HarnessTransportClosedError("early EOF", replay_safe=True)
+
+    harness.initialize.side_effect = initialize
+    with pytest.raises(HarnessTransportClosedError):
+        await harness.session.start()
+    assert len(harness.spawns) == 2
+    assert harness.spawns[1] == ("/bin/echo", "app-server", "-c", "base=true")
+    assert caplog.text.count(RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
+
+
+async def test_disabled_mcp_not_applied_early_exit_does_not_retry(disabled_mcp_session, caplog):
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = disabled_mcp_session
+    harness.probe.return_value = {}
+
+    async def initialize(*_args, **_kwargs):
+        harness.processes[-1].returncode = 1
+        raise BrokenPipeError
+
+    harness.initialize.side_effect = initialize
+    with pytest.raises(BrokenPipeError):
+        await harness.session.start()
+    assert harness.spawns == [("/bin/echo", "app-server", "-c", "base=true")]
+    assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
+
+
+async def test_disabled_mcp_inactive_does_not_probe(disabled_mcp_session):
+    harness = disabled_mcp_session
+    harness.session._mcp_active_harnesses = None
+    try:
+        await harness.session.start()
+        harness.probe.assert_not_awaited()
+        assert harness.spawns == [("/bin/echo", "app-server", "-c", "base=true")]
+    finally:
+        await harness.session.close()
+
+
+@pytest.mark.parametrize(
+    "error", [BrokenPipeError(), ConnectionResetError(), RuntimeError("live")]
+)
+async def test_disabled_mcp_live_initialize_failure_does_not_retry(
+    disabled_mcp_session, caplog, error
+):
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = disabled_mcp_session
+    harness.initialize.side_effect = error
+    with pytest.raises(type(error)):
+        await harness.session.start()
+    assert len(harness.spawns) == 1
+    assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
+
+
+async def test_disabled_mcp_restarts_plan_from_original_baseline(disabled_mcp_session):
+    harness = disabled_mcp_session
+    for _ in range(2):
+        await harness.session.start()
+        await harness.session.close()
+    assert harness.spawns == [
+        ("/bin/echo", "app-server", "-c", "base=true", "-c", "mcp_servers.fixture.enabled=false"),
+        ("/bin/echo", "app-server", "-c", "base=true", "-c", "mcp_servers.fixture.enabled=false"),
+    ]
+    assert [plan.fallback_config_overrides for plan in harness.plans] == [
+        ("base=true",),
+        ("base=true",),
+    ]
+    assert harness.session._codex_config_overrides == ["base=true"]

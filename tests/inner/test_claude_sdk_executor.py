@@ -6588,6 +6588,21 @@ async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, 
         assert options.settings is original
 
 
+@pytest.mark.parametrize(
+    "data,expected",
+    [
+        ({}, ()),
+        ({"mcp_servers": None}, ()),
+        ({"mcp_servers": "invalid"}, ()),
+        ({"mcp_servers": [None, {}, {"name": 1}, {"name": "fixture"}]}, ("fixture",)),
+    ],
+)
+def test_disabled_mcp_init_server_names(data, expected):
+    from omnigent.inner.claude_sdk_executor import _init_mcp_server_names
+
+    assert _init_mcp_server_names(data) == expected
+
+
 @pytest.mark.parametrize("active", [None, ["claude"]])
 async def test_disabled_mcp_sdk_init_reports_loaded_server(tmp_path, monkeypatch, caplog, active):
     from claude_agent_sdk.types import SystemMessage as SDKSystemMessage

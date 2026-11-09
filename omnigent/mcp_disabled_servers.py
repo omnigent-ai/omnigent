@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Final, Literal, Protocol, overload
 
 from omnigent.config import global_config_path
+from omnigent.inner._proc import pipe_supervised_command, remember_process_group, spawn_kwargs
+from omnigent.inner._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 
 HarnessKey = Literal["claude", "codex"]
 ExecutorId = Literal["claude-native", "claude-sdk", "codex-native", "codex"]
@@ -24,7 +26,10 @@ HARNESS_EXECUTORS: Final[Mapping[HarnessKey, tuple[ExecutorId, ...]]] = {
     "codex": ("codex-native", "codex"),
 }
 FILENAME: Final = "mcp-disabled-servers.json"
+RELAUNCH_WITHOUT_OVERRIDES_EVENT: Final = "mcp_disabled_relaunch_without_overrides"
 _MAX_BYTES = 64 * 1024
+_MAX_NAME_LENGTH = 1024
+_TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 _write_lock = threading.Lock()
 _read_failure_lock = threading.Lock()
 _read_failures: set[tuple[Path, str]] = set()
@@ -59,7 +64,7 @@ def _validate(key: ServerKey) -> None:
         if (
             not isinstance(name, str)
             or not name.strip()
-            or len(name) > 1024
+            or len(name) > _MAX_NAME_LENGTH
             or any(ord(character) < 32 or ord(character) == 127 for character in name)
         ):
             raise DisabledServerWriteError("invalid_name")
@@ -75,7 +80,7 @@ def _log_read_failure(path: Path, reason: str) -> None:
     _logger.warning("mcp_disabled_servers_read_failed path=%s reason=%s", path, reason)
 
 
-def _read(path: Path, *, replacing: bool = False) -> list[ServerKey]:
+def _read(path: Path, *, for_write: bool = False) -> list[ServerKey]:
     try:
         with path.open("rb") as stream:
             raw = stream.read(_MAX_BYTES + 1)
@@ -99,7 +104,7 @@ def _read(path: Path, *, replacing: bool = False) -> list[ServerKey]:
                     entry.get("server"),
                     entry.get("plugin"),
                 )
-                if harness not in ("claude", "codex") or not isinstance(server, str):
+                if harness not in HARNESS_EXECUTORS or not isinstance(server, str):
                     continue
                 if plugin is not None and not isinstance(plugin, str):
                     continue
@@ -112,8 +117,8 @@ def _read(path: Path, *, replacing: bool = False) -> list[ServerKey]:
         return result
     except (OSError, ValueError, RecursionError) as error:
         _log_read_failure(path, type(error).__name__)
-        if replacing and not isinstance(error, FileNotFoundError):
-            _logger.warning("mcp_disabled_servers_replacing_invalid_storage path=%s", path)
+        if for_write and not isinstance(error, FileNotFoundError):
+            raise DisabledServerWriteError("io") from error
         return []
 
 
@@ -131,7 +136,7 @@ def set_disabled(key: ServerKey, disabled: bool) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.with_suffix(".lock").open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
-                entries = _read(path, replacing=True)
+                entries = _read(path, for_write=True)
                 if disabled and key not in entries:
                     entries.append(key)
                 elif not disabled:
@@ -208,7 +213,10 @@ def apply_claude_settings(
     executor: Literal["claude-native", "claude-sdk"],
     active_harnesses: Collection[str] | None,
 ) -> dict[str, object] | str | None:
-    """Append Claude deny entries without modifying the caller's settings."""
+    """Append Claude deny entries without modifying the caller's settings.
+
+    The executor selects native dict settings versus the SDK's JSON-string form.
+    """
     entries = _active_entries("claude", active_harnesses)
     if not entries:
         return settings
@@ -264,14 +272,14 @@ class SubprocessCodexProbe:
         try:
             async with asyncio.timeout(timeout_s):
                 process = await asyncio.create_subprocess_exec(
-                    argv[0],
-                    *self._launch_args,
-                    *argv[1:],
+                    *pipe_supervised_command(argv[0], *self._launch_args, *argv[1:]),
                     env=env,
                     cwd=cwd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
+                    **spawn_kwargs(),
                 )
+                remember_process_group(process)
                 stdout, _ = await process.communicate()
             if process.returncode != 0:
                 raise ValueError("Codex MCP list failed")
@@ -289,10 +297,13 @@ class SubprocessCodexProbe:
                 result[row["name"]] = row["enabled"]
             return result
         finally:
-            if process is not None and process.returncode is None:
-                with suppress(ProcessLookupError):
-                    process.kill()
-                await process.wait()
+            if process is not None:
+                try:
+                    await terminate_subprocess(
+                        process, label="Codex MCP probe", terminate_timeout=0.5, kill_timeout=0.5
+                    )
+                finally:
+                    close_subprocess_transport(process)
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,7 +314,10 @@ class CodexLaunchPlan:
     dropped: tuple[str, ...]
 
     def overrides_after_early_exit(self) -> tuple[str, ...] | None:
-        """Return the unmodified overrides for the caller's single retry."""
+        """Return the baseline for one retry after any pre-initialize exit.
+
+        Disabled servers may run on retry; callers signal this with the warning event.
+        """
         return self.fallback_config_overrides if self.outcome == "applied" else None
 
 
@@ -340,10 +354,10 @@ async def plan_codex_launch(
         if key.server not in servers:
             dropped.append(key.server)
             continue
-        name = (
-            key.server if re.fullmatch(r"[A-Za-z0-9_-]+", key.server) else json.dumps(key.server)
-        )
+        name = key.server if _TOML_BARE_KEY.fullmatch(key.server) else json.dumps(key.server)
         overrides.append(f"mcp_servers.{name}.enabled=false")
+    if dropped:
+        _logger.warning("mcp_disabled_servers_not_reported names=%s", tuple(dropped))
     return CodexLaunchPlan(
         (*original, *overrides), original, "applied" if overrides else "none", tuple(dropped)
     )

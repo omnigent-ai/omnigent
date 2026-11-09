@@ -33,7 +33,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
@@ -2956,7 +2956,8 @@ class _CodexAppServerSession:
         self._cwd = cwd
         self._env = env
         self._tool_executor = tool_executor
-        self._codex_config_overrides = list(codex_config_overrides or [])
+        self._base_codex_config_overrides = tuple(codex_config_overrides or ())
+        self._codex_config_overrides = list(self._base_codex_config_overrides)
         self._mcp_active_harnesses = active_harnesses
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._disable_native_tools = disable_native_tools
@@ -3050,6 +3051,7 @@ class _CodexAppServerSession:
     async def _start_unchecked(self) -> None:
         if self._started:
             return
+        self._codex_config_overrides = list(self._base_codex_config_overrides)
         cleanup_task = self._cleanup_task
         if cleanup_task is not None and not cleanup_task.done():
             await asyncio.shield(cleanup_task)
@@ -3234,7 +3236,10 @@ class _CodexAppServerSession:
                 await asyncio.to_thread(worker_launch.close)
                 raise RuntimeError("Codex session closed during worker preparation")
             self._worker_launch = worker_launch
-            from omnigent.mcp_disabled_servers import plan_codex_launch
+            from omnigent.mcp_disabled_servers import (
+                RELAUNCH_WITHOUT_OVERRIDES_EVENT,
+                plan_codex_launch,
+            )
 
             mcp_plan = await plan_codex_launch(
                 self._worker_launch.launch_path,
@@ -3244,77 +3249,15 @@ class _CodexAppServerSession:
                 env=proc_env,
                 cwd=process_cwd,
             )
-            self._codex_config_overrides = list(mcp_plan.config_overrides)
-            while True:
-                try:
-                    argv = [self._worker_launch.launch_path, "app-server"]
-                    for override in self._codex_config_overrides:
-                        argv.extend(["-c", override])
-                    spawn_argv = argv
-                    pass_fds: tuple[int, ...] = ()
-                    liveness_read_fd: int | None = None
-                    await self._require_live_signer()
-                    if self._worker_launch.sandboxed and os.name == "posix":
-                        liveness_read_fd, self._worker_liveness_fd = os.pipe()
-                        os.set_inheritable(liveness_read_fd, True)
-                        spawn_argv = [
-                            sys.executable,
-                            str(Path(__file__).with_name("_liveness_exec.py")),
-                            "--liveness-fd",
-                            str(liveness_read_fd),
-                            *argv,
-                        ]
-                        pass_fds = (liveness_read_fd,)
-                    try:
-                        spawn_task = asyncio.create_task(
-                            _create_subprocess_exec(
-                                *spawn_argv,
-                                stdin=asyncio.subprocess.PIPE,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
-                                env=proc_env,
-                                pass_fds=pass_fds,
-                                **_proc.spawn_kwargs(),
-                                cwd=self._cwd or os.getcwd(),
-                            )
-                        )
-                        self._worker_spawn_task = spawn_task
-                        proc = await asyncio.shield(spawn_task)
-                        self._proc = proc
-                        if self._worker_spawn_task is spawn_task:
-                            self._worker_spawn_task = None
-                        _proc.remember_process_group(self._proc)
-                        _proc.refresh_process_tree(self._proc)
-                        if self._closing:
-                            raise RuntimeError("Codex session closed during worker spawn")
-                        await self._require_live_signer()
-                    finally:
-                        if liveness_read_fd is not None:
-                            os.close(liveness_read_fd)
-                    self._reader_task = asyncio.create_task(self._reader_loop())
-                    self._stderr_task = asyncio.create_task(self._stderr_loop())
-                    self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
-                    initialized = await self._request(
-                        "initialize",
-                        {
-                            "clientInfo": {
-                                "name": "omnigent",
-                                "version": "0.1",
-                            },
-                            "capabilities": {
-                                "experimentalApi": True,
-                            },
-                        },
-                    )
-                    break
-                except HarnessTransportClosedError:
-                    fallback = mcp_plan.overrides_after_early_exit()
-                    if fallback is None:
-                        raise
-                    logger.warning("mcp_disabled_relaunch_without_overrides")
-                    await self._discard_early_exit_worker()
-                    self._codex_config_overrides = list(fallback)
-                    mcp_plan = replace(mcp_plan, outcome="none")
+            try:
+                initialized = await self._spawn_and_initialize(mcp_plan.config_overrides, proc_env)
+            except Exception:
+                fallback = mcp_plan.overrides_after_early_exit()
+                if fallback is None or self._proc is None or self._proc.returncode is None:
+                    raise
+                logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
+                await self._discard_early_exit_worker()
+                initialized = await self._spawn_and_initialize(fallback, proc_env)
             user_agent = initialized.get("result", {}).get("userAgent")
             version = (
                 re.match(r"^[^/\s]+/(\d+)\.(\d+)\.(\d+)", user_agent)
@@ -3343,6 +3286,71 @@ class _CodexAppServerSession:
         except BaseException:
             await self.close()
             raise
+
+    async def _spawn_and_initialize(
+        self, overrides: Sequence[str], proc_env: dict[str, str]
+    ) -> CodexMessage:
+        """Spawn the prepared worker and complete its initialize handshake."""
+        assert self._worker_launch is not None
+        argv = [self._worker_launch.launch_path, "app-server"]
+        for override in overrides:
+            argv.extend(["-c", override])
+        spawn_argv = argv
+        pass_fds: tuple[int, ...] = ()
+        liveness_read_fd: int | None = None
+        await self._require_live_signer()
+        if self._worker_launch.sandboxed and os.name == "posix":
+            liveness_read_fd, self._worker_liveness_fd = os.pipe()
+            os.set_inheritable(liveness_read_fd, True)
+            spawn_argv = [
+                sys.executable,
+                str(Path(__file__).with_name("_liveness_exec.py")),
+                "--liveness-fd",
+                str(liveness_read_fd),
+                *argv,
+            ]
+            pass_fds = (liveness_read_fd,)
+        try:
+            spawn_task = asyncio.create_task(
+                _create_subprocess_exec(
+                    *spawn_argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=proc_env,
+                    pass_fds=pass_fds,
+                    **_proc.spawn_kwargs(),
+                    cwd=self._cwd or os.getcwd(),
+                )
+            )
+            self._worker_spawn_task = spawn_task
+            proc = await asyncio.shield(spawn_task)
+            self._proc = proc
+            if self._worker_spawn_task is spawn_task:
+                self._worker_spawn_task = None
+            _proc.remember_process_group(self._proc)
+            _proc.refresh_process_tree(self._proc)
+            if self._closing:
+                raise RuntimeError("Codex session closed during worker spawn")
+            await self._require_live_signer()
+        finally:
+            if liveness_read_fd is not None:
+                os.close(liveness_read_fd)
+        self._reader_task = asyncio.create_task(self._reader_loop())
+        self._stderr_task = asyncio.create_task(self._stderr_loop())
+        self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
+        return await self._request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "omnigent",
+                    "version": "0.1",
+                },
+                "capabilities": {
+                    "experimentalApi": True,
+                },
+            },
+        )
 
     async def _discard_early_exit_worker(self) -> None:
         """Reap a pre-initialize worker while retaining its prepared sandbox and signer."""
