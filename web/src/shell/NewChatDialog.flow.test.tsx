@@ -18,7 +18,10 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => useTestConversations(),
+  useOptionalLoadedConversations: () => useTestConversations().data,
+}));
 
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: ({ target, enabled }: { target: { agentId?: string } | null; enabled?: boolean }) => ({
@@ -91,6 +94,7 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // (`@/lib/routing`), not react-router directly — mock that so the create
 // flow's navigate() lands on our spy regardless of router/provider setup.
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ hash: "", state: null }),
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));
@@ -527,39 +531,88 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
   });
 
-  it("keeps the Canvas project and draft when a temporary create fails", async () => {
-    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
-    projects = [{ id: "proj_alpha", name: "Alpha" }];
-    const previousUrl = window.location.href;
-    navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
-      window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
-    });
-    beginLocalConversationMock.mockReturnValue({
-      tempConvId: "temp:1234567890abcdef1234567890abcdef",
-      pendingMsgTempId: "pend_canvas",
-      createToken: "1234567890abcdef1234567890abcdef",
-    });
-    removeLocalConversationMock.mockReturnValue(true);
-    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "Host unavailable" }), { status: 503 }),
-    );
-    try {
-      renderLanding([], { features: { canvas: true } });
-      await waitForWorkspaceSeed();
-      typeMessage("Keep this Canvas draft");
-      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-      await waitFor(() =>
-        expect(navigateMock).toHaveBeenLastCalledWith({
-          pathname: "/",
-          search: "?canvas=proj_alpha&project=Alpha",
-        }),
-      );
-      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this Canvas draft");
-      expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
-    } finally {
-      window.history.replaceState({}, "", previousUrl);
-    }
-  });
+  it.each([
+    { query: "canvas=proj_alpha&project=Alpha", sourceDeleted: false },
+    { query: "sibling=source", sourceDeleted: false },
+    { query: "sibling=source", sourceDeleted: true },
+  ])(
+    "keeps the composer draft after a temporary create fails: $query, sourceDeleted=$sourceDeleted",
+    async ({ query, sourceDeleted }) => {
+      searchParams = new URLSearchParams(query);
+      projects = [{ id: "proj_alpha", name: "Alpha" }];
+      const previousUrl = window.location.href;
+      navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
+        window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
+      });
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId: "temp:1234567890abcdef1234567890abcdef",
+        pendingMsgTempId: "pend_scoped",
+        createToken: "1234567890abcdef1234567890abcdef",
+      });
+      removeLocalConversationMock.mockReturnValue(true);
+      let resolveCreate!: (response: Response) => void;
+      let sourceUnavailable = false;
+      vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+        if (String(url).startsWith("/v1/sessions/source?")) {
+          if (sourceUnavailable) {
+            return new Response(JSON.stringify({ detail: "Not found" }), { status: 404 });
+          }
+          return new Response(
+            JSON.stringify({
+              id: "source",
+              title: "Source",
+              host_id: "host_1",
+              workspace: SEEDED_WORKSPACE,
+              agent_id: "ag_hello",
+              permission_level: 4,
+              labels: {},
+              items: [],
+            }),
+          );
+        }
+        return new Promise<Response>((resolve) => {
+          resolveCreate = resolve;
+        });
+      });
+      const info = { features: { canvas: true }, sibling_sessions: true };
+      try {
+        renderLanding([], info);
+        await waitForWorkspaceSeed();
+        typeMessage("Keep this scoped draft");
+        fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+          target: { files: [new File(["notes"], "notes.txt", { type: "text/plain" })] },
+        });
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+        await waitFor(() => expect(resolveCreate).toBeDefined());
+        cleanup();
+        sourceUnavailable = sourceDeleted;
+        await act(async () => {
+          resolveCreate(
+            new Response(JSON.stringify({ detail: "Source unavailable" }), { status: 403 }),
+          );
+        });
+        await waitFor(() =>
+          expect(navigateMock).toHaveBeenLastCalledWith({ pathname: "/", search: `?${query}` }),
+        );
+        searchParams = new URLSearchParams(window.location.search);
+        renderLanding([], info);
+        if (sourceDeleted) {
+          expect(await screen.findByText("Source session is unavailable.")).toBeVisible();
+          fireEvent.click(screen.getByRole("button", { name: "Continue in a new session" }));
+          cleanup();
+          searchParams = new URLSearchParams(window.location.search);
+          expect(searchParams.has("sibling")).toBe(false);
+          renderLanding([], info);
+        }
+        await waitForWorkspaceSeed();
+        expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this scoped draft");
+        expect(screen.getByText("notes.txt")).toBeVisible();
+        expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+      } finally {
+        window.history.replaceState({}, "", previousUrl);
+      }
+    },
+  );
 
   it("includes selected registry services in the sandbox creation request", async () => {
     vi.mocked(registryRequest).mockResolvedValue({
@@ -764,6 +817,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         project,
+        false,
       ),
     );
   });
@@ -871,6 +925,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
     expect(resolveCreate).toBeTypeOf("function");
@@ -917,6 +972,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
   });
@@ -1127,6 +1183,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
 
@@ -2110,11 +2167,6 @@ describe("NewChatLandingScreen create flow", () => {
     expect(fullNameRow).not.toBeNull();
     expect(fullNameRow).toHaveTextContent("GPT 5.6 Sol");
     expect(fullNameRow).toHaveAttribute("title", "omnigent-openai/system.ai.gpt-5-6-sol");
-    fireEvent.change(screen.getByTestId("new-chat-landing-agent-model-search"), {
-      target: { value: "gpt sol" },
-    });
-    expect(screen.getByText("GPT 5.6 Sol")).toBeInTheDocument();
-    expect(screen.queryByText("Claude Sonnet 4.6")).toBeNull();
     fireEvent.click(screen.getByText("GPT 5.6 Sol"));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");

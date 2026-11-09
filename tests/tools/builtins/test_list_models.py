@@ -12,6 +12,7 @@ import pytest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
 from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins.list_models import SysListModelsTool
+from tests._helpers.providers import isolate_provider_resolution
 
 
 def _make_spec() -> AgentSpec:
@@ -77,10 +78,8 @@ def test_invoke_lists_acp_curated_models_without_gateway_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The real tool advertises only the ACP child's configured, dispatchable ids."""
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.delenv("ACP_TEST_CATALOG_API_KEY", raising=False)
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
     (tmp_path / "config.yaml").write_text(
         "providers:\n"
         "  gateway:\n"

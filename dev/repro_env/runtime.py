@@ -53,6 +53,9 @@ def isolated_env(environ: dict[str, str], output: Path) -> dict[str, str]:
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_AUTH_ENABLED",
         "OMNIGENT_AUTH_PROVIDER",
+        # Set for an agent running under Omnigent; inherited, the instance's
+        # processes would write into that agent's runner log.
+        "OMNIGENT_PROCESS_LOG_FILE",
     }
     env = {
         key: value

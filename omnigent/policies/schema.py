@@ -11,6 +11,7 @@ Usage in a policy callable::
 
     from omnigent.policies.schema import PolicyEvent, PolicyResponse
 
+
     def my_policy(event: PolicyEvent) -> PolicyResponse | None:
         if event["type"] != "tool_call":
             return None  # abstain
@@ -28,8 +29,8 @@ Two-argument form (with config)::
 Factory form (with ``factory_params``)::
 
     def create_policy(limit: int = 10) -> PolicyCallable:
-        def evaluate(event: PolicyEvent) -> PolicyResponse | None:
-            ...
+        def evaluate(event: PolicyEvent) -> PolicyResponse | None: ...
+
         return evaluate
 """
 
@@ -115,6 +116,23 @@ USER_PERIOD_ASK_APPROVED_STATE_KEY = "_policy_user_period_ask_approved_usd"
 SESSION_COST_UNPRICED_APPROVED_KEY = "_policy_cost_unpriced_approved"
 
 
+AUTOMATIC_RUNTIME_STATE_KEYS = frozenset(
+    {
+        "_policy_spawn_bounds_dispatches",
+        "_policy_tool_call_count",
+        "_policy_loop_recent_hashes",
+    }
+)
+
+
+def is_reserved_state_key(key: str) -> bool:
+    """Approval checkpoints require an explicit human approval before writing."""
+    return key.startswith("_policy_") or key in {
+        "subagent_cost_ask_approved_usd",
+        "subagent_cost_over_budget_approved_usd",
+    }
+
+
 class UserDailyCostContext(TypedDict, total=False):
     """The session owner's per-UTC-day LLM cost rollup.
 
@@ -186,6 +204,9 @@ class EventContext(TypedDict, total=False):
     :param conversation_id: The conversation this event belongs to.
         Injected by the engine, which already owns this identity.
         Read via ``event["context"]["conversation_id"]``.
+    :param conversation_title: The conversation's readable title
+        (``Conversation.title``). ``None`` when the conversation has no
+        title yet. Read via ``event["context"]["conversation_title"]``.
     :param turn_final: On ``RESPONSE``, the runner relay sets ``True`` for
         the final text segment of a successful turn and ``False`` for
         intermediate segments or failed, cancelled, and incomplete turns.
@@ -209,6 +230,9 @@ class EventContext(TypedDict, total=False):
     # ``str | None``: the value is ``ctx.conversation_id``, injected by the
     # engine. ``None`` only in contexts with no engine.
     conversation_id: str | None
+    # ``str | None``: the value is ``ctx.conversation_title``, ``None`` when
+    # the conversation has no title yet.
+    conversation_title: str | None
     # RESPONSE policies skip only explicit False for completion actions;
     # None preserves callers that do not distinguish segments.
     turn_final: bool | None

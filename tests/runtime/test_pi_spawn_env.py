@@ -147,6 +147,7 @@ def _ucode_state_for_pi(
                     "openai": "https://example.databricks.com/ai-gateway/codex/v1",
                 },
                 auth_command="printf token",
+                auth_refresh_interval_ms=1234,
             )
         }
         if with_pi_entry
@@ -184,6 +185,14 @@ def test_ucode_state_without_model_falls_back_to_databricks_default(
     env = _build_pi_spawn_env(spec, workdir=None)
 
     assert env["HARNESS_PI_GATEWAY"] == "true"
+    assert env["HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS"] == "1234"
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OMNIGENT_PI_PATH", "/usr/bin/pi")
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: (1, 0, 4))
+    from omnigent.inner.pi_harness import _build_pi_executor
+
+    assert _build_pi_executor()._gateway_auth_refresh_interval_s == 1.234
     # The verified routable gateway endpoint name, not pi's own default.
     assert env["HARNESS_PI_MODEL"] == "catalog-databricks-claude-default"
 

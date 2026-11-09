@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import json
 import math
 import os
 import secrets
 import sys
+import threading
 import time
-from collections.abc import Callable
+import types
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn, TextIO
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -30,6 +33,10 @@ from omnigent.harnesses.claude_native.bridge import (
     transcript_has_recent_local_command,
     url_component,
     write_active_session_id,
+)
+from omnigent.native.elicitation_reattach import (
+    HELD_POLL_READ_TIMEOUT_S,
+    PRE_RESOLVED_ELICITATION_TTL_S,
 )
 
 # The observer path (the default, most frequent invocation — Claude blocks
@@ -62,6 +69,15 @@ _PERMISSION_RETRY_MAX_BACKOFF_S = 30.0
 # Fail unreachable-server connects fast into the backoff loop instead
 # of inheriting the day-long read budget.
 _PERMISSION_CONNECT_TIMEOUT_S = 30.0
+# Re-POST a silent held poll just past the gateway's 300s idle cut: after a
+# host network outage the gateway's reply never arrives and the socket is dead.
+_PERMISSION_POLL_READ_TIMEOUT_S = HELD_POLL_READ_TIMEOUT_S
+# Claude starts its matching command-hook timeout before this process starts,
+# so retrying stops early enough to still write a final decision.
+_PERMISSION_DEADLINE_MARGIN_S = 60.0
+# A question stops retrying a lost poll this long before the server drops an
+# answer submitted meanwhile, leaving time for the last re-POST to claim it.
+_QUESTION_ANSWER_WINDOW_MARGIN_S = 30.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -170,6 +186,13 @@ _SESSION_ROTATION_TIMEOUT_S = 70.0
 # the permission long-poll. Held at one day; the server caps the real
 # wait via the deciding policy's ``ask_timeout``.
 _EVALUATE_POLICY_TIMEOUT_S = 86400.0
+# A question Omnigent can't show on the web is otherwise left in Claude's
+# terminal picker, where a web-only user never sees it. Asking in chat text
+# reaches both the web transcript and the terminal.
+_ASK_USER_QUESTION_UNAVAILABLE_MESSAGE = (
+    "Omnigent could not show this question in its web UI. Ask the same question, "
+    "with its options, in a normal chat message instead, then wait for the user's reply."
+)
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _FORK_TRANSCRIPT_WAIT_S = 1.0
 _FORK_TRANSCRIPT_POLL_S = 0.05
@@ -218,13 +241,44 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(payload, dict):
         print("omnigent claude hook: expected JSON object", file=sys.stderr)
         return 0
-    bridge_dir = Path(args.bridge_dir)
+    output = record_hook_payload(
+        Path(args.bridge_dir), payload, conversation_url=args.conversation_url
+    )
+    if output is not None:
+        print(json.dumps(output))
+    return 0
+
+
+def record_hook_payload(
+    bridge_dir: Path,
+    payload: dict[str, object],
+    *,
+    conversation_url: str | None = None,
+    env: Mapping[str, str] | None = None,
+    diagnostics: TextIO | None = None,
+) -> dict[str, object] | None:
+    """
+    Record one Claude hook event for the forwarder.
+
+    The Python hook runs this, and so does the runner's relay for the hook
+    commands that post to it, passing the hook terminal's launch variables
+    as *env* and the session's hook stderr file as *diagnostics*.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param payload: Hook payload from Claude Code, e.g.
+        ``{"hook_event_name": "Stop", "session_id": "..."}``.
+    :param conversation_url: Legacy URL from old hook settings, used when no
+        active session URL can be built.
+    :param env: The hook terminal's environment; ``None`` reads this process's.
+    :param diagnostics: Where failure messages go; ``None`` is stderr.
+    :returns: The hook's output for Claude (the SessionStart banner), or ``None``.
+    """
     from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
 
-    record_hook_lifecycle(bridge_dir, payload, time.time())
+    record_hook_lifecycle(bridge_dir, payload, time.time(), env, diagnostics)
     if payload.get("hook_event_name") == "SessionEnd":
         # SessionEnd is diagnostic evidence, not a status or transcript change.
-        return 0
+        return None
     _annotate_resume_session_context(bridge_dir, payload)
     if payload.get("hook_event_name") == "SessionStart" and payload.get("source") == "clear":
         rotated_session_id = _rotate_session_on_clear(bridge_dir)
@@ -238,13 +292,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         record_hook_event(bridge_dir, payload)
     except Exception as exc:  # noqa: BLE001 - hook must not break Claude Code.
-        print(f"omnigent claude hook: failed to record hook: {exc}", file=sys.stderr)
-    conversation_url = _conversation_url_for_active_session(bridge_dir, args.conversation_url)
-    if conversation_url and payload.get("hook_event_name") == "SessionStart":
         print(
-            json.dumps({"systemMessage": (f"Open this session in Omnigent: {conversation_url}")})
+            f"omnigent claude hook: failed to record hook: {exc}",
+            file=sys.stderr if diagnostics is None else diagnostics,
         )
-    return 0
+    url = _conversation_url_for_active_session(bridge_dir, conversation_url)
+    if url and payload.get("hook_event_name") == "SessionStart":
+        return {"systemMessage": f"Open this session in Omnigent: {url}"}
+    return None
 
 
 def _annotate_resume_session_context(bridge_dir: Path, payload: dict[str, object]) -> None:
@@ -399,9 +454,13 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
     from omnigent.cli_auth import databricks_request_headers
 
     headers.update(databricks_request_headers(ap_server_url))
+    from omnigent.native.native_policy_hook import is_loopback_url
+
     try:
         with httpx.Client(
-            headers=headers, timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S)
+            headers=headers,
+            timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S),
+            trust_env=not is_loopback_url(ap_server_url),
         ) as client:
             new_session_id = _create_clear_replacement_session(
                 client,
@@ -457,9 +516,13 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     from omnigent.cli_auth import databricks_request_headers
 
     headers.update(databricks_request_headers(ap_server_url))
+    from omnigent.native.native_policy_hook import is_loopback_url
+
     try:
         with httpx.Client(
-            headers=headers, timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S)
+            headers=headers,
+            timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S),
+            trust_env=not is_loopback_url(ap_server_url),
         ) as client:
             new_session_id = _create_fork_replacement_session(
                 client,
@@ -513,13 +576,15 @@ def _create_clear_replacement_session(
     )
     labels.setdefault(BRIDGE_ID_LABEL_KEY, read_bridge_id(bridge_dir) or old_session_id)
 
-    create_resp = client.post(
-        f"{ap_server_url}/v1/sessions",
-        json={
-            "agent_id": agent_id,
-            "labels": labels,
-        },
+    from omnigent.native._native_supersession import (
+        clear_replacement_create_body,
+        unfiled_clear_replacement_body,
     )
+
+    create_body = clear_replacement_create_body(old, agent_id=agent_id, labels=labels)
+    create_resp = client.post(f"{ap_server_url}/v1/sessions", json=create_body)
+    if (unfiled_body := unfiled_clear_replacement_body(create_body, create_resp)) is not None:
+        create_resp = client.post(f"{ap_server_url}/v1/sessions", json=unfiled_body)
     create_resp.raise_for_status()
     created = create_resp.json()
     if not isinstance(created, dict):
@@ -672,6 +737,17 @@ def _conversation_url_for_active_session(
     return fallback_url
 
 
+def _sleep_before_retry(backoff_s: float, retry_by: float) -> None:
+    """
+    Back off before the next re-POST, waking no later than *retry_by*.
+
+    :param backoff_s: Current backoff, e.g. ``4.0``.
+    :param retry_by: :func:`time.monotonic` time the next attempt must not
+        start after, e.g. the retry deadline.
+    """
+    time.sleep(max(0.0, min(backoff_s, retry_by - time.monotonic())))
+
+
 def _post_hook_with_reattach(
     url: str,
     headers: dict[str, str],
@@ -679,6 +755,7 @@ def _post_hook_with_reattach(
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
     wait_marker: Path | None = None,
+    answer_window_s: float | None = None,
 ) -> httpx.Response | None:
     """
     POST one permission-style hook payload, surviving severed long-polls.
@@ -702,7 +779,9 @@ def _post_hook_with_reattach(
       :data:`_PERMISSION_HELD_POLL_FLOOR_S`, or a connection that never
       established (:func:`_never_connected_errors`), or an established
       connection that dropped in under the floor (a flapping/crash-looping
-      server). This is the spin.
+      server). This is the spin. Exception: once a poll has been held, a
+      connect that never reaches the server (a host network outage) backs
+      off without counting, so the card re-parks when the network returns.
     * **Held-poll sever → reset the counter and the backoff.** An established
       connection that dropped mid-poll after being held ≥ the floor, or a
       gateway 5xx (the Databricks front door answers an idle long-poll with
@@ -738,8 +817,13 @@ def _post_hook_with_reattach(
     one hook re-POSTing once per proxy timeout for up to a day, which also
     keeps the card alive until the server recovers.
 
-    The absolute :data:`_PERMISSION_TIMEOUT_S` ceiling bounds the total wait on
-    every path, matching the day-long human-answer window.
+    The absolute :data:`_PERMISSION_TIMEOUT_S` ceiling, matching the day-long
+    human-answer window, ends retries on every path. It falls
+    :data:`_PERMISSION_DEADLINE_MARGIN_S` short: no request or backoff starts
+    past it, and each request's connect and read timeouts are clipped to the
+    time left. The margin leaves room for that last connect and read before
+    Claude's own hook timeout; it does not bound a slow token renewal or a
+    response that keeps trickling data.
 
     :param url: Absolute hook endpoint URL, e.g.
         ``"http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request"``.
@@ -753,15 +837,25 @@ def _post_hook_with_reattach(
         or returns ``401`` — i.e. the one-shot ``ap_auth_headers`` token lapsed.
         Called at most once per accepted poll: new headers trigger an immediate
         retry, and a poll the server then held past the floor re-arms it, so a
-        wait longer than the token lifetime survives every lapse while two
-        rejections in a row still fail-ask. ``None`` keeps the legacy behavior.
+        wait longer than the token lifetime survives every lapse. Two rejections
+        in a row fail-ask until a poll has been held; after that, the hook keeps
+        retrying until the deadline. ``None`` keeps the legacy behavior.
     :param wait_marker: Approval-wait marker held fresh for the life of the
         wait (see :func:`hold_approval_wait_marker`), from
         :func:`approval_wait_marker_path`, so the idle pane reaper spares a
         pane parked on this prompt. ``None`` skips the marker (non-approval
         callers).
-    :returns: The successful (2xx) response, or ``None`` when rejected
-        or out of budget — callers fail-ask as before.
+    :param answer_window_s: For prompts with no useful terminal-only fallback:
+        after a held poll is lost, keep retrying hard failures past the cap for
+        this many seconds, while the server can still hand back an answer
+        submitted meanwhile. After it, a failure from a reachable server or an
+        auth lapse that can't be renewed ends retries whatever the cap, while a
+        parked wait still rides out an unreachable server. ``None`` keeps the
+        count-based cap alone.
+    :returns: The successful (2xx) response, or ``None`` when the server
+        rejects the request (a 4xx, including an auth rejection that can't be
+        re-minted before any held poll), or when the hard-failure cap, answer
+        window, or deadline runs out.
     """
     body = {
         **payload,
@@ -770,25 +864,51 @@ def _post_hook_with_reattach(
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
     import httpx
 
-    from omnigent.native.native_policy_hook import _is_login_redirect_or_unauthorized
+    from omnigent.native.native_policy_hook import (
+        _is_login_redirect_or_unauthorized,
+        is_loopback_url,
+    )
 
-    timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
     # Absolute backstop: even a run of held-poll severs (which don't count
     # toward the hard-failure cap) can't loop past the day-long human-answer
     # window — matches the read budget and the server's ask_timeout.
-    deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
+    deadline = time.monotonic() + _PERMISSION_TIMEOUT_S - _PERMISSION_DEADLINE_MARGIN_S
     reauthed = False
     consecutive_hard_failures = 0
+    # Once the server has held a poll, the card is live: ride out a network
+    # outage until the deadline so the re-POST re-publishes it on reconnect.
+    parked = False
+    answer_window_ends_at: float | None = None
     marker_scope = (
         hold_approval_wait_marker(wait_marker)
         if wait_marker is not None
         else contextlib.nullcontext()
     )
     with marker_scope:
+        trust_env = not is_loopback_url(url)
         while True:
             attempt_started = time.monotonic()
+            remaining_s = deadline - attempt_started
+            if remaining_s <= 0.0:
+                print(
+                    f"omnigent {hook_label} hook: retry budget exhausted "
+                    f"({_PERMISSION_TIMEOUT_S - _PERMISSION_DEADLINE_MARGIN_S:.0f}s) "
+                    "— failing ask",
+                    file=sys.stderr,
+                )
+                return None
+            timeout = httpx.Timeout(
+                remaining_s,
+                connect=min(_PERMISSION_CONNECT_TIMEOUT_S, remaining_s),
+                read=min(_PERMISSION_POLL_READ_TIMEOUT_S, remaining_s),
+            )
+            never_connected = False
             try:
-                with httpx.Client(headers=headers, timeout=timeout) as client:
+                with httpx.Client(
+                    headers=headers,
+                    timeout=timeout,
+                    trust_env=trust_env,
+                ) as client:
                     resp = client.post(url, json=body)
                     if (
                         reauth is not None
@@ -812,6 +932,31 @@ def _post_hook_with_reattach(
                     resp.raise_for_status()
                     return resp
             except httpx.HTTPStatusError as exc:
+                if (
+                    reauth is not None
+                    and parked
+                    and _is_login_redirect_or_unauthorized(exc.response)
+                ):
+                    # A parked prompt may outlive login; retry reauth until its deadline.
+                    retry_by = deadline
+                    if answer_window_ends_at is not None:
+                        if time.monotonic() >= answer_window_ends_at:
+                            print(
+                                f"omnigent {hook_label} hook: Omnigent auth could not "
+                                f"be renewed within the answer window — failing ask: {exc}",
+                                file=sys.stderr,
+                            )
+                            return None
+                        retry_by = min(deadline, answer_window_ends_at)
+                    print(
+                        f"omnigent {hook_label} hook: Omnigent auth lapsed and "
+                        f"could not be renewed; retrying: {exc}",
+                        file=sys.stderr,
+                    )
+                    reauthed = False
+                    _sleep_before_retry(backoff_s, retry_by)
+                    backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
+                    continue
                 if exc.response.status_code < 500:
                     print(
                         f"omnigent {hook_label} hook: Omnigent request rejected: {exc}",
@@ -849,8 +994,12 @@ def _post_hook_with_reattach(
                     file=sys.stderr,
                 )
             if is_hard_failure:
-                consecutive_hard_failures += 1
+                # A connect that never reached the server cannot spin it, so a
+                # parked wait keeps backing off without counting toward the cap.
+                if not (parked and never_connected):
+                    consecutive_hard_failures += 1
             else:
+                parked = True
                 # A proxy severed a genuinely-held poll — the re-park mechanism
                 # working as intended. Reset so a slow human is never capped, and
                 # re-POST promptly so the same id re-parks inside the server's
@@ -861,7 +1010,26 @@ def _post_hook_with_reattach(
                 # re-mint is armed again: a wait longer than the token lifetime
                 # lapses once an hour, and each lapse must be re-mintable.
                 reauthed = False
-            if consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
+                if answer_window_s is not None:
+                    answer_window_ends_at = time.monotonic() + answer_window_s
+            retry_by = deadline
+            if answer_window_ends_at is not None and time.monotonic() < answer_window_ends_at:
+                # The server can still hand back an answer submitted since the
+                # poll was lost, so the cap waits for the window to end.
+                retry_by = min(deadline, answer_window_ends_at)
+            elif answer_window_ends_at is not None and not never_connected:
+                # That answer has expired, so a raised cap can't recover it.
+                print(
+                    f"omnigent {hook_label} hook: Omnigent still failing after the "
+                    "answer window — failing ask",
+                    file=sys.stderr,
+                )
+                return None
+            elif consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES and not (
+                # Failures counted inside a question's window must not end a
+                # parked wait that then rides out an unreachable server.
+                parked and never_connected
+            ):
                 print(
                     f"omnigent {hook_label} hook: giving up after "
                     f"{consecutive_hard_failures} consecutive hard failures "
@@ -870,15 +1038,8 @@ def _post_hook_with_reattach(
                 )
                 return None
             # Two-line backoff; not worth a retry lib in this dependency-light hook.
-            time.sleep(backoff_s)
+            _sleep_before_retry(backoff_s, retry_by)
             backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
-            if time.monotonic() >= deadline:
-                print(
-                    f"omnigent {hook_label} hook: retry budget exhausted "
-                    f"({_PERMISSION_TIMEOUT_S:.0f}s) — failing ask",
-                    file=sys.stderr,
-                )
-                return None
 
 
 def _main_permission_request(argv: list[str]) -> int:
@@ -888,8 +1049,11 @@ def _main_permission_request(argv: list[str]) -> int:
     :param argv: CLI argv after the ``permission-request`` subcommand,
         e.g. ``["--bridge-dir", "/tmp/x", "--omnigent-server-url",
         "http://127.0.0.1:8787"]``.
-    :returns: Process exit code. Returns ``0`` on transport failures so
-        Claude Code falls back to its terminal prompt.
+    :returns: Process exit code. Returns ``0`` without a decision when no
+        web verdict arrives (Omnigent rejected the request, was unreachable
+        past the retry budget, or its wait expired), so Claude Code falls back
+        to its terminal prompt; an ``AskUserQuestion`` is denied instead so
+        Claude asks it in chat text.
     """
     from omnigent.native.native_policy_hook import policy_hook_reauth
 
@@ -929,6 +1093,7 @@ def _main_permission_request(argv: list[str]) -> int:
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
     )
+    is_question = payload.get("tool_name") == "AskUserQuestion"
     resp = _post_hook_with_reattach(
         url,
         headers,
@@ -936,12 +1101,43 @@ def _main_permission_request(argv: list[str]) -> int:
         "claude permission",
         reauth=policy_hook_reauth(ap_server_url, headers),
         wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
+        answer_window_s=(
+            PRE_RESOLVED_ELICITATION_TTL_S - _QUESTION_ANSWER_WINDOW_MARGIN_S
+            if is_question
+            else None
+        ),
     )
-    if resp is None:
+    # The server returns an empty 200 when the question wait expires.
+    if resp is None or not resp.content:
+        if is_question:
+            decision = {"behavior": "deny", "message": _ASK_USER_QUESTION_UNAVAILABLE_MESSAGE}
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PermissionRequest",
+                            "decision": decision,
+                        }
+                    }
+                )
+            )
         return 0
-    if resp.content:
-        sys.stdout.write(resp.text)
+    sys.stdout.write(resp.text)
     return 0
+
+
+def _skip_httpx_cli_import() -> None:
+    """
+    Keep httpx from importing its command-line client, and with it rich and click.
+
+    httpx imports ``httpx._main`` inside ``try/except ImportError``, so a
+    placeholder without ``main`` gives it the fallback stub. The policy hook
+    never runs that client, and Claude Code waits on the hook's imports.
+
+    :returns: None.
+    """
+    if "httpx" not in sys.modules:
+        sys.modules.setdefault("httpx._main", types.ModuleType("httpx._main"))
 
 
 def _main_evaluate_policy(argv: list[str]) -> int:
@@ -995,6 +1191,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     :returns: Process exit code. Always ``0`` — blocking verdicts
         are expressed via the JSON output, not exit codes.
     """
+    _skip_httpx_cli_import()
     from omnigent.native.native_policy_hook import (
         evaluation_response_to_hook_output,
         fail_ask_hook_output,
@@ -1016,6 +1213,11 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         print("omnigent evaluate-policy hook: expected JSON object", file=sys.stderr)
         return 0
     bridge_dir = Path(args.bridge_dir)
+    from omnigent.native import policy_allow_cache
+
+    # Read before the session identity: a session switch picks a new
+    # generation, so an answer for the previous session opens no window.
+    cache_generation = policy_allow_cache.generation(bridge_dir)
     session_id = read_active_session_id(bridge_dir)
     if not session_id:
         return 0
@@ -1068,6 +1270,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
         reauth = policy_hook_reauth(ap_server_url, headers)
 
+    requested_at = time.time()
     resp, api_error = post_evaluate_with_retry(
         url,
         headers,
@@ -1088,6 +1291,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         print("omnigent evaluate-policy hook: malformed Omnigent response", file=sys.stderr)
         return _fail_closed()
 
+    # Through the relay the server evaluated the relay's session, which can
+    # trail a session switch.
+    if relay is None or relay[2] == session_id:
+        policy_allow_cache.record(bridge_dir, cache_generation, eval_response, requested_at)
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:
         sys.stdout.write(json.dumps(hook_output))
@@ -1366,5 +1573,35 @@ def _route_turn_post(
     return decoded if isinstance(decoded, dict) else None
 
 
+# Claude Code waits on these on every tool call and prompt.
+_FAST_EXIT_SUBCOMMANDS = frozenset({"evaluate-policy", "pre-tool-use"})
+
+
+def _exit_without_teardown(code: int) -> NoReturn:
+    """
+    Finalize as the interpreter would, then leave before module teardown.
+
+    Claude Code blocks on the policy hook until its process exits, and tearing
+    down the modules it imported costs tens of milliseconds on every tool call.
+    This runs the ``threading`` exit callbacks and joins non-daemon threads,
+    then runs the ``atexit`` callbacks, in the interpreter's own order (as
+    CPython 3.13's forked multiprocessing children do), so pending writes and
+    exit work still finish. Only object finalizers that run during module
+    teardown are skipped.
+
+    :param code: Process exit code, e.g. ``0``.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    threading._shutdown()  # type: ignore[attr-defined]  # private, as in multiprocessing
+    atexit._run_exitfuncs()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    if sys.argv[1:2] and sys.argv[1] in _FAST_EXIT_SUBCOMMANDS:
+        _exit_without_teardown(exit_code)
+    raise SystemExit(exit_code)

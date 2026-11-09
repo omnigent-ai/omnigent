@@ -230,9 +230,20 @@ sandbox:
     sweep_interval_s: 86400           # optional; defaults to 1 day
 ```
 
+Disabling `reaper.enabled` stops age-based offline cleanup. Retries of teardown
+already requested by session or host deletion continue running.
+
 The server resolves the provider through the registry and calls
 `prepare()` → `provision()` → `start_host()` → wait for online registration.
 Each managed sandbox authenticates back with a server-minted per-launch token.
+`start_host()` must start the host under the `host_id` it is given: the token
+only resolves for that id, and a client may have chosen the id at create time
+(a managed create's `host_id`) so it can route the session's requests to it
+before the host connects. The host then keys its own traffic by that id, and a
+host whose create chose none does not, so it reaches the same server replica as
+the caller's unkeyed requests. The server sets this through
+`host.slice_key_enabled` in `host_config`, so `start_host()` must accept and
+install `host_config` (as `ExecModelHostLauncher` does).
 
 Sandbox automations use this same launch path and create a fresh sandbox for
 each run. Existing managed sandbox hosts cannot be pinned as automation targets.
@@ -241,9 +252,13 @@ chats: automations do not override timeouts or terminate a sandbox when a run
 finishes. Server owners must choose provider lifetime, idle, and cleanup settings
 appropriate for their automation frequency and resource budget.
 
-For `agent_sandbox`, `sandbox.keep_warm_s` controls the runner idle timeout;
-the existing keepalive renews the sandbox deadline while the runner is alive.
-Once renewal stops, expiry suspends compute while retaining storage. Other
+The server's keepalive calls a provider's `keep_alive` while the sandbox's
+runner reports agent work, and for the runner idle timeout
+(`host_config.runner.idle_timeout_s`, one hour by default) afterwards, so a
+sandbox stays warm about as long as an idle runner stays alive. Viewing a session
+does not count as work. After renewal stops, the provider's own idle or expiry
+behavior applies. For `agent_sandbox`, `sandbox.keep_warm_s` sets that runner
+idle timeout, and expiry suspends compute while retaining storage. Other
 providers have different lifetime behavior, so enabling managed sandboxes alone
 does not guarantee a short shutdown time.
 
@@ -278,6 +293,13 @@ Providers declare their feature set via a `capabilities` property returning
 | `file_copy` | Supports copying files into the sandbox |
 | `streaming_exec` | Supports streaming process execution |
 | `foreground_exec` | Supports a foreground exec with inherited stdio |
+
+## Provider-owned sandbox profiles
+
+Providers can offer per-user sandbox choices by implementing `list_profiles` and
+`select_profile` on their launcher. They own configuration and authorization;
+Omnigent shows approved metadata and saves an immutable revision reference.
+See [the provider contract and rollout guide](provider_profiles.md).
 
 ## Network policy for harness bridge servers
 

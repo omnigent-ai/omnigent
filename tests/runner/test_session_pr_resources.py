@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import threading
 import time
 from pathlib import Path
 from threading import Barrier
@@ -17,7 +19,9 @@ from filelock import Timeout as FileLockTimeout
 from omnigent.runner import create_runner_app, pr_resource
 from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from omnigent.runner.slow_io import run_slow_io
 from omnigent.workspace_fs import WorkspaceReader
+from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 
@@ -92,7 +96,7 @@ def test_titles_include_unselected_prs_and_are_cached_between_polls(
         B: "Second",
     }
     assert [call[-1] for call in calls] == [
-        github._PR_VIEW_FIELDS + ",headRefOid,baseRefOid",
+        github._PR_VIEW_FIELDS + ",headRefOid,baseRefOid,headRepository,headRepositoryOwner",
         "title",
     ]
     registry = SessionPrRegistry("session")
@@ -216,12 +220,12 @@ def test_slow_title_lookups_preserve_metadata_and_leave_queued_prs_for_next_poll
     def run(argv: list[str], *, timeout: float, **_kwargs: object) -> tuple[int | None, str, str]:
         nonlocal clock
         if argv[-1] != "title":
-            assert github._pr_title_deadline.get() is None
+            assert github._gh_deadline.get() is None
             assert timeout == github._gh_timeout_seconds()
             return 0, '{"title": "Selected PR"}', ""
         assert 0 < timeout <= 0.2
         attempted.append(argv[3])
-        deadline = github._pr_title_deadline.get()
+        deadline = github._gh_deadline.get()
         assert deadline is not None
         title_lookups.wait()
         # Concurrent timeouts expire at the same deadline, regardless of scheduling.
@@ -308,18 +312,18 @@ def test_title_deadline_is_shared_across_enterprise_auth_and_view(
         return 0, '{"title": "Enterprise PR"}', ""
 
     monkeypatch.setattr(github, "_run", run)
-    token = github._pr_title_deadline.set(12.0)
-    timeout_token = github._pr_title_timed_out.set(False)
+    token = github._gh_deadline.set(12.0)
+    timeout_token = github._gh_timed_out.set(False)
     try:
         result = github._pr_json(
             str(tmp_path),
             PullRequestRef.from_url(A.replace("github.com", "github.example.org")),
             "title",
         )
-        timed_out = github._pr_title_timed_out.get()
+        timed_out = github._gh_timed_out.get()
     finally:
-        github._pr_title_timed_out.reset(timeout_token)
-        github._pr_title_deadline.reset(token)
+        github._gh_timed_out.reset(timeout_token)
+        github._gh_deadline.reset(token)
     if command_seconds == 0.6:
         assert timeouts == pytest.approx([2.0, 1.4, 0.8])
         assert result == {"title": "Enterprise PR"}
@@ -328,7 +332,7 @@ def test_title_deadline_is_shared_across_enterprise_auth_and_view(
         assert timeouts == [2.0]
         assert result is None
         assert timed_out is True
-    assert github._pr_title_deadline.get() is None
+    assert github._gh_deadline.get() is None
 
 
 def test_slow_selected_metadata_does_not_get_extra_title_work(
@@ -379,7 +383,7 @@ def test_title_timeout_at_request_deadline_retries_after_short_backoff(
     entry = next(entry for entry in registry.list() if entry.url == A)
     assert entry.title_checked_at == wall_clock
     assert entry.title_lookup_timed_out
-    assert github._pr_title_timed_out.get() is False
+    assert github._gh_timed_out.get() is False
 
     wall_clock += pr_resource._PR_TITLE_TIMEOUT_RETRY_SECONDS - 0.1
     github.github_info(tracked, session_id="session", pr_url=B)
@@ -447,7 +451,12 @@ def test_unassociated_selection_is_rejected(tracked: str) -> None:
 
 def test_auth_failure_preserves_pr_list(tracked: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(github, "_gh", lambda *_args, **_kwargs: (1, "", "not authenticated"))
+    accounts = [{"login": "alice", "host": "github.com", "active": True}]
+    monkeypatch.setattr(github, "_list_accounts", lambda _: (True, accounts))
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _: "alice")
     info = github.github_info(tracked, session_id="session", pr_url=B)
+    assert info["accounts"] == accounts
+    assert info["selected_account"] == "alice"
     assert info["authenticated"] is False
     assert info["selected_pr_url"] == B
     assert len(info["prs"]) == 2
@@ -490,6 +499,149 @@ def test_context_uses_fork_head_and_merge_base(
         github.github_file_diff(
             tracked, "main", "new.py", session_id="session", pr_url=B, head_sha="stale"
         )
+
+
+async def test_changes_route_pins_revision_and_reports_truncation(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head, base = "a" * 40, "b" * 40
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if args[-1] == "repos/example/two/pulls/42":
+            pr = {"head": {"sha": head}, "base": {"sha": base}, "changed_files": 3001}
+            return 0, json.dumps(pr), ""
+        assert args[-1] == "repos/example/two/pulls/42/files?per_page=100"
+        page = [{"filename": f"f{index}.py", "status": "added"} for index in range(3000)]
+        return 0, json.dumps([page]), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.get(
+            "/v1/sessions/session/resources/github/changes",
+            params={"pr_url": B, "head_sha": head, "base_sha": base},
+        )
+        partial = await client.get(
+            "/v1/sessions/session/resources/github/changes",
+            params={"pr_url": B, "head_sha": head},
+        )
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert len(result["data"]) == 3000
+    assert {key: result[key] for key in ("has_more", "total_count", "head_sha", "base_sha")} == {
+        "has_more": True,
+        "total_count": 3001,
+        "head_sha": head,
+        "base_sha": base,
+    }
+    assert result["warning"] == "The provider lists at most 3000 files; 1 files are not shown."
+    assert partial.status_code == 400
+    assert partial.json()["detail"] == "Expected full head and base commit SHAs"
+
+
+@pytest.mark.parametrize("bad_sha", ["", "abc", "A" * 40, "a" * 39, "a" * 41])
+def test_commit_ids_must_be_full_lowercase_shas(
+    tracked: str, monkeypatch: pytest.MonkeyPatch, bad_sha: str
+) -> None:
+    def forbidden_gh(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("A malformed commit id must not reach gh")
+
+    monkeypatch.setattr(github, "_gh", forbidden_gh)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        pr_resource.pr_commits(tracked, session_id="session", pr_url=B, head_sha=bad_sha)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        pr_resource.pr_commit_diff(tracked, session_id="session", pr_url=B, commit_sha=bad_sha)
+
+
+async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head, commit = "a" * 40, "c" * 40
+    pr = {"head": {"sha": head}, "base": {"sha": "b" * 40}, "commits": 1}
+    listing = [
+        [
+            {
+                "sha": commit,
+                "commit": {
+                    "message": "Fix the thing\n\nDetails",
+                    "author": {"name": "Ada", "date": "2026-11-01T10:00:00Z"},
+                },
+            }
+        ]
+    ]
+    gh_args: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        gh_args.append(args)
+        if args[-1] == "repos/example/two/pulls/42":
+            return 0, json.dumps(pr), ""
+        if args[-1] == "repos/example/two/pulls/42/commits?per_page=100":
+            return 0, json.dumps(listing), ""
+        assert args[-1] == f"repos/example/two/commits/{commit}"
+        return 0, "commit-patch", ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        commits = await client.get(
+            "/v1/sessions/session/resources/github/commits",
+            params={"pr_url": B, "head_sha": head},
+        )
+        unpinned = await client.get(
+            "/v1/sessions/session/resources/github/commits", params={"pr_url": B}
+        )
+        moved = await client.get(
+            "/v1/sessions/session/resources/github/commits",
+            params={"pr_url": B, "head_sha": "d" * 40},
+        )
+        patch = await client.get(
+            "/v1/sessions/session/resources/github/commit-diff",
+            params={"pr_url": B, "commit_sha": commit},
+        )
+        malformed = await client.get(
+            "/v1/sessions/session/resources/github/commit-diff",
+            params={"pr_url": B, "commit_sha": "abc"},
+        )
+        foreign = await client.get(
+            "/v1/sessions/session/resources/github/commit-diff",
+            params={"pr_url": B, "commit_sha": "e" * 40},
+        )
+
+    assert commits.status_code == 200, commits.text
+    assert commits.json() == {
+        "object": "list",
+        "has_more": False,
+        "data": [
+            {
+                "object": "session.github.commit",
+                "sha": commit,
+                "title": "Fix the thing",
+                "author": "Ada",
+                "date": "2026-11-01T10:00:00Z",
+            }
+        ],
+    }
+    assert unpinned.status_code == 400
+    assert unpinned.json()["detail"] == "Expected head_sha to be a full commit SHA"
+    assert moved.status_code == 400
+    assert "pull request changed" in moved.json()["detail"]
+    assert patch.status_code == 200, patch.text
+    assert patch.json() == {"object": "session.github.pr_diff", "patch": "commit-patch"}
+    assert any("Accept: application/vnd.github.diff" in args for args in gh_args)
+    assert malformed.status_code == 400
+    assert foreign.status_code == 400
+    assert foreign.json()["detail"] == "That commit is not part of the selected pull request."
 
 
 @pytest.fixture
@@ -612,6 +764,74 @@ async def test_pr_reads_report_lock_contention_and_allow_retry(
     assert response.status_code == 200, response.text
     assert {pr["url"] for pr in response.json()["prs"]} == {A, B}
     assert reader.github_info(session_id="session", pr_url=pr_url)["pr"]["number"] == 42
+
+
+async def test_runner_serves_a_pr_the_server_vouches_for(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh host never recorded the session's PR; the server's vouching is enough."""
+    monkeypatch.setattr(github, "_gh", lambda *_a, **_kw: (0, '{"number": 42}', ""))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/fresh/resources/github"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        refused = await client.get(path, params={"pr_url": A})
+        served = await client.get(path, params={"pr_url": A, "server_tracked": "1"})
+        default = await client.get(path, params={"default_pr_url": A, "server_tracked": "1"})
+    assert refused.status_code == 400
+    assert served.status_code == 200, served.text
+    assert served.json()["pr"]["number"] == 42
+    assert default.json()["selected_pr_url"] == A
+    assert SessionPrRegistry("fresh").list() == []
+
+
+async def test_pr_panel_reads_answer_while_changed_file_listings_hold_the_slow_pool(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provider CLI reads have their own threads, so stuck ``git status`` can't delay them."""
+    gh_threads: list[str] = []
+
+    def fake_gh(*_args: object, **_kwargs: object) -> tuple[int, str, str]:
+        gh_threads.append(threading.current_thread().name)
+        return 0, '{"number": 42}', ""
+
+    monkeypatch.setattr(github, "_gh", fake_gh)
+    release_git = threading.Event()
+    listings_started = [threading.Event() for _ in range(4)]
+
+    def stuck_listing(started: threading.Event) -> None:
+        started.set()
+        release_git.wait(budget(30))
+
+    listings = [asyncio.create_task(run_slow_io(stuck_listing, e)) for e in listings_started]
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    try:
+        await poll_until_async(
+            lambda: all(e.is_set() for e in listings_started), timeout_s=budget(5)
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            response = await asyncio.wait_for(
+                client.get(
+                    "/v1/sessions/fresh/resources/github",
+                    params={"pr_url": A, "server_tracked": "1"},
+                ),
+                timeout=budget(5),
+            )
+    finally:
+        release_git.set()
+        await asyncio.gather(*listings)
+
+    assert response.status_code == 200, response.text
+    assert gh_threads and all(name.startswith("runner-provider-cli_") for name in gh_threads)
 
 
 @pytest.mark.parametrize("operation", ["github_changes", "github_pr_diff", "github_file_diff"])
@@ -748,5 +968,8 @@ def test_enterprise_without_auth_retains_selection(
     monkeypatch.setattr(github, "_gh", gh)
     info = github.github_info(tracked, session_id="session", pr_url=url)
     assert info["selected_pr_url"] == url
+    assert info["authenticated"] is False
+    assert info["accounts"] == []
+    assert info["selected_account"] is None
     assert info["pr"] is None
     assert len(info["prs"]) == 3

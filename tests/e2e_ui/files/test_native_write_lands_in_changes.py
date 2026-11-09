@@ -51,6 +51,7 @@ from tests.e2e_ui.conftest import (
     open_right_rail,
     reset_mock_llm,
 )
+from tests.helpers.ui_configuration import validate_native_claude_mock_routing
 
 _FILE_NAME = "native_write_report.txt"
 _FILE_CONTENT = "hello from Claude Code's native Write tool\n"
@@ -96,6 +97,7 @@ def native_claude_nongit_session(
     mock_llm_server_url: str,
     tmp_path: Path,
     tmp_path_factory: pytest.TempPathFactory,
+    claude_managed_settings: None,
 ) -> Iterator[tuple[str, str, Path]]:
     """A runner-bound claude-native session in a fresh non-git workspace.
 
@@ -110,9 +112,11 @@ def native_claude_nongit_session(
     workspace = tmp_path / "plain-folder"
     workspace.mkdir()
 
+    use_mock = not os.environ.get("LLM_API_KEY")
+    if use_mock:
+        validate_native_claude_mock_routing(mock_llm_server_url)
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
-    use_mock = not os.environ.get("LLM_API_KEY")
     ctx: Any = (
         _temp_omnigent_mock_config(mock_llm_server_url, "claude")
         if use_mock

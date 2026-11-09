@@ -22,7 +22,7 @@ do not guess cwd-relative paths.
 | First turn: input, mode, recovery, preflight, existing-fix discovery | `resolve-inputs` |
 | Investigation: reported path, cause, and design intent | `resolve-investigate` |
 | Recovered repro, before authoring or reviewing | `resolve-repro-audit` |
-| Every mode: affected behavior, consumers, checks, evidence | `resolve-impact-assessment` |
+| Every mode: affected behavior, consumers, checks, evidence | `otto-impact-assessment` |
 | Existing fix PR (Step 2A) | `resolve-review-pr` |
 | Authoring the fix (Step 2B) | `resolve-author-fix` |
 | Author commit and publication choice (Step 3) | `resolve-publish` |
@@ -31,7 +31,7 @@ do not guess cwd-relative paths.
 
 Start with `resolve-inputs`. For reproduction-driven work, complete
 `resolve-repro-audit` before the existing-fix search and either resolution path.
-Start `resolve-impact-assessment` during investigation and refresh it against
+Start `otto-impact-assessment` during investigation and refresh it against
 the full final diff before delivery. Step 1–4 names are consistent across skills.
 
 ## Mode and authority
@@ -40,7 +40,7 @@ Exactly one work source selects the mode:
 
 - `session` or `ci_link`: recover and audit the repro, then discover an existing
   fix PR. Review it if sound; otherwise follow the author procedure.
-- `review_pr`: follow `resolve-inputs`' review-remediation resource. Work on the
+- `review_pr`: follow the shared `otto-review-remediation` skill. Work on the
   named PR's current branch, handle trusted human change requests, and use the
   workflow's fixed-target push command. Never create a replacement PR, rebase,
   rewrite history, approve, or dismiss human reviews. This mode skips inherited

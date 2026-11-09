@@ -45,7 +45,7 @@ const SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
 
 // The request is valid but reached a replica without its host tunnel.
 // Unlike runner_unavailable, wrong_replica can recover by re-addressing.
-const WRONG_REPLICA_CODE = "wrong_replica";
+export const WRONG_REPLICA_CODE = "wrong_replica";
 
 /**
  * Classify a request URL for slice-key routing. A host-scoped request must key
@@ -237,10 +237,23 @@ function beginSessionHostResolve(url: string): Promise<void> | null {
 // {@link hostScopeForUrl} can't see it: the session create (POST /v1/sessions)
 // and the host-mediated local import (POST /v1/imports/local[/stream]).
 const BODY_HOST_KEYED_RE = /\/v1\/(?:sessions(?:\?|$)|imports\/local(?:[/?]|$))/;
+// A managed fork keys like a managed create: its launch must run where its own
+// new host connects, never on the source session's replica.
+const FORK_RE = /\/v1\/sessions\/[^/?#]+\/fork(?:\?|$)/;
+
+function isManagedForkRequest(url: string, body: BodyInit | null | undefined): boolean {
+  if (typeof body !== "string" || !FORK_RE.test(url)) return false;
+  try {
+    return (JSON.parse(body) as { host_type?: unknown }).host_type === "managed";
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Recover the target host_id from a JSON request body for a body-host-keyed
- * request ({@link isBodyHostKeyedRequest}), or null when the body names none.
+ * request ({@link isBodyHostKeyedRequest}) or a managed fork, or null when the
+ * body names none.
  *
  * These requests carry the host in the body, not the URL, so left unkeyed they
  * round-robin and can miss the replica holding that host's runner tunnel. A
@@ -248,15 +261,17 @@ const BODY_HOST_KEYED_RE = /\/v1\/(?:sessions(?:\?|$)|imports\/local(?:[/?]|$))/
  * inline over its pod-local tunnel); an import fails "host is not connected"
  * (the import reads the host's transcripts over that same tunnel). Keying by the
  * body host_id pins both to the right replica like every other host-scoped
- * request. Bundled (multipart) creates are hostless here (non-string body) and a
- * managed-sandbox create carries ``host_type`` but no ``host_id``; both yield
- * null → unkeyed (see {@link isBodyHostKeyedRequest}).
+ * request. A managed-sandbox create's ``host_id`` is the id it chose for its
+ * new sandbox host, so the launch runs where that host's tunnel will land.
+ * Multipart creates carry the same routing fields in their metadata part.
+ * Creates without a host ID stay unkeyed.
  */
 function hostIdFromBody(url: string, body: BodyInit | null | undefined): string | null {
-  if (typeof body !== "string") return null;
-  if (!BODY_HOST_KEYED_RE.test(url)) return null;
+  const metadata = body instanceof FormData ? body.get("metadata") : body;
+  if (typeof metadata !== "string") return null;
+  if (!BODY_HOST_KEYED_RE.test(url) && !FORK_RE.test(url)) return null;
   try {
-    const hostId = (JSON.parse(body) as { host_id?: unknown }).host_id;
+    const hostId = (JSON.parse(metadata) as { host_id?: unknown }).host_id;
     return typeof hostId === "string" && hostId ? hostId : null;
   } catch {
     return null;
@@ -269,20 +284,20 @@ function hostIdFromBody(url: string, body: BodyInit | null | undefined): string 
  * The modal host is a cache-affinity hint for reads, but these requests have a
  * side effect pinned to a replica and must key by their OWN target host:
  *
- * - A managed create has no host_id yet and stays unkeyed. If the new host
- *   connects elsewhere, its first message must resolve the assigned host and
- *   re-address after wrong_replica. A create that names a host keeps that key.
+ * - A managed create keys by the host_id it chose for its sandbox host. One
+ *   without a host_id stays unkeyed: if the new host connects elsewhere, its
+ *   first message must resolve the assigned host and re-address after
+ *   wrong_replica. A create that names a host keeps that key.
  * - A local import reads the chosen host's transcripts over its tunnel, which is
  *   registered on the replica keyed by that host_id — never the importing user's
  *   modal host (null / a different host for a fresh user), which is why an
  *   unkeyed import lands off-replica and 409s "host is not connected".
  *
- * A bundled (multipart) create has a non-string body and is not matched: it only
- * writes rows and binds the runner via a separate ``POST /v1/hosts/{id}/runners``
- * (keyed from the URL), so it spawns no replica-pinned work and may ride the modal.
+ * Multipart creates can launch on a host during creation, so they use the same
+ * routing rule as JSON creates.
  */
 function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined): boolean {
-  return typeof body === "string" && BODY_HOST_KEYED_RE.test(url);
+  return (typeof body === "string" || body instanceof FormData) && BODY_HOST_KEYED_RE.test(url);
 }
 
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
@@ -574,7 +589,9 @@ export async function authenticatedFetch(
     // it is keyable ONLY by that body host_id (a managed create with none stays
     // unkeyed).
     const scope = hostScopeForUrl(url);
-    if (scope.scoped) {
+    if (isManagedForkRequest(url, init?.body)) {
+      derivedHostId = hostIdFromBody(url, init?.body);
+    } else if (scope.scoped) {
       derivedHostId = scope.hostId;
     } else if (isBodyHostKeyedRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
@@ -694,4 +711,28 @@ export async function authenticatedFetch(
     if (loginUrl) redirectToLogin(loginUrl);
   }
   return res;
+}
+
+// A light authenticated read the SPA already makes at boot. It reaches the same
+// auth edge as the stream and the sends, so its answer speaks for them.
+const SIGN_IN_PROBE_PATH = "/v1/me";
+
+/**
+ * Whether the sign-in has expired, judged from one request that does not follow
+ * redirects. A redirect to a login page or a 401/403 means a retry cannot renew the
+ * sign-in. The edge answers an invalid session with a redirect, never an HTML 200,
+ * so a 200 (such as a maintenance page) reads as not expired. A failed probe also
+ * reads as not expired, and the caller keeps retrying.
+ */
+export async function isSignInExpired(signal?: AbortSignal): Promise<boolean> {
+  try {
+    const res = await hostFetch(SIGN_IN_PROBE_PATH, {
+      redirect: "manual",
+      cache: "no-store",
+      signal,
+    });
+    return res.type === "opaqueredirect" || res.status === 401 || res.status === 403;
+  } catch {
+    return false;
+  }
 }

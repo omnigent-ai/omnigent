@@ -3,11 +3,13 @@ import type { NativeModelOption } from "@/lib/types";
 
 import {
   effortLevelsForConv,
+  shouldShowEffortPicker,
+  shouldShowModelPicker,
+} from "@/lib/composerCapabilities";
+import {
   shouldShowCodexApprovalModeControl,
   shouldShowCodexPlanModeControl,
-  shouldShowEffortPicker,
   shouldShowGoalControl,
-  shouldShowModelPicker,
   shouldShowPollyClaudeGoalControl,
   shouldShowPollyCodexGoalControl,
 } from "./ChatPage";
@@ -326,5 +328,39 @@ describe("shouldShowPollyCodexGoalControl", () => {
         parentSessionId: null,
       }),
     ).toBe(false);
+  });
+});
+
+describe("effortLevelsForConv with a declared effort family", () => {
+  it("offers the family's ladder to a label-less SDK conversation", () => {
+    // WHY: claude-sdk carries no wrapper label; its ladder is the declared
+    // anthropic family, not the shared 3-level default.
+    const conv = { labels: {}, harness: "claude-sdk" };
+    expect(effortLevelsForConv(conv, [], null, "anthropic")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(effortLevelsForConv({ labels: {}, harness: "codex" }, [], null, "openai")).toEqual([
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+  });
+
+  it("lets the wrapper label win over a family for native conversations", () => {
+    const conv = { labels: { "omnigent.wrapper": "claude-code-native-ui" } };
+    expect(effortLevelsForConv(conv, [], null, "openai")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
   });
 });

@@ -49,6 +49,8 @@ def test_ios_ipad_keeps_header_and_composer_in_visible_viewport(
 
     toggle_box = open_sidebar.bounding_box()
     assert toggle_box is not None
+    assert toggle_box["width"] >= 44
+    assert toggle_box["height"] >= 44
     assert toggle_box["y"] >= _IPAD_SAFE_AREA["top"], (
         f"sidebar toggle starts at y={toggle_box['y']:.0f}, inside the "
         f"{_IPAD_SAFE_AREA['top']}px iPad status-bar safe area"

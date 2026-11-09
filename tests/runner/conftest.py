@@ -33,6 +33,7 @@ REAL_CLAUDE_LAUNCH_CATALOG = claude_native.claude_launch_catalog
 REAL_CLAUDE_REPROBED_LAUNCH_CATALOG = claude_native.claude_reprobed_launch_catalog
 REAL_CODEX_LAUNCH_CATALOG = codex_native_app_server.codex_launch_catalog
 REAL_CODEX_REPROBED_LAUNCH_CATALOG = codex_native_app_server.codex_reprobed_launch_catalog
+REAL_DATABRICKS_PROFILE_CODEX_MODELS = codex_native_app_server.databricks_profile_codex_models
 
 # Project root: two parents up from this conftest (tests/runner/ → repo root).
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -79,15 +80,10 @@ def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> 
 def _isolated_model_catalog_store(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """Keep launch-path catalog consults off the developer's machine.
+    """Keep launch-path catalog reads off the developer's machine.
 
-    The native launch paths consult the shared model-catalog store and, on
-    a miss, probe the REAL harness CLIs — which a unit test must never do
-    (a real ``claude`` boot takes ~6 s and writes the developer's real
-    ``~/.omnigent`` store). Redirect the store's directory seam per test
-    and stub the launch-catalog resolvers to "no catalog" (the
-    pre-catalog behavior); a test exercising catalogs re-patches them
-    explicitly.
+    Redirect the catalog store per test and stub CLI and workspace model
+    discovery; a test that exercises a resolver restores it explicitly.
     """
     store_dir = tmp_path_factory.mktemp("model_catalog_store")
     monkeypatch.setattr("omnigent.models.model_catalog_store._data_dir", lambda: store_dir)
@@ -104,6 +100,23 @@ def _isolated_model_catalog_store(
     )
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.codex_reprobed_launch_catalog", _no_catalog
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.databricks_profile_codex_models",
+        lambda _profile: codex_native_app_server.DatabricksCodexModelListing(),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_claude_prompt_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the claude-native model-change prompt wait off a real tmux pane.
+
+    The handler waits for the pane's prompt before typing. Runner tests have no
+    pane behind them, so that wait passes at once; a test that exercises it
+    re-patches ``wait_for_input_ready`` itself.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.wait_for_input_ready", lambda *_a, **_k: None
     )
 
 

@@ -35,6 +35,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle
 
 
@@ -128,7 +129,9 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
         task = asyncio.create_task(
             client.get("/v1/skills", params={"session_id": conv.id}, headers={"x-test-user": user})
         )
-        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
+        frame = decode_host_frame(
+            (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
+        )
         assert isinstance(frame, HostSkillsFrame)
         assert (
             frame.session_id,
@@ -137,20 +140,23 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
             frame.agent_version,
             frame.sub_agent_name,
         ) == (conv.id, conv.workspace, agent.id, str(agent.version), "child")
+        warning = "Codex plugin skills unavailable: `codex plugin list` exited 1"
         conn.pending_skills[frame.request_id].set_result(
             HostSkillsResultFrame(
                 frame.request_id,
                 "ok",
                 skills=[{"name": "child-review", "description": "Review"}],
                 session_id=conv.id if acknowledged else None,
+                warnings=[warning],
             )
         )
         response = await task
     assert response.status_code == (200 if acknowledged else 502)
     if acknowledged:
-        assert response.json()["skills"] == [
-            {"name": "child-review", "description": "Review", "display_name": None}
-        ]
+        assert response.json() == {
+            "skills": [{"name": "child-review", "description": "Review", "display_name": None}],
+            "warnings": [warning],
+        }
     else:
         assert "update the host" in response.json()["detail"]
     assert not conn.pending_skills
@@ -226,15 +232,12 @@ async def test_presession_catalog_matches_filtered_invocations(
         _to_agent_object as session_agent_object,
     )
 
-    assert [s.name for s in builtin_agent_object(agent, app.state.agent_cache).skills] == [
-        "bundled"
-    ]
-    assert [
-        s.name
-        for s in session_agent_object(
-            agent, app.state.agent_cache, mcp_servers_editable=True
-        ).skills
-    ] == ["bundled"]
+    builtin = builtin_agent_object(agent, app.state.agent_cache)
+    session = session_agent_object(agent, app.state.agent_cache, mcp_servers_editable=True)
+    assert [s.name for s in builtin.skills] == ["bundled"]
+    assert [s.name for s in session.skills] == ["bundled"]
+    # `skills: none` runs claude-sdk with no setting sources, so /mcp hides user servers.
+    assert builtin.loads_user_settings is session.loads_user_settings is (skill_filter != "none")
     discovery = HostSkillDiscovery(
         lambda _: pytest.fail("Pre-session discovery needs no bundle fetch")
     )
@@ -253,7 +256,9 @@ async def test_presession_catalog_matches_filtered_invocations(
                 headers={"x-test-user": "owner"},
             )
         )
-        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
+        frame = decode_host_frame(
+            (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
+        )
         assert isinstance(frame, HostSkillsFrame)
         assert frame.skills_filter == skill_filter
         assert frame.agent_version == str(agent.version)
@@ -274,6 +279,32 @@ async def test_presession_catalog_matches_filtered_invocations(
         for s in expected
     ]
     assert "hidden" not in {s["name"] for s in response.json()["skills"]}
+    assert response.json()["warnings"] == []
+
+
+async def test_agent_object_without_loadable_bundle_keeps_user_settings(
+    presession_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _, _, _, agent, _ = presession_app
+
+    def fail_load(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("bundle unavailable")
+
+    monkeypatch.setattr(app.state.agent_cache, "load", fail_load)
+    from omnigent.server.routes.builtin_agents import _to_agent_object as builtin_agent_object
+    from omnigent.server.routes.sessions.routes_permissions import (
+        _to_agent_object as session_agent_object,
+    )
+
+    for agent_object in (
+        builtin_agent_object(agent, app.state.agent_cache),
+        session_agent_object(agent, app.state.agent_cache, mcp_servers_editable=True),
+    ):
+        # Without the spec, `skills: none` can't be told apart, so /mcp keeps user servers.
+        assert agent_object.loads_user_settings is True
+        assert agent_object.harness is None
+        assert agent_object.mcp_servers == []
+        assert agent_object.skills == []
 
 
 async def test_presession_discovery_rejects_private_agent(
@@ -318,7 +349,9 @@ async def test_presession_discovery_requires_host_to_apply_agent_filter(presessi
                 headers={"x-test-user": "owner"},
             )
         )
-        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
+        frame = decode_host_frame(
+            (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
+        )
         assert isinstance(frame, HostSkillsFrame)
         conn.pending_skills[frame.request_id].set_result(
             HostSkillsResultFrame(frame.request_id, "ok")

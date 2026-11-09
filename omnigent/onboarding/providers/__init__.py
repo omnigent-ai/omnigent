@@ -628,6 +628,10 @@ _BEDROCK_ANTHROPIC_PATTERN = re.compile(
 # model the workspace serves as its ``databricks-<model>`` endpoint.
 _DATABRICKS_SYSTEM_AI_PREFIX = "system.ai."
 
+# Fireworks gateway IDs retain their account namespace in the catalog.
+_FIREWORKS_MODEL_PREFIX = "accounts/fireworks/"
+_FIREWORKS_PROVIDER_ALIAS = "fireworks"
+
 
 def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
     """Return bounded provider/id pairs for a model catalog lookup."""
@@ -654,6 +658,11 @@ def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
         _add("openrouter", bare)
         return targets
 
+    if normalized.lower().startswith(_FIREWORKS_MODEL_PREFIX):
+        _add("fireworks_ai", normalized)
+        _add("openrouter", normalized)
+        return targets
+
     if "/" in normalized:
         namespace, bare = normalized.split("/", 1)
         provider = namespace.lower()
@@ -662,6 +671,9 @@ def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
             if provider == "databricks" and bare.lower().startswith("databricks-"):
                 base = bare[len("databricks-") :]
                 _add(_inferred_catalog_provider(base), base)
+        elif provider == _FIREWORKS_PROVIDER_ALIAS:
+            _add("fireworks_ai", bare)
+            _add("openrouter", normalized)
         else:
             _add("openrouter", normalized)
             _add(_inferred_catalog_provider(bare), bare)

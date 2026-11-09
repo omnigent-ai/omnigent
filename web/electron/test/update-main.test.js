@@ -13,16 +13,20 @@ function loadMainHarness({
   sessionCookies = [],
   forceDevUpdateConfig = false,
   dialogResponses = [{ response: 1, checkboxChecked: false }],
+  saveDialogResult = { canceled: false, filePath: "/tmp/desktop-diagnostics.jsonl" },
+  exportError = null,
   serverShutdown = () => Promise.resolve(),
   isPackaged = false,
   platform = process.platform,
   developerMode = false,
   desktopVersionOverride,
+  runningWork = { hosts: 0, localServer: false },
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-update-test-"));
   fs.writeFileSync(path.join(userData, "settings.json"), JSON.stringify(settings), "utf8");
 
   const ipcHandlers = new Map();
+  const ipcListeners = new Map();
   const appEvents = new Map();
   const mainImmediates = [];
   const calls = {
@@ -33,6 +37,8 @@ function loadMainHarness({
     quitAndInstall: [],
     sent: [],
     showMessageBox: [],
+    showSaveDialog: [],
+    exportedDiagnostics: [],
     setApplicationMenu: [],
     aboutOpens: [],
     expiredAccess: [],
@@ -41,6 +47,10 @@ function loadMainHarness({
     cookieReads: [],
     cookieRemovals: [],
     reloads: 0,
+    windowCloses: 0,
+    webContentsFocuses: 0,
+    globalShortcuts: [],
+    firstResponderActions: [],
   };
 
   const sender = {
@@ -54,11 +64,19 @@ function loadMainHarness({
       reload: () => {
         calls.reloads++;
       },
+      focus: () => {
+        calls.webContentsFocuses++;
+      },
     },
     isMinimized: () => false,
     restore: () => {},
+    show: () => {},
     focus: () => {},
+    close: () => {
+      calls.windowCloses += 1;
+    },
   };
+  let focusedWindow = win;
 
   class FakeSemVer {
     constructor(version) {
@@ -92,6 +110,7 @@ function loadMainHarness({
 
   const electron = {
     app: {
+      name: "Omnigent",
       isPackaged,
       getPath: (name) => (name === "userData" ? userData : userData),
       getVersion: () => "0.3.0",
@@ -110,16 +129,28 @@ function loadMainHarness({
     },
     BrowserWindow: Object.assign(function BrowserWindow() {}, {
       fromWebContents: (webContents) => (webContents === sender ? win : null),
-      getFocusedWindow: () => win,
+      getFocusedWindow: () => focusedWindow,
       getAllWindows: () => [win],
     }),
     Menu: {
       buildFromTemplate: (template) => ({ template }),
       setApplicationMenu: (menu) => calls.setApplicationMenu.push(menu),
+      sendActionToFirstResponder: (action) => calls.firstResponderActions.push(action),
     },
     Notification: { isSupported: () => false },
     clipboard: {},
+    globalShortcut: {
+      register: (accelerator) => {
+        calls.globalShortcuts.push(accelerator);
+        return true;
+      },
+      unregister: () => {},
+    },
     dialog: {
+      showSaveDialog: (...args) => {
+        calls.showSaveDialog.push(args);
+        return Promise.resolve(saveDialogResult);
+      },
       showMessageBox: (dialogWin, options) => {
         calls.showMessageBox.push({ win: dialogWin, options });
         return Promise.resolve(dialogResponses.shift() ?? { response: 1, checkboxChecked: false });
@@ -127,7 +158,7 @@ function loadMainHarness({
     },
     ipcMain: {
       handle: (channel, handler) => ipcHandlers.set(channel, handler),
-      on: () => {},
+      on: (channel, listener) => ipcListeners.set(channel, listener),
     },
     nativeImage: {
       createFromPath: () => ({ isEmpty: () => true }),
@@ -155,6 +186,15 @@ function loadMainHarness({
   };
 
   const localRequires = {
+    "./diagnostics": {
+      diagnostics: {
+        record: () => {},
+        exportTo: (destination) => {
+          if (exportError) throw exportError;
+          calls.exportedDiagnostics.push(destination);
+        },
+      },
+    },
     "./about_window": {
       createAboutWindow: () => ({
         open: (parent) => calls.aboutOpens.push(parent),
@@ -194,6 +234,7 @@ function loadMainHarness({
     },
     "./server_manager": {
       shutdown: () => serverShutdown(),
+      runningWork: () => runningWork,
       onChange: () => {},
       ensureServerAuth: async () => ({ ok: true }),
       ensureHostConnected: async () => ({ ok: true }),
@@ -269,6 +310,11 @@ function loadMainHarness({
       unpinned: { sender, senderFrame: { url: "https://evil.example/app" } },
     },
     ipcHandlers,
+    ipcListeners,
+    win,
+    setFocusedWindow: (next) => {
+      focusedWindow = next;
+    },
     pendingMainImmediates: () => mainImmediates.length,
     readSettings: () => JSON.parse(fs.readFileSync(path.join(userData, "settings.json"), "utf8")),
     runMainImmediates: () => {
@@ -328,6 +374,45 @@ describe("in-app navigation menu actions", () => {
   });
 });
 
+describe("diagnostics export menu wiring", () => {
+  it("exports from the production Server menu without renderer IPC", async (t) => {
+    const harness = loadMainHarness({ isPackaged: true, platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    assert.equal(hasDebugMenu(menu), false);
+    assert.ok(harness.ipcHandlers.size > 0);
+    const item = findMenuItem(menu, "export_diagnostics");
+    assert.equal(item.label, "Export Diagnostics…");
+    item.click();
+    await flushPromises();
+    assert.equal(harness.calls.showSaveDialog.length, 1);
+    assert.deepEqual(harness.calls.exportedDiagnostics, ["/tmp/desktop-diagnostics.jsonl"]);
+    assert.equal(harness.ipcHandlers.has("omnigent:export-diagnostics"), false);
+  });
+
+  it("does not export when the save dialog is cancelled", async (t) => {
+    const harness = loadMainHarness({ saveDialogResult: { canceled: true } });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "export_diagnostics").click();
+    await flushPromises();
+    assert.deepEqual(harness.calls.exportedDiagnostics, []);
+  });
+
+  it("shows an error if the chosen destination cannot be written", async (t) => {
+    const harness = loadMainHarness({ exportError: new Error("Destination is not writable") });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "export_diagnostics").click();
+    await flushPromises();
+    assert.deepEqual(harness.calls.exportedDiagnostics, []);
+    assert.equal(harness.calls.showMessageBox.length, 1);
+    assert.equal(harness.calls.showMessageBox[0].options.title, "Could not export diagnostics");
+  });
+});
+
 describe("About menu wiring", () => {
   it("opens the shell-owned About window from About and Check for Updates", async (t) => {
     const harness = loadMainHarness({
@@ -363,6 +448,668 @@ describe("About menu wiring", () => {
 
     assert.equal(aboutItem.label, "About Omnigent");
     assert.equal(harness.calls.aboutOpens.length, 1);
+  });
+});
+
+function submenuIds(menu, label) {
+  const entry = menu.template.find((item) => item.label === label);
+  return plain(entry.submenu.map((item) => item.id ?? item.role ?? item.type));
+}
+
+function topLevelMenus(menu) {
+  return plain(
+    menu.template.map((item) => item.label ?? item.role).filter((label) => label !== "Debug"),
+  );
+}
+
+describe("application menu layout", () => {
+  it("keeps updates, Settings, and the confirming Quit in the macOS app menu", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+
+    assert.deepEqual(topLevelMenus(menu), [
+      "Omnigent",
+      "File",
+      "Edit",
+      "View",
+      "Go",
+      "Session",
+      "Server",
+      "windowMenu",
+    ]);
+    assert.deepEqual(submenuIds(menu, "Omnigent"), [
+      "open_about",
+      "check_for_updates",
+      "restart_to_update",
+      "separator",
+      "open_settings",
+      "separator",
+      "services",
+      "separator",
+      "hide",
+      "hideOthers",
+      "unhide",
+      "separator",
+      "confirm_before_quit",
+      "quit",
+    ]);
+    assert.deepEqual(submenuIds(menu, "File"), [
+      "new_session",
+      "new_window",
+      "new_server_window",
+      "separator",
+      "new_terminal",
+      "new_browser_tab",
+      "focus_address_bar",
+      "reopen_closed_tab",
+      "separator",
+      "close",
+      "close_window",
+    ]);
+    assert.deepEqual(submenuIds(menu, "Session"), [
+      "toggle_pin_session",
+      "archive_session",
+      "fork_session",
+    ]);
+    assert.deepEqual(submenuIds(menu, "Server"), [
+      "change_server",
+      "sign_out_server",
+      "separator",
+      "export_diagnostics",
+    ]);
+  });
+
+  it("keeps Settings and Quit in File and updates in Help on Windows and Linux", (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+
+    assert.deepEqual(topLevelMenus(menu), [
+      "File",
+      "Edit",
+      "View",
+      "Go",
+      "Session",
+      "Server",
+      "Window",
+      "Help",
+    ]);
+    assert.deepEqual(submenuIds(menu, "File"), [
+      "new_session",
+      "new_window",
+      "new_server_window",
+      "separator",
+      "new_terminal",
+      "new_browser_tab",
+      "focus_address_bar",
+      "reopen_closed_tab",
+      "separator",
+      "open_settings",
+      "separator",
+      "close",
+      "close_window",
+      "separator",
+      "confirm_before_quit",
+      "quit",
+    ]);
+    // Electron's Window role adds its own CmdOrCtrl+W Close off macOS.
+    assert.deepEqual(submenuIds(menu, "Window"), ["minimize", "zoom"]);
+    assert.deepEqual(submenuIds(menu, "Help"), [
+      "check_for_updates",
+      "restart_to_update",
+      "separator",
+      "open_about",
+    ]);
+    assert.equal(findMenuItem(menu, "confirm_before_quit").label, "Warn Before Quitting (Ctrl+Q)");
+  });
+});
+
+describe("desktop command menu items", () => {
+  function reportState(harness, state, event = harness.events.pinned) {
+    harness.api.registerIpc();
+    harness.ipcListeners.get("omnigent:set-desktop-command-state")(event, state);
+    return harness.calls.setApplicationMenu.at(-1);
+  }
+
+  it("binds the platform shortcuts and disables commands until the SPA reports them", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+
+    const expected = {
+      new_terminal: "Ctrl+`",
+      new_browser_tab: "CmdOrCtrl+T",
+      close: "CmdOrCtrl+W",
+      close_window: "CmdOrCtrl+Shift+W",
+      toggle_pin_session: "CmdOrCtrl+Alt+P",
+      archive_session: "CmdOrCtrl+Shift+A",
+      fork_session: "CmdOrCtrl+Alt+F",
+    };
+    for (const [id, accelerator] of Object.entries(expected)) {
+      assert.equal(findMenuItem(menu, id).accelerator, accelerator, id);
+    }
+    for (const id of [
+      "new_terminal",
+      "new_browser_tab",
+      "toggle_pin_session",
+      "archive_session",
+      "fork_session",
+    ]) {
+      assert.equal(findMenuItem(menu, id).enabled, false, id);
+    }
+    assert.equal(findMenuItem(menu, "close_window").role, "close");
+  });
+
+  it("closes the window directly when the page never reported command support", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "close").click();
+
+    assert.equal(harness.calls.windowCloses, 1);
+    assert.deepEqual(harness.calls.sent, []);
+  });
+
+  it("enables and labels commands from the reported state, then routes clicks to the SPA", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    const menu = reportState(harness, {
+      commands: [
+        "close",
+        "new-terminal",
+        "toggle-pin-session",
+        "archive-session",
+        "fork-session",
+        "bogus",
+      ],
+      sessionPinned: true,
+      sessionArchived: true,
+    });
+
+    assert.equal(findMenuItem(menu, "new_terminal").enabled, true);
+    assert.equal(findMenuItem(menu, "new_browser_tab").enabled, false);
+    assert.equal(findMenuItem(menu, "toggle_pin_session").label, "Unpin Session");
+    assert.equal(findMenuItem(menu, "archive_session").label, "Unarchive Session");
+    assert.deepEqual(plain([...harness.api.windows.get(harness.win).desktopCommands.commands]), [
+      "close",
+      "new-terminal",
+      "toggle-pin-session",
+      "archive-session",
+      "fork-session",
+    ]);
+
+    findMenuItem(menu, "new_terminal").click();
+    findMenuItem(menu, "toggle_pin_session").click();
+    findMenuItem(menu, "fork_session").click();
+    // Not reported, so the click is dropped rather than sent to a page that can't act.
+    findMenuItem(menu, "new_browser_tab").click();
+    assert.deepEqual(plain(harness.calls.sent), [
+      { channel: "omnigent:desktop-command", payload: { command: "new-terminal" } },
+      { channel: "omnigent:desktop-command", payload: { command: "toggle-pin-session" } },
+      { channel: "omnigent:desktop-command", payload: { command: "fork-session" } },
+    ]);
+  });
+
+  it("hands Close to the SPA with the focused embedded browser view", (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+    let viewFocused = false;
+    harness.api.windows.get(harness.win).browserRegistry = {
+      activeConversationId: () => "browser-tab:session-1:tab-1",
+      get: () => ({ view: { webContents: { isFocused: () => viewFocused } } }),
+    };
+    const menu = reportState(harness, { commands: ["close"] });
+
+    findMenuItem(menu, "close").click();
+    viewFocused = true;
+    findMenuItem(menu, "close").click();
+
+    assert.equal(harness.calls.windowCloses, 0);
+    // The only window off macOS, so closing it would quit the app.
+    assert.deepEqual(plain(harness.calls.sent), [
+      {
+        channel: "omnigent:desktop-command",
+        payload: { command: "close", browserViewId: null, closingQuits: true },
+      },
+      {
+        channel: "omnigent:desktop-command",
+        payload: {
+          command: "close",
+          browserViewId: "browser-tab:session-1:tab-1",
+          closingQuits: true,
+        },
+      },
+    ]);
+  });
+
+  it("steps a focused web page's own history, else hands Back/Forward to the app", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    const pageHistory = [];
+    let viewFocused = true;
+    harness.api.windows.get(harness.win).browserRegistry = {
+      activeConversationId: () => "browser-tab:session-1:tab-1",
+      get: () => ({
+        view: {
+          webContents: {
+            isFocused: () => viewFocused,
+            navigationHistory: {
+              canGoBack: () => true,
+              canGoForward: () => true,
+              goBack: () => pageHistory.push("back"),
+              goForward: () => pageHistory.push("forward"),
+            },
+          },
+        },
+      }),
+    };
+    const menu = reportState(harness, { commands: ["go-back", "go-forward"] });
+    assert.equal(findMenuItem(menu, "go_back").accelerator, "CmdOrCtrl+[");
+    assert.equal(findMenuItem(menu, "go_forward").accelerator, "CmdOrCtrl+]");
+
+    findMenuItem(menu, "go_back").click();
+    findMenuItem(menu, "go_forward").click();
+    viewFocused = false;
+    findMenuItem(menu, "go_back").click();
+
+    assert.deepEqual(pageHistory, ["back", "forward"]);
+    assert.deepEqual(plain(harness.calls.sent), [
+      { channel: "omnigent:desktop-command", payload: { command: "go-back" } },
+    ]);
+  });
+
+  it("reloads a focused web page, else asks the app, else reloads the window", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    let pageReloads = 0;
+    let viewFocused = true;
+    harness.api.windows.get(harness.win).browserRegistry = {
+      activeConversationId: () => "browser-tab:session-1:tab-1",
+      get: () => ({
+        view: {
+          webContents: {
+            isFocused: () => viewFocused,
+            reload: () => {
+              pageReloads += 1;
+            },
+          },
+        },
+      }),
+    };
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "reload").click();
+    assert.equal(harness.calls.reloads, 1, "an older page reloads the window as before");
+
+    const menu = reportState(harness, { commands: ["reload", "focus-address-bar"] });
+    findMenuItem(menu, "reload").click();
+    viewFocused = false;
+    findMenuItem(menu, "reload").click();
+    findMenuItem(menu, "focus_address_bar").click();
+
+    assert.equal(findMenuItem(menu, "reload").accelerator, "CmdOrCtrl+R");
+    assert.equal(findMenuItem(menu, "focus_address_bar").accelerator, "CmdOrCtrl+L");
+    assert.equal(pageReloads, 1);
+    assert.equal(harness.calls.reloads, 1);
+    assert.equal(harness.calls.webContentsFocuses, 1);
+    assert.deepEqual(plain(harness.calls.sent), [
+      { channel: "omnigent:desktop-command", payload: { command: "reload" } },
+      {
+        channel: "omnigent:desktop-command",
+        payload: { command: "focus-address-bar", browserViewId: null },
+      },
+    ]);
+
+    // A hung page can't reload itself, so its window reloads instead.
+    harness.api.windows.get(harness.win).unresponsive = true;
+    findMenuItem(menu, "reload").click();
+    assert.equal(harness.calls.reloads, 2);
+    assert.equal(harness.calls.sent.length, 2);
+  });
+
+  it("takes focus from a focused page for New Browser Tab and names that page", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.windows.get(harness.win).browserRegistry = {
+      activeConversationId: () => "browser-tab:session-1:tab-1",
+      get: () => ({ view: { webContents: { isFocused: () => true } } }),
+    };
+    const menu = reportState(harness, { commands: ["new-browser-tab"] });
+
+    findMenuItem(menu, "new_browser_tab").click();
+    assert.equal(harness.calls.webContentsFocuses, 1);
+    assert.deepEqual(plain(harness.calls.sent), [
+      {
+        channel: "omnigent:desktop-command",
+        payload: { command: "new-browser-tab", browserViewId: "browser-tab:session-1:tab-1" },
+      },
+    ]);
+  });
+
+  it("hands tab switching and Reopen Closed Tab to the app with keyboard focus", (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+    const ids = ["previous_tab", "next_tab", "reopen_closed_tab"];
+    const menu = reportState(harness, {
+      commands: ["previous-tab", "next-tab", "reopen-closed-tab"],
+    });
+
+    for (const id of ids) findMenuItem(menu, id).click();
+
+    assert.deepEqual(
+      ids.map((id) => findMenuItem(menu, id).accelerator),
+      ["CmdOrCtrl+Shift+[", "CmdOrCtrl+Shift+]", "CmdOrCtrl+Shift+T"],
+    );
+    assert.equal(harness.calls.webContentsFocuses, 3);
+    assert.deepEqual(
+      plain(harness.calls.sent).map(({ payload }) => payload.command),
+      ["previous-tab", "next-tab", "reopen-closed-tab"],
+    );
+  });
+
+  it("gives no two menu items the same shortcut", (t) => {
+    for (const platform of ["darwin", "linux"]) {
+      const harness = loadMainHarness({ platform });
+      t.after(harness.cleanup);
+      harness.api.buildMenu();
+      const accelerators = [];
+      const collect = (items) => {
+        for (const item of items) {
+          if (item.accelerator) accelerators.push(item.accelerator);
+          collect(item.submenu ?? []);
+        }
+      };
+      collect(harness.calls.setApplicationMenu.at(-1).template);
+      const repeats = accelerators.filter((key, index) => accelerators.indexOf(key) !== index);
+      assert.deepEqual(repeats, [], platform);
+    }
+  });
+
+  it("ignores command state from a page off the pinned server", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const builds = harness.calls.setApplicationMenu.length;
+    harness.ipcListeners.get("omnigent:set-desktop-command-state")(harness.events.unpinned, {
+      commands: ["close", "new-terminal"],
+    });
+
+    assert.equal(harness.api.windows.get(harness.win).desktopCommands, undefined);
+    assert.equal(harness.calls.setApplicationMenu.length, builds);
+  });
+});
+
+describe("close-window request", () => {
+  it("closes the window once the page has confirmed, without a native prompt", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:close-window")(harness.events.pinned),
+      true,
+    );
+    assert.equal(harness.calls.windowCloses, 1);
+    assert.equal(harness.calls.showMessageBox.length, 0);
+  });
+
+  it("refuses a page off the pinned server", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:close-window")(harness.events.unpinned),
+      false,
+    );
+    assert.equal(harness.calls.windowCloses, 0);
+  });
+});
+
+describe("system dictation request", () => {
+  it("starts macOS Dictation in the page's focused field", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    const started = harness.ipcHandlers.get("omnigent:start-system-dictation")(
+      harness.events.pinned,
+    );
+    assert.equal(harness.calls.webContentsFocuses, 1);
+    // macOS must register the refocused field first, so Dictation starts after a pause.
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+    assert.equal(await started, true);
+    assert.deepEqual(harness.calls.firstResponderActions, ["startDictation:"]);
+  });
+
+  it("doesn't start when the window loses focus during the pause", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    const started = harness.ipcHandlers.get("omnigent:start-system-dictation")(
+      harness.events.pinned,
+    );
+    harness.setFocusedWindow(null);
+    assert.equal(await started, false);
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+  });
+
+  it("refuses a page off the pinned server", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.unpinned),
+      false,
+    );
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+  });
+
+  it("refuses a window that isn't focused", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const start = harness.ipcHandlers.get("omnigent:start-system-dictation");
+
+    // Dictation types into the key window, so a background window must not start it.
+    for (const focused of [null, { isDestroyed: () => false }]) {
+      harness.setFocusedWindow(focused);
+      // oxlint-disable-next-line no-await-in-loop -- Each case reads the call log afterwards.
+      assert.equal(await start(harness.events.pinned), false);
+    }
+    assert.equal(harness.calls.webContentsFocuses, 0);
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+  });
+
+  it("does nothing off macOS", async (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.pinned),
+      false,
+    );
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+  });
+});
+
+describe("global show shortcut IPC", () => {
+  it("refuses the shortcut handlers from a page off the pinned server and saves nothing", (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.throws(
+      () => harness.ipcHandlers.get("omnigent:get-global-shortcut")(harness.events.unpinned),
+      /connected server page/,
+    );
+    assert.throws(
+      () =>
+        harness.ipcHandlers.get("omnigent:set-global-shortcut")(harness.events.unpinned, {
+          enabled: true,
+          accelerator: "Control+Shift+K",
+        }),
+      /connected server page/,
+    );
+    assert.throws(
+      () => harness.ipcHandlers.get("omnigent:record-global-shortcut")(harness.events.unpinned),
+      /connected server page/,
+    );
+    assert.equal(
+      harness.ipcHandlers.get("omnigent:cancel-global-shortcut-recording")(harness.events.unpinned),
+      false,
+    );
+    assert.equal(harness.readSettings().global_shortcut, undefined);
+  });
+
+  it("asks natively before the pinned page sets a chord, and keeps nothing it refuses", async (t) => {
+    const setting = { enabled: true, accelerator: "Control+Shift+K" };
+    const refused = loadMainHarness({ dialogResponses: [{ response: 0 }] });
+    t.after(refused.cleanup);
+    refused.api.registerIpc();
+    const result = await refused.ipcHandlers.get("omnigent:set-global-shortcut")(
+      refused.events.pinned,
+      setting,
+    );
+    assert.equal(result.ok, false);
+    assert.equal(refused.calls.showMessageBox.length, 1);
+    const { options } = refused.calls.showMessageBox[0];
+    assert.match(options.message, /show Omnigent from any app/);
+    assert.match(options.detail, /system-wide shortcut/);
+    assert.deepEqual(plain(options.buttons), ["Don't Allow", "Allow"]);
+    assert.equal(options.cancelId, 0);
+    assert.equal(options.defaultId, 0);
+    assert.deepEqual(refused.calls.globalShortcuts, []);
+    assert.equal(refused.readSettings().global_shortcut, undefined);
+  });
+
+  it("registers and saves a page-recorded chord once the user allows it", async (t) => {
+    const allowed = loadMainHarness({ dialogResponses: [{ response: 1 }] });
+    t.after(allowed.cleanup);
+    allowed.api.registerIpc();
+    const setting = { enabled: true, accelerator: "Control+Shift+K" };
+    const result = await allowed.ipcHandlers.get("omnigent:set-global-shortcut")(
+      allowed.events.pinned,
+      setting,
+    );
+    assert.deepEqual(plain(result), { ok: true, setting });
+    assert.deepEqual(allowed.calls.globalShortcuts, ["Control+Shift+K"]);
+    assert.deepEqual(allowed.readSettings().global_shortcut, setting);
+  });
+
+  it("turns the shortcut off without asking, keeping the saved chord", async (t) => {
+    const harness = loadMainHarness({ dialogResponses: [{ response: 1 }] });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const set = (setting) =>
+      harness.ipcHandlers.get("omnigent:set-global-shortcut")(harness.events.pinned, setting);
+    await set({ enabled: true, accelerator: "Control+Shift+K" });
+
+    const result = await set({ enabled: false });
+
+    assert.deepEqual(plain(result), {
+      ok: true,
+      setting: { enabled: false, accelerator: "Control+Shift+K" },
+    });
+    assert.equal(harness.calls.showMessageBox.length, 1);
+    assert.deepEqual(harness.readSettings().global_shortcut, {
+      enabled: false,
+      accelerator: "Control+Shift+K",
+    });
+  });
+});
+
+describe("Quit confirmation wiring", () => {
+  function quitItem(harness) {
+    return findMenuItem(harness.calls.setApplicationMenu.at(-1), "quit");
+  }
+
+  it("asks in the window's page, naming what stops, and quits once it confirms", async (t) => {
+    const harness = loadMainHarness({
+      platform: "darwin",
+      runningWork: { hosts: 1, localServer: false },
+    });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    harness.ipcListeners.get("omnigent:set-desktop-command-state")(harness.events.pinned, {
+      commands: ["quit"],
+    });
+
+    assert.equal(quitItem(harness).accelerator, "CmdOrCtrl+Q");
+    quitItem(harness).click();
+    assert.deepEqual(plain(harness.calls.sent), [
+      {
+        channel: "omnigent:desktop-command",
+        payload: {
+          command: "quit",
+          quitDetail: "Sessions running on this computer will go offline.",
+        },
+      },
+    ]);
+    assert.equal(harness.calls.appQuit, 0);
+    assert.equal(harness.calls.showMessageBox.length, 0);
+
+    const confirm = harness.ipcHandlers.get("omnigent:confirm-quit");
+    assert.equal(await confirm(harness.events.unpinned, { dontAskAgain: true }), false);
+    assert.equal(harness.calls.appQuit, 0);
+    assert.equal(await confirm(harness.events.pinned, { dontAskAgain: true }), true);
+    assert.equal(harness.calls.appQuit, 1);
+    assert.equal(harness.readSettings().confirm_before_quit, false);
+  });
+
+  it("quits at once when the page that would ask is hung", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    harness.ipcListeners.get("omnigent:set-desktop-command-state")(harness.events.pinned, {
+      commands: ["quit"],
+    });
+    // A hung page can't show the dialog or answer it.
+    const [state] = harness.api.windows.values();
+    state.unresponsive = true;
+
+    quitItem(harness).click();
+    assert.deepEqual(harness.calls.sent, []);
+    assert.equal(harness.calls.appQuit, 1);
+  });
+
+  it("quits at once when no page can ask", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    quitItem(harness).click();
+    assert.equal(harness.calls.appQuit, 1);
+    assert.deepEqual(harness.calls.sent, []);
+  });
+
+  it("does not prompt from the before-quit path that Dock Quit and logout take", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    assert.deepEqual(harness.calls.sent, []);
+    assert.equal(harness.calls.showMessageBox.length, 0);
+  });
+
+  it("quits without asking when Quit is pressed again during shutdown", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    harness.ipcListeners.get("omnigent:set-desktop-command-state")(harness.events.pinned, {
+      commands: ["quit"],
+    });
+    // Dock Quit starts shutdown; Cmd+Q during it must not offer a Cancel.
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    quitItem(harness).click();
+    assert.deepEqual(harness.calls.sent, []);
+    assert.equal(harness.calls.appQuit, 1);
   });
 });
 

@@ -2,10 +2,24 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bubble } from "@/lib/renderItems";
+import type { Bubble, RenderItem } from "@/lib/renderItems";
+import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import { childSessionsQueryKey } from "@/hooks/useChildSessions";
+import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
-import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
+import { type ReactNode, useLayoutEffect } from "react";
+import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
+import {
+  BubbleView,
+  buildUndeliveredBubbles,
+  ConversationScrollRefBridge,
+  containsMermaidDiagram,
+  keyboardActiveQuestionId,
+  placeUndeliveredBubbles,
+} from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
 const initialStoreState = useChatStore.getState();
@@ -210,19 +224,205 @@ describe("message navigation highlight", () => {
   });
 });
 
+describe("UserBubble inline mentions", () => {
+  it("renders tagged sessions and files as pills in the sentence", () => {
+    const text =
+      'Ask [Session: "auth" id=s_child subagent=yes] to compare [Attached: src/a.ts] ' +
+      `with [Session: "Alpha *planning*" id=s_alpha subagent=no].\n\n${SESSION_MENTION_HINT}`;
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "user_mentions",
+            content: [{ type: "input_text", text }],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const pills = screen.getAllByTestId("mention-pill");
+    expect(pills.map((pill) => pill.textContent)).toEqual([
+      "@auth",
+      "@src/a.ts",
+      "@Alpha *planning*",
+    ]);
+    // Session pills open the tagged session; the pill sits inside the paragraph.
+    expect(pills[0]).toHaveAttribute("href", "/c/s_child");
+    expect(pills[0].closest("p")?.textContent).toBe(
+      "Ask @auth to compare @src/a.ts with @Alpha *planning*.",
+    );
+    expect(screen.queryByText(/Tagged sessions/)).not.toBeInTheDocument();
+  });
+});
+
+describe("UserBubble messages from another session", () => {
+  function renderOriginBubble(client: QueryClient, text: string) {
+    render(
+      <QueryClientProvider client={client}>
+        <ConversationScopeContext.Provider value="s_here">
+          <BubbleView
+            bubble={{
+              kind: "user",
+              itemId: "user_origin",
+              content: [{ type: "input_text", text }],
+            }}
+            isLastAssistant={false}
+          />
+        </ConversationScopeContext.Provider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("names a cached sender with a pill and drops the raw prefix", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "s_src"], { title: "Casual greeting", parentSessionId: null });
+    renderOriginBubble(client, "[Message from session s_src]\nhi there");
+    const origin = screen.getByTestId("message-origin");
+    expect(origin.textContent).toBe("From@Casual greeting");
+    expect(screen.getByTestId("mention-pill")).toHaveAttribute("href", "/c/s_src");
+    expect(screen.queryByText(/Message from session/)).not.toBeInTheDocument();
+    expect(screen.getByText("hi there")).toBeInTheDocument();
+    // Served from cache: no session fetch.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["standalone", null, "/c/s_src"],
+    ["an embed mount", "/mount", "/mount/c/s_src"],
+  ])(
+    "opens the sender in-app on a plain click instead of reloading the page (%s)",
+    (_case, mount, target) => {
+      const client = new QueryClient();
+      client.setQueryData(["session", "s_src"], {
+        title: "Casual greeting",
+        parentSessionId: null,
+      });
+      function LocationProbe() {
+        return <div data-testid="location">{useLocation().pathname}</div>;
+      }
+      const bubble = (
+        <QueryClientProvider client={client}>
+          <BubbleView
+            bubble={{
+              kind: "user",
+              itemId: "user_origin_nav",
+              content: [{ type: "input_text", text: "[Message from session s_src]\nhi" }],
+            }}
+            isLastAssistant={false}
+          />
+          <LocationProbe />
+        </QueryClientProvider>
+      );
+      render(
+        <MemoryRouter initialEntries={[`${mount ?? ""}/c/s_here`]}>
+          {mount ? (
+            <RoutingProvider value={basenamedRouting(mount)}>{bubble}</RoutingProvider>
+          ) : (
+            bubble
+          )}
+        </MemoryRouter>,
+      );
+      const pill = screen.getByTestId("mention-pill");
+      // The href a new tab or a copied link uses keeps the mount.
+      expect(pill).toHaveAttribute("href", target);
+      // A plain click routes in-app; the click event is cancelled, so no document load.
+      expect(fireEvent.click(pill)).toBe(false);
+      expect(screen.getByTestId("location").textContent).toBe(target);
+      // A modified click is left to the browser (new tab).
+      expect(fireEvent.click(pill, { metaKey: true })).toBe(true);
+    },
+  );
+
+  it("names a subagent of the viewed session from its cached child list", () => {
+    const client = new QueryClient();
+    client.setQueryData(childSessionsQueryKey("s_here"), [
+      { id: "s_kid", title: "researcher:auth", tool: "researcher", session_name: "auth" },
+    ]);
+    renderOriginBubble(client, "[Message from session s_kid]\ndone");
+    expect(screen.getByTestId("mention-pill").textContent).toBe("@auth");
+    expect(screen.getByTestId("mention-pill")).toHaveAttribute("title", "Subagent");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetches an uncached sender once and says 'another session' when it is unreadable", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ detail: "not found" }, 404));
+    const client = new QueryClient();
+    renderOriginBubble(client, "[Message from session s_gone]\nhello");
+    // Wait for the failed lookup to settle, not just for the loading fallback.
+    await waitFor(() => expect(client.getQueryState(["session", "s_gone"])?.status).toBe("error"));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("/v1/sessions/s_gone");
+    expect(screen.getByTestId("message-origin").textContent).toBe("Fromanother session");
+    expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
+    // A later bubble from the same sender, or a return to the transcript, does not ask again.
+    cleanup();
+    renderOriginBubble(client, "[Message from session s_gone]\nagain");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(screen.getByTestId("message-origin").textContent).toBe("Fromanother session");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fetches an uncached sender once and reuses it for later bubbles", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ id: "s_far", object: "session", title: "Release notes draft" }),
+    );
+    const client = new QueryClient();
+    renderOriginBubble(client, "[Message from session s_far]\nfirst");
+    await waitFor(() =>
+      expect(screen.getByTestId("mention-pill").textContent).toBe("@Release notes draft"),
+    );
+    cleanup();
+    renderOriginBubble(client, "[Message from session s_far]\nsecond");
+    expect(screen.getByTestId("mention-pill").textContent).toBe("@Release notes draft");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a system-looking message from another session as an attributed user bubble", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "s_src"], { title: "Casual greeting", parentSessionId: null });
+    renderOriginBubble(client, "[Message from session s_src]\n[System: build finished]");
+    expect(screen.getByTestId("message-origin").textContent).toBe("From@Casual greeting");
+    expect(screen.getByText("[System: build finished]")).toBeInTheDocument();
+  });
+});
+
+describe("UserBubble literal session markers", () => {
+  it("shows a session marker the user typed as text, with no pill", () => {
+    const text = 'why is [Session: "x" id=y subagent=no] inline?';
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{ kind: "user", itemId: "user_literal", content: [{ type: "input_text", text }] }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/why is \[Session: "x" id=y subagent=no\] inline\?/),
+    ).toBeInTheDocument();
+  });
+});
+
 describe("UserBubble literal text", () => {
   it.each(["", "[Attached: docs/a.md]\n\n", "[Attached file: docs/a.md]\r\n\r\n"])(
     "keeps indented bullets as siblings after stripping %j",
     (preamble) => {
       render(
-        <BubbleView
-          bubble={{
-            kind: "user",
-            itemId: "user_list",
-            content: [{ type: "input_text", text: `${preamble}  - first\n  - second` }],
-          }}
-          isLastAssistant={false}
-        />,
+        <QueryClientProvider client={new QueryClient()}>
+          <BubbleView
+            bubble={{
+              kind: "user",
+              itemId: "user_list",
+              content: [{ type: "input_text", text: `${preamble}  - first\n  - second` }],
+            }}
+            isLastAssistant={false}
+          />
+        </QueryClientProvider>,
       );
 
       expect(screen.getAllByRole("list")).toHaveLength(1);
@@ -482,6 +682,85 @@ describe("AssistantBubble error retry", () => {
   });
 });
 
+describe("AssistantBubble error-only role", () => {
+  // The reconnect journey counts [data-role="assistant"] bubbles as Claude
+  // replies. An undelivered-message notice is a standalone error item with no
+  // prose, so it must not carry the assistant role and inflate that count.
+  it("tags an undelivered-message notice as an error bubble, not an assistant reply", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "assistant",
+            responseId: "resp_undelivered",
+            stableId: "undelivered_notice",
+            lifecycle: "failed",
+            error: null,
+            items: [
+              {
+                kind: "error",
+                itemId: "undelivered_notice",
+                message: "Message not delivered. Try sending it again.",
+                source: "runtime",
+                code: "native_prompt_not_recorded",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveAttribute("data-role", "error");
+    expect(bubble).toHaveTextContent("Message not delivered. Try sending it again.");
+  });
+
+  it.each<{ name: string; nonError: Extract<Bubble, { kind: "assistant" }>["items"][number] }>([
+    {
+      name: "a prose reply carrying a trailing error",
+      nonError: { kind: "text", itemId: "reply_text", text: "the answer is 42", final: true },
+    },
+    {
+      name: "a failed turn with reasoning but no prose",
+      nonError: {
+        kind: "reasoning",
+        itemId: "thinking",
+        text: "Weighing the options.",
+        duration: 1,
+      },
+    },
+  ])("keeps $name on the assistant role", ({ nonError }) => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "assistant",
+            responseId: "resp_mixed_failure",
+            stableId: "mixed_failure",
+            lifecycle: "failed",
+            error: null,
+            items: [
+              nonError,
+              {
+                kind: "error",
+                itemId: "mixed_error",
+                message: "API Error: Request rejected (429): rate limit",
+                source: "execution",
+                code: "rate_limit_exceeded",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveAttribute("data-role", "assistant");
+  });
+});
+
 describe("AssistantBubble sealed side-chat recovery", () => {
   it("removes recovery actions when the side chat is sealed but keeps the error", () => {
     const view = render(
@@ -598,6 +877,20 @@ describe("UserBubble long-prompt collapse", () => {
     expect(bubble).not.toHaveTextContent(TAIL);
   });
 
+  it("keeps message typography when expanding a prompt over 50K characters", () => {
+    const text = "Long user prose. ".repeat(3_000) + TAIL;
+    render(<BubbleView bubble={userBubble(text)} isLastAssistant={false} />);
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble.querySelector(".break-all")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+
+    const fallback = bubble.querySelector(".break-all");
+    expect(fallback).toHaveClass("text-message", "font-mono", "whitespace-pre-wrap");
+    expect(fallback).not.toHaveClass("text-sm");
+    expect(fallback!.textContent).toBe(text);
+  });
+
   it("Copy always writes the full text to the clipboard regardless of collapse state", async () => {
     const writtenTexts: string[] = [];
     vi.stubGlobal("navigator", {
@@ -675,5 +968,140 @@ describe("AssistantBubble copy", () => {
     expect(await item.items["text/html"].text()).toBe(
       "<h2>Findings</h2>\n<p>A <strong>bold</strong> claim and <code>code</code>.</p>",
     );
+  });
+});
+
+describe("undelivered startup messages", () => {
+  const lost = {
+    pendingId: "pending_first",
+    content: [
+      { type: "input_file" as const, file_id: "file_notes", filename: "notes.txt" },
+      { type: "input_image" as const, file_id: "file_chart", filename: "chart.png" },
+      { type: "input_text" as const, text: "Summarize these" },
+    ],
+  };
+
+  it("sit above the startup failure notice, or last when it isn't loaded", () => {
+    const user: Bubble = { kind: "user", itemId: "user_1", content: [] };
+    const notice = errorBubble("startup_input_failed");
+    const [undelivered] = buildUndeliveredBubbles([lost], "alice@example.com");
+    expect(undelivered).toMatchObject({ undelivered: true, createdBy: "alice@example.com" });
+    expect(placeUndeliveredBubbles([user, notice], [undelivered!])).toEqual([
+      user,
+      undelivered,
+      notice,
+    ]);
+    expect(placeUndeliveredBubbles([user], [undelivered!])).toEqual([user, undelivered]);
+  });
+
+  it("start a new session carrying the text and the attachments that download", async () => {
+    function LocationProbe() {
+      const location = useLocation();
+      return <output data-testid="location">{location.pathname + location.search}</output>;
+    }
+    fetchMock.mockImplementation(async (url: string) =>
+      url.endsWith("/files/file_notes/content")
+        ? new Response("meeting notes", { headers: { "Content-Type": "text/plain" } })
+        : jsonResponse({ detail: "gone" }, 404),
+    );
+    const toasts: unknown[] = [];
+    const recordToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", recordToast);
+    const [bubble] = buildUndeliveredBubbles([lost], null);
+    render(
+      <MemoryRouter initialEntries={["/c/conv_failed"]}>
+        <ConversationScopeContext.Provider value="conv_failed">
+          <BubbleView bubble={bubble!} isLastAssistant={false} />
+        </ConversationScopeContext.Provider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("message-undelivered")).toHaveTextContent("Not delivered");
+    fireEvent.click(screen.getByRole("button", { name: "Copy message to new session" }));
+
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toMatch(/^\/\?/));
+    window.removeEventListener("omnigent:toast", recordToast);
+    const search = new URLSearchParams(screen.getByTestId("location").textContent!.slice(1));
+    const handoff = peekNewSessionHandoff(search.get(NEW_SESSION_HANDOFF_PARAM));
+    expect(handoff?.text).toBe("Summarize these");
+    const [notes] = handoff?.files ?? [];
+    expect(handoff?.files).toHaveLength(1);
+    expect(notes?.name).toBe("notes.txt");
+    expect(await notes?.text()).toBe("meeting notes");
+    expect(toasts).toEqual(["Couldn't copy chart.png. Attach again before you send."]);
+  });
+});
+
+describe("keyboardActiveQuestionId", () => {
+  type Elicitation = Extract<RenderItem, { kind: "elicitation" }>;
+  const question = (elicitationId: string, extra: Partial<Elicitation> = {}): Elicitation => ({
+    kind: "elicitation",
+    itemId: null,
+    elicitationId,
+    message: "Claude has questions",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: "",
+    requestedSchema: {},
+    status: "pending",
+    response: null,
+    askUserQuestion: {
+      questions: [
+        { question: "Which framework?", options: [{ label: "React" }], multiSelect: false },
+      ],
+    },
+    ...extra,
+  });
+  const approval = (elicitationId: string): Elicitation => ({
+    ...question(elicitationId),
+    askUserQuestion: null,
+    contentPreview: "Bash({})",
+  });
+
+  it("picks the newest pending question", () => {
+    expect(keyboardActiveQuestionId([question("q_old"), question("q_new")])).toBe("q_new");
+  });
+
+  it("looks past newer approvals to the newest question", () => {
+    expect(keyboardActiveQuestionId([question("q_1"), approval("bash_2")])).toBe("q_1");
+  });
+
+  it("returns null when no question is pending", () => {
+    expect(keyboardActiveQuestionId([])).toBeNull();
+    expect(keyboardActiveQuestionId([approval("bash_1")])).toBeNull();
+  });
+
+  it("holds the keys while the newest question awaits delivery", () => {
+    const awaiting = question("q_new", {
+      nativeDelivery: { state: "sending", attempt: "attempt_1", action: "accept" },
+    });
+    expect(keyboardActiveQuestionId([question("q_old"), awaiting])).toBeNull();
+  });
+});
+
+describe("ConversationScrollRefBridge", () => {
+  it("hands over the scroll element before paint when rendered after the content", () => {
+    const onScroller = vi.fn();
+    let seenBeforePaint: unknown = "not run";
+    // A parent's layout effect runs after its children's and before paint.
+    function BeforePaint({ children }: { children: ReactNode }) {
+      useLayoutEffect(() => {
+        seenBeforePaint = onScroller.mock.lastCall?.[0]?.el;
+      }, []);
+      return <div>{children}</div>;
+    }
+    render(
+      <BeforePaint>
+        <Conversation>
+          <ConversationContent>
+            <p>row</p>
+          </ConversationContent>
+          <ConversationScrollRefBridge onScroller={onScroller} />
+        </Conversation>
+      </BeforePaint>,
+    );
+    expect(seenBeforePaint).toBeInstanceOf(HTMLElement);
+    expect(seenBeforePaint).toBe(screen.getByText("row").parentElement?.parentElement);
   });
 });

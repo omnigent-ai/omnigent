@@ -200,16 +200,11 @@ function createArcaConnectFlow({
             runCommand();
             return;
           }
+          // The user's Connect click covers sign-in, so it starts without its own prompt.
           if (!login && result.authError && !loginAttempted) {
-            phase = "auth-required";
-            connect = null;
-            send("arca-connect:done", {
-              ok: false,
-              authRequired: true,
-              command: loginCommandLine(serverUrl),
-              error:
-                "This instance needs an Omnigent sign-in. Sign in through your browser, then we'll retry the connection.",
-            });
+            loginAttempted = true;
+            log(`arca connect: ${serverUrl} needs sign-in; starting it`);
+            runCommand(true);
             return;
           }
           phase = "done";
@@ -225,11 +220,6 @@ function createArcaConnectFlow({
         win,
         phase: () => phase,
         onConfirm: () => {
-          if (phase === "auth-required") {
-            loginAttempted = true;
-            runCommand(true);
-            return;
-          }
           if (phase !== "asking") return;
           log(`arca connect: user confirmed; running against ${serverUrl}`);
           runCommand();

@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import TypeAlias
 
 from omnigent._platform import stable_user_id
+from omnigent.harnesses.hermes_native.credentials import with_hermes_ci_request_tags
 from omnigent.native.input_ready import PaneSettledProbe
 
 _logger = logging.getLogger(__name__)
@@ -273,6 +274,7 @@ _USER_CONFIG_KEYS = frozenset(
     {
         "model",
         "providers",
+        "custom_providers",
         "fallback_providers",
         "credential_pool_strategies",
     }
@@ -291,7 +293,7 @@ def _load_user_hermes_config() -> _ConfigObject:
 
         full = yaml.safe_load(user_config.read_text()) or {}
         return {k: v for k, v in full.items() if k in _USER_CONFIG_KEYS}
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.debug("Failed to load user Hermes config at %s", user_config, exc_info=True)
         return {}
 
@@ -402,7 +404,7 @@ def write_policy_hook_config(
     }
 
     config_path = hermes_home / "config.yaml"
-    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    config_path.write_text(json.dumps(with_hermes_ci_request_tags(config), indent=2) + "\n")
 
     # Copy user's .env (API keys).
     user_env = Path.home() / ".hermes" / ".env"

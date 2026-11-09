@@ -24,24 +24,36 @@ from __future__ import annotations
 import builtins
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import httpx
 from pydantic import TypeAdapter
 
+from omnigent.harness_availability import harness_launch_availability
 from omnigent.server.schemas import ServerStreamEvent
 
+from ._agent_catalog import AgentCatalogEntry, RegisteredAgent, RegisteredAgentCatalog
 from ._child_status import child_summary_busy
-from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
-from ._timeouts import _SSE_TIMEOUT
+from ._errors import (
+    OmnigentError,
+    StaleCursorError,
+    raise_for_status,
+    require_json_object,
+    response_body,
+)
+from ._timeouts import _HOST_LAUNCH_READ_TIMEOUT_S, _SSE_TIMEOUT
 from ._types import PaginatedList
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
 # rollup, the CLI ``↓`` tree, and the web Agents rail all walk the same depth.
 _DEFAULT_SUBTREE_DEPTH = 3
+# Rows asked for per ``descendants=true`` page (the server's page cap), and the
+# deepest tree the server returns that way; deeper walks go level by level.
+_DESCENDANTS_LIMIT = 1000
+_DESCENDANTS_MAX_DEPTH = 10
 
 # Adapter that validates a single SSE ``data:`` payload against the
 # typed discriminated union. Built once at module load — TypeAdapter
@@ -181,6 +193,8 @@ class Session:
         returned with ``visibility="archived"`` or with
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
+    :param host_id: Host owning this session's runner, or ``None`` when unbound.
+    :param sandbox_status: Managed launch progress or failure details, when available.
     """
 
     id: str
@@ -202,6 +216,8 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    host_id: str | None = None
+    sandbox_status: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -238,6 +254,8 @@ class Session:
             last_task_error=raw.get("last_task_error"),
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
+            host_id=raw.get("host_id"),
+            sandbox_status=raw.get("sandbox_status"),
         )
 
 
@@ -328,18 +346,20 @@ class SessionListItem:
 
 
 @dataclass(frozen=True)
-class RegisteredAgent:
+class LaunchHost:
     """
-    A server-registered agent resolved by display name.
+    A connected host the server can launch a session's runner on.
 
-    :param id: The agent's durable identifier, e.g. ``"ag_abc123"``.
-    :param harness: Harness the agent runs on, e.g.
-        ``"openai-agents"``. ``None`` when the server did not report
-        one.
+    :param host_id: Durable host identifier.
+    :param name: Display name; the id when the host reported none.
+    :param launchable: Whether it can run the requested harness (or hasn't said).
+    :param unavailable_reason: Why not, e.g. ``"binary-missing"``; ``None`` when launchable.
     """
 
-    id: str
-    harness: str | None = None
+    host_id: str
+    name: str
+    launchable: bool = True
+    unavailable_reason: str | None = None
 
 
 class SessionsNamespace:
@@ -450,6 +470,9 @@ class SessionsNamespace:
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        host_id: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
     ) -> Session:
         """
         Create a new session bound to an already-registered agent.
@@ -470,9 +493,15 @@ class SessionsNamespace:
             effort, e.g. ``"high"``. ``None`` uses the agent default.
         :param workspace: Optional absolute starting cwd to record on
             the session, e.g. ``"/Users/corey/projects/myapp"``.
+        :param host_id: Launch the runner on this host; read timeout is at least
+            3660 seconds. Longer or unlimited client timeouts are retained.
+        :param host_type: Use ``managed`` to provision a fresh sandbox host.
+            Its optional workspace is a repository URL instead of a host path.
+        :param sandbox_provider: Explicit managed sandbox provider, e.g. ``modal``.
+            Only valid with ``host_type="managed"``; validated by the server.
         :returns: The newly created :class:`Session` snapshot.
-        :raises OmnigentError: If the server returns a non-2xx
-            status.
+        :raises OmnigentError: If the server returns a non-2xx status,
+            or a host-targeted create times out before its outcome is known.
         """
         body: dict[str, Any] = {"agent_id": agent_id}
         if title is not None:
@@ -483,7 +512,31 @@ class SessionsNamespace:
             body["reasoning_effort"] = reasoning_effort
         if workspace is not None:
             body["workspace"] = workspace
-        resp = await self._http.post(f"{self._base}/v1/sessions", json=body)
+        if host_id is not None:
+            body["host_id"] = host_id
+        if host_type != "external":
+            body["host_type"] = host_type
+        if sandbox_provider is not None:
+            body["sandbox_provider"] = sandbox_provider
+        timeout = httpx.Timeout(self._http.timeout)
+        if host_id is not None and timeout.read is not None:
+            timeout.read = max(timeout.read, _HOST_LAUNCH_READ_TIMEOUT_S)
+        try:
+            resp = await self._http.post(f"{self._base}/v1/sessions", json=body, timeout=timeout)
+        except httpx.TimeoutException as exc:
+            if host_id is None:
+                raise
+            if isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+                raise OmnigentError(
+                    f"Timed out connecting to the server to launch a runner on host {host_id!r} "
+                    "(POST /v1/sessions). The launch request was not sent; "
+                    "check the server connection and retry."
+                ) from exc
+            raise OmnigentError(
+                f"Timed out waiting for runner launch on host {host_id!r} "
+                "(POST /v1/sessions). The launch may still complete on the server; "
+                "check the host's runners before retrying."
+            ) from exc
         raise_for_status(resp.status_code, response_body(resp))
         created = require_json_object(resp, "POST /v1/sessions")
         return Session.from_dict(created)
@@ -494,74 +547,51 @@ class SessionsNamespace:
 
         Used by clients that only know the name the user picked — the
         remote-URL chat picker lists names, but session creation binds
-        by id. ``GET /v1/agents`` lists only server-registered
-        (``session_id IS NULL``) agents, so a session-scoped agent is
-        not resolvable this way and raises ``LookupError``.
+        by id. Searches server agents (``GET /v1/agents``), then the
+        caller's own (``scope=user``, from ``omnigent agent add``); a
+        session-scoped agent is not resolvable this way and raises
+        ``LookupError``.
 
         Follows the listing cursor, so an agent past the first page
-        still resolves. The only quiet end of the walk is the server
-        reporting ``has_more`` false; a stalled listing raises instead
-        of masquerading as a clean miss.
+        still resolves. A walk ends quietly when the server reports
+        ``has_more`` false, or when the ``scope=user`` listing answers
+        401, 403, 404 or 422 (no usable user agents); a stalled listing
+        raises instead of masquerading as a clean miss.
 
         :param agent_name: Agent display name, e.g. ``"hello_world"``.
         :returns: The matching agent's id and advertised harness.
-        :raises OmnigentError: If the listing returns a non-2xx status,
-            or reports ``has_more`` with a missing or non-advancing
+        :raises OmnigentError: If a listing returns another non-2xx
+            status, or reports ``has_more`` with a missing or non-advancing
             ``last_id`` cursor (a stalled walk, not an absent agent).
         :raises LookupError: If no registered agent has that name.
         """
-        # Cap the miss-path name list: a large deployment should not
-        # build thousands of names just to render one error message.
-        names: list[str] = []
-        truncated = False
-        after: str | None = None
-        while True:
-            params: dict[str, str | int] = {"limit": 1000}
-            if after is not None:
-                params["after"] = after
-            resp = await self._http.get(f"{self._base}/v1/agents", params=params)
-            raise_for_status(resp.status_code, response_body(resp))
-            listing = require_json_object(resp, "GET /v1/agents")
-            data = listing.get("data", [])
-            for item in data if isinstance(data, list) else []:
-                if not isinstance(item, dict):
-                    continue
-                name = item.get("name")
-                if name == agent_name:
-                    harness = item.get("harness")
-                    return RegisteredAgent(
-                        id=str(item["id"]),
-                        harness=str(harness) if isinstance(harness, str) else None,
-                    )
-                if isinstance(name, str):
-                    if len(names) < 50:
-                        names.append(name)
-                    else:
-                        truncated = True
-            if not listing.get("has_more"):
-                break
-            last_id = listing.get("last_id")
-            if not last_id:
-                # Server reports more pages but provides no cursor to advance
-                # — raise rather than silently stopping, so callers can
-                # distinguish a pagination stall from "agent not found".
-                raise OmnigentError(
-                    f"agent listing stalled: server returned has_more=True but"
-                    f" no last_id cursor (searched so far: {', '.join(names) or '<none>'})"
-                )
-            next_after = str(last_id)
-            if next_after == after:
-                # A cursor that does not advance would page forever; raise
-                # instead of looping on the same page.
-                raise OmnigentError(
-                    f"agent listing stalled: server repeated cursor {next_after!r}"
-                    f" with has_more=True (searched so far: {', '.join(names) or '<none>'})"
-                )
-            after = next_after
-        available = ", ".join(names) + (", …" if truncated else "")
+        agents = await self.list_registered_agents(stop_at=agent_name)
+        for agent in agents:
+            if agent.name == agent_name:
+                return RegisteredAgent(id=agent.id, harness=agent.harness)
+        names = [agent.name for agent in agents]
+        available = ", ".join(names[:50]) + (", ..." if len(names) > 50 else "")
         raise LookupError(
             f"No agent named {agent_name!r} is registered on this server. Available: {available}"
         )
+
+    async def list_registered_agents(
+        self, *, stop_at: str | None = None
+    ) -> list[AgentCatalogEntry]:
+        """List server and user registrations with server-first name precedence.
+
+        :param stop_at: Stop after a validated page containing this name.
+        :returns: Unique registrations in catalog order.
+        :raises OmnigentError: On failed requests, malformed rows or stalled pagination.
+        """
+        catalog = RegisteredAgentCatalog(stop_at=stop_at)
+        while not catalog.done:
+            resp = await self._http.get(f"{self._base}/v1/agents", params=catalog.params)
+            if catalog.skip_unavailable_scope(resp.status_code):
+                break
+            raise_for_status(resp.status_code, response_body(resp))
+            catalog.add_page(require_json_object(resp, "GET /v1/agents"))
+        return list(catalog.entries.values())
 
     async def resolve_online_runner(
         self,
@@ -618,6 +648,53 @@ class SessionsNamespace:
             if wanted & names:
                 return runner_id
         return unknown_harness
+
+    async def list_launch_hosts(
+        self,
+        *,
+        harness: str | None = None,
+    ) -> list[LaunchHost]:
+        """
+        List the caller's connected hosts a runner could be launched on, with readiness.
+
+        Skip sandbox hosts and use ``harness_launch_availability`` so readiness
+        matches the server. Unknown readiness counts as launchable.
+
+        :param harness: Harness the session needs, e.g. ``"claude-sdk"``.
+        :returns: Online hosts in listing order; empty when there are none.
+        :raises OmnigentError: If the listing returns a non-2xx status.
+        """
+        resp = await self._http.get(f"{self._base}/v1/hosts")
+        raise_for_status(resp.status_code, response_body(resp))
+        listing = require_json_object(resp, "GET /v1/hosts")
+        hosts = listing.get("hosts")
+        if not isinstance(hosts, list):
+            raise OmnigentError("GET /v1/hosts returned an unexpected hosts listing")
+
+        result: list[LaunchHost] = []
+        for item in hosts:
+            if not isinstance(item, dict) or item.get("status") != "online":
+                continue
+            if item.get("sandbox_provider") is not None:
+                continue
+            host_id = item.get("host_id")
+            if not isinstance(host_id, str) or not host_id:
+                continue
+            name = item.get("name")
+            display = name if isinstance(name, str) and name else host_id
+            readiness = item.get("configured_harnesses")
+            available, reason = harness_launch_availability(
+                harness, readiness if isinstance(readiness, dict) else None
+            )
+            result.append(
+                LaunchHost(
+                    host_id,
+                    display,
+                    available is not False,
+                    reason if available is False else None,
+                )
+            )
+        return result
 
     async def list(
         self,
@@ -943,6 +1020,8 @@ class SessionsNamespace:
         *,
         limit: int = 100,
         after: str | None = None,
+        descendants: bool = False,
+        max_depth: int | None = None,
     ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
@@ -959,6 +1038,11 @@ class SessionsNamespace:
         :param limit: Maximum number of children to return
             (1-1000, default 100).
         :param after: Cursor — return children after this session ID.
+        :param descendants: Ask for the whole subtree in one response
+            (breadth-first, each row's ``parent_session_id`` is its own
+            parent and ``depth`` is set). Servers without it ignore the
+            flag and return direct children, whose rows have no ``depth``.
+        :param max_depth: Levels to return with *descendants*.
         :returns: :class:`PaginatedList` with ``data``, ``has_more``,
             ``first_id``, and ``last_id``.  Pass ``result.last_id`` as
             ``after=`` to fetch the next page when ``result.has_more``.
@@ -968,6 +1052,10 @@ class SessionsNamespace:
         params: dict[str, str | int] = {"limit": limit}
         if after is not None:
             params["after"] = after
+        if descendants:
+            params["descendants"] = "true"
+            if max_depth is not None:
+                params["max_depth"] = max_depth
         resp = await self._http.get(
             f"{self._base}/v1/sessions/{session_id}/child_sessions",
             params=params,
@@ -982,11 +1070,16 @@ class SessionsNamespace:
         *,
         max_depth: int = _DEFAULT_SUBTREE_DEPTH,
         limit: int = 100,
+        expand: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> builtins.list[dict[str, Any]]:
         """List the whole sub-agent subtree under *session_id*, flattened.
 
-        :meth:`child_sessions` is one level deep; this recurses it breadth-first
-        to *max_depth*, mirroring web's ``useChildSessions`` per-node fetch.
+        Asks the server for the whole subtree (``descendants=true``, paged).
+        A server without that, or a spawn tree too big for it, answers with
+        one level instead; that page is reused as the first level of a
+        breadth-first walk of :meth:`child_sessions`, mirroring web's
+        ``useChildSessions`` per-node fetch. Either way the result is what
+        that walk returns, including *limit* children per parent.
         Each returned row is the raw ``ChildSessionSummary`` dict with an added
         ``parent_id`` recording the session it was queried under, so callers can
         reconstruct the hierarchy. *session_id* itself is not included.
@@ -998,11 +1091,23 @@ class SessionsNamespace:
         :param max_depth: Levels to descend (1 = direct children only). Capped
             to match the CLI tree and the web Agents rail.
         :param limit: Per-level page size passed to :meth:`child_sessions`.
+        :param expand: Optional predicate over a returned row deciding whether
+            to fetch that row's own children. ``None`` descends into every row.
+            A poller passes one to skip subtrees it already knows have settled,
+            so their unchanged rows aren't re-fetched; *session_id* itself is
+            always expanded.
         :returns: Flattened list of child-session summary dicts, each carrying a
             ``parent_id`` key (empty when the session has no sub-agents).
         :raises OmnigentError: On non-2xx status (404 when the session does not
             exist).
         """
+        if max_depth <= 0:
+            return []
+        first: PaginatedList | None = None
+        if max_depth <= _DESCENDANTS_MAX_DEPTH:
+            rows, first = await _descendant_rows(self, session_id, max_depth)
+            if rows is not None:
+                return _limit_children_per_parent(rows, session_id, limit)
         nodes: list[dict[str, Any]] = []
         seen: set[str] = {session_id}
         frontier: list[str] = [session_id]
@@ -1010,7 +1115,12 @@ class SessionsNamespace:
         while frontier and depth < max_depth:
             next_frontier: list[str] = []
             for parent_id in frontier:
-                page = await self.child_sessions(parent_id, limit=limit)
+                if depth == 0 and first is not None:
+                    # An older server answered the descendants request with
+                    # this level; reuse it rather than asking again.
+                    page = PaginatedList(data=first.data[:limit], has_more=first.has_more)
+                else:
+                    page = await self.child_sessions(parent_id, limit=limit)
                 for row in page.data:
                     if not isinstance(row, dict):
                         continue
@@ -1018,8 +1128,10 @@ class SessionsNamespace:
                     if not isinstance(sid, str) or sid in seen:  # cycle / dupe guard
                         continue
                     seen.add(sid)
-                    nodes.append({**row, "parent_id": parent_id})
-                    next_frontier.append(sid)
+                    node = {**row, "parent_id": parent_id}
+                    nodes.append(node)
+                    if expand is None or expand(node):
+                        next_frontier.append(sid)
             frontier = next_frontier
             depth += 1
         return nodes
@@ -1052,7 +1164,15 @@ class SessionsNamespace:
         nodes = await self.child_sessions_tree(session_id, max_depth=max_depth, limit=limit)
         return any(child_summary_busy(node) for node in nodes)
 
-    async def get(self, session_id: str) -> Session:
+    async def get(
+        self,
+        session_id: str,
+        *,
+        include_items: bool = True,
+        include_liveness: bool = True,
+        include_live_status: bool = True,
+        include_usage: bool = True,
+    ) -> Session:
         """
         Fetch the current snapshot of a session.
 
@@ -1061,14 +1181,34 @@ class SessionsNamespace:
         queued inputs — clients use this on reconnect to reconcile
         state observed via :meth:`stream`.
 
+        The ``include_*`` flags let a poller that reads only a few fields
+        (status, labels) skip the snapshot's expensive parts. Only flags set to
+        ``False`` are sent, so the default request is unchanged and older
+        servers, which ignore unknown parameters, still answer.
+
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param include_items: ``False`` skips the committed-items read
+            (``items`` is then empty).
+        :param include_liveness: ``False`` skips the runner/host liveness
+            lookup (``runner_online`` / ``host_online`` are then unset).
+        :param include_live_status: ``False`` reports the cached status
+            instead of probing the bound runner.
+        :param include_usage: ``False`` skips the subtree usage read.
         :returns: The current :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status (404 when the session does not exist).
         """
+        flags = {
+            "include_items": include_items,
+            "include_liveness": include_liveness,
+            "include_live_status": include_live_status,
+            "include_usage": include_usage,
+        }
+        params = {name: "false" for name, enabled in flags.items() if not enabled}
         resp = await self._http.get(
             f"{self._base}/v1/sessions/{session_id}",
+            params=params or None,
         )
         raise_for_status(resp.status_code, response_body(resp))
         return Session.from_dict(require_json_object(resp, "GET /v1/sessions/{session_id}"))
@@ -1397,3 +1537,74 @@ def _try_parse_envelope(raw: str) -> ServerStreamEvent | None:
         # event in arrival order.
         _log.debug("Skipping unparseable session event: %s (%s)", raw[:200], exc)
         return None
+
+
+def _limit_children_per_parent(
+    rows: list[dict[str, Any]], root_id: str, limit: int
+) -> list[dict[str, Any]]:
+    """Keep what a level-by-level walk with page size *limit* would have seen.
+
+    The walk reads the first *limit* children of each node (newest first),
+    so it never reaches children it did not read or anything below them.
+
+    :param rows: Breadth-first ``descendants=true`` rows.
+    :param root_id: Session the subtree hangs off.
+    :param limit: Children kept per parent.
+    :returns: Kept rows, each with ``parent_id`` set to its parent.
+    """
+    reached = {root_id}
+    kept_per_parent: dict[str, int] = {}
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        parent_id, child_id = row.get("parent_session_id"), row.get("id")
+        if not isinstance(parent_id, str) or not isinstance(child_id, str):
+            continue
+        if parent_id not in reached:
+            continue
+        if kept_per_parent.get(parent_id, 0) >= limit:
+            continue
+        kept_per_parent[parent_id] = kept_per_parent.get(parent_id, 0) + 1
+        reached.add(child_id)
+        kept.append({**row, "parent_id": parent_id})
+    return kept
+
+
+async def _descendant_rows(
+    sessions: SessionsNamespace, session_id: str, max_depth: int
+) -> tuple[list[dict[str, Any]] | None, PaginatedList | None]:
+    """Read the subtree with ``descendants=true``, following its pages.
+
+    :param sessions: Namespace whose :meth:`~SessionsNamespace.child_sessions` is read.
+    :param session_id: Root parent session identifier.
+    :param max_depth: Levels to return.
+    :returns: ``(rows, None)`` when the server returned the subtree;
+        ``(None, page)`` when it answered with one level instead (a server
+        without the flag, or a tree too big for it), so the caller walks
+        levels starting from *page*; or ``(None, None)`` when a later page
+        could not continue, so the caller walks from scratch.
+    """
+    page = await sessions.child_sessions(
+        session_id, limit=_DESCENDANTS_LIMIT, descendants=True, max_depth=max_depth
+    )
+    rows = [row for row in page.data if isinstance(row, dict)]
+    if any(row.get("depth") is None for row in rows):
+        return None, page
+    while page.has_more and page.last_id:
+        try:
+            page = await sessions.child_sessions(
+                session_id,
+                limit=_DESCENDANTS_LIMIT,
+                after=page.last_id,
+                descendants=True,
+                max_depth=max_depth,
+            )
+        except StaleCursorError:
+            # The tree changed past what one read covers; restart the walk.
+            return None, None
+        more = [row for row in page.data if isinstance(row, dict)]
+        # A continuation is never empty or depth-less; either means this page
+        # is not part of the same subtree, so the pages cannot be stitched.
+        if not more or any(row.get("depth") is None for row in more):
+            return None, None
+        rows.extend(more)
+    return rows, None

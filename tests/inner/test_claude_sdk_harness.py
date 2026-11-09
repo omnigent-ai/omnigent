@@ -79,6 +79,7 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "900000")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_CWD", "/tmp/test-cwd")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_PERMISSION_MODE", "acceptEdits")
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET", "claude_code")
 
     captured: dict[str, Any] = {}
 
@@ -89,6 +90,7 @@ def test_executor_factory_reads_env_vars(
         os_env: Any,
         model: str | None,
         permission_mode: str,
+        system_prompt_preset: str | None,
         gateway: bool,
         databricks_profile: str | None,
         gateway_host: str | None,
@@ -101,6 +103,7 @@ def test_executor_factory_reads_env_vars(
         captured["os_env"] = os_env
         captured["model"] = model
         captured["permission_mode"] = permission_mode
+        captured["system_prompt_preset"] = system_prompt_preset
         captured["gateway"] = gateway
         captured["databricks_profile"] = databricks_profile
         captured["gateway_host"] = gateway_host
@@ -125,6 +128,7 @@ def test_executor_factory_reads_env_vars(
     assert captured["gateway_auth_refresh_interval_ms"] == "900000"
     assert captured["cwd"] == "/tmp/test-cwd"
     assert captured["permission_mode"] == "acceptEdits"
+    assert captured["system_prompt_preset"] == "claude_code"
     # When ``HARNESS_CLAUDE_SDK_OS_ENV`` is unset (this test
     # doesn't set it), the wrap defaults to ``caller_process +
     # sandbox=none`` so the SDK exposes its native tools to the
@@ -345,6 +349,31 @@ def test_databricks_env_var_truthy_parsing(
         claude_sdk_harness._build_claude_sdk_executor()
 
     assert captured["gateway"] is expected
+
+
+@pytest.mark.parametrize(
+    "raw_value, expected",
+    [("1000000", 1_000_000), (" 200000 ", 200_000), ("", None), ("1M", None), ("0", None)],
+)
+def test_context_window_env_var_parsing(
+    raw_value: str,
+    expected: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a positive integer reaches the executor; anything else resolves from the model."""
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_CONTEXT_WINDOW", raw_value)
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["context_window"] == expected
 
 
 @pytest.mark.parametrize(

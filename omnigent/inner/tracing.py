@@ -14,7 +14,8 @@ Usage::
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
 
     from .tracing import enable_tracing
-    enable_tracing()          # turns on tracing globally
+
+    enable_tracing()  # turns on tracing globally
     # ... run agents as normal via Session ...
 
 Or per-session::

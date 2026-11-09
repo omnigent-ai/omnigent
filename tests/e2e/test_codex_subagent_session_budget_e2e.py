@@ -171,7 +171,7 @@ def test_codex_child_enforces_root_cost_budget_without_parent_activity(
         },
         "os_env": {
             "type": "caller_process",
-            "cwd": str(workspace),
+            "cwd": ".",
             "sandbox": {"type": "none"},
         },
     }

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import psutil
 import pytest
+from execnet.gateway_io import popen_bootstrapline
 
 from omnigent.testing.process_reaper import (
     find_leaked_omnigent_processes,
@@ -106,7 +107,8 @@ def test_ignores_processes_without_omnigent_in_cmdline(data_dir: Path) -> None:
         _kill_quietly(child)
 
 
-def test_ignores_pytest_processes(data_dir: Path) -> None:
+@pytest.mark.parametrize("invocation", ["pytest", "execnet"])
+def test_ignores_pytest_processes(data_dir: Path, invocation: str) -> None:
     """A concurrent pytest carrying the data dir is never attributed.
 
     xdist workers and nested pytest runs are exec'd with the parent's
@@ -114,13 +116,22 @@ def test_ignores_pytest_processes(data_dir: Path) -> None:
     exec), so a live pytest can legitimately reference this session's
     data dir without being a leak.
     """
-    child = _spawn(
-        _SLEEP_CHILD,
-        "-m",
-        "pytest",
-        "omnigent-suite",
-        env={"OMNIGENT_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
-    )
+    env = {"OMNIGENT_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"}
+    if invocation == "execnet":
+        child = subprocess.Popen(
+            [sys.executable, "-u", "-c", popen_bootstrapline, "omnigent-suite"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=env,
+        )
+        assert child.stdin is not None
+        child.stdin.write(repr(_SLEEP_CHILD) + "\n")
+        child.stdin.flush()
+        child.stdin.close()
+    else:
+        child = _spawn(_SLEEP_CHILD, "-m", "pytest", "omnigent-suite", env=env)
     try:
         found = find_leaked_omnigent_processes(data_dir)
         assert child.pid not in {p.pid for p in found}

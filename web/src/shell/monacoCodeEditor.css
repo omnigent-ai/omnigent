@@ -17,6 +17,14 @@
   background-color: rgba(250, 204, 21, 0.3);
 }
 
+/* Lines a chat citation's range points at; matches the Shiki viewer's cited-line tint. */
+.oa-cited-lines {
+  background-color: rgba(254, 240, 138, 0.4);
+}
+.dark .oa-cited-lines {
+  background-color: rgba(161, 98, 7, 0.3);
+}
+
 /* Paint Monaco surfaces with the active Omnigent card tone so the file editor
    follows both the app mode and palette instead of the syntax theme's fixed
    background. The gutter uses a separate Monaco variable. */

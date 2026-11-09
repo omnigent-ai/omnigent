@@ -157,13 +157,59 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
     overrides: list[str],
     expected_provider: str | None,
 ) -> None:
-    """CLI cold resume applies the configured provider before attaching the TUI."""
+    """
+    CLI cold resume applies the configured provider before attaching the TUI.
+
+    When a managed config outranks that provider, Codex 0.166+ refuses the
+    resume and names its effective provider; the rollout is restamped and the
+    resume retried under that provider.
+    """
     from unittest.mock import AsyncMock
 
+    from omnigent.harnesses.codex_native import app_server as codex_app_server
     from omnigent.harnesses.codex_native.app_server import NativeCodexLaunch
 
-    server = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), codex_cli_version=(0, 156, 1))
-    preload = AsyncMock(side_effect=RuntimeError("stop after resume"))
+    server = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), codex_cli_version=(0, 166, 0))
+    rollout = _write_source_rollout(
+        codex_home=tmp_path / "codex-home", thread_id="thread_test", source_cwd=str(tmp_path)
+    )
+    later_records = rollout.read_bytes().split(b"\n", 1)[1]
+    resumes: list[dict[str, Any]] = []
+
+    class _ManagedProviderClient:
+        """Preload client for a Codex whose managed config forces ``Databricks``."""
+
+        async def connect(self) -> None:
+            """:returns: None."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """
+            Refuse the launch provider, then stop the launch on the retry.
+
+            :param method: JSON-RPC method, always ``"thread/resume"``.
+            :param params: Resume params.
+            :raises CodexAppServerResponseError: For the first resume.
+            :raises RuntimeError: For the retried resume.
+            """
+            assert method == "thread/resume"
+            resumes.append(params)
+            if len(resumes) == 1:
+                raise codex_app_server.CodexAppServerResponseError(
+                    {
+                        "code": -32600,
+                        "message": "provider mismatch",
+                        "data": {
+                            "type": "modelProviderMismatch",
+                            "modelProvider": expected_provider or "openai",
+                            "currentModelProvider": "Databricks",
+                        },
+                    }
+                )
+            raise RuntimeError("stop after resume")
+
+        async def close(self) -> None:
+            """:returns: None."""
+
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
     monkeypatch.setattr(
         codex_native,
@@ -176,14 +222,20 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
         ),
     )
     monkeypatch.setattr(codex_native, "_find_running_codex_terminal", AsyncMock(return_value=None))
-    monkeypatch.setattr(codex_native, "_ensure_local_codex_resume_rollout", AsyncMock())
+    monkeypatch.setattr(
+        codex_native, "_ensure_local_codex_resume_rollout", AsyncMock(return_value=rollout)
+    )
     monkeypatch.setattr(
         codex_native,
         "resolve_native_codex_launch",
         lambda **_kwargs: NativeCodexLaunch(overrides, "test-model", profile),
     )
     monkeypatch.setattr(codex_native, "build_codex_native_server", lambda **_kwargs: server)
-    monkeypatch.setattr(codex_native, "preload_codex_thread_for_resume", preload)
+    monkeypatch.setattr(
+        codex_app_server,
+        "client_for_transport",
+        lambda *_args, **_kwargs: _ManagedProviderClient(),
+    )
 
     with pytest.raises(RuntimeError, match="stop after resume"):
         await codex_native._prepare_codex_terminal(
@@ -197,8 +249,10 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
             model=None,
         )
 
-    preload.assert_awaited_once()
-    assert preload.await_args.kwargs["model_provider"] == expected_provider
+    assert [resume.get("modelProvider") for resume in resumes] == [expected_provider, "Databricks"]
+    session_meta, rest = rollout.read_bytes().split(b"\n", 1)
+    assert json.loads(session_meta)["payload"]["model_provider"] == "Databricks"
+    assert rest == later_records
     server.close.assert_awaited_once()
 
 

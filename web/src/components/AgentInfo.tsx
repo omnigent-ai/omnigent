@@ -1568,7 +1568,6 @@ export function AgentInfoButton({ agent, sessionId, permissionLevel }: AgentInfo
     cancelClose();
     closeTimeoutRef.current = window.setTimeout(() => {
       closeTimeoutRef.current = null;
-      openedByHoverRef.current = false;
       setOpen(false);
     }, HOVER_CLOSE_DELAY_MS);
   }
@@ -1647,12 +1646,21 @@ export function AgentInfoButton({ agent, sessionId, permissionLevel }: AgentInfo
       </Tooltip>
       <PopoverContent
         align="end"
-        className="w-80"
+        className="menu-surface w-80 rounded-[12px] ring-0"
         data-testid="agent-info-panel"
         onPointerEnter={cancelCloseOnEnter}
         onPointerLeave={scheduleCloseOnLeave}
+        onFocusCapture={() => {
+          cancelClose();
+          openedByHoverRef.current = false;
+        }}
         onOpenAutoFocus={(e) => {
           if (openedByHoverRef.current) e.preventDefault();
+        }}
+        onCloseAutoFocus={(e) => {
+          // A hover preview must not steal focus from an input when it closes.
+          if (openedByHoverRef.current) e.preventDefault();
+          openedByHoverRef.current = false;
         }}
         onInteractOutside={(e) => {
           if (subdialogOpenRef.current) e.preventDefault();

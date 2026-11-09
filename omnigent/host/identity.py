@@ -54,6 +54,32 @@ class HostIdentity:
     name: str
 
 
+HOST_SLICE_KEY_ENABLED_ENV_VAR = "OMNIGENT_HOST_SLICE_KEY_ENABLED"
+
+
+def export_configured_slice_key(path: Path) -> None:
+    """Export ``host.slice_key_enabled`` from *path* as the slice-key env var.
+
+    A managed launch writes the setting into the sandbox's config; exporting it
+    once at host startup lets the request-header builder and the host's runners
+    (which inherit the env var) all agree. An env var already set wins.
+
+    :param path: The host's ``config.yaml``.
+    """
+    if os.environ.get(HOST_SLICE_KEY_ENABLED_ENV_VAR) is not None or not path.exists():
+        return
+    try:
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+    except yaml.YAMLError:
+        # Malformed config is reported by the identity load, not here.
+        return
+    host_section = cfg.get("host") if isinstance(cfg, dict) else None
+    enabled = host_section.get("slice_key_enabled") if isinstance(host_section, dict) else None
+    if isinstance(enabled, bool):
+        os.environ[HOST_SLICE_KEY_ENABLED_ENV_VAR] = "1" if enabled else "0"
+
+
 def host_config_path(path: Path | None = None) -> Path:
     """Return the effective config path used for host identity."""
     return path if path is not None else global_config_path(CONFIG_PATH)

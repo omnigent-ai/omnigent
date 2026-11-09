@@ -602,13 +602,56 @@ describe("authenticatedFetch", () => {
       },
     );
 
-    it("keys /v1/imports/local by its body host_id, not the modal host", async () => {
-      // The import reads the CHOSEN host's transcripts over that host's tunnel,
-      // so it must route to the replica keyed by the body host_id — never the
-      // importing user's modal host (a different host, or null for a fresh user),
-      // which would land off-replica and 409 "host is not connected".
+    it.each(["import", "bundle", "hostless_bundle"])(
+      "keys %s by its own destination",
+      async (kind) => {
+        // Requests route by their own host_id; hostless creates stay unkeyed.
+        vi.doMock("./sessionHost", () => ({
+          getSessionHost: vi.fn(() => null),
+          setSessionHost: vi.fn(),
+          isHostKeyless: vi.fn(() => false),
+          markHostKeyless: vi.fn(),
+          clearHostKeyless: vi.fn(),
+          modalHostId: vi.fn(() => "host_modal"),
+          resolveModalHost: vi.fn(),
+          isModalHostResolved: vi.fn(() => true),
+        }));
+        vi.doMock("./host", () => ({
+          getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+          hostFetch: fetchMock,
+          isDatabricksWorkspace: vi.fn(() => true),
+          isHostRoutingEnabled: vi.fn(() => true),
+        }));
+
+        fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+        const { authenticatedFetch } = await import("./identity");
+
+        const metadata =
+          kind === "hostless_bundle" ? { host_type: "managed" } : { host_id: "host_target" };
+        const bundle = new FormData();
+        bundle.append("metadata", JSON.stringify(metadata));
+        await authenticatedFetch(kind === "import" ? "/v1/imports/local/stream" : "/v1/sessions", {
+          method: "POST",
+          body: kind === "import" ? JSON.stringify(metadata) : bundle,
+        });
+
+        const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+        expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe(
+          kind === "hostless_bundle" ? null : "host_target",
+        );
+      },
+    );
+
+    it.each([
+      [{ host_type: "managed", host_id: "host_fork" }, "host_fork"],
+      [{ host_type: "managed" }, null],
+      [{}, "host_source"],
+    ])("keys a managed fork only by the host it names (%j)", async (body, key) => {
+      // A managed fork's launch runs on the replica it lands on, so it must
+      // land where its own new host will connect (unkeyed without an id),
+      // never on the source's; any other fork keeps the source's key.
       vi.doMock("./sessionHost", () => ({
-        getSessionHost: vi.fn(() => null),
+        getSessionHost: vi.fn(() => "host_source"),
         setSessionHost: vi.fn(),
         isHostKeyless: vi.fn(() => false),
         markHostKeyless: vi.fn(),
@@ -627,14 +670,14 @@ describe("authenticatedFetch", () => {
       fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
       const { authenticatedFetch } = await import("./identity");
 
-      await authenticatedFetch("/v1/imports/local/stream", {
+      await authenticatedFetch("/v1/sessions/conv_src/fork", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ host_id: "host_target", source: "all", limit: 5 }),
+        body: JSON.stringify(body),
       });
 
       const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
-      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_target");
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe(key);
     });
   });
 });
@@ -840,5 +883,45 @@ describe("login redirect", () => {
 
     expect(isLoginRedirectPending()).toBe(false);
     expect(hrefWrites).toEqual([]);
+  });
+});
+
+describe("isSignInExpired", () => {
+  const redirected = { ok: false, status: 0, type: "opaqueredirect", headers: new Headers() };
+  const maintenancePage = {
+    ok: true,
+    status: 200,
+    type: "basic",
+    headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+  };
+
+  it.each([
+    ["a redirect to a login page", redirected],
+    ["a 401", { ok: false, status: 401, type: "basic", headers: new Headers() }],
+    ["a 403", { ok: false, status: 403, type: "basic", headers: new Headers() }],
+  ])(
+    "reports an expired sign-in for %s, probing without following redirects",
+    async (_label, answer) => {
+      fetchMock.mockResolvedValueOnce(answer);
+      const { isSignInExpired } = await import("./identity");
+
+      await expect(isSignInExpired()).resolves.toBe(true);
+      expect(fetchMock.mock.calls[0]).toEqual([
+        "/v1/me",
+        expect.objectContaining({ redirect: "manual" }),
+      ]);
+    },
+  );
+
+  it.each([
+    ["a network failure", new TypeError("Failed to fetch")],
+    ["a JSON answer", mockJsonResponse({ user_id: "alice" })],
+    ["a 200 maintenance page", maintenancePage],
+  ])("reads %s as not expired, so the caller keeps retrying", async (_label, answer) => {
+    if (answer instanceof Error) fetchMock.mockRejectedValueOnce(answer);
+    else fetchMock.mockResolvedValueOnce(answer);
+    const { isSignInExpired } = await import("./identity");
+
+    await expect(isSignInExpired()).resolves.toBe(false);
   });
 });
