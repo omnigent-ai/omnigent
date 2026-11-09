@@ -4110,7 +4110,13 @@ function ComposerImpl(
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
     // Sessions are taggable in every harness; files only in native ones.
-    setMention(detectMentionAt(e.target.value, e.target.selectionStart ?? e.target.value.length));
+    setMention(
+      detectMentionAt(
+        e.target.value,
+        e.target.selectionStart ?? e.target.value.length,
+        sessionEntries.map((session) => session.title),
+      ),
+    );
     recallingRef.current = false;
     resetCursor();
   };
@@ -4360,6 +4366,8 @@ function ComposerImpl(
               {(mentionOpen || mentionListingPending) && (
                 <FileMentionMenu
                   currentDir={mentionDir}
+                  query={mention?.query ?? ""}
+                  fileQuery={mentionFilter}
                   activeIndex={mentionIndex}
                   entries={mentionEntries}
                   loading={mentionListingPending}

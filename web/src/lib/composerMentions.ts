@@ -46,26 +46,44 @@ export function mentionItemPath(item: MentionItem): string {
 // behaves the same.
 const MENTION_RE = /(?:^|\s)@([^\s@]*)$/;
 
+// Same token, but its run may contain single spaces (session titles do).
+const SPACED_MENTION_RE = /(?:^|\s)@([^\s@]+(?: [^\s@]+)* ?)$/;
+/** Longest spaced ``@`` query kept open, in characters. */
+const SPACED_MENTION_MAX = 80;
+
 /**
  * Detect an in-progress ``@``-mention immediately before the caret.
  *
- * Looks only at ``text`` up to ``caret`` so a trailing space (token
- * finished) closes the menu. Returns ``null`` when there is no active
- * mention token.
+ * Looks only at ``text`` up to ``caret``. A space normally finishes the token
+ * and closes the menu; it continues the token only while one of
+ * ``sessionTitles`` (the sessions the menu lists now) still contains the
+ * query, so ``@Casual g`` keeps finding "Casual greeting".
  *
  * :param text: The full textarea value.
  * :param caret: The caret offset (``selectionStart``).
+ * :param sessionTitles: Titles the menu currently lists, e.g. ``["Casual greeting"]``.
  * :returns: The active :class:`MentionState`, or ``null``.
  */
-export function detectMentionAt(text: string, caret: number): MentionState | null {
+export function detectMentionAt(
+  text: string,
+  caret: number,
+  sessionTitles: readonly string[] = [],
+): MentionState | null {
   const before = text.slice(0, caret);
-  const m = MENTION_RE.exec(before);
+  const m = MENTION_RE.exec(before) ?? spacedMention(before, sessionTitles);
   if (!m) return null;
   const query = m[1];
   // ``m.index`` points at the matched whitespace (or -1+1=0 at line start);
   // the "@" sits just before the captured query.
   const start = caret - query.length - 1;
   return { query, start, end: caret };
+}
+
+function spacedMention(before: string, sessionTitles: readonly string[]): RegExpExecArray | null {
+  const m = SPACED_MENTION_RE.exec(before);
+  if (!m || m[1].length > SPACED_MENTION_MAX) return null;
+  const needle = m[1].toLowerCase();
+  return sessionTitles.some((title) => title.toLowerCase().includes(needle)) ? m : null;
 }
 
 /**

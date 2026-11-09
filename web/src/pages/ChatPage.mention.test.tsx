@@ -216,6 +216,21 @@ describe("detectMentionAt", () => {
     expect(detectMentionAt("@server.ts ", 11)).toBeNull();
   });
 
+  it("continues across a space only while a listed session title still matches", () => {
+    const titles = ["Casual greeting", "Explain Omnigent Repo"];
+    expect(detectMentionAt("hi @casual g", 12, titles)).toEqual({
+      query: "casual g",
+      start: 3,
+      end: 12,
+    });
+    expect(detectMentionAt("@casual ", 8, titles)?.query).toBe("casual ");
+    // No listed title contains the query, so the space finishes the token.
+    expect(detectMentionAt("@casual x", 9, titles)).toBeNull();
+    // A double space or a newline always finishes it.
+    expect(detectMentionAt("@casual  ", 9, titles)).toBeNull();
+    expect(detectMentionAt("@casual\ng", 9, titles)).toBeNull();
+  });
+
   it("reads the token at the caret, ignoring text after it (mid-token edit)", () => {
     // WHY: the user can move the caret back into a token to refine it; only the
     // text up to the caret defines the active query, never the trailing text.
@@ -780,6 +795,19 @@ describe("Composer @-session mentions", () => {
     expect(onSend.mock.calls[0]![0]).toBe(
       `Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review\n\n${SESSION_MENTION_HINT}`,
     );
+  });
+
+  it("keeps matching a session title as the query gains a space", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("Ask @alpha");
+    type("Ask @alpha pl");
+    // The typed part of the matching title is tinted, spaces included.
+    expect(screen.getByTestId("mention-match").textContent).toBe("Alpha pl");
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+    expect(textarea().value).toBe("Ask @Alpha planning ");
+    // Once nothing matches, the space ends the token and the menu closes.
+    type("Ask @alpha zz");
+    expect(screen.queryByTestId("file-mention-menu")).not.toBeInTheDocument();
   });
 
   it("searches only once typing pauses for the debounce, with the latest text", () => {

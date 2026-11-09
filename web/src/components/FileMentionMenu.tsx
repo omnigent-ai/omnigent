@@ -18,6 +18,10 @@ import type { SessionMention } from "@/lib/composerMentions";
 interface FileMentionMenuProps {
   /** Directory currently being browsed ("" = workspace root). */
   currentDir: string;
+  /** Typed text after ``@``; its first match in each session title is tinted. */
+  query?: string;
+  /** Typed name segment within ``currentDir``; tinted in file and folder names. */
+  fileQuery?: string;
   /** Index of the highlighted row (-1 = none). */
   activeIndex: number;
   /** Entries of the current directory (folders first), already filtered + capped. */
@@ -43,6 +47,22 @@ const ROW_CLASS =
 const ACTIVE_ROW_CLASS = "bg-muted dark:bg-muted/50";
 const ROW_ICON_CLASS = "size-3.5 shrink-0 text-slate-500 dark:text-slate-400";
 
+/** ``text`` with the first case-insensitive match of ``query`` tinted like a mention token. */
+export function MatchHighlight({ text, query }: { text: string; query: string }) {
+  const at = query ? text.toLowerCase().indexOf(query.toLowerCase()) : -1;
+  if (at < 0) return <>{text}</>;
+  const end = at + query.length;
+  return (
+    <>
+      {text.slice(0, at)}
+      <span data-testid="mention-match" className="text-brand-accent">
+        {text.slice(at, end)}
+      </span>
+      {text.slice(end)}
+    </>
+  );
+}
+
 /**
  * Floating ``@`` menu. A bare ``@`` shows one "Sessions" row; opening it lists
  * a "Subagents" row and then the other sessions, and Back or Esc goes up one
@@ -55,6 +75,8 @@ const ROW_ICON_CLASS = "size-3.5 shrink-0 text-slate-500 dark:text-slate-400";
  */
 export function FileMentionMenu({
   currentDir,
+  query = "",
+  fileQuery = "",
   activeIndex,
   entries,
   loading = false,
@@ -145,7 +167,9 @@ export function FileMentionMenu({
                     ) : (
                       <MessageSquareIcon className={ROW_ICON_CLASS} />
                     )}
-                    <span className="min-w-0 flex-1 truncate">{session.title}</span>
+                    <span className="min-w-0 flex-1 truncate">
+                      <MatchHighlight text={session.title} query={query} />
+                    </span>
                     {session.isSubagent && (
                       <span className="shrink-0 text-[10px] text-muted-foreground">subagent</span>
                     )}
@@ -197,7 +221,7 @@ export function FileMentionMenu({
                       <FileTextIcon className="size-3.5 shrink-0 text-slate-500 dark:text-slate-400" />
                     )}
                     <span className="truncate">
-                      {entry.name}
+                      <MatchHighlight text={entry.name} query={fileQuery} />
                       {isDir ? "/" : ""}
                     </span>
                   </button>

@@ -7145,6 +7145,7 @@ function NewChatLandingContent({
                     detectMentionAt(
                       e.target.value,
                       e.target.selectionStart ?? e.target.value.length,
+                      sessionEntries.map((session) => session.title),
                     ),
                   );
                 },
@@ -7213,6 +7214,8 @@ function NewChatLandingContent({
                     {(mentionOpen || mentionListingPending) && (
                       <FileMentionMenu
                         currentDir={mentionDir}
+                        query={mention?.query ?? ""}
+                        fileQuery={mentionFilter}
                         activeIndex={mentionIndex}
                         entries={mentionEntries}
                         loading={mentionListingPending}
