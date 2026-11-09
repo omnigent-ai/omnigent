@@ -44,9 +44,9 @@ const ACTIVE_ROW_CLASS = "bg-muted dark:bg-muted/50";
 const ROW_ICON_CLASS = "size-3.5 shrink-0 text-slate-500 dark:text-slate-400";
 
 /**
- * Floating ``@`` menu. A bare ``@`` shows one "Sessions" row that opens the
- * full session list (subagents first, Back or Esc returns); typed text lists
- * matching sessions inline. Below them, in native coding-agent sessions, sits a
+ * Floating ``@`` menu. A bare ``@`` shows one "Sessions" row; opening it lists
+ * a "Subagents" row and then the other sessions, and Back or Esc goes up one
+ * level. Typed text lists matching sessions inline. Below them, in native coding-agent sessions, sits a
  * drill-down file/folder browser. Row indices run top to bottom across all
  * sections. Folders open (drill in) on click so nested
  * files are reachable; a file attaches on click, and a folder's ``+`` button
@@ -69,13 +69,12 @@ export function FileMentionMenu({
     listRef.current.querySelector('[data-active="true"]')?.scrollIntoView({ block: "nearest" });
   }, [activeIndex]);
   const sessions = sessionMenu?.rows ?? [];
-  const showCategory = sessionMenu?.showCategory ?? false;
-  const browsing = sessionMenu?.browsing ?? false;
-  if (entries.length === 0 && sessions.length === 0 && !showCategory && !browsing && !loading)
-    return null;
-  const sessionOffset = showCategory ? 1 : 0;
+  const category = sessionMenu?.category ?? null;
+  const level = sessionMenu?.level ?? null;
+  if (entries.length === 0 && sessions.length === 0 && !category && !level && !loading) return null;
+  const sessionOffset = category ? 1 : 0;
   const fileOffset = sessionOffset + sessions.length;
-  const showFiles = !browsing && (entries.length > 0 || loading);
+  const showFiles = level === null && (entries.length > 0 || loading);
 
   return (
     <div className="absolute bottom-full left-0 z-30 mb-2 flex items-end gap-2">
@@ -85,12 +84,12 @@ export function FileMentionMenu({
       >
         <MobileMenuGlassSurface />
         <div ref={listRef} role="listbox" className="max-h-80 overflow-y-auto">
-          {browsing && (
+          {level && (
             <button
               type="button"
               data-testid="session-mention-back"
               onMouseDown={(e) => e.preventDefault()}
-              onClick={() => sessionMenu?.closeSessions()}
+              onClick={() => sessionMenu?.goBack()}
               className={cn(ROW_CLASS, "text-muted-foreground hover:text-foreground")}
             >
               <ArrowLeftIcon className="size-3.5 shrink-0" />
@@ -98,25 +97,29 @@ export function FileMentionMenu({
               <kbd className="shrink-0 rounded border border-border px-1 text-[10px]">Esc</kbd>
             </button>
           )}
-          {showCategory && (
+          {category && (
             <button
               type="button"
               role="option"
               aria-selected={activeIndex === 0}
-              data-testid="session-mention-category"
+              data-testid={`session-mention-category-${category}`}
               data-active={activeIndex === 0 ? "true" : undefined}
               onMouseDown={(e) => e.preventDefault()}
-              onClick={() => sessionMenu?.openSessions()}
+              onClick={() => sessionMenu?.openCategory()}
               className={cn(ROW_CLASS, activeIndex === 0 && ACTIVE_ROW_CLASS)}
             >
-              <MessagesSquareIcon className={ROW_ICON_CLASS} />
-              <span className="flex-1">Sessions</span>
+              {category === "subagents" ? (
+                <BotIcon className={ROW_ICON_CLASS} />
+              ) : (
+                <MessagesSquareIcon className={ROW_ICON_CLASS} />
+              )}
+              <span className="flex-1">{category === "subagents" ? "Subagents" : "Sessions"}</span>
               <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
             </button>
           )}
           {sessions.length > 0 && (
             <>
-              {!browsing && (
+              {level === null && (
                 <div className="px-1.5 py-1 text-sm font-medium text-muted-foreground">
                   Sessions
                 </div>
@@ -151,8 +154,10 @@ export function FileMentionMenu({
               })}
             </>
           )}
-          {browsing && sessions.length === 0 && (
-            <div className="px-1.5 py-1 text-ui text-muted-foreground">No matching sessions</div>
+          {level && sessions.length === 0 && !category && (
+            <div className="px-1.5 py-1 text-ui text-muted-foreground">
+              {level === "subagents" ? "No matching subagents" : "No matching sessions"}
+            </div>
           )}
           {showFiles && (
             <div className="flex items-center justify-between gap-2 px-1.5 py-1 text-sm font-medium text-muted-foreground">

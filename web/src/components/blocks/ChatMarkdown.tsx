@@ -523,8 +523,9 @@ function ZoomableMarkdownImage({
 
 // Stable module-level override map so MessageResponse's shallow prop compare
 // never sees a new `components` identity and re-parses needlessly.
+/** Same pink as the composer's mention tokens, so a tag looks alike before and after send. */
 const MENTION_PILL_CLASS =
-  "inline-flex max-w-full items-center gap-1 rounded-md border border-border bg-background/60 px-1.5 align-baseline text-[0.95em] leading-snug text-foreground no-underline hover:bg-accent";
+  "inline-flex max-w-full items-center gap-1 rounded-[4px] bg-brand-accent/10 px-1 align-baseline text-[0.95em] leading-snug text-brand-accent no-underline ring-2 ring-brand-accent/10 hover:bg-brand-accent/20";
 
 /** A tagged file in a sent message; opens it like a workspace file link. */
 function FileMentionPill({
@@ -549,7 +550,7 @@ function FileMentionPill({
         open?.();
       }}
     >
-      <Icon className="size-3 shrink-0 text-muted-foreground" />
+      <Icon className="size-3 shrink-0" />
       <span className="truncate">{children}</span>
     </button>
   );
@@ -575,7 +576,7 @@ function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) 
       title={target.isSubagent ? "Subagent" : "Session"}
       onClick={(event) => event.stopPropagation()}
     >
-      <Icon className="size-3 shrink-0 text-muted-foreground" />
+      <Icon className="size-3 shrink-0" />
       <span className="truncate">{props.children}</span>
     </a>
   );

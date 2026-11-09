@@ -44,16 +44,21 @@ export interface MentionBrowserParams {
   initialMentions?: TaggedMentions;
 }
 
+/** An open level of the ``@`` session menu; ``null`` is the top level. */
+export type SessionMenuLevel = "sessions" | "subagents";
+
 /** What the ``@`` menu renders above the files. */
 export interface SessionMenuView {
   /** Session rows to render, indexed first (after the category row, if any). */
   rows: readonly SessionMention[];
-  /** Bare ``@``: one "Sessions" row that opens the full list. */
-  showCategory: boolean;
-  /** The full session list is open; files are hidden until Back. */
-  browsing: boolean;
-  openSessions: () => void;
-  closeSessions: () => void;
+  /** The one row (index 0) that opens a deeper list, if this level has one. */
+  category: SessionMenuLevel | null;
+  /** The open list, or ``null`` at the top level; files show only at the top level. */
+  level: SessionMenuLevel | null;
+  /** Open the list ``category`` names. */
+  openCategory: () => void;
+  /** Go up one level. */
+  goBack: () => void;
 }
 
 export interface MentionBrowser {
@@ -105,23 +110,32 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const [mentionedSessions, setMentionedSessions] = useState<SessionMention[]>(
     () => initialMentions?.sessions ?? [],
   );
-  // The full session list stays open for the "@" token it was opened from.
-  const [browseStart, setBrowseStart] = useState<number | null>(null);
-  if (browseStart !== null && mention?.start !== browseStart) setBrowseStart(null);
-  const browsing = browseStart !== null && mention?.start === browseStart;
-  // Bare "@" collapses sessions into one row; typing lists the top matches inline.
-  const showCategory = !browsing && mention?.query === "" && sessionEntries.length > 0;
-  const sessionRows = browsing
-    ? sessionEntries
-    : showCategory
-      ? NO_SESSION_MENTIONS
-      : sessionEntries.slice(0, SESSION_MENTION_CAP);
-  const fileRows = browsing ? NO_FILE_ENTRIES : mentionEntries;
+  // An opened list stays open for the "@" token it was opened from.
+  const [browse, setBrowse] = useState<{ start: number; level: SessionMenuLevel } | null>(null);
+  if (browse !== null && mention?.start !== browse.start) setBrowse(null);
+  const level = browse !== null && mention?.start === browse.start ? browse.level : null;
+  const subagentEntries = sessionEntries.filter((session) => session.isSubagent);
+  // Top level: a bare "@" collapses sessions into one row; typing lists the top
+  // matches inline. Sessions: a Subagents row, then the other sessions.
+  let category: SessionMenuLevel | null = null;
+  let sessionRows: readonly SessionMention[];
+  if (level === "subagents") {
+    sessionRows = subagentEntries;
+  } else if (level === "sessions") {
+    if (subagentEntries.length > 0) category = "subagents";
+    sessionRows = sessionEntries.filter((session) => !session.isSubagent);
+  } else if (mention?.query === "" && sessionEntries.length > 0) {
+    category = "sessions";
+    sessionRows = NO_SESSION_MENTIONS;
+  } else {
+    sessionRows = sessionEntries.slice(0, SESSION_MENTION_CAP);
+  }
+  const fileRows = level === null ? mentionEntries : NO_FILE_ENTRIES;
   // Rows: the category row (if shown), then sessions, then files.
-  const sessionOffset = showCategory ? 1 : 0;
+  const sessionOffset = category ? 1 : 0;
   const fileOffset = sessionOffset + sessionRows.length;
   const rowCount = fileOffset + fileRows.length;
-  const mentionOpen = rowCount > 0 || browsing;
+  const mentionOpen = rowCount > 0 || level !== null;
 
   // Pre-select the top row whenever the listing changes — lets Enter/Tab act on
   // the top hit without arrowing first. Keyed by type+path so a file and a dir
@@ -129,7 +143,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   // "store-previous-props" pattern — mirrors the slash menu's reset.)
   const prevMentionMatchesRef = useRef<string[]>([]);
   const mentionEntryKeys = [
-    ...(showCategory ? ["category:sessions"] : []),
+    ...(category ? [`category:${category}`] : []),
     ...sessionRows.map((session) => `session:${session.id}`),
     ...fileRows.map((e) => `${e.type}:${e.path}`),
   ];
@@ -229,28 +243,30 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionIndex(-1);
   };
 
-  const openSessions = () => {
-    if (!mention) return;
-    setBrowseStart(mention.start);
+  const openCategory = () => {
+    if (!mention || !category) return;
+    setBrowse({ start: mention.start, level: category });
     setMentionIndex(0);
     textareaRef.current?.focus();
   };
 
-  const closeSessions = () => {
-    setBrowseStart(null);
+  const goBack = () => {
+    setBrowse(
+      level === "subagents" && mention ? { start: mention.start, level: "sessions" } : null,
+    );
     setMentionIndex(0);
     textareaRef.current?.focus();
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
     if (!mentionOpen) return false;
-    if (e.key === "Escape" && browsing) {
+    if (e.key === "Escape" && level !== null) {
       e.preventDefault();
-      closeSessions();
+      goBack();
       return true;
     }
     if (rowCount === 0) return false;
-    const onCategory = showCategory && mentionIndex === 0;
+    const onCategory = category !== null && mentionIndex === 0;
     const activeSession =
       mentionIndex >= sessionOffset && mentionIndex < fileOffset
         ? sessionRows[mentionIndex - sessionOffset]
@@ -271,7 +287,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       (e.key === "Tab" || e.key === "ArrowRight" || (e.key === "Enter" && !e.shiftKey && !isMobile))
     ) {
       e.preventDefault();
-      openSessions();
+      openCategory();
       return true;
     }
     if (activeSession && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile))) {
@@ -303,7 +319,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   return {
     mentionIndex,
     mentionOpen,
-    sessionMenu: { rows: sessionRows, showCategory, browsing, openSessions, closeSessions },
+    sessionMenu: { rows: sessionRows, category, level, openCategory, goBack },
     mentionedItems,
     setMentionedItems,
     attachMention,

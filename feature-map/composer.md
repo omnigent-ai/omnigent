@@ -175,9 +175,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
 - `at-mentions`: a bare `@` in the in-session or new-session composer shows a
-  "Sessions" row. Opening it (click, Enter, Tab or →) lists every session the
-  sidebar has loaded, the current session's subagents first; Back or Esc
-  returns. In native coding-agent sessions workspace files and folders sit
+  "Sessions" row. Opening it (click, Enter, Tab or →) shows a "Subagents" row
+  for the current session's subagents, then every other session the sidebar
+  has loaded; Back or Esc goes up one level. In native coding-agent sessions workspace files and folders sit
   below the Sessions row. Typing lists the top matching sessions inline above
   the files and, after a short pause, searches session titles and the
   workspace. Picking a row puts a

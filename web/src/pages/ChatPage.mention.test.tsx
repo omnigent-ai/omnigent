@@ -684,18 +684,26 @@ describe("Composer @-session mentions", () => {
     vi.restoreAllMocks();
   });
 
-  it("collapses sessions into one row on a bare @ and opens the full list from it", () => {
+  it("collapses sessions into one row on a bare @ and opens the lists from it", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
-    // A bare "@" shows only the category row: no session rows, no files on SDK harnesses.
-    expect(screen.getByTestId("session-mention-category")).toHaveAttribute("data-active", "true");
+    // A bare "@" shows only the Sessions row: no session rows, no files on SDK harnesses.
+    expect(screen.getByTestId("session-mention-category-sessions")).toHaveAttribute(
+      "data-active",
+      "true",
+    );
     expect(screen.queryAllByTestId(/^session-mention-item-/)).toHaveLength(0);
     expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("session-mention-category"));
-    const rows = screen.getAllByTestId(/^session-mention-item-/).map((row) => row.textContent);
-    // Subagents first; the current session and archived rows are excluded; untitled rows get a label.
-    expect(rows).toEqual(["authsubagent", "Alpha planning", "Untitled session"]);
-    // The list is served from cache alone.
+    fireEvent.click(screen.getByTestId("session-mention-category-sessions"));
+    // A Subagents row, then the other sessions; the current session and archived
+    // rows are excluded, and untitled rows get a label.
+    expect(screen.getByTestId("session-mention-category-subagents")).toBeInTheDocument();
+    const rowText = () =>
+      screen.getAllByTestId(/^session-mention-item-/).map((row) => row.textContent);
+    expect(rowText()).toEqual(["Alpha planning", "Untitled session"]);
+    fireEvent.click(screen.getByTestId("session-mention-category-subagents"));
+    expect(rowText()).toEqual(["authsubagent"]);
+    // The lists are served from cache alone.
     expect(sessions.searchedQueries).toEqual([]);
   });
 
@@ -704,8 +712,8 @@ describe("Composer @-session mentions", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    // One subagent plus all twelve loaded sessions.
-    expect(screen.getAllByTestId(/^session-mention-item-/)).toHaveLength(13);
+    // All twelve loaded sessions, below the Subagents row.
+    expect(screen.getAllByTestId(/^session-mention-item-/)).toHaveLength(12);
     type("@plan");
     // Typing in the open list filters it without a cap.
     expect(screen.getAllByTestId(/^session-mention-item-/)).toHaveLength(12);
@@ -714,20 +722,24 @@ describe("Composer @-session mentions", () => {
     expect(screen.getAllByTestId(/^session-mention-item-/)).toHaveLength(SESSION_MENTION_CAP);
   });
 
-  it("returns from the session list with Back or Escape, then Escape closes the menu", () => {
+  it("goes up one level with Back or Escape, then Escape closes the menu", () => {
     useChatStore.setState({ sessionHarness: "claude-native" });
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
-    fireEvent.click(screen.getByTestId("session-mention-category"));
-    // The open list hides files.
+    fireEvent.click(screen.getByTestId("session-mention-category-sessions"));
+    // An open list hides files.
     expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("session-mention-back"));
-    expect(screen.getByTestId("session-mention-category")).toBeInTheDocument();
+    expect(screen.getByTestId("session-mention-category-sessions")).toBeInTheDocument();
     expect(screen.getByTitle("Open src")).toBeInTheDocument();
+    // ArrowRight opens the highlighted category: Sessions, then Subagents.
     fireEvent.keyDown(textarea(), { key: "ArrowRight" });
-    expect(screen.getByTestId("session-mention-back")).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "ArrowRight" });
+    expect(screen.queryByTestId("session-mention-category-subagents")).not.toBeInTheDocument();
     fireEvent.keyDown(textarea(), { key: "Escape" });
-    expect(screen.getByTestId("session-mention-category")).toBeInTheDocument();
+    expect(screen.getByTestId("session-mention-category-subagents")).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(screen.getByTestId("session-mention-category-sessions")).toBeInTheDocument();
     fireEvent.keyDown(textarea(), { key: "Escape" });
     expect(screen.queryByTestId("file-mention-menu")).not.toBeInTheDocument();
   });
@@ -736,7 +748,8 @@ describe("Composer @-session mentions", () => {
     const onSend = vi.fn();
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
     type("Ask @");
-    // Enter opens the session list, then tags its first row (the subagent).
+    // Enter opens Sessions, then Subagents, then tags the first subagent.
+    fireEvent.keyDown(textarea(), { key: "Enter" });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     append("to compare with @alpha");
@@ -792,7 +805,10 @@ describe("Composer @-session mentions", () => {
     useChatStore.setState({ sessionHarness: "claude-native" });
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
-    expect(screen.getByTestId("session-mention-category")).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("session-mention-category-sessions")).toHaveAttribute(
+      "data-active",
+      "true",
+    );
     // The Sessions row, then the "src" folder.
     fireEvent.keyDown(textarea(), { key: "ArrowDown" });
     expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
