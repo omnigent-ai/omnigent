@@ -586,12 +586,11 @@ export function ConnectHostInstructions({
   /** After the desktop shell connects a machine over SSH, with its host id. */
   onSshConnected?: (hostId: string) => void;
 }) {
-  // Databricks/internal deployments add the "Databricks Lakebox" connect
-  // path; OSS deployments (where the lakebox launcher is excluded) show
-  // only the plain `omni host` command. Driven by /v1/info.
+  // Managed servers add the Lakebox connect path. Other builds show only the
+  // plain `omni host` command. Driven by /v1/info.
   const info = useServerInfo();
-  // "loading" before the boot probe resolves → treat as OSS (no Databricks
-  // hints) until known, so the clean UI shows first and lakebox never flashes.
+  // "loading" counts as no managed hints until the probe resolves, so the
+  // Lakebox option never flashes in.
   const databricksFeatures = info !== "loading" && info.databricks_features;
   const quotedServerUrl = quoteShellArgument(serverUrl);
   const sshConnectAvailable = useSshConnectAvailable();
@@ -2693,8 +2692,8 @@ function NewChatLandingContent({
   // consumed in the menu's onOpenChange) — connecting while the menu is open
   // looks janky. A ref so the close handler sees it synchronously.
   const pendingConnectRef = useRef(false);
-  // Arca: the desktop shell reports the MDM flag; when
-  // set, the picker offers connecting the user's Arca dev instance as a host.
+  // The desktop shell reports whether Arca is enabled. When it is, the picker
+  // offers connecting the user's Arca instance as a host.
   const [arcaEnabled, setArcaEnabled] = useState(false);
   const [arcaPreviewRecovery, setArcaPreviewRecovery] = useState(false);
   const [connectingArca, setConnectingArca] = useState(false);
@@ -3005,9 +3004,8 @@ function NewChatLandingContent({
     };
   }, []);
 
-  // Desktop feature gates (MDM-managed). Read once per mount — the shell
-  // re-reads macOS preferences on every call, so reopening the composer is
-  // enough to pick up a profile change.
+  // Desktop feature gates. Read once per mount, so reopening the composer
+  // picks up a change.
   useEffect(() => {
     if (!isElectronShell()) return;
     let cancelled = false;
@@ -3133,7 +3131,7 @@ function NewChatLandingContent({
         setSandboxProvider(defaultSandboxProvider());
         return;
       }
-      // Sandbox no longer offered (e.g. an OSS server) — fall through.
+      // Sandbox no longer offered (e.g. the server dropped it) — fall through.
     } else if (lastChoice) {
       // Restore offline hosts too; availability gates creation, not selection.
       // Wait for the list so a remembered host cannot lose to a default.
@@ -5769,11 +5767,9 @@ function NewChatLandingContent({
     }
   }
 
-  // Connect the user's Arca dev instance as a
-  // host, then select it. The bridge runs `arca ssh … isaac omni host
-  // --background` and resolves once the remote daemon started; the daemon then
-  // registers over its own tunnel moments later, so we poll the host list
-  // briefly to pick the host that newly came online.
+  // Connect the user's Arca instance as a host, then select it. The bridge
+  // resolves once the remote daemon starts. The daemon registers a moment
+  // later, so poll the host list briefly for the host that came online.
   async function connectArca() {
     if (connectingArca) return;
     setConnectingArca(true);
@@ -5819,7 +5815,7 @@ function NewChatLandingContent({
         });
         const fresh = hostList.find((h) => h.status === "online" && !onlineBefore.has(h.host_id));
         if (fresh) {
-          // Remember which host is the Arca box so the picker can tag it.
+          // Remember which host is the Arca instance so the picker can tag it.
           writeArcaHostId(fresh.host_id);
           selectHost(fresh.host_id);
           return;

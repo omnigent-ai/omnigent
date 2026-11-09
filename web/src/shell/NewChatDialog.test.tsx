@@ -3767,7 +3767,7 @@ describe("desktop Arclet credential preflight", () => {
   });
 });
 
-describe("Run on Arca (MDM-gated)", () => {
+describe("Run on Arca (flag-gated)", () => {
   beforeEach(() => {
     setupLandingMocks();
     mockHosts([]);
@@ -3785,7 +3785,7 @@ describe("Run on Arca (MDM-gated)", () => {
     cleanup();
     localStorage.clear();
     // Restore the browser defaults so these overrides don't leak into the
-    // other describe blocks (which assume no desktop shell / no MDM flag).
+    // other describe blocks (which assume no desktop shell / no desktop flags).
     vi.mocked(isElectronShell).mockReturnValue(false);
     vi.mocked(getDesktopFeatures).mockResolvedValue(null);
   });
@@ -3796,7 +3796,7 @@ describe("Run on Arca (MDM-gated)", () => {
     fireEvent.click(chip);
   }
 
-  it("offers the Arca option only when the desktop shell reports the MDM flag", async () => {
+  it("offers the Arca option only when the desktop shell reports the flag", async () => {
     renderLanding();
     await openHostMenu();
     expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toBeTruthy();

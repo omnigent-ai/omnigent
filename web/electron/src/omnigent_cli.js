@@ -387,8 +387,8 @@ function resolveCliPath(configuredPath, deps = {}) {
 }
 
 /**
- * Normalize a CLI invocation. Public paths pass a string (`/path/omnigent`);
- * Managed host enrollment passes an executable + fixed argv prefix
+ * Normalize a CLI invocation. A plain path passes a string (`/path/omnigent`);
+ * managed host enrollment passes an executable + fixed argv prefix
  * (`/usr/local/bin/isaac`, `["omni"]`). Both stay shell-free.
  *
  * @param {string | {
@@ -1025,7 +1025,7 @@ const WORKSPACE_API_PATH = "/api/2.0/omnigent";
 /**
  * Whether requests to `serverUrl` should carry a host's routing key, by the same
  * rule as `databricks_request_headers()` (omnigent/cli_auth.py): on by default
- * for the host-sharded workspace mount, opt-in on other servers with
+ * for workspace mounts, opt-in on other servers with
  * `OMNIGENT_HOST_SLICE_KEY_ENABLED=1`, and off for either when it is "0".
  *
  * @param {string} serverUrl
