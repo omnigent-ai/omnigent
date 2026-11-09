@@ -673,11 +673,12 @@ class PersistentTaskScheduler:
             return min(occurrence, now + TRIGGER_POLL_SECONDS)
         return occurrence
 
-    async def _skip_busy_occurrence(self, task: ScheduledTask, *, now: int) -> bool:
+    async def _skip_busy_occurrence(self, task: ScheduledTask, *, now: int, next_run: int) -> bool:
         """Move a busy trigger automation's due poll to its next check, recording no run.
 
-        Returns True when this occurrence must not be claimed. A failed busy check
-        returns False, so the occurrence is sent as it would be without skipping.
+        The next check is no later than *next_run*, the schedule's next occurrence. Returns
+        True when this occurrence must not be claimed. A failed busy check returns False, so
+        the occurrence is sent as it would be without skipping.
         """
         if self._busy_until is None or not is_trigger_automation(task):
             return False
@@ -692,6 +693,7 @@ class PersistentTaskScheduler:
             return False
         if until is None or until <= now:
             return False
+        until = min(until, next_run)
         with workspace_scope(task.workspace_id):
             advanced = await asyncio.to_thread(
                 self._store.skip_scheduled_occurrence, task, now=now, next_run_at=until
@@ -934,7 +936,11 @@ class PersistentTaskScheduler:
                     next_run = await self._next_occurrence(task, now)
                     if self._stopped:
                         return
-                    if await self._skip_busy_occurrence(task, now=now):
+                    # A skip only defers a poll, so the last occurrence of a schedule that ends
+                    # is always sent.
+                    if next_run is not None and await self._skip_busy_occurrence(
+                        task, now=now, next_run=next_run
+                    ):
                         continue
                     with workspace_scope(task.workspace_id):
                         run = await asyncio.to_thread(

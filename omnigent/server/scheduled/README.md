@@ -193,8 +193,11 @@ It records `succeeded` once the prompt is delivered, without waiting for the tur
 Trigger automations are the exception. A trigger automation is such a task whose
 prompt starts with the opening sentence of a Jira, Slack, GitHub or Linear
 trigger template, the same check the web form uses. The database scheduler
-ignores a trigger's saved schedule and checks it again two minutes after each
-poll (`TRIGGER_POLL_SECONDS`). It also configures the store so that a trigger
+checks a trigger again two minutes after each poll (`TRIGGER_POLL_SECONDS`)
+instead of on its saved schedule, though never past the schedule's next
+occurrence: a schedule that ends (`COUNT` or `UNTIL`) still ends the trigger,
+and its last occurrence is sent even while the session is busy. It also
+configures the store so that a trigger
 that is created or resumed, or edited into a trigger, is first checked two
 minutes later; after an upgrade, an existing trigger switches over at its next
 saved poll. Before claiming a poll, the scheduler asks the check built by

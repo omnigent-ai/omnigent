@@ -2588,8 +2588,9 @@ def _last_occurrence(task) -> int:
     return last
 
 
+@pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
 @pytest.mark.parametrize("end", ["COUNT=2", "UNTIL"])
-async def test_a_trigger_still_ends_when_its_saved_schedule_does(store, end) -> None:
+async def test_a_trigger_still_ends_when_its_saved_schedule_does(store, end, busy) -> None:
     if end == "UNTIL":
         until = datetime.fromtimestamp(int(time.time()) + 25 * 60, UTC)
         end = "UNTIL=" + until.strftime("%Y%m%dT%H%M%SZ")
@@ -2598,12 +2599,10 @@ async def test_a_trigger_still_ends_when_its_saved_schedule_does(store, end) -> 
     last = _last_occurrence(task)
     clock = FakeClock(task.next_run_at)
     fire = AsyncMock()
+    # A busy session is always checked again two minutes later.
+    check = AsyncMock(side_effect=lambda task, now: now + TRIGGER_POLL_SECONDS if busy else None)
     scheduler = PersistentTaskScheduler(
-        store,
-        fire,
-        AsyncMock(return_value=None),
-        now=clock.now,
-        busy_until=AsyncMock(return_value=None),
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=check
     )
     for _ in range(25):
         await scheduler.poll_once()
@@ -2613,9 +2612,12 @@ async def test_a_trigger_still_ends_when_its_saved_schedule_does(store, end) -> 
     assert saved.state == "completed"
     assert saved.next_run_at is None
     runs = store.list_runs(task.id)[0]
-    # It polled every two minutes, and never after the schedule's last occurrence.
-    assert len(runs) > 2
+    # Nothing polls after the schedule's last occurrence, which is sent even while busy.
     assert max(run.scheduled_at for run in runs) == last
+    if busy:
+        assert [run.scheduled_at for run in runs] == [last]
+    else:
+        assert len(runs) > 2
 
 
 async def test_other_continued_sessions_keep_their_schedule_and_send_while_busy(store) -> None:
