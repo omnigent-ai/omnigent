@@ -280,17 +280,20 @@ async def test_resume_child_thread_or_log_not_ready_still_retries() -> None:
     assert forwarder_state.needs_child_thread_backfill("thread_child") is True
 
 
-def _agent_message_turn(turn_id: str, text: str) -> dict:
-    """Build a completed Codex resume turn holding one assistant message."""
+def _message_turn(turn_id: str, *, task: str, reply: str) -> dict:
+    """Build a completed Codex resume turn: a user task and the assistant reply."""
     return {
         "id": turn_id,
         "status": "completed",
-        "items": [{"type": "agentMessage", "id": f"msg-{turn_id}", "text": text}],
+        "items": [
+            {"type": "userMessage", "id": f"user-{turn_id}", "content": [{"text": task}]},
+            {"type": "agentMessage", "id": f"reply-{turn_id}", "text": reply},
+        ],
     }
 
 
 def _mirrored_texts(client: _RecordingClient, session_id: str) -> list[str]:
-    """Return assistant texts mirrored into one Omnigent session."""
+    """Return the message texts mirrored into one Omnigent session."""
     return [
         part["text"]
         for url, body in client.posts
@@ -301,80 +304,144 @@ def _mirrored_texts(client: _RecordingClient, session_id: str) -> list[str]:
     ]
 
 
+class _ForkedThreadsClient:
+    """
+    Fake Codex app-server holding forked threads and their turn history.
+
+    ``thread/turns/list`` pages one turn at a time so pagination is exercised.
+
+    :param turns: Each thread's turns, oldest first.
+    :param sources: Thread fields naming each forked thread's source, e.g.
+        ``{"thread_child": {"forkedFromId": "thread_parent"}}``.
+    :param failing_methods: Methods that raise a Codex error envelope.
+    """
+
+    def __init__(
+        self,
+        turns: dict[str, list[dict]],
+        sources: dict[str, dict[str, str]],
+        failing_methods: frozenset[str] = frozenset(),
+    ) -> None:
+        self.turns = turns
+        self.sources = sources
+        self.failing_methods = failing_methods
+        self.calls: list[tuple[str, dict]] = []
+
+    async def request(self, method: str, params: dict) -> dict:
+        """Answer resume, read and turn-list requests from the stored history."""
+        self.calls.append((method, params))
+        if method in self.failing_methods:
+            raise CodexAppServerResponseError({"code": -32601, "message": f"{method} unsupported"})
+        thread_id = params["threadId"]
+        turns = self.turns[thread_id]
+        if method in {"thread/resume", "thread/read"}:
+            thread = {"id": thread_id, "turns": turns, **self.sources.get(thread_id, {})}
+            return {"result": {"thread": thread}}
+        assert method == "thread/turns/list"
+        assert params["itemsView"] == "notLoaded"
+        index = int(params.get("cursor") or 0)
+        page = [{"id": turn["id"], "items": []} for turn in turns[index : index + 1]]
+        next_cursor = str(index + 1) if index + 1 < len(turns) else None
+        return {"result": {"data": page, "nextCursor": next_cursor, "backwardsCursor": None}}
+
+
+async def _backfill_child(codex_client: _ForkedThreadsClient, child_thread_id: str) -> list[str]:
+    """Backfill one registered child thread and return the texts it mirrored."""
+    client = _RecordingClient()
+    forwarder_state = fwd._CodexForwarderState(parent_session_id="conv_parent")
+    forwarder_state.note_child_thread(child_thread_id, f"conv_{child_thread_id}")
+    await fwd._backfill_child_thread(
+        client,  # type: ignore[arg-type]
+        codex_client,  # type: ignore[arg-type]
+        parent_session_id="conv_parent",
+        child_session_id=f"conv_{child_thread_id}",
+        child_thread_id=child_thread_id,
+        forwarder_state=forwarder_state,
+    )
+    await forwarder_state.close_child_streams()
+    return _mirrored_texts(client, f"conv_{child_thread_id}")
+
+
+_PARENT_TURNS = [
+    _message_turn("turn_parent_1", task="parent task 1", reply="parent reply 1"),
+    _message_turn("turn_parent_2", task="parent task 2", reply="parent reply 2"),
+]
+_CHILD_TURN = _message_turn("turn_child", task="child task", reply="child reply")
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("parent_turn_source", ["live", "resume"])
-async def test_backfill_child_thread_skips_turns_forked_from_the_parent(
-    tmp_path: Path, parent_turn_source: str
+@pytest.mark.parametrize(
+    ("source_field", "failing_methods"),
+    [
+        ("forkedFromId", frozenset()),
+        ("parentThreadId", frozenset()),
+        # Codex without thread/turns/list: read the source thread instead.
+        ("forkedFromId", frozenset({"thread/turns/list"})),
+    ],
+)
+async def test_backfill_child_thread_skips_turns_copied_from_its_fork_source(
+    source_field: str, failing_methods: frozenset[str]
 ) -> None:
     """
     A forked sub-agent's backfill mirrors only the sub-agent's own turns.
 
-    Codex returns the parent's turns, with the parent's turn ids, at the start
-    of a forked sub-agent thread. Replaying them copied the parent transcript
-    into every sub-agent session and held up the parent's live events.
+    A Codex fork starts with its source thread's turns, under the source's turn
+    ids. Replaying them copied the parent transcript into every sub-agent
+    session and held up the parent's events. The skipped turns come from the
+    source thread itself, so they are found even when this forwarder never saw
+    them (e.g. it reconnected to an idle parent without its history).
     """
-    client = _RecordingClient()
-    forwarder_state = fwd._CodexForwarderState(parent_session_id="conv_parent")
-    forwarder_state.note_child_thread("thread_child", "conv_child")
-    usage = fwd._SessionUsageCoalescer(client, "conv_parent")  # type: ignore[arg-type]
-    elicitations = fwd._CodexElicitationTaskTracker()
-    parent_turn = _agent_message_turn("turn_parent", "parent reply")
-    if parent_turn_source == "live":
-        await fwd._handle_event(
-            client,  # type: ignore[arg-type]
-            session_id="conv_parent",
-            bridge_dir=tmp_path,
-            event={
-                "method": "item/completed",
-                "params": {
-                    "threadId": "thread_parent",
-                    "turnId": "turn_parent",
-                    "item": parent_turn["items"][0],
-                },
-            },
-            usage_coalescer=usage,
-            elicitation_tracker=elicitations,
-            expected_thread_id="thread_parent",
-            forwarder_state=forwarder_state,
-        )
-    else:
-        # A restarted forwarder resumes the parent from its newest turn only.
-        await fwd._replay_resume_response(
-            client,  # type: ignore[arg-type]
-            session_id="conv_parent",
-            bridge_dir=tmp_path,
-            response={
-                "result": {
-                    "thread": {
-                        "id": "thread_parent",
-                        "turns": [parent_turn, _agent_message_turn("turn_latest", "latest")],
-                    }
-                }
-            },
-            usage_coalescer=usage,
-            elicitation_tracker=elicitations,
-            forwarder_state=forwarder_state,
-            replay_from_turn_id="turn_latest",
-        )
-    child_response = _child_resume_response(
-        "thread_child",
-        forkedFromId="thread_parent",
-        turns=[parent_turn, _agent_message_turn("turn_child", "child reply")],
+    codex_client = _ForkedThreadsClient(
+        turns={"thread_parent": _PARENT_TURNS, "thread_child": [*_PARENT_TURNS, _CHILD_TURN]},
+        sources={"thread_child": {source_field: "thread_parent"}},
+        failing_methods=failing_methods,
     )
 
-    await fwd._backfill_child_thread(
-        client,  # type: ignore[arg-type]
-        _FakeChildResumeClient(resume_response=child_response),  # type: ignore[arg-type]
-        parent_session_id="conv_parent",
-        child_session_id="conv_child",
-        child_thread_id="thread_child",
-        forwarder_state=forwarder_state,
-    )
-    await elicitations.close()
-    await usage.close()
-    await forwarder_state.close_child_streams()
+    assert await _backfill_child(codex_client, "thread_child") == ["child task", "child reply"]
 
-    assert _mirrored_texts(client, "conv_child") == ["child reply"]
+
+@pytest.mark.asyncio
+async def test_backfill_nested_child_skips_every_ancestor_turn() -> None:
+    """A grandchild skips the turns its source child copied and the child's own."""
+    child_turns = [*_PARENT_TURNS, _CHILD_TURN]
+    grandchild_turn = _message_turn("turn_grandchild", task="nested task", reply="nested reply")
+    codex_client = _ForkedThreadsClient(
+        turns={
+            "thread_parent": _PARENT_TURNS,
+            "thread_child": child_turns,
+            "thread_grandchild": [*child_turns, grandchild_turn],
+        },
+        sources={
+            "thread_child": {"forkedFromId": "thread_parent"},
+            "thread_grandchild": {"forkedFromId": "thread_child"},
+        },
+    )
+
+    assert await _backfill_child(codex_client, "thread_grandchild") == [
+        "nested task",
+        "nested reply",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_backfill_child_without_a_fork_source_replays_all_its_turns() -> None:
+    """A thread that names no source is not forked: nothing is listed or skipped."""
+    codex_client = _ForkedThreadsClient(turns={"thread_child": [_CHILD_TURN]}, sources={})
+
+    assert await _backfill_child(codex_client, "thread_child") == ["child task", "child reply"]
+    assert [method for method, _ in codex_client.calls] == ["thread/resume"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_child_replays_everything_when_its_source_cannot_be_listed() -> None:
+    """If Codex can neither list nor read the source, the backfill keeps every turn."""
+    codex_client = _ForkedThreadsClient(
+        turns={"thread_parent": _PARENT_TURNS, "thread_child": [*_PARENT_TURNS, _CHILD_TURN]},
+        sources={"thread_child": {"forkedFromId": "thread_parent"}},
+        failing_methods=frozenset({"thread/turns/list", "thread/read"}),
+    )
+
+    assert len(await _backfill_child(codex_client, "thread_child")) == 6
 
 
 class CodexChildForwarderTest(unittest.IsolatedAsyncioTestCase):
