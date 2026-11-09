@@ -295,6 +295,27 @@ def content_bundle_location(agent_id: str, bundle_bytes: bytes) -> str:
     return f"{agent_id}/{digest}"
 
 
+def _blob_confirmed(artifact_store: ArtifactStore, location: str) -> bool:
+    """
+    Return whether the store confirms a blob at *location*.
+
+    The check only lets a caller skip rewriting a content-addressed blob it
+    already holds, so a failed check reads as unconfirmed: the rewrite is
+    harmless, and its own failure is the one that should reach the caller.
+
+    :returns: ``False`` when the blob is absent or the check failed.
+    """
+    try:
+        return artifact_store.exists(location)
+    except Exception:
+        _logger.warning(
+            "Could not confirm bundle %s in the artifact store; rewriting it",
+            location,
+            exc_info=True,
+        )
+        return False
+
+
 # An MCP edit moves a row off its upload's content, so later uploads of that
 # content take the next id; past this many edited rows they get fresh rows.
 _UPLOADED_AGENT_ATTEMPTS = 3
@@ -350,7 +371,7 @@ def uploaded_agent_for(
         ):
             # The blob can vanish while the row survives (pruned artifacts, a DB
             # restored without its store); this upload holds the same files.
-            if not artifact_store.exists(location):
+            if not _blob_confirmed(artifact_store, location):
                 artifact_store.put(location, bundle_bytes)
             return agent
     return None
