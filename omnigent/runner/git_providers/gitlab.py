@@ -528,6 +528,8 @@ class GitLabPullRequests:
         patch = _whole_patch(
             *_pinned_changes(root, reference, head_sha=head_sha, base_sha=base_sha)
         )
+        if "unavailable_reason" in patch:
+            return patch
         return {**patch, "head_sha": head_sha, "base_sha": base_sha}
 
     def file_diff(

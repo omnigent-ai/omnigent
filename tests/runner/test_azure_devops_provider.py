@@ -1175,6 +1175,29 @@ def test_pinned_diff_refuses_a_pr_that_moved(
         facet.pinned_diff(str(workspace), reference(), head_sha="d" * 40, base_sha=BASE)
 
 
+def test_pinned_read_without_computed_merge_commits_is_unavailable_not_moved(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request(head=None))
+
+    with pytest.raises(ValueError, match="could not confirm"):
+        facet.pinned_changed_files(str(tmp_path), reference(), head_sha=HEAD, base_sha=BASE)
+
+
+def test_pinned_diff_outside_the_workspace_echoes_no_revision(
+    facet: AzureDevOpsPullRequests, workspace: Path
+) -> None:
+    result = facet.pinned_diff(
+        str(workspace),
+        reference(repository="contoso/other/app"),
+        head_sha=HEAD,
+        base_sha=BASE,
+    )
+
+    assert result["unavailable_reason"] == "pr_outside_workspace"
+    assert "head_sha" not in result and "base_sha" not in result
+
+
 def diffed_files(patch: str) -> int:
     return len(re.findall(r"^diff --git ", patch, flags=re.MULTILINE))
 

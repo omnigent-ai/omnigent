@@ -606,6 +606,13 @@ def test_pinned_read_refuses_a_merge_request_that_moves_during_the_listing(
         getattr(module.PULL_REQUESTS, read)(root, ref(), head_sha=HEAD, base_sha=BASE)
 
 
+def test_incomplete_pinned_diff_echoes_no_revision(root: str, api: Mock, mr: dict) -> None:
+    mr["changes_count"] = "1000+"
+    result = module.PULL_REQUESTS.pinned_diff(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert result["unavailable_reason"] == "incomplete_diff"
+    assert "head_sha" not in result and "base_sha" not in result
+
+
 def test_panel_pinned_reads_route_to_the_gitlab_revisions(
     root: str, api: Mock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

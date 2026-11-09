@@ -932,6 +932,9 @@ class AzureDevOpsPullRequests:
         except _RestFailure as exc:
             raise ValueError(_PR_REVISION_UNAVAILABLE) from exc
         current = (_commit(pr, "lastMergeSourceCommit"), _commit(pr, "lastMergeTargetCommit"))
+        if None in current:
+            # Azure has not computed the merge commits yet; that is not a moved PR.
+            raise ValueError(_PR_REVISION_UNAVAILABLE)
         if current != (head_sha, base_sha):
             raise ValueError(_PR_CHANGED)
 
@@ -944,6 +947,8 @@ class AzureDevOpsPullRequests:
     ) -> dict[str, Any]:
         """Diff the pinned revisions; the patch is fixed by the commits, so one check suffices."""
         patch = self._pr_patch(root, reference, pinned=(head_sha, base_sha))
+        if "unavailable_reason" in patch:
+            return patch
         return {**patch, "head_sha": head_sha, "base_sha": base_sha}
 
     def _pr_patch(
