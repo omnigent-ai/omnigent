@@ -75,6 +75,7 @@ from omnigent.models.model_override import is_databricks_model_id
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
 from omnigent.telemetry.surface import harness_client_surface
+from omnigent.tools.builtins.load_skill import reuse_skill_context
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
@@ -4455,11 +4456,10 @@ class ClaudeSDKExecutor(Executor):
         # serialize prior history as a text prefix but preserve the
         # latest message's content blocks for native multimodal
         # delivery to the Anthropic API.
-        latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
         latest_index = max(i for i, msg in enumerate(messages) if msg.get("role") == "user")
         prior = messages[:latest_index] + messages[latest_index + 1 :]
 
-        kept: list[list[_JsonObject]] = []
+        kept: list[tuple[Message, list[_JsonObject]]] = []
         remaining_tokens = history_token_budget
         for msg in reversed(prior):
             rendered = _render_prior_message(msg)
@@ -4467,7 +4467,11 @@ class ClaudeSDKExecutor(Executor):
                 remaining_tokens -= _estimated_replay_tokens(rendered)
                 if remaining_tokens < 0:
                     break
-            kept.append(rendered)
+            kept.append((msg, rendered))
+
+        kept.reverse()
+        selected = reuse_skill_context([*[message for message, _ in kept], messages[latest_index]])
+        latest_content = ClaudeSDKExecutor._extract_latest_user_content(selected)
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         omitted = len(prior) - len(kept)
@@ -4483,8 +4487,10 @@ class ClaudeSDKExecutor(Executor):
                     f"[Earlier messages omitted to fit the model's context window: {omitted}.]"
                 )
             )
-        for rendered in reversed(kept):
-            prior_blocks.extend(rendered)
+        for message, (original, rendered) in zip(selected[:-1], kept, strict=True):
+            prior_blocks.extend(
+                rendered if message == original else _render_prior_message(message)
+            )
         prior_blocks.append(_text_block(""))
         prior_blocks.append(
             _text_block(
@@ -4578,6 +4584,7 @@ class ClaudeSDKExecutor(Executor):
             else:
                 break
         trailing.reverse()
+        trailing = reuse_skill_context(trailing)
         if not trailing:
             return ""
         if len(trailing) == 1:

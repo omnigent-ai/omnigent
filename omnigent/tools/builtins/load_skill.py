@@ -293,7 +293,7 @@ def find_skill_by_name(skills: list[SkillSpec], name: str) -> SkillSpec | None:
 
 
 def format_skill_meta_text(skill: SkillSpec, arguments: str) -> str:
-    """Build a full skill expansion for durable history on the runner filesystem.
+    """Build a full skill expansion using paths on the runner filesystem.
 
     Auxiliary files remain available through ``load_skill`` and ``read_skill_file``.
     Every invocation retains its arguments, independently of instruction reuse.
@@ -317,29 +317,32 @@ def reuse_skill_context(messages: Sequence[JsonObject]) -> list[JsonObject]:
     latest: dict[str, str] = {}
 
     def shorten(text: str) -> str:
+        if not text.startswith("<skill>\n"):
+            return text
         if not text.startswith("<skill>\n<name>") or text.count("\n</skill>") != 1:
+            latest.clear()
             return text
         name, separator, _ = text.removeprefix("<skill>\n<name>").partition("</name>\n")
         if not separator or not name or "\n" in name:
+            latest.clear()
             return text
-        instructions, closing, arguments = text.rpartition("\n</skill>")
-        if not closing or (
-            arguments
-            and not (
-                arguments.startswith("\n\n<user_request>\n")
-                and arguments.endswith("\n</user_request>")
-            )
+        instructions, _, arguments = text.rpartition("\n</skill>")
+        if arguments and not (
+            arguments.startswith("\n\n<user_request>\n")
+            and arguments.endswith("\n</user_request>")
         ):
+            latest.clear()
             return text
         previous = latest.get(name)
         latest[name] = instructions
         if previous != instructions:
             return text
-        return (
+        reference = (
             f"<skill_invocation>\n<name>{name}</name>\n"
             "Apply the skill instructions already present in this conversation.\n"
             f"</skill_invocation>{arguments}"
         )
+        return reference if len(reference.encode("utf-8")) < len(text.encode("utf-8")) else text
 
     result: list[JsonObject] = []
     for message in messages:
@@ -353,7 +356,7 @@ def reuse_skill_context(messages: Sequence[JsonObject]) -> list[JsonObject]:
             blocks = [
                 {**block, "text": shorten(block["text"])}
                 if isinstance(block, dict)
-                and block.get("type") == "input_text"
+                and block.get("type") in ("input_text", "text", "output_text")
                 and isinstance(block.get("text"), str)
                 else block
                 for block in content

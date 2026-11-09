@@ -7640,3 +7640,77 @@ async def test_disabled_mcp_sdk_init_reports_loaded_server(tmp_path, monkeypatch
         finally:
             await executor.close()
     assert ("mcp_disabled_server_not_applied server=fixture" in caplog.text) == bool(active)
+
+
+@pytest.mark.parametrize(
+    "scenario,reused",
+    [
+        ("fresh-retained", True),
+        ("fresh-dropped", False),
+        ("resumed-cached", False),
+        ("resumed-batch", True),
+        ("resumed-compacted", False),
+    ],
+)
+@pytest.mark.parametrize("shape", ["string", "blocks", "image"])
+def test_skill_reuse_follows_final_sdk_history_selection(scenario, reused, shape):
+    from copy import deepcopy
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.spec.types import SkillSpec
+    from omnigent.tools.builtins.load_skill import format_skill_meta_text
+
+    skill = SkillSpec(
+        name="review",
+        description="Review",
+        content="SKILL-BODY-SENTINEL " + "Read all changed files. " * 8,
+    )
+    messages = [
+        {"role": "user", "content": format_skill_meta_text(skill, "FIRST-ARGUMENT")},
+        {"role": "user", "content": format_skill_meta_text(skill, "LATEST-ARGUMENT")},
+    ]
+    if scenario == "resumed-cached":
+        messages.insert(1, {"role": "assistant", "content": "Previous reply"})
+    elif scenario == "resumed-compacted":
+        messages.insert(1, {"role": "user", "content": "/compact"})
+    if shape != "string":
+        for message in messages:
+            message["content"] = [{"type": "input_text", "text": message["content"]}]
+    if shape == "image":
+        messages[-1]["content"].append(
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}
+        )
+    original = deepcopy(messages)
+    prompt = ClaudeSDKExecutor._build_prompt(
+        messages,
+        resume_session=scenario.startswith("resumed"),
+        history_token_budget=0 if scenario == "fresh-dropped" else None,
+    )
+    text = (
+        prompt if isinstance(prompt, str) else "\n".join(block.get("text", "") for block in prompt)
+    )
+    assert text.count("SKILL-BODY-SENTINEL") == 1
+    assert "LATEST-ARGUMENT" in text
+    assert ("FIRST-ARGUMENT" in text) == reused
+    assert ("<skill_invocation>" in text) == reused
+    assert messages == original
+    if shape == "image":
+        assert isinstance(prompt, list)
+        assert {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="},
+        } in prompt
+
+
+@pytest.mark.parametrize("block_type", [{"unexpected": "value"}, ["unexpected"]])
+def test_skill_reuse_preserves_unrecognized_replay_block_types(block_type):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    messages = [
+        {"role": "user", "content": [{"type": block_type, "text": "retained-history"}]},
+        {"role": "user", "content": "latest request"},
+    ]
+    prompt = ClaudeSDKExecutor._build_prompt(messages, resume_session=False)
+    assert isinstance(prompt, str)
+    assert "retained-history" in prompt
+    assert "latest request" in prompt

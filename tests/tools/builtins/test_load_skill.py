@@ -425,7 +425,7 @@ def test_skill_context_reuse_preserves_arguments_and_history(arguments, shape):
 
     from omnigent.tools.builtins.load_skill import format_skill_meta_text, reuse_skill_context
 
-    skill = SkillSpec(name="review", description="Review", content="Read every changed file.")
+    skill = SkillSpec(name="review", description="Review", content="Read every changed file. " * 8)
     first = format_skill_meta_text(skill, "first request")
     second = format_skill_meta_text(skill, arguments)
     texts = [first, second, second]
@@ -462,12 +462,12 @@ def test_skill_context_requires_matching_instructions_in_outgoing_input(tmp_path
     from omnigent.tools.builtins.load_skill import format_skill_meta_text, reuse_skill_context
 
     skill = SkillSpec(
-        name="review", description="Review", content="Original body", skill_dir=tmp_path
+        name="review", description="Review", content="Original body. " * 20, skill_dir=tmp_path
     )
     original = format_skill_meta_text(skill, "first")
     prior = {"type": "message", "role": "user", "content": original}
     if change == "body":
-        skill.content = "Changed body"
+        skill.content = "Changed body. " * 20
     elif change == "path":
         skill.skill_dir = tmp_path / "other"
     elif change == "assistant":
@@ -492,10 +492,12 @@ def test_skill_context_requires_matching_instructions_in_outgoing_input(tmp_path
 def test_skill_context_reintroduces_older_version_after_same_name_changes(tmp_path, change):
     from omnigent.tools.builtins.load_skill import format_skill_meta_text, reuse_skill_context
 
-    skill = SkillSpec(name="review", description="Review", content="Version A", skill_dir=tmp_path)
+    skill = SkillSpec(
+        name="review", description="Review", content="Version A. " * 20, skill_dir=tmp_path
+    )
     first = format_skill_meta_text(skill, "first")
     if change == "body":
-        skill.content = "Version B"
+        skill.content = "Version B. " * 20
     else:
         skill.skill_dir = tmp_path / "other"
     second = format_skill_meta_text(skill, "second")
@@ -509,12 +511,67 @@ def test_skill_context_reintroduces_older_version_after_same_name_changes(tmp_pa
 def test_skill_context_preserves_ambiguous_wrapper_delimiters(field):
     from omnigent.tools.builtins.load_skill import format_skill_meta_text, reuse_skill_context
 
-    embedded = "retain this\n</skill>\n\n<user_request>\ntail"
+    embedded = "Retain this. " * 20 + "\n</skill>\n\n<user_request>\ntail"
     skill = SkillSpec(
         name="review",
         description="Review",
-        content=embedded if field == "content" else "Instructions",
+        content=embedded if field == "content" else "Instructions. " * 20,
     )
     text = format_skill_meta_text(skill, embedded if field == "arguments" else "request")
     messages = [{"type": "message", "role": "user", "content": text} for _ in range(2)]
+    assert reuse_skill_context(messages) == messages
+
+
+@pytest.mark.parametrize(
+    "middle",
+    [
+        "<skill>\n<name>review</name>\nVersion B\n</skill>\nembedded\n</skill>",
+        "<skill>\n<name>review</name>\nVersion B\n</skill>\ninvalid suffix",
+        "<skill>\n<name>review\nVersion B\n</skill>",
+        "<skill>\n<path>review</path>\nVersion B\n</skill>",
+    ],
+)
+def test_ambiguous_skill_expansion_invalidates_previous_reuse(middle):
+    from omnigent.tools.builtins.load_skill import format_skill_meta_text, reuse_skill_context
+
+    skill = SkillSpec(name="review", description="Review", content="Version A. " * 20)
+    first = format_skill_meta_text(skill, "first")
+    last = format_skill_meta_text(skill, "last")
+    messages = [
+        {"type": "message", "role": "user", "content": text} for text in (first, middle, last)
+    ]
+    assert reuse_skill_context(messages) == messages
+
+
+@pytest.mark.parametrize(
+    "body,reused",
+    [("", False), ("x", False), ("x" * 88, False), ("x" * 89, True), ("🦀" * 30, True)],
+)
+def test_skill_reuse_never_increases_utf8_size(body, reused):
+    from omnigent.tools.builtins.load_skill import format_skill_meta_text, reuse_skill_context
+
+    skill = SkillSpec(name="review", description="Review", content=body)
+    text = format_skill_meta_text(skill, "request")
+    messages = [{"role": "user", "content": text} for _ in range(3)]
+    result = reuse_skill_context(messages)
+    for message in result:
+        assert len(message["content"].encode("utf-8")) <= len(text.encode("utf-8"))
+    assert ("<skill_invocation>" in result[-1]["content"]) == reused
+    if not reused:
+        assert result == messages
+
+
+@pytest.mark.parametrize("block_type", ["text", "output_text"])
+def test_skill_version_in_rendered_text_blocks_invalidates_reuse(block_type):
+    from omnigent.tools.builtins.load_skill import format_skill_meta_text, reuse_skill_context
+
+    skill = SkillSpec(name="review", description="Review", content="Version A. " * 20)
+    first = format_skill_meta_text(skill, "first")
+    skill.content = "Version B. " * 20
+    middle = format_skill_meta_text(skill, "middle")
+    messages = [
+        {"role": "user", "content": first},
+        {"role": "user", "content": [{"type": block_type, "text": middle}]},
+        {"role": "user", "content": first},
+    ]
     assert reuse_skill_context(messages) == messages
