@@ -4114,6 +4114,7 @@ def build_codex_native_server(
     model_catalog_rows: list[_JsonObject] | None = None,
     reconcile_process_registry: bool = True,
     terminal_launch_args: Sequence[str] = (),
+    active_harnesses: Collection[str] | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -4225,6 +4226,7 @@ def build_codex_native_server(
     ):
         config_overrides.append(f"model={json.dumps(pinned_model)}")
     return CodexNativeAppServer(
+        active_harnesses=active_harnesses,
         codex_path=resolved_codex,
         socket_path=socket_path,
         codex_home=codex_home,

@@ -530,3 +530,30 @@ def test_the_status_file_can_live_outside_a_read_only_home(
 
     monkeypatch.setenv(mcp_inventory.MCP_AUTH_STATUS_ENV, str(elsewhere))
     assert HostMcpInventory().discover()[0]["auth_status"] == "connected"
+
+
+@pytest.mark.parametrize("harness", ["claude", "codex", "cursor"])
+@pytest.mark.parametrize("managed", [False, True])
+def test_enablement_overlay_and_cache_clear(home, monkeypatch, harness, managed):
+    from omnigent.mcp_disabled_servers import ServerKey, set_disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(home / "omnigent-config"))
+    if harness != "cursor":
+        set_disabled(ServerKey(harness, "docs"), True)
+    row = {"name": "docs", "harness": harness, "transport": "stdio", "scope": "user"}
+    if managed:
+        row["managed"] = "true"
+    discovered = [row]
+    monkeypatch.setattr(mcp_inventory, "discover_mcp_servers", lambda: discovered)
+    inventory = HostMcpInventory()
+    result = inventory.discover()[0]
+    if harness == "cursor":
+        assert "enabled" not in result and "locked" not in result
+    else:
+        assert result["enabled"] == str(managed).lower()
+        assert result["locked"] == str(managed).lower()
+    assert "enabled" not in row
+    discovered = [{**row, "name": "new"}]
+    assert inventory.discover()[0]["name"] == "docs"
+    inventory.clear()
+    assert inventory.discover()[0]["name"] == "new"

@@ -3008,3 +3008,35 @@ def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) ->
                 }
             )
         )
+
+
+@pytest.mark.parametrize("activation", [None, [], ["claude"], ["claude", "codex"]])
+def test_mcp_launch_activation_round_trip(activation):
+    frame = HostLaunchRunnerFrame(
+        "request", "token", "/repo", mcp_disabled_servers_harnesses=activation
+    )
+    wire = encode_host_frame(frame)
+    assert decode_host_frame(wire) == frame
+    assert ("mcp_disabled_servers_harnesses" in json.loads(wire)) is (activation is not None)
+
+
+def test_enablement_fields_survive_inventory_allow_list():
+    frame = HostMcpServersResultFrame(
+        "request",
+        "ok",
+        mcp_servers=[
+            {
+                "name": "docs",
+                "harness": "claude",
+                "transport": "stdio",
+                "scope": "user",
+                "enabled": "false",
+                "locked": "true",
+                "command": "private",
+            }
+        ],
+    )
+    decoded = decode_host_frame(encode_host_frame(frame))
+    assert decoded.mcp_servers[0]["enabled"] == "false"
+    assert decoded.mcp_servers[0]["locked"] == "true"
+    assert "command" not in decoded.mcp_servers[0]

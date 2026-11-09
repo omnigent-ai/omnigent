@@ -102,6 +102,7 @@ from omnigent.inner.executor import Executor
 from omnigent.inner.model_egress import UCODE_SIGNER_BINDING_ID, registered_model_provider_binding
 from omnigent.inner.model_signer import SignerLaunchConfig
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
+from omnigent.runner.identity import runner_mcp_disabled_servers_harnesses
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.spec.types import RetryPolicy
 
@@ -394,6 +395,7 @@ def _build_codex_executor() -> Executor:
     signer_launch_config = _resolve_signer_launch_config()
     route = _codex_route(os.environ)
     return CodexExecutor(
+        active_harnesses=runner_mcp_disabled_servers_harnesses(),
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),

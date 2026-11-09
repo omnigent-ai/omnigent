@@ -13,12 +13,16 @@ from fastapi.responses import JSONResponse
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
     CAP_MCP_INVENTORY,
+    CAP_MCP_SERVER_ENABLED,
     HostHelloFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
+    HostSetMcpServerEnabledFrame,
+    HostSetMcpServerEnabledResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes.mcp_servers import (
     create_mcp_servers_router,
@@ -55,8 +59,23 @@ def mcp_app(db_uri: str) -> tuple[FastAPI, HostRegistry, HostStore]:
     hosts = HostStore(db_uri)
     hosts.upsert_on_connect(_HOST_ID, "laptop", "owner")
     app = FastAPI()
+    app.state.mcp_enabled = False
     app.include_router(
-        create_mcp_servers_router(registry, hosts, auth_provider=_Auth()), prefix="/v1"
+        create_mcp_servers_router(
+            registry,
+            hosts,
+            auth_provider=_Auth(),
+            mcp_disabled_servers=lambda: app.state.mcp_enabled,
+            feature_flags=FeatureFlags(
+                frozenset(
+                    {
+                        Feature.MCP_DISABLED_SERVERS_CLAUDE,
+                        Feature.MCP_DISABLED_SERVERS_CODEX,
+                    }
+                )
+            ),
+        ),
+        prefix="/v1",
     )
 
     @app.exception_handler(OmnigentError)
@@ -103,6 +122,8 @@ async def test_owner_gets_host_inventory(
                     "auth_status": None,
                     "sign_in_url": None,
                     "managed": False,
+                    "enabled": None,
+                    "locked": False,
                 }
             ]
         }
@@ -198,3 +219,99 @@ async def test_proxy_cleans_up_unanswered_requests(
         await request_host_mcp_servers(host_registry=registry, host_conn=conn)
     assert exc_info.value.status_code == status
     assert conn.pending_mcp_servers == {}
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_enablement_inventory_gate(mcp_app, enabled):
+    app, registry, _ = mcp_app
+    app.state.mcp_enabled = enabled
+    conn = _register(registry, CAP_MCP_INVENTORY)
+    async with _client(app) as client:
+        task = asyncio.create_task(
+            client.get(f"/v1/hosts/{_HOST_ID}/mcp-servers", headers={"x-test-user": "owner"})
+        )
+        frame = decode_host_frame((await conn.outbound_queue.get()).data)
+        reply = decode_host_frame(
+            encode_host_frame(
+                HostMcpServersResultFrame(
+                    frame.request_id,
+                    "ok",
+                    mcp_servers=[{**_GITHUB, "enabled": "false", "locked": "true"}],
+                )
+            )
+        )
+        conn.pending_mcp_servers[frame.request_id].set_result(reply)
+        response = await task
+    row = response.json()["mcp_servers"][0]
+    assert row["enabled"] is (False if enabled else None)
+    assert row["locked"] is enabled
+
+
+@pytest.mark.parametrize(
+    "status,error_code,expected",
+    [
+        ("ok", None, 200),
+        ("failed", "invalid_server", 422),
+        ("failed", "io", 502),
+    ],
+)
+async def test_owner_put_through_tunnel(mcp_app, status, error_code, expected):
+    app, registry, _ = mcp_app
+    app.state.mcp_enabled = True
+    conn = _register(registry, CAP_MCP_SERVER_ENABLED)
+    async with _client(app) as client:
+        task = asyncio.create_task(
+            client.put(
+                f"/v1/hosts/{_HOST_ID}/mcp-servers/enabled",
+                headers={"x-test-user": "owner"},
+                json={"harness": "claude", "server": "github", "enabled": False},
+            )
+        )
+        frame = decode_host_frame((await conn.outbound_queue.get()).data)
+        assert isinstance(frame, HostSetMcpServerEnabledFrame)
+        assert (frame.harness, frame.server, frame.enabled) == ("claude", "github", False)
+        reply = decode_host_frame(
+            encode_host_frame(
+                HostSetMcpServerEnabledResultFrame(
+                    frame.request_id,
+                    status,
+                    server={**_GITHUB, "enabled": "false", "locked": "false"},
+                    error_code=error_code,
+                )
+            )
+        )
+        conn.pending_mcp_server_enabled[frame.request_id].set_result(reply)
+        response = await task
+    assert response.status_code == expected
+    if expected == 200:
+        assert response.json()["server"]["enabled"] is False
+    assert not conn.pending_mcp_server_enabled
+
+
+@pytest.mark.parametrize(
+    "user,gate,capabilities,body,status",
+    [
+        ("owner", False, [], {}, 404),
+        ("other", True, [], {}, 403),
+        (None, True, [], {}, 401),
+        ("owner", True, [], {}, 501),
+        ("owner", True, [], {"server": "omnigent"}, 422),
+        ("owner", True, [], {"harness": "cursor"}, 422),
+        ("owner", True, [], {"server": ""}, 422),
+        ("owner", True, [], {"server": "x" * 1025}, 422),
+        ("owner", True, [], {"plugin": "x" * 1025}, 422),
+        ("owner", True, [], {"source_id": "bad"}, 422),
+    ],
+)
+async def test_put_rejections_do_not_reach_host(mcp_app, user, gate, capabilities, body, status):
+    app, registry, _ = mcp_app
+    app.state.mcp_enabled = gate
+    conn = _register(registry, *capabilities)
+    async with _client(app) as client:
+        response = await client.put(
+            f"/v1/hosts/{_HOST_ID}/mcp-servers/enabled",
+            headers={"x-test-user": user} if user else {},
+            json={"harness": "claude", "server": "github", "enabled": False, **body},
+        )
+    assert response.status_code == status
+    assert conn.outbound_queue.empty()

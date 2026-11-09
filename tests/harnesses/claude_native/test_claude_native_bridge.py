@@ -17402,6 +17402,10 @@ async def test_relay_keeps_high_descriptor_connections_alive(
 @pytest.mark.parametrize("saved", [False, True])
 @pytest.mark.parametrize("active", [None, [], ["claude"]])
 def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved):
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
+    active = launch_activation(active)
+
     from unittest.mock import patch
 
     from omnigent.mcp_disabled_servers import ServerKey, apply_claude_settings, set_disabled

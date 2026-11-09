@@ -327,12 +327,33 @@ def apply_auth_status(
     return servers
 
 
+def apply_enabled_status(servers: list[McpServerSummary]) -> list[McpServerSummary]:
+    """Overlay saved preferences without altering the harness configuration."""
+    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS, ServerKey, is_disabled
+
+    for server in servers:
+        harness = server["harness"]
+        if harness not in HARNESS_EXECUTORS:
+            continue
+        locked = server.get("managed") == "true"
+        server["locked"] = str(locked).lower()
+        server["enabled"] = str(
+            locked or not is_disabled(ServerKey(harness, server["name"], server.get("plugin")))
+        ).lower()
+    return servers
+
+
 class HostMcpInventory:
     """Cache the inventory briefly and serialize scans off the event loop."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._cached: tuple[float, list[McpServerSummary]] | None = None
+
+    def clear(self) -> None:
+        """Invalidate discovery after a successful preference write."""
+        with self._lock:
+            self._cached = None
 
     def discover(self) -> list[McpServerSummary]:
         """Return the cached inventory, rescanning after the TTL; account state is always fresh."""
@@ -343,4 +364,4 @@ class HostMcpInventory:
                 result = discover_mcp_servers()
                 self._cached = (time.monotonic() + MCP_INVENTORY_CACHE_TTL_SECONDS, result)
                 servers = [dict(server) for server in result]
-        return apply_auth_status(servers, _auth_status_overlay())
+        return apply_enabled_status(apply_auth_status(servers, _auth_status_overlay()))

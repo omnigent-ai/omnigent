@@ -35,6 +35,9 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "sandbox_profiles": False,
         "usage_page": False,
         "harness_install": False,
+        "mcp_disabled_servers": False,
+        "mcp_disabled_servers_claude": False,
+        "mcp_disabled_servers_codex": False,
         "canvas": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
@@ -213,3 +216,35 @@ def test_release_flags_have_lifecycle_metadata_and_expected_defaults() -> None:
         assert definition.review_by_release
         assert defaults.enabled(definition.feature) == definition.default_enabled
     assert FeatureFlags().enabled_features == frozenset()
+
+
+@pytest.mark.parametrize("master", [False, True, lambda: False, lambda: True])
+@pytest.mark.parametrize(
+    "claude,codex", [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_mcp_active_harnesses(master, claude, codex):
+    from omnigent.server.feature_flags import FeatureFlags, active_harnesses
+
+    features = FeatureFlags(
+        frozenset(
+            feature
+            for feature, enabled in [
+                (Feature.MCP_DISABLED_SERVERS_CLAUDE, claude),
+                (Feature.MCP_DISABLED_SERVERS_CODEX, codex),
+            ]
+            if enabled
+        )
+    )
+    expected = [name for name, enabled in [("claude", claude), ("codex", codex)] if enabled]
+    assert active_harnesses(master, features) == (
+        expected if (master() if callable(master) else master) else []
+    )
+
+
+def test_mcp_gate_fails_closed():
+    from omnigent.server.feature_flags import FeatureFlags, active_harnesses
+
+    def broken():
+        raise RuntimeError("SAFE unavailable")
+
+    assert active_harnesses(broken, FeatureFlags(frozenset(Feature))) == []

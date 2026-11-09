@@ -6562,6 +6562,10 @@ async def test_turn_options_expose_ask_user_question_only_with_its_hook(
 @pytest.mark.parametrize("saved", [False, True])
 @pytest.mark.parametrize("active", [None, [], ["claude"]])
 async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved):
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
+    active = launch_activation(active)
+
     from omnigent.mcp_disabled_servers import ServerKey, apply_claude_settings, set_disabled
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))

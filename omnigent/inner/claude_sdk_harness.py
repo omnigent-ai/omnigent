@@ -98,6 +98,7 @@ from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
+from omnigent.runner.identity import runner_mcp_disabled_servers_harnesses
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.spec.types import RetryPolicy
 
@@ -276,6 +277,7 @@ def _build_claude_sdk_executor() -> Executor:
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     return ClaudeSDKExecutor(
+        active_harnesses=runner_mcp_disabled_servers_harnesses(),
         # Run the CLI in the session workspace: an explicit
         # HARNESS_CLAUDE_SDK_CWD wins, else the runner's
         # OMNIGENT_RUNNER_WORKSPACE (the folder the user launched in, and

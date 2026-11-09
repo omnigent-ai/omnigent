@@ -4,7 +4,7 @@
 // host inventory, and the heavy composer/dialog imports are mocked so it renders
 // without a backend.
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -16,6 +16,8 @@ import { ApiError } from "@/lib/sessionsApi";
 import type { HarnessStartup, Host } from "@/hooks/useHosts";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
 
+const setEnabled = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/mcpServerEnabledApi", () => ({ setMcpServerEnabled: setEnabled }));
 let pluginMetadataRequested = false;
 const CONTENT: SkillContent = {
   name: "review",
@@ -240,6 +242,7 @@ const ONLINE: Host = {
 };
 
 afterEach(() => {
+  setEnabled.mockReset();
   contentQuery = { data: CONTENT, isPending: false };
   contentLookup = null;
   contentSource = undefined;
@@ -1377,4 +1380,122 @@ it("requests a host update instead of guessing installed MCP identity", () => {
   expect(screen.getByText("Update my-laptop to inspect installed plugin MCP tools.")).toBeTruthy();
   expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
   expect(mcpSources).toEqual([]);
+});
+
+it("keeps old-host and unsupported harness rows without a switch", () => {
+  hosts = [ONLINE];
+  renderHarnesses("claude-native");
+  expect(screen.queryByRole("switch")).toBeNull();
+});
+
+it.each([false, true])("renders MCP enabled=%s and suppresses off probes", (enabled) => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      mcps: [{ id: "docs", name: "docs", harness: "claude", enabled }],
+    },
+  };
+  renderHarnesses("claude-native");
+  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toHaveAttribute(
+    "aria-checked",
+    String(enabled),
+  );
+  fireEvent.click(screen.getByTestId("catalog-row-docs"));
+  if (!enabled) {
+    expect(screen.getByText("Off")).toBeInTheDocument();
+    expect(mcpLookups.every((lookup) => !lookup[4])).toBe(true);
+    expect(screen.getByTestId("catalog-row-docs")).toHaveStyle({ opacity: "0.5" });
+  } else expect(mcpLookups).toContainEqual(["h1", "claude", "docs", undefined, true]);
+});
+
+it("locks managed MCP switches", () => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      mcps: [{ id: "docs", name: "docs", harness: "claude", enabled: true, locked: true }],
+    },
+  };
+  renderHarnesses("claude-native");
+  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toBeDisabled();
+  expect(setEnabled).not.toHaveBeenCalled();
+});
+
+it.each([false, true])(
+  "optimistically toggles a plugin MCP and rolls back on failure=%s",
+  async (fails) => {
+    hosts = [ONLINE];
+    inventory = {
+      ...INVENTORY,
+      context: {
+        ...INVENTORY.context,
+        mcps: [
+          {
+            id: "source",
+            name: "docs",
+            harness: "claude",
+            plugin: "toolkit",
+            sourceId: "a".repeat(64),
+            enabled: true,
+          },
+        ],
+      },
+    };
+    let finish!: () => void;
+    setEnabled.mockImplementation(
+      () =>
+        new Promise((resolve, reject) => {
+          finish = () => (fails ? reject(new Error("offline")) : resolve({ enabled: false }));
+        }),
+    );
+    const client = renderHarnesses("claude-native");
+    client.setQueryData(
+      ["host-mcp-servers", "h1"],
+      [
+        {
+          name: "docs",
+          harness: "claude",
+          plugin: "toolkit",
+          source_id: "a".repeat(64),
+          enabled: true,
+        },
+      ],
+    );
+    const toggle = screen.getByRole("switch", { name: "Enable docs for claude" });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+    expect(toggle).toBeDisabled();
+    expect(setEnabled).toHaveBeenCalledWith("h1", {
+      harness: "claude",
+      server: "docs",
+      plugin: "toolkit",
+      source_id: "a".repeat(64),
+      enabled: false,
+    });
+    finish();
+    await waitFor(() => expect(toggle).not.toBeDisabled());
+    expect(
+      client.getQueryData<{ enabled: boolean }[]>(["host-mcp-servers", "h1"])?.[0].enabled,
+    ).toBe(fails);
+    if (fails) expect(toggle).toHaveAttribute("aria-checked", "true");
+  },
+);
+
+it("retains the enablement switch when tool discovery is unavailable", () => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      mcps: [{ id: "docs", name: "docs", harness: "claude", enabled: true }],
+    },
+  };
+  mcpResult = { error: new ApiError("404", 404, null), isPending: false };
+  renderHarnesses("claude-native");
+  fireEvent.click(screen.getByTestId("catalog-row-docs"));
+  expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
+  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toBeEnabled();
 });

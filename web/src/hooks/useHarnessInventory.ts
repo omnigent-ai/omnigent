@@ -1,6 +1,5 @@
 // What each harness on a user-connected host already brings to Omnigent: login
-// state, user-level skills, plugins, and MCP servers. Read-only; nothing here
-// changes the host's configuration.
+// state, user-level skills, plugins, and MCP servers.
 
 import { skipToken, useQueries, useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
@@ -33,6 +32,8 @@ export interface InventoryMcpServer {
   /** Plugin that bundles the server, e.g. ``"figma"``. */
   plugin?: string;
   sourceId?: string;
+  enabled?: boolean | null;
+  locked?: boolean;
 }
 
 export interface InventorySkill {
@@ -94,6 +95,8 @@ export interface HostMcpServer {
   scope: "user";
   /** Pinned for every user on the host by an organization; not the user's to edit. */
   managed?: boolean;
+  enabled?: boolean | null;
+  locked?: boolean;
   plugin?: string | null;
   source_id?: string | null;
   url_host?: string | null;
@@ -194,6 +197,8 @@ export function buildInventoryContext(
         detail: detail || undefined,
         plugin: server.plugin ?? undefined,
         sourceId: server.source_id ?? undefined,
+        enabled: server.enabled,
+        locked: server.locked,
       });
     }
     for (const [name, skills] of plugins) {

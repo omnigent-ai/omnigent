@@ -6465,6 +6465,10 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
 async def test_disabled_mcp_launch_hook_and_early_exit(
     tmp_path, monkeypatch, caplog, active, failures, saved
 ):
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
+    active = launch_activation(active)
+
     from omnigent import mcp_disabled_servers as disabled
     from omnigent.errors import HarnessTransportClosedError
 

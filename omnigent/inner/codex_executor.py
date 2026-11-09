@@ -4778,9 +4778,11 @@ def _default_app_session_factory(
     skills_dir: Path | None = None,
     os_env: OSEnvSpec | None,
     signer_launch_config: SignerLaunchConfig | None = None,
+    active_harnesses: Collection[str] | None = None,
 ) -> _CodexAppServerSession:
     return _CodexAppServerSession(
         codex_path=codex_path,
+        active_harnesses=active_harnesses,
         cwd=cwd,
         env=env,
         tool_executor=tool_executor,
@@ -4831,6 +4833,7 @@ class CodexExecutor(Executor):
         skills_filter: str | list[str] = "all",
         skills_dir: Path | None = None,
         signer_launch_config: SignerLaunchConfig | None = None,
+        active_harnesses: Collection[str] | None = None,
     ) -> None:
         """Create a CodexExecutor.
 
@@ -5084,6 +5087,7 @@ class CodexExecutor(Executor):
                 _AppSessionFactory,
                 partial(
                     _default_app_session_factory,
+                    active_harnesses=active_harnesses,
                     signer_launch_config=signer_launch_config,
                 ),
             )

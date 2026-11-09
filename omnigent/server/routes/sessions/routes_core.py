@@ -87,7 +87,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
-from omnigent.server.feature_flags import Feature
+from omnigent.server.feature_flags import Feature, FeatureFlags, active_harnesses
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -963,6 +963,10 @@ def register_core_routes(
                 # spawning. None (agent not resolvable) skips the
                 # host-side check.
                 harness=harness,
+                mcp_disabled_servers_harnesses=active_harnesses(
+                    getattr(request.app.state, "mcp_disabled_servers", False),
+                    getattr(request.app.state, "feature_flags", FeatureFlags()),
+                ),
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
                     if target.conv.inference_snapshot

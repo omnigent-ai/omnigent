@@ -3067,3 +3067,33 @@ def test_picker_restriction_warning_names_the_agents_new_chat_cannot_offer(
         assert text in caplog.text
     for text in absent:
         assert text not in caplog.text
+
+
+@pytest.mark.parametrize("mode", ["snapshot", "off", "on", "callable", "raising"])
+async def test_info_mcp_gate(db_uri, runtime_init, tmp_path, monkeypatch, mode):
+    monkeypatch.setenv("OMNIGENT_FEATURES", "mcp_disabled_servers")
+    values = iter([False, True])
+
+    def broken():
+        raise RuntimeError("gate unavailable")
+
+    gate = {
+        "snapshot": None,
+        "off": False,
+        "on": True,
+        "callable": lambda: next(values),
+        "raising": broken,
+    }[mode]
+    app = _build_branding_app(db_uri, tmp_path, f"mcp-{mode}", mcp_disabled_servers=gate)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = (await client.get("/v1/info")).json()["features"]["mcp_disabled_servers"]
+        second = (await client.get("/v1/info")).json()["features"]["mcp_disabled_servers"]
+    assert (first, second) == {
+        "snapshot": (True, True),
+        "off": (False, False),
+        "on": (True, True),
+        "callable": (False, True),
+        "raising": (False, False),
+    }[mode]

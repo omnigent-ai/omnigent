@@ -50,6 +50,7 @@ RUNNER_SLICE_KEY_ENV_VAR = "OMNIGENT_RUNNER_SLICE_KEY"
 # can start harness-specific prewarms before session init arrives. Absent
 # for CLI-local runners and hosts that predate the stamp.
 RUNNER_LAUNCH_HARNESS_ENV_VAR = "OMNIGENT_RUNNER_LAUNCH_HARNESS"
+RUNNER_MCP_DISABLED_SERVERS_HARNESSES_ENV_VAR = "OMNIGENT_RUNNER_MCP_DISABLED_SERVERS_HARNESSES"
 # JSON-encoded ordered shell inventory discovered by the host daemon. The
 # runner uses this exact snapshot for native wrapper terminal declarations.
 RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"
@@ -97,6 +98,25 @@ RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset(
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     }
 )
+
+
+def runner_mcp_disabled_servers_harnesses(
+    env: Mapping[str, str] | None = None,
+) -> list[str] | None:
+    """Decode the server-owned launch activation; old or malformed stamps apply nothing."""
+    source = os.environ if env is None else env
+    raw = source.get(RUNNER_MCP_DISABLED_SERVERS_HARNESSES_ENV_VAR)
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(decoded, list) or not all(isinstance(item, str) for item in decoded):
+        return None
+    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS
+
+    return [harness for harness in HARNESS_EXECUTORS if harness in decoded]
 
 
 def touch_connect_marker(env: Mapping[str, str] | None = None) -> None:

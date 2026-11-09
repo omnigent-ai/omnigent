@@ -48,6 +48,7 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     HostPluginsResultFrame,
     HostProbeAccountsFrame,
+    HostSetMcpServerEnabledResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
     encode_host_frame,
@@ -189,6 +190,7 @@ def _fail_pending_skills(conn: HostConnection) -> None:
 def _fail_pending_mcp_servers(conn: HostConnection) -> None:
     """Fail MCP inventory requests as soon as their host disappears."""
     _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
+    _fail_pending_inventory(conn.pending_mcp_server_enabled, conn.host_id)
 
 
 def _fail_pending_worktrees(conn: HostConnection) -> None:
@@ -579,6 +581,9 @@ class HostConnection:
     )
     pending_skill_content: dict[str, asyncio.Future[HostSkillContentResultFrame]] = field(
         default_factory=dict
+    )
+    pending_mcp_server_enabled: dict[str, asyncio.Future[HostSetMcpServerEnabledResultFrame]] = (
+        field(default_factory=dict)
     )
     pending_mcp_tools: dict[str, asyncio.Future[HostMcpToolsResultFrame]] = field(
         default_factory=dict
