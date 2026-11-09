@@ -102,6 +102,40 @@ _CODEX_LAUNCH_DEFAULT = StaticModelFallback(
 
 CODEX_DEFAULT_MODEL = _CODEX_LAUNCH_DEFAULT.model_ids[0]
 
+#: Genie's bundled catalog slugs, in ``models.json`` order. Per-model efforts
+#: and the re-pin recipe live in ``omnigent/models/genie_catalog.py``.
+GENIE_BUNDLED_CATALOG = StaticModelFallback(
+    model_ids=(
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.2",
+    ),
+    owner="Genie worker listing (omnigent.models.genie_catalog)",
+    provenance=(
+        "codex-rs/models-manager/models.json at databricks-eng/genie-code-codex "
+        "v0.2.1, without its alias rows and the codex-auto-review reviewer"
+    ),
+    discovery_gap=(
+        "genie has no debug models command, and its model/list needs a running "
+        "genie app-server that a worker listing does not have"
+    ),
+)
+
+#: Endpoint names genie keeps verbatim: its catalog lists them as aliases.
+GENIE_VERBATIM_ENDPOINTS = StaticModelFallback(
+    model_ids=("databricks-gpt-5-2-codex", "databricks-gpt-5-4-nano"),
+    owner="Genie model-id mapping (omnigent.inner.genie_executor.genie_model_id)",
+    provenance=(
+        "databricks_codex_model_id in codex-rs/tui/src/config_update.rs at "
+        "databricks-eng/genie-code-codex v0.2.1"
+    ),
+    discovery_gap="the endpoint name is mapped before genie's app-server starts",
+)
+
 
 # ── Smart Routing ───────────────────────────────────────────────────────────
 #

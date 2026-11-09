@@ -718,6 +718,35 @@ async def test_handle_model_options_serves_the_pi_harness(
     )
 
 
+async def test_handle_model_options_serves_genie_pinned_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Genie's launch picker lists its pinned catalog, with no default row."""
+    from omnigent.host import connect as host_connect
+    from omnigent.models.genie_catalog import GENIE_CATALOG_MODELS
+
+    monkeypatch.setattr(host_connect, "_model_configuration_source_for_harness", lambda h: None)
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_genie", harness="genie"),
+    )
+
+    assert result.status == "ok"
+    assert [row["id"] for row in result.models] == [m.slug for m in GENIE_CATALOG_MODELS]
+    assert not any(row.get("isDefault") for row in result.models)
+    sol = result.models[0]
+    assert sol["model"] == "gpt-5.6-sol"
+    assert [e["reasoningEffort"] for e in sol["supportedReasoningEfforts"]] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+    ]
+
+
 @pytest.mark.parametrize("harness", ["devin-native", "native-devin", "devin"])
 async def test_handle_model_options_missing_devin_is_quiet(
     monkeypatch: pytest.MonkeyPatch,

@@ -48,11 +48,13 @@ from cachetools import TTLCache
 from omnigent._platform import default_shell_argv
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
+from omnigent.models.genie_catalog import GENIE_CATALOG_MODELS, GENIE_CATALOG_VERSION
 from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
     ModelIntent,
     ModelMetadata,
+    ModelReasoningMetadata,
     ModelWireAPI,
 )
 from omnigent.models.model_override import (
@@ -1107,7 +1109,8 @@ def list_models_for_worker(
     family rule from :func:`~omnigent.models.model_override.model_family_mismatch`
     — claude harnesses keep Claude ids, codex harnesses keep GPT ids,
     pi keeps everything. Curated generic ACP workers return their configured
-    shortlist without resolving credentials or querying the gateway.
+    shortlist without resolving credentials or querying the gateway. Genie
+    workers list Genie's pinned bundled catalog instead of the provider's.
 
     :param spec: The worker's (sub-)agent spec.
     :param harness: The worker's harness id, e.g. ``"codex-native"``.
@@ -1127,28 +1130,12 @@ def list_models_for_worker(
                 ),
                 note="Configured ACP provider model shortlist; vendor CLI owns authentication.",
             )
-    provider = resolve_model_provider(spec, harness)
-    if provider.kind == DATABRICKS_KIND:
-        uc_key = ("uc", *_listing_cache_key(provider))
-        with _listing_cache_lock:
-            uc_listing = cast(ModelListing | None, _listing_cache.get(uc_key))
-        if uc_listing is None:
-            try:
-                uc_listing = _fetch_databricks_uc_listing(provider, transport=transport)
-                with _listing_cache_lock:
-                    _listing_cache[uc_key] = uc_listing
-            except (httpx.HTTPError, OSError):
-                _logger.debug(
-                    "UC model listing failed for Databricks provider, falling back",
-                    exc_info=True,
-                )
-        listing = (
-            _with_custom_serving_endpoints(uc_listing, provider, transport=transport)
-            if uc_listing is not None
-            else _listing_for_provider(provider, transport=transport)
-        )
+    provider = None
+    if canonicalize_harness(harness) == "genie":
+        listing = _genie_catalog_listing()
     else:
-        listing = _listing_for_provider(provider, transport=transport)
+        provider = resolve_model_provider(spec, harness)
+        listing = _provider_listing(provider, transport=transport)
     canonical_harness = (harness or "").lower().replace("-", "").replace("_", "")
     if canonical_harness in {"pi", "pinative", "nativepi"}:
         listing = replace(
@@ -1170,10 +1157,74 @@ def list_models_for_worker(
             listing,
             models=tuple(by_id[mid] for mid in binding.model_allowlist if mid in by_id),
         )
-    if not listing.models:
+    if not listing.models and provider is not None:
         listing = _cli_login_probe_listing(spec, harness, provider) or listing
     filtered = tuple(m for m in listing.models if model_family_mismatch(harness, m.id) is None)
     return replace(listing, models=filtered)
+
+
+def _genie_catalog_listing() -> ModelListing:
+    """List Genie's pinned bundled catalog with each model's efforts.
+
+    Genie runs only catalogued slugs on the Databricks AI gateway, silently
+    swapping anything else for its default, so the provider's endpoint names
+    are not what a genie worker can run.
+
+    :returns: A ``source="static"`` listing of :data:`GENIE_CATALOG_MODELS`.
+    """
+    return ModelListing(
+        source="static",
+        verified=False,
+        models=tuple(
+            ModelEntry(
+                id=model.slug,
+                family=model_family_token(model.slug),
+                metadata=ModelMetadata(
+                    context_window=model.context_window,
+                    reasoning=ModelReasoningMetadata(efforts=frozenset(model.efforts)),
+                ),
+            )
+            for model in GENIE_CATALOG_MODELS
+        ),
+        note=(
+            f"Genie {GENIE_CATALOG_VERSION} bundled catalog. A session also accepts "
+            "models its gateway's /models adds; any other model or effort is rejected."
+        ),
+    )
+
+
+def _provider_listing(
+    provider: ResolvedModelProvider,
+    *,
+    transport: httpx.BaseTransport | None,
+) -> ModelListing:
+    """Fetch (or replay from cache) a provider's unfiltered model listing.
+
+    Databricks providers list Unity Catalog model services plus custom serving
+    endpoints, falling back to the serving-endpoints listing.
+
+    :param provider: The worker's resolved provider.
+    :param transport: Optional httpx transport override for tests.
+    :returns: The provider's :class:`ModelListing`, before harness filtering.
+    """
+    if provider.kind != DATABRICKS_KIND:
+        return _listing_for_provider(provider, transport=transport)
+    uc_key = ("uc", *_listing_cache_key(provider))
+    with _listing_cache_lock:
+        uc_listing = cast(ModelListing | None, _listing_cache.get(uc_key))
+    if uc_listing is None:
+        try:
+            uc_listing = _fetch_databricks_uc_listing(provider, transport=transport)
+            with _listing_cache_lock:
+                _listing_cache[uc_key] = uc_listing
+        except (httpx.HTTPError, OSError):
+            _logger.debug(
+                "UC model listing failed for Databricks provider, falling back",
+                exc_info=True,
+            )
+    if uc_listing is None:
+        return _listing_for_provider(provider, transport=transport)
+    return _with_custom_serving_endpoints(uc_listing, provider, transport=transport)
 
 
 def catalog_for_spec(

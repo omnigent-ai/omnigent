@@ -4188,6 +4188,17 @@ class HostProcess:
                 models=with_source(pi_models),
             )
 
+        if harness == "genie":
+            # Genie's catalog needs a running app-server, so the picker lists the
+            # pinned bundled catalog the session validates picks against.
+            from omnigent.models.genie_catalog import genie_model_options
+
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(genie_model_options()),
+            )
+
         if harness == "devin-native":
             # devin authenticates through its own CLI login; the host shells
             # ``devin models list`` (list_devin_cli_model_options) to preview the

@@ -61,6 +61,9 @@ class EffortFamily(str, Enum):
     # The real codex process is the per-model authority on reasoning levels
     # (Sol reaches ``ultra``); the SDK codex wire caps at ``xhigh``.
     CODEX_NATIVE = "codex-native"
+    # Genie's bundled catalog lists ``max``/``ultra`` on its 5.6 models and
+    # never ``none``/``minimal``; the running genie checks each model.
+    GENIE = "genie"
 
 
 class ModelFamily(str, Enum):

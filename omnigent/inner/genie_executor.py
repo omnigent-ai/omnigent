@@ -6,7 +6,7 @@ AI Gateway (Codex Responses API at ``/ai-gateway/codex/v1``) as its default
 provider. Its ``app-server`` speaks the identical JSON-RPC protocol codex does,
 so :class:`~omnigent.inner.codex_executor.CodexExecutor` already drives it: the
 gateway base URL, ``databricks auth token`` auth command, model, and profile
-are all shared behavior. Genie differs from codex in five ways that this
+are all shared behavior. Genie differs from codex in six ways that this
 subclass encodes:
 
 1. **Binary** — resolve/run ``genie`` (``OMNIGENT_GENIE_PATH``) rather than
@@ -17,15 +17,23 @@ subclass encodes:
 3. **No ``-c``** — genie's CLI allowlist denies ``-c``/``--config`` (and every
    ``app-server`` flag), so config overrides are written into the private
    home's ``config.toml`` and ``genie app-server`` runs with no flags.
-4. **Model ids** — genie only honors models in its bundled catalog, keyed by
-   slug (``gpt-5.4-mini``), so Databricks endpoint names
-   (``databricks-gpt-5-4-mini``) are mapped with :func:`genie_model_id`.
+4. **Model ids** — genie honors a model only when its catalog lists the slug
+   (``gpt-5.4-mini``), so Databricks endpoint names
+   (``databricks-gpt-5-4-mini``) are mapped with :func:`genie_model_id`. The
+   catalog is the bundled ``models.json`` plus, for a provider id other than
+   ``databricks`` with an auth command, the gateway's ``/models`` rows.
 5. **Brokered auth** — the signer path is codex's, but genie reports
-   ``genie X.Y.Z`` from ``--version`` and has no ``debug models`` command (its
-   catalog is compiled in), so the version floor is genie's own and the
-   bundled-catalog probe is skipped. Genie also refuses to start without a
-   Databricks CLI (``databricks version``) on ``PATH``; it only checks the
-   version, so the brokered worker still holds no credential.
+   ``genie X.Y.Z`` from ``--version`` and has no ``debug models`` command, so
+   the version floor is genie's own and the bundled-catalog probe is skipped.
+   Genie also refuses to start without a Databricks CLI (``databricks
+   version``) on ``PATH``; it only checks the version, so the brokered worker
+   still holds no credential.
+6. **Catalog-bound model and effort** — on the Databricks AI gateway genie
+   silently runs its default model for a slug its catalog lacks, and it
+   forwards an effort the model does not list for the gateway to reject. The
+   session checks both against the running genie's ``model/list`` and rejects
+   a mismatch; the effort vocabulary is ``GENIE_EFFORTS``, so ``max`` /
+   ``ultra`` are kept rather than folded to ``xhigh``.
 
 Keeping this a thin subclass — rather than a fork of the executor — is
 deliberate: genie's interaction surface is codex's today, and this is the seam
@@ -41,6 +49,8 @@ from packaging.version import Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.inner.codex_executor import CodexExecutor
+from omnigent.models.model_fallbacks import GENIE_VERBATIM_ENDPOINTS
+from omnigent.util.reasoning_effort import GENIE_EFFORTS
 
 # Env override for an explicit genie binary, mirroring codex's
 # ``OMNIGENT_CODEX_PATH``. Set this when genie lives on a PATH the host daemon
@@ -50,10 +60,24 @@ _GENIE_PATH_ENV = "OMNIGENT_GENIE_PATH"
 GENIE_HOME_ENV_VAR = "GENIE_HOME"
 GENIE_HOME_DIR_NAME = ".genie"
 
+# Base-URL suffix genie treats as the Databricks AI gateway, where it swaps an
+# uncatalogued model for its default.
+_DATABRICKS_AI_GATEWAY_SUFFIX = "/ai-gateway/codex/v1"
+
 
 def _find_genie_cli() -> str | None:
     """Resolve the ``genie`` CLI binary (override → ``PATH`` → global dirs)."""
     return resolve_cli_binary("genie", env_var=_GENIE_PATH_ENV)
+
+
+def is_databricks_ai_gateway(base_url: str | None) -> bool:
+    """Port of genie's ``ModelProviderInfo::is_databricks_ai_gateway``.
+
+    :param base_url: Provider base URL, e.g.
+        ``"https://example.databricks.com/ai-gateway/codex/v1"``.
+    :returns: Whether genie treats the provider as the Databricks AI gateway.
+    """
+    return base_url is not None and base_url.rstrip("/").endswith(_DATABRICKS_AI_GATEWAY_SUFFIX)
 
 
 def genie_model_id(model: str) -> str:
@@ -61,15 +85,16 @@ def genie_model_id(model: str) -> str:
 
     Port of genie's ``databricks_codex_model_id``: ``"databricks-gpt-5-4-mini"``
     becomes ``"gpt-5.4-mini"``. Genie silently replaces a gateway model missing
-    from its bundled catalog with the provider default, so the endpoint name
-    Omnigent's catalog uses would launch a different model. Ids that are not
-    ``[databricks-]gpt-<n>...`` endpoint names pass through unchanged. Genie
-    special-cases two legacy endpoints that are absent from its catalog either
-    way; they are not special-cased here.
+    from its catalog with the provider default, so the endpoint name Omnigent's
+    catalog uses would launch a different model. Ids that are not
+    ``[databricks-]gpt-<n>...`` endpoint names pass through unchanged, as do the
+    two legacy endpoints genie's catalog lists under their endpoint names.
 
     :param model: Model id, e.g. ``"databricks-gpt-5-4-mini"`` or ``"gpt-5.4-mini"``.
     :returns: The genie catalog slug, e.g. ``"gpt-5.4-mini"``.
     """
+    if model in GENIE_VERBATIM_ENDPOINTS.model_ids:
+        return model
     version = model.removeprefix("databricks-")
     if not version.startswith("gpt-"):
         return model
@@ -95,6 +120,9 @@ class GenieExecutor(CodexExecutor):
     (base URL, ``databricks auth token`` auth command, model, profile) is
     inherited unchanged.
     """
+
+    _effort_harness = "genie"
+    _effort_vocabulary = GENIE_EFFORTS
 
     _brokered_cli_name = "Genie"
     _brokered_version_banner = "genie"
@@ -127,6 +155,11 @@ class GenieExecutor(CodexExecutor):
 
     def _cli_model_id(self, model: str) -> str:
         return genie_model_id(model)
+
+    def _requires_catalog_models(self) -> bool:
+        # Off the gateway genie forwards an uncatalogued model to the provider,
+        # which answers for it, so only the gateway route is held to the catalog.
+        return is_databricks_ai_gateway(self._provider_base_url)
 
     def _cli_missing_message(self) -> str:
         return (

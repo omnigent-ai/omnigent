@@ -20,6 +20,7 @@ from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
     DEFAULT_MODEL_EFFORT_CAPS,
     EFFORT_VALUES,
+    GENIE_EFFORTS,
     PI_EFFORTS,
     ModelEffortCaps,
     clamp_effort_for_model,
@@ -250,11 +251,24 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
     # at ultra to Codex's default before its first turn.
     assert efforts_for_harness("codex-native") == CODEX_NATIVE_EFFORTS
     assert efforts_for_harness("codex") == CODEX_EFFORTS
+    # genie forwards none/minimal for the gateway to 400 and runs max/ultra.
+    assert efforts_for_harness("genie") == GENIE_EFFORTS
     # Known, but declared EffortFamily.NONE.
     assert efforts_for_harness("opencode-native") == frozenset()
     # Not in the registry at all — unclassifiable, not unsupported.
     assert efforts_for_harness("some-plugin-harness") is None
     assert efforts_for_harness(None) is None
+
+
+def test_genie_efforts_match_the_pinned_catalog() -> None:
+    """``GENIE_EFFORTS`` is every effort some pinned Genie catalog model lists."""
+    from omnigent.models.genie_catalog import GENIE_CATALOG_MODELS
+
+    assert {effort for model in GENIE_CATALOG_MODELS for effort in model.efforts} == GENIE_EFFORTS
+    # Genie's own max/ultra survive validation instead of folding to xhigh.
+    assert validate_effort("ultra", "genie", GENIE_EFFORTS) == "ultra"
+    with pytest.raises(ValueError, match="minimal"):
+        validate_effort("minimal", "genie", GENIE_EFFORTS)
 
 
 def test_efforts_for_harness_resolves_aliases() -> None:

@@ -28,6 +28,10 @@ CODEX_EFFORTS = OPENAI_EFFORTS
 # and dispatch clamp incompatible pairs; accept the full vocabulary here so
 # supported ``max``/``ultra`` settings survive harness-level validation.
 CODEX_NATIVE_EFFORTS = EFFORT_VALUES
+# Every effort a model in Genie's pinned catalog lists (see
+# ``omnigent/models/genie_catalog.py``). Genie forwards an effort unvalidated,
+# so ``none``/``minimal`` 400 at the gateway; the live session checks per model.
+GENIE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
 GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
 ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
@@ -141,6 +145,7 @@ def efforts_for_harness(harness: str | None) -> frozenset[str] | None:
         EffortFamily.COPILOT: COPILOT_EFFORTS,
         EffortFamily.PI: PI_EFFORTS,
         EffortFamily.CODEX_NATIVE: CODEX_NATIVE_EFFORTS,
+        EffortFamily.GENIE: GENIE_EFFORTS,
     }.get(capabilities.effort, frozenset())
 
 
