@@ -192,6 +192,7 @@ _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 # ahead (e.g. Enter arrives before the menu commits, so the command never
 # submits).
 _CODEX_POPUP_RENDER_S = 0.7
+_CODEX_GOAL_PROMPT_DISMISS_BUDGET_S = 2.0
 
 
 # Budget for confirming an approval switch actually landed. Codex echoes
@@ -2166,11 +2167,41 @@ def build_native_controls(
         return Response(status_code=200)
 
     def _inject_codex_slash_command(socket_path: str, target: str, command: str) -> None:
+        from omnigent.codex_approval_modes import codex_permissions_menu
+        from omnigent.harnesses.claude_native.bridge import _capture_pane, _run_tmux
+
+        def _goal_resume_prompt_is_open(pane: str) -> bool:
+            """Recognize the live goal selection, excluding quoted transcript text."""
+            lines = pane.splitlines()
+            selected_row = next(
+                (line for line in reversed(lines) if line.lstrip().startswith("›")), ""
+            )
+            choices = {"Resume goal", "Leave paused"}
+            return (
+                any(line.strip() == "Resume paused goal?" for line in lines)
+                and choices <= codex_permissions_menu(pane).keys()
+                and bool(choices & codex_permissions_menu(selected_row).keys())
+            )
+
+        # Enter belongs to this selection until it closes; dismissing keeps the goal paused.
+        if _goal_resume_prompt_is_open(_capture_pane(socket_path, target)):
+            _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
+            deadline = time.monotonic() + _CODEX_GOAL_PROMPT_DISMISS_BUDGET_S
+            while True:
+                pane = _capture_pane(socket_path, target)
+                if pane and not _goal_resume_prompt_is_open(pane):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Codex's paused-goal prompt is still open. "
+                        "Open the terminal, dismiss it, and try again."
+                    )
+                time.sleep(min(_CODEX_POPUP_RENDER_S, remaining))
+
         # Typing a slash command opens Codex's slash-command popup, which draws
         # asynchronously: an Enter sent back-to-back is swallowed by the
         # still-opening popup and the command never submits, so settle first.
-        from omnigent.harnesses.claude_native.bridge import _run_tmux
-
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, command)
         time.sleep(_CODEX_POPUP_RENDER_S)

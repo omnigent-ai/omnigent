@@ -710,9 +710,11 @@ async def test_events_compact_on_codex_native_types_settles_then_submits(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("goal_dialog", ["absent", "open", "unresponsive", "quoted"])
 async def test_events_clear_on_codex_native_types_clear_into_the_tui(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    goal_dialog: str,
 ) -> None:
     """
     POST ``/events`` with ``{"type":"clear"}`` on a codex-native session types
@@ -724,13 +726,45 @@ async def test_events_clear_on_codex_native_types_clear_into_the_tui(
     from tests.runner.helpers import make_test_terminal_instance
 
     tmux_calls: list[tuple[str, list[str]]] = []
+    goal_prompt = (
+        "Resume paused goal?\n"
+        "Goal: Finish the task\n"
+        "› 1. Resume goal   Mark it active and continue when idle\n"
+        "  2. Leave paused  Keep it paused; use /goal resume later\n"
+        "Press enter to confirm or esc to go back\n"
+    )
+    prompt_open = goal_dialog in {"open", "unresponsive"}
+    goal_resumed = False
+    typed_command: str | None = None
+    submitted_commands: list[str] = []
 
     def _fake_run_tmux(socket_path: str, *args: str) -> None:
-        """Record tmux send-keys calls without touching tmux."""
+        """Route keys to the currently focused goal dialog or composer."""
+        nonlocal prompt_open, goal_resumed, typed_command
         tmux_calls.append((socket_path, list(args)))
+        if args[-1] == "Escape":
+            if goal_dialog != "unresponsive":
+                prompt_open = False
+        elif args[:2] == ("send-keys", "-l") and not prompt_open:
+            typed_command = args[-1]
+        elif args[-1] == "Enter":
+            if prompt_open:
+                goal_resumed = True
+                prompt_open = False
+            elif typed_command is not None:
+                submitted_commands.append(typed_command)
+
+    def _fake_capture_pane(_socket_path: str, _target: str) -> str:
+        """Keep quoted dialog text in history separate from the live selection."""
+        if prompt_open:
+            return goal_prompt
+        history = goal_prompt if goal_dialog == "quoted" else ""
+        return history + "› Ask Codex to do anything\n"
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture_pane)
     monkeypatch.setattr(native_controls, "_CODEX_POPUP_RENDER_S", 0)
+    monkeypatch.setattr(native_controls, "_CODEX_GOAL_PROMPT_DISMISS_BUDGET_S", 0)
 
     conv_id = "5b6a0c3d0f1e4a7b8c9d0e1f2a3b4c5d"
     terminal_registry = TerminalRegistry()
@@ -748,8 +782,19 @@ async def test_events_clear_on_codex_native_types_clear_into_the_tui(
         assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
 
-    assert resp.status_code == 200, resp.text
     socket = str(instance.socket_path)
+    assert not goal_resumed
+    if goal_dialog == "unresponsive":
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["error"] == "codex_native_clear_failed"
+        assert submitted_commands == []
+        assert tmux_calls == [(socket, ["send-keys", "-t", "main", "Escape"])]
+        return
+
+    assert resp.status_code == 200, resp.text
+    assert submitted_commands == ["/clear"]
+    if goal_dialog == "open":
+        assert tmux_calls.pop(0) == (socket, ["send-keys", "-t", "main", "Escape"])
     assert tmux_calls == [
         (socket, ["send-keys", "-t", "main", "C-u"]),
         (socket, ["send-keys", "-l", "-t", "main", "/clear"]),
