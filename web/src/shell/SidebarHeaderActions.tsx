@@ -58,6 +58,7 @@ export function SidebarHeaderActions({
   onTogglePointerEnter,
   onTogglePointerDown,
   onTogglePointerLeave,
+  showMobileToggle = false,
 }: {
   /**
    * Whether the sidebar currently reads as open — `open || peek`. Drives the
@@ -86,6 +87,8 @@ export function SidebarHeaderActions({
   onTogglePointerEnter?: () => void;
   onTogglePointerDown?: () => void;
   onTogglePointerLeave?: () => void;
+  /** Keep the toggle below md, where the layout has no tap-to-dismiss strip. */
+  showMobileToggle?: boolean;
 }) {
   const { canGoBack, canGoForward } = useHistoryNavigationAvailability();
   const hasNavigationHistory = canGoBack || canGoForward;
@@ -108,7 +111,10 @@ export function SidebarHeaderActions({
             // that leaves a strip of the chat visible, and tapping that strip
             // is how you get back — a collapse icon would be a second, worse
             // way to do the same thing.
-            className="size-6 text-muted-foreground hover:text-foreground max-md:hidden"
+            className={cn(
+              "size-6 text-muted-foreground hover:text-foreground",
+              !showMobileToggle && "max-md:hidden",
+            )}
           >
             {/* panel-right-open reads as "push the panel away" while the sidebar
             is open; panel-left-open as "bring it back" once it is collapsed or
