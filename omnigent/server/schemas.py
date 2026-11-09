@@ -3128,12 +3128,12 @@ class SessionPullRequestList(BaseModel):
     synced: bool = False
 
 
-LedgerEntryKind = Literal["status", "note", "dispatch", "dispatch_result", "plan", "plan_status"]
+JournalEntryKind = Literal["status", "note", "dispatch", "dispatch_result", "plan", "plan_status"]
 
 
-class SessionLedgerAuthor(BaseModel):
+class SessionJournalAuthor(BaseModel):
     """
-    Who wrote a ledger entry, derived from its kind and, for plans, its source.
+    Who wrote a journal entry, derived from its kind and, for plans, its source.
 
     :param type: ``"agent"`` for the session's agent, ``"omnigent"`` for
         entries Omnigent writes.
@@ -3142,12 +3142,12 @@ class SessionLedgerAuthor(BaseModel):
     type: Literal["agent", "omnigent"]
 
 
-class SessionLedgerEntry(BaseModel):
+class SessionJournalEntry(BaseModel):
     """
-    One entry of a session's ledger.
+    One entry of a session's journal.
 
     :param id: Entry ID, a bare 32-character hex UUID.
-    :param position: The entry's place in the ledger: 0, 1, 2, …
+    :param position: The entry's place in the journal: 0, 1, 2, …
     :param created_at: Unix epoch seconds when it was appended.
     :param scheduled_task_run_id: The automation run the session was serving,
         or ``None``.
@@ -3163,26 +3163,26 @@ class SessionLedgerEntry(BaseModel):
     created_at: int
     scheduled_task_run_id: str | None = None
     step: str | None = None
-    author: SessionLedgerAuthor
-    kind: LedgerEntryKind
+    author: SessionJournalAuthor
+    kind: JournalEntryKind
     payload: dict[str, Any]
 
 
-class SessionLedgerPage(BaseModel):
+class SessionJournalPage(BaseModel):
     """
-    One page of a session's ledger, for ``GET /v1/sessions/{id}/ledger``.
+    One page of a session's journal, for ``GET /v1/sessions/{id}/journal``.
     """
 
     object: Literal["list"] = "list"
-    data: list[SessionLedgerEntry] = Field(default_factory=list)
+    data: list[SessionJournalEntry] = Field(default_factory=list)
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
 
 
-class SessionLedgerAppendRequest(BaseModel):
+class SessionJournalAppendRequest(BaseModel):
     """
-    Body of ``POST /v1/sessions/{id}/ledger``, sent by the session's runner.
+    Body of ``POST /v1/sessions/{id}/journal``, sent by the session's runner.
 
     :param kind: The kind the agent writes.
     :param payload: The kind's fields, e.g. ``{"status": "done", "text": "PR merged"}``.
@@ -5220,21 +5220,21 @@ class SessionChildSessionUpdatedEvent(_SSEEventBase):
     child: dict[str, Any]
 
 
-class SessionLedgerAppendedEvent(_SSEEventBase):
+class SessionJournalAppendedEvent(_SSEEventBase):
     """
-    An entry was appended to the session's ledger.
+    An entry was appended to the session's journal.
 
-    Transient: the ledger itself is the source of truth, and a client that
-    reconnects catches up with ``GET …/ledger?order=asc&after=<last entry ID>``.
+    Transient: the journal itself is the source of truth, and a client that
+    reconnects catches up with ``GET …/journal?order=asc&after=<last entry ID>``.
 
-    :param type: Always ``"session.ledger.appended"``.
-    :param conversation_id: The session whose ledger grew.
+    :param type: Always ``"session.journal.appended"``.
+    :param conversation_id: The session whose journal grew.
     :param entry: The new entry.
     """
 
-    type: Literal["session.ledger.appended"]
+    type: Literal["session.journal.appended"]
     conversation_id: str
-    entry: SessionLedgerEntry
+    entry: SessionJournalEntry
 
 
 class SessionChangedFilesInvalidatedEvent(_SSEEventBase):
@@ -5381,7 +5381,7 @@ ServerStreamEvent = Annotated[
     | SessionResourceCreatedEvent
     | SessionResourceDeletedEvent
     | SessionChildSessionUpdatedEvent
-    | SessionLedgerAppendedEvent
+    | SessionJournalAppendedEvent
     | SessionChangedFilesInvalidatedEvent
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────

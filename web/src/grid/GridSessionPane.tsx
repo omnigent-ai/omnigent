@@ -517,7 +517,7 @@ export function GridSessionPane({
                 showFilesPanel={showFiles}
                 showGithubTab={showFiles}
                 showTasksTab={
-                  (serverInfo !== "loading" && serverInfo.session_ledger === true) ||
+                  (serverInfo !== "loading" && serverInfo.session_journal === true) ||
                   (state.todos?.length ?? 0) > 0
                 }
                 showBrowserTab={supportsBrowser()}

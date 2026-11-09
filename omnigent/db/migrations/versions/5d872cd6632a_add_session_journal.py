@@ -1,13 +1,13 @@
-"""Add each session's append-only ledger.
+"""Add each session's append-only journal.
 
 Revision ID: 5d872cd6632a
 Revises: f1c7a9e2b406
 
-``session_ledger_entries`` holds what a session's agent plans and records:
+``session_journal_entries`` holds what a session's agent plans and records:
 plans, step statuses, notes and, later, the work it sends to other sessions.
 Entries are append-only and are deleted only with their session.
-``session_ledger_heads`` holds one counter row per session; appends lock it
-to allocate positions, so ledger writes never wait on the session's metadata
+``session_journal_heads`` holds one counter row per session; appends lock it
+to allocate positions, so journal writes never wait on the session's metadata
 row.
 
 The primary key is ``(workspace_id, conversation_id, position, created_at)``,
@@ -16,7 +16,7 @@ the primary key, with no unique key that leaves it out, lets a deployment
 partition the table by time with pure DDL. So the heads lock, not the
 database, keeps positions and idempotency keys unique, as the conversation
 lock does for conversation items. The payload is an envelope private to the
-ledger store; a CHECK caps it at 16,383 stored bytes. ``kind`` has no CHECK,
+journal store; a CHECK caps it at 16,383 stored bytes. ``kind`` has no CHECK,
 so adding a kind needs no migration. The tables have no database defaults:
 writes name the workspace.
 
@@ -29,7 +29,7 @@ schema revision the build does not know.
 Rollback: stop the servers, downgrade with a build that includes this
 migration (``OMNIGENT_DB_URL=<uri> alembic -c omnigent/db/alembic.ini
 downgrade f1c7a9e2b406``), then start the older build. Downgrade drops both
-tables and every ledger entry.
+tables and every journal entry.
 """
 
 from __future__ import annotations
@@ -44,33 +44,33 @@ down_revision: str | None = "f1c7a9e2b406"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
-# Mirrors omnigent.db.db_models.LEDGER_PAYLOAD_MAX_STORED_BYTES at this revision.
+# Mirrors omnigent.db.db_models.JOURNAL_PAYLOAD_MAX_STORED_BYTES at this revision.
 _PAYLOAD_MAX_STORED_BYTES = 16_383
 
-_ENTRIES = "session_ledger_entries"
-_HEADS = "session_ledger_heads"
+_ENTRIES = "session_journal_entries"
+_HEADS = "session_journal_heads"
 # Every index ends with the primary key's (position, created_at) suffix.
 _INDEXES = {
-    "ix_session_ledger_entries_id": ["workspace_id", "conversation_id", "id"],
-    "ix_session_ledger_entries_idempotency_key": [
+    "ix_session_journal_entries_id": ["workspace_id", "conversation_id", "id"],
+    "ix_session_journal_entries_idempotency_key": [
         "workspace_id",
         "conversation_id",
         "idempotency_key",
     ],
-    "ix_session_ledger_entries_kind": ["workspace_id", "conversation_id", "kind"],
-    "ix_session_ledger_entries_kind_step": ["workspace_id", "conversation_id", "kind", "step"],
-    "ix_session_ledger_entries_scheduled_task_run_id": [
+    "ix_session_journal_entries_kind": ["workspace_id", "conversation_id", "kind"],
+    "ix_session_journal_entries_kind_step": ["workspace_id", "conversation_id", "kind", "step"],
+    "ix_session_journal_entries_scheduled_task_run_id": [
         "workspace_id",
         "scheduled_task_run_id",
         "conversation_id",
         "kind",
     ],
-    "ix_session_ledger_entries_step": ["workspace_id", "conversation_id", "step"],
+    "ix_session_journal_entries_step": ["workspace_id", "conversation_id", "step"],
 }
 
 
 def upgrade() -> None:
-    """Create ``session_ledger_entries`` with its indexes, and ``session_ledger_heads``."""
+    """Create ``session_journal_entries`` with its indexes, and ``session_journal_heads``."""
     op.create_table(
         _ENTRIES,
         sa.Column("workspace_id", sa.BigInteger(), nullable=False),
@@ -86,7 +86,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("workspace_id", "conversation_id", "position", "created_at"),
         sa.CheckConstraint(
             f"length(payload) <= {_PAYLOAD_MAX_STORED_BYTES}",
-            name="ck_session_ledger_entries_payload_size",
+            name="ck_session_journal_entries_payload_size",
         ),
     )
     for name, columns in _INDEXES.items():
@@ -101,7 +101,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Drop both ledger tables and every entry."""
+    """Drop both journal tables and every entry."""
     op.drop_table(_HEADS)
     for name in reversed(_INDEXES):
         op.drop_index(name, table_name=_ENTRIES)

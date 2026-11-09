@@ -1,16 +1,16 @@
-# Session ledger
+# Session journal
 
-Every Omnigent session has a **ledger**: an append-only record of the plan its
+Every Omnigent session has a **journal**: an append-only record of the plan its
 agent follows, where each step stands, and the notes the agent keeps. The agent
 reads it to pick up where it left off, after a restart, a context compaction or
 the next automation run. People follow its plan in the session's **Tasks** tab.
 
-## What's in a ledger
+## What's in a journal
 
 Each entry has an ID, a position (0, 1, 2, … within the session), the time it
 was appended, the automation run the session was serving (if any), and an
 optional plan step. Entries are never edited, and are deleted only with their
-session. A fork carries the ledger its history wrote: all of it, or up to where a fork
+session. A fork carries the journal its history wrote: all of it, or up to where a fork
 from an earlier message cuts the history. A side chat starts with none.
 
 | Kind     | Written by | Fields                                                                       |
@@ -50,16 +50,16 @@ stored entry is at most 16,383 bytes after compression.
 
 ## Agent tools
 
-The four tools make up the `ledger` tool group, which every agent has. An agent
-spec can drop it with `tool_groups.ledger: false` (see
+The four tools make up the `journal` tool group, which every agent has. An agent
+spec can drop it with `tool_groups.journal: false` (see
 [Tool groups](AGENT_YAML_SPEC.md#tool-groups)).
 
 | Tool                                                               | Does                                                                                                                                                                                                                                                                            |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sys_ledger_read(conversation_id?, kind?, step?, cursor?, limit?)` | Returns entries as compact lines, oldest first within the page, and `page.next_cursor` for older ones. With no arguments it reads the caller's newest entries. `kind: "plan"` returns plans with their full graphs. Another session's ledger needs read access to that session. |
-| `sys_ledger_write_plan(name, steps)`                               | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`.                                                                                                                                                                                       |
-| `sys_ledger_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. `started` and `done` need every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                  |
-| `sys_ledger_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
+| `sys_journal_read(conversation_id?, kind?, step?, cursor?, limit?)` | Returns entries as compact lines, oldest first within the page, and `page.next_cursor` for older ones. With no arguments it reads the caller's newest entries. `kind: "plan"` returns plans with their full graphs. Another session's journal needs read access to that session. |
+| `sys_journal_write_plan(name, steps)`                               | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`.                                                                                                                                                                                       |
+| `sys_journal_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. `started` and `done` need every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                  |
+| `sys_journal_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
 
 Errors come back as `{"error": …}`: `invalid_entry` (a field failed
 validation), `entry_too_large` (with the size and the limit),
@@ -76,7 +76,7 @@ from the composer's **+** menu, for example:
 /workflow Cut p95 latency of GET /orders 20%; one change per step; open a PR.
 ```
 
-`/workflow` is a skill Omnigent ships to every agent with the ledger tools. The
+`/workflow` is a skill Omnigent ships to every agent with the journal tools. The
 agent turns the description into a plan, works through it, and records each
 step's status as it goes; the Tasks tab shows the plan's steps the moment it's
 written. The agent asks first only if the description is ambiguous, and you can
@@ -85,7 +85,7 @@ takes precedence over Omnigent's.
 
 ## Automations
 
-An automation's prompt asks the agent to read its ledger first, write a plan if
+An automation's prompt asks the agent to read its journal first, write a plan if
 the session has none, and write a status for each step it worked on before its
 final reply. Before each run's prompt, Omnigent labels the session with the run
 (`omnigent.scheduled_task_run`), so the entries written during the run carry its
@@ -124,7 +124,7 @@ show only their name and state.
 
 Notes that aren't about one task appear under Notes. With no tasks yet, the
 tab links to starting a workflow, the same as **Run a workflow** in the
-composer's **+** menu. On servers that don't keep ledgers, the tab appears once
+composer's **+** menu. On servers that don't keep journals, the tab appears once
 the agent makes a to-do list.
 
 New entries arrive live over the session's event stream. After a reconnect the
@@ -135,17 +135,17 @@ tab fetches whatever it missed, and while the stream is down it checks every
 
 | Method | Path                       | Notes                                                                                                                                                                                                           |
 | ------ | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET`  | `/v1/sessions/{id}/ledger` | Read access. `limit` (1–1000), `order` (`asc` or `desc`), `after` and `before` (entry IDs, as for conversation items), `kind`, `step`. Returns a list page. `kind=plan&order=desc&limit=1` is the current plan. |
-| `POST` | `/v1/sessions/{id}/ledger` | Written by the session's runner for its agent's tools; the call must carry `X-Omnigent-Orchestration-Source` naming the session.                                                                                |
+| `GET`  | `/v1/sessions/{id}/journal` | Read access. `limit` (1–1000), `order` (`asc` or `desc`), `after` and `before` (entry IDs, as for conversation items), `kind`, `step`. Returns a list page. `kind=plan&order=desc&limit=1` is the current plan. |
+| `POST` | `/v1/sessions/{id}/journal` | Written by the session's runner for its agent's tools; the call must carry `X-Omnigent-Orchestration-Source` naming the session.                                                                                |
 
-Each new entry is also published as `session.ledger.appended` on
-`GET /v1/sessions/{id}/stream`. `GET /v1/info` reports `session_ledger: true` on
-servers that keep ledgers.
+Each new entry is also published as `session.journal.appended` on
+`GET /v1/sessions/{id}/stream`. `GET /v1/info` reports `session_journal: true` on
+servers that keep journals.
 
 ## Storage
 
-Entries live in `session_ledger_entries`, beside the session metadata, keyed by
-workspace, session, position and creation time; `session_ledger_heads` holds
+Entries live in `session_journal_entries`, beside the session metadata, keyed by
+workspace, session, position and creation time; `session_journal_heads` holds
 each session's next position. An append locks only its session's heads row, so
 one session's appends run in order without slowing other sessions or the
 session's own metadata updates. Payloads are compressed JSON in an envelope that

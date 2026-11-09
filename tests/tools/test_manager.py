@@ -88,12 +88,12 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_scheduled_task_list",
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
-        # The session ledger's tools are always auto-registered so every
+        # The session journal's tools are always auto-registered so every
         # agent can keep a plan, step statuses and notes; runner-dispatched.
-        "sys_ledger_read",
-        "sys_ledger_write_note",
-        "sys_ledger_write_plan",
-        "sys_ledger_write_status",
+        "sys_journal_read",
+        "sys_journal_write_note",
+        "sys_journal_write_plan",
+        "sys_journal_write_status",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.

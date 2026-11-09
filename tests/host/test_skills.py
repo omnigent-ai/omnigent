@@ -40,7 +40,7 @@ def _bundle(files: dict[str, str], **config: object) -> bytes:
         "name": "test-agent",
         "llm": {"model": "test", "connection": {"api_key": "test-key"}},
         "executor": {"config": {"harness": "claude-sdk"}},
-        "tool_groups": {"ledger": False},
+        "tool_groups": {"journal": False},
         **config,
     }
     output = io.BytesIO()
@@ -106,7 +106,7 @@ def test_session_catalog_matches_invocation_scope(
 
 
 def test_session_catalog_ends_with_the_framework_workflow_skill(tmp_path: Path) -> None:
-    """Agents with the ledger tools get ``/workflow``; their own skill of that name wins."""
+    """Agents with the journal tools get ``/workflow``; their own skill of that name wins."""
     plain = _bundle({"skills/bundled/SKILL.md": _skill("bundled")}, tool_groups={})
     own = _bundle({"skills/workflow/SKILL.md": _skill("workflow")}, tool_groups={})
     frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
@@ -176,7 +176,7 @@ def test_nested_subagent_uses_directory_name_and_own_filter(tmp_path: Path) -> N
             "llm": {"model": "test", "connection": {"api_key": "test"}},
             "skills": "none",
             "executor": {"config": {"harness": "claude-sdk"}},
-            "tool_groups": {"ledger": False},
+            "tool_groups": {"journal": False},
         }
     )
     bundle = _bundle(

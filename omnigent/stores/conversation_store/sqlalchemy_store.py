@@ -142,11 +142,11 @@ from omnigent.stores.sandbox_profile_store import (
     reject_profile_labels,
     same_profile_identity,
 )
-from omnigent.stores.session_ledger_store import (
-    LEDGER_DELETE_BATCH,
-    copy_ledger_for_fork,
-    delete_ledger_entries_batch,
-    delete_ledger_heads,
+from omnigent.stores.session_journal_store import (
+    JOURNAL_DELETE_BATCH,
+    copy_journal_for_fork,
+    delete_journal_entries_batch,
+    delete_journal_heads,
 )
 
 _logger = logging.getLogger(__name__)
@@ -945,7 +945,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         super().__init__(storage_location, conversation_storage_location)
         # Omnigent DB: agents, hosts, policies, files, user_daily_costs,
         # session_permissions, comments, omnigent_conversation_metadata,
-        # session_ledger_entries, session_ledger_heads.
+        # session_journal_entries, session_journal_heads.
         self._engine = get_or_create_engine(storage_location)
         self._session = make_named_managed_session_maker(
             self._engine,
@@ -6274,16 +6274,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             if cutoff_position is not None:
                 items_query = items_query.where(SqlConversationItem.position <= cutoff_position)
             source_items = session.execute(items_query).scalars().all() if copy_items else []
-            # The fork carries the ledger its history wrote: all of it, or for a
+            # The fork carries the journal its history wrote: all of it, or for a
             # truncated fork what was written by its last copied item. A side chat
             # is about the session, not a continuation, so it starts with none.
-            copy_ledger = copy_items and side_chat_parent_id is None
-            ledger_through: int | None = None
-            if copy_ledger and cutoff_position is not None:
+            copy_journal = copy_items and side_chat_parent_id is None
+            journal_through: int | None = None
+            if copy_journal and cutoff_position is not None:
                 if source_items:
-                    ledger_through = source_items[-1].created_at
+                    journal_through = source_items[-1].created_at
                 else:
-                    copy_ledger = False
+                    copy_journal = False
 
             # Compaction cursors refer to item IDs. Since every copied item gets
             # a fresh ID, build the complete mapping before copying any payloads
@@ -6630,12 +6630,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     if host is not None and host.deleted_at is None:
                         fork_meta.host_id = current.host_id
             meta_sess.add(fork_meta)
-            if copy_ledger:
-                copy_ledger_for_fork(
+            if copy_journal:
+                copy_journal_for_fork(
                     meta_sess,
                     source_conversation_id,
                     new_conv_id,
-                    created_through=ledger_through,
+                    created_through=journal_through,
                 )
             if creating_clone and agent_id is not None:
                 assert cloned_agent_name is not None and cloned_agent_bundle_location is not None
@@ -6800,7 +6800,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         all direct/indirect children), then deletes their items, labels,
         comments, policies, and session-permission rows before deleting
         the conversation rows themselves (children before parent), and
-        finally their ledgers.
+        finally their journals.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -6966,27 +6966,27 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "delete_conversation_metadata",
                 lambda session, batch=batch_ids: delete_metadata(session, batch),
             )
-        self._delete_session_ledgers(subtree_ids)
+        self._delete_session_journals(subtree_ids)
 
         return True
 
-    def _delete_session_ledgers(self, conversation_ids: list[str]) -> None:
-        """Delete the sessions' ledgers, at most one batch of entries per transaction.
+    def _delete_session_journals(self, conversation_ids: list[str]) -> None:
+        """Delete the sessions' journals, at most one batch of entries per transaction.
 
         Heads go first, so an append racing the deletion finds its session gone.
         """
         for batch_ids in batched(conversation_ids, _DELETE_METADATA_BATCH_SIZE):
             run_write_transaction(
                 self._session_immediate,
-                "delete_session_ledger_heads",
-                lambda session, batch=batch_ids: delete_ledger_heads(session, batch),
+                "delete_session_journal_heads",
+                lambda session, batch=batch_ids: delete_journal_heads(session, batch),
             )
             while (
                 run_write_transaction(
                     self._session_immediate,
-                    "delete_session_ledger_entries",
-                    lambda session, batch=batch_ids: delete_ledger_entries_batch(session, batch),
+                    "delete_session_journal_entries",
+                    lambda session, batch=batch_ids: delete_journal_entries_batch(session, batch),
                 )
-                == LEDGER_DELETE_BATCH
+                == JOURNAL_DELETE_BATCH
             ):
                 pass

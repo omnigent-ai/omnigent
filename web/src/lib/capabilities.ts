@@ -287,10 +287,10 @@ export interface ServerInfo {
    */
   session_pull_requests?: boolean;
   /**
-   * True when the server keeps session ledgers (``/v1/sessions/{id}/ledger`` and
-   * ``session.ledger.appended``), which the Activity tab shows; absent on older servers (off).
+   * True when the server keeps session journals (``/v1/sessions/{id}/journal`` and
+   * ``session.journal.appended``), which the Activity tab shows; absent on older servers (off).
    */
-  session_ledger?: boolean;
+  session_journal?: boolean;
   /**
    * Which uploads Claude Code and Codex sessions receive as files. Null on
    * older servers, whose policy is the default extension list.
@@ -625,7 +625,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
-          session_ledger: data.session_ledger === true,
+          session_journal: data.session_journal === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,

@@ -181,7 +181,7 @@ ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
 SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_source_sha256"
 # Server-owned: the automation run this session serves, set before each run's
-# prompt is sent. Ledger entries the session records are attributed to it.
+# prompt is sent. Journal entries the session records are attributed to it.
 SCHEDULED_TASK_RUN_LABEL_KEY = "omnigent.scheduled_task_run"
 
 # Compare-and-swap rounds swap_label tries before giving up on a contended label.

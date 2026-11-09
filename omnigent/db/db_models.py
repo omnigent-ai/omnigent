@@ -1772,27 +1772,27 @@ class SqlScheduledTaskRun(OmnigentBase):
     )
 
 
-# Largest stored ledger payload: the store's envelope, compression and any
+# Largest stored journal payload: the store's envelope, compression and any
 # encryption included. One byte below the 16 KiB per-value limit.
-LEDGER_PAYLOAD_MAX_STORED_BYTES = 16_383
+JOURNAL_PAYLOAD_MAX_STORED_BYTES = 16_383
 
 
-class SqlSessionLedgerEntry(OmnigentBase):
+class SqlSessionJournalEntry(OmnigentBase):
     """
-    SQLAlchemy model for the ``session_ledger_entries`` table.
+    SQLAlchemy model for the ``session_journal_entries`` table.
 
-    One append-only entry in a session's ledger: a plan, a step status, a note,
+    One append-only entry in a session's journal: a plan, a step status, a note,
     or a record of work sent to another session. Entries are never updated and
     are deleted only with their session.
 
-    :param conversation_id: The session that owns the ledger (relates to
+    :param conversation_id: The session that owns the journal (relates to
         ``conversations.id``; no DB foreign key, Rule R032).
-    :param position: The entry's place in the session's ledger, 0, 1, 2, …,
-        allocated from ``session_ledger_heads.next_position`` under its lock.
+    :param position: The entry's place in the session's journal, 0, 1, 2, …,
+        allocated from ``session_journal_heads.next_position`` under its lock.
     :param created_at: Unix epoch seconds when the entry was appended. Set once;
         a deployment can partition the table on it.
     :param id: UUID of the entry, stored as 16 raw bytes.
-    :param kind: The entry kind as a ``LEDGER_ENTRY_KIND`` code
+    :param kind: The entry kind as a ``JOURNAL_ENTRY_KIND`` code
         (``omnigent.db.enum_codecs``).
     :param scheduled_task_run_id: The automation run the session was serving
         (relates to ``scheduled_task_runs.id``; no DB foreign key); ``None``
@@ -1801,11 +1801,11 @@ class SqlSessionLedgerEntry(OmnigentBase):
         for entries about no step, such as plans.
     :param idempotency_key: Names the write that appended the entry, e.g.
         ``"tool:toolu_01…"``, so a retried append returns the existing entry.
-    :param payload: The kind's fields in an envelope private to the ledger
-        store, at most :data:`LEDGER_PAYLOAD_MAX_STORED_BYTES` bytes.
+    :param payload: The kind's fields in an envelope private to the journal
+        store, at most :data:`JOURNAL_PAYLOAD_MAX_STORED_BYTES` bytes.
     """
 
-    __tablename__ = "session_ledger_entries"
+    __tablename__ = "session_journal_entries"
 
     # A new table takes no database defaults; writes always name the workspace.
     workspace_id: Mapped[int] = mapped_column(
@@ -1829,7 +1829,7 @@ class SqlSessionLedgerEntry(OmnigentBase):
     __table_args__ = (
         # Resolves an entry ID to its position for after/before cursors.
         Index(
-            "ix_session_ledger_entries_id",
+            "ix_session_journal_entries_id",
             "workspace_id",
             "conversation_id",
             "id",
@@ -1838,7 +1838,7 @@ class SqlSessionLedgerEntry(OmnigentBase):
         ),
         # Finds an earlier attempt of a retried append.
         Index(
-            "ix_session_ledger_entries_idempotency_key",
+            "ix_session_journal_entries_idempotency_key",
             "workspace_id",
             "conversation_id",
             "idempotency_key",
@@ -1847,7 +1847,7 @@ class SqlSessionLedgerEntry(OmnigentBase):
         ),
         # Pages one kind in order, e.g. the current plan and plan history.
         Index(
-            "ix_session_ledger_entries_kind",
+            "ix_session_journal_entries_kind",
             "workspace_id",
             "conversation_id",
             "kind",
@@ -1856,7 +1856,7 @@ class SqlSessionLedgerEntry(OmnigentBase):
         ),
         # Pages one kind for one step, e.g. a step's newest status.
         Index(
-            "ix_session_ledger_entries_kind_step",
+            "ix_session_journal_entries_kind_step",
             "workspace_id",
             "conversation_id",
             "kind",
@@ -1867,7 +1867,7 @@ class SqlSessionLedgerEntry(OmnigentBase):
         # One kind recorded during one automation run, e.g. its statuses for the
         # run history. A run serves a single session.
         Index(
-            "ix_session_ledger_entries_scheduled_task_run_id",
+            "ix_session_journal_entries_scheduled_task_run_id",
             "workspace_id",
             "scheduled_task_run_id",
             "conversation_id",
@@ -1877,7 +1877,7 @@ class SqlSessionLedgerEntry(OmnigentBase):
         ),
         # Pages one step's entries of every kind in order, for the step drawer.
         Index(
-            "ix_session_ledger_entries_step",
+            "ix_session_journal_entries_step",
             "workspace_id",
             "conversation_id",
             "step",
@@ -1886,17 +1886,17 @@ class SqlSessionLedgerEntry(OmnigentBase):
         ),
         # length() of a binary value counts bytes on every supported engine.
         CheckConstraint(
-            f"length(payload) <= {LEDGER_PAYLOAD_MAX_STORED_BYTES}",
-            name="ck_session_ledger_entries_payload_size",
+            f"length(payload) <= {JOURNAL_PAYLOAD_MAX_STORED_BYTES}",
+            name="ck_session_journal_entries_payload_size",
         ),
     )
 
 
-class SqlSessionLedgerHead(OmnigentBase):
+class SqlSessionJournalHead(OmnigentBase):
     """
-    SQLAlchemy model for the ``session_ledger_heads`` table.
+    SQLAlchemy model for the ``session_journal_heads`` table.
 
-    A session's ledger counter. Appends lock this row, so a session's appends
+    A session's journal counter. Appends lock this row, so a session's appends
     run one at a time without waiting on its metadata row. Created by the
     session's first append and deleted with the session.
 
@@ -1905,7 +1905,7 @@ class SqlSessionLedgerHead(OmnigentBase):
     :param next_position: The position the session's next entry gets.
     """
 
-    __tablename__ = "session_ledger_heads"
+    __tablename__ = "session_journal_heads"
 
     workspace_id: Mapped[int] = mapped_column(
         BigInteger, primary_key=True, nullable=False, default=current_workspace_id

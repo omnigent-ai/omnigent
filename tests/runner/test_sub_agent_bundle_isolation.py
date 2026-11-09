@@ -320,7 +320,7 @@ def test_isolated_framework_bundle_carries_only_the_framework_skill(
     Pins the native auto-create fallback: when no bundle dir resolves, the
     runner mints an EMPTY temp dir and seeds at most the framework-owned
     skills: ``build-omnigent``, which every agent gets unconditionally, and
-    ``workflow`` for agents with the ledger tools. It
+    ``workflow`` for agents with the journal tools. It
     never copies from the parent — which is why those two call sites need
     no change. This fails loudly if that fallback ever starts sourcing a
     parent bundle.

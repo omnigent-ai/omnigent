@@ -1,8 +1,8 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import type { SessionTasksView } from "@/hooks/useSessionTasks";
-import { nativeTaskProgress, planSteps, stepProgress, type NativeTask } from "@/lib/sessionLedger";
-import { ledgerEntry, ledgerPlan } from "@/test/ledgerFixtures";
+import { nativeTaskProgress, planSteps, stepProgress, type NativeTask } from "@/lib/sessionJournal";
+import { journalEntry, journalPlan } from "@/test/journalFixtures";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 import { ChatTasksPreview } from "./ChatTasksPreview";
 
@@ -11,8 +11,8 @@ function view(todos: NativeTask[], extra: Partial<SessionTasksView> = {}): Sessi
     plan: null,
     progress: nativeTaskProgress(todos, true),
     native: true,
-    ledger: {} as SessionTasksView["ledger"],
-    ledgerSupported: true,
+    journal: {} as SessionTasksView["journal"],
+    journalSupported: true,
     loading: false,
     sessionWorking: true,
     paused: null,
@@ -54,10 +54,10 @@ describe("ChatTasksPreview", () => {
   });
 
   it("counts a failed task as finished, and says one failed", () => {
-    const plan = ledgerPlan(0, ["measure"], ["pool"]);
+    const plan = journalPlan(0, ["measure"], ["pool"]);
     const statuses = [
-      ledgerEntry(1, { kind: "status", step: "measure", payload: { status: "done", text: "" } }),
-      ledgerEntry(2, { kind: "status", step: "pool", payload: { status: "failed", text: "" } }),
+      journalEntry(1, { kind: "status", step: "measure", payload: { status: "done", text: "" } }),
+      journalEntry(2, { kind: "status", step: "pool", payload: { status: "failed", text: "" } }),
     ];
     const progress = stepProgress(planSteps(plan), statuses, false);
     render(
@@ -70,10 +70,10 @@ describe("ChatTasksPreview", () => {
   });
 
   it("leads with a task waiting for you, in pink", () => {
-    const plan = ledgerPlan(0, ["build"], ["approve", ["build"]]);
+    const plan = journalPlan(0, ["build"], ["approve", ["build"]]);
     const statuses = [
-      ledgerEntry(1, { kind: "status", step: "build", payload: { status: "done", text: "ok" } }),
-      ledgerEntry(2, {
+      journalEntry(1, { kind: "status", step: "build", payload: { status: "done", text: "ok" } }),
+      journalEntry(2, {
         kind: "status",
         step: "approve",
         payload: { status: "needs_input", text: "Approve the deploy?" },
@@ -89,7 +89,7 @@ describe("ChatTasksPreview", () => {
   });
 
   it("names the plan in its label and, on hover or focus, its tooltip", async () => {
-    const plan = ledgerPlan(0, ["measure"]);
+    const plan = journalPlan(0, ["measure"]);
     plan.payload.name = "Cut GET /orders p95 by 20%";
     const progress = stepProgress(planSteps(plan), [], true);
     render(

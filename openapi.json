@@ -6319,9 +6319,9 @@
             "title": "Session Fork Workspaces",
             "type": "boolean"
           },
-          "session_ledger": {
+          "session_journal": {
             "default": false,
-            "title": "Session Ledger",
+            "title": "Session Journal",
             "type": "boolean"
           },
           "session_pull_requests": {
@@ -6434,7 +6434,7 @@
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
-            "session.ledger.appended": "#/components/schemas/SessionLedgerAppendedEvent",
+            "session.journal.appended": "#/components/schemas/SessionJournalAppendedEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
@@ -6533,7 +6533,7 @@
             "$ref": "#/components/schemas/SessionChildSessionUpdatedEvent"
           },
           {
-            "$ref": "#/components/schemas/SessionLedgerAppendedEvent"
+            "$ref": "#/components/schemas/SessionJournalAppendedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionChangedFilesInvalidatedEvent"
@@ -7479,32 +7479,9 @@
         "title": "SessionInterruptedPayload",
         "type": "object"
       },
-      "SessionLabelsResponse": {
-        "description": "Lightweight response body for `GET /v1/sessions/{id}/labels`.",
-        "properties": {
-          "id": {
-            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
-            "title": "Id",
-            "type": "string"
-          },
-          "labels": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "description": "Session-scoped guardrails labels. Empty dict when no labels have been written.",
-            "title": "Labels",
-            "type": "object"
-          }
-        },
-        "required": [
-          "id"
-        ],
-        "title": "SessionLabelsResponse",
-        "type": "object"
-      },
-      "SessionLedgerAppendRequest": {
+      "SessionJournalAppendRequest": {
         "additionalProperties": false,
-        "description": "Body of `POST /v1/sessions/{id}/ledger`, sent by the session's runner.",
+        "description": "Body of `POST /v1/sessions/{id}/journal`, sent by the session's runner.",
         "properties": {
           "idempotency_key": {
             "description": "Names the write, e.g. `\"tool:<tool call ID>\"`; a retry with the same key returns the first attempt's entry.",
@@ -7547,19 +7524,19 @@
           "payload",
           "idempotency_key"
         ],
-        "title": "SessionLedgerAppendRequest",
+        "title": "SessionJournalAppendRequest",
         "type": "object"
       },
-      "SessionLedgerAppendedEvent": {
-        "description": "An entry was appended to the session's ledger.\n\nTransient: the ledger itself is the source of truth, and a client that\nreconnects catches up with `GET \u2026/ledger?order=asc&after=<last entry ID>`.",
+      "SessionJournalAppendedEvent": {
+        "description": "An entry was appended to the session's journal.\n\nTransient: the journal itself is the source of truth, and a client that\nreconnects catches up with `GET \u2026/journal?order=asc&after=<last entry ID>`.",
         "properties": {
           "conversation_id": {
-            "description": "The session whose ledger grew.",
+            "description": "The session whose journal grew.",
             "title": "Conversation Id",
             "type": "string"
           },
           "entry": {
-            "$ref": "#/components/schemas/SessionLedgerEntry",
+            "$ref": "#/components/schemas/SessionJournalEntry",
             "description": "The new entry."
           },
           "sequence_number": {
@@ -7576,8 +7553,8 @@
             "title": "Sequence Number"
           },
           "type": {
-            "const": "session.ledger.appended",
-            "description": "Always `\"session.ledger.appended\"`.",
+            "const": "session.journal.appended",
+            "description": "Always `\"session.journal.appended\"`.",
             "title": "Type",
             "type": "string"
           }
@@ -7587,11 +7564,11 @@
           "conversation_id",
           "entry"
         ],
-        "title": "SessionLedgerAppendedEvent",
+        "title": "SessionJournalAppendedEvent",
         "type": "object"
       },
-      "SessionLedgerAuthor": {
-        "description": "Who wrote a ledger entry, derived from its kind and, for plans, its source.",
+      "SessionJournalAuthor": {
+        "description": "Who wrote a journal entry, derived from its kind and, for plans, its source.",
         "properties": {
           "type": {
             "description": "`\"agent\"` for the session's agent, `\"omnigent\"` for entries Omnigent writes.",
@@ -7606,14 +7583,14 @@
         "required": [
           "type"
         ],
-        "title": "SessionLedgerAuthor",
+        "title": "SessionJournalAuthor",
         "type": "object"
       },
-      "SessionLedgerEntry": {
-        "description": "One entry of a session's ledger.",
+      "SessionJournalEntry": {
+        "description": "One entry of a session's journal.",
         "properties": {
           "author": {
-            "$ref": "#/components/schemas/SessionLedgerAuthor"
+            "$ref": "#/components/schemas/SessionJournalAuthor"
           },
           "created_at": {
             "description": "Unix epoch seconds when it was appended.",
@@ -7646,7 +7623,7 @@
             "type": "object"
           },
           "position": {
-            "description": "The entry's place in the ledger: 0, 1, 2, \u2026",
+            "description": "The entry's place in the journal: 0, 1, 2, \u2026",
             "format": "int64",
             "title": "Position",
             "type": "integer"
@@ -7684,15 +7661,15 @@
           "kind",
           "payload"
         ],
-        "title": "SessionLedgerEntry",
+        "title": "SessionJournalEntry",
         "type": "object"
       },
-      "SessionLedgerPage": {
-        "description": "One page of a session's ledger, for `GET /v1/sessions/{id}/ledger`.",
+      "SessionJournalPage": {
+        "description": "One page of a session's journal, for `GET /v1/sessions/{id}/journal`.",
         "properties": {
           "data": {
             "items": {
-              "$ref": "#/components/schemas/SessionLedgerEntry"
+              "$ref": "#/components/schemas/SessionJournalEntry"
             },
             "title": "Data",
             "type": "array"
@@ -7731,7 +7708,30 @@
             "type": "string"
           }
         },
-        "title": "SessionLedgerPage",
+        "title": "SessionJournalPage",
+        "type": "object"
+      },
+      "SessionLabelsResponse": {
+        "description": "Lightweight response body for `GET /v1/sessions/{id}/labels`.",
+        "properties": {
+          "id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Session-scoped guardrails labels. Empty dict when no labels have been written.",
+            "title": "Labels",
+            "type": "object"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "SessionLabelsResponse",
         "type": "object"
       },
       "SessionList": {
@@ -16579,54 +16579,10 @@
         ]
       }
     },
-    "/v1/sessions/{session_id}/labels": {
+    "/v1/sessions/{session_id}/journal": {
       "get": {
-        "description": "Return only the labels for a session.\n\nNative runner bridge setup needs labels during harness spawn,\nbut the full session snapshot also loads history, skills,\nrunner status, and agent metadata. This endpoint keeps that\nspawn-time dependency to one authorized conversation read.\n\n**Returns:** The session id and labels.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
-        "operationId": "get_session_labels_v1_sessions__session_id__labels_get",
-        "parameters": [
-          {
-            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SessionLabelsResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Get Session Labels",
-        "tags": [
-          "sessions"
-        ]
-      }
-    },
-    "/v1/sessions/{session_id}/ledger": {
-      "get": {
-        "description": "One page of the session's ledger by position; requires read access.\n\n`after` continues in the sort order and `before` goes against it,\nboth taking entry IDs, as for conversation items.",
-        "operationId": "list_session_ledger_v1_sessions__session_id__ledger_get",
+        "description": "One page of the session's journal by position; requires read access.\n\n`after` continues in the sort order and `before` goes against it,\nboth taking entry IDs, as for conversation items.",
+        "operationId": "list_session_journal_v1_sessions__session_id__journal_get",
         "parameters": [
           {
             "in": "path",
@@ -16741,7 +16697,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SessionLedgerPage"
+                  "$ref": "#/components/schemas/SessionJournalPage"
                 }
               }
             },
@@ -16758,14 +16714,14 @@
             "description": "Validation Error"
           }
         },
-        "summary": "List Session Ledger",
+        "summary": "List Session Journal",
         "tags": [
-          "session_ledger"
+          "session_journal"
         ]
       },
       "post": {
         "description": "Append an entry written by the session's agent; only its runner calls this.",
-        "operationId": "append_session_ledger_entry_v1_sessions__session_id__ledger_post",
+        "operationId": "append_session_journal_entry_v1_sessions__session_id__journal_post",
         "parameters": [
           {
             "in": "path",
@@ -16781,7 +16737,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SessionLedgerAppendRequest"
+                "$ref": "#/components/schemas/SessionJournalAppendRequest"
               }
             }
           },
@@ -16792,7 +16748,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SessionLedgerEntry"
+                  "$ref": "#/components/schemas/SessionJournalEntry"
                 }
               }
             },
@@ -16809,9 +16765,53 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Append Session Ledger Entry",
+        "summary": "Append Session Journal Entry",
         "tags": [
-          "session_ledger"
+          "session_journal"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/labels": {
+      "get": {
+        "description": "Return only the labels for a session.\n\nNative runner bridge setup needs labels during harness spawn,\nbut the full session snapshot also loads history, skills,\nrunner status, and agent metadata. This endpoint keeps that\nspawn-time dependency to one authorized conversation read.\n\n**Returns:** The session id and labels.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
+        "operationId": "get_session_labels_v1_sessions__session_id__labels_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionLabelsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Labels",
+        "tags": [
+          "sessions"
         ]
       }
     },

@@ -4,26 +4,30 @@ import type { PropsWithChildren } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { sessionLedgerKey, type LedgerPage } from "@/lib/sessionLedger";
+import { sessionJournalKey, type JournalPage } from "@/lib/sessionJournal";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
-import { ledgerEntry, ledgerPage, ledgerPlan } from "@/test/ledgerFixtures";
-import { applyLedgerEntry, LEDGER_FALLBACK_REFETCH_MS, useSessionLedger } from "./useSessionLedger";
+import { journalEntry, journalPage, journalPlan } from "@/test/journalFixtures";
+import {
+  applyJournalEntry,
+  JOURNAL_FALLBACK_REFETCH_MS,
+  useSessionJournal,
+} from "./useSessionJournal";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 
-const SESSION = "conv_ledger";
+const SESSION = "conv_journal";
 const RUN = "0b6c5f0d8a7e4c3b9a1d2e3f4a5b6c7d";
 
 let queryClient: QueryClient;
 // Pages for plain reads, in order, and the page a `kind=` read gets.
-let queued: LedgerPage[];
-let byKind: Record<string, LedgerPage>;
+let queued: JournalPage[];
+let byKind: Record<string, JournalPage>;
 
 function wrapper({ children }: PropsWithChildren) {
   return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
 }
 
-function respond(...pages: LedgerPage[]) {
+function respond(...pages: JournalPage[]) {
   queued.push(...pages);
 }
 
@@ -41,7 +45,7 @@ beforeEach(() => {
   vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
     const kind = new URL(String(url), "http://test").searchParams.get("kind");
     const page = kind ? byKind[kind] : queued.shift();
-    return new Response(JSON.stringify(page ?? ledgerPage([])));
+    return new Response(JSON.stringify(page ?? journalPage([])));
   });
 });
 
@@ -50,10 +54,10 @@ afterEach(() => {
   noteSessionStreamClosed(SESSION);
 });
 
-describe("useSessionLedger", () => {
+describe("useSessionJournal", () => {
   it("loads the newest page, then older pages only on request", async () => {
-    respond(ledgerPage([ledgerEntry(2), ledgerEntry(1)]));
-    const { result } = renderHook(() => useSessionLedger(SESSION, true), { wrapper });
+    respond(journalPage([journalEntry(2), journalEntry(1)]));
+    const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
     await waitFor(() => expect(result.current.entries).toHaveLength(2));
     expect(result.current.entries.map((entry) => entry.position)).toEqual([1, 2]);
     expect(result.current.hasOlder).toBe(false);
@@ -63,11 +67,11 @@ describe("useSessionLedger", () => {
   });
 
   it("reads the newest plan and statuses when older pages exist", async () => {
-    const plan = ledgerPlan(0, ["a"]);
-    const started = ledgerEntry(1, { kind: "status", step: "a", payload: { status: "started" } });
-    byKind = { plan: ledgerPage([plan]), status: ledgerPage([started]) };
-    respond(ledgerPage([ledgerEntry(3), ledgerEntry(2)], { has_more: true }));
-    const { result } = renderHook(() => useSessionLedger(SESSION, true), { wrapper });
+    const plan = journalPlan(0, ["a"]);
+    const started = journalEntry(1, { kind: "status", step: "a", payload: { status: "started" } });
+    byKind = { plan: journalPage([plan]), status: journalPage([started]) };
+    respond(journalPage([journalEntry(3), journalEntry(2)], { has_more: true }));
+    const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
     await waitFor(() =>
       expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1, 2, 3]),
     );
@@ -78,7 +82,7 @@ describe("useSessionLedger", () => {
       { kind: "status", order: "desc", limit: "1000" },
     ]);
 
-    respond(ledgerPage([started, plan]));
+    respond(journalPage([started, plan]));
     act(() => result.current.loadOlder());
     await waitFor(() => expect(result.current.hasOlder).toBe(false));
     expect(requestedQueries()[3].get("after")).toBe("e2");
@@ -86,14 +90,14 @@ describe("useSessionLedger", () => {
   });
 
   it("adds live entries once, including entries written during an automation run", async () => {
-    respond(ledgerPage([ledgerEntry(0)]));
-    const { result } = renderHook(() => useSessionLedger(SESSION, true), { wrapper });
+    respond(journalPage([journalEntry(0)]));
+    const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
     await waitFor(() => expect(result.current.entries).toHaveLength(1));
 
     act(() => {
-      applyLedgerEntry(queryClient, SESSION, ledgerEntry(1));
-      applyLedgerEntry(queryClient, SESSION, ledgerEntry(1));
-      applyLedgerEntry(queryClient, SESSION, ledgerEntry(2, { scheduled_task_run_id: RUN }));
+      applyJournalEntry(queryClient, SESSION, journalEntry(1));
+      applyJournalEntry(queryClient, SESSION, journalEntry(1));
+      applyJournalEntry(queryClient, SESSION, journalEntry(2, { scheduled_task_run_id: RUN }));
     });
     await waitFor(() =>
       expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1, 2]),
@@ -104,34 +108,34 @@ describe("useSessionLedger", () => {
   it("catches up when the stream reopens, and polls only while it is down", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     noteSessionStreamOpen(SESSION, false);
-    respond(ledgerPage([ledgerEntry(0)]));
-    const { result } = renderHook(() => useSessionLedger(SESSION, true), { wrapper });
+    respond(journalPage([journalEntry(0)]));
+    const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
     await waitFor(() => expect(result.current.entries).toHaveLength(1));
 
     // Open stream: no polling.
-    await act(async () => vi.advanceTimersByTimeAsync(LEDGER_FALLBACK_REFETCH_MS * 2));
+    await act(async () => vi.advanceTimersByTimeAsync(JOURNAL_FALLBACK_REFETCH_MS * 2));
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
 
     // Down: catch up every 30 s from the newest entry.
     act(() => noteSessionStreamClosed(SESSION));
-    respond(ledgerPage([ledgerEntry(1)]));
-    await act(async () => vi.advanceTimersByTimeAsync(LEDGER_FALLBACK_REFETCH_MS));
+    respond(journalPage([journalEntry(1)]));
+    await act(async () => vi.advanceTimersByTimeAsync(JOURNAL_FALLBACK_REFETCH_MS));
     await waitFor(() => expect(result.current.entries).toHaveLength(2));
     expect(requestedQueries()[1].get("after")).toBe("e0");
 
     // Reopened: one catch-up, and polling stops.
-    respond(ledgerPage([ledgerEntry(2)]));
+    respond(journalPage([journalEntry(2)]));
     act(() => noteSessionStreamOpen(SESSION, true));
     await waitFor(() => expect(result.current.entries).toHaveLength(3));
     expect(requestedQueries()[2].get("after")).toBe("e1");
-    await act(async () => vi.advanceTimersByTimeAsync(LEDGER_FALLBACK_REFETCH_MS * 2));
+    await act(async () => vi.advanceTimersByTimeAsync(JOURNAL_FALLBACK_REFETCH_MS * 2));
     expect(authenticatedFetch).toHaveBeenCalledTimes(3);
   });
 
   it("reads nothing while disabled or for a provisional session", () => {
-    renderHook(() => useSessionLedger(SESSION, false), { wrapper });
-    renderHook(() => useSessionLedger("temp:pending", true), { wrapper });
+    renderHook(() => useSessionJournal(SESSION, false), { wrapper });
+    renderHook(() => useSessionJournal("temp:pending", true), { wrapper });
     expect(authenticatedFetch).not.toHaveBeenCalled();
-    expect(queryClient.getQueryData(sessionLedgerKey(SESSION))).toBeUndefined();
+    expect(queryClient.getQueryData(sessionJournalKey(SESSION))).toBeUndefined();
   });
 });

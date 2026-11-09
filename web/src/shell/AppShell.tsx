@@ -1086,9 +1086,9 @@ function AppShellImpl() {
         // Pull Requests tab: shares the Files/workspace gate. Non-git workspaces and
         // other unavailable reasons are shown as empty states in the panel.
         github: showFilesPanel,
-        // Tasks tab: on servers that keep ledgers; elsewhere once the agent
+        // Tasks tab: on servers that keep journals; elsewhere once the agent
         // makes a to-do list, so the chat's task preview can always open it.
-        tasks: (serverInfo !== "loading" && serverInfo.session_ledger === true) || hasNativeTasks,
+        tasks: (serverInfo !== "loading" && serverInfo.session_journal === true) || hasNativeTasks,
         // Browser soft tabs: available only when the shell hosts the embedded
         // WebContentsView. Plain web and older desktop builds hide the "+"
         // option entirely so they never surface a dead tab whose calls no-op.

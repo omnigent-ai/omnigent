@@ -1,7 +1,7 @@
-import type { LedgerEntry, LedgerPage } from "@/lib/sessionLedger";
+import type { JournalEntry, JournalPage } from "@/lib/sessionJournal";
 
-/** A ledger entry at *position*; a note unless *fields* say otherwise. */
-export function ledgerEntry(position: number, fields: Partial<LedgerEntry> = {}): LedgerEntry {
+/** A journal entry at *position*; a note unless *fields* say otherwise. */
+export function journalEntry(position: number, fields: Partial<JournalEntry> = {}): JournalEntry {
   return {
     id: `e${position}`,
     position,
@@ -16,8 +16,8 @@ export function ledgerEntry(position: number, fields: Partial<LedgerEntry> = {})
 }
 
 /** A plan entry named "The plan", whose steps are `[id, dependencies]` pairs. */
-export function ledgerPlan(position: number, ...steps: [string, string[]?][]): LedgerEntry {
-  return ledgerEntry(position, {
+export function journalPlan(position: number, ...steps: [string, string[]?][]): JournalEntry {
+  return journalEntry(position, {
     kind: "plan",
     payload: {
       name: "The plan",
@@ -29,8 +29,8 @@ export function ledgerPlan(position: number, ...steps: [string, string[]?][]): L
   });
 }
 
-/** One page of a ledger, as `GET …/ledger` returns it. */
-export function ledgerPage(data: LedgerEntry[], fields: Partial<LedgerPage> = {}): LedgerPage {
+/** One page of a journal, as `GET …/journal` returns it. */
+export function journalPage(data: JournalEntry[], fields: Partial<JournalPage> = {}): JournalPage {
   return {
     object: "list",
     data,

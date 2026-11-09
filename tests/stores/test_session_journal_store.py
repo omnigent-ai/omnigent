@@ -1,4 +1,4 @@
-"""Tests for :class:`SessionLedgerStore` against a migrated database."""
+"""Tests for :class:`SessionJournalStore` against a migrated database."""
 
 from __future__ import annotations
 
@@ -10,18 +10,18 @@ import threading
 import pytest
 import sqlalchemy as sa
 
-from omnigent.db.db_models import LEDGER_PAYLOAD_MAX_STORED_BYTES
+from omnigent.db.db_models import JOURNAL_PAYLOAD_MAX_STORED_BYTES
 from omnigent.db.utils import run_write_transaction
-from omnigent.entities.session_ledger import InvalidLedgerEntryError, StepNotReadyError
+from omnigent.entities.session_journal import InvalidJournalEntryError, StepNotReadyError
 from omnigent.errors import StaleCursorError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
-from omnigent.stores.session_ledger_store import (
-    LEDGER_DELETE_BATCH,
-    LedgerEntryTooLargeError,
-    LedgerSessionNotFoundError,
-    SessionLedgerStore,
-    UnreadableLedgerEntryError,
-    copy_ledger_for_fork,
+from omnigent.stores.session_journal_store import (
+    JOURNAL_DELETE_BATCH,
+    JournalEntryTooLargeError,
+    JournalSessionNotFoundError,
+    SessionJournalStore,
+    UnreadableJournalEntryError,
+    copy_journal_for_fork,
 )
 
 SESSION = "4e92b5a0c0ee6db3f874f9c4a3f855a5"
@@ -39,9 +39,9 @@ def conversations(db_uri: str) -> SqlAlchemyConversationStore:
 
 
 @pytest.fixture()
-def ledger(db_uri: str, conversations: SqlAlchemyConversationStore) -> SessionLedgerStore:
+def journal(db_uri: str, conversations: SqlAlchemyConversationStore) -> SessionJournalStore:
     del conversations
-    return SessionLedgerStore(db_uri)
+    return SessionJournalStore(db_uri)
 
 
 def _plan(*steps: str) -> dict[str, object]:
@@ -49,9 +49,9 @@ def _plan(*steps: str) -> dict[str, object]:
 
 
 def _note(
-    ledger: SessionLedgerStore, key: str, *, session: str = SESSION, step: str | None = None
+    journal: SessionJournalStore, key: str, *, session: str = SESSION, step: str | None = None
 ):
-    return ledger.append(session, "note", {"body": f"note {key}"}, idempotency_key=key, step=step)
+    return journal.append(session, "note", {"body": f"note {key}"}, idempotency_key=key, step=step)
 
 
 def _count(db_uri: str, table: str, session: str) -> int:
@@ -63,10 +63,10 @@ def _count(db_uri: str, table: str, session: str) -> int:
 
 
 def test_appends_take_consecutive_positions_and_plans_count_versions(
-    ledger: SessionLedgerStore,
+    journal: SessionJournalStore,
 ) -> None:
-    first = ledger.append(SESSION, "plan", _plan("baseline", "goal"), idempotency_key="tool:1")
-    status = ledger.append(
+    first = journal.append(SESSION, "plan", _plan("baseline", "goal"), idempotency_key="tool:1")
+    status = journal.append(
         SESSION,
         "status",
         {"status": "done", "text": "p95 430 ms"},
@@ -74,7 +74,7 @@ def test_appends_take_consecutive_positions_and_plans_count_versions(
         step="baseline",
         scheduled_task_run_id=RUN,
     )
-    second = ledger.append(
+    second = journal.append(
         SESSION, "plan", _plan("baseline", "opt", "goal"), idempotency_key="tool:3"
     )
 
@@ -85,52 +85,52 @@ def test_appends_take_consecutive_positions_and_plans_count_versions(
     assert status.entry.scheduled_task_run_id == RUN
     assert all(result.created for result in (first, status, second))
     assert len(status.entry.id) == 32 and status.entry.created_at > 0
-    # Another session's ledger counts from zero.
-    assert _note(ledger, "tool:1", session=OTHER).entry.position == 0
-    current = ledger.current_plan(SESSION)
+    # Another session's journal counts from zero.
+    assert _note(journal, "tool:1", session=OTHER).entry.position == 0
+    current = journal.current_plan(SESSION)
     assert current is not None and current.id == second.entry.id
     assert current.payload["version"] == 2
 
 
-def test_a_retried_append_returns_the_first_attempts_entry(ledger: SessionLedgerStore) -> None:
-    first = _note(ledger, "tool:call_1")
-    retry = _note(ledger, "tool:call_1")
+def test_a_retried_append_returns_the_first_attempts_entry(journal: SessionJournalStore) -> None:
+    first = _note(journal, "tool:call_1")
+    retry = _note(journal, "tool:call_1")
     assert retry.created is False
     assert retry.entry == first.entry
-    assert _note(ledger, "tool:call_2").entry.position == 1
-    with pytest.raises(InvalidLedgerEntryError, match="different kind of entry"):
-        ledger.append(SESSION, "plan", _plan("a"), idempotency_key="tool:call_1")
+    assert _note(journal, "tool:call_2").entry.position == 1
+    with pytest.raises(InvalidJournalEntryError, match="different kind of entry"):
+        journal.append(SESSION, "plan", _plan("a"), idempotency_key="tool:call_1")
 
 
 def test_a_status_without_a_step_names_the_only_step_of_the_plan(
-    ledger: SessionLedgerStore,
+    journal: SessionJournalStore,
 ) -> None:
     started = {"status": "started"}
-    with pytest.raises(InvalidLedgerEntryError, match="the session has no plan"):
-        ledger.append(SESSION, "status", started, idempotency_key="tool:1")
-    ledger.append(SESSION, "plan", _plan("nightly"), idempotency_key="tool:2")
-    status = ledger.append(SESSION, "status", started, idempotency_key="tool:3")
+    with pytest.raises(InvalidJournalEntryError, match="the session has no plan"):
+        journal.append(SESSION, "status", started, idempotency_key="tool:1")
+    journal.append(SESSION, "plan", _plan("nightly"), idempotency_key="tool:2")
+    status = journal.append(SESSION, "status", started, idempotency_key="tool:3")
     assert status.entry.step == "nightly"
-    ledger.append(SESSION, "plan", _plan("nightly", "ship"), idempotency_key="tool:4")
-    with pytest.raises(InvalidLedgerEntryError, match="exactly one step"):
-        ledger.append(SESSION, "status", started, idempotency_key="tool:5")
-    with pytest.raises(InvalidLedgerEntryError, match="a plan names no step"):
-        ledger.append(SESSION, "plan", _plan("a"), idempotency_key="tool:6", step="a")
+    journal.append(SESSION, "plan", _plan("nightly", "ship"), idempotency_key="tool:4")
+    with pytest.raises(InvalidJournalEntryError, match="exactly one step"):
+        journal.append(SESSION, "status", started, idempotency_key="tool:5")
+    with pytest.raises(InvalidJournalEntryError, match="a plan names no step"):
+        journal.append(SESSION, "plan", _plan("a"), idempotency_key="tool:6", step="a")
 
 
 def test_a_step_starts_or_finishes_only_after_its_dependencies_are_done(
-    ledger: SessionLedgerStore,
+    journal: SessionJournalStore,
 ) -> None:
     steps = [
         {"id": "deploy", "name": "Deploy"},
         {"id": "verify", "name": "Verify routing", "depends_on": ["deploy"]},
         {"id": "video", "name": "Record the video", "depends_on": ["verify"]},
     ]
-    ledger.append(SESSION, "plan", {"name": "Demo", "steps": steps}, idempotency_key="k0")
+    journal.append(SESSION, "plan", {"name": "Demo", "steps": steps}, idempotency_key="k0")
 
     def status(key: str, step: str, value: str, text: str | None = "x") -> None:
         payload = {"status": value, **({"text": text} if value != "started" else {})}
-        ledger.append(SESSION, "status", payload, idempotency_key=key, step=step)
+        journal.append(SESSION, "status", payload, idempotency_key=key, step=step)
 
     with pytest.raises(StepNotReadyError, match="verify waits on deploy") as raised:
         status("k1", "verify", "started")
@@ -149,89 +149,91 @@ def test_a_step_starts_or_finishes_only_after_its_dependencies_are_done(
     status("k9", "extra", "started")
     # A retry of a write that went through returns it, whatever changed since.
     status("k8", "video", "started")
-    assert [entry.step for entry in ledger.list_entries(SESSION).entries][-1] == "extra"
+    assert [entry.step for entry in journal.list_entries(SESSION).entries][-1] == "extra"
 
 
 def test_an_append_to_a_missing_session_writes_nothing(
-    db_uri: str, ledger: SessionLedgerStore
+    db_uri: str, journal: SessionJournalStore
 ) -> None:
-    with pytest.raises(LedgerSessionNotFoundError):
-        _note(ledger, "tool:1", session=MISSING)
-    assert _count(db_uri, "session_ledger_heads", MISSING) == 0
-    assert _count(db_uri, "session_ledger_entries", MISSING) == 0
+    with pytest.raises(JournalSessionNotFoundError):
+        _note(journal, "tool:1", session=MISSING)
+    assert _count(db_uri, "session_journal_heads", MISSING) == 0
+    assert _count(db_uri, "session_journal_entries", MISSING) == 0
 
 
 def test_the_stored_payload_limit_counts_the_compressed_envelope(
-    ledger: SessionLedgerStore,
+    journal: SessionJournalStore,
 ) -> None:
     # Random text barely compresses: within the raw limit, but not the stored one.
     noise = random.Random(7)
     goal = lambda: "".join(noise.choices(string.ascii_letters + string.digits, k=300))  # noqa: E731
     steps = [{"id": f"s{index}", "name": f"Step {index}", "goal": goal()} for index in range(90)]
-    with pytest.raises(LedgerEntryTooLargeError) as raised:
-        ledger.append(
+    with pytest.raises(JournalEntryTooLargeError) as raised:
+        journal.append(
             SESSION, "plan", {"name": "The plan", "steps": steps}, idempotency_key="tool:1"
         )
-    assert raised.value.limit == LEDGER_PAYLOAD_MAX_STORED_BYTES
-    assert raised.value.size > LEDGER_PAYLOAD_MAX_STORED_BYTES
-    assert ledger.list_entries(SESSION).entries == []
+    assert raised.value.limit == JOURNAL_PAYLOAD_MAX_STORED_BYTES
+    assert raised.value.size > JOURNAL_PAYLOAD_MAX_STORED_BYTES
+    assert journal.list_entries(SESSION).entries == []
 
 
-def test_pages_follow_cursors_in_both_directions_and_filter(ledger: SessionLedgerStore) -> None:
-    ledger.append(SESSION, "plan", _plan("a", "b"), idempotency_key="k0")
+def test_pages_follow_cursors_in_both_directions_and_filter(journal: SessionJournalStore) -> None:
+    journal.append(SESSION, "plan", _plan("a", "b"), idempotency_key="k0")
     for index in range(1, 7):
-        _note(ledger, f"k{index}", step="a" if index % 2 else "b")
-    ledger.append(
+        _note(journal, f"k{index}", step="a" if index % 2 else "b")
+    journal.append(
         SESSION, "status", {"status": "done", "text": "ok"}, idempotency_key="k7", step="a"
     )
-    everything = ledger.list_entries(SESSION, limit=100).entries
+    everything = journal.list_entries(SESSION, limit=100).entries
     assert [entry.position for entry in everything] == list(range(8))
     ids = [entry.id for entry in everything]
 
-    newest = ledger.list_entries(SESSION, limit=3, order="desc")
+    newest = journal.list_entries(SESSION, limit=3, order="desc")
     assert [entry.position for entry in newest.entries] == [7, 6, 5] and newest.has_more
-    older = ledger.list_entries(SESSION, limit=3, order="desc", after=newest.entries[-1].id)
+    older = journal.list_entries(SESSION, limit=3, order="desc", after=newest.entries[-1].id)
     assert [entry.position for entry in older.entries] == [4, 3, 2]
-    caught_up = ledger.list_entries(SESSION, order="asc", after=ids[5])
+    caught_up = journal.list_entries(SESSION, order="asc", after=ids[5])
     assert [entry.position for entry in caught_up.entries] == [6, 7] and not caught_up.has_more
-    window = ledger.list_entries(SESSION, order="asc", after=ids[1], before=ids[5])
+    window = journal.list_entries(SESSION, order="asc", after=ids[1], before=ids[5])
     assert [entry.position for entry in window.entries] == [2, 3, 4]
-    reverse_window = ledger.list_entries(SESSION, order="desc", after=ids[5], before=ids[1])
+    reverse_window = journal.list_entries(SESSION, order="desc", after=ids[5], before=ids[1])
     assert [entry.position for entry in reverse_window.entries] == [4, 3, 2]
 
-    step_a = ledger.list_entries(SESSION, step="a")
+    step_a = journal.list_entries(SESSION, step="a")
     assert [entry.position for entry in step_a.entries] == [1, 3, 5, 7]
-    notes_a = ledger.list_entries(SESSION, kind="note", step="a", order="desc", limit=2)
+    notes_a = journal.list_entries(SESSION, kind="note", step="a", order="desc", limit=2)
     assert [entry.position for entry in notes_a.entries] == [5, 3] and notes_a.has_more
-    plans = ledger.list_entries(SESSION, kind="plan", order="desc", limit=1)
+    plans = journal.list_entries(SESSION, kind="plan", order="desc", limit=1)
     assert [entry.payload["version"] for entry in plans.entries] == [1] and not plans.has_more
 
 
-def test_page_arguments_are_checked(ledger: SessionLedgerStore) -> None:
-    _note(ledger, "k1")
+def test_page_arguments_are_checked(journal: SessionJournalStore) -> None:
+    _note(journal, "k1")
     with pytest.raises(StaleCursorError):
-        ledger.list_entries(SESSION, after="a" * 32)
+        journal.list_entries(SESSION, after="a" * 32)
     with pytest.raises(ValueError, match="before must be an entry ID"):
-        ledger.list_entries(SESSION, before="not-an-id")
+        journal.list_entries(SESSION, before="not-an-id")
     with pytest.raises(ValueError, match="limit must be between 1 and 1000"):
-        ledger.list_entries(SESSION, limit=1001)
+        journal.list_entries(SESSION, limit=1001)
     with pytest.raises(ValueError, match="order must be"):
-        ledger.list_entries(SESSION, order="newest")
+        journal.list_entries(SESSION, order="newest")
     with pytest.raises(ValueError, match="kind must be one of"):
-        ledger.list_entries(SESSION, kind="objective")
-    # A cursor from another session's ledger doesn't resolve here.
-    other = _note(ledger, "k1", session=OTHER).entry.id
+        journal.list_entries(SESSION, kind="objective")
+    # A cursor from another session's journal doesn't resolve here.
+    other = _note(journal, "k1", session=OTHER).entry.id
     with pytest.raises(StaleCursorError):
-        ledger.list_entries(SESSION, after=other)
+        journal.list_entries(SESSION, after=other)
 
 
-def test_concurrent_appends_get_unique_positions_without_gaps(ledger: SessionLedgerStore) -> None:
+def test_concurrent_appends_get_unique_positions_without_gaps(
+    journal: SessionJournalStore,
+) -> None:
     errors: list[BaseException] = []
 
     def append_many(worker: int) -> None:
         try:
             for index in range(10):
-                _note(ledger, f"tool:{worker}-{index}")
+                _note(journal, f"tool:{worker}-{index}")
         except BaseException as exc:
             errors.append(exc)
 
@@ -241,31 +243,31 @@ def test_concurrent_appends_get_unique_positions_without_gaps(ledger: SessionLed
     for thread in threads:
         thread.join()
     assert errors == []
-    positions = [entry.position for entry in ledger.list_entries(SESSION, limit=1000).entries]
+    positions = [entry.position for entry in journal.list_entries(SESSION, limit=1000).entries]
     assert positions == list(range(60))
 
 
-def test_deleting_a_session_deletes_its_ledger_in_batches(
-    db_uri: str, conversations: SqlAlchemyConversationStore, ledger: SessionLedgerStore
+def test_deleting_a_session_deletes_its_journal_in_batches(
+    db_uri: str, conversations: SqlAlchemyConversationStore, journal: SessionJournalStore
 ) -> None:
-    for index in range(LEDGER_DELETE_BATCH + 7):
-        _note(ledger, f"k{index}")
-    _note(ledger, "k0", session=OTHER)
+    for index in range(JOURNAL_DELETE_BATCH + 7):
+        _note(journal, f"k{index}")
+    _note(journal, "k0", session=OTHER)
 
     assert asyncio.run(conversations.delete_conversation(SESSION)) is True
-    assert _count(db_uri, "session_ledger_entries", SESSION) == 0
-    assert _count(db_uri, "session_ledger_heads", SESSION) == 0
-    assert [entry.position for entry in ledger.list_entries(OTHER).entries] == [0]
-    with pytest.raises(LedgerSessionNotFoundError):
-        _note(ledger, "late")
-    assert _count(db_uri, "session_ledger_heads", SESSION) == 0
+    assert _count(db_uri, "session_journal_entries", SESSION) == 0
+    assert _count(db_uri, "session_journal_heads", SESSION) == 0
+    assert [entry.position for entry in journal.list_entries(OTHER).entries] == [0]
+    with pytest.raises(JournalSessionNotFoundError):
+        _note(journal, "late")
+    assert _count(db_uri, "session_journal_heads", SESSION) == 0
 
 
-def test_a_fork_carries_the_ledger_and_continues_it(
-    conversations: SqlAlchemyConversationStore, ledger: SessionLedgerStore
+def test_a_fork_carries_the_journal_and_continues_it(
+    conversations: SqlAlchemyConversationStore, journal: SessionJournalStore
 ) -> None:
-    ledger.append(SESSION, "plan", _plan("deploy", "video"), idempotency_key="k0")
-    ledger.append(
+    journal.append(SESSION, "plan", _plan("deploy", "video"), idempotency_key="k0")
+    journal.append(
         SESSION,
         "status",
         {"status": "done", "text": "Pod 1/1"},
@@ -273,11 +275,11 @@ def test_a_fork_carries_the_ledger_and_continues_it(
         step="deploy",
         scheduled_task_run_id=RUN,
     )
-    ledger.append(SESSION, "note", {"body": "Swap is up"}, idempotency_key="k2", step="video")
-    source = ledger.list_entries(SESSION).entries
+    journal.append(SESSION, "note", {"body": "Swap is up"}, idempotency_key="k2", step="video")
+    source = journal.list_entries(SESSION).entries
 
     fork = conversations.fork_conversation(SESSION)
-    copied = ledger.list_entries(fork.id).entries
+    copied = journal.list_entries(fork.id).entries
     assert [(e.position, e.kind, e.step, e.payload) for e in copied] == [
         (e.position, e.kind, e.step, e.payload) for e in source
     ]
@@ -285,47 +287,47 @@ def test_a_fork_carries_the_ledger_and_continues_it(
     assert not {e.id for e in copied} & {e.id for e in source}
     # A run's history lists each entry once, under the session that served it.
     assert [e.scheduled_task_run_id for e in copied] == [None, None, None]
-    assert ledger.current_plan(fork.id).payload == ledger.current_plan(SESSION).payload
+    assert journal.current_plan(fork.id).payload == journal.current_plan(SESSION).payload
     # The fork goes on from where its copy ends; the parent is untouched.
-    started = ledger.append(
+    started = journal.append(
         fork.id, "status", {"status": "started"}, idempotency_key="k3", step="video"
     )
     assert started.entry.position == 3
-    assert len(ledger.list_entries(SESSION).entries) == 3
+    assert len(journal.list_entries(SESSION).entries) == 3
 
 
-def test_a_side_chat_or_an_empty_fork_starts_with_no_ledger(
-    conversations: SqlAlchemyConversationStore, ledger: SessionLedgerStore
+def test_a_side_chat_or_an_empty_fork_starts_with_no_journal(
+    conversations: SqlAlchemyConversationStore, journal: SessionJournalStore
 ) -> None:
-    ledger.append(SESSION, "plan", _plan("a"), idempotency_key="k0")
+    journal.append(SESSION, "plan", _plan("a"), idempotency_key="k0")
     side_chat = conversations.fork_conversation(SESSION, side_chat_parent_id=SESSION)
     empty = conversations.fork_conversation(SESSION, copy_items=False)
     for fork in (side_chat, empty):
-        assert ledger.list_entries(fork.id).entries == []
-        assert ledger.current_plan(fork.id) is None
+        assert journal.list_entries(fork.id).entries == []
+        assert journal.current_plan(fork.id) is None
 
 
 def test_a_truncated_fork_copies_only_what_its_history_wrote(
     monkeypatch: pytest.MonkeyPatch,
     conversations: SqlAlchemyConversationStore,
-    ledger: SessionLedgerStore,
+    journal: SessionJournalStore,
 ) -> None:
     times = iter((100, 200, 300))
-    monkeypatch.setattr("omnigent.stores.session_ledger_store.now_epoch", lambda: next(times))
+    monkeypatch.setattr("omnigent.stores.session_journal_store.now_epoch", lambda: next(times))
     for index in range(3):
-        _note(ledger, f"k{index}")
+        _note(journal, f"k{index}")
     fork = conversations.fork_conversation(SESSION, copy_items=False)
     copied = run_write_transaction(
-        ledger._session_immediate,
-        "copy_ledger_for_fork",
-        lambda session: copy_ledger_for_fork(session, SESSION, fork.id, created_through=200),
+        journal._session_immediate,
+        "copy_journal_for_fork",
+        lambda session: copy_journal_for_fork(session, SESSION, fork.id, created_through=200),
     )
     assert copied == 2
-    assert [e.created_at for e in ledger.list_entries(fork.id).entries] == [100, 200]
+    assert [e.created_at for e in journal.list_entries(fork.id).entries] == [100, 200]
 
 
-def test_an_encrypted_envelope_needs_a_store_that_decrypts(ledger: SessionLedgerStore) -> None:
-    with pytest.raises(UnreadableLedgerEntryError, match="needs a store that can decrypt it"):
-        ledger._open([bytes((1, 2)) + b"ciphertext"])
-    with pytest.raises(UnreadableLedgerEntryError, match="unrecognized ledger envelope"):
-        ledger._open([b"\x09\x01payload"])
+def test_an_encrypted_envelope_needs_a_store_that_decrypts(journal: SessionJournalStore) -> None:
+    with pytest.raises(UnreadableJournalEntryError, match="needs a store that can decrypt it"):
+        journal._open([bytes((1, 2)) + b"ciphertext"])
+    with pytest.raises(UnreadableJournalEntryError, match="unrecognized journal envelope"):
+        journal._open([b"\x09\x01payload"])

@@ -1,4 +1,4 @@
-"""Tests for the session ledger migration (5d872cd6632a)."""
+"""Tests for the session journal migration (5d872cd6632a)."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ import sqlalchemy as sa
 from alembic import command
 
 from omnigent.db.db_models import (
-    LEDGER_PAYLOAD_MAX_STORED_BYTES,
-    SqlSessionLedgerEntry,
-    SqlSessionLedgerHead,
+    JOURNAL_PAYLOAD_MAX_STORED_BYTES,
+    SqlSessionJournalEntry,
+    SqlSessionJournalHead,
 )
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache
 
-_ENTRIES = "session_ledger_entries"
-_HEADS = "session_ledger_heads"
+_ENTRIES = "session_journal_entries"
+_HEADS = "session_journal_heads"
 
 
 def _migrate(uri: str, engine: sa.Engine, revision: str, *, down: bool = False) -> None:
@@ -40,12 +40,12 @@ def _entry(position: int, payload: bytes) -> dict[str, object]:
 
 
 def test_upgrade_matches_models_and_downgrade_drops_tables(tmp_path: Path) -> None:
-    uri = f"sqlite:///{tmp_path / 'ledger.db'}"
+    uri = f"sqlite:///{tmp_path / 'journal.db'}"
     engine = sa.create_engine(uri)
     _migrate(uri, engine, "head")
     inspector = sa.inspect(engine)
 
-    for model in (SqlSessionLedgerEntry, SqlSessionLedgerHead):
+    for model in (SqlSessionJournalEntry, SqlSessionJournalHead):
         table = model.__table__
         columns = {column["name"]: column for column in inspector.get_columns(table.name)}
         assert list(columns) == [column.name for column in table.columns]
@@ -78,14 +78,16 @@ def test_upgrade_matches_models_and_downgrade_drops_tables(tmp_path: Path) -> No
 
 
 def test_payload_check_caps_stored_bytes(tmp_path: Path) -> None:
-    uri = f"sqlite:///{tmp_path / 'ledger.db'}"
+    uri = f"sqlite:///{tmp_path / 'journal.db'}"
     engine = sa.create_engine(uri)
     _migrate(uri, engine, "head")
     entries = sa.Table(_ENTRIES, sa.MetaData(), autoload_with=engine)
     with engine.begin() as conn:
-        conn.execute(entries.insert(), _entry(0, b"x" * LEDGER_PAYLOAD_MAX_STORED_BYTES))
-    with pytest.raises(sa.exc.IntegrityError, match="ck_session_ledger_entries_payload_size"):
+        conn.execute(entries.insert(), _entry(0, b"x" * JOURNAL_PAYLOAD_MAX_STORED_BYTES))
+    with pytest.raises(sa.exc.IntegrityError, match="ck_session_journal_entries_payload_size"):
         with engine.begin() as conn:
-            conn.execute(entries.insert(), _entry(1, b"x" * (LEDGER_PAYLOAD_MAX_STORED_BYTES + 1)))
+            conn.execute(
+                entries.insert(), _entry(1, b"x" * (JOURNAL_PAYLOAD_MAX_STORED_BYTES + 1))
+            )
     engine.dispose()
     clear_engine_cache()

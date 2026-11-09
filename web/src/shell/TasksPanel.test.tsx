@@ -1,26 +1,26 @@
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
-import type * as UseSessionLedgerModule from "@/hooks/useSessionLedger";
+import type * as UseSessionJournalModule from "@/hooks/useSessionJournal";
 import type * as CapabilitiesModule from "@/lib/CapabilitiesContext";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
-import { type SessionLedgerView, useSessionLedger } from "@/hooks/useSessionLedger";
+import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import type { LedgerEntry } from "@/lib/sessionLedger";
+import type { JournalEntry } from "@/lib/sessionJournal";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { registerStartWorkflow } from "@/store/sessionTasksActions";
-import { ledgerEntry, ledgerPlan } from "@/test/ledgerFixtures";
+import { journalEntry, journalPlan } from "@/test/journalFixtures";
 import { TasksPanel } from "./TasksPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
 }));
-vi.mock("@/hooks/useSessionLedger", async (importOriginal) => ({
-  ...(await importOriginal<typeof UseSessionLedgerModule>()),
-  useSessionLedger: vi.fn(),
+vi.mock("@/hooks/useSessionJournal", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSessionJournalModule>()),
+  useSessionJournal: vi.fn(),
 }));
 vi.mock("@/lib/CapabilitiesContext", async (importOriginal) => ({
   ...(await importOriginal<typeof CapabilitiesModule>()),
@@ -29,8 +29,8 @@ vi.mock("@/lib/CapabilitiesContext", async (importOriginal) => ({
 
 const RUN = "0b6c5f0d8a7e4c3b9a1d2e3f4a5b6c7d";
 
-function showLedger(entries: LedgerEntry[], extra = {}) {
-  const view: SessionLedgerView = {
+function showJournal(entries: JournalEntry[], extra = {}) {
+  const view: SessionJournalView = {
     entries,
     isLoading: false,
     error: null,
@@ -39,12 +39,12 @@ function showLedger(entries: LedgerEntry[], extra = {}) {
     loadOlder: vi.fn(),
     ...extra,
   };
-  vi.mocked(useSessionLedger).mockReturnValue(view);
+  vi.mocked(useSessionJournal).mockReturnValue(view);
   return view;
 }
 
 function status(position: number, step: string, value: string, text?: string, run?: string) {
-  return ledgerEntry(position, {
+  return journalEntry(position, {
     kind: "status",
     step,
     scheduled_task_run_id: run ?? null,
@@ -63,7 +63,7 @@ function setSession(state: Partial<ConversationState>) {
 
 beforeEach(() => {
   vi.mocked(useChildSessions).mockReturnValue({ children: [] } as never);
-  vi.mocked(useServerInfo).mockReturnValue({ session_ledger: true } as never);
+  vi.mocked(useServerInfo).mockReturnValue({ session_journal: true } as never);
   conversationRegistry
     .acquire("conv")
     .setState({ sessionStatus: "idle", todos: [], backgroundTaskCount: 0 });
@@ -76,7 +76,7 @@ afterEach(() => {
 
 describe("TasksPanel", () => {
   it("says where tasks come from, and links to starting a workflow when the composer can", () => {
-    showLedger([]);
+    showJournal([]);
     renderPanel();
     expect(screen.getByText("No tasks yet")).toBeTruthy();
     expect(screen.getByText("Tasks show up here when the agent makes a to-do list.")).toBeTruthy();
@@ -100,7 +100,7 @@ describe("TasksPanel", () => {
   });
 
   it("shows the agent's own task list when the session has no plan", () => {
-    showLedger([]);
+    showJournal([]);
     setSession({
       sessionStatus: "running",
       todos: [
@@ -124,7 +124,7 @@ describe("TasksPanel", () => {
   });
 
   it("shows the plan instead of the agent's own list once the session has one", () => {
-    showLedger([ledgerPlan(0, ["profile"], ["ship", ["profile"]])]);
+    showJournal([journalPlan(0, ["profile"], ["ship", ["profile"]])]);
     setSession({ todos: [{ content: "Scratch item", status: "pending", activeForm: "" }] });
     renderPanel();
     expect(screen.getAllByTestId("tasks-row").map((row) => row.dataset.stepId)).toEqual([
@@ -134,18 +134,18 @@ describe("TasksPanel", () => {
     expect(screen.queryByText("Scratch item")).toBeNull();
   });
 
-  it("shows the agent's own list on a server that keeps no ledger", () => {
-    vi.mocked(useServerInfo).mockReturnValue({ session_ledger: false } as never);
-    showLedger([ledgerPlan(0, ["profile"])]);
+  it("shows the agent's own list on a server that keeps no journal", () => {
+    vi.mocked(useServerInfo).mockReturnValue({ session_journal: false } as never);
+    showJournal([journalPlan(0, ["profile"])]);
     setSession({ todos: [{ content: "Only item", status: "pending", activeForm: "" }] });
     renderPanel();
     expect(screen.getByTestId("tasks-row").textContent).toContain("Only item");
-    expect(vi.mocked(useSessionLedger)).toHaveBeenLastCalledWith("conv", false);
+    expect(vi.mocked(useSessionJournal)).toHaveBeenLastCalledWith("conv", false);
   });
 
   it("lists the plan's steps in order, each once, with where it stands", () => {
-    showLedger([
-      ledgerPlan(
+    showJournal([
+      journalPlan(
         0,
         ["baseline"],
         ["batch", ["baseline"]],
@@ -178,8 +178,8 @@ describe("TasksPanel", () => {
   });
 
   it("marks every step that can start as ready", () => {
-    showLedger([
-      ledgerPlan(
+    showJournal([
+      journalPlan(
         0,
         ["profile"],
         ["batch", ["profile"]],
@@ -196,8 +196,8 @@ describe("TasksPanel", () => {
   });
 
   it("says on hover which task a progress segment is and where it stands", async () => {
-    showLedger([
-      ledgerPlan(0, ["profile"], ["cache", ["profile"]], ["ship", ["cache"]]),
+    showJournal([
+      journalPlan(0, ["profile"], ["cache", ["profile"]], ["ship", ["cache"]]),
       status(1, "profile", "done"),
     ]);
     renderPanel();
@@ -216,7 +216,7 @@ describe("TasksPanel", () => {
     const scrollIntoView = vi.fn();
     Element.prototype.scrollIntoView = scrollIntoView;
     try {
-      showLedger([ledgerPlan(0, ["a"], ["b"], ["c"])]);
+      showJournal([journalPlan(0, ["a"], ["b"], ["c"])]);
       renderPanel();
       fireEvent.click(screen.getAllByTestId("tasks-progress-segment")[2]);
       const row = screen.getAllByTestId("tasks-row")[2];
@@ -228,9 +228,9 @@ describe("TasksPanel", () => {
   });
 
   it("heads the list with the plan's name", () => {
-    const named = ledgerPlan(0, ["baseline"]);
+    const named = journalPlan(0, ["baseline"]);
     named.payload.name = "Cut GET /orders p95 by 20%";
-    showLedger([named]);
+    showJournal([named]);
     renderPanel();
     expect(screen.getByTestId("tasks-plan-name").textContent).toBe("Cut GET /orders p95 by 20%");
     // The name is the heading, level with "Updated …"; the tab already says Tasks.
@@ -239,14 +239,14 @@ describe("TasksPanel", () => {
   });
 
   it("says every task finished when the last one failed", () => {
-    showLedger([ledgerPlan(0, ["a"], ["b"]), status(1, "a", "done"), status(2, "b", "failed")]);
+    showJournal([journalPlan(0, ["a"], ["b"]), status(1, "a", "done"), status(2, "b", "failed")]);
     renderPanel();
     expect(screen.getByTestId("tasks-summary").textContent).toBe("All 2 tasks finished");
     expect(screen.getByText("1 failed")).toBeTruthy();
   });
 
   it("shows a started task as running only while the session works", () => {
-    showLedger([ledgerPlan(0, ["baseline"]), status(1, "baseline", "started")]);
+    showJournal([journalPlan(0, ["baseline"]), status(1, "baseline", "started")]);
     renderPanel();
     const step = () => screen.getByTestId("tasks-row");
     expect(step().dataset.state).toBe("stopped");
@@ -262,7 +262,7 @@ describe("TasksPanel", () => {
     try {
       const start = status(1, "build", "started");
       vi.setSystemTime((start.created_at + 10) * 1000);
-      showLedger([ledgerPlan(0, ["build"]), start]);
+      showJournal([journalPlan(0, ["build"]), start]);
       setSession({ sessionStatus: "running" });
       renderPanel();
       const elapsed = () => within(screen.getByTestId("tasks-row")).getByTitle(/^Started/);
@@ -277,7 +277,7 @@ describe("TasksPanel", () => {
   });
 
   it("keeps a started task running while a background task it started runs on", () => {
-    showLedger([ledgerPlan(0, ["deploy"]), status(1, "deploy", "started")]);
+    showJournal([journalPlan(0, ["deploy"]), status(1, "deploy", "started")]);
     renderPanel();
     const step = () => screen.getByTestId("tasks-row");
     expect(step().dataset.state).toBe("stopped");
@@ -289,8 +289,8 @@ describe("TasksPanel", () => {
   });
 
   it("shows a task waiting for you in pink, and counts it in the summary", () => {
-    showLedger([
-      ledgerPlan(0, ["build"], ["approve", ["build"]], ["ship", ["approve"]]),
+    showJournal([
+      journalPlan(0, ["build"], ["approve", ["build"]], ["ship", ["approve"]]),
       status(1, "build", "done", "Image built"),
       status(2, "approve", "needs_input", "Approve the deploy to prod?"),
     ]);
@@ -306,7 +306,7 @@ describe("TasksPanel", () => {
   });
 
   it("shows a running task waiting for you while a prompt in the chat waits", () => {
-    showLedger([ledgerPlan(0, ["tests"]), status(1, "tests", "started")]);
+    showJournal([journalPlan(0, ["tests"]), status(1, "tests", "started")]);
     setSession({ sessionStatus: "running" });
     renderPanel();
     const row = () => screen.getByTestId("tasks-row");
@@ -322,20 +322,20 @@ describe("TasksPanel", () => {
   });
 
   it("says an idle list stopped while a task could run, or that an automation's run ended", () => {
-    showLedger([ledgerPlan(0, ["a"], ["b", ["a"]]), status(1, "a", "done", "ok")]);
+    showJournal([journalPlan(0, ["a"], ["b", ["a"]]), status(1, "a", "done", "ok")]);
     const { unmount } = renderPanel();
     expect(screen.getByTestId("tasks-paused").textContent).toBe("· Stopped");
     setSession({ sessionStatus: "running" });
     expect(screen.queryByTestId("tasks-paused")).toBeNull();
     unmount();
     setSession({ sessionStatus: "idle" });
-    showLedger([ledgerPlan(0, ["a"], ["b", ["a"]]), status(1, "a", "done", "ok", RUN)]);
+    showJournal([journalPlan(0, ["a"], ["b", ["a"]]), status(1, "a", "done", "ok", RUN)]);
     renderPanel();
     expect(screen.getByTestId("tasks-paused").textContent).toBe("· Run ended");
   });
 
   it("counts a busy sub-agent as work, but not a side chat", () => {
-    showLedger([ledgerPlan(0, ["deploy"]), status(1, "deploy", "started")]);
+    showJournal([journalPlan(0, ["deploy"]), status(1, "deploy", "started")]);
     const busy = (labels: Record<string, string>) =>
       vi.mocked(useChildSessions).mockReturnValue({
         children: [{ id: "child", busy: true, labels }] as ChildSessionInfo[],
@@ -350,8 +350,8 @@ describe("TasksPanel", () => {
   });
 
   it("marks where a task restarted in its history", () => {
-    showLedger([
-      ledgerPlan(0, ["deploy"]),
+    showJournal([
+      journalPlan(0, ["deploy"]),
       status(1, "deploy", "started"),
       status(2, "deploy", "failed", "Stopped during the build"),
       status(3, "deploy", "started", "Redeploying"),
@@ -372,8 +372,8 @@ describe("TasksPanel", () => {
   });
 
   it("opens a task's history: what it waits on, then its entries, oldest first", () => {
-    showLedger([
-      ledgerPlan(0, ["profile"], ["batch"], ["pool", ["profile", "batch"]]),
+    showJournal([
+      journalPlan(0, ["profile"], ["batch"], ["pool", ["profile", "batch"]]),
       status(1, "pool", "started"),
       status(2, "pool", "failed", "Reverted"),
     ]);
@@ -391,7 +391,7 @@ describe("TasksPanel", () => {
 
   it("shows a task's newest note under it, shortened until opened", () => {
     const body = `## The pool didn't move p95\n${"Cold connects are the slowest requests. ".repeat(6)}**Next**: pre-warm it.`;
-    showLedger([ledgerPlan(0, ["pool"]), ledgerEntry(1, { step: "pool", payload: { body } })]);
+    showJournal([journalPlan(0, ["pool"]), journalEntry(1, { step: "pool", payload: { body } })]);
     renderPanel();
     const note = screen.getByTestId("tasks-note");
     expect(within(note).getByText("The pool didn't move p95")).toBeTruthy();
@@ -402,9 +402,9 @@ describe("TasksPanel", () => {
   });
 
   it("lists notes that aren't about one task, newest first, with no Runs section", () => {
-    showLedger([
-      ledgerEntry(0, { payload: { body: "Measure first" } }),
-      ledgerEntry(1, { scheduled_task_run_id: RUN, payload: { body: "Stopped at the try cap" } }),
+    showJournal([
+      journalEntry(0, { payload: { body: "Measure first" } }),
+      journalEntry(1, { scheduled_task_run_id: RUN, payload: { body: "Stopped at the try cap" } }),
     ]);
     renderPanel();
     const notes = screen.getByRole("region", { name: "Notes" });
@@ -421,7 +421,7 @@ describe("TasksPanel", () => {
     vi.mocked(useChildSessions).mockReturnValue({
       children: [{ id: "c1", busy: true, task_summary: "fix-3", title: "codex:fix-3" }],
     } as never);
-    const view = showLedger([ledgerEntry(5)], { hasOlder: true });
+    const view = showJournal([journalEntry(5)], { hasOlder: true });
     renderPanel();
     expect(screen.queryByText(/workers? running/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Show older notes" }));

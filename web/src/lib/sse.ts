@@ -10,7 +10,7 @@ import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
 // catch — please add an SSE-parser test when you touch this.
 
 import { assistantMessagePhase } from "./conversationItems";
-import type { LedgerEntry } from "./sessionLedger";
+import type { JournalEntry } from "./sessionJournal";
 import { readSubagentActivity } from "./subagentActivity";
 import type {
   BrowserActionRequestEvent,
@@ -40,7 +40,7 @@ import type {
   SessionBtwSidechatEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
-  SessionLedgerAppendedEvent,
+  SessionJournalAppendedEvent,
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
@@ -957,7 +957,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       child: child as Record<string, unknown>,
     } satisfies SessionChildSessionUpdatedEvent;
   }
-  if (eventType === "session.ledger.appended") {
+  if (eventType === "session.journal.appended") {
     const conversationId = data.conversation_id;
     const entry = data.entry;
     if (typeof conversationId !== "string" || !conversationId) return null;
@@ -965,10 +965,10 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const { id, position } = entry as Record<string, unknown>;
     if (typeof id !== "string" || typeof position !== "number") return null;
     return {
-      type: "session_ledger_appended",
+      type: "session_journal_appended",
       conversationId,
-      entry: entry as LedgerEntry,
-    } satisfies SessionLedgerAppendedEvent;
+      entry: entry as JournalEntry,
+    } satisfies SessionJournalAppendedEvent;
   }
   if (eventType === "session.changed_files.invalidated") {
     const sessionId = data.session_id;

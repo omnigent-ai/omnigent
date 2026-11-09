@@ -420,10 +420,10 @@ UNATTENDED_RUN_NOTE = (
     "independent work that does not depend on those decisions. If an action is denied or "
     "requires unavailable approval, skip that action and explain the blocker. Continue "
     "independent work and permitted alternatives. Do not change permission settings to "
-    "get past the restriction. If you have the sys_ledger tools, start by reading your "
-    "ledger with sys_ledger_read; if the session has no plan, write one with "
-    "sys_ledger_write_plan (one step is fine); and before your final reply, write a "
-    "status for each step you worked on with sys_ledger_write_status. Lead your final "
+    "get past the restriction. If you have the sys_journal tools, start by reading your "
+    "journal with sys_journal_read; if the session has no plan, write one with "
+    "sys_journal_write_plan (one step is fine); and before your final reply, write a "
+    "status for each step you worked on with sys_journal_write_status. Lead your final "
     "reply with unresolved decisions and assumptions, prioritizing those the user is most "
     "likely to want to change, then summarize what you did and anything you couldn't do.\n"
     "</omnigent-automation-context>"
@@ -947,7 +947,7 @@ async def _continue_session(
         return
     progress = _PromptSendProgress()
     progress_token = _PROMPT_SEND_PROGRESS.set(progress)
-    # Stamped before the prompt goes in, so the ledger entries the session records
+    # Stamped before the prompt goes in, so the journal entries the session records
     # are attributed to this run on any replica, even after a restart. A task, so
     # a cancelled fire can still learn whether the write landed.
     stamp = asyncio.ensure_future(

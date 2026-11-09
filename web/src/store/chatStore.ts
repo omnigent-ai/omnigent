@@ -109,7 +109,7 @@ import {
 } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
-import { applyLedgerEntry } from "@/hooks/useSessionLedger";
+import { applyJournalEntry } from "@/hooks/useSessionJournal";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
@@ -9492,9 +9492,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         });
       }
       return;
-    case "session_ledger_appended":
-      // A new ledger entry for the Activity tab; the cache drops duplicates by ID.
-      if (queryClient) applyLedgerEntry(queryClient, event.conversationId, event.entry);
+    case "session_journal_appended":
+      // A new journal entry for the Activity tab; the cache drops duplicates by ID.
+      if (queryClient) applyJournalEntry(queryClient, event.conversationId, event.entry);
       return;
     case "session_changed_files_invalidated":
       // Coarse "something changed" signal. Coalesce bursts into one

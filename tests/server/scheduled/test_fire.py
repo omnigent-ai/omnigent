@@ -3351,7 +3351,7 @@ async def test_a_legacy_fire_names_its_run_on_the_session_before_sending(continu
 
 @pytest.mark.asyncio
 async def test_a_continued_session_that_cannot_be_stamped_records_a_failed_run() -> None:
-    """Without the label, the ledger entries could land on another run, so nothing is sent."""
+    """Without the label, the journal entries could land on another run, so nothing is sent."""
     conv_store = _ExistingConversationStore(_continued_session())
     store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
 

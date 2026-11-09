@@ -244,14 +244,14 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
         interaction=InteractionConfig(conversational=False),
         tools=ToolsConfig(),
         # A headless one-shot fetcher: no browser pane, review comments,
-        # scheduling, policy editing, agent lookup or ledger to drive.
+        # scheduling, policy editing, agent lookup or journal to drive.
         tool_groups=ToolGroupsConfig(
             browser=False,
             scheduled_tasks=False,
             comments=False,
             policies=False,
             agent_discovery=False,
-            ledger=False,
+            journal=False,
         ),
         os_env=child_os_env,
         instructions=_RESEARCHER_INSTRUCTIONS,

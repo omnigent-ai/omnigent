@@ -172,7 +172,7 @@ def test_swap_label_gives_up_on_a_label_that_keeps_changing(
 def test_fork_drops_the_automation_run_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A fork serves no automation run, so its ledger entries are not the run's."""
+    """A fork serves no automation run, so its journal entries are not the run's."""
     from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 
     source = conversation_store.create_conversation()

@@ -1,7 +1,12 @@
 import { ChevronRightIcon, ListTodoIcon } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { SessionTasksView } from "@/hooks/useSessionTasks";
-import { finishedTaskCount, planName, taskPreviewText, WAITING_FOR_YOU } from "@/lib/sessionLedger";
+import {
+  finishedTaskCount,
+  planName,
+  taskPreviewText,
+  WAITING_FOR_YOU,
+} from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 import { openTasksTab } from "@/store/sessionTasksActions";
 

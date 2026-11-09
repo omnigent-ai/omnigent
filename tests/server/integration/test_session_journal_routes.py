@@ -1,4 +1,4 @@
-"""HTTP tests for ``/v1/sessions/{id}/ledger``: appending, paging and access."""
+"""HTTP tests for ``/v1/sessions/{id}/journal``: appending, paging and access."""
 
 from __future__ import annotations
 
@@ -67,11 +67,11 @@ def _write(kind: str, payload: dict[str, object], key: str, **fields: object) ->
     return {"kind": kind, "payload": payload, "idempotency_key": key, **fields}
 
 
-async def test_the_runner_appends_and_people_page_the_ledger(
+async def test_the_runner_appends_and_people_page_the_journal(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:
     session_id = _session(db_uri)
-    url = f"/v1/sessions/{session_id}/ledger"
+    url = f"/v1/sessions/{session_id}/journal"
     plan = {
         "name": "Cut GET /orders p95 by 20%",
         "steps": [{"id": "baseline", "name": "Baseline"}, {"id": "goal", "name": "Goal"}],
@@ -139,7 +139,7 @@ async def test_entries_are_attributed_to_the_run_the_session_serves(
         uuid.uuid4().hex, task.id, "running", 1_762_498_800, fired_at=1_762_498_801
     )
     session_id = _session(db_uri, labels={SCHEDULED_TASK_RUN_LABEL_KEY: run.id})
-    url = f"/v1/sessions/{session_id}/ledger"
+    url = f"/v1/sessions/{session_id}/journal"
     resp = await client.post(
         url, json=_write("note", {"body": "Started"}, "tool:1"), headers=_runner(session_id)
     )
@@ -157,7 +157,7 @@ async def test_entries_are_attributed_to_the_run_the_session_serves(
 
 async def test_only_the_sessions_own_runner_writes(client: httpx.AsyncClient, db_uri: str) -> None:
     session_id, other = _session(db_uri), _session(db_uri)
-    url = f"/v1/sessions/{session_id}/ledger"
+    url = f"/v1/sessions/{session_id}/journal"
     body = _write("note", {"body": "x"}, "tool:1")
     for headers in (_headers(), {**_headers(), ORCHESTRATION_SOURCE_HEADER: other}):
         refused = await client.post(url, json=body, headers=headers)
@@ -170,7 +170,7 @@ async def test_reading_needs_read_access_and_writing_needs_edit(
 ) -> None:
     session_id = _session(db_uri)
     assert (
-        await client.get(f"/v1/sessions/{session_id}/ledger", headers=_headers(BOB))
+        await client.get(f"/v1/sessions/{session_id}/journal", headers=_headers(BOB))
     ).status_code in (
         403,
         404,
@@ -180,7 +180,7 @@ async def test_reading_needs_read_access_and_writing_needs_edit(
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.grant(BOB, readable, LEVEL_READ)
     permissions.grant(CAROL, readable, LEVEL_EDIT)
-    url = f"/v1/sessions/{readable}/ledger"
+    url = f"/v1/sessions/{readable}/journal"
     body = _write("note", {"body": "x"}, "tool:1")
     assert (await client.get(url, headers=_headers(BOB))).status_code == 200
     assert (await client.post(url, json=body, headers=_runner(readable, BOB))).status_code == 403
@@ -241,7 +241,7 @@ async def test_invalid_entries_are_refused_without_writing(
     client: httpx.AsyncClient, db_uri: str, body: dict[str, object], status: int, reason: str
 ) -> None:
     session_id = _session(db_uri)
-    url = f"/v1/sessions/{session_id}/ledger"
+    url = f"/v1/sessions/{session_id}/journal"
     resp = await client.post(url, json=body, headers=_runner(session_id))
     assert resp.status_code == status, resp.text
     assert reason in resp.text
@@ -250,7 +250,7 @@ async def test_invalid_entries_are_refused_without_writing(
 
 async def test_a_missing_session_is_not_found(client: httpx.AsyncClient) -> None:
     session_id = uuid.uuid4().hex
-    url = f"/v1/sessions/{session_id}/ledger"
+    url = f"/v1/sessions/{session_id}/journal"
     assert (await client.get(url, headers=_headers())).status_code == 404
     body = _write("note", {"body": "x"}, "tool:1")
     assert (await client.post(url, json=body, headers=_runner(session_id))).status_code == 404
@@ -267,9 +267,9 @@ async def test_clients_cannot_set_the_run_label(client: httpx.AsyncClient, db_ur
     assert "server-internal" in resp.text
 
 
-async def test_the_server_advertises_the_ledger(client: httpx.AsyncClient) -> None:
+async def test_the_server_advertises_the_journal(client: httpx.AsyncClient) -> None:
     info = await client.get("/v1/info", headers=_headers())
-    assert info.json()["session_ledger"] is True
+    assert info.json()["session_journal"] is True
 
 
 async def test_the_agents_tools_write_and_read_through_the_runner(
@@ -278,7 +278,7 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
     """The runner's handlers drive the real routes: writes, live events and compact reads."""
     import json
 
-    from omnigent.runner.ledger_tools import execute_ledger_tool
+    from omnigent.runner.journal_tools import execute_journal_tool
 
     session_id, worker = _session(db_uri), _session(db_uri)
     client.headers.update(_headers())
@@ -291,7 +291,7 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
         call_id: str | None = None,
         session: str = session_id,
     ) -> dict:
-        output = await execute_ledger_tool(
+        output = await execute_journal_tool(
             tool,
             json.dumps(args),
             server_client=client,
@@ -307,18 +307,20 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
         "name": "Green nightly",
         "steps": [{"id": "nightly", "name": "Get the nightly build green", "depends_on": []}],
     }
-    assert await run("sys_ledger_write_plan", one_step, call_id="call_1") == {
+    assert await run("sys_journal_write_plan", one_step, call_id="call_1") == {
         "id": published[0][1]["entry"]["id"],
         "position": 0,
         "version": 1,
     }
-    assert published[0][0] == session_id and published[0][1]["type"] == "session.ledger.appended"
-    started = await run("sys_ledger_write_status", {"status": "started"}, call_id="call_2")
+    assert published[0][0] == session_id and published[0][1]["type"] == "session.journal.appended"
+    started = await run("sys_journal_write_status", {"status": "started"}, call_id="call_2")
     assert published[-1][1]["entry"]["step"] == "nightly"
     # A retried call with the same call ID writes nothing new.
-    assert await run("sys_ledger_write_status", {"status": "started"}, call_id="call_2") == started
+    assert (
+        await run("sys_journal_write_status", {"status": "started"}, call_id="call_2") == started
+    )
     await run(
-        "sys_ledger_write_note",
+        "sys_journal_write_note",
         {"body": "Retry the flaky e2e first\nthen bump the image", "step": "nightly"},
     )
     replan = {
@@ -328,14 +330,14 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
             {"id": "ship", "name": "Ship", "depends_on": ["nightly"]},
         ],
     }
-    assert (await run("sys_ledger_write_plan", replan))["version"] == 2
-    early = await run("sys_ledger_write_status", {"status": "started", "step": "ship"})
+    assert (await run("sys_journal_write_plan", replan))["version"] == 2
+    early = await run("sys_journal_write_status", {"status": "started", "step": "ship"})
     assert early["error"].startswith("step_not_ready: ship waits on nightly, not done yet")
     await run(
-        "sys_ledger_write_status", {"status": "blocked", "step": "nightly", "text": "CI is down"}
+        "sys_journal_write_status", {"status": "blocked", "step": "nightly", "text": "CI is down"}
     )
 
-    read = await run("sys_ledger_read", {})
+    read = await run("sys_journal_read", {})
     lines = read["entries"]
     assert [line.split(" · ", 1)[1] for line in lines] == [
         'plan v1 "Green nightly" (agent): 1 step: nightly',
@@ -346,18 +348,18 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
     ]
     assert lines[0].startswith("#0 ") and read["page"] == {"has_more": False, "next_cursor": None}
 
-    newest = await run("sys_ledger_read", {"limit": 2})
+    newest = await run("sys_journal_read", {"limit": 2})
     assert [line.split(" ", 1)[0] for line in newest["entries"]] == ["#3", "#4"]
-    older = await run("sys_ledger_read", {"limit": 2, "cursor": newest["page"]["next_cursor"]})
+    older = await run("sys_journal_read", {"limit": 2, "cursor": newest["page"]["next_cursor"]})
     assert [line.split(" ", 1)[0] for line in older["entries"]] == ["#1", "#2"]
     mismatched = await run(
-        "sys_ledger_read", {"kind": "note", "cursor": newest["page"]["next_cursor"]}
+        "sys_journal_read", {"kind": "note", "cursor": newest["page"]["next_cursor"]}
     )
     assert mismatched["error"].startswith(
         "invalid_entry: cursor belongs to a read with other arguments"
     )
 
-    plans = await run("sys_ledger_read", {"kind": "plan"})
+    plans = await run("sys_journal_read", {"kind": "plan"})
     assert [
         (plan["version"], plan["name"], [step["id"] for step in plan["steps"]])
         for plan in plans["entries"]
@@ -366,20 +368,20 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
         (2, "Green nightly, then ship", ["nightly", "ship"]),
     ]
     # Another session the caller can read, and one that doesn't exist.
-    assert (await run("sys_ledger_read", {"conversation_id": worker}))["entries"] == []
-    missing = await run("sys_ledger_read", {"conversation_id": uuid.uuid4().hex})
+    assert (await run("sys_journal_read", {"conversation_id": worker}))["entries"] == []
+    missing = await run("sys_journal_read", {"conversation_id": uuid.uuid4().hex})
     assert missing["error"] == "session_not_found"
-    assert (await run("sys_ledger_read", {"conversation_id": "../info"}))["error"].startswith(
+    assert (await run("sys_journal_read", {"conversation_id": "../info"}))["error"].startswith(
         "invalid_entry"
     )
 
     count = len(published)
-    assert (await run("sys_ledger_write_status", {"status": "done"}))["error"].startswith(
+    assert (await run("sys_journal_write_status", {"status": "done"}))["error"].startswith(
         "invalid_entry: text is required"
     )
-    too_large = await run("sys_ledger_write_note", {"body": "x" * 4097})
+    too_large = await run("sys_journal_write_note", {"body": "x" * 4097})
     assert too_large["error"].startswith("entry_too_large: body is 4097 bytes")
     # Two steps now, so a status must name one; the server says so.
-    unnamed = await run("sys_ledger_write_status", {"status": "started"})
+    unnamed = await run("sys_journal_write_status", {"status": "started"})
     assert unnamed["error"].startswith("invalid_entry: step is required")
     assert len(published) == count

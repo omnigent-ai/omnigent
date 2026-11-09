@@ -46,7 +46,7 @@ _CODECS = [
         ec.encode_scheduled_task_session_mode,
         ec.decode_scheduled_task_session_mode,
     ),
-    (ec.LEDGER_ENTRY_KIND, ec.encode_ledger_entry_kind, ec.decode_ledger_entry_kind),
+    (ec.JOURNAL_ENTRY_KIND, ec.encode_journal_entry_kind, ec.decode_journal_entry_kind),
 ]
 
 
@@ -137,7 +137,7 @@ def test_shipped_codes_are_stable() -> None:
         "skipped": 5,
         "starting": 6,
     }
-    assert ec.LEDGER_ENTRY_KIND == {
+    assert ec.JOURNAL_ENTRY_KIND == {
         "status": 1,
         "note": 2,
         "dispatch": 3,
@@ -147,8 +147,8 @@ def test_shipped_codes_are_stable() -> None:
     }
 
 
-def test_ledger_entry_kinds_match_the_entity_kinds() -> None:
-    """Every ledger kind has a code, and every code names a ledger kind."""
-    from omnigent.entities.session_ledger import LEDGER_KINDS
+def test_journal_entry_kinds_match_the_entity_kinds() -> None:
+    """Every journal kind has a code, and every code names a journal kind."""
+    from omnigent.entities.session_journal import JOURNAL_KINDS
 
-    assert set(ec.LEDGER_ENTRY_KIND) == set(LEDGER_KINDS)
+    assert set(ec.JOURNAL_ENTRY_KIND) == set(JOURNAL_KINDS)

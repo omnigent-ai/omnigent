@@ -29,16 +29,16 @@ import {
   stepStatusLabel,
   textOf,
   WAITING_FOR_YOU,
-  type LedgerEntry,
-  type LedgerPlanStep,
+  type JournalEntry,
+  type JournalPlanStep,
   type PausedLabel,
   type StepProgress,
   type StepState,
-} from "@/lib/sessionLedger";
+} from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 
-const NO_ENTRIES: LedgerEntry[] = [];
+const NO_ENTRIES: JournalEntry[] = [];
 
 const SECTION_HEADING = "text-xs font-medium tracking-wide text-muted-foreground uppercase";
 
@@ -238,7 +238,7 @@ function StepMeta({ item }: { item: StepProgress }) {
 }
 
 /** A small dot for one recorded status or note, in the status's color. */
-function EntryDot({ entry, className }: { entry: LedgerEntry; className?: string }) {
+function EntryDot({ entry, className }: { entry: JournalEntry; className?: string }) {
   const status = statusOf(entry);
   const color =
     status === "done"
@@ -255,7 +255,7 @@ function EntryDot({ entry, className }: { entry: LedgerEntry; className?: string
   return <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", color, className)} />;
 }
 
-function entryLabel(entry: LedgerEntry): string {
+function entryLabel(entry: JournalEntry): string {
   const status = statusOf(entry);
   if (!status) return "Note";
   return {
@@ -267,7 +267,7 @@ function entryLabel(entry: LedgerEntry): string {
   }[status];
 }
 
-function entryText(entry: LedgerEntry): string | null {
+function entryText(entry: JournalEntry): string | null {
   return entry.kind === "note" ? firstLine(noteBody(entry)) || null : textOf(entry);
 }
 
@@ -288,8 +288,8 @@ function StepHistory({
   names,
   showGoal,
 }: {
-  step: LedgerPlanStep;
-  entries: readonly LedgerEntry[];
+  step: JournalPlanStep;
+  entries: readonly JournalEntry[];
   names: ReadonlyMap<string, string>;
   /** False when the step's row already shows its goal. */
   showGoal: boolean;
@@ -360,7 +360,7 @@ function splitNote(markdown: string): { title: string | null; body: string } {
 }
 
 /** A note the agent wrote: a title line, then Markdown shortened until opened when long. */
-function NoteBlock({ entry, className }: { entry: LedgerEntry; className?: string }) {
+function NoteBlock({ entry, className }: { entry: JournalEntry; className?: string }) {
   const { title, body } = splitNote(noteBody(entry));
   const [open, setOpen] = useState(false);
   const long = body.length > 160 || body.split("\n").length > 2;
@@ -402,7 +402,7 @@ function StepRow({
   item: StepProgress;
   number: number;
   last: boolean;
-  entries: readonly LedgerEntry[];
+  entries: readonly JournalEntry[];
   names: ReadonlyMap<string, string>;
   /** True for a moment after a click on its progress segment. */
   flash: boolean;
@@ -623,7 +623,7 @@ function TasksHeader({
   stuck,
   onSelect,
 }: {
-  plan: LedgerEntry | null;
+  plan: JournalEntry | null;
   progress: readonly StepProgress[];
   paused: PausedLabel | null;
   stuck: boolean;
@@ -706,7 +706,7 @@ function TaskList({
   flashStep,
 }: {
   progress: readonly StepProgress[];
-  entries: readonly LedgerEntry[];
+  entries: readonly JournalEntry[];
   names: ReadonlyMap<string, string>;
   flashStep: string | null;
 }) {
@@ -729,7 +729,7 @@ function TaskList({
   );
 }
 
-function NotesSection({ notes }: { notes: readonly LedgerEntry[] }) {
+function NotesSection({ notes }: { notes: readonly JournalEntry[] }) {
   return (
     <section aria-label="Notes" className="flex flex-col gap-2 px-2">
       <h3 className={SECTION_HEADING}>Notes</h3>
@@ -764,13 +764,13 @@ export function TasksPanel({
   onStartWorkflow?: () => void;
 }) {
   const tasks = useSessionTasks(conversationId, active);
-  const { ledger, plan, progress } = tasks;
+  const { journal, plan, progress } = tasks;
   const startWorkflow = useSessionTasksActions((state) => state.startWorkflow[conversationId]);
-  const entries = tasks.ledgerSupported ? ledger.entries : NO_ENTRIES;
+  const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
   const notes = sessionNotes(entries);
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const empty = progress.length === 0 && notes.length === 0;
-  const showPlan = !tasks.loading && !ledger.error && progress.length > 0;
+  const showPlan = !tasks.loading && !journal.error && progress.length > 0;
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const [stuck, setStuck] = useState(false);
@@ -813,9 +813,9 @@ export function TasksPanel({
               </span>
             ))}
           </div>
-        ) : ledger.error ? (
+        ) : journal.error ? (
           <p className="px-2 py-6 text-center text-sm text-muted-foreground">
-            {ledger.error.message}
+            {journal.error.message}
           </p>
         ) : empty ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-1.5 px-6 text-center">
@@ -862,15 +862,15 @@ export function TasksPanel({
               </>
             )}
             {notes.length > 0 && <NotesSection notes={notes} />}
-            {ledger.hasOlder && (
+            {journal.hasOlder && (
               <div className="flex justify-center">
                 <Button
                   size="sm"
                   variant="ghost"
-                  disabled={ledger.loadingOlder}
-                  onClick={ledger.loadOlder}
+                  disabled={journal.loadingOlder}
+                  onClick={journal.loadOlder}
                 >
-                  {ledger.loadingOlder ? "Loading…" : "Show older notes"}
+                  {journal.loadingOlder ? "Loading…" : "Show older notes"}
                 </Button>
               </div>
             )}

@@ -1,9 +1,9 @@
-"""Runner-side handlers for the ``sys_ledger_*`` tools.
+"""Runner-side handlers for the ``sys_journal_*`` tools.
 
-The runner has no ledger store, so these tools call the server's
-``/v1/sessions/{id}/ledger`` routes. A write carries an idempotency key that
+The runner has no journal store, so these tools call the server's
+``/v1/sessions/{id}/journal`` routes. A write carries an idempotency key that
 its retries reuse, and once the server accepts it the runner publishes
-``session.ledger.appended`` on the session stream, the way it reports
+``session.journal.appended`` on the session stream, the way it reports
 child-session updates. Reads come back as compact lines the model can scan.
 """
 
@@ -24,20 +24,20 @@ from typing import Any
 
 import httpx
 
-from omnigent.entities.session_ledger import (
+from omnigent.entities.session_journal import (
     IDEMPOTENCY_KEY_MAX_CHARS,
-    LEDGER_KINDS,
-    InvalidLedgerEntryError,
-    LedgerEntryTooLargeError,
+    JOURNAL_KINDS,
+    InvalidJournalEntryError,
+    JournalEntryTooLargeError,
     normalize_note,
     normalize_plan,
     normalize_status,
     normalize_step_id,
 )
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.tools.builtins.ledger import LEDGER_READ_PAGE_MAX, LEDGER_TOOLS
+from omnigent.tools.builtins.journal import JOURNAL_READ_PAGE_MAX, JOURNAL_TOOLS
 
-LEDGER_TOOL_NAMES: frozenset[str] = frozenset(tool.name() for tool in LEDGER_TOOLS)
+JOURNAL_TOOL_NAMES: frozenset[str] = frozenset(tool.name() for tool in JOURNAL_TOOLS)
 
 # A read returns the newest entries whose lines fit this budget.
 _READ_OUTPUT_MAX_BYTES = 32 * 1024
@@ -57,16 +57,16 @@ _UNROUTED_NOT_FOUND_BODIES = (
     {"detail": "Not Found"},
     {"error": {"code": "not_found", "message": "Not found"}},
 )
-_UNSUPPORTED = "this Omnigent server has no session ledger"
+_UNSUPPORTED = "this Omnigent server has no session journal"
 
 _Publisher = Callable[[str, dict[str, Any]], None]
 
 
-def _ledger_url(session_id: str) -> str:
-    """The session's ledger route; the ID must stay one URL segment."""
+def _journal_url(session_id: str) -> str:
+    """The session's journal route; the ID must stay one URL segment."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
         raise ValueError("conversation_id must be a session ID")
-    return f"/v1/sessions/{session_id}/ledger"
+    return f"/v1/sessions/{session_id}/journal"
 
 
 def _error(message: str, **fields: object) -> str:
@@ -74,7 +74,7 @@ def _error(message: str, **fields: object) -> str:
 
 
 def _is_unrouted(response: httpx.Response) -> bool:
-    """Whether *response* says the server has no such route, so it predates the ledger."""
+    """Whether *response* says the server has no such route, so it predates the journal."""
     if response.status_code == 405:
         return True
     if response.status_code != 404:
@@ -111,14 +111,14 @@ def _idempotency_key(call_id: str | None) -> str:
 def _write_request(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Build the POST body, checking fields locally so errors come back at once.
 
-    :raises InvalidLedgerEntryError: If a field is invalid.
+    :raises InvalidJournalEntryError: If a field is invalid.
     """
     step = args.get("step")
     if step is not None:
         step = normalize_step_id(step)
-    if tool_name == "sys_ledger_write_note":
+    if tool_name == "sys_journal_write_note":
         return {"kind": "note", "payload": normalize_note(args.get("body")), "step": step}
-    if tool_name == "sys_ledger_write_status":
+    if tool_name == "sys_journal_write_status":
         payload = normalize_status(args.get("status"), text=args.get("text"))
         return {"kind": "status", "payload": payload, "step": step}
     plan = normalize_plan(args.get("steps"), name=args.get("name"))
@@ -160,7 +160,11 @@ async def _sleep(seconds: float) -> None:
 def _publish(
     publish_event: _Publisher | None, conversation_id: str, entry: dict[str, Any]
 ) -> None:
-    event = {"type": "session.ledger.appended", "conversation_id": conversation_id, "entry": entry}
+    event = {
+        "type": "session.journal.appended",
+        "conversation_id": conversation_id,
+        "entry": entry,
+    }
     if publish_event is not None:
         publish_event(conversation_id, event)
         return
@@ -180,12 +184,12 @@ async def _write(
 ) -> str:
     try:
         body = _write_request(tool_name, args)
-    except LedgerEntryTooLargeError as exc:
+    except JournalEntryTooLargeError as exc:
         return _error(f"entry_too_large: {exc}")
-    except InvalidLedgerEntryError as exc:
+    except InvalidJournalEntryError as exc:
         return _error(f"invalid_entry: {exc}")
     body["idempotency_key"] = _idempotency_key(call_id)
-    url = _ledger_url(conversation_id)
+    url = _journal_url(conversation_id)
     response = await _post_with_retries(server_client, url, body, conversation_id)
     if isinstance(response, str):
         return _error(f"{tool_name} failed: {response}")
@@ -216,9 +220,9 @@ def _decode_cursor(cursor: str) -> dict[str, Any]:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
         state = json.loads(raw)
     except (binascii.Error, ValueError) as exc:
-        raise ValueError("cursor is not a sys_ledger_read cursor") from exc
+        raise ValueError("cursor is not a sys_journal_read cursor") from exc
     if not isinstance(state, dict) or not isinstance(state.get("after"), str):
-        raise ValueError("cursor is not a sys_ledger_read cursor")
+        raise ValueError("cursor is not a sys_journal_read cursor")
     return state
 
 
@@ -278,13 +282,13 @@ async def _get(
     server_client: httpx.AsyncClient, target: str, params: dict[str, Any]
 ) -> dict[str, Any] | str:
     try:
-        response = await server_client.get(_ledger_url(target), params=params, timeout=30.0)
+        response = await server_client.get(_journal_url(target), params=params, timeout=30.0)
     except ValueError as exc:
         return _error(f"invalid_entry: {exc}")
     except httpx.HTTPError as exc:
-        return _error(f"sys_ledger_read failed: {exc}")
+        return _error(f"sys_journal_read failed: {exc}")
     if _is_unrouted(response):
-        return _error(f"sys_ledger_read: {_UNSUPPORTED}")
+        return _error(f"sys_journal_read: {_UNSUPPORTED}")
     if response.status_code == 404:
         return _error("session_not_found", conversation_id=target)
     if response.status_code in (401, 403):
@@ -292,7 +296,7 @@ async def _get(
     if response.status_code >= 400:
         return _error(_server_message(response))
     body = response.json()
-    return body if isinstance(body, dict) else _error("sys_ledger_read: malformed response")
+    return body if isinstance(body, dict) else _error("sys_journal_read: malformed response")
 
 
 async def _previous_plans(
@@ -323,12 +327,12 @@ async def _read(
     kind, step, limit = args.get("kind"), args.get("step"), args.get("limit")
     if not isinstance(target, str):
         return _error("invalid_entry: conversation_id must be a session ID")
-    if kind is not None and kind not in LEDGER_KINDS:
-        return _error(f"invalid_entry: kind must be one of {', '.join(LEDGER_KINDS)}")
+    if kind is not None and kind not in JOURNAL_KINDS:
+        return _error(f"invalid_entry: kind must be one of {', '.join(JOURNAL_KINDS)}")
     if limit is None:
-        limit = LEDGER_READ_PAGE_MAX
-    if not isinstance(limit, int) or not 1 <= limit <= LEDGER_READ_PAGE_MAX:
-        return _error(f"invalid_entry: limit must be between 1 and {LEDGER_READ_PAGE_MAX}")
+        limit = JOURNAL_READ_PAGE_MAX
+    if not isinstance(limit, int) or not 1 <= limit <= JOURNAL_READ_PAGE_MAX:
+        return _error(f"invalid_entry: limit must be between 1 and {JOURNAL_READ_PAGE_MAX}")
     try:
         if step is not None:
             step = normalize_step_id(step)
@@ -342,7 +346,7 @@ async def _read(
             ):
                 raise ValueError("cursor belongs to a read with other arguments; repeat them")
             after = state["after"]
-    except (InvalidLedgerEntryError, ValueError) as exc:
+    except (InvalidJournalEntryError, ValueError) as exc:
         return _error(f"invalid_entry: {exc}")
     params: dict[str, Any] = {"order": "desc", "limit": limit}
     for name, value in (("kind", kind), ("step", step), ("after", after)):
@@ -392,7 +396,7 @@ async def _read(
     )
 
 
-async def execute_ledger_tool(
+async def execute_journal_tool(
     tool_name: str,
     arguments: str,
     *,
@@ -401,12 +405,12 @@ async def execute_ledger_tool(
     call_id: str | None = None,
     publish_event: _Publisher | None = None,
 ) -> str:
-    """Run one ``sys_ledger_*`` tool call for the session's agent.
+    """Run one ``sys_journal_*`` tool call for the session's agent.
 
-    :param tool_name: One of :data:`LEDGER_TOOL_NAMES`.
+    :param tool_name: One of :data:`JOURNAL_TOOL_NAMES`.
     :param arguments: The call's JSON arguments.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :param conversation_id: The calling session; writes go to its ledger only.
+    :param conversation_id: The calling session; writes go to its journal only.
     :param call_id: The harness's tool call ID, for the write's idempotency key;
         ``None`` when the call came without one.
     :param publish_event: Publishes on a session's stream; ``None`` uses the
@@ -421,7 +425,7 @@ async def execute_ledger_tool(
         return _error(f"{tool_name}: malformed JSON arguments")
     if not isinstance(args, dict):
         return _error(f"{tool_name}: arguments must be an object")
-    if tool_name == "sys_ledger_read":
+    if tool_name == "sys_journal_read":
         return await _read(args, server_client=server_client, conversation_id=conversation_id)
     return await _write(
         tool_name,

@@ -1,6 +1,6 @@
-"""Entries in a session's ledger, and the rules every write follows.
+"""Entries in a session's journal, and the rules every write follows.
 
-A session's ledger is an append-only record of what its agent plans and how
+A session's journal is an append-only record of what its agent plans and how
 the work goes. Each entry has a kind:
 
 * ``plan``: the workflow graph the session follows. The newest one is the
@@ -14,7 +14,7 @@ the work goes. Each entry has a kind:
   not by agents.
 
 The normalizers here check an entry's fields and return the payload to store.
-The ledger store runs them on every append, so every write path applies them.
+The journal store runs them on every append, so every write path applies them.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-LEDGER_KINDS: tuple[str, ...] = (
+JOURNAL_KINDS: tuple[str, ...] = (
     "status",
     "note",
     "dispatch",
@@ -51,15 +51,15 @@ STEP_GOAL_MAX_CHARS = 300
 PLAN_SOURCES: tuple[str, ...] = ("agent", "workflow")
 # Names the write that appended an entry, e.g. "tool:<tool call ID>".
 IDEMPOTENCY_KEY_MAX_CHARS = 128
-# One page of a ledger read; the agent's tool reads at most 100 entries at a time.
-LEDGER_PAGE_MAX = 1000
+# One page of a journal read; the agent's tool reads at most 100 entries at a time.
+JOURNAL_PAGE_MAX = 1000
 
 
-class InvalidLedgerEntryError(ValueError):
+class InvalidJournalEntryError(ValueError):
     """An entry's fields fail validation; the message says which and why."""
 
 
-class LedgerEntryTooLargeError(InvalidLedgerEntryError):
+class JournalEntryTooLargeError(InvalidJournalEntryError):
     """An entry is over a size limit: a kind's raw limit, or the stored-payload limit.
 
     :param what: What is too large, e.g. ``"body"``.
@@ -80,7 +80,7 @@ class LedgerEntryTooLargeError(InvalidLedgerEntryError):
 STATUSES_NEEDING_DEPENDENCIES: frozenset[str] = frozenset({"started", "done"})
 
 
-class StepNotReadyError(InvalidLedgerEntryError):
+class StepNotReadyError(InvalidJournalEntryError):
     """A step can't start or be done yet: steps it depends on aren't done.
 
     :param step: The step, e.g. ``"ls-video"``.
@@ -98,14 +98,14 @@ class StepNotReadyError(InvalidLedgerEntryError):
 
 
 @dataclass(frozen=True)
-class LedgerEntry:
-    """One entry in a session's ledger.
+class JournalEntry:
+    """One entry in a session's journal.
 
     :param id: Entry ID, a bare 32-character hex UUID.
-    :param conversation_id: The session whose ledger holds the entry.
-    :param position: Its place in the ledger: 0, 1, 2, …
+    :param conversation_id: The session whose journal holds the entry.
+    :param position: Its place in the journal: 0, 1, 2, …
     :param created_at: Unix epoch seconds when it was appended.
-    :param kind: One of :data:`LEDGER_KINDS`, e.g. ``"status"``.
+    :param kind: One of :data:`JOURNAL_KINDS`, e.g. ``"status"``.
     :param step: The plan step it is about, e.g. ``"propose"``, or ``None``.
     :param scheduled_task_run_id: The automation run the session was serving
         when it was appended, or ``None``.
@@ -123,38 +123,38 @@ class LedgerEntry:
 
 
 @dataclass(frozen=True)
-class LedgerAppend:
+class JournalAppend:
     """The result of an append.
 
-    :param entry: The entry now in the ledger.
+    :param entry: The entry now in the journal.
     :param created: ``False`` when an earlier attempt of the same write had
         already appended *entry*.
     """
 
-    entry: LedgerEntry
+    entry: JournalEntry
     created: bool
 
 
 @dataclass(frozen=True)
-class LedgerPage:
-    """One page of a session's ledger, in the order requested.
+class JournalPage:
+    """One page of a session's journal, in the order requested.
 
     :param entries: The entries on this page.
     :param has_more: Whether more entries follow in the same order.
     """
 
-    entries: list[LedgerEntry]
+    entries: list[JournalEntry]
     has_more: bool
 
 
 def _text(name: str, value: object) -> str:
     """Check *value* is valid Unicode text and return it."""
     if not isinstance(value, str):
-        raise InvalidLedgerEntryError(f"{name} must be a string")
+        raise InvalidJournalEntryError(f"{name} must be a string")
     try:
         value.encode("utf-8")
     except UnicodeEncodeError as exc:  # e.g. an unpaired surrogate from raw JSON
-        raise InvalidLedgerEntryError(f"{name} must be valid Unicode text") from exc
+        raise InvalidJournalEntryError(f"{name} must be valid Unicode text") from exc
     return value
 
 
@@ -162,9 +162,9 @@ def _line(name: str, value: object, max_chars: int) -> str:
     """Collapse a one-line value's whitespace and bound its length."""
     collapsed = " ".join(_text(name, value).split())
     if not collapsed:
-        raise InvalidLedgerEntryError(f"{name} must not be empty")
+        raise InvalidJournalEntryError(f"{name} must not be empty")
     if len(collapsed) > max_chars:
-        raise InvalidLedgerEntryError(f"{name} must be at most {max_chars} characters")
+        raise InvalidJournalEntryError(f"{name} must be at most {max_chars} characters")
     return collapsed
 
 
@@ -173,11 +173,11 @@ def normalize_step_id(step: object) -> str:
 
     :param step: e.g. ``"propose"``: lowercase letters, digits, ``-`` and ``_``,
         starting with a letter or digit, at most :data:`STEP_ID_MAX_CHARS`.
-    :raises InvalidLedgerEntryError: If it doesn't match that form.
+    :raises InvalidJournalEntryError: If it doesn't match that form.
     """
     value = _text("step", step).strip()
     if not _STEP_ID.fullmatch(value):
-        raise InvalidLedgerEntryError(
+        raise InvalidJournalEntryError(
             f"step must be a short ID like 'propose': lowercase letters, digits, '-' and "
             f"'_', starting with a letter or digit, at most {STEP_ID_MAX_CHARS} characters"
         )
@@ -191,13 +191,13 @@ def normalize_status(status: object, *, text: object = None) -> dict[str, Any]:
     :param text: Why, in at most :data:`STATUS_TEXT_MAX_CHARS` characters;
         required except for ``started``.
     :returns: ``{"status": …, "text": … | None}``.
-    :raises InvalidLedgerEntryError: If a field is invalid.
+    :raises InvalidJournalEntryError: If a field is invalid.
     """
     if status not in STEP_STATUSES:
-        raise InvalidLedgerEntryError(f"status must be one of {', '.join(STEP_STATUSES)}")
+        raise InvalidJournalEntryError(f"status must be one of {', '.join(STEP_STATUSES)}")
     if text is None or (isinstance(text, str) and not text.strip()):
         if status != "started":
-            raise InvalidLedgerEntryError(f"text is required for a {status} status")
+            raise InvalidJournalEntryError(f"text is required for a {status} status")
         text = None
     else:
         text = _line("text", text, STATUS_TEXT_MAX_CHARS)
@@ -210,23 +210,23 @@ def normalize_note(body: object) -> dict[str, Any]:
     :param body: Markdown whose first line is the summary, at most
         :data:`NOTE_BODY_MAX_BYTES` UTF-8 bytes.
     :returns: ``{"body": …}``, without surrounding blank space.
-    :raises InvalidLedgerEntryError: If it is empty or too large.
+    :raises InvalidJournalEntryError: If it is empty or too large.
     """
     value = _text("body", body).strip()
     if not value:
-        raise InvalidLedgerEntryError("body must not be empty")
+        raise InvalidJournalEntryError("body must not be empty")
     size = len(value.encode("utf-8"))
     if size > NOTE_BODY_MAX_BYTES:
-        raise LedgerEntryTooLargeError("body", size, NOTE_BODY_MAX_BYTES)
+        raise JournalEntryTooLargeError("body", size, NOTE_BODY_MAX_BYTES)
     return {"body": value}
 
 
 def _plan_step(raw: object, index: int) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
-        raise InvalidLedgerEntryError(f"steps[{index}] must be an object")
+        raise InvalidJournalEntryError(f"steps[{index}] must be an object")
     unknown = set(raw) - {"id", "name", "goal", "depends_on"}
     if unknown:
-        raise InvalidLedgerEntryError(
+        raise InvalidJournalEntryError(
             f"steps[{index}] has unknown fields: {', '.join(sorted(map(str, unknown)))}"
         )
     step_id = normalize_step_id(raw.get("id"))
@@ -238,10 +238,10 @@ def _plan_step(raw: object, index: int) -> dict[str, Any]:
         goal = None
     depends_on = raw.get("depends_on", [])
     if not isinstance(depends_on, Sequence) or isinstance(depends_on, str):
-        raise InvalidLedgerEntryError(f"steps[{index}].depends_on must be a list of step IDs")
+        raise InvalidJournalEntryError(f"steps[{index}].depends_on must be a list of step IDs")
     dependencies = [normalize_step_id(dependency) for dependency in depends_on]
     if len(set(dependencies)) != len(dependencies):
-        raise InvalidLedgerEntryError(f"step {step_id!r} lists a dependency twice")
+        raise InvalidJournalEntryError(f"step {step_id!r} lists a dependency twice")
     return {"id": step_id, "name": name, "goal": goal, "depends_on": dependencies}
 
 
@@ -263,7 +263,7 @@ def _check_acyclic(steps: list[dict[str, Any]]) -> None:
                 ready.append(dependent)
     if done != len(steps):
         cyclic = sorted(step_id for step_id, count in waiting.items() if count > 0)
-        raise InvalidLedgerEntryError(
+        raise InvalidJournalEntryError(
             f"the plan's dependencies form a cycle among: {', '.join(cyclic)}"
         )
 
@@ -282,66 +282,66 @@ def normalize_plan(
     :param source: Who drew it, one of :data:`PLAN_SOURCES`.
     :param workflow: ``"<id>@<version>"`` for a copy of a user-drawn workflow.
     :returns: ``{"name", "source", "workflow", "steps"}``; the store adds ``version``.
-    :raises InvalidLedgerEntryError: If the name, the graph or a step is invalid.
+    :raises InvalidJournalEntryError: If the name, the graph or a step is invalid.
     """
     if name is None:
-        raise InvalidLedgerEntryError("a plan needs a name: its goal in a few words")
+        raise InvalidJournalEntryError("a plan needs a name: its goal in a few words")
     plan_name = _line("name", name, PLAN_NAME_MAX_CHARS)
     if source not in PLAN_SOURCES:
-        raise InvalidLedgerEntryError(f"source must be one of {', '.join(PLAN_SOURCES)}")
+        raise InvalidJournalEntryError(f"source must be one of {', '.join(PLAN_SOURCES)}")
     if not isinstance(steps, Sequence) or isinstance(steps, str):
-        raise InvalidLedgerEntryError("steps must be a list")
+        raise InvalidJournalEntryError("steps must be a list")
     if not steps:
-        raise InvalidLedgerEntryError("a plan needs at least one step")
+        raise InvalidJournalEntryError("a plan needs at least one step")
     if len(steps) > PLAN_MAX_STEPS:
-        raise InvalidLedgerEntryError(f"a plan has at most {PLAN_MAX_STEPS} steps")
+        raise InvalidJournalEntryError(f"a plan has at most {PLAN_MAX_STEPS} steps")
     normalized = [_plan_step(raw, index) for index, raw in enumerate(steps)]
     ids = [step["id"] for step in normalized]
     duplicates = sorted({step_id for step_id in ids if ids.count(step_id) > 1})
     if duplicates:
-        raise InvalidLedgerEntryError(f"step IDs must be unique: {', '.join(duplicates)}")
+        raise InvalidJournalEntryError(f"step IDs must be unique: {', '.join(duplicates)}")
     known = set(ids)
     for step in normalized:
         missing = [dependency for dependency in step["depends_on"] if dependency not in known]
         if missing:
-            raise InvalidLedgerEntryError(
+            raise InvalidJournalEntryError(
                 f"step {step['id']!r} depends on steps not in the plan: {', '.join(missing)}"
             )
     _check_acyclic(normalized)
     payload = {"name": plan_name, "source": source, "workflow": workflow, "steps": normalized}
     size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     if size > PLAN_MAX_RAW_BYTES:
-        raise LedgerEntryTooLargeError("the plan", size, PLAN_MAX_RAW_BYTES)
+        raise JournalEntryTooLargeError("the plan", size, PLAN_MAX_RAW_BYTES)
     return payload
 
 
 def normalize_payload(kind: str, payload: Mapping[str, Any]) -> dict[str, Any]:
     """Check an entry's payload for its kind and return the payload to store.
 
-    :param kind: One of :data:`LEDGER_KINDS`.
+    :param kind: One of :data:`JOURNAL_KINDS`.
     :param payload: The kind's fields; for a plan, without ``version``.
-    :raises InvalidLedgerEntryError: If the kind is unknown, has no writer yet,
+    :raises InvalidJournalEntryError: If the kind is unknown, has no writer yet,
         or a field is invalid.
     """
     if kind == "status":
         unknown = set(payload) - {"status", "text"}
         if unknown:
-            raise InvalidLedgerEntryError(f"unknown status fields: {', '.join(sorted(unknown))}")
+            raise InvalidJournalEntryError(f"unknown status fields: {', '.join(sorted(unknown))}")
         return normalize_status(payload.get("status"), text=payload.get("text"))
     if kind == "note":
         if set(payload) != {"body"}:
-            raise InvalidLedgerEntryError("a note has exactly one field, body")
+            raise InvalidJournalEntryError("a note has exactly one field, body")
         return normalize_note(payload["body"])
     if kind == "plan":
         unknown = set(payload) - {"name", "source", "workflow", "steps"}
         if unknown:
-            raise InvalidLedgerEntryError(f"unknown plan fields: {', '.join(sorted(unknown))}")
+            raise InvalidJournalEntryError(f"unknown plan fields: {', '.join(sorted(unknown))}")
         return normalize_plan(
             payload.get("steps"),
             name=payload.get("name"),
             source=payload.get("source", "agent"),
             workflow=payload.get("workflow"),
         )
-    if kind in LEDGER_KINDS:
-        raise InvalidLedgerEntryError(f"{kind} entries can't be written yet")
-    raise InvalidLedgerEntryError(f"kind must be one of {', '.join(LEDGER_KINDS)}")
+    if kind in JOURNAL_KINDS:
+        raise InvalidJournalEntryError(f"{kind} entries can't be written yet")
+    raise InvalidJournalEntryError(f"kind must be one of {', '.join(JOURNAL_KINDS)}")

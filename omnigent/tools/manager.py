@@ -190,7 +190,7 @@ class ToolManager:
         self._register_comment_tools()
         self._register_policy_tools()
         self._register_scheduled_task_tools()
-        self._register_ledger_tools()
+        self._register_journal_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -230,19 +230,19 @@ class ToolManager:
         ):
             self._tools[tool.name()] = tool
 
-    def _register_ledger_tools(self) -> None:
+    def _register_journal_tools(self) -> None:
         """
-        Auto-register the ``sys_ledger_*`` tools for the session's ledger.
+        Auto-register the ``sys_journal_*`` tools for the session's journal.
 
         Registered without spec opt-in, so every agent can keep a plan, step
-        statuses and notes; ``tool_groups.ledger: false`` drops all four. The
-        runner dispatches them via the server's ``/v1/sessions/{id}/ledger``.
+        statuses and notes; ``tool_groups.journal: false`` drops all four. The
+        runner dispatches them via the server's ``/v1/sessions/{id}/journal``.
         """
-        if not self._spec.tool_groups.ledger:
+        if not self._spec.tool_groups.journal:
             return
-        from omnigent.tools.builtins.ledger import LEDGER_TOOLS
+        from omnigent.tools.builtins.journal import JOURNAL_TOOLS
 
-        for tool_class in LEDGER_TOOLS:
+        for tool_class in JOURNAL_TOOLS:
             self._tools[tool_class.name()] = tool_class()
 
     def _register_async_inbox_tools(self) -> None:

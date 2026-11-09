@@ -1,16 +1,16 @@
-"""Session ledger API: what a session's agent plans and records.
+"""Session journal API: what a session's agent plans and records.
 
-A session's ledger is append-only. Its agent writes plans, step statuses and
-notes through its ``sys_ledger_*`` tools, which the session's runner sends
+A session's journal is append-only. Its agent writes plans, step statuses and
+notes through its ``sys_journal_*`` tools, which the session's runner sends
 here. Entries are attributed to the automation run the session serves, named
 by its :data:`~omnigent.stores.conversation_store.SCHEDULED_TASK_RUN_LABEL_KEY`
-label. People follow a ledger's plan in the session's Tasks tab.
+label. People follow a journal's plan in the session's Tasks tab.
 
 Routes, under ``/v1``:
 
-* ``GET /sessions/{session_id}/ledger`` returns one page, with the automation
+* ``GET /sessions/{session_id}/journal`` returns one page, with the automation
   runs its entries name (read access).
-* ``POST /sessions/{session_id}/ledger`` appends an entry. Only the session's
+* ``POST /sessions/{session_id}/journal`` appends an entry. Only the session's
   runner writes, so the call must carry the orchestration source header naming
   the session (edit access).
 """
@@ -25,11 +25,11 @@ from typing import Literal
 from fastapi import APIRouter, Query, Request
 
 from omnigent.entities import Conversation
-from omnigent.entities.session_ledger import (
-    LEDGER_PAGE_MAX,
-    InvalidLedgerEntryError,
-    LedgerEntry,
-    LedgerEntryTooLargeError,
+from omnigent.entities.session_journal import (
+    JOURNAL_PAGE_MAX,
+    InvalidJournalEntryError,
+    JournalEntry,
+    JournalEntryTooLargeError,
     StepNotReadyError,
 )
 from omnigent.errors import ErrorCode, OmnigentError
@@ -38,16 +38,16 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
 from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
-    LedgerEntryKind,
-    SessionLedgerAppendRequest,
-    SessionLedgerAuthor,
-    SessionLedgerEntry,
-    SessionLedgerPage,
+    JournalEntryKind,
+    SessionJournalAppendRequest,
+    SessionJournalAuthor,
+    SessionJournalEntry,
+    SessionJournalPage,
 )
 from omnigent.stores import ConversationStore
 from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.permission_store import PermissionStore
-from omnigent.stores.session_ledger_store import LedgerSessionNotFoundError, SessionLedgerStore
+from omnigent.stores.session_journal_store import JournalSessionNotFoundError, SessionJournalStore
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 _logger = logging.getLogger(__name__)
@@ -56,14 +56,14 @@ _logger = logging.getLogger(__name__)
 _OMNIGENT_KINDS = frozenset({"dispatch", "dispatch_result", "plan_status"})
 
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by database URL; queries scope rows
-_stores: dict[str, SessionLedgerStore] = {}
+_stores: dict[str, SessionJournalStore] = {}
 _stores_lock = threading.Lock()
 
 
-def open_store(conversation_store: object) -> SessionLedgerStore | None:
-    """Return the ledger store beside the session metadata, or ``None`` without SQL.
+def open_store(conversation_store: object) -> SessionJournalStore | None:
+    """Return the journal store beside the session metadata, or ``None`` without SQL.
 
-    :param conversation_store: The server's conversation store; ledgers live in
+    :param conversation_store: The server's conversation store; journals live in
         the database at its ``storage_location``.
     """
     location = getattr(conversation_store, "storage_location", None)
@@ -73,9 +73,9 @@ def open_store(conversation_store: object) -> SessionLedgerStore | None:
         store = _stores.get(location)
         if store is None:
             try:
-                store = SessionLedgerStore(location)
+                store = SessionJournalStore(location)
             except Exception:
-                _logger.warning("Session ledger storage is unavailable", exc_info=True)
+                _logger.warning("Session journal storage is unavailable", exc_info=True)
                 return None
             _stores[location] = store
         return store
@@ -88,43 +88,43 @@ def _same_session(left: str, right: str) -> bool:
         return False
 
 
-def entry_to_response(entry: LedgerEntry) -> SessionLedgerEntry:
+def entry_to_response(entry: JournalEntry) -> SessionJournalEntry:
     """Serialize an entry; its author is derived from its kind and a plan's source."""
     omnigent = entry.kind in _OMNIGENT_KINDS or (
         entry.kind == "plan" and entry.payload.get("source") == "workflow"
     )
-    return SessionLedgerEntry(
+    return SessionJournalEntry(
         id=entry.id,
         position=entry.position,
         created_at=entry.created_at,
         scheduled_task_run_id=entry.scheduled_task_run_id,
         step=entry.step,
-        author=SessionLedgerAuthor(type="omnigent" if omnigent else "agent"),
+        author=SessionJournalAuthor(type="omnigent" if omnigent else "agent"),
         kind=entry.kind,  # type: ignore[arg-type]
         payload=entry.payload,
     )
 
 
-def create_session_ledger_router(
+def create_session_journal_router(
     conversation_store: ConversationStore,
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
 ) -> APIRouter:
-    """Build the session ledger router, mounted under ``/v1``.
+    """Build the session journal router, mounted under ``/v1``.
 
-    :param conversation_store: The server's conversation store. Ledgers are
+    :param conversation_store: The server's conversation store. Journals are
         stored in its database; without a SQL backend every route answers 404.
     :param auth_provider: Identifies the caller; ``None`` in single-user mode.
     :param permission_store: Session grants; ``None`` disables enforcement.
     """
     router = APIRouter()
 
-    def _store() -> SessionLedgerStore:
+    def _store() -> SessionJournalStore:
         store = open_store(conversation_store)
         if store is None:
             raise OmnigentError(
-                "Session ledgers are not available on this server", code=ErrorCode.NOT_FOUND
+                "Session journals are not available on this server", code=ErrorCode.NOT_FOUND
             )
         return store
 
@@ -150,18 +150,18 @@ def create_session_ledger_router(
             _logger.warning("Session %s names an invalid automation run", session.id)
             return None
 
-    @router.get("/sessions/{session_id}/ledger", response_model=SessionLedgerPage)
-    async def list_session_ledger(
+    @router.get("/sessions/{session_id}/journal", response_model=SessionJournalPage)
+    async def list_session_journal(
         request: Request,
         session_id: str,
-        limit: int = Query(100, ge=1, le=LEDGER_PAGE_MAX),
+        limit: int = Query(100, ge=1, le=JOURNAL_PAGE_MAX),
         after: str | None = None,
         before: str | None = None,
         order: Literal["asc", "desc"] = "asc",
-        kind: LedgerEntryKind | None = None,
+        kind: JournalEntryKind | None = None,
         step: str | None = None,
-    ) -> SessionLedgerPage:
-        """One page of the session's ledger by position; requires read access.
+    ) -> SessionJournalPage:
+        """One page of the session's journal by position; requires read access.
 
         ``after`` continues in the sort order and ``before`` goes against it,
         both taking entry IDs, as for conversation items.
@@ -182,23 +182,23 @@ def create_session_ledger_router(
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         data = [entry_to_response(entry) for entry in page.entries]
-        return SessionLedgerPage(
+        return SessionJournalPage(
             data=data,
             first_id=data[0].id if data else None,
             last_id=data[-1].id if data else None,
             has_more=page.has_more,
         )
 
-    @router.post("/sessions/{session_id}/ledger", response_model=SessionLedgerEntry)
-    async def append_session_ledger_entry(
-        request: Request, session_id: str, body: SessionLedgerAppendRequest
-    ) -> SessionLedgerEntry:
+    @router.post("/sessions/{session_id}/journal", response_model=SessionJournalEntry)
+    async def append_session_journal_entry(
+        request: Request, session_id: str, body: SessionJournalAppendRequest
+    ) -> SessionJournalEntry:
         """Append an entry written by the session's agent; only its runner calls this."""
         session = await _session(request, session_id, LEVEL_EDIT)
         source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
         if source is None or not _same_session(source, session.id):
             raise OmnigentError(
-                "Only the session's own agent writes its ledger", code=ErrorCode.FORBIDDEN
+                "Only the session's own agent writes its journal", code=ErrorCode.FORBIDDEN
             )
         if body.kind == "plan" and set(body.payload) != {"name", "steps"}:
             # The agent's plans are its own; copies of drawn workflows come later.
@@ -218,13 +218,13 @@ def create_session_ledger_router(
                     scheduled_task_run_id=_run_id(session),
                 )
             )
-        except LedgerSessionNotFoundError as exc:
+        except JournalSessionNotFoundError as exc:
             raise session_not_found() from exc
-        except LedgerEntryTooLargeError as exc:
+        except JournalEntryTooLargeError as exc:
             raise OmnigentError(f"entry_too_large: {exc}", code=ErrorCode.INVALID_INPUT) from exc
         except StepNotReadyError as exc:
             raise OmnigentError(f"step_not_ready: {exc}", code=ErrorCode.CONFLICT) from exc
-        except InvalidLedgerEntryError as exc:
+        except InvalidJournalEntryError as exc:
             raise OmnigentError(f"invalid_entry: {exc}", code=ErrorCode.INVALID_INPUT) from exc
         return entry_to_response(appended.entry)
 

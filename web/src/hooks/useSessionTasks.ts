@@ -3,24 +3,24 @@
 
 import { useChildSessions } from "@/hooks/useChildSessions";
 import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
-import { useSessionLedger, type SessionLedgerView } from "@/hooks/useSessionLedger";
+import { useSessionJournal, type SessionJournalView } from "@/hooks/useSessionJournal";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import {
   pausedLabel,
   sessionTaskList,
-  type LedgerEntry,
+  type JournalEntry,
   type PausedLabel,
   type SessionTaskList,
-} from "@/lib/sessionLedger";
+} from "@/lib/sessionJournal";
 
-const NO_ENTRIES: LedgerEntry[] = [];
+const NO_ENTRIES: JournalEntry[] = [];
 
 export interface SessionTasksView extends SessionTaskList {
-  /** The session's ledger; empty on servers that keep none. */
-  ledger: SessionLedgerView;
-  /** Whether the server keeps session ledgers. */
-  ledgerSupported: boolean;
+  /** The session's journal; empty on servers that keep none. */
+  journal: SessionJournalView;
+  /** Whether the server keeps session journals. */
+  journalSupported: boolean;
   /** True until it's known whether the session has a plan. */
   loading: boolean;
   /**
@@ -39,15 +39,15 @@ export interface SessionTasksView extends SessionTaskList {
 
 /**
  * @param conversationId - The session; undefined while it has none.
- * @param enabled - Whether to load the ledger now, e.g. while the tab shows.
+ * @param enabled - Whether to load the journal now, e.g. while the tab shows.
  */
 export function useSessionTasks(
   conversationId: string | undefined,
   enabled: boolean,
 ): SessionTasksView {
   const serverInfo = useServerInfo();
-  const ledgerSupported = serverInfo !== "loading" && serverInfo.session_ledger === true;
-  const ledger = useSessionLedger(conversationId, enabled && ledgerSupported);
+  const journalSupported = serverInfo !== "loading" && serverInfo.session_journal === true;
+  const journal = useSessionJournal(conversationId, enabled && journalSupported);
   const nativeTasks = useConversationEntryValue(conversationId ?? null, (state) => state.todos);
   const sessionStatus = useConversationEntryValue(
     conversationId ?? null,
@@ -71,13 +71,13 @@ export function useSessionTasks(
   const awaitingUser = useConversationEntryValue(conversationId ?? null, (state) =>
     state.blocks.some((block) => block.type === "elicitation" && block.status === "pending"),
   );
-  const entries = ledgerSupported ? ledger.entries : NO_ENTRIES;
+  const entries = journalSupported ? journal.entries : NO_ENTRIES;
   const tasks = sessionTaskList(entries, nativeTasks, sessionWorking, awaitingUser);
   return {
     ...tasks,
-    ledger,
-    ledgerSupported,
-    loading: serverInfo === "loading" || ledger.isLoading,
+    journal,
+    journalSupported,
+    loading: serverInfo === "loading" || journal.isLoading,
     sessionWorking,
     paused: pausedLabel(tasks.progress, entries, sessionWorking),
   };

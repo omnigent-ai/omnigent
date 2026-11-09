@@ -1,4 +1,4 @@
-// A session's ledger: the plan its agent follows, step statuses and notes.
+// A session's journal: the plan its agent follows, step statuses and notes.
 // The server pages it by position; the session stream pushes new entries.
 // The UI shows a plan's steps as tasks, and falls back to the agent's own
 // task list when the session has no plan.
@@ -6,7 +6,7 @@
 import { authenticatedFetch } from "@/lib/identity";
 import { relativeTime } from "@/lib/relativeTime";
 
-export type LedgerEntryKind =
+export type JournalEntryKind =
   "status" | "note" | "dispatch" | "dispatch_result" | "plan" | "plan_status";
 
 export type StepStatus = "started" | "done" | "needs_input" | "blocked" | "failed";
@@ -17,15 +17,15 @@ const STEP_STATUSES: readonly string[] = ["started", "done", "needs_input", "blo
 export const WAITING_FOR_YOU = "Waiting for you";
 
 /** One plan step, as a plan entry's payload lists it. */
-export interface LedgerPlanStep {
+export interface JournalPlanStep {
   id: string;
   name: string;
   goal: string | null;
   depends_on: string[];
 }
 
-/** One entry of a session's ledger, as `GET /v1/sessions/{id}/ledger` returns it. */
-export interface LedgerEntry {
+/** One entry of a session's journal, as `GET /v1/sessions/{id}/journal` returns it. */
+export interface JournalEntry {
   id: string;
   position: number;
   /** Epoch seconds. */
@@ -33,65 +33,65 @@ export interface LedgerEntry {
   scheduled_task_run_id: string | null;
   step: string | null;
   author: { type: "agent" | "omnigent" };
-  kind: LedgerEntryKind;
+  kind: JournalEntryKind;
   payload: Record<string, unknown>;
 }
 
-export interface LedgerPage {
+export interface JournalPage {
   object: "list";
-  data: LedgerEntry[];
+  data: JournalEntry[];
   first_id: string | null;
   last_id: string | null;
   has_more: boolean;
 }
 
-export function sessionLedgerKey(conversationId: string | undefined) {
-  return ["session-ledger", conversationId] as const;
+export function sessionJournalKey(conversationId: string | undefined) {
+  return ["session-journal", conversationId] as const;
 }
 
 /**
- * Fetch one page of the session's ledger.
+ * Fetch one page of the session's journal.
  *
  * @param query - e.g. `{ order: "desc", limit: "100" }`, or `{ order: "asc",
  *   after: "<entry id>" }` to catch up after a reconnect.
  */
-export async function fetchLedgerPage(
+export async function fetchJournalPage(
   conversationId: string,
   query: Record<string, string>,
-): Promise<LedgerPage> {
+): Promise<JournalPage> {
   const params = new URLSearchParams(query);
   const response = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/ledger?${params}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/journal?${params}`,
   );
   if (!response.ok) throw new Error(`Couldn't load the session's tasks (${response.status})`);
-  return (await response.json()) as LedgerPage;
+  return (await response.json()) as JournalPage;
 }
 
 /** Entries in position order, without duplicates; later copies of an entry win. */
-export function mergeLedgerEntries(...lists: readonly LedgerEntry[][]): LedgerEntry[] {
-  const byId = new Map<string, LedgerEntry>();
+export function mergeJournalEntries(...lists: readonly JournalEntry[][]): JournalEntry[] {
+  const byId = new Map<string, JournalEntry>();
   for (const list of lists) for (const entry of list) byId.set(entry.id, entry);
   return [...byId.values()].sort((a, b) => a.position - b.position);
 }
 
-export function statusOf(entry: LedgerEntry): StepStatus | null {
+export function statusOf(entry: JournalEntry): StepStatus | null {
   const status = entry.payload.status;
   return typeof status === "string" && STEP_STATUSES.includes(status)
     ? (status as StepStatus)
     : null;
 }
 
-export function textOf(entry: LedgerEntry): string | null {
+export function textOf(entry: JournalEntry): string | null {
   return typeof entry.payload.text === "string" ? entry.payload.text : null;
 }
 
-export function planSteps(entry: LedgerEntry): LedgerPlanStep[] {
+export function planSteps(entry: JournalEntry): JournalPlanStep[] {
   const steps = entry.payload.steps;
-  return Array.isArray(steps) ? (steps as LedgerPlanStep[]) : [];
+  return Array.isArray(steps) ? (steps as JournalPlanStep[]) : [];
 }
 
 /** A plan's name, its goal in a few words, e.g. "Cut GET /orders p95 by 20%". */
-export function planName(entry: LedgerEntry | null): string | null {
+export function planName(entry: JournalEntry | null): string | null {
   const name = entry?.payload.name;
   return typeof name === "string" && name.trim() ? name : null;
 }
@@ -113,12 +113,12 @@ export function stepStatusLabel(
   ];
 }
 
-export function noteBody(entry: LedgerEntry): string {
+export function noteBody(entry: JournalEntry): string {
   return typeof entry.payload.body === "string" ? entry.payload.body : "";
 }
 
 /** The newest plan among the entries, which are in position order. */
-export function currentPlan(entries: readonly LedgerEntry[]): LedgerEntry | null {
+export function currentPlan(entries: readonly JournalEntry[]): JournalEntry | null {
   return entries.findLast((entry) => entry.kind === "plan") ?? null;
 }
 
@@ -133,14 +133,14 @@ export type StepState =
 
 /** One task, a plan step or an item of the agent's own task list, and where it stands. */
 export interface StepProgress {
-  step: LedgerPlanStep;
+  step: JournalPlanStep;
   state: StepState;
   /** The step's newest status; null until it has one. */
-  status: LedgerEntry | null;
+  status: JournalEntry | null;
   /** When the step's current attempt started, in epoch seconds, if it wrote a start. */
   startedAt: number | null;
   /** The newest note of the step's current attempt, so a restarted step drops older ones. */
-  note: LedgerEntry | null;
+  note: JournalEntry | null;
   /** True for an item of the agent's own task list, which has no history. */
   native: boolean;
   /** What the agent says it's doing while an item of its own list is in progress. */
@@ -148,7 +148,7 @@ export interface StepProgress {
 }
 
 /** The start of the attempt that wrote a step's newest status, if it wrote one. */
-function attemptStart(statuses: readonly LedgerEntry[]): LedgerEntry | null {
+function attemptStart(statuses: readonly JournalEntry[]): JournalEntry | null {
   for (let index = statuses.length - 1; index >= 0; index -= 1) {
     const status = statusOf(statuses[index]);
     if (status === "started") return statuses[index];
@@ -164,9 +164,9 @@ function attemptStart(statuses: readonly LedgerEntry[]): LedgerEntry | null {
  * start, a note written just ahead of the first one counts.
  */
 function currentAttemptNote(
-  statuses: readonly LedgerEntry[],
-  notes: readonly LedgerEntry[],
-): LedgerEntry | null {
+  statuses: readonly JournalEntry[],
+  notes: readonly JournalEntry[],
+): JournalEntry | null {
   const starts = statuses.filter((entry) => statusOf(entry) === "started");
   const restartedAt = starts.length > 1 ? (starts.at(-1)?.position ?? null) : null;
   return notes.findLast((note) => restartedAt === null || note.position > restartedAt) ?? null;
@@ -176,7 +176,7 @@ function currentAttemptNote(
  * Whether a status restarts its step: a start after the step was done or
  * failed. A start after waiting, a block or an earlier start resumes it.
  */
-export function isRestart(entry: LedgerEntry, earlier: readonly LedgerEntry[]): boolean {
+export function isRestart(entry: JournalEntry, earlier: readonly JournalEntry[]): boolean {
   if (statusOf(entry) !== "started") return false;
   const previous = earlier.findLast((other) => other.step === entry.step && statusOf(other));
   const status = previous ? statusOf(previous) : null;
@@ -191,13 +191,13 @@ export function isRestart(entry: LedgerEntry, earlier: readonly LedgerEntry[]): 
  * @param awaitingUser - Whether a question or permission prompt waits for the user.
  */
 export function stepProgress(
-  steps: readonly LedgerPlanStep[],
-  entries: readonly LedgerEntry[],
+  steps: readonly JournalPlanStep[],
+  entries: readonly JournalEntry[],
   sessionWorking: boolean,
   awaitingUser = false,
 ): StepProgress[] {
-  const statuses = new Map<string, LedgerEntry[]>();
-  const notes = new Map<string, LedgerEntry[]>();
+  const statuses = new Map<string, JournalEntry[]>();
+  const notes = new Map<string, JournalEntry[]>();
   for (const entry of entries) {
     if (!entry.step) continue;
     const byStep =
@@ -237,7 +237,7 @@ export function stepProgress(
 }
 
 /** The steps to show when the agent wrote statuses but no plan: one per step it named. */
-export function stepsWithoutPlan(entries: readonly LedgerEntry[]): LedgerPlanStep[] {
+export function stepsWithoutPlan(entries: readonly JournalEntry[]): JournalPlanStep[] {
   const ids = new Set<string>();
   for (const entry of entries) if (entry.kind === "status" && entry.step) ids.add(entry.step);
   return [...ids].map((id) => ({ id, name: id, goal: null, depends_on: [] }));
@@ -265,7 +265,7 @@ export function finishedTaskCount(progress: readonly StepProgress[]): number {
 }
 
 /** Notes that aren't about one step, newest first. */
-export function sessionNotes(entries: readonly LedgerEntry[]): LedgerEntry[] {
+export function sessionNotes(entries: readonly JournalEntry[]): JournalEntry[] {
   return entries.filter((entry) => entry.kind === "note" && !entry.step).reverse();
 }
 
@@ -309,7 +309,7 @@ export function nativeTaskProgress(
 /** A session's tasks: its plan's steps when it has a plan, otherwise the agent's own list. */
 export interface SessionTaskList {
   /** The plan the tasks come from; null for the agent's own list. */
-  plan: LedgerEntry | null;
+  plan: JournalEntry | null;
   progress: StepProgress[];
   /** True when the tasks are the agent's own list. */
   native: boolean;
@@ -319,11 +319,11 @@ export interface SessionTaskList {
  * The tasks to show for a session. A plan, or statuses written without one,
  * win over the agent's own list, so a workflow never shows two lists.
  *
- * @param entries - Loaded ledger entries in position order.
+ * @param entries - Loaded journal entries in position order.
  * @param nativeTasks - The agent's own task list.
  */
 export function sessionTaskList(
-  entries: readonly LedgerEntry[],
+  entries: readonly JournalEntry[],
   nativeTasks: readonly NativeTask[],
   sessionWorking: boolean,
   awaitingUser = false,
@@ -348,7 +348,7 @@ export type PausedLabel = "Stopped" | "Run ended";
  */
 export function pausedLabel(
   progress: readonly StepProgress[],
-  entries: readonly LedgerEntry[],
+  entries: readonly JournalEntry[],
   sessionWorking: boolean,
 ): PausedLabel | null {
   if (sessionWorking || progress.some((item) => item.state === "needs_input")) return null;

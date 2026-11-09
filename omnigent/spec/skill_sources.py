@@ -280,14 +280,14 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
 
 # Skills Omnigent ships, each for agents that have the tool group it drives.
 _FRAMEWORK_SKILLS_DIR = Path(__file__).resolve().parent.parent / "resources" / "skills"
-_FRAMEWORK_SKILL_GROUPS = {"workflow": "ledger"}
+_FRAMEWORK_SKILL_GROUPS = {"workflow": "journal"}
 
 
 def framework_skills(spec: AgentSpec) -> list[SkillSpec]:
     """The skills Omnigent ships for the agent's tool groups, e.g. ``workflow``.
 
     Like bundled skills, they ignore ``skills_filter``; an agent drops one by
-    turning its tool group off, e.g. ``tool_groups.ledger: false``.
+    turning its tool group off, e.g. ``tool_groups.journal: false``.
     """
     names = {
         name for name, group in _FRAMEWORK_SKILL_GROUPS.items() if getattr(spec.tool_groups, group)

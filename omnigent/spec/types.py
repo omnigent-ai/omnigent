@@ -890,7 +890,7 @@ class ToolGroupsConfig:
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
-    :param ledger: The ``sys_ledger_*`` tools (4): the session's plan, step
+    :param journal: The ``sys_journal_*`` tools (4): the session's plan, step
         statuses and notes.
     """
 
@@ -899,7 +899,7 @@ class ToolGroupsConfig:
     comments: bool = True
     policies: bool = True
     agent_discovery: bool = True
-    ledger: bool = True
+    journal: bool = True
 
 
 @dataclass

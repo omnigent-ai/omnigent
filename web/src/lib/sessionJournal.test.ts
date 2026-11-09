@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { ledgerEntry, ledgerPlan as plan } from "@/test/ledgerFixtures";
+import { journalEntry, journalPlan as plan } from "@/test/journalFixtures";
 import {
   currentPlan,
   finishedTaskCount,
   isRestart,
-  mergeLedgerEntries,
+  mergeJournalEntries,
   nativeTaskProgress,
   pausedLabel,
   planName,
@@ -16,14 +16,14 @@ import {
   stepsWithoutPlan,
   stepStatusLabel,
   taskPreviewText,
-  type LedgerEntry,
+  type JournalEntry,
   type NativeTask,
-} from "./sessionLedger";
+} from "./sessionJournal";
 
 const RUN = "0b6c5f0d8a7e4c3b9a1d2e3f4a5b6c7d";
 
-function status(position: number, step: string, value: string, fields: Partial<LedgerEntry> = {}) {
-  return ledgerEntry(position, {
+function status(position: number, step: string, value: string, fields: Partial<JournalEntry> = {}) {
+  return journalEntry(position, {
     kind: "status",
     step,
     payload: { status: value, text: `${step} ${value}` },
@@ -31,11 +31,11 @@ function status(position: number, step: string, value: string, fields: Partial<L
   });
 }
 
-describe("mergeLedgerEntries", () => {
+describe("mergeJournalEntries", () => {
   it("orders by position and keeps one copy of each entry", () => {
-    const merged = mergeLedgerEntries(
-      [ledgerEntry(2), ledgerEntry(0)],
-      [ledgerEntry(1), ledgerEntry(2, { payload: { body: "newer copy" } })],
+    const merged = mergeJournalEntries(
+      [journalEntry(2), journalEntry(0)],
+      [journalEntry(1), journalEntry(2, { payload: { body: "newer copy" } })],
     );
     expect(merged.map((entry) => entry.position)).toEqual([0, 1, 2]);
     expect(merged[2].payload.body).toBe("newer copy");
@@ -60,8 +60,8 @@ describe("stepStatusLabel", () => {
 
 describe("currentPlan", () => {
   it("is the newest plan among the entries", () => {
-    expect(currentPlan([plan(0, ["a"]), ledgerEntry(1), plan(2, ["a"], ["b"])])?.position).toBe(2);
-    expect(currentPlan([ledgerEntry(0)])).toBeNull();
+    expect(currentPlan([plan(0, ["a"]), journalEntry(1), plan(2, ["a"], ["b"])])?.position).toBe(2);
+    expect(currentPlan([journalEntry(0)])).toBeNull();
   });
 });
 
@@ -71,8 +71,8 @@ describe("stepProgress", () => {
     status(1, "a", "started"),
     status(2, "a", "done"),
     status(3, "b", "started"),
-    ledgerEntry(4, { step: "b", payload: { body: "first note" } }),
-    ledgerEntry(5, { step: "b", payload: { body: "second note" } }),
+    journalEntry(4, { step: "b", payload: { body: "first note" } }),
+    journalEntry(5, { step: "b", payload: { body: "second note" } }),
     status(6, "c", "started"),
     status(7, "c", "failed"),
     status(8, "c", "done"),
@@ -93,7 +93,7 @@ describe("stepProgress", () => {
   it("shows only the current attempt's note once a step starts again", () => {
     const one = planSteps(plan(0, ["a"]));
     const note = (position: number, body: string) =>
-      ledgerEntry(position, { step: "a", payload: { body } });
+      journalEntry(position, { step: "a", payload: { body } });
     const firstTry = [note(1, "Deploying the swap"), status(2, "a", "started")];
     // Before a second start, a note written just ahead of the first one counts.
     expect(stepProgress(one, firstTry, true)[0].note?.payload.body).toBe("Deploying the swap");
@@ -169,7 +169,7 @@ describe("stepProgress", () => {
 
   it("makes a step ready once every step it depends on is done", () => {
     const chain = planSteps(plan(0, ["a"], ["b", ["a"]], ["c", ["a", "b"]]));
-    const states = (written: LedgerEntry[]) =>
+    const states = (written: JournalEntry[]) =>
       stepProgress(chain, written, false).map((item) => item.state);
     expect(states([])).toEqual(["ready", "waiting", "waiting"]);
     expect(states([status(1, "a", "done")])).toEqual(["done", "ready", "waiting"]);
@@ -195,7 +195,7 @@ describe("stepProgress", () => {
 
 describe("pausedLabel", () => {
   const chain = plan(0, ["a"], ["b", ["a"]]);
-  const label = (entries: LedgerEntry[], working = false) =>
+  const label = (entries: JournalEntry[], working = false) =>
     pausedLabel(stepProgress(planSteps(chain), entries, working), entries, working);
 
   it("says an idle list stopped while the agent could run a task and none waits for you", () => {
@@ -217,10 +217,10 @@ describe("pausedLabel", () => {
 describe("sessionNotes", () => {
   it("keeps notes that aren't about one step, newest first", () => {
     const notes = sessionNotes([
-      ledgerEntry(0),
-      ledgerEntry(1, { step: "a" }),
-      ledgerEntry(2, { scheduled_task_run_id: RUN }),
-      ledgerEntry(3),
+      journalEntry(0),
+      journalEntry(1, { step: "a" }),
+      journalEntry(2, { scheduled_task_run_id: RUN }),
+      journalEntry(3),
     ]);
     expect(notes.map((entry) => entry.position)).toEqual([3, 2, 0]);
   });
@@ -254,7 +254,7 @@ describe("nativeTaskProgress", () => {
 
 describe("sessionTaskList", () => {
   it("uses the agent's own list while the session has no plan", () => {
-    const list = sessionTaskList([ledgerEntry(0)], TODOS, true);
+    const list = sessionTaskList([journalEntry(0)], TODOS, true);
     expect(list.native).toBe(true);
     expect(list.plan).toBeNull();
     expect(list.progress).toHaveLength(3);
