@@ -475,9 +475,9 @@ class TurnContext:
         # resolved by the ``approval`` /events handler.
         self._pending_elicitations: dict[str, asyncio.Future[ElicitationResult]] = {}
         # Human-approval waits in flight (elicitation replies, policy
-        # verdicts). While > 0 heartbeats hold the idle window open so an
-        # unanswered approval isn't failed as a wedged turn; the absolute
-        # ceiling still applies.
+        # verdicts, client-tool call results). While > 0 heartbeats hold
+        # the idle window open so an unanswered wait isn't failed as a
+        # wedged turn; the absolute ceiling still applies.
         self._pending_human_waits = 0
         # Layer 3 per-policy-evaluation state:
         # ``evaluation_id`` → Future[PolicyVerdictPayload].
@@ -545,7 +545,15 @@ class TurnContext:
             self._hold_idle_watchdog()
         self._event_queue.put_nowait(event)
 
-    async def dispatch_tool(self, call_id: str, name: str, arguments: str, agent: str) -> str:
+    async def dispatch_tool(
+        self,
+        call_id: str,
+        name: str,
+        arguments: str,
+        agent: str,
+        *,
+        client_owned: bool = True,
+    ) -> str:
         """
         Emit a server-dispatched tool call and park until the result.
 
@@ -555,6 +563,17 @@ class TurnContext:
         the parked Future when Omnigent delivers an event carrying the
         matching ``call_id``. See §How Omnigent resolves action_required
         tool calls in the design doc.
+
+        ``client_owned`` gates whether the wait counts toward the idle
+        watchdog's human-approval hold (see ``_pending_human_waits``): a
+        genuine client-side tool can legitimately wait on a person far
+        longer than any in-turn LLM step, so heartbeats hold the idle
+        window open for as long as it is outstanding. A server-executed
+        call (e.g. the ``sys_os_*`` host-tool bridge) is answered by
+        Omnigent's own machinery, not a person, so a wedge there must
+        still trip the idle watchdog like any other stalled tool call;
+        callers pass ``client_owned=False`` for those. The absolute
+        ceiling bounds the turn either way.
 
         :param call_id: Unique identifier for this tool call,
             e.g. ``"call_abc123"``. Omnigent echoes it back in the
@@ -567,6 +586,13 @@ class TurnContext:
         :param agent: Agent name that invoked the tool — required
             on the function_call item per
             :class:`omnigent.entities.conversation.FunctionCallData`.
+        :param client_owned: ``True`` when a real connected client (a
+            human or an external system standing in for one) must
+            answer this call, so the idle watchdog should not fire
+            merely because the answer is slow. ``False`` for a call
+            Omnigent's own server-side machinery executes and answers,
+            which must still be treated as a normal tool step for
+            watchdog purposes.
         :returns: The tool's output string from
             :class:`omnigent.server.schemas.ToolResult`.
         :raises asyncio.CancelledError: If the turn is cancelled
@@ -587,8 +613,25 @@ class TurnContext:
             "arguments": arguments,
             "call_id": call_id,
             "agent": agent,
+            # Additive marker, not part of the OpenAI function_call shape:
+            # lets omnigent.runtime.pending_client_tool_calls exclude a
+            # server-executed dispatch from the reconnect snapshot —
+            # a reconnecting client has nothing to answer for a call it
+            # never owned. Pydantic ignores unknown keys by default, so
+            # this is safe even if the item is later parsed as
+            # FunctionCallData.
+            "client_owned": client_owned,
         }
         self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
+        # A genuinely client-owned tool parks on a human (or external system)
+        # to answer, same as an elicitation reply — hold the idle window open
+        # on heartbeats while it waits so an unanswered call doesn't trip the
+        # idle watchdog mid-wait. The absolute ceiling still bounds the turn.
+        # A server-executed call (``client_owned=False``) gets no such hold:
+        # nothing is waiting on a person, so a wedge there must still fail
+        # the turn like any other stalled tool call.
+        if client_owned:
+            self._pending_human_waits += 1
         try:
             result = await future
             item["status"] = "completed"
@@ -610,8 +653,12 @@ class TurnContext:
         finally:
             # Always remove — whether the Future resolved cleanly
             # or was cancelled, holding it in the dict would
-            # leak memory across turns.
+            # leak memory across turns. The hold decrement mirrors
+            # whichever branch incremented it above, on every exit path
+            # (answer, cancel, or an unexpected exception from ``future``).
             self._pending_tool_calls.pop(call_id, None)
+            if client_owned:
+                self._pending_human_waits -= 1
 
     async def elicit(
         self, elicitation_id: str, params: ElicitationRequestParams
