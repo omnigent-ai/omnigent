@@ -4,6 +4,7 @@ import {
   compileGithubQuery,
   compileJiraJql,
   describeLinearFilter,
+  describePagerDutyFilter,
   describeSlackFilter,
   isTriggerPrompt,
   readTriggerWorkerSettings,
@@ -16,6 +17,7 @@ import {
   splitJqlOrderBy,
   triggerConditionFields,
   triggerFieldsComplete,
+  triggerScopeOperators,
   updateTriggerWorkerSettings,
   withTriggerEvent,
   TRIGGER_SOURCES,
@@ -518,8 +520,49 @@ describe("describeLinearFilter", () => {
   });
 });
 
+describe("triggerScopeOperators", () => {
+  it("offers contains only where the template opts in", () => {
+    expect(triggerScopeOperators("pagerduty")).toEqual(["is", "in", "contains"]);
+    for (const source of ["jira", "slack", "github", "linear"] as const) {
+      expect(triggerScopeOperators(source)).toEqual(["is", "in"]);
+    }
+  });
+
+  it("treats contains as one value, like equals", () => {
+    const pagerduty = (scope: string) =>
+      triggerFieldsComplete(
+        fields({ event: "triggered", scope, scopeOperator: "contains", conditions: [] }),
+        "pagerduty",
+      );
+    expect(pagerduty("payments")).toBe(true);
+    expect(pagerduty("payments, checkout")).toBe(false);
+  });
+});
+
+describe("describePagerDutyFilter", () => {
+  const filter = (...conditions: TriggerCondition[]) =>
+    describePagerDutyFilter(fields({ scope: "Payments API", conditions }));
+
+  it("joins the rows into one clause, with me as the owner", () => {
+    expect(filter()).toBe("");
+    expect(
+      filter(
+        { field: "urgency", operator: "is", value: "high" },
+        { field: "priority", operator: "is_not", value: "P3" },
+        { field: "title", operator: "not_contains", value: "flaky" },
+        { field: "assignee", operator: "is", value: "Me" },
+      ),
+    ).toBe(
+      'that have urgency "high", don\'t have priority "P3", don\'t have "flaky" in the title and are assigned to you',
+    );
+    expect(filter({ field: "assignee", operator: "is_not", value: "ana@example.com" })).toBe(
+      'that aren\'t assigned to "ana@example.com"',
+    );
+  });
+});
+
 describe("isTriggerPrompt", () => {
-  it.each(["jira", "slack", "github", "linear"] as const)(
+  it.each(["jira", "slack", "github", "linear", "pagerduty"] as const)(
     "recognizes a rendered %s prompt",
     (source) => {
       expect(isTriggerPrompt(renderTriggerPrompt(source, fields(), CTX))).toBe(true);
@@ -823,6 +866,89 @@ describe("renderTriggerPrompt", () => {
     expect(unfiltered).toContain("Watch: new Linear issues in team ENG\n");
     expect(unfiltered).toContain("with team set to that team,");
     expect(unfiltered).toContain("Every issue counts.");
+  });
+
+  it("renders the PagerDuty search for open incidents with the incident note link-back", () => {
+    const prompt = renderTriggerPrompt(
+      "pagerduty",
+      fields({
+        event: "triggered",
+        scope: "Payments API, PABC123",
+        scopeOperator: "in",
+        conditions: [{ field: "urgency", operator: "is", value: "high" }],
+        instructions: "Find the likely cause.",
+      }),
+      CTX,
+    );
+
+    expect(prompt).toContain(
+      "This automation watches PagerDuty and starts one Omnigent session for each newly created incident that matches.",
+    );
+    expect(prompt).toContain(
+      'Watch: new open PagerDuty incidents on services Payments API, PABC123 that have urgency "high"',
+    );
+    // Resolved incidents are left out, so only open ones start sessions.
+    expect(prompt).toContain(
+      'with service_ids set to those services\' IDs, since set to that time and until set to the time you noted, both in ISO 8601, statuses triggered and acknowledged, and sort_by "created_at:asc".',
+    );
+    // Sorted results checkpoint by the last one read; unsorted ones need every page first.
+    expect(prompt).toContain(
+      "If the tool can't sort by creation time, read every page first, then work through the results oldest first; if you can't read every page that way, start no sessions in this run and keep the previous check time.",
+    );
+    expect(prompt).toContain("Incidents already resolved don't count.");
+    expect(prompt).toContain('Only incidents that have urgency "high" count.');
+    expect(prompt).toContain('title "PagerDuty <incident number>"');
+    expect(prompt).toContain("between <pagerduty-incident> and </pagerduty-incident> lines.");
+    expect(prompt).toContain(
+      'Add "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" as a note on each incident you started a session for.',
+    );
+    // A note that fails is retried like any other link-back.
+    expect(prompt).toContain('"Link-back pending:"');
+    // Workers must leave the incident's state alone so paging continues.
+    expect(prompt).toMatch(
+      /\n\nPosting instructions for each session:\n.*\nDon't acknowledge, reassign, escalate or resolve the incident; notes are fine\.$/,
+    );
+    expect(splitTriggerPrompt(prompt)).toEqual({
+      userPrompt: "Find the likely cause.",
+      systemPrompt: expect.stringMatching(
+        /Don't acknowledge, reassign, escalate or resolve the incident; notes are fine\.$/,
+      ),
+    });
+    expect(prompt).toContain(
+      "say that this automation needs a PagerDuty MCP server where it runs.",
+    );
+
+    const unfiltered = renderTriggerPrompt(
+      "pagerduty",
+      fields({ event: "triggered", scope: "Payments API", conditions: [] }),
+      CTX,
+    );
+    expect(unfiltered).toContain("Watch: new open PagerDuty incidents on service Payments API\n");
+    expect(unfiltered).toContain("with service_ids set to that service's ID,");
+    expect(unfiltered).toContain("Every open incident counts.");
+  });
+
+  it("renders a PagerDuty service name contains scope as a service lookup", () => {
+    const prompt = renderTriggerPrompt(
+      "pagerduty",
+      fields({
+        event: "triggered",
+        scope: " payments ",
+        scopeOperator: "contains",
+        conditions: [],
+        instructions: "Find the likely cause.",
+      }),
+      CTX,
+    );
+
+    expect(prompt).toContain(
+      'Watch: new open PagerDuty incidents on services whose name contains "payments"\n',
+    );
+    expect(prompt).toContain(
+      'Use your PagerDuty tools to find every service whose name contains "payments", ignoring case, for example the services list with query set to "payments", through every page, keeping only names that contain it. If none does, skip to your reply and say so. Then list the incidents created on those services since that time that are still open, for example the incidents list with service_ids set to their IDs,',
+    );
+    // A name fragment isn't one service, so it skips the exact-name lookup.
+    expect(prompt).not.toContain("Each service is given by ID or name");
   });
 
   it("shell-quotes the GitHub example so an apostrophe can't break it", () => {

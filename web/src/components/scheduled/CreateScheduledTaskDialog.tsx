@@ -102,6 +102,7 @@ const TRIGGER_TYPE_LABELS: Record<AutomationTriggerType, string> = {
   slack: "Slack",
   github: "GitHub",
   linear: "Linear",
+  pagerduty: "PagerDuty",
 };
 
 interface AutomationTypeDraft {
@@ -139,7 +140,7 @@ export function CreateScheduledTaskDialog({
   /** Seed values applied when opening from a template card. */
   initialName?: string;
   initialPrompt?: string;
-  /** Open on a Jira/Slack/GitHub/Linear trigger template instead of a plain prompt. */
+  /** Open on a Jira/Slack/GitHub/Linear/PagerDuty trigger template instead of a plain prompt. */
   initialTrigger?: TriggerSource | null;
   initialTemplateId?: AutomationTemplateId;
   /** Shareable session URL the trigger prompt links back with; see `SESSION_LINK_ID_PLACEHOLDER`. */
@@ -964,15 +965,17 @@ export function CreateScheduledTaskDialog({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
-                  {(["schedule", "jira", "slack", "github", "linear"] as const).map((type) => (
-                    <SelectItem
-                      key={type}
-                      value={type}
-                      disabled={type !== "schedule" && !triggersSupported}
-                    >
-                      {TRIGGER_TYPE_LABELS[type]}
-                    </SelectItem>
-                  ))}
+                  {(["schedule", "jira", "slack", "github", "linear", "pagerduty"] as const).map(
+                    (type) => (
+                      <SelectItem
+                        key={type}
+                        value={type}
+                        disabled={type !== "schedule" && !triggersSupported}
+                      >
+                        {TRIGGER_TYPE_LABELS[type]}
+                      </SelectItem>
+                    ),
+                  )}
                 </SelectContent>
               </Select>
               {!curationPending && !triggersSupported && (

@@ -367,7 +367,7 @@ def _scheduled_session_title(task: ScheduledTask) -> str:
     if task.session_mode == "continue" and task.prompt.startswith(
         tuple(
             f"This automation watches {source} and starts one Omnigent session"
-            for source in ("Jira", "Slack", "GitHub", "Linear")
+            for source in ("Jira", "Slack", "GitHub", "Linear", "PagerDuty")
         )
     ):
         return f"[automation job] {task.name}"

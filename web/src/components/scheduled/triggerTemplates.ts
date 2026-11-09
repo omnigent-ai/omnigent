@@ -1,9 +1,9 @@
-// Renders manager prompts for Jira, Slack, GitHub, and Linear trigger automations.
+// Renders manager prompts for Jira, Slack, GitHub, Linear, and PagerDuty trigger automations.
 
 import type { LucideIcon } from "lucide-react";
-import { CircleDotIcon, HashIcon, ListTodoIcon, TicketIcon } from "lucide-react";
+import { CircleDotIcon, HashIcon, ListTodoIcon, SirenIcon, TicketIcon } from "lucide-react";
 
-export type TriggerSource = "jira" | "slack" | "github" | "linear";
+export type TriggerSource = "jira" | "slack" | "github" | "linear" | "pagerduty";
 
 /** Where the manager starts each worker: next to itself, or in a new sandbox. */
 export type WorkerPlacement = "same_host" | "managed";
@@ -26,6 +26,15 @@ export const TRIGGER_OPERATOR_LABELS: Record<TriggerOperator, string> = {
 /** Operators that compare against nothing, so their row has no value to fill in. */
 export const VALUELESS_OPERATORS: ReadonlySet<TriggerOperator> = new Set(["empty", "not_empty"]);
 
+/** How the scope matches: one value, any listed value, or a name containing the text. */
+export type TriggerScopeOperator = "is" | "in" | "contains";
+
+export const TRIGGER_SCOPE_OPERATOR_LABELS: Record<TriggerScopeOperator, string> = {
+  is: "equals",
+  in: "in",
+  contains: "contains",
+};
+
 /** One "and <field> <operator> <value>" row of a trigger. */
 export interface TriggerCondition {
   /** A field id from the source's {@link TriggerTemplate.fields}, e.g. `"label"`. */
@@ -39,11 +48,11 @@ export interface TriggerFields {
   event: string;
   /**
    * Jira: project keys. Slack: channels, or people for DMs. GitHub: `owner/repo`.
-   * Linear: team keys. Comma-separated.
+   * Linear: team keys. PagerDuty: service names or IDs. Comma-separated.
    */
   scope: string;
   /** Omitted by older callers, which infer membership from the number of values. */
-  scopeOperator?: "is" | "in";
+  scopeOperator?: TriggerScopeOperator;
   conditions: TriggerCondition[];
   /** What each started session should do with its item. */
   instructions: string;
@@ -121,6 +130,8 @@ export interface TriggerTemplate {
   /** Scope field, e.g. "project", compared by the selected operator. */
   scopeLabel: string;
   scopePlaceholder: string;
+  /** The scope operators offered, in order; equals and in when omitted. */
+  scopeOperators?: TriggerScopeOperator[];
   fields: TriggerConditionField[];
   instructionsPlaceholder: string;
   /** Label for the checkbox that posts the session link. */
@@ -308,6 +319,46 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     itemPlural: "issues",
     toolsExample: "a Linear MCP server",
   },
+  pagerduty: {
+    source: "pagerduty",
+    icon: SirenIcon,
+    iconClassName: "text-red-600 dark:text-red-400",
+    title: "PagerDuty incidents",
+    description:
+      "Watch services for matching new incidents and start a session to investigate each one.",
+    name: "PagerDuty incidents",
+    events: [
+      {
+        id: "triggered",
+        label: "Incident triggered",
+        authorAction: "trigger an incident on this service",
+      },
+    ],
+    scopeLabel: "service",
+    scopePlaceholder: "Payments API, PXXXXXX",
+    // Service names often share a team or product prefix, so one rule can cover them all.
+    scopeOperators: ["is", "in", "contains"],
+    fields: [
+      { id: "urgency", label: "Urgency", operators: ["is", "is_not"], placeholder: "high" },
+      { id: "priority", label: "Priority", operators: ["is", "is_not"], placeholder: "P1" },
+      {
+        id: "title",
+        label: "Title",
+        operators: ["contains", "not_contains"],
+        placeholder: "latency",
+      },
+      {
+        id: "assignee",
+        label: "Assigned to",
+        operators: ["is", "is_not"],
+        placeholder: "me, or a name or email",
+      },
+    ],
+    instructionsPlaceholder: "Investigate the incident and add a note with the likely cause.",
+    linkBackLabel: "Add the session link as a note on the incident",
+    itemPlural: "incidents",
+    toolsExample: "a PagerDuty MCP server",
+  },
 };
 
 /** The fields a new trigger starts with: the default event, nothing else filled. */
@@ -322,7 +373,12 @@ export function emptyTriggerFields(source: TriggerSource): TriggerFields {
   };
 }
 
-export const TRIGGER_SOURCES: TriggerSource[] = ["jira", "slack", "github", "linear"];
+export const TRIGGER_SOURCES: TriggerSource[] = ["jira", "slack", "github", "linear", "pagerduty"];
+
+/** The scope operators a template offers, e.g. PagerDuty's service name `contains`. */
+export function triggerScopeOperators(source: TriggerSource): TriggerScopeOperator[] {
+  return TRIGGER_TEMPLATES[source].scopeOperators ?? ["is", "in"];
+}
 
 /** The selected event of a template, or its default when `eventId` is unknown. */
 export function triggerEvent(source: TriggerSource, eventId: string): TriggerEvent {
@@ -536,6 +592,7 @@ const SERVICE_NAMES: Record<TriggerSource, string> = {
   slack: "Slack",
   github: "GitHub",
   linear: "Linear",
+  pagerduty: "PagerDuty",
 };
 
 /** The service a template watches, e.g. "Jira". */
@@ -595,11 +652,16 @@ export function triggerFieldsComplete(fields: TriggerFields, source?: TriggerSou
     source === undefined ? scopeList(fields.scope) : triggerScopeEntries(source, fields);
   return (
     entries.length >= (isGroup ? 2 : 1) &&
-    (isGroup || fields.scopeOperator !== "is" || !fields.scope.includes(",")) &&
+    (isGroup || !singleValueScope(fields) || !fields.scope.includes(",")) &&
     fields.conditions.every((c) => VALUELESS_OPERATORS.has(c.operator) || c.value.trim() !== "") &&
     instructions !== "" &&
     instructions.length <= MAX_INSTRUCTIONS_CHARS
   );
+}
+
+/** Whether the scope operator compares against one value, so a comma can't separate a list. */
+export function singleValueScope(fields: TriggerFields): boolean {
+  return fields.scopeOperator === "is" || fields.scopeOperator === "contains";
 }
 
 /**
@@ -785,6 +847,27 @@ export function describeLinearFilter(fields: TriggerFields): string {
   return `that ${joined}`;
 }
 
+/** The PagerDuty condition rows as a clause, e.g. `that have urgency "high"`; "" with none. */
+export function describePagerDutyFilter(fields: TriggerFields): string {
+  const phrases = fields.conditions.map((c) => {
+    const value = `"${c.value.trim()}"`;
+    const negated = c.operator === "is_not" || c.operator === "not_contains";
+    switch (c.field) {
+      case "urgency":
+      case "priority":
+        return `${negated ? "don't have" : "have"} ${c.field} ${value}`;
+      case "assignee": {
+        // "me" is the owner, whose PagerDuty tools the manager runs with.
+        const who = c.value.trim().toLowerCase() === "me" ? "you" : value;
+        return `${negated ? "aren't" : "are"} assigned to ${who}`;
+      }
+      default:
+        return `${negated ? "don't have" : "have"} ${value} in the title`;
+    }
+  });
+  return phrases.length === 0 ? "" : `that ${joinAnd(phrases)}`;
+}
+
 /** How a run reads search results when the service returns them oldest first. */
 const READ_OLDEST_FIRST =
   "Read every page of results in that order. If you can't read them all, stop at the last result you read.";
@@ -820,6 +903,10 @@ const GITHUB_ACCOUNT_INSTRUCTIONS =
   "Do not use gh auth switch: changing shared CLI state can disrupt other sessions. " +
   "Keep the verified account for reads and writes; do not treat an access failure as no matches. " +
   "If no configured account has access, report the blocker without attempting to grant access.";
+
+/** Changing an incident's state can stop PagerDuty from paging the on-call engineer. */
+const PAGERDUTY_INCIDENT_STATE_INSTRUCTIONS =
+  "Don't acknowledge, reassign, escalate or resolve the incident; notes are fine.";
 
 const GITHUB_ITEMS: Record<string, string> = {
   issue: "issue",
@@ -916,6 +1003,39 @@ function sourceText(source: TriggerSource, fields: TriggerFields): SourceText {
       linkBack: (link) => `Comment "${link}" on each issue you started a session for.`,
     };
   }
+  if (source === "pagerduty") {
+    const services = scopeList(fields.scope);
+    const nameText = `"${fields.scope.trim()}"`;
+    const byName = fields.scopeOperator === "contains";
+    const where = byName
+      ? `services whose name contains ${nameText}`
+      : services.length === 1
+        ? `service ${services[0]}`
+        : `services ${services.join(", ")}`;
+    const openIncidents = (on: string, serviceIds: string) =>
+      `the incidents created on ${on} since that time that are still open, for example the incidents list with service_ids set to ${serviceIds}, since set to that time and until set to the time you noted, both in ISO 8601, statuses triggered and acknowledged, and sort_by "created_at:asc".`;
+    const filter = describePagerDutyFilter(fields);
+    return {
+      watch: () =>
+        `Watch: new open PagerDuty incidents on ${where}${filter !== "" ? ` ${filter}` : ""}`,
+      search: () =>
+        (byName
+          ? `Use your PagerDuty tools to find every service whose name contains ${nameText}, ignoring case, for example the services list with query set to ${nameText}, through every page, keeping only names that contain it. If none does, skip to your reply and say so. Then list ${openIncidents("those services", "their IDs")}`
+          : `Use your PagerDuty tools to list ${openIncidents(where, services.length === 1 ? "that service's ID" : "those services' IDs")} Each service is given by ID or name: look up a name's ID first, and treat a name that matches no service or more than one as no match and say so in your reply.`) +
+        " Incidents already resolved don't count." +
+        (filter !== ""
+          ? ` Only incidents ${filter} count. Pass the conditions the tool can filter on and check the rest against each incident yourself; "you" is the PagerDuty user your tools act as.`
+          : " Every open incident counts."),
+      readOrder:
+        "Follow the offset while more is true and read every page in that order. If you can't read them all, stop at the last result you read. If the tool can't sort by creation time, read every page first, then work through the results oldest first; if you can't read every page that way, start no sessions in this run and keep the previous check time.",
+      createdAt: "created",
+      item: "incident",
+      fence: "pagerduty-incident",
+      title: '"PagerDuty <incident number>"',
+      details: "the incident's number, link, title, service, urgency, priority and alert summary",
+      linkBack: (link) => `Add "${link}" as a note on each incident you started a session for.`,
+    };
+  }
   const item = GITHUB_ITEMS[fields.event] ?? GITHUB_ITEMS.any;
   const query = compileGithubQuery(fields);
   return {
@@ -995,6 +1115,8 @@ export function renderTriggerPrompt(
       ? `Instructions for each session:\n${fields.instructions.trim()}${SESSION_POSTING_INSTRUCTIONS}${POSTING_INSTRUCTIONS}\n${GITHUB_ACCOUNT_INSTRUCTIONS}`
       : source === "slack"
         ? `Instructions for each session:\n${fields.instructions.trim()}${SESSION_POSTING_INSTRUCTIONS}${workerPostingInstructions}`
-        : `Instructions for each session:\n${fields.instructions.trim()}\n${POSTING_INSTRUCTIONS}`,
+        : source === "pagerduty"
+          ? `Instructions for each session:\n${fields.instructions.trim()}${SESSION_POSTING_INSTRUCTIONS}${POSTING_INSTRUCTIONS}\n${PAGERDUTY_INCIDENT_STATE_INSTRUCTIONS}`
+          : `Instructions for each session:\n${fields.instructions.trim()}\n${POSTING_INSTRUCTIONS}`,
   ].join("\n\n");
 }

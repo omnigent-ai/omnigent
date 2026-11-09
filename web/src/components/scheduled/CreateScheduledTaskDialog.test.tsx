@@ -3068,6 +3068,7 @@ describe("automation trigger type", () => {
     ["Slack", "slack", "support"],
     ["GitHub", "github", "acme/app"],
     ["Linear", "linear", "ENG"],
+    ["PagerDuty", "pagerduty", "Payments API"],
   ])(
     "defaults to Schedule and creates a %s trigger from the selector",
     async (label, source, scope) => {
@@ -3204,7 +3205,7 @@ describe("automation trigger type", () => {
       );
       fireEvent.keyDown(screen.getByLabelText("Trigger type"), { key: "Enter" });
       await screen.findByRole("listbox");
-      for (const label of ["Jira", "Slack", "GitHub", "Linear"]) {
+      for (const label of ["Jira", "Slack", "GitHub", "Linear", "PagerDuty"]) {
         expect(screen.getByRole("option", { name: label })).toHaveAttribute(
           "aria-disabled",
           "true",
@@ -3226,7 +3227,7 @@ describe("automation trigger type", () => {
 
 describe("CreateScheduledTaskDialog trigger template", () => {
   function renderTrigger(
-    source: "jira" | "slack" | "github" | "linear",
+    source: "jira" | "slack" | "github" | "linear" | "pagerduty",
     extraInfo: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> = {},
     sessionLink = "https://omni.example.com/c/CONVERSATION_ID",
   ) {
@@ -3619,6 +3620,73 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt).toContain("Watch: new Linear issues in team ENG that are unassigned");
     expect(prompt).toContain(
       'Comment "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" on each issue',
+    );
+  });
+
+  it("builds a PagerDuty trigger for a service, with an urgency row and the incident note", async () => {
+    renderTrigger("pagerduty");
+    expect(screen.getByTestId("task-name-input")).toHaveValue("PagerDuty incidents");
+    expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Incident triggered");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where service");
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can trigger an incident on this service may direct the agent",
+    );
+    expect(showWarnings().getByTestId("task-trigger-tools-note")).toHaveTextContent(
+      "This only works if the agent has a PagerDuty MCP server where this task runs.",
+    );
+    type("task-trigger-scope", "Payments API");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    pick("task-trigger-condition-0-field", "task-trigger-condition-0-field-urgency");
+    type("task-trigger-condition-0-value", "high");
+    type("task-trigger-instructions", "Find the likely cause.");
+
+    const prompt = await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].templateId).toBe("pagerduty");
+    expect(prompt).toContain(
+      'Watch: new open PagerDuty incidents on service Payments API that have urgency "high"',
+    );
+    expect(prompt).toContain(
+      'Add "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" as a note on each incident',
+    );
+  });
+
+  it("matches PagerDuty services by name with contains, which other sources don't offer", async () => {
+    function openScopeOperator() {
+      const scopeOperator = screen.getByTestId("task-trigger-scope-operator");
+      fireEvent.pointerDown(
+        scopeOperator,
+        new MouseEvent("pointerdown", { bubbles: true, button: 0 }),
+      );
+      fireEvent.click(scopeOperator);
+    }
+
+    const { unmount } = renderTrigger("jira");
+    openScopeOperator();
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "equals",
+      "in",
+    ]);
+    unmount();
+
+    renderTrigger("pagerduty");
+    openScopeOperator();
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "equals",
+      "in",
+      "contains",
+    ]);
+    fireEvent.click(screen.getByRole("option", { name: "contains" }));
+    expect(screen.getByTestId("task-trigger-scope-operator")).toHaveTextContent("contains");
+    type("task-trigger-scope", "payments, checkout");
+    type("task-trigger-instructions", "Find the likely cause.");
+    expect(screen.getByRole("alert")).toHaveTextContent("Contains matches one piece of text.");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    type("task-trigger-scope", "payments");
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    const prompt = await submittedPrompt();
+    expect(prompt).toContain(
+      'Watch: new open PagerDuty incidents on services whose name contains "payments"',
     );
   });
 
