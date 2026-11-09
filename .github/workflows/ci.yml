@@ -187,11 +187,12 @@ jobs:
         run: |
           mkdir -p artifacts artifacts/progress "$(dirname "$COVERAGE_FILE")"
           # matrix.paths is unquoted on purpose: it word-splits into pytest args.
+          # Default workers match the standard runner's 4 vCPUs.
           # shellcheck disable=SC2086
           env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
             uv run pytest ${{ matrix.paths }} \
               -m "${{ matrix.markexpr || 'not databricks' }}" \
-              -n ${{ matrix.workers || '8' }} \
+              -n ${{ matrix.workers || '4' }} \
               --dist=${{ matrix.dist || 'loadfile' }} \
               --timeout=300 \
               --junitxml=artifacts/pytest-${{ matrix.group }}.xml \
