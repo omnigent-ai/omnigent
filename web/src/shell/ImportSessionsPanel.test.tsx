@@ -12,7 +12,7 @@ import { useSessionImportStore } from "@/store/sessionImport";
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/lib/sessionsApi", () => ({ importLocalSessions: vi.fn() }));
 vi.mock("./HostLabel", () => ({
-  HostLabel: ({ host }: { host: { name: string } }) => <>{host.name}</>,
+  HostLabel: ({ host }: { host: { name: string } }) => host.name,
 }));
 // Radix Select uses a portal + pointer events jsdom can't drive; a native
 // <select> keeps the option list assertable.

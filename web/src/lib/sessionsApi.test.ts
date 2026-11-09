@@ -2071,7 +2071,8 @@ describe("importLocalSessions", () => {
 
     const seen: string[] = [];
     await expect(importLocalSessions("h", "all", 25, (s) => seen.push(s.id))).rejects.toThrow(
-      "The import stopped before it could finish. 2 sessions were imported.",
+      "The import stopped before it could finish. 2 sessions were imported. " +
+        "Import again to pick up the rest.",
     );
     expect(seen).toEqual(["c1", "c2"]);
   });
