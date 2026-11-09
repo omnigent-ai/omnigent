@@ -13,6 +13,7 @@ import pytest
 from omnigent.debug_logging import current_session_id_scope, record_to_row
 from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
 from omnigent.native.input_diagnostics import input_delivery_scope
+from tests.harnesses.claude_native.test_claude_native_bridge import _composer_pane
 
 
 @pytest.mark.parametrize(
@@ -104,7 +105,9 @@ def test_delivery_diagnostics(
     monkeypatch.setattr(bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
     monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
+    monkeypatch.setattr(
+        bridge, "_capture_pane", lambda *_a, **_k: _composer_pane() if pane == "❯ " else pane
+    )
     if scenario == "observation_error":
         monkeypatch.setattr(delivery_diagnostics, "_draft_observation", broken_observation)
     if scenario.startswith("pending_"):
@@ -203,8 +206,8 @@ def test_delivery_diagnostics(
         assert attrs["draft_pane_max_columns"] == len("❯ " + secret)
         assert attrs["submit_polls"] == (6 if scenario == "empty_capture" else 1)
         assert attrs["submit_wait_ms"] == (60 if scenario == "empty_capture" else 10)
-        assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 1)
-        assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
+        assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 4)
+        assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 30)
         assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
         assert attrs["stage_verifying_submit_ms"] == (60 if scenario == "empty_capture" else 10)
         assert attrs["elapsed_ms"] == (80 if scenario == "empty_capture" else 30)

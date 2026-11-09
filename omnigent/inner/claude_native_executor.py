@@ -27,6 +27,8 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTerminalExited,
     ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
+    _original_input_scope,
+    _OriginalInputAttempt,
     cancellable_injection,
     claude_pane_ready,
     has_pending_user_prompt,
@@ -50,6 +52,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     TextChunk,
     ToolSpec,
@@ -102,8 +105,11 @@ class _ClaudeSessionInactive(RuntimeError):
 
 def _can_hold_refusal(
     exc: ClaudeUserPromptPending | ClaudeTerminalDialog | ClaudeComposerNotCleared,
+    attempt: _OriginalInputAttempt | None = None,
 ) -> bool:
     """Return whether a refusal came before typing, so the message can be held and retried."""
+    if attempt is None or not attempt.can_hold(exc):
+        return False
     if isinstance(exc, ClaudeUserPromptPending):
         return exc.nothing_typed
     if isinstance(exc, ClaudeTerminalDialog):
@@ -184,10 +190,19 @@ class ClaudeNativeExecutor(Executor):
             # run_turn's short-circuit answers it with the `omni setup`
             # guidance instead of spending a model turn on it.
             return False
+        attempt = _OriginalInputAttempt(self._bridge_dir, self._request_session_id)
         try:
-            async with self._inject_lock:
-                await self._inject_prompt(text, framework_notices(content))
-        except RuntimeError:
+            with _original_input_scope(attempt):
+                async with self._inject_lock:
+                    await self._inject_prompt(text, framework_notices(content))
+        except _ClaudeSessionInactive as exc:
+            if attempt.payload_may_have_been_written:
+                raise InjectionDeliveryAmbiguous(str(exc)) from exc
+            # The caller's binding guard refused before worker dispatch.
+            return False
+        except RuntimeError as exc:
+            if not attempt.undelivered(exc):
+                raise InjectionDeliveryAmbiguous(str(exc)) from exc
             return False
         return True
 
@@ -463,8 +478,9 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` only accepts this session's picker values, aliases, and
         # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
+        attempt = _OriginalInputAttempt(self._bridge_dir, self._request_session_id)
         try:
-            with telemetry.span("claude_native.inject"):
+            with _original_input_scope(attempt), telemetry.span("claude_native.inject"):
                 hold_deadline: float | None = None
                 while True:
                     try:
@@ -476,7 +492,7 @@ class ClaudeNativeExecutor(Executor):
                         ClaudeComposerNotCleared,
                     ) as exc:
                         # Refused before the message was typed: hold it and retry.
-                        if not _can_hold_refusal(exc):
+                        if not _can_hold_refusal(exc, attempt):
                             raise
                         if hold_deadline is None:
                             hold_deadline = asyncio.get_running_loop().time() + _MESSAGE_HOLD_S
@@ -484,7 +500,9 @@ class ClaudeNativeExecutor(Executor):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)
         except _ClaudeSessionInactive as exc:
-            yield ExecutorError(message=str(exc), undelivered=True)
+            yield ExecutorError(
+                message=str(exc), undelivered=not attempt.payload_may_have_been_written
+            )
             return
         except ClaudeTerminalExited as exc:
             # Claude Code exits 0 on /quit or a closed window. The turn still
@@ -498,24 +516,26 @@ class ClaudeNativeExecutor(Executor):
                 exc_info=not clean_exit,
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
+            # tmux coordinates do not prove the failed pane's physical lifetime.
             message = describe_exception(exc)
-            if cleanup_error is not None:
-                message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message, undelivered=True)
+            yield ExecutorError(
+                message=message,
+                undelivered=attempt.undelivered(exc),
+                preserve_session=attempt.uncertain_write(exc),
+            )
             return
         except ClaudePromptTimeout as exc:
             _logger.exception(
                 "claude-native: prompt delivery to harness timed out",
                 extra={"session_id": self._request_session_id},
             )
-            # The pane is still alive here: this turn's error reports the close,
-            # so the runner must not also report the pane's exit as a failure.
-            cleanup_error = self._reap_failed_turn(expected_close=True)
+            # A replacement can use the same socket before it is advertised.
             message = describe_exception(exc)
-            if cleanup_error is not None:
-                message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message, undelivered=True)
+            yield ExecutorError(
+                message=message,
+                undelivered=attempt.undelivered(exc),
+                preserve_session=attempt.uncertain_write(exc),
+            )
             return
         except ClaudeSignInPending as exc:
             # The pane is parked on a launcher sign-in the person finishes from
@@ -529,7 +549,8 @@ class ClaudeNativeExecutor(Executor):
                 code=exc.code,
                 title=exc.title,
                 remediation=exc.remediation,
-                undelivered=True,
+                undelivered=attempt.undelivered(exc),
+                preserve_session=attempt.uncertain_write(exc),
             )
             return
         except ClaudeTerminalDialog as exc:
@@ -542,7 +563,11 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: terminal surface blocks delivery; message not delivered",
                 extra={"session_id": self._request_session_id},
             )
-            yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            yield ExecutorError(
+                message=describe_exception(exc),
+                undelivered=attempt.undelivered(exc),
+                preserve_session=attempt.uncertain_write(exc),
+            )
             return
         except ClaudeUserPromptPending as exc:
             # A question or permission prompt held the message before its submit
@@ -552,7 +577,11 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: pending Claude prompt blocks delivery; message not delivered",
                 extra={"session_id": self._request_session_id},
             )
-            yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            yield ExecutorError(
+                message=describe_exception(exc),
+                undelivered=attempt.undelivered(exc),
+                preserve_session=attempt.uncertain_write(exc),
+            )
             return
         except (TmuxSessionNotAdvertised, ClaudeMessageNotAccepted) as exc:
             # The terminal may still launch, or its unsent draft may be recoverable.
@@ -560,14 +589,22 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: terminal refused delivery; message not delivered",
                 extra={"session_id": self._request_session_id},
             )
-            yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            yield ExecutorError(
+                message=describe_exception(exc),
+                undelivered=attempt.undelivered(exc),
+                preserve_session=attempt.uncertain_write(exc),
+            )
             return
         except RuntimeError as exc:
             _logger.exception(
                 "claude-native: failed to deliver message to harness",
                 extra={"session_id": self._request_session_id},
             )
-            yield ExecutorError(message=describe_exception(exc))
+            yield ExecutorError(
+                message=describe_exception(exc),
+                undelivered=attempt.undelivered(exc),
+                preserve_session=attempt.uncertain_write(exc),
+            )
             return
         yield TurnComplete(response=None)
 
