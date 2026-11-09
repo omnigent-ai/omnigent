@@ -4,24 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
 import re
 import shlex
-import time
 import urllib.error
 import urllib.request
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import httpx
-from websockets.exceptions import ConnectionClosed
 
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.debug_logging import debug_event
@@ -47,13 +45,10 @@ from omnigent.harnesses.codex_native.bridge import (
     MCP_STARTUP_STATES,
     CodexNativeBridgeState,
     DeveloperInstructionsReadState,
-    claim_codex_automatic_input,
     clear_active_turn_id_if_matches,
     clear_certificate_failure,
-    codex_automatic_input_was_interrupted,
     codex_config_revision,
     codex_home_for_bridge_dir,
-    codex_input_was_interrupted,
     pending_mcp_servers,
     read_bridge_state,
     read_certificate_failure,
@@ -63,8 +58,6 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_mcp_startup,
     record_child_usage_baseline,
-    record_codex_automatic_input_receipt,
-    settle_codex_automatic_input,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -102,12 +95,6 @@ from omnigent.native._native_supersession import (
 from omnigent.native.input_receipt import NATIVE_INPUT_RECEIPT_EVENT
 from omnigent.process_logging import log_info_once
 from omnigent.runner.launch_failure import is_codex_provider_auth_failure
-from omnigent.runtime.prompt import (
-    OUTPUT_LIMIT_CONTINUATION_INSTRUCTION as _OUTPUT_LIMIT_CONTINUE_TEXT,
-)
-from omnigent.runtime.prompt import (
-    STREAM_DISCONNECT_CONTINUATION_INSTRUCTION as _STREAM_DISCONNECT_CONTINUE_TEXT,
-)
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -281,6 +268,17 @@ _CODEX_COLLAB_RUNNING_STATUSES = frozenset({"pendingInit", "running"})
 _CODEX_COLLAB_FAILED_STATUSES = frozenset({"errored", "notFound"})
 # Omnigent control event type sent when a Codex child thread is discovered.
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE = "external_codex_subagent_start"
+# Items that register child threads stay on the ordered parent path so a
+# child's lane only ever starts after its Omnigent session exists.
+_CODEX_CHILD_REGISTRATION_ITEM_TYPES = frozenset(
+    {_CODEX_COLLAB_AGENT_ITEM_TYPE, _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE}
+)
+# Child events handled at once across all sub-agent lanes.
+_CHILD_DELIVERY_CONCURRENCY = 8
+# A child event older than this when delivered means its lane is backlogged.
+_CHILD_DELIVERY_LAG_WARNING_SECONDS = 30.0
+# Upper bound on draining queued child events at forwarder shutdown.
+_CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS = 10.0
 _PLAN_IMPLEMENTATION_QUESTION_ID = "plan_implementation"
 _PLAN_IMPLEMENTATION_TITLE = "Implement this plan?"
 _PLAN_IMPLEMENTATION_YES = "Yes, implement this plan"
@@ -352,21 +350,6 @@ _CODEX_OUTPUT_LIMIT_HINT = (
     "The model reached its response length limit. Ask it to continue or split "
     "the request into smaller parts."
 )
-_CODEX_STREAM_DISCONNECT_PREFIX = "stream disconnected before completion: "
-_CODEX_STREAM_DISCONNECT_HINT = (
-    "The response stream disconnected. Inspect the terminal before retrying so "
-    "completed work is not repeated."
-)
-
-
-def _is_stream_disconnect_message(message: str) -> bool:
-    """Codex transport failures exclude incomplete responses with their own policy."""
-    if not message.startswith(_CODEX_STREAM_DISCONNECT_PREFIX):
-        return False
-    detail = message.removeprefix(_CODEX_STREAM_DISCONNECT_PREFIX)
-    return bool(detail) and not detail.startswith("Incomplete response returned, reason:")
-
-
 # Budget/quota exhaustion from the AI gateway: the gateway returns HTTP 403 +
 # PERMISSION_DENIED for these, which looks like auth to the generic checks —
 # it isn't. Re-authenticating cannot resolve a spending limit.
@@ -401,6 +384,14 @@ class _ForwarderTarget:
     elicitation_tracker: _CodexElicitationTaskTracker
 
 
+@dataclass(frozen=True)
+class _QueuedChildEvent:
+    """One child-thread notification waiting on its lane."""
+
+    deliver: Callable[[], Awaitable[None]]
+    enqueued_at: float
+
+
 @dataclass
 class _CodexChildStream:
     """Child output and turn identity, independent of the parent's disk bridge."""
@@ -409,6 +400,68 @@ class _CodexChildStream:
     delta_coalescer: _OutputTextDeltaCoalescer
     active_turn_id: str | None = None
     terminal_turn_ids: set[str] = field(default_factory=set)
+    # Ordered lane so a busy child never blocks the parent's notifications.
+    delivery_queue: asyncio.Queue[_QueuedChildEvent | None] = field(default_factory=asyncio.Queue)
+    delivery_worker: asyncio.Task[None] | None = None
+    last_lag_warning_at: float | None = None
+
+    def enqueue(self, queued: _QueuedChildEvent, slots: asyncio.Semaphore) -> None:
+        """Queue one child event and start the lane's worker if needed."""
+        self.delivery_queue.put_nowait(queued)
+        if self.delivery_worker is None or self.delivery_worker.done():
+            self.delivery_worker = asyncio.create_task(
+                self._deliver(slots), name="codex-native-child-delivery"
+            )
+
+    async def _deliver(self, slots: asyncio.Semaphore) -> None:
+        """Deliver this child's events in order, sharing the global post budget."""
+        loop = asyncio.get_running_loop()
+        while (queued := await self.delivery_queue.get()) is not None:
+            waited = loop.time() - queued.enqueued_at
+            if waited >= _CHILD_DELIVERY_LAG_WARNING_SECONDS and (
+                self.last_lag_warning_at is None
+                or loop.time() - self.last_lag_warning_at >= _CHILD_DELIVERY_LAG_WARNING_SECONDS
+            ):
+                self.last_lag_warning_at = loop.time()
+                _logger.warning(
+                    "Codex child delivery is backlogged: waited=%.1fs queued=%d",
+                    waited,
+                    self.delivery_queue.qsize(),
+                )
+            async with slots:
+                try:
+                    await queued.deliver()
+                except Exception:  # keep the lane alive, as the parent loop does.
+                    _logger.warning("Codex child event handling failed", exc_info=True)
+
+    async def drain(self, timeout: float | None = _CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS) -> None:
+        """Deliver queued events, then stop the worker; ``None`` waits without a bound."""
+        worker = self.delivery_worker
+        if worker is None or worker.done():
+            return
+        self.delivery_queue.put_nowait(None)
+        try:
+            async with asyncio.timeout(timeout):
+                await asyncio.shield(worker)
+        except TimeoutError:
+            # The unread sentinel offsets the dequeued event the cancel drops.
+            _logger.warning(
+                "Codex child delivery drain timed out: dropped=%d",
+                self.delivery_queue.qsize(),
+            )
+            await self._stop_worker(worker)
+        except asyncio.CancelledError:
+            # The shield keeps a timeout from killing delivery mid-post; a
+            # cancelled shutdown must still stop the worker before resources close.
+            await self._stop_worker(worker)
+            raise
+
+    @staticmethod
+    async def _stop_worker(worker: asyncio.Task[None]) -> None:
+        """Cancel the lane worker and wait until it has finished."""
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
 
     def accepts_event(self, method: str, params: _JsonObject) -> bool:
         turn_id = _terminal_turn_id_from_params(params) or _turn_id_from_payload(params)
@@ -504,21 +557,6 @@ _RECENT_USAGE_FRAMES_PER_THREAD = 64
 
 
 @dataclass
-class _PendingOutputLimitError:
-    """A known native error held briefly for its owning completion, then surfaced."""
-
-    client: httpx.AsyncClient
-    session_id: str
-    bridge_dir: Path
-    owner: CodexNativeBridgeState
-    error: _CodexTerminalError
-    usage_coalescer: _SessionUsageCoalescer
-    timer: asyncio.Task[None] | None = None
-    client_message_id: str | None = None
-    acknowledged_turn_id: str | None = None
-
-
-@dataclass
 class _CodexForwarderState:
     """
     Mutable state for one long-lived Codex forwarder connection.
@@ -584,12 +622,6 @@ class _CodexForwarderState:
     :param surfaced_terminal_error_turns: Turn ids whose standalone terminal
         ``error`` notification was already surfaced. Used to suppress a later
         terminal boundary for the same turn.
-    :param open_tool_items_by_turn: Unfinished tools on this routed thread, by turn.
-        An unscoped tool start fences all recovery until its result is known.
-    :param pending_output_limit_errors: Output-limit notifications awaiting their
-        owning native turn's accepted completion.
-    :param output_limit_interrupt_attempts: Cancellation delivery outcome by
-        exact automatic continuation turn.
     :param posted_user_turns: Turn ids whose ``userMessage`` has been
         posted to Omnigent this connection, e.g. ``{"turn_123"}``. Used to
         enforce user-before-assistant ordering: before posting a turn's
@@ -702,12 +734,11 @@ class _CodexForwarderState:
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
+    child_delivery_slots: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(_CHILD_DELIVERY_CONCURRENCY)
+    )
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
-    presented_output_limit_error_turns: set[str] = field(default_factory=set)
-    open_tool_items_by_turn: dict[str | None, set[str]] = field(default_factory=dict)
-    pending_output_limit_errors: dict[str, _PendingOutputLimitError] = field(default_factory=dict)
-    output_limit_interrupt_attempts: dict[str, str] = field(default_factory=dict)
     posted_user_turns: set[str] = field(default_factory=set)
     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
     resume_echo_thread_ids: set[str] = field(default_factory=set)
@@ -942,17 +973,58 @@ class _CodexForwarderState:
             self.child_streams[thread_id] = stream
         return stream
 
-    async def close_output_limit_errors(self) -> None:
-        """Surface known failures before disconnect closes their HTTP client."""
-        for pending in list(self.pending_output_limit_errors.values()):
-            await _surface_pending_output_limit_error(self, pending)
+    def enqueue_child_event(
+        self,
+        client: httpx.AsyncClient,
+        event: CodexMessage,
+        deliver: Callable[[], Awaitable[None]],
+        parent_thread_id: str | None,
+    ) -> bool:
+        """
+        Hand a registered child's notification to that child's ordered lane.
+
+        Usage frames are recorded here, in connection order, because a child's
+        inherited baseline depends on frames other lanes have not delivered yet.
+
+        :param client: HTTP client the child's coalescer posts through.
+        :param event: Codex app-server notification envelope.
+        :param deliver: Handles ``event`` with its usage frame already recorded.
+        :param parent_thread_id: Current parent Codex thread id.
+        :returns: ``True`` when queued; ``False`` when the caller must handle
+            it inline (parent, unregistered, or child-registration events).
+        """
+        method = event.get("method")
+        params = event.get("params")
+        if method == "thread/started" or not isinstance(params, dict):
+            return False
+        item = params.get("item")
+        if isinstance(item, dict) and item.get("type") in _CODEX_CHILD_REGISTRATION_ITEM_TYPES:
+            return False
+        thread_id = _thread_id_from_params(params)
+        session_id = self.session_for_child_thread(thread_id) if thread_id is not None else None
+        if thread_id is None or session_id is None:
+            return False
+        if method == "thread/tokenUsage/updated":
+            self.note_usage_frame(params, parent_thread_id)
+        queued = _QueuedChildEvent(deliver=deliver, enqueued_at=asyncio.get_running_loop().time())
+        self.child_stream(client, thread_id, session_id).enqueue(queued, self.child_delivery_slots)
+        return True
+
+    async def settle_child_lanes(self) -> None:
+        """Deliver every queued child event before the parent's resources are replaced."""
+        await asyncio.gather(
+            *(stream.drain(timeout=None) for stream in self.child_streams.values())
+        )
 
     async def close_child_streams(self) -> None:
         """Drain child output while the forwarder's HTTP client is still open."""
-        await asyncio.gather(
-            *(stream.delta_coalescer.close() for stream in self.child_streams.values())
-        )
-        self.child_streams.clear()
+        try:
+            await asyncio.gather(*(stream.drain() for stream in self.child_streams.values()))
+        finally:
+            await asyncio.gather(
+                *(stream.delta_coalescer.close() for stream in self.child_streams.values())
+            )
+            self.child_streams.clear()
 
     def note_parent_rotation(self, session_id: str) -> None:
         """
@@ -1559,10 +1631,6 @@ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalErro
     return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
 
 
-def _is_recoverable_stream_error(error: _CodexTerminalError) -> bool:
-    return error.kind != _CODEX_ERROR_KIND_AUTH and _is_stream_disconnect_message(error.message)
-
-
 @dataclass(frozen=True)
 class _CodexTurnStatusEdge:
     """
@@ -2047,7 +2115,7 @@ class _OutputTextDeltaCoalescer:
                     delta,
                     started=chunk.reasoning_started,
                 )
-            except Exception:
+            except Exception:  # preserve the long-lived forwarder.
                 _logger.warning("Codex forwarder reasoning delta flush failed", exc_info=True)
             return
         if chunk.tool_call_id is not None:
@@ -2058,7 +2126,7 @@ class _OutputTextDeltaCoalescer:
                     delta,
                     call_id=chunk.tool_call_id,
                 )
-            except Exception:
+            except Exception:  # preserve the long-lived forwarder.
                 _logger.warning("Codex forwarder tool-output delta flush failed", exc_info=True)
             return
         index: int | None = None
@@ -2076,7 +2144,7 @@ class _OutputTextDeltaCoalescer:
                 index=index,
                 final=final,
             )
-        except Exception:
+        except Exception:  # preserve the long-lived forwarder.
             _logger.warning("Codex forwarder delta flush failed", exc_info=True)
 
 
@@ -2413,7 +2481,7 @@ class _CodexElicitationTaskTracker:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception:  # keep the long-lived forwarder alive.
             _logger.warning(
                 "Codex forwarder elicitation hook task failed: method=%s",
                 event.get("method"),
@@ -2633,6 +2701,7 @@ async def supervise_forwarder(
                         bridge_dir=bridge_dir,
                         app_server_url=app_server_url,
                         event=event,
+                        forwarder_state=forwarder_state,
                     )
                     if rotated:
                         await _clear_superseded_background_work(
@@ -2676,7 +2745,8 @@ async def supervise_forwarder(
                         parent_thread_id=target.thread_id,
                         event=event,
                     )
-                    await _handle_event(
+                    handle = functools.partial(
+                        _handle_event,
                         ap_client,
                         session_id=target.session_id,
                         bridge_dir=bridge_dir,
@@ -2688,7 +2758,15 @@ async def supervise_forwarder(
                         codex_client=client,
                         forwarder_state=forwarder_state,
                     )
-                except Exception:
+                    # Sub-agents share this socket; their posts must not delay the parent.
+                    if not forwarder_state.enqueue_child_event(
+                        ap_client,
+                        event,
+                        functools.partial(handle, usage_frame_recorded=True),
+                        parent_thread_id=target.thread_id,
+                    ):
+                        await handle()
+                except Exception:  # keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         except BaseException as exc:
             stream_error = exc
@@ -2709,12 +2787,12 @@ async def supervise_forwarder(
                 if isinstance(result, BaseException)
                 and not isinstance(result, asyncio.CancelledError)
             ]
+            # Child lanes run first: their queued handlers use the shared tracker.
             for close in (
-                forwarder_state.close_output_limit_errors,
+                forwarder_state.close_child_streams,
                 target.delta_coalescer.close,
                 target.usage_coalescer.close,
                 target.elicitation_tracker.close,
-                forwarder_state.close_child_streams,
                 client.close,
             ):
                 try:
@@ -2778,7 +2856,7 @@ async def _drive_side_chat_requests(
                         )
                         if child_thread_id is None:
                             raise RuntimeError("thread/fork returned no thread id")
-                    except Exception:
+                    except Exception:  # one bad request must not drop the rest.
                         _logger.warning(
                             "Codex /side fork failed for %s", request.path, exc_info=True
                         )
@@ -2789,7 +2867,7 @@ async def _drive_side_chat_requests(
                     # done, and a failed one has surfaced a notice — keeping it
                     # would retry the same failure forever.
                     side_chat.discard_side_chat_request(request.path)
-        except Exception:
+        except Exception:  # keep the drain loop alive.
             _logger.warning("Codex /side drain iteration failed", exc_info=True)
         await _sleep(_SIDE_CHAT_POLL_SECONDS)
 
@@ -2828,7 +2906,7 @@ async def _post_side_chat_failed_notice(
             response_id=marker,
             source_id=marker,
         )
-    except Exception:
+    except Exception:  # the notice is best-effort.
         _logger.warning("Codex /side failure notice could not be posted", exc_info=True)
 
 
@@ -2839,6 +2917,7 @@ async def _maybe_rotate_session_on_thread_started(
     bridge_dir: Path,
     app_server_url: str,
     event: CodexMessage,
+    forwarder_state: _CodexForwarderState | None = None,
 ) -> bool:
     """
     Rotate Omnigent ownership when Codex starts a new native thread.
@@ -2856,6 +2935,8 @@ async def _maybe_rotate_session_on_thread_started(
         ``"ws://127.0.0.1:9876"``. Persisted to bridge state for the
         replacement session.
     :param event: Codex app-server notification envelope.
+    :param forwarder_state: Connection state whose child lanes still hold
+        handlers bound to the target's current coalescers and tracker.
     :returns: ``True`` when rotation occurred.
     """
     new_thread_id = _thread_id_from_started_event(event)
@@ -2873,6 +2954,10 @@ async def _maybe_rotate_session_on_thread_started(
     # strands the real turn's output as stale. Ignore all ephemeral threads.
     if _thread_started_is_ephemeral(event):
         return False
+    # Queued child handlers captured this target's tracker and coalescers;
+    # deliver them before those are closed, as the serial loop used to.
+    if forwarder_state is not None:
+        await forwarder_state.settle_child_lanes()
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
     old_usage_coalescer = target.usage_coalescer
@@ -3093,11 +3178,6 @@ async def _subscribe_until_ready(
     bridge_state = read_bridge_state(bridge_dir)
     replay_from_turn_id = (
         bridge_state.active_turn_id
-        or (
-            bridge_state.automatic_input_source_turn_id
-            if bridge_state.automatic_input_outcome not in {"completed", "cancel_completed"}
-            else None
-        )
         if bridge_state is not None and bridge_state.thread_id == thread_id
         else None
     )
@@ -3261,7 +3341,6 @@ async def _finish_subscription(
             elicitation_tracker=elicitation_tracker,
             forwarder_state=forwarder_state,
             replay_from_turn_id=replay_from_turn_id,
-            codex_client=codex_client,
         )
     finally:
         if forwarder_state is not None:
@@ -3326,7 +3405,6 @@ async def _replay_resume_response(
     elicitation_tracker: _CodexElicitationTaskTracker,
     forwarder_state: _CodexForwarderState | None = None,
     replay_from_turn_id: str | None = None,
-    codex_client: CodexAppServerClient | None = None,
 ) -> None:
     """
     Mirror message items returned by ``thread/resume``.
@@ -3361,45 +3439,6 @@ async def _replay_resume_response(
     thread_id = thread_id if isinstance(thread_id, str) and thread_id else None
     replay_turns = _resume_turns_from(turns, replay_from_turn_id)
     async with _conversation_item_delivery_scope(session_id):
-        owner = read_bridge_state(bridge_dir)
-        if (
-            owner is not None
-            and thread_id is not None
-            and owner.session_id == session_id
-            and owner.thread_id == thread_id
-            and owner.automatic_input_client_message_id is not None
-            and owner.automatic_input_source_turn_id is not None
-        ):
-            receipt = _receipt_from_thread(
-                response,
-                thread_id=thread_id,
-                client_message_id=owner.automatic_input_client_message_id,
-                source_turn_id=owner.automatic_input_source_turn_id,
-            )
-            if receipt is not None:
-                proof = record_codex_automatic_input_receipt(
-                    bridge_dir,
-                    session_id=session_id,
-                    thread_id=thread_id,
-                    turn_id=receipt[0],
-                    client_message_id=owner.automatic_input_client_message_id,
-                )
-                if (
-                    proof is not None
-                    and codex_automatic_input_was_interrupted(proof, bridge_dir=bridge_dir)
-                    and codex_client is not None
-                    and forwarder_state is not None
-                    and receipt[1] == "inProgress"
-                ):
-                    await _interrupt_output_limit_continuation(
-                        codex_client,
-                        client=client,
-                        session_id=session_id,
-                        bridge_dir=bridge_dir,
-                        forwarder_state=forwarder_state,
-                        owner=proof,
-                        turn_id=receipt[0],
-                    )
         for turn in replay_turns:
             if not isinstance(turn, dict):
                 continue
@@ -3407,18 +3446,6 @@ async def _replay_resume_response(
             items = turn.get("items")
             if not turn_id or not isinstance(items, list):
                 continue
-            if (
-                _is_completed_automatic_input_source(read_bridge_state(bridge_dir), turn_id)
-                and not _is_recovered_output_limit_source(bridge_dir, turn_id)
-                and (source_error := _terminal_error_from_turn({"turn": turn})) is not None
-            ):
-                await _present_output_limit_error(
-                    client,
-                    session_id,
-                    turn_id,
-                    source_error,
-                    automatic_input_uncertain=True,
-                )
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -3443,7 +3470,6 @@ async def _replay_resume_response(
                     elicitation_tracker=elicitation_tracker,
                     expected_thread_id=thread_id,
                     forwarder_state=forwarder_state,
-                    codex_client=codex_client,
                 )
         await _post_resume_turn_status(
             client,
@@ -3541,42 +3567,10 @@ def _resume_turn_status_edge_for_latest_turn(
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
             return None
-        if _is_completed_automatic_input_source(state, turn_id):
-            return None
-        if (
-            state.automatic_input_turn_id == turn_id
-            and state.automatic_input_outcome in {"completed", "cancel_completed"}
-            and status == "running"
-        ):
-            return None
-        if state.automatic_input_turn_id == turn_id and not (
-            state.turn_generation == state.automatic_input_turn_generation
-            or (
-                state.active_turn_id == turn_id
-                and state.turn_generation == state.automatic_input_turn_generation + 1
-            )
-            or (status != "running" and state.automatic_input_outcome == "accepted")
-        ):
-            return None
         update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
         # forced this resume turn to ``failed``.
         error = _terminal_error_from_turn({"turn": turn})
-        if state.automatic_input_turn_id == turn_id and status != "running":
-            try:
-                settle_codex_automatic_input(
-                    bridge_dir,
-                    expected=state,
-                    outcome=(
-                        "cancel_completed"
-                        if codex_automatic_input_was_interrupted(state, bridge_dir=bridge_dir)
-                        else "completed"
-                    ),
-                )
-            except OSError:
-                _logger.warning("Could not settle the resumed Codex continuation", exc_info=True)
-        if _is_recovered_output_limit_source(bridge_dir, turn_id):
-            return _CodexTurnStatusEdge(status="idle", turn_id=turn_id, source="thread/resume")
         return _CodexTurnStatusEdge(
             status=status,
             turn_id=turn_id,
@@ -3627,6 +3621,7 @@ async def _handle_event(
     expected_thread_id: str | None = None,
     codex_client: CodexAppServerClient | None = None,
     forwarder_state: _CodexForwarderState | None = None,
+    usage_frame_recorded: bool = False,
 ) -> None:
     """
     Forward one Codex app-server notification.
@@ -3647,6 +3642,8 @@ async def _handle_event(
         JSON-RPC response.
     :param forwarder_state: Optional mutable state for Plan-mode prompt
         synthesis and thread setting tracking.
+    :param usage_frame_recorded: Whether a usage frame was already recorded in
+        connection order before the event was queued on a child lane.
     :returns: None.
     """
     method = event.get("method")
@@ -3713,7 +3710,11 @@ async def _handle_event(
         await _settle_mcp_startup(
             client, session_id=session_id, bridge_dir=bridge_dir, reason="thread went idle"
         )
-    if method == "thread/tokenUsage/updated" and forwarder_state is not None:
+    if (
+        method == "thread/tokenUsage/updated"
+        and forwarder_state is not None
+        and not usage_frame_recorded
+    ):
         forwarder_state.note_usage_frame(params, expected_thread_id)
     # Resolve routing: parent thread, known child thread, or stale/ignored.
     route_session_id, is_child = _resolve_event_session(
@@ -3733,43 +3734,6 @@ async def _handle_event(
         event_state = child_stream.state
         delta_coalescer = child_stream.delta_coalescer
         child_usage_baseline = forwarder_state.child_usage_baselines.get(child_thread_id)
-    if not is_child:
-        control = await asyncio.to_thread(read_bridge_state, bridge_dir)
-        if control is not None and (
-            control.session_id != route_session_id
-            or (
-                _thread_id_from_params(params) is not None
-                and control.thread_id != _thread_id_from_params(params)
-            )
-        ):
-            # Late events may retain their transcript, but cannot control a successor.
-            if method in {"turn/started", "turn/completed", "turn/failed", "error"} or (
-                method in _CODEX_STREAMING_DELTA_METHODS
-            ):
-                return
-            event_bridge_dir = None
-        elif control is not None:
-            observed_turn = _terminal_turn_id_from_params(params)
-            if _is_completed_automatic_input_source(control, observed_turn) and (
-                method == "turn/started" or method in _CODEX_STREAMING_DELTA_METHODS
-            ):
-                return
-            automatic_turn = control.automatic_input_turn_id
-            if automatic_turn is not None and observed_turn == automatic_turn:
-                if control.automatic_input_outcome in {"completed", "cancel_completed"}:
-                    if method == "turn/started" or method in _CODEX_STREAMING_DELTA_METHODS:
-                        return
-                if control.automatic_input_outcome in {
-                    "cancel_requested",
-                    "cancel_acknowledged",
-                    "cancel_unconfirmed",
-                }:
-                    if method == "turn/started":
-                        await _post_status(client, route_session_id, "running")
-                        return
-                    # Observe real output without re-adopting cancelled bridge control.
-                    if method in _CODEX_STREAMING_DELTA_METHODS:
-                        event_bridge_dir = None
     # First model-produced item settles the synthesized MCP startup round
     # mid-turn — codex defers turn execution until the round ends, so
     # assistant-side output proves startup is over before the idle edge.
@@ -3790,16 +3754,6 @@ async def _handle_event(
     # Child discovery remains connection-wide; output state is per thread.
     if method == "item/started" and forwarder_state is not None:
         item = params.get("item")
-        if (
-            isinstance(item, dict)
-            and item.get("type") in _OUTPUT_LIMIT_TOOL_ITEM_TYPES
-            and event_state is not None
-        ):
-            turn_id = _turn_id_from_payload(params)
-            item_id = item.get("id")
-            event_state.open_tool_items_by_turn.setdefault(turn_id, set()).add(
-                item_id if isinstance(item_id, str) and item_id else "unknown-tool"
-            )
         if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
             await _handle_collab_item(client, params, item, forwarder_state)
         elif isinstance(item, dict) and item.get("type") == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE:
@@ -3892,25 +3846,6 @@ async def _handle_event(
         return
     if method == "item/completed":
         item = params.get("item")
-        if (
-            not is_child
-            and codex_client is not None
-            and event_state is not None
-            and isinstance(item, dict)
-        ):
-            await _maybe_interrupt_late_output_limit_continuation(
-                codex_client,
-                client=client,
-                bridge_dir=bridge_dir,
-                session_id=route_session_id,
-                forwarder_state=event_state,
-                params=params,
-                item=item,
-            )
-        if event_state is not None and isinstance(item, dict):
-            open_tools = event_state.open_tool_items_by_turn.get(_turn_id_from_payload(params))
-            if open_tools is not None and isinstance(item_id := item.get("id"), str):
-                open_tools.discard(item_id)
         # Nested-spawn registration uses the connection's complete child map.
         # Transcript dedup and partial text belong only to the routed child.
         item_state = (
@@ -4819,7 +4754,7 @@ async def _maybe_fail_turn_on_certificate_failure(
             await codex_client.request(
                 "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
             )
-        except Exception:
+        except Exception:  # the failure is surfaced either way.
             _logger.warning(
                 "Codex turn interrupt after a certificate failure failed", exc_info=True
             )
@@ -4852,528 +4787,6 @@ async def _maybe_fail_turn_on_certificate_failure(
         await usage_coalescer.flush()
     await forwarder_state.forget_posted_terminals()
     return True
-
-
-_OUTPUT_LIMIT_CONTINUE_TIMEOUT_SECONDS = 10.0
-_OUTPUT_LIMIT_TERMINAL_WAIT_SECONDS = 10.0
-
-
-def _same_native_owner(
-    current: CodexNativeBridgeState | None, owner: CodexNativeBridgeState
-) -> bool:
-    return current is not None and (
-        current.session_id,
-        current.thread_id,
-        current.socket_path,
-        current.codex_home,
-    ) == (owner.session_id, owner.thread_id, owner.socket_path, owner.codex_home)
-
-
-def _is_recovered_output_limit_source(bridge_dir: Path | None, turn_id: str | None) -> bool:
-    """Retire a source only after exact native delivery proof, including after reconnect."""
-    if bridge_dir is None or turn_id is None:
-        return False
-    state = read_bridge_state(bridge_dir)
-    return (
-        state is not None
-        and state.automatic_input_owner_scope
-        == (
-            state.session_id,
-            state.thread_id,
-            state.socket_path,
-            state.codex_home,
-        )
-        and state.automatic_input_source_turn_id == turn_id
-        and state.automatic_input_turn_id is not None
-        and state.automatic_input_outcome
-        in {
-            "accepted",
-            "completed",
-            "cancel_requested",
-            "cancel_acknowledged",
-            "cancel_unconfirmed",
-            "cancel_completed",
-        }
-    )
-
-
-def _is_completed_automatic_input_source(
-    state: CodexNativeBridgeState | None, turn_id: str | None
-) -> bool:
-    """The durable claim proves source completion before delivery is known."""
-    if state is None or turn_id is None:
-        return False
-    return bool(
-        state is not None
-        and state.automatic_input_source_turn_id == turn_id
-        and state.automatic_input_client_message_id
-        and state.automatic_input_owner_scope
-        == (
-            state.session_id,
-            state.thread_id,
-            state.socket_path,
-            state.codex_home,
-        )
-    )
-
-
-async def _present_output_limit_error(
-    client: httpx.AsyncClient,
-    session_id: str,
-    turn_id: str,
-    error: _CodexTerminalError,
-    *,
-    automatic_input_uncertain: bool = False,
-) -> None:
-    """Persist the source's error without changing another native turn's lifecycle."""
-    stream_disconnect = _is_stream_disconnect_message(error.message)
-    if automatic_input_uncertain:
-        hint = (
-            "Automatic continuation is unconfirmed. "
-            "Inspect the terminal before sending more input."
-        )
-    elif stream_disconnect:
-        hint = _CODEX_STREAM_DISCONNECT_HINT
-    else:
-        hint = _CODEX_OUTPUT_LIMIT_HINT
-    source_kind = "stream-disconnect" if stream_disconnect else "output-limit"
-    await _post_external_item(
-        client,
-        session_id,
-        item_type="error",
-        item_data={
-            "source": "execution",
-            "code": "codex_turn_error",
-            "message": f"{error.message}\n\n{hint}",
-        },
-        response_id=_response_id(_params_with_turn_id({}, turn_id)),
-        source_id=f"codex-{source_kind}:{turn_id}",
-    )
-
-
-async def _interrupt_output_limit_continuation(
-    codex_client: CodexAppServerClient,
-    *,
-    client: httpx.AsyncClient,
-    session_id: str,
-    bridge_dir: Path,
-    forwarder_state: _CodexForwarderState,
-    owner: CodexNativeBridgeState,
-    turn_id: str,
-) -> None:
-    """Attempt cancellation once; only a native terminal event proves it stopped."""
-    if turn_id in forwarder_state.output_limit_interrupt_attempts:
-        return
-    current = read_bridge_state(bridge_dir)
-    if not _same_native_owner(current, owner) or current is None:
-        return
-    if current.automatic_input_turn_id != turn_id:
-        return
-    if current.automatic_input_outcome in {
-        "cancel_requested",
-        "cancel_acknowledged",
-        "cancel_unconfirmed",
-        "cancel_completed",
-    }:
-        return
-    forwarder_state.output_limit_interrupt_attempts[turn_id] = "cancel_requested"
-    recorded = current
-    try:
-        recorded = settle_codex_automatic_input(
-            bridge_dir, expected=current, outcome="cancel_requested"
-        )
-        if recorded is None:
-            return
-        async with asyncio.timeout(_OUTPUT_LIMIT_CONTINUE_TIMEOUT_SECONDS):
-            await codex_client.request(
-                "turn/interrupt", {"threadId": owner.thread_id, "turnId": turn_id}
-            )
-        outcome = "cancel_acknowledged"
-    except (TimeoutError, OSError, RuntimeError, ConnectionClosed):
-        outcome = "cancel_unconfirmed"
-        _logger.warning("Codex continuation cancellation was not confirmed", exc_info=True)
-    forwarder_state.output_limit_interrupt_attempts[turn_id] = outcome
-    if _same_native_owner(read_bridge_state(bridge_dir), owner):
-        try:
-            settle_codex_automatic_input(bridge_dir, expected=recorded, outcome=outcome)
-        except OSError:
-            _logger.warning("Could not persist Codex cancellation outcome", exc_info=True)
-    if outcome == "cancel_unconfirmed":
-        await _post_external_item(
-            client,
-            session_id,
-            item_type="error",
-            item_data={
-                "source": "execution",
-                "code": "codex_continuation_cancel_unconfirmed",
-                "message": "Cancellation of the automatic continuation was not confirmed. "
-                "Inspect the terminal before starting more work.",
-            },
-            response_id=_response_id(_params_with_turn_id({}, turn_id)),
-            source_id=f"codex-output-limit-cancel:{turn_id}",
-        )
-
-
-def _receipt_from_thread(
-    response: CodexMessage, *, thread_id: str, client_message_id: str, source_turn_id: str
-) -> tuple[str, str] | None:
-    result = response.get("result")
-    thread = result.get("thread") if isinstance(result, dict) else None
-    if not isinstance(thread, dict) or thread.get("id") != thread_id:
-        return None
-    turns = thread.get("turns")
-    if not isinstance(turns, list):
-        return None
-    receipts: dict[str, str] = {}
-    for turn in turns:
-        if not isinstance(turn, dict):
-            continue
-        turn_id = turn.get("id")
-        items = turn.get("items")
-        if not isinstance(turn_id, str) or not turn_id or turn_id == source_turn_id:
-            continue
-        if not isinstance(items, list):
-            continue
-        if any(
-            isinstance(item, dict)
-            and item.get("type") == "userMessage"
-            and isinstance(item.get("id"), str)
-            and bool(item["id"])
-            and item.get("clientId") == client_message_id
-            for item in items
-        ):
-            status = turn.get("status")
-            receipts[turn_id] = (
-                status
-                if isinstance(status, str)
-                and status
-                in {
-                    "inProgress",
-                    "completed",
-                    "interrupted",
-                    "cancelled",
-                    "canceled",
-                    "failed",
-                    "errored",
-                }
-                else "unknown"
-            )
-    return next(iter(receipts.items())) if len(receipts) == 1 else None
-
-
-async def _surface_pending_output_limit_error(
-    forwarder_state: _CodexForwarderState, pending: _PendingOutputLimitError
-) -> None:
-    """Show an unresolved source error; native activity remains authoritative."""
-    turn_id = pending.owner.active_turn_id
-    assert turn_id is not None
-    async with _conversation_item_delivery_scope(pending.session_id):
-        if forwarder_state.pending_output_limit_errors.get(turn_id) is not pending:
-            return
-        forwarder_state.pending_output_limit_errors.pop(turn_id)
-        if pending.timer is not None and pending.timer is not asyncio.current_task():
-            pending.timer.cancel()
-            await asyncio.gather(pending.timer, return_exceptions=True)
-        forwarder_state.surfaced_terminal_error_turns.add(turn_id)
-        forwarder_state.presented_output_limit_error_turns.add(turn_id)
-        await _present_output_limit_error(
-            pending.client, pending.session_id, turn_id, pending.error
-        )
-
-
-def _defer_output_limit_error(
-    client: httpx.AsyncClient,
-    *,
-    session_id: str,
-    bridge_dir: Path,
-    forwarder_state: _CodexForwarderState,
-    owner: CodexNativeBridgeState,
-    error: _CodexTerminalError,
-    usage_coalescer: _SessionUsageCoalescer,
-) -> None:
-    """Wait a fixed time for the owning terminal boundary; never infer completion."""
-    turn_id = owner.active_turn_id
-    assert turn_id is not None
-    if turn_id in forwarder_state.pending_output_limit_errors:
-        return
-    pending = _PendingOutputLimitError(
-        client=client,
-        session_id=session_id,
-        bridge_dir=bridge_dir,
-        owner=owner,
-        error=error,
-        usage_coalescer=usage_coalescer,
-    )
-    forwarder_state.pending_output_limit_errors[turn_id] = pending
-
-    async def expire() -> None:
-        await asyncio.sleep(_OUTPUT_LIMIT_TERMINAL_WAIT_SECONDS)
-        try:
-            await _surface_pending_output_limit_error(forwarder_state, pending)
-        except (OSError, RuntimeError, httpx.HTTPError):
-            _logger.error("Could not surface the deferred Codex output-limit error", exc_info=True)
-
-    pending.timer = asyncio.create_task(expire(), name="codex-output-limit-terminal-wait")
-
-
-async def _auto_continue_after_output_limit(
-    codex_client: CodexAppServerClient,
-    *,
-    client: httpx.AsyncClient,
-    session_id: str,
-    bridge_dir: Path,
-    completed: CodexNativeBridgeState,
-    forwarder_state: _CodexForwarderState,
-    error: _CodexTerminalError,
-    flush_source: Callable[[], Awaitable[None]],
-) -> bool:
-    """Submit once and certify delivery only by the native clientId receipt."""
-    turn_id = completed.active_turn_id
-    stream_disconnect = _is_recoverable_stream_error(error)
-    if (
-        turn_id is None
-        or getattr(codex_client, "supports_user_message_ids", False) is not True
-        or (error.message != _CODEX_OUTPUT_LIMIT_ERROR and not stream_disconnect)
-        or forwarder_state.open_tool_items_by_turn.get(turn_id)
-        or forwarder_state.open_tool_items_by_turn.get(None)
-    ):
-        return False
-    continuation_text = (
-        _STREAM_DISCONNECT_CONTINUE_TEXT if stream_disconnect else _OUTPUT_LIMIT_CONTINUE_TEXT
-    )
-    client_message_id = uuid4().hex
-    deadline = time.time() + _OUTPUT_LIMIT_CONTINUE_TIMEOUT_SECONDS
-    try:
-        claimed = claim_codex_automatic_input(
-            bridge_dir, completed, client_message_id=client_message_id, deadline=deadline
-        )
-    except OSError:
-        _logger.warning("Could not persist the Codex continuation bound", exc_info=True)
-        return False
-    if claimed is None:
-        return False
-    await flush_source()
-    current = read_bridge_state(bridge_dir)
-    if (
-        not _same_native_owner(current, claimed)
-        or current is None
-        or current.interrupt_generation != claimed.interrupt_generation
-        or codex_input_was_interrupted(bridge_dir, claimed)
-        or current.turn_generation < current.automatic_input_min_turn_generation
-        or current.turn_generation != claimed.turn_generation
-        or current.active_turn_id is not None
-        or current.pending_shell_command_id is not None
-        or current.active_shell_turn_id is not None
-        or time.time() >= deadline
-    ):
-        try:
-            settle_codex_automatic_input(bridge_dir, expected=claimed, outcome="uncertain")
-        except OSError:
-            _logger.warning("Could not settle unsubmitted Codex continuation", exc_info=True)
-        await _present_output_limit_error(client, session_id, turn_id, error)
-        return True
-    receipt: tuple[str, str] | None = None
-    try:
-        # The supervisor owns reconnect and resume of this shared event transport.
-        async with asyncio.timeout(max(0, deadline - time.time())):
-            await codex_client.request(
-                "turn/start",
-                {
-                    "threadId": completed.thread_id,
-                    "clientUserMessageId": client_message_id,
-                    "input": [{"type": "text", "text": continuation_text}],
-                },
-            )
-            while _same_native_owner(read_bridge_state(bridge_dir), completed):
-                response = await codex_client.request(
-                    "thread/read", {"threadId": completed.thread_id, "includeTurns": True}
-                )
-                receipt = _receipt_from_thread(
-                    response,
-                    thread_id=completed.thread_id,
-                    client_message_id=client_message_id,
-                    source_turn_id=turn_id,
-                )
-                if receipt is not None:
-                    break
-                await asyncio.sleep(0.05)
-    except (TimeoutError, OSError, RuntimeError, ConnectionClosed):
-        _logger.warning("Codex continuation delivery remains uncertain", exc_info=True)
-    if receipt is None:
-        current = read_bridge_state(bridge_dir)
-        if _same_native_owner(current, claimed) and current is not None:
-            try:
-                settle_codex_automatic_input(bridge_dir, expected=claimed, outcome="uncertain")
-            except OSError:
-                _logger.warning("Could not persist uncertain Codex delivery", exc_info=True)
-        await _present_output_limit_error(
-            client,
-            session_id,
-            turn_id,
-            error,
-            automatic_input_uncertain=True,
-        )
-        return True
-    continued_turn_id, native_status = receipt
-    try:
-        proven = record_codex_automatic_input_receipt(
-            bridge_dir,
-            session_id=session_id,
-            thread_id=completed.thread_id,
-            turn_id=continued_turn_id,
-            client_message_id=client_message_id,
-        )
-        adopted = (
-            settle_codex_automatic_input(bridge_dir, expected=claimed, outcome="accepted")
-            if proven is not None and native_status != "unknown"
-            else None
-        )
-        if proven is not None and native_status == "unknown":
-            settle_codex_automatic_input(bridge_dir, expected=claimed, outcome="uncertain")
-    except OSError:
-        _logger.warning("Could not save the Codex continuation receipt", exc_info=True)
-        adopted = None
-    if adopted is None:
-        await _present_output_limit_error(
-            client,
-            session_id,
-            turn_id,
-            error,
-            automatic_input_uncertain=True,
-        )
-        current = read_bridge_state(bridge_dir)
-        if _same_native_owner(current, claimed) and current is not None:
-            # The exact receipt still identifies this input even when adoption failed.
-            try:
-                proof = record_codex_automatic_input_receipt(
-                    bridge_dir,
-                    session_id=session_id,
-                    thread_id=completed.thread_id,
-                    turn_id=continued_turn_id,
-                    client_message_id=client_message_id,
-                )
-            except OSError:
-                proof = None
-            if proof is not None and (
-                native_status != "unknown"
-                or codex_automatic_input_was_interrupted(proof, bridge_dir=bridge_dir)
-            ):
-                await _interrupt_output_limit_continuation(
-                    codex_client,
-                    client=client,
-                    session_id=session_id,
-                    bridge_dir=bridge_dir,
-                    forwarder_state=forwarder_state,
-                    owner=claimed,
-                    turn_id=continued_turn_id,
-                )
-        return True
-    if native_status in {"failed", "errored"}:
-        await _post_external_item(
-            client,
-            session_id,
-            item_type="error",
-            item_data={
-                "source": "execution",
-                "code": "codex_continuation_failed",
-                "message": "The automatic continuation failed. Inspect the terminal for details.",
-            },
-            response_id=_response_id(_params_with_turn_id({}, continued_turn_id)),
-            source_id=(
-                f"codex-{'stream-disconnect' if stream_disconnect else 'output-limit'}-"
-                f"failed:{continued_turn_id}"
-            ),
-        )
-    if native_status not in {"inProgress", "unknown"}:
-        try:
-            if not clear_active_turn_id_if_matches(
-                bridge_dir, continued_turn_id, expected_owner=adopted
-            ):
-                return True
-            settled = settle_codex_automatic_input(
-                bridge_dir, expected=adopted, outcome="completed"
-            )
-        except OSError:
-            _logger.warning("Could not settle the completed Codex continuation", exc_info=True)
-            await _present_output_limit_error(
-                client,
-                session_id,
-                turn_id,
-                error,
-                automatic_input_uncertain=True,
-            )
-            return True
-        if settled is None:
-            return True
-    current = read_bridge_state(bridge_dir)
-    expected_active = continued_turn_id if native_status in {"inProgress", "unknown"} else None
-    if (
-        _same_native_owner(current, adopted)
-        and current is not None
-        and current.interrupt_generation == adopted.interrupt_generation
-        and not codex_input_was_interrupted(bridge_dir, adopted)
-        and current.turn_generation >= current.automatic_input_min_turn_generation
-        and current.turn_generation == adopted.turn_generation
-        and current.active_turn_id == expected_active
-        and current.automatic_input_client_message_id == client_message_id
-        and current.automatic_input_turn_id == continued_turn_id
-        and current.pending_shell_command_id is None
-        and current.active_shell_turn_id is None
-    ):
-        await _post_status(
-            client,
-            session_id,
-            "running" if expected_active is not None else "idle",
-            response_id=_response_id(_params_with_turn_id({}, continued_turn_id)),
-        )
-    return True
-
-
-async def _maybe_interrupt_late_output_limit_continuation(
-    codex_client: CodexAppServerClient,
-    *,
-    client: httpx.AsyncClient,
-    bridge_dir: Path,
-    session_id: str,
-    forwarder_state: _CodexForwarderState,
-    params: _JsonObject,
-    item: _JsonObject,
-) -> None:
-    """A matching receipt can identify uncertain input; literal text never does."""
-    client_id = item.get("clientId")
-    thread_id = _thread_id_from_params(params)
-    turn_id = _turn_id_from_payload(params)
-    if (
-        item.get("type") != "userMessage"
-        or not isinstance(item.get("id"), str)
-        or not item.get("id")
-        or not isinstance(client_id, str)
-        or not client_id
-        or thread_id is None
-        or turn_id is None
-    ):
-        return
-    try:
-        proof = record_codex_automatic_input_receipt(
-            bridge_dir,
-            session_id=session_id,
-            thread_id=thread_id,
-            turn_id=turn_id,
-            client_message_id=client_id,
-        )
-    except OSError:
-        _logger.warning("Could not persist the late Codex delivery receipt", exc_info=True)
-        return
-    if proof is not None and codex_automatic_input_was_interrupted(proof, bridge_dir=bridge_dir):
-        await _interrupt_output_limit_continuation(
-            codex_client,
-            client=client,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            forwarder_state=forwarder_state,
-            owner=proof,
-            turn_id=turn_id,
-        )
 
 
 async def _maybe_handle_turn_event(
@@ -5431,58 +4844,12 @@ async def _maybe_handle_turn_event(
                 return True
             turn_id = _turn_id_from_payload(params)
             if forwarder_state is not None:
-                if (
-                    turn_id in forwarder_state.surfaced_terminal_error_turns
-                    or _is_recovered_output_limit_source(bridge_dir, turn_id)
-                ):
+                if turn_id in forwarder_state.surfaced_terminal_error_turns:
                     _logger.info(
                         "Codex forwarder ignored duplicate terminal error: turn_id=%s",
                         turn_id,
                     )
                     return True
-                if _is_completed_automatic_input_source(
-                    read_bridge_state(bridge_dir) if bridge_dir is not None else None, turn_id
-                ):
-                    assert turn_id is not None
-                    forwarder_state.surfaced_terminal_error_turns.add(turn_id)
-                    forwarder_state.presented_output_limit_error_turns.add(turn_id)
-                    await _present_output_limit_error(
-                        client,
-                        session_id,
-                        turn_id,
-                        error,
-                        automatic_input_uncertain=True,
-                    )
-                    return True
-                if (
-                    bridge_dir is not None
-                    and codex_client is not None
-                    and getattr(codex_client, "supports_user_message_ids", False) is True
-                    and turn_id is not None
-                    and (
-                        error.message == _CODEX_OUTPUT_LIMIT_ERROR
-                        or _is_recoverable_stream_error(error)
-                    )
-                ):
-                    active = read_bridge_state(bridge_dir)
-                    if (
-                        active is not None
-                        and active.thread_id == _thread_id_from_params(params)
-                        and active.active_turn_id == turn_id
-                        and active.automatic_input_source_turn_id is None
-                        and not forwarder_state.open_tool_items_by_turn.get(turn_id)
-                        and not forwarder_state.open_tool_items_by_turn.get(None)
-                    ):
-                        _defer_output_limit_error(
-                            client,
-                            session_id=session_id,
-                            bridge_dir=bridge_dir,
-                            forwarder_state=forwarder_state,
-                            owner=active,
-                            error=error,
-                            usage_coalescer=usage_coalescer,
-                        )
-                        return True
                 # Child threads have no on-disk bridge to correlate against.
                 if bridge_dir is not None and (
                     turn_id is None
@@ -5503,7 +4870,6 @@ async def _maybe_handle_turn_event(
                         ),
                     )
                     return True
-                forwarder_state.open_tool_items_by_turn.pop(turn_id, None)
                 if turn_id is not None:
                     forwarder_state.surfaced_terminal_error_turns.add(turn_id)
                 forwarder_state.turn_failure_surfaced = True
@@ -5519,7 +4885,7 @@ async def _maybe_handle_turn_event(
                     compaction_model = await asyncio.to_thread(
                         _failed_compaction_model, bridge_dir, selected_model
                     )
-                except Exception:
+                except Exception:  # the failure still posts, undiagnosed.
                     _logger.warning("Could not read the Codex rollout's last model", exc_info=True)
             await _post_turn_status_edge(
                 client,
@@ -5538,12 +4904,6 @@ async def _maybe_handle_turn_event(
             await forwarder_state.forget_posted_terminals()
         return True
     if method == "turn/started":
-        started_turn_id = _terminal_turn_id_from_params(params)
-        if (
-            forwarder_state is not None
-            and started_turn_id in forwarder_state.surfaced_terminal_error_turns
-        ) or _is_recovered_output_limit_source(bridge_dir, started_turn_id):
-            return True
         async with _conversation_item_delivery_scope(session_id):
             if delta_coalescer is not None:
                 await delta_coalescer.flush()
@@ -5724,9 +5084,7 @@ async def _maybe_handle_delta_event(
             # is mirrored whole when the item completes.
             return True
         turn_id = _turn_id_from_payload(params)
-        if bridge_dir is not None and not await asyncio.to_thread(
-            _is_active_turn_delta, bridge_dir, turn_id
-        ):
+        if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
             _logger.info("Codex forwarder ignored stale command output delta: turn_id=%s", turn_id)
             return True
         await delta_coalescer.append_tool_output(delta, call_id=call_id)
@@ -5838,149 +5196,14 @@ async def _handle_terminal_turn_boundary_inner(
     # Reconcile control state before any network-backed output flush. Transcript
     # and status posts retain their original order below, but a slow consumer
     # can no longer leave a completed Codex turn steerable in bridge state.
-    completed = read_bridge_state(bridge_dir) if bridge_dir is not None else None
-    terminal_turn_id = _terminal_turn_id_from_params(params)
-    pending = (
-        forwarder_state.pending_output_limit_errors.get(terminal_turn_id)
-        if forwarder_state is not None and terminal_turn_id is not None
-        else None
+    terminal = _prepare_terminal_turn_event(
+        bridge_dir,
+        method,
+        params,
+        forwarder_state=forwarder_state,
     )
-    candidate_error = _terminal_error_from_turn(params) or (
-        pending.error if pending is not None else None
-    )
-    interrupted = _turn_status_is_interrupted(_turn_status_from_params(params))
-    retired_source = _is_completed_automatic_input_source(completed, terminal_turn_id)
-    source_flushed = False
-
-    async def flush_source() -> None:
-        nonlocal source_flushed
-        if source_flushed:
-            return
-        source_flushed = True
-        if delta_coalescer is not None:
-            await delta_coalescer.flush()
-        await _maybe_persist_interrupted_partial_text(
-            client,
-            session_id=session_id,
-            method=method,
-            params=params,
-            forwarder_state=forwarder_state,
-        )
-        await _flush_turn_diff(
-            client,
-            session_id=session_id,
-            params=params,
-            forwarder_state=forwarder_state,
-        )
-
-    if pending is not None and pending.timer is not None:
-        pending.timer.cancel()
-        await asyncio.gather(pending.timer, return_exceptions=True)
-    if forwarder_state is not None and terminal_turn_id is not None:
-        turn = params.get("turn")
-        items = turn.get("items") if isinstance(turn, dict) else None
-        recoverable_stream = candidate_error is not None and _is_recoverable_stream_error(
-            candidate_error
-        )
-        if isinstance(items, list):
-            for item in items:
-                if not isinstance(item, dict):
-                    if recoverable_stream:
-                        forwarder_state.open_tool_items_by_turn.setdefault(
-                            terminal_turn_id, set()
-                        ).add("malformed-item")
-                    continue
-                item_type = item.get("type")
-                potentially_open_tool = item_type in _OUTPUT_LIMIT_TOOL_ITEM_TYPES or (
-                    recoverable_stream and item_type not in _STREAM_RECOVERY_NON_TOOL_ITEM_TYPES
-                )
-                if (
-                    potentially_open_tool
-                    and item.get("status") not in _TERMINAL_TOOL_ITEM_STATUSES
-                ):
-                    forwarder_state.open_tool_items_by_turn.setdefault(
-                        terminal_turn_id, set()
-                    ).add(str(item.get("id", "unknown-tool")))
-        elif recoverable_stream and isinstance(turn, dict) and "items" in turn:
-            forwarder_state.open_tool_items_by_turn.setdefault(terminal_turn_id, set()).add(
-                "malformed-items"
-            )
-        if recoverable_stream and not isinstance(turn, dict):
-            forwarder_state.open_tool_items_by_turn.setdefault(terminal_turn_id, set()).add(
-                "malformed-turn"
-            )
-    continued = bool(
-        (
-            method == "turn/completed"
-            or (
-                method == "turn/failed"
-                and candidate_error is not None
-                and _is_recoverable_stream_error(candidate_error)
-            )
-        )
-        and not retired_source
-        and not interrupted
-        and bridge_dir is not None
-        and completed is not None
-        and terminal_turn_id is not None
-        and completed.thread_id == _thread_id_from_params(params)
-        and completed.active_turn_id == terminal_turn_id
-        and codex_client is not None
-        and forwarder_state is not None
-        and candidate_error is not None
-        and terminal_turn_id not in forwarder_state.surfaced_terminal_error_turns
-        and await _auto_continue_after_output_limit(
-            codex_client,
-            client=client,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            completed=completed,
-            forwarder_state=forwarder_state,
-            error=candidate_error,
-            flush_source=flush_source,
-        )
-    )
-    terminal = (
-        _PreparedTerminalTurn(handled=True, edge=None)
-        if continued or retired_source
-        else _prepare_terminal_turn_event(
-            bridge_dir,
-            method,
-            params,
-            forwarder_state=forwarder_state,
-        )
-    )
-    if bridge_dir is not None and completed is not None and terminal_turn_id is not None:
-        current = read_bridge_state(bridge_dir)
-        if (
-            _same_native_owner(current, completed)
-            and current is not None
-            and current.automatic_input_turn_id == terminal_turn_id
-        ):
-            outcome = (
-                "cancel_completed"
-                if current.automatic_input_outcome
-                in {"cancel_requested", "cancel_acknowledged", "cancel_unconfirmed"}
-                else "completed"
-            )
-            try:
-                settle_codex_automatic_input(bridge_dir, expected=current, outcome=outcome)
-            except OSError:
-                _logger.warning("Could not settle the completed Codex continuation", exc_info=True)
-    await flush_source()
-    if (
-        retired_source
-        and candidate_error is not None
-        and terminal_turn_id is not None
-        and not _is_recovered_output_limit_source(bridge_dir, terminal_turn_id)
-    ):
-        await _present_output_limit_error(
-            client,
-            session_id,
-            terminal_turn_id,
-            candidate_error,
-            automatic_input_uncertain=True,
-        )
+    if delta_coalescer is not None:
+        await delta_coalescer.flush()
     # Safety net: if a compaction was reported in progress but Codex never
     # emitted a completion signal we recognize (e.g. a protocol-spelling
     # drift), force the spinner closed at the turn boundary so it can't hang.
@@ -5988,42 +5211,31 @@ async def _handle_terminal_turn_boundary_inner(
         await _post_compaction_status(
             client, session_id, "completed", forwarder_state=forwarder_state
         )
+    await _maybe_persist_interrupted_partial_text(
+        client,
+        session_id=session_id,
+        method=method,
+        params=params,
+        forwarder_state=forwarder_state,
+    )
+    await _flush_turn_diff(
+        client,
+        session_id=session_id,
+        params=params,
+        forwarder_state=forwarder_state,
+    )
+    terminal_turn_id = _terminal_turn_id_from_params(params)
     if forwarder_state is not None and terminal_turn_id is not None:
         forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
-    edge = terminal.edge
-    if forwarder_state is not None and terminal_turn_id is not None:
-        pending = forwarder_state.pending_output_limit_errors.pop(terminal_turn_id, None)
-        pending_error = pending.error if pending is not None else None
-        if continued:
-            forwarder_state.surfaced_terminal_error_turns.add(terminal_turn_id)
-            forwarder_state.presented_output_limit_error_turns.add(terminal_turn_id)
-        if (
-            edge is not None
-            and edge.error is None
-            and pending_error is not None
-            and not interrupted
-        ):
-            edge = replace(edge, status="failed", error=pending_error)
-        if (
-            edge is not None
-            and edge.error is not None
-            and edge.error.message == _CODEX_OUTPUT_LIMIT_ERROR
-        ):
-            forwarder_state.surfaced_terminal_error_turns.add(terminal_turn_id)
-            if continued:
-                edge = None
-        forwarder_state.open_tool_items_by_turn.pop(terminal_turn_id, None)
-    if edge is not None:
-        await _post_turn_status_edge(client, session_id, edge)
-        if forwarder_state is not None and edge.status == "failed":
+    if terminal.edge is not None:
+        await _post_turn_status_edge(client, session_id, terminal.edge)
+        if forwarder_state is not None and terminal.edge.status == "failed":
             forwarder_state.turn_failure_surfaced = True
             await forwarder_state.forget_posted_terminals()
     terminal_thread_id = _thread_id_from_params(params)
     if (
         handled
-        and not continued
-        and not retired_source
         and bridge_dir is not None
         and codex_client is not None
         and forwarder_state is not None
@@ -6045,8 +5257,6 @@ async def _handle_terminal_turn_boundary_inner(
         )
     if (
         handled
-        and not retired_source
-        and not continued
         and method == "turn/completed"
         and bridge_dir is not None
         and codex_client is not None
@@ -7036,31 +6246,16 @@ def _prepare_terminal_turn_event(
         forwarder_state is not None
         and terminal_turn_id is not None
         and terminal_turn_id in forwarder_state.surfaced_terminal_error_turns
-    ) or _is_recovered_output_limit_source(bridge_dir, terminal_turn_id):
-        cleared = bridge_dir is None or clear_active_turn_id_if_matches(
-            bridge_dir, terminal_turn_id
-        )
+    ):
+        if bridge_dir is not None:
+            clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
         _logger.info(
             "Codex forwarder suppressed terminal boundary after standalone error: "
             "method=%s turn_id=%s",
             method,
             terminal_turn_id,
         )
-        return _PreparedTerminalTurn(
-            handled=True,
-            edge=(
-                _CodexTurnStatusEdge(
-                    status="idle",
-                    turn_id=terminal_turn_id,
-                    source=f"{method}:error-already-presented",
-                )
-                if cleared
-                and forwarder_state is not None
-                and terminal_turn_id in forwarder_state.presented_output_limit_error_turns
-                and not _is_recovered_output_limit_source(bridge_dir, terminal_turn_id)
-                else None
-            ),
-        )
+        return _PreparedTerminalTurn(handled=True, edge=None)
     edge = _terminal_turn_status_edge(bridge_dir, method, params)
     if edge is None:
         _logger.info(
@@ -8138,9 +7333,7 @@ async def _handle_agent_message_delta(
     if not isinstance(delta, str):
         _logger.warning("Codex agentMessage delta missing string delta: turn_id=%s", turn_id)
         return
-    if bridge_dir is not None and not await asyncio.to_thread(
-        _is_active_turn_delta, bridge_dir, turn_id
-    ):
+    if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
         edge = _delta_recovery_status_edge(bridge_dir, params, turn_id)
         if edge is not None:
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)
@@ -8209,9 +7402,7 @@ async def _handle_plan_delta(
     if not isinstance(delta, str):
         _logger.warning("Codex plan delta missing string delta: turn_id=%s", turn_id)
         return
-    if bridge_dir is not None and not await asyncio.to_thread(
-        _is_active_turn_delta, bridge_dir, turn_id
-    ):
+    if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
         edge = _delta_recovery_status_edge(bridge_dir, params, turn_id)
         if edge is not None:
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)
@@ -8288,7 +7479,7 @@ async def _ensure_user_message_posted(
         response = await codex_client.request("thread/resume", {"threadId": thread_id})
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception:  # degrade to current behavior on resume failure.
         _logger.warning(
             "Codex forwarder could not resume to recover user message: thread=%s turn=%s",
             thread_id,
@@ -9057,29 +8248,6 @@ _TOOL_ITEM_BUILDERS: dict[str, _ToolItemBuilder] = {
     "imageGeneration": _image_generation_tool_call,
 }
 _TOOL_ITEM_TYPES = frozenset(_TOOL_ITEM_BUILDERS)
-_OUTPUT_LIMIT_TOOL_ITEM_TYPES = _TOOL_ITEM_TYPES | {
-    "mcpToolCall",
-    "dynamicToolCall",
-    _CODEX_COLLAB_AGENT_ITEM_TYPE,
-}
-_TERMINAL_TOOL_ITEM_STATUSES = frozenset(
-    {"completed", "failed", "interrupted", "cancelled", "canceled", "declined"}
-)
-# These items cannot still perform side effects when the response stream ends.
-_STREAM_RECOVERY_NON_TOOL_ITEM_TYPES = frozenset(
-    {
-        "userMessage",
-        "agentMessage",
-        "reasoning",
-        "plan",
-        "proposedPlan",
-        "contextCompaction",
-        "turnDiff",
-        "enteredReviewMode",
-        "exitedReviewMode",
-        _CODEX_ERROR_ITEM_TYPE,
-    }
-)
 
 # Codex ``/review`` enter/exit thread items. The web UI has no dedicated
 # review-mode affordance, so these are mirrored as a visible assistant-message
@@ -10092,7 +9260,7 @@ async def _replay_dead_letters_before_resume(
             max_records=_REPLAY_MAX_RECORDS,
             deadline_seconds=_REPLAY_DEADLINE_SECONDS,
         )
-    except Exception:
+    except Exception:  # replay must never block resume.
         _logger.warning("Codex dead-letter replay before resume failed", exc_info=True)
 
 

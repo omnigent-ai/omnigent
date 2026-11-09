@@ -206,6 +206,8 @@ class CodexNativeBridgeState:
     :param turn_generation: Monotonic activity revision within the current native owner.
     :param automatic_input_turn_generation: Activity revision that authorized the claim.
     :param automatic_input_min_turn_generation: Earliest activity eligible after a checkpoint gap.
+    :param active_turn_revision: Incremented whenever the active turn is set or
+        cleared, so a late acknowledgement can tell that turns changed meanwhile.
     """
 
     session_id: str
@@ -228,6 +230,7 @@ class CodexNativeBridgeState:
     turn_generation: int = 0
     automatic_input_turn_generation: int = 0
     automatic_input_min_turn_generation: int = 0
+    active_turn_revision: int = 0
 
 
 @dataclass(frozen=True)
@@ -1109,6 +1112,7 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "automatic_input_min_turn_generation": (
                         state.automatic_input_min_turn_generation
                     ),
+                    "active_turn_revision": state.active_turn_revision,
                 },
                 handle,
                 sort_keys=True,
@@ -1162,6 +1166,11 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
             state = replace(
                 state,
                 active_turn_id=published_turn_id,
+                active_turn_revision=max(
+                    current.active_turn_revision
+                    + int(published_turn_id != current.active_turn_id),
+                    state.active_turn_revision,
+                ),
                 interrupt_generation=max(state.interrupt_generation, current.interrupt_generation),
                 interrupted_turn_id=(
                     current.interrupted_turn_id
@@ -1933,6 +1942,9 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             turn_generation=turn_generation,
             automatic_input_turn_generation=automatic_generation,
             automatic_input_min_turn_generation=minimum_activity,
+            active_turn_revision=(
+                value if isinstance(value := raw.get("active_turn_revision"), int) else 0
+            ),
         ),
         "ready",
     )
@@ -1968,25 +1980,69 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
     """
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
-        # An accepted steer often returns the turn already saved here. Rewriting
-        # it can fail on a full disk after Codex has accepted the message.
-        if state is None or (
-            state.active_turn_id == active_turn_id
-            and (active_turn_id is not None or state.active_shell_turn_id is None)
+        if state is not None:
+            _replace_active_turn_id_unlocked(bridge_dir, state, active_turn_id)
+
+
+def record_acknowledged_turn_id(
+    bridge_dir: Path, sent_state: CodexNativeBridgeState, turn_id: str
+) -> bool:
+    """
+    Record the turn a ``turn/start`` or ``turn/steer`` response acknowledged.
+
+    While the request is in flight the forwarder may record a turn starting or
+    ending, and Codex can acknowledge ``turn/start`` on a busy thread with a
+    turn id that never starts. The forwarder's newer state wins in each case,
+    as does a relaunch, resume or thread rotation, which resets the revision.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param sent_state: Bridge state the request was sent against.
+    :param turn_id: Turn id from the response, e.g. ``"turn_abc123"``.
+    :returns: ``True`` when bridge state names *turn_id*, ``False`` when it
+        was missing or the session, thread, app-server or active turn changed
+        after *sent_state*.
+    """
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            return False
+        if state.active_turn_id == turn_id:
+            return True
+        if (
+            not _bridge_owner_matches(state, sent_state)
+            or state.active_turn_id != sent_state.active_turn_id
+            or state.active_turn_revision != sent_state.active_turn_revision
+            or state.interrupt_generation != sent_state.interrupt_generation
+            or state.turn_generation != sent_state.turn_generation
         ):
-            return
-        _write_bridge_state_unlocked(
-            bridge_dir,
-            replace(
-                state,
-                active_turn_id=active_turn_id,
-                turn_generation=state.turn_generation
-                + int(active_turn_id is not None and state.active_turn_id != active_turn_id),
-                active_shell_turn_id=(
-                    active_turn_id if state.active_shell_turn_id == active_turn_id else None
-                ),
+            return False
+        _replace_active_turn_id_unlocked(bridge_dir, state, turn_id)
+        return True
+
+
+def _replace_active_turn_id_unlocked(
+    bridge_dir: Path, state: CodexNativeBridgeState, active_turn_id: str | None
+) -> None:
+    """Set the active turn id while the caller holds the bridge state lock."""
+    # An accepted steer often returns the turn already saved here. Rewriting
+    # it can fail on a full disk after Codex has accepted the message.
+    if state.active_turn_id == active_turn_id and (
+        active_turn_id is not None or state.active_shell_turn_id is None
+    ):
+        return
+    _write_bridge_state_unlocked(
+        bridge_dir,
+        replace(
+            state,
+            active_turn_id=active_turn_id,
+            turn_generation=state.turn_generation
+            + int(active_turn_id is not None and state.active_turn_id != active_turn_id),
+            active_shell_turn_id=(
+                active_turn_id if state.active_shell_turn_id == active_turn_id else None
             ),
-        )
+            active_turn_revision=state.active_turn_revision + 1,
+        ),
+    )
 
 
 def read_interrupt_generations(bridge_dir: Path) -> dict[str, int]:
@@ -2457,6 +2513,7 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
                 active_turn_id=active_turn_id,
                 cwd=state.cwd,
                 interrupt_generation=state.interrupt_generation,
+                active_turn_revision=state.active_turn_revision + 1,
             ),
         )
 
@@ -2536,6 +2593,7 @@ def clear_active_turn_id_if_matches(
                 state,
                 active_turn_id=None,
                 active_shell_turn_id=None,
+                active_turn_revision=state.active_turn_revision + 1,
             ),
         )
         _run_on_cleared()
