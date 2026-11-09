@@ -23,7 +23,13 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import MCP_SELECTION_PREFIX, selected_mcp_spec
 from omnigent.runtime import session_stream
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider, local_single_user_enabled
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    AuthProvider,
+    local_single_user_enabled,
+)
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import (
     get_user_id,
@@ -349,6 +355,18 @@ def create_session_mcp_servers_router(
             raise OmnigentError(
                 "Built-in agents are read-only through this endpoint.",
                 code=ErrorCode.INVALID_INPUT,
+            )
+        # A session-scoped agent row can be bound into several sessions, so
+        # editing it through a session that does not own the row needs EDIT on
+        # the owning session; READ there must not be enough to rewrite another
+        # user's private agent.
+        if agent.session_id != session_id:
+            await require_access(
+                get_user_id(request, auth_provider),
+                agent.session_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
             )
         if artifact_store is None or agent_cache is None:
             raise OmnigentError(
