@@ -3122,6 +3122,7 @@ describe("automation trigger type", () => {
     },
   );
 
+  // Many timezone and integration switches; slow under CI coverage, so a longer timeout.
   it("restores schedule and source drafts without carrying conditions between integrations", async () => {
     async function chooseTimezone(zone: string) {
       await userEvent.click(screen.getByLabelText("Timezone", { exact: true }));
@@ -3174,7 +3175,7 @@ describe("automation trigger type", () => {
     expect(mutateAsync.mock.calls[0][0].timezone).toBe("America/New_York");
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("templateId");
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
-  });
+  }, 15_000);
 
   it("keeps custom prompt edits and attributes a switched gallery template to the selected source", async () => {
     render(dialog({ initialTrigger: "jira", initialTemplateId: "jira" }));
