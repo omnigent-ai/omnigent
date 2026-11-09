@@ -879,9 +879,11 @@ class ToolGroupsConfig:
     """
     Which framework-owned tool groups an agent advertises.
 
-    Every group defaults to ``True``: the groups register on every agent
-    unless the spec opts out under a top-level ``tool_groups:`` block (a
-    mapping of group name to boolean). Trimming a group the agent cannot
+    Every group except ``user_inbox`` defaults to ``True``: those groups
+    register on every agent unless the spec opts out under a top-level
+    ``tool_groups:`` block (a mapping of group name to boolean).
+    ``user_inbox`` is opt-in, so only agents built to post Inbox suggestions
+    can write to their owner's Inbox. Trimming a group the agent cannot
     use keeps the advertised tool payload under a strict provider's byte
     limit and stops a small model from picking an irrelevant tool.
 
@@ -890,6 +892,8 @@ class ToolGroupsConfig:
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+    :param user_inbox: ``sys_user_inbox_post`` and ``sys_user_inbox_list``,
+        which write to and read the owner's Inbox. Off by default.
     """
 
     browser: bool = True
@@ -897,6 +901,7 @@ class ToolGroupsConfig:
     comments: bool = True
     policies: bool = True
     agent_discovery: bool = True
+    user_inbox: bool = False
 
 
 @dataclass

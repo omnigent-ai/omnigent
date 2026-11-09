@@ -70,6 +70,7 @@ from omnigent.tools.builtins.timer import (
     SysTimerSetTool,
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
+from omnigent.tools.builtins.user_inbox import SysUserInboxListTool, SysUserInboxPostTool
 from omnigent.tools.builtins.web_read import WebReadTool
 from omnigent.tools.builtins.web_search import WebSearchTool
 
@@ -103,6 +104,8 @@ __all__ = [
     "SysSessionShareTool",
     "SysTimerCancelTool",
     "SysTimerSetTool",
+    "SysUserInboxListTool",
+    "SysUserInboxPostTool",
     "UpdateCommentTool",
     "WebReadTool",
     "WebSearchTool",

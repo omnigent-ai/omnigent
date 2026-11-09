@@ -44,6 +44,8 @@ from omnigent.tools.builtins import (
     SysSessionShareTool,
     SysTimerCancelTool,
     SysTimerSetTool,
+    SysUserInboxListTool,
+    SysUserInboxPostTool,
     UpdateCommentTool,
     any_skill_has_resources,
     get_builtin_tool,
@@ -190,6 +192,7 @@ class ToolManager:
         self._register_comment_tools()
         self._register_policy_tools()
         self._register_scheduled_task_tools()
+        self._register_user_inbox_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -227,6 +230,19 @@ class ToolManager:
             SysScheduledTaskUpdateTool(),
             SysScheduledTaskDeleteTool(),
         ):
+            self._tools[tool.name()] = tool
+
+    def _register_user_inbox_tools(self) -> None:
+        """
+        Register ``sys_user_inbox_post`` and ``sys_user_inbox_list``.
+
+        Opt-in through ``tool_groups.user_inbox: true``, so only agents built
+        to post Inbox suggestions can write to their owner's Inbox. The runner
+        dispatches both via the server's ``/v1/inbox/items`` endpoints.
+        """
+        if not self._spec.tool_groups.user_inbox:
+            return
+        for tool in (SysUserInboxPostTool(), SysUserInboxListTool()):
             self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:

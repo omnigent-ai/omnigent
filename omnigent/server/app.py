@@ -125,6 +125,7 @@ from omnigent.server.routes.extension_assets import create_extension_assets_rout
 from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
+from omnigent.server.routes.inbox_items import create_inbox_items_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
 from omnigent.server.routes.projects import create_projects_router
@@ -179,6 +180,7 @@ from omnigent.stores.conversation_store import (
     runner_seen_is_fresh,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.inbox_item_store import InboxItemStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.preference_store import PreferenceStore
@@ -1571,6 +1573,7 @@ def create_app(
     agent_cache: AgentCache,
     runner_tunnel_tokens: frozenset[str] | None = None,
     comment_store: CommentStore | None = None,
+    inbox_item_store: InboxItemStore | None = None,
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
@@ -1637,6 +1640,9 @@ def create_app(
         token-bound runner id, which is the shared remote-server
         behavior.
     :param comment_store: Store for per-conversation review comments.
+    :param inbox_item_store: Store for agent-posted Inbox items. The Inbox
+        item routes are served only with this store and the
+        ``proactive_agent`` feature on.
     :param policy_store: Store for server-persisted policies
         (session-scoped and server-wide defaults). ``None``
         disables both the session policy and default policy
@@ -3956,6 +3962,19 @@ def create_app(
         prefix="/v1",
         tags=["session_mcp_servers"],
     )
+    if inbox_item_store is not None and resolved_feature_flags.enabled(Feature.PROACTIVE_AGENT):
+        app.include_router(
+            create_inbox_items_router(
+                inbox_item_store,
+                conversation_store=conversation_store,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+                permission_store=permission_store,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["inbox_items"],
+        )
     if comment_store is not None:
         app.include_router(
             create_comments_router(

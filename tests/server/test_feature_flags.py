@@ -47,6 +47,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "session_orchestration": True,
         "sibling_sessions": False,
         "codex_plan_at_launch": True,
+        "proactive_agent": False,
     }
 
 

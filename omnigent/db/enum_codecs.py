@@ -5,10 +5,9 @@ Several low-cardinality closed-set columns (``conversations.kind``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
 ``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
 ``scheduled_tasks.execution_target``,
-``scheduled_task_runs.status``) are stored as
-integer codes rather
-than their string names — smaller rows and a tighter ``CHECK`` than a
-free ``VARCHAR``. The string names remain the
+``scheduled_task_runs.status``, ``inbox_items.kind``/``state``/``feedback``)
+are stored as integer codes rather than their string names — smaller rows
+and a tighter ``CHECK`` than a free ``VARCHAR``. The string names remain the
 contract for entities, the HTTP API, the web client, and the SDKs; the
 integer form never leaves the store row↔entity boundary. These codecs are
 the single place that translates between the two.
@@ -132,6 +131,26 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "failed": 4,
     "skipped": 5,
     "starting": 6,
+}
+
+# Proactive-agent Inbox items (``inbox_items``).
+INBOX_ITEM_KIND: dict[str, int] = {
+    "followup": 1,
+    "info": 2,
+    "reminder": 3,
+}
+
+INBOX_ITEM_STATE: dict[str, int] = {
+    "unread": 1,
+    "read": 2,
+    "done": 3,
+    "dismissed": 4,
+}
+
+INBOX_ITEM_FEEDBACK: dict[str, int] = {
+    "none": 0,
+    "useful": 1,
+    "not_useful": 2,
 }
 
 
@@ -355,3 +374,33 @@ def encode_scheduled_task_run_status(name: str) -> int:
 def decode_scheduled_task_run_status(code: int) -> str:
     """Decode a ``scheduled_task_runs.status`` int code to its name."""
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
+
+
+def encode_inbox_item_kind(name: str) -> int:
+    """Encode an ``inbox_items.kind`` name to its int code."""
+    return _encode(INBOX_ITEM_KIND, name, field="inbox_items.kind")
+
+
+def decode_inbox_item_kind(code: int) -> str:
+    """Decode an ``inbox_items.kind`` int code to its name."""
+    return _decode(INBOX_ITEM_KIND, code, field="inbox_items.kind")
+
+
+def encode_inbox_item_state(name: str) -> int:
+    """Encode an ``inbox_items.state`` name to its int code."""
+    return _encode(INBOX_ITEM_STATE, name, field="inbox_items.state")
+
+
+def decode_inbox_item_state(code: int) -> str:
+    """Decode an ``inbox_items.state`` int code to its name."""
+    return _decode(INBOX_ITEM_STATE, code, field="inbox_items.state")
+
+
+def encode_inbox_item_feedback(name: str) -> int:
+    """Encode an ``inbox_items.feedback`` name to its int code."""
+    return _encode(INBOX_ITEM_FEEDBACK, name, field="inbox_items.feedback")
+
+
+def decode_inbox_item_feedback(code: int) -> str:
+    """Decode an ``inbox_items.feedback`` int code to its name."""
+    return _decode(INBOX_ITEM_FEEDBACK, code, field="inbox_items.feedback")

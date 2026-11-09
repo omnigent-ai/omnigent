@@ -1770,3 +1770,80 @@ class SqlScheduledTaskRun(OmnigentBase):
             "id",
         ),
     )
+
+
+class SqlInboxItem(OmnigentBase):
+    """SQLAlchemy model for the ``inbox_items`` table.
+
+    One suggestion an agent posted to its owner's Inbox. Relationships to
+    ``conversations.id`` and ``agents.id`` are application-owned (no DB
+    foreign key, Rule R032).
+
+    :param id: UUID primary key.
+    :param user_id: Owner of the item; the reserved ``"local"`` user in
+        single-user mode, so the duplicate-detection unique index applies
+        there too (NULLs never collide in a unique index).
+    :param source_session_id: Session whose agent posted the item.
+    :param agent_id: Agent of that session.
+    :param prompt_version: Content hash of the agent bundle the session ran.
+    :param kind: Stable int code (see omnigent.db.enum_codecs INBOX_ITEM_KIND).
+    :param title: One-line summary.
+    :param body_md: Markdown body, stored compressed.
+    :param links: JSON list of evidence links, stored compressed.
+    :param suggested_prompt: Prompt for the card's Start session action.
+    :param primary_link: Canonical form of the first link; a duplicate-key input.
+    :param topic: The agent's slug for what the item is about; a duplicate-key input.
+    :param dedupe_key: Versioned duplicate-detection key, unique per owner.
+    :param state: Stable int code (see INBOX_ITEM_STATE).
+    :param feedback: Stable int code (see INBOX_ITEM_FEEDBACK).
+    :param feedback_text: The user's comment.
+    :param created_at: Unix epoch seconds when the item was posted.
+    :param read_at: Unix epoch seconds when the user first read it.
+    :param acted_at: Unix epoch seconds of the user's last action on it.
+    :param expires_at: Unix epoch seconds after which the key may be reused.
+    """
+
+    __tablename__ = "inbox_items"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_session_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    agent_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    body_md: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    links: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    suggested_prompt: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    primary_link: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    topic: Mapped[str] = mapped_column(String(128), nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    feedback: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="0")
+    feedback_text: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    read_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    acted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("kind IN (1, 2, 3)", name="ck_inbox_items_kind"),
+        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_inbox_items_state"),
+        CheckConstraint("feedback IN (0, 1, 2)", name="ck_inbox_items_feedback"),
+        Index("ix_inbox_items_user_created", "workspace_id", "user_id", "created_at", "id"),
+        Index(
+            "uq_inbox_items_user_dedupe_key",
+            "workspace_id",
+            "user_id",
+            "dedupe_key",
+            unique=True,
+        ),
+    )
