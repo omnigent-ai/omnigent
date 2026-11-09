@@ -288,8 +288,14 @@ Open the imported session and choose a host and working directory to resume it,
 then continue from Chat or Terminal.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
-offer pin, fork, rename, mark as unread or read, add to project (or move
-session), archive or unarchive, and delete.
+offer pin, fork, rename, mark as unread or read, create automation (when
+automations are on), add to project (or move session), archive or unarchive,
+and delete. Create automation opens the New automation dialog for the session;
+saving files its copy in the automation's project and opens the automation. The
+dialog and the automation's page link the session it starts from under Starts
+from. Deleting a session an automation runs from asks to Delete both, and leaves
+the automation's page for the automations list. With automations off for the
+caller, the session is deleted alone and its automation pauses at its next run.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens.
@@ -311,11 +317,12 @@ right-click menu do the same. On mobile, press and hold a row in the sidebar
 drawer, then drag it. Ordering → Custom in the filter menu keeps the order shown.
 
 **Bulk selection:** select several rows in the sidebar, then use the selection
-actions (mark as read or unread, archive, unarchive, delete).
+actions (mark as read or unread, archive, unarchive, delete). Deleting sessions
+automations run from names those automations and deletes them first.
 
 **Session header menu:** open a session and use the menu next to its title for
-pin, fork, export, rename, mark as unread, add to project, archive or
-unarchive, and delete. Clicking the title also renames, and the title's folder
+pin, fork, export, rename, mark as unread, create automation, add to project,
+archive or unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
 actions. On phones, the sidebar toggle has a circular glass surface; host,
 harness/model, background tasks, and session actions share the top-right glass

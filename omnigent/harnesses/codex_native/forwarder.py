@@ -2830,11 +2830,14 @@ async def _drive_side_chat_requests(
     """
     while True:
         try:
-            parent_thread_id = target.thread_id
-            # Only claim once the parent thread exists — a request read before
-            # then can't fork, and consuming it would lose the question (#3).
-            if parent_thread_id is not None:
-                for request in side_chat.peek_side_chat_requests(bridge_dir):
+            # Leave requests pending until a parent thread can accept them.
+            if target.thread_id is not None:
+                requests = await asyncio.to_thread(side_chat.peek_side_chat_requests, bridge_dir)
+                for request in requests:
+                    # The parent may change while filesystem I/O is in progress.
+                    parent_thread_id = target.thread_id
+                    if parent_thread_id is None:
+                        break
                     try:
                         child_thread_id = await side_chat.open_side_chat_on_client(
                             codex_client,
@@ -2851,10 +2854,15 @@ async def _drive_side_chat_requests(
                         await _post_side_chat_failed_notice(
                             ap_client, target.session_id, request.path.stem
                         )
-                    # Remove whether it forked or failed: a forked request is
-                    # done, and a failed one has surfaced a notice — keeping it
-                    # would retry the same failure forever.
-                    side_chat.discard_side_chat_request(request.path)
+                    # Finish acknowledging handled requests before a replacement
+                    # forwarder can pick them up, including during cancellation.
+                    discard = asyncio.create_task(
+                        asyncio.to_thread(side_chat.discard_side_chat_request, request.path)
+                    )
+                    try:
+                        await asyncio.shield(discard)
+                    finally:
+                        await discard
         except Exception:  # keep the drain loop alive.
             _logger.warning("Codex /side drain iteration failed", exc_info=True)
         await _sleep(_SIDE_CHAT_POLL_SECONDS)

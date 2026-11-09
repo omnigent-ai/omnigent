@@ -283,6 +283,21 @@ select its namespaced suggestion. See the
 then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
 Probes run only on expansion.
 
+**MCP enablement:** the switch on configured Claude/Codex servers and plugin MCP
+rows applies only to Omnigent launches, including new sessions and cold resumes.
+It does not stop a running harness or edit the harness's configuration. Off rows
+cannot expand or probe; turning a server off collapses it, and re-enabling leaves
+it collapsed. Managed server names are locked across matching rows in that
+harness, including plugin rows. A failed save rolls the switch back and shows the
+error. Refreshing inventory updates switches on an already-open plugin page.
+
+The server's `mcp_disabled_servers` master gate and each harness's
+`mcp_disabled_servers_claude` / `mcp_disabled_servers_codex` flag must be enabled.
+Older hosts without the enablement capability have no switches. For rollback,
+disable the master gate or a harness flag: switches disappear for that scope,
+future launches ignore its saved preferences, and running sessions remain
+unchanged. Saved preferences remain available when the flags are re-enabled.
+
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
 shown once for the host desktop onboarding just connected → See more. It opens
@@ -1049,6 +1064,10 @@ Cross-harness journeys:
   `tests/server/routes/test_mcp_tools.py`, and the real-host test
   `tests/e2e/test_host_mcp_tools_e2e.py::test_host_mcp_tools` with plain pytest.
   Web coverage is in `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  For enablement, also run `tests/host/test_mcp_inventory.py` and
+  `tests/server/routes/test_mcp_servers.py`. The non-browser journey
+  `tests/e2e/test_mcp_disabled_servers.py` checks both native CLIs, a disabled
+  fixture, an enabled control, and the Omnigent relay without building the SPA.
   Disabled plugin MCP rows stay visible without expansion or probes. Check
   same-name plugins from different marketplaces return their respective tools.
   HTTP probes honor the host's proxy and certificate environment settings.
