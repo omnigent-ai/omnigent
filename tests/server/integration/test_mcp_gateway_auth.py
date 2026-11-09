@@ -456,6 +456,18 @@ async def test_selection_preserves_literal_bundles_and_operator_provenance(
         json={"user_id": "reader@example.test", "level": 1},
     )
     assert shared.status_code in (200, 204), shared.text
+    redacted = await auth_client.get(
+        f"/v1/sessions/{sid}/agent/contents",
+        headers={"X-Forwarded-Email": "reader@example.test"},
+    )
+    assert redacted.status_code == 200, redacted.text
+    assert redacted.headers["x-agent-bundle-redacted"] == "true"
+    shared = await auth_client.put(
+        f"/v1/sessions/{sid}/permissions",
+        headers=headers,
+        json={"user_id": "reader@example.test", "level": 3},
+    )
+    assert shared.status_code in (200, 204), shared.text
     download = await auth_client.get(
         f"/v1/sessions/{sid}/agent/contents",
         headers={"X-Forwarded-Email": "reader@example.test"},
