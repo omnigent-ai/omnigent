@@ -13,6 +13,7 @@ import json as _json
 import re as _re
 from typing import Literal
 
+from omnigent.native.permission_modes import APPROVAL_SKIPPING_PERMISSION_MODES
 from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
@@ -490,6 +491,10 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
         if raw_permission_mode is None
         else str(raw_permission_mode)
     )
+    if isinstance(raw_permission_mode, str) and raw_permission_mode in (
+        APPROVAL_SKIPPING_PERMISSION_MODES
+    ):
+        permission_mode += " (skips approval prompts, so unattended runs act without asking)"
     legacy_notice = ""
     if action == "update" and _SCHEDULED_TASK_REVIEW_FIELDS.difference(args):
         legacy_notice = (

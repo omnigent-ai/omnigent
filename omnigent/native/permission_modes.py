@@ -48,3 +48,18 @@ PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
         "dangerous": ["--permission-mode", "dangerous"],
     },
 }
+
+# Modes that skip the approval prompt (``dontAsk`` denies instead, by rules the server
+# cannot see). An automation runs in one only when the task itself selects it, never
+# through an agent default or a reused session's live mode.
+APPROVAL_SKIPPING_PERMISSION_MODES: frozenset[str] = frozenset(
+    {
+        "bypassPermissions",  # claude-native, claude-sdk, acp
+        "dontAsk",  # claude-native
+        "full-access",  # codex-native
+        "bypass",  # codex-native
+        "yolo",  # cursor-native
+        "skip",  # antigravity-native
+        "dangerous",  # devin-native
+    }
+)

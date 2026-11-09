@@ -750,7 +750,10 @@ def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -
     ):
         assert setting in reason, reason
     assert prompt in reason
-    assert "Effective task permission mode: bypassPermissions" in reason
+    assert (
+        "Effective task permission mode: bypassPermissions "
+        "(skips approval prompts, so unattended runs act without asking)"
+    ) in reason.splitlines()
 
 
 @pytest.mark.parametrize(

@@ -65,6 +65,7 @@ class _FakeConversation:
     runner_last_seen: int | None = None
     parent_conversation_id: str | None = None
     root_conversation_id: str = ""
+    terminal_launch_args: list[str] | None = None
 
     def __post_init__(self) -> None:
         self.root_conversation_id = self.root_conversation_id or self.id
@@ -92,36 +93,57 @@ class FakeAgentStore:
 
 
 class _FakeExecutor:
-    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
+    def __init__(
+        self,
+        harness: str,
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
         # Mirrors AgentSpec.executor: a canonical harness in ``config['harness']``
         # (falls back to ``type``). The permission-mode injection reads this to
         # confirm a claude-native agent before adding ``--permission-mode``.
         self.type = harness
-        self.config = {"harness": harness}
+        self.config: dict[str, Any] = {"harness": harness}
+        if permission_mode is not None:
+            self.config["permission_mode"] = permission_mode
         self.reasoning_effort = reasoning_effort
 
 
 class _FakeSpec:
-    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
-        self.executor = _FakeExecutor(harness, reasoning_effort)
+    def __init__(
+        self,
+        harness: str,
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
+        self.executor = _FakeExecutor(harness, reasoning_effort, permission_mode)
 
 
 class _FakeLoadedAgent:
-    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
-        self.spec = _FakeSpec(harness, reasoning_effort)
+    def __init__(
+        self,
+        harness: str,
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
+        self.spec = _FakeSpec(harness, reasoning_effort, permission_mode)
 
 
 class FakeAgentCache:
     """Resolves an agent id to a spec with a fixed harness (for launch gating)."""
 
     def __init__(
-        self, harness: str = "claude-native", reasoning_effort: str | None = None
+        self,
+        harness: str = "claude-native",
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
     ) -> None:
         self._harness = harness
         self._reasoning_effort = reasoning_effort
+        self._permission_mode = permission_mode
 
     def load(self, agent_id: str, bundle_location: str, **_: Any) -> _FakeLoadedAgent:
-        return _FakeLoadedAgent(self._harness, self._reasoning_effort)
+        return _FakeLoadedAgent(self._harness, self._reasoning_effort, self._permission_mode)
 
 
 class FakeScheduledTaskStore:
@@ -2864,6 +2886,23 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
         ),
         (_continued_session(agent_id="ag_other"), {}, "continued_session_incompatible"),
         (_continued_session(), {"base_branch": "HEAD"}, "continued_session_incompatible"),
+        # A reused session keeps its own mode, so one switched to a mode that skips
+        # approval must not take prompts from a task that never selected such a mode.
+        (
+            _continued_session(
+                labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+            ),
+            {"permission_mode": "auto"},
+            "permission_mode_not_allowed",
+        ),
+        # Codex's full bypass, as spec-derived launch args emit it, with no label.
+        (
+            _continued_session(
+                terminal_launch_args=["--dangerously-bypass-approvals-and-sandbox"]
+            ),
+            {},
+            "permission_mode_not_allowed",
+        ),
         (
             _continued_session(
                 git_branch="main",
@@ -2958,6 +2997,42 @@ async def test_continue_never_replaces_an_unusable_session(
     assert conv_store.created == []
     assert [(run["status"], run["error_code"]) for run in store.runs] == [("failed", error_code)]
     assert "start a new session" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_mode", "session"),
+    [
+        (
+            "bypassPermissions",
+            _continued_session(
+                labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+            ),
+        ),
+        (
+            "full-access",
+            _continued_session(
+                terminal_launch_args=[
+                    "--sandbox",
+                    "danger-full-access",
+                    "--ask-for-approval",
+                    "never",
+                ]
+            ),
+        ),
+    ],
+)
+async def test_continue_accepts_a_session_in_a_mode_the_task_selects(
+    task_mode: str, session: _FakeConversation
+) -> None:
+    """A task that selects a mode skipping approval keeps sending into its session in one."""
+    conv_store = _ExistingConversationStore(session)
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(permission_mode=task_mode)})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert [conv.id for conv in launched] == ["conv_prev"]
+    assert [run["status"] for run in store.runs] == ["succeeded"]
 
 
 @pytest.mark.asyncio
@@ -3781,3 +3856,72 @@ async def test_cancelled_session_creation_waits_for_writes_before_cleanup(
         thread_release.set()
         finish_cleanup.set()
         await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("spec_mode", "fires"), [(None, True), ("bypassPermissions", False)])
+async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fires: bool) -> None:
+    """A Claude SDK spec with no mode runs in auto; one set to bypassPermissions cannot fire."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    launch = AsyncMock()
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness="claude-sdk", permission_mode=spec_mode),
+    )
+
+    on_fire = build_on_fire(deps, launch_dispatch=launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    if fires:
+        assert len(conv_store.created) == 1
+    else:
+        launch.assert_not_awaited()
+        assert conv_store.created == []
+        assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
+        assert "spec sets permission mode 'bypassPermissions'" in store.runs[0]["error"]
+
+
+@pytest.mark.parametrize(
+    ("labels", "launch_args", "expected"),
+    [
+        ({}, None, None),
+        ({"omnigent.claude_native.permission_mode": "auto"}, None, None),
+        (
+            {"omnigent.claude_native.permission_mode": "bypassPermissions"},
+            None,
+            "bypassPermissions",
+        ),
+        ({"omnigent.claude_native.permission_mode": "dontAsk"}, None, "dontAsk"),
+        # The live label wins over the flags the session was launched with.
+        (
+            {"omnigent.claude_native.permission_mode": "auto"},
+            ["--permission-mode", "bypassPermissions"],
+            None,
+        ),
+        ({}, ["--permission-mode", "bypassPermissions"], "--permission-mode bypassPermissions"),
+        ({}, ["--dangerously-skip-permissions"], "--dangerously-skip-permissions"),
+        ({}, ["--yolo"], "--yolo"),
+        (
+            {},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            "--dangerously-bypass-approvals-and-sandbox",
+        ),
+        (
+            {},
+            ["--sandbox", "read-only", "--ask-for-approval", "never"],
+            "--ask-for-approval never",
+        ),
+        ({}, ["--sandbox", "read-only", "--ask-for-approval", "on-request"], None),
+        ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, None, "bypass"),
+    ],
+)
+def test_session_approval_skipping_mode(
+    labels: dict[str, str], launch_args: list[str] | None, expected: str | None
+) -> None:
+    conv = SimpleNamespace(labels=labels, terminal_launch_args=launch_args)
+
+    assert fire_mod.session_approval_skipping_mode(conv) == expected

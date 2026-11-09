@@ -79,7 +79,10 @@ from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
-from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.native.permission_modes import (
+    APPROVAL_SKIPPING_PERMISSION_MODES,
+    PERMISSION_LAUNCH_ARGS,
+)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
@@ -94,6 +97,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_agent,
     validate_session_model_metadata,
 )
+from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
 from omnigent.server.routes._sessions.helpers import _announce_session_added
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentity,
@@ -101,6 +105,7 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     StartupLease,
 )
 from omnigent.server.scheduled.harness_settings import (
+    inherited_approval_skipping_problem,
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
@@ -860,6 +865,14 @@ async def _continue_session(
         )
         return
     assert conv is not None
+    agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+    inherited = await _inherited_permission_problem(deps, task, agent)
+    if inherited is not None:
+        reason, error_code = inherited
+        await recorder.finish(
+            "failed", conversation_id=session_id, error=reason, error_code=error_code
+        )
+        return
 
     await recorder.check()
     start_fire_stage("budget_validation", session_id=session_id)
@@ -916,6 +929,55 @@ async def _continue_session(
 
 _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"
 
+UNATTENDED_PERMISSION_ERROR_CODE = "permission_mode_not_allowed"
+
+# Launch flags that start a native CLI without an approval gate, for sessions whose
+# live mode has no label; Codex's full bypass is what spec-derived args emit for ``yolo``.
+_APPROVAL_SKIPPING_LAUNCH_ARGS: tuple[tuple[str, ...], ...] = (
+    *(
+        tuple(args)
+        for modes in PERMISSION_LAUNCH_ARGS.values()
+        for mode, args in modes.items()
+        if mode in APPROVAL_SKIPPING_PERMISSION_MODES and args
+    ),
+    ("--dangerously-skip-permissions",),
+    ("--dangerously-bypass-approvals-and-sandbox",),
+    ("--ask-for-approval", "never"),
+)
+
+
+def _contains_args(args: list[str], needle: tuple[str, ...]) -> bool:
+    width = len(needle)
+    return any(tuple(args[i : i + width]) == needle for i in range(len(args) - width + 1))
+
+
+def session_approval_skipping_mode(conv: Conversation) -> str | None:
+    """The approval-skipping permission mode *conv* is running in, or ``None``.
+
+    The Claude label tracks the live mode, including switches made inside the
+    CLI, so it wins over the launch flags it may have replaced.
+    """
+    claude_mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    if claude_mode:
+        return claude_mode if claude_mode in APPROVAL_SKIPPING_PERMISSION_MODES else None
+    if conv.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
+        return "bypass"
+    launch_args = list(getattr(conv, "terminal_launch_args", None) or [])
+    for needle in _APPROVAL_SKIPPING_LAUNCH_ARGS:
+        if _contains_args(launch_args, needle):
+            return " ".join(needle)
+    return None
+
+
+async def _inherited_permission_problem(
+    deps: FireDeps, task: ScheduledTask, agent: Any
+) -> tuple[str, str] | None:
+    """Why *task*, which selects no permission mode, may not run in its agent's default."""
+    if task.permission_mode is not None:
+        return None
+    problem = await inherited_approval_skipping_problem(agent, deps.agent_cache)
+    return None if problem is None else (problem, UNATTENDED_PERMISSION_ERROR_CODE)
+
 
 async def continued_session_problem(
     task: ScheduledTask,
@@ -942,6 +1004,14 @@ async def continued_session_problem(
         return "the session is a sub-agent's session", "continued_session_incompatible"
     if conv.agent_id != task.agent_id:
         return "the session runs a different agent", "continued_session_incompatible"
+    session_mode = session_approval_skipping_mode(conv)
+    if session_mode is not None and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES:
+        return (
+            f"the session is in permission mode {session_mode!r}, which skips approval, but the "
+            "automation does not select such a mode; switch the session to a mode that asks for "
+            "approval or uses the auto classifier",
+            UNATTENDED_PERMISSION_ERROR_CODE,
+        )
     # A pin the task changed since would otherwise be ignored silently: the
     # session keeps running where it was created.
     from omnigent.server.routes._host_worktree import (
@@ -1823,6 +1893,10 @@ async def _validate_fire_session_inputs(
             model_override=task.model_override,
             reasoning_effort=task.reasoning_effort,
         )
+        # The agent's default could change after the task was saved.
+        inherited = await _inherited_permission_problem(deps, task, agent)
+        if inherited is not None:
+            return inherited
         validate_scheduled_permission_mode(task.permission_mode)
         # An unresolvable or incompatible mode fails session creation.
         if validate_workspace:

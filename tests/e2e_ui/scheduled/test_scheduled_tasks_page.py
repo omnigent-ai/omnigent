@@ -861,15 +861,9 @@ def test_scheduled_task_edit_switches_the_harness(
 
 
 # ── Permission-mode selector ───────────────────────────────────────────────
-#
-# The dialog renders a Permission-mode select alongside Model/Effort, gated on
-# the same ``permissionMode`` capability (Claude Code). Because an automation
-# fires a fresh session each run, the whole launch vocabulary is offered —
-# including the launch-only ``dontAsk`` / ``bypassPermissions``. Left on
-# "Default" the field is omitted (agent default); a concrete pick persists
-# ``permission_mode``, which the fire path turns into the runner's
-# ``--permission-mode`` launch arg. Like the sibling tests these are LLM-free:
-# they exercise only the dialog, REST, and the rendered row.
+# Claude Code's picker offers every launch mode, including ``dontAsk`` and
+# ``bypassPermissions``; "Default" omits ``permission_mode``. LLM-free: these
+# exercise only the dialog, REST, and the rendered row.
 
 
 @pytest.mark.usefixtures("online_host")

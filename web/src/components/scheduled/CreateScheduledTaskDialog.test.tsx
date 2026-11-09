@@ -246,6 +246,7 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
           ...SERVER_INFO_OFFLINE_FALLBACK,
           features: { automations_v2: true },
           scheduled_task_harness_settings: true,
+          scheduled_task_approval_skipping_modes: true,
           scheduled_task_worktrees: true,
         }}
       >
@@ -4218,6 +4219,53 @@ describe("automation harness settings", () => {
     expect(!!screen.queryByTestId("task-permission-trigger")).toBe(permission);
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", harness, model);
   });
+
+  it.each([
+    ["Full Access", "full-access"],
+    ["Bypass approvals & sandbox", "bypass"],
+  ])("saves Codex's %s mode, which skips approval", async (label, mode) => {
+    mockHarness("codex-native");
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />,
+    );
+    await choose("permission", label);
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent(label);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe(mode);
+  });
+
+  it.each([
+    ["codex-native", "Approve for me", ["Full Access", "Bypass approvals & sandbox"]],
+    ["claude-native", "Auto", ["Bypass permissions", "Don't ask"]],
+  ])(
+    "hides %s modes that skip approval from a server that refuses them",
+    async (harness, kept, hidden) => {
+      mockHarness(harness);
+      // The server supports harness settings but predates approval-skipping modes.
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            features: { automations_v2: true },
+            scheduled_task_harness_settings: true,
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            initialName="R"
+            initialPrompt="P"
+          />
+        </CapabilitiesProvider>,
+      );
+      fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+      expect(await screen.findByRole("option", { name: kept })).toBeInTheDocument();
+      for (const name of hidden) {
+        expect(screen.queryByRole("option", { name })).not.toBeInTheDocument();
+      }
+    },
+  );
 
   it("starts a new Codex automation on Approve for me", async () => {
     mockHarness("codex-native");

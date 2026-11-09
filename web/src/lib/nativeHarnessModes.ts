@@ -261,6 +261,20 @@ export const CODEX_NATIVE_BYPASS_APPROVAL_OPTION: NativeHarnessMode = {
 };
 
 /**
+ * Modes that skip the approval prompt. Automations offer them only on servers that
+ * advertise scheduled_task_approval_skipping_modes. Mirrors omnigent/native/permission_modes.py.
+ */
+export const APPROVAL_SKIPPING_PERMISSION_MODES: ReadonlySet<string> = new Set([
+  "bypassPermissions",
+  "dontAsk",
+  "full-access",
+  "bypass",
+  "yolo",
+  "skip",
+  "dangerous",
+]);
+
+/**
  * Mode a new automation starts with. Nobody watches an automation's turns, so a
  * mode that asks would stall them; the user can still pick another one.
  */
