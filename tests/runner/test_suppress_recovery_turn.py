@@ -40,6 +40,7 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
     _sse,
 )
+from tests.runner.helpers import history_items_page
 
 # ── helpers ────────────────────────────────────────────────────────────
 
@@ -314,7 +315,6 @@ class _StoppedTurnServerClient(_HistoryServerClient):
     """History of a turn the user stopped: the request, then Stop's cancellation marker."""
 
     async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
-        del kwargs
         if url.rstrip("/").endswith("/items"):
             marker = {
                 "id": "msg_002",
@@ -322,7 +322,8 @@ class _StoppedTurnServerClient(_HistoryServerClient):
                 "role": "user",
                 "content": [{"type": "input_text", "text": CANCELLATION_MARKER_TEXT}],
             }
-            return self._Resp({**_ITEMS_PAGE, "data": [_PENDING_USER_MESSAGE, marker]})
+            page = history_items_page([_PENDING_USER_MESSAGE, marker], kwargs.get("params", {}))
+            return self._Resp(page)
         return self._Resp({})
 
 
