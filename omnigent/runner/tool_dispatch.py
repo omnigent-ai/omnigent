@@ -423,13 +423,13 @@ _COMMENT_TOOLS = frozenset(
     }
 )
 
-# Priority 5k: Agent-management reads — sys_agent_get / sys_agent_download /
+# Priority 5k: Agent-management tools — sys_agent_get / sys_agent_download /
 # sys_agent_list. The runner has no in-process AgentStore/ArtifactStore, so
 # these proxy the Omnigent server's REST endpoints (GET /v1/sessions/{id}/agent,
 # .../agent/contents, GET /v1/agents, GET /v1/sessions) over server_client.
-# sys_agent_download writes the bundle bytes into the agent's local os_env
-# cwd so sys_os_* can read it; sys_agent_list also scans that cwd for
-# locally-authored configs.
+# sys_agent_download returns a redacted bundle for READ callers and writes it into the
+# agent's local os_env cwd so sys_os_* can read it; sys_agent_list also
+# scans that cwd for locally-authored configs.
 _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list"})
 
 # Priority 5l: Policy management — sys_add_policy.
@@ -5775,7 +5775,7 @@ async def _agent_download_via_rest(
     :param agent_spec: The running agent's spec, for os_env resolution.
     :param conversation_id: The caller's session id, for os_env cwd.
     :param runner_workspace: The runner workspace, authoritative cwd.
-    :returns: JSON ``{path, agent_name, agent_version, bytes_written}``,
+    :returns: JSON ``{path, agent_name, agent_version, bytes_written, redacted}``,
         or a JSON error object.
     """
     try:
@@ -5817,6 +5817,7 @@ async def _agent_download_via_rest(
             "agent_name": agent_name,
             "agent_version": agent_version,
             "bytes_written": len(resp.content),
+            "redacted": resp.headers.get("X-Agent-Bundle-Redacted") == "true",
         }
     )
 
