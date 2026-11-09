@@ -606,6 +606,9 @@ class _CodexForwarderState:
         non-retryable error this connection (guards against re-replay
         or a repeated doomed attempt if the same collab item is observed
         multiple times).
+    :param thread_by_turn: First Codex thread each turn id was seen on, e.g.
+        ``{"turn_1": "thread_parent"}``. A forked child repeats its source
+        thread's turn ids, so a child turn owned by another thread is inherited.
     :param synced_item_keys: Stable item keys already posted to Omnigent this
         connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
         guards replay-vs-live overlap within one forwarder lifetime.
@@ -722,6 +725,7 @@ class _CodexForwarderState:
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
+    thread_by_turn: dict[str, str] = field(default_factory=dict)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
     child_delivery_slots: asyncio.Semaphore = field(
         default_factory=lambda: asyncio.Semaphore(_CHILD_DELIVERY_CONCURRENCY)
@@ -1119,6 +1123,27 @@ class _CodexForwarderState:
         :returns: ``True`` until the child has been subscribed this connection.
         """
         return thread_id not in self.subscribed_child_threads
+
+    def note_thread_turn(self, thread_id: str, turn_id: str) -> None:
+        """
+        Record the first thread a Codex turn id was seen on.
+
+        :param thread_id: Codex thread id, e.g. ``"thread_parent"``.
+        :param turn_id: Codex turn id, e.g. ``"turn_1"``.
+        :returns: None.
+        """
+        self.thread_by_turn.setdefault(turn_id, thread_id)
+
+    def is_inherited_turn(self, thread_id: str, turn_id: str) -> bool:
+        """
+        Return whether a thread's turn was first seen on another thread.
+
+        :param thread_id: Codex thread id, e.g. ``"thread_child"``.
+        :param turn_id: Codex turn id, e.g. ``"turn_1"``.
+        :returns: ``True`` when the turn belongs to the thread it was forked from.
+        """
+        owner_thread_id = self.thread_by_turn.get(turn_id)
+        return owner_thread_id is not None and owner_thread_id != thread_id
 
     def note_child_thread_subscribed(self, thread_id: str) -> None:
         """
@@ -3393,6 +3418,7 @@ async def _replay_resume_response(
     elicitation_tracker: _CodexElicitationTaskTracker,
     forwarder_state: _CodexForwarderState | None = None,
     replay_from_turn_id: str | None = None,
+    skip_inherited_turns: bool = False,
 ) -> None:
     """
     Mirror message items returned by ``thread/resume``.
@@ -3412,6 +3438,8 @@ async def _replay_resume_response(
         sub-agent registration.
     :param replay_from_turn_id: Optional first turn to replay after an
         interrupted forwarder. Earlier acknowledged turns are skipped.
+    :param skip_inherited_turns: Skip turns first seen on another thread, such
+        as the history a sub-agent forked from its parent.
     :returns: None.
     """
     result = response.get("result")
@@ -3425,6 +3453,13 @@ async def _replay_resume_response(
         return
     thread_id = thread.get("id")
     thread_id = thread_id if isinstance(thread_id, str) and thread_id else None
+    if skip_inherited_turns and forwarder_state is not None and thread_id is not None:
+        turns = _own_thread_turns(turns, thread_id, forwarder_state)
+    if forwarder_state is not None and thread_id is not None:
+        for turn in turns:
+            turn_id = _turn_id_from_payload(turn)
+            if turn_id is not None:
+                forwarder_state.note_thread_turn(thread_id, turn_id)
     replay_turns = _resume_turns_from(turns, replay_from_turn_id)
     async with _conversation_item_delivery_scope(session_id):
         for turn in replay_turns:
@@ -3467,6 +3502,26 @@ async def _replay_resume_response(
             turns=turns,
             forwarder_state=forwarder_state,
         )
+
+
+def _own_thread_turns(
+    turns: list[object],
+    thread_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> list[object]:
+    """Drop resume turns a forked thread inherited from another thread."""
+    own_turns = [
+        turn
+        for turn in turns
+        if not forwarder_state.is_inherited_turn(thread_id, _turn_id_from_payload(turn) or "")
+    ]
+    if len(own_turns) != len(turns):
+        _logger.info(
+            "Codex forwarder skipped %d inherited turns replaying thread %s",
+            len(turns) - len(own_turns),
+            thread_id,
+        )
+    return own_turns
 
 
 def _resume_turns_from(turns: list[object], replay_from_turn_id: str | None) -> list[object]:
@@ -3638,6 +3693,8 @@ async def _handle_event(
     params = event.get("params")
     if not isinstance(method, str) or not isinstance(params, dict):
         return
+    if forwarder_state is not None:
+        _note_event_thread_turn(forwarder_state, params)
     if forwarder_state is not None and _thread_started_is_subagent(event):
         child_thread_id = _thread_id_from_started_event(event)
         if child_thread_id is not None:
@@ -6361,6 +6418,22 @@ def _turn_items_are_empty(params: _JsonObject) -> bool:
     return isinstance(items, list) and len(items) == 0
 
 
+def _note_event_thread_turn(forwarder_state: _CodexForwarderState, params: _JsonObject) -> None:
+    """
+    Record which thread a notification's turn belongs to.
+
+    :param forwarder_state: Mutable forwarder state.
+    :param params: Codex notification params, e.g.
+        ``{"threadId": "thread_1", "turnId": "turn_1"}``.
+    :returns: None.
+    """
+    thread_id = _thread_id_from_params(params)
+    turn = params.get("turn")
+    turn_id = params.get("turnId") or (turn.get("id") if isinstance(turn, dict) else None)
+    if thread_id is not None and isinstance(turn_id, str) and turn_id:
+        forwarder_state.note_thread_turn(thread_id, turn_id)
+
+
 def _terminal_turn_id_from_params(params: _JsonObject) -> str | None:
     """
     Extract the terminal turn id from Codex turn-boundary params.
@@ -7111,6 +7184,7 @@ async def _apply_child_resume(
             usage_coalescer=usage_coalescer,
             elicitation_tracker=child_elicitation_tracker,
             forwarder_state=forwarder_state,
+            skip_inherited_turns=True,
         )
     finally:
         await child_elicitation_tracker.close()

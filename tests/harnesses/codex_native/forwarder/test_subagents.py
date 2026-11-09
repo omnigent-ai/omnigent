@@ -280,6 +280,103 @@ async def test_resume_child_thread_or_log_not_ready_still_retries() -> None:
     assert forwarder_state.needs_child_thread_backfill("thread_child") is True
 
 
+def _agent_message_turn(turn_id: str, text: str) -> dict:
+    """Build a completed Codex resume turn holding one assistant message."""
+    return {
+        "id": turn_id,
+        "status": "completed",
+        "items": [{"type": "agentMessage", "id": f"msg-{turn_id}", "text": text}],
+    }
+
+
+def _mirrored_texts(client: _RecordingClient, session_id: str) -> list[str]:
+    """Return assistant texts mirrored into one Omnigent session."""
+    return [
+        part["text"]
+        for url, body in client.posts
+        if url == f"/v1/sessions/{session_id}/events"
+        and body["type"] == "external_conversation_item"
+        for part in body["data"]["item_data"].get("content", [])
+        if isinstance(part, dict) and "text" in part
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_turn_source", ["live", "resume"])
+async def test_backfill_child_thread_skips_turns_forked_from_the_parent(
+    tmp_path: Path, parent_turn_source: str
+) -> None:
+    """
+    A forked sub-agent's backfill mirrors only the sub-agent's own turns.
+
+    Codex returns the parent's turns, with the parent's turn ids, at the start
+    of a forked sub-agent thread. Replaying them copied the parent transcript
+    into every sub-agent session and held up the parent's live events.
+    """
+    client = _RecordingClient()
+    forwarder_state = fwd._CodexForwarderState(parent_session_id="conv_parent")
+    forwarder_state.note_child_thread("thread_child", "conv_child")
+    usage = fwd._SessionUsageCoalescer(client, "conv_parent")  # type: ignore[arg-type]
+    elicitations = fwd._CodexElicitationTaskTracker()
+    parent_turn = _agent_message_turn("turn_parent", "parent reply")
+    if parent_turn_source == "live":
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            event={
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread_parent",
+                    "turnId": "turn_parent",
+                    "item": parent_turn["items"][0],
+                },
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=elicitations,
+            expected_thread_id="thread_parent",
+            forwarder_state=forwarder_state,
+        )
+    else:
+        # A restarted forwarder resumes the parent from its newest turn only.
+        await fwd._replay_resume_response(
+            client,  # type: ignore[arg-type]
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            response={
+                "result": {
+                    "thread": {
+                        "id": "thread_parent",
+                        "turns": [parent_turn, _agent_message_turn("turn_latest", "latest")],
+                    }
+                }
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=elicitations,
+            forwarder_state=forwarder_state,
+            replay_from_turn_id="turn_latest",
+        )
+    child_response = _child_resume_response(
+        "thread_child",
+        forkedFromId="thread_parent",
+        turns=[parent_turn, _agent_message_turn("turn_child", "child reply")],
+    )
+
+    await fwd._backfill_child_thread(
+        client,  # type: ignore[arg-type]
+        _FakeChildResumeClient(resume_response=child_response),  # type: ignore[arg-type]
+        parent_session_id="conv_parent",
+        child_session_id="conv_child",
+        child_thread_id="thread_child",
+        forwarder_state=forwarder_state,
+    )
+    await elicitations.close()
+    await usage.close()
+    await forwarder_state.close_child_streams()
+
+    assert _mirrored_texts(client, "conv_child") == ["child reply"]
+
+
 class CodexChildForwarderTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         temporary = tempfile.TemporaryDirectory()
