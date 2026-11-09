@@ -1,11 +1,9 @@
 """E2E: a clone whose sandbox is still launching takes its first message.
 
-"Clone & start" onto a new sandbox returns as soon as the fork row exists. Until
-the sandbox registers, the clone has no host or workspace, so it looks like an
-unbound coding fork. Its first send used to open "Resume this session" with "The
-original session's host is offline" (OMNI-10516). That dialog offers to bind a
-clone the server is already placing, and it closed by itself once the sandbox
-bound. The send must go to the server instead, which holds it for the launch.
+A sandbox clone remains unbound until its sandbox registers: "Clone & start"
+returns as soon as the fork row exists, and the clone has no host or workspace
+until then, so it looks like an unbound coding fork. Its first send must go to
+the server, which holds it for the launch, not open the resume picker.
 
 The clone is a real fork with the fork-source label a coding source stamps, so
 the server reports it as an unbound fork (``needs_workspace``, runner offline).

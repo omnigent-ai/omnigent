@@ -4855,12 +4855,8 @@ export function unboundSessionResumableInApp(params: {
  * in-app resume picker (`ResumeWithDirectoryDialog`) instead of going to the
  * server.
  *
- * A managed-sandbox session, including a clone forked onto a new sandbox, has
- * no host or workspace until its sandbox registers, so it reads as unbound.
- * The server binds it and holds a message sent meanwhile for the launch, so
- * the picker would offer a bind the server is already doing, and for a clone
- * it says the source's host is offline (host pickers hide sandbox hosts). A
- * failed launch opens the picker as before.
+ * An in-flight sandbox launch owns binding, so bypass the resume picker.
+ * Failed launches retain normal recovery.
  *
  * @param unboundFork - See `isUnboundCodingFork`.
  * @param resumableUnbound - See `unboundSessionResumableInApp`.
