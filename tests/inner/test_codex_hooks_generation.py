@@ -131,6 +131,24 @@ def test_write_router_hooks_file_replaces_symlink_and_merges(tmp_path: Path) -> 
     assert json.loads((source / "hooks.json").read_text()) == _USER_HOOKS
 
 
+def test_stripping_host_config_keeps_only_router_hooks(tmp_path: Path) -> None:
+    source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
+    codex_home = tmp_path / "private"
+    codex_home.mkdir()
+    _populate_codex_home_config(codex_home, source)
+
+    codex_executor._strip_host_launched_config(
+        codex_home, tmp_path / "bridge", session_id="conv_abc"
+    )
+
+    hooks = codex_home / "hooks.json"
+    assert not hooks.is_symlink()
+    payload = json.loads(hooks.read_text())
+    assert [entry.get("matcher") for entry in payload["hooks"]["PreToolUse"]] == [r".*spawn_agent"]
+    assert "Stop" not in payload["hooks"]
+    assert json.loads((source / "hooks.json").read_text()) == _USER_HOOKS
+
+
 def test_populate_skips_hooks_symlink_when_hooks_are_injected(tmp_path: Path) -> None:
     source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
     codex_home = tmp_path / "private"
