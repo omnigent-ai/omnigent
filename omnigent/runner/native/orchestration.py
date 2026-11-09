@@ -8813,9 +8813,8 @@ def _ensure_orchestrator_skills_in_bundle(
             target_dir.symlink_to(source)
         except OSError:
             _logger.debug(
-                "Could not link %s skill into bundle %s",
+                "Could not link the %s skill into the agent bundle",
                 name,
-                bundle_dir,
                 exc_info=True,
                 extra={"session_id": runner_primary_session_id()},
             )

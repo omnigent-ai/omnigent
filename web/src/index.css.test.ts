@@ -370,7 +370,7 @@ describe("index.css app-shell viewport lock", () => {
 const allWidthNativeLayoutRules = [
   ["iOS keyboard viewport", "[data-ios-native].app-shell", "--omnigent-viewport-height"],
   ["native chat header", ".chat-header", "--omnigent-safe-top"],
-  ["native Plan tracker", ".chat-plan-accordion", "--omnigent-safe-top"],
+  ["native task preview", ".chat-tasks-preview", "--omnigent-safe-top"],
 ] as const;
 
 describe("index.css native tablet layout", () => {
