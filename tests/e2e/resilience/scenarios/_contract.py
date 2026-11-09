@@ -129,6 +129,12 @@ def enter(driver: SessionDriver, phase: str, *, outage_s: float) -> Phase:
         return Phase(phase, driver.start_unanswered_turn())
     if phase != IDLE:
         raise ValueError(f"unknown phase {phase!r}")
+    # The final reply can be committed before the native turn's idle edge.
+    wait_for(
+        lambda: driver.lab.snapshot(driver.session_id).get("status") == "idle" or None,
+        timeout=SETTLE_S,
+        what="idle before injecting the fault",
+    )
     return Phase(phase)
 
 

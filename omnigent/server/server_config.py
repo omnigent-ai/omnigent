@@ -112,6 +112,14 @@ def config_str_list(value: Any) -> list[str]:
     return [str(item).strip() for item in items if str(item).strip()]
 
 
+def automation_trigger_poll_minutes(config: Mapping[str, Any]) -> int:
+    """Read the polling interval for new trigger templates, in whole minutes."""
+    value = config.get("automation_trigger_poll_minutes", 10)
+    if isinstance(value, bool) or not isinstance(value, int) or not 10 <= value <= 240:
+        raise ValueError("automation_trigger_poll_minutes must be an integer from 10 to 240")
+    return value
+
+
 def session_title_instructions(config: Mapping[str, Any]) -> str | None:
     """Return validated additional guidance for automatic session titles.
 

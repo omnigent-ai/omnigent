@@ -12,6 +12,7 @@ import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { MobileMenuGlassSurface } from "./MobileMenuGlassSurface";
 
 /**
  * Built-in slash commands the web UI recognises directly. Each entry
@@ -387,8 +388,9 @@ function McpServerMenu({
     <div
       data-testid="mcp-server-menu"
       onMouseDown={(event) => event.preventDefault()}
-      className="menu-surface absolute bottom-full left-0 z-30 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
+      className="menu-surface mobile-menu-glass absolute bottom-full left-0 z-30 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
     >
+      <MobileMenuGlassSurface />
       <div className="px-2 py-1">
         <div className="font-medium text-ui text-foreground">MCP servers</div>
         <div className="text-xs leading-4 text-muted-foreground">Enabled for this session</div>
@@ -660,8 +662,9 @@ export function SlashCommandMenu({
     <TooltipProvider>
       <div
         data-testid="slash-command-menu"
-        className="menu-surface absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
+        className="menu-surface mobile-menu-glass absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
       >
+        <MobileMenuGlassSurface />
         <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
           {builtinRows.length > 0 && sectionHeader("Commands")}
           {builtinRows.map((row) => (

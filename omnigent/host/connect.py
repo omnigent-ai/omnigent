@@ -659,6 +659,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
+        # Path to the MCP sign-in status file; the executor must read the
+        # same file the host lists in /mcp to reconnect after sign-in.
+        "OMNIGENT_MCP_AUTH_STATUS_FILE",
         # The workspace this host is bound to (cli_auth.load_databricks_org_id),
         # so runners keep routing to it when the stored record changes.
         "OMNIGENT_DATABRICKS_ORG_PIN",
@@ -1030,6 +1033,9 @@ def _build_runner_env(
         or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
         or key in forwarded
     }
+    # Runners start in the session workspace, so resolve a relative override here.
+    if auth_status_file := env.get("OMNIGENT_MCP_AUTH_STATUS_FILE"):
+        env["OMNIGENT_MCP_AUTH_STATUS_FILE"] = str(Path(auth_status_file).expanduser().absolute())
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
@@ -2064,10 +2070,16 @@ class HostProcess:
             and (binding_for_harness(frame.inference_config, frame.harness) is not None)
         )
         if has_binding:
-            from omnigent.onboarding.harness_install import missing_harness_cli
+            from omnigent.onboarding.harness_install import (
+                READINESS_CLI_PROBE_TIMEOUT_S,
+                missing_harness_cli,
+            )
 
             assert frame.harness is not None
-            harness_ready = (await asyncio.to_thread(missing_harness_cli, frame.harness)) is None
+            missing = await asyncio.to_thread(
+                missing_harness_cli, frame.harness, READINESS_CLI_PROBE_TIMEOUT_S
+            )
+            harness_ready = missing is None
         else:
             harness_ready = frame.harness is None or await asyncio.to_thread(
                 harness_is_configured, frame.harness
@@ -2498,14 +2510,43 @@ class HostProcess:
         :param frame: The stop request frame.
         :returns: Result frame with status.
         """
+        return await self._finish_stop(frame, self._claim_runner_for_stop(frame))
+
+    def _claim_runner_for_stop(self, frame: HostStopRunnerFrame) -> _RunnerHandle | None:
+        """Untrack the runner a stop names, marking its exit as intentional.
+
+        This is the only part of a stop that must keep arrival order with
+        launches, so the frame dispatcher runs it under the lifecycle lock.
+
+        :param frame: The stop request frame.
+        :returns: The claimed handle, or ``None`` for an unknown runner.
+        """
         handle = self._runners.pop(frame.runner_id, None)
+        if handle is not None:
+            handle.stop_requested = True
+        return handle
+
+    async def _finish_stop(
+        self,
+        frame: HostStopRunnerFrame,
+        handle: _RunnerHandle | None,
+    ) -> HostStopRunnerResultFrame:
+        """Terminate a claimed runner and build the stop result.
+
+        Runs outside the lifecycle lock: termination can wait out the
+        runner's exit grace, and launches queued behind a burst of stops
+        would otherwise exceed the server's launch timeout.
+
+        :param frame: The stop request frame.
+        :param handle: The handle from :meth:`_claim_runner_for_stop`.
+        :returns: Result frame with status.
+        """
         if handle is None:
             return HostStopRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
-        handle.stop_requested = True
         # The poll/terminate/wait round-trips are lock-free waitpid calls for a
         # direct-Popen runner, but blocking control-socket exchanges for a
         # zygote-forked one — run them off the loop so a wedged zygote can't
@@ -4334,6 +4375,18 @@ class HostProcess:
                 head_sha=cast("str | None", params.get("head_sha")),
                 base_sha=cast("str | None", params.get("base_sha")),
             )
+        if op == "github_commits":
+            return r.github_commits(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+            )
+        if op == "github_commit_diff":
+            return r.github_commit_diff(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                commit_sha=cast("str | None", params.get("commit_sha")),
+            )
         if op == "github_labels":
             return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_merge_options":
@@ -5893,7 +5946,8 @@ class HostProcess:
                 raise launch_fault
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
-                stop_result = await self._handle_stop(frame)
+                stopping_handle = self._claim_runner_for_stop(frame)
+            stop_result = await self._finish_stop(frame, stopping_handle)
             await self._send_text(ws, self._encode_frame(stop_result))
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, self._encode_frame(await self._handle_runner_status(frame)))
