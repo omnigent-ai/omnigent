@@ -8788,14 +8788,17 @@ def _ensure_orchestrator_skills_in_bundle(
     """
     # Anchored on the package root, not a ``.parent`` count off this file:
     # moving this module deeper must not silently break the source path.
-    sources = [_OMNIGENT_PACKAGE_DIR / "onboarding" / "agent" / "skills" / "build-omnigent"]
+    onboarding_skills = _OMNIGENT_PACKAGE_DIR / "onboarding" / "agent" / "skills"
+    sources = {"build-omnigent": onboarding_skills / "build-omnigent"}
     spec = _unwrap_resolved_spec(agent_spec)
     if isinstance(spec, AgentSpec):
-        from omnigent.spec.skill_sources import framework_skills
+        from omnigent.spec.skill_sources import FRAMEWORK_SKILLS_DIR, framework_skill_names
 
-        sources += [skill.skill_dir for skill in framework_skills(spec) if skill.skill_dir]
-    for source in sources:
-        target_dir = bundle_dir / "skills" / source.name
+        # Names come from Omnigent's own table, so the logs below name no spec value.
+        for name in framework_skill_names(spec):
+            sources[name] = FRAMEWORK_SKILLS_DIR / name
+    for name, source in sources.items():
+        target_dir = bundle_dir / "skills" / name
         if target_dir.exists():
             continue
         if not source.is_dir():
@@ -8811,7 +8814,7 @@ def _ensure_orchestrator_skills_in_bundle(
         except OSError:
             _logger.debug(
                 "Could not link %s skill into bundle %s",
-                source.name,
+                name,
                 bundle_dir,
                 exc_info=True,
                 extra={"session_id": runner_primary_session_id()},

@@ -279,8 +279,18 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
 
 
 # Skills Omnigent ships, each for agents that have the tool group it drives.
-_FRAMEWORK_SKILLS_DIR = Path(__file__).resolve().parent.parent / "resources" / "skills"
+FRAMEWORK_SKILLS_DIR = Path(__file__).resolve().parent.parent / "resources" / "skills"
 _FRAMEWORK_SKILL_GROUPS = {"workflow": "journal"}
+
+
+def framework_skill_names(spec: AgentSpec) -> list[str]:
+    """Names of the skills Omnigent ships for the agent's tool groups, e.g. ``["workflow"]``.
+
+    Each lives in ``FRAMEWORK_SKILLS_DIR / name``.
+    """
+    return [
+        name for name, group in _FRAMEWORK_SKILL_GROUPS.items() if getattr(spec.tool_groups, group)
+    ]
 
 
 def framework_skills(spec: AgentSpec) -> list[SkillSpec]:
@@ -289,14 +299,12 @@ def framework_skills(spec: AgentSpec) -> list[SkillSpec]:
     Like bundled skills, they ignore ``skills_filter``; an agent drops one by
     turning its tool group off, e.g. ``tool_groups.journal: false``.
     """
-    names = {
-        name for name, group in _FRAMEWORK_SKILL_GROUPS.items() if getattr(spec.tool_groups, group)
-    }
-    if not names or not _FRAMEWORK_SKILLS_DIR.is_dir():
+    names = set(framework_skill_names(spec))
+    if not names or not FRAMEWORK_SKILLS_DIR.is_dir():
         return []
     return [
         skill
-        for skill in _discover_skills(_FRAMEWORK_SKILLS_DIR, skipped=[])
+        for skill in _discover_skills(FRAMEWORK_SKILLS_DIR, skipped=[])
         if skill.name in names
     ]
 
