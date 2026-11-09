@@ -129,9 +129,56 @@ def test_staged_only_and_existing_lines(
     )
     assert check(repository) == []
     git(repository, "add", ".")
-    assert check(repository) == [
+    expected = [
         "existing.txt:3: prohibited reference in added text",
         "existing.txt:4: prohibited reference in added text",
+    ]
+    assert check(repository) == expected
+    if not separator:
+        for setting in ["color.diff", "color.ui"]:
+            git(repository, "config", setting, "always")
+            try:
+                assert check(repository) == expected
+            finally:
+                git(repository, "config", "--unset", setting)
+
+
+@pytest.mark.usefixtures("sample_policy")
+def test_wrapped_phrases_only_report_added_text(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = repository / "existing.txt"
+    path.write_text("example\nrestricted\nkeep\nexample\n", encoding="utf-8")
+    git(repository, "add", ".")
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "historical")
+    path.write_text("example\n\nrestricted\nkeep\nexample\nsafe\n", encoding="utf-8")
+    git(repository, "add", ".")
+    assert check(repository) == []
+    path.write_text(
+        "example\n\nrestricted\nkeep\nexample\nrestricted\nkeep\nexample\nrestricted\n",
+        encoding="utf-8",
+    )
+    git(repository, "add", ".")
+    assert check(repository) == [
+        "existing.txt:6: prohibited reference in added text",
+        "existing.txt:8: prohibited reference in added text",
+        "existing.txt:9: prohibited reference in added text",
+    ]
+    monkeypatch.setattr(
+        policy,
+        "PHRASES",
+        re.compile(r"example[\s_-]*restricted|restricted[\s_-]*example", re.IGNORECASE),
+    )
+    definition = repository / "dev/lint/lint_reference_policy.py"
+    definition.parent.mkdir(parents=True)
+    definition.write_text("example\nrestricted\nexample\n", encoding="utf-8")
+    git(repository, "add", ".")
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "definition")
+    git(repository, "mv", "dev/lint/lint_reference_policy.py", "moved.txt")
+    assert check(repository) == [
+        "moved.txt:1: prohibited reference in added text",
+        "moved.txt:2: prohibited reference in added text",
+        "moved.txt:3: prohibited reference in added text",
     ]
 
 

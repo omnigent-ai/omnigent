@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+from bisect import bisect_right
 from pathlib import Path
 
 POLICY_FILES = frozenset({"dev/lint/lint_reference_policy.py"})
@@ -55,15 +56,32 @@ def host_pattern(suffixes: tuple[str, ...]) -> re.Pattern[str]:
 HOST = host_pattern(HOST_SUFFIXES)
 
 
-def violates(text: str) -> bool:
-    """Match names in prose, snake_case, camelCase, and filenames."""
+def _violation_lines(text: str) -> set[int]:
+    """Return LF-based locations, including phrases that wrap across lines."""
     words = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
     words = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", words)
-    if PROHIBITED_NAMES.intersection(re.findall(r"[a-z]+", words.lower())):
-        return True
-    if PHRASES.search(words):
-        return True
-    return any(match.group().lower() not in PUBLIC_HOSTS for match in HOST.finditer(text))
+    lines = set()
+    original_lines = text.split("\n")
+    for line_number, normalized in enumerate(words.split("\n"), 1):
+        if PROHIBITED_NAMES.intersection(re.findall(r"[a-z]+", normalized.lower())) or any(
+            match.group().lower() not in PUBLIC_HOSTS
+            for match in HOST.finditer(original_lines[line_number - 1])
+        ):
+            lines.add(line_number)
+    line_starts = [0, *(match.end() for match in re.finditer("\n", words))]
+    position = 0
+    while match := PHRASES.search(words, position):
+        first_line = bisect_right(line_starts, match.start())
+        for offset, segment in enumerate(match.group().split("\n")):
+            if segment.strip():
+                lines.add(first_line + offset)
+        position = match.start() + 1
+    return lines
+
+
+def violates(text: str) -> bool:
+    """Match names in prose, snake_case, camelCase, and filenames."""
+    return bool(_violation_lines(text))
 
 
 def git(root: Path, *args: str) -> bytes:
@@ -79,7 +97,7 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
         target = head or "HEAD"
         ancestor = git(root, "merge-base", base, target).decode().strip()
         revisions = [ancestor, target]
-    options = ["--no-ext-diff", "--no-textconv", "--find-renames", *revisions]
+    options = ["--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", *revisions]
     entries = iter(
         git(
             root, "diff", *options, "--raw", "--no-abbrev", "-z", "--diff-filter=AMRT", "--"
@@ -102,35 +120,39 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
         contents = git(root, "cat-file", "blob", object_id.decode())
         if b"\0" in contents[:8000]:
             continue
-        if old_path in POLICY_FILES:
-            for line_number, line in enumerate(
-                contents.decode("utf-8", errors="replace").split("\n"), 1
-            ):
-                if violates(line):
-                    findings.append(f"{path}:{line_number}: prohibited reference in added text")
+        violation_lines = _violation_lines(contents.decode("utf-8", errors="replace"))
+        if not violation_lines:
             continue
-        paths = [old_path, path] if renamed else [path]
-        patch = git(
-            root,
-            "--literal-pathspecs",
-            "diff",
-            *options,
-            "--text",
-            "--unified=0",
-            "--",
-            *paths,
-        ).decode("utf-8", errors="replace")
-        line_number = None
-        for line in patch.split("\n"):
-            hunk = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-            if hunk:
-                line_number = int(hunk[1])
-            elif line_number is not None and line.startswith("+"):
-                if violates(line[1:]):
-                    findings.append(f"{path}:{line_number}: prohibited reference in added text")
-                line_number += 1
-            elif line_number is not None and line.startswith(" "):
-                line_number += 1
+        if old_path in POLICY_FILES:
+            added_lines = violation_lines
+        else:
+            paths = [old_path, path] if renamed else [path]
+            patch = git(
+                root,
+                "--literal-pathspecs",
+                "diff",
+                *options,
+                "--text",
+                "--unified=0",
+                "--inter-hunk-context=0",
+                "--",
+                *paths,
+            ).decode("utf-8", errors="replace")
+            added_lines = set()
+            line_number = None
+            for line in patch.split("\n"):
+                hunk = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+                if hunk:
+                    line_number = int(hunk[1])
+                elif line_number is not None and line.startswith("+"):
+                    added_lines.add(line_number)
+                    line_number += 1
+                elif line_number is not None and line.startswith(" "):
+                    line_number += 1
+        findings.extend(
+            f"{path}:{line_number}: prohibited reference in added text"
+            for line_number in sorted(violation_lines & added_lines)
+        )
     return findings
 
 
