@@ -1388,10 +1388,12 @@ describe("index.css electron-mac sidebar header", () => {
     expect(peekHeaderRowRule).toContain("display: none");
   });
 
-  it("orders the cluster Toggle, Search, Settings left-to-right", () => {
-    // The DOM order is Search → Settings → toggle (tab order follows
-    // importance), so the toggle is reordered visually rather than moved.
-    expect(stripActionsRule).toMatch(/&\s*>\s*\*\s*>\s*\*:last-child\s*\{[^}]*order:\s*-1/);
+  it("keeps Collapse by the lights and docks Back/Forward at the sidebar's edge", () => {
+    // The toggle comes first in the DOM, so nothing reorders the cluster.
+    expect(stripActionsRule).not.toMatch(/order:/);
+    expect(cssSource).toMatch(
+      /\.app-shell\[data-sidebar-open\]\s+\.electron-sidebar-header-actions\s+\[data-testid="history-navigation-buttons"\]\s*\{[^}]*margin-left:\s*auto/,
+    );
   });
 
   it("pushes the settings sidebar's Back row below the lights", () => {
@@ -1482,7 +1484,16 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
 
   it("has the clearance rule this test exists to protect", () => {
     expect(rule, "the maximized rail tab-strip padding rule is gone from index.css").toBeDefined();
-    expect(rule).toContain("padding-left: calc(var(--mac-traffic-light-width) + 5rem)");
+    expect(rule).toContain("padding-left: var(--mac-header-actions-clearance)");
+  });
+
+  it("clears the same width as the chat header, which sits under the same cluster", () => {
+    expect(cssSource).toMatch(
+      /\.traffic-light-clearance \{\s*padding-left: var\(--mac-header-actions-clearance\);/,
+    );
+    expect(cssSource).toContain(
+      "--mac-header-actions-clearance: calc(var(--mac-traffic-light-width) + 6.75rem);",
+    );
   });
 
   it("clears the lights on the mac shell while the sidebar is collapsed", () => {

@@ -1500,6 +1500,8 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
 
 /** The server's ErrorCode.HOST_OFFLINE: a held send whose host is offline. */
 export const HOST_OFFLINE_CODE = "host_offline";
+/** A request answered by a sign-in page instead of the API. */
+export const SIGN_IN_EXPIRED_CODE = "sign_in_expired";
 
 /** Tells the server this client resends a message once its offline host reconnects. */
 const HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline";
@@ -1529,17 +1531,27 @@ export async function postEvent(
   // on `code` — e.g. surface a friendly "runner didn't come online" message
   // for the 503 the server returns when a host-bound runner never connects.
   if (!res.ok) throw await apiErrorFromResponse(res);
-  return postEventResponseFromWire(
-    (await res.json()) as {
-      queued: boolean;
-      item_id?: string;
-      denied?: boolean;
-      pending_id?: string;
-      recovered?: boolean;
-      recovery?: PostEventResponse["recovery"];
-      session_id?: string;
-    },
-  );
+  const body = (await res.json().catch((error: unknown): never => {
+    // An auth layer's login page answers the POST with a 200 HTML page: an expired
+    // sign-in, not a malformed reply.
+    if ((res.headers.get("content-type") ?? "").toLowerCase().includes("text/html")) {
+      throw new ApiError(
+        "Your sign-in expired. Reload the page to sign in again.",
+        401,
+        SIGN_IN_EXPIRED_CODE,
+      );
+    }
+    throw error;
+  })) as {
+    queued: boolean;
+    item_id?: string;
+    denied?: boolean;
+    pending_id?: string;
+    recovered?: boolean;
+    recovery?: PostEventResponse["recovery"];
+    session_id?: string;
+  };
+  return postEventResponseFromWire(body);
 }
 
 /**

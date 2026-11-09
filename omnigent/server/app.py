@@ -281,6 +281,9 @@ class ServerInfoResponse(BaseModel):
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
+    # Scheduled tasks accept explicit modes that skip approval; servers that omit
+    # this may reject them, so clients hide those modes.
+    scheduled_task_approval_skipping_modes: bool = True
     scheduled_task_sandbox_workspaces: bool = True
     # Owner-private families and reuse of the source session's sandbox.
     sibling_sessions: bool = False
@@ -1882,7 +1885,10 @@ def create_app(
 
     configure_host_sharding(host_sharded)
     # A tunnel this replica retires on purpose is a handoff, not a lost runner.
-    tunnel_registry = TunnelRegistry(on_retire=shutdown_state.note_runner_tunnel_retired)
+    tunnel_registry = TunnelRegistry(
+        on_retire=shutdown_state.note_runner_tunnel_retired,
+        on_work_dispatched=managed_host_keepalive.record_work_dispatched,
+    )
     host_registry = HostRegistry()
     runner_router = RunnerRouter(
         registry=tunnel_registry,

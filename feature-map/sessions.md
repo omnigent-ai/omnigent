@@ -458,6 +458,17 @@ toast while the dot keeps spinning on the server's stage.
 Reloading during the wake keeps it spinning, with the stage (for example
 "Provisioning sandbox") in the chip's tooltip and in the chat. Reconnect host
 stays in the menu then, in case that stage never finishes.
+Opening such a session presses Reconnect host for the user once the session
+has stayed open for a second in a visible tab, and so does picking Files,
+Changes or Pull Requests in the Workspace rail. This only happens for editors,
+on an idle session whose launch isn't already running, and does exactly what
+pressing Reconnect host does. Each opening checks once, so a session that sleeps again
+while it stays open waits for Reconnect host, a Files, Changes or Pull
+Requests pick, or a message. Every way of waking
+the sandbox (Reconnect host, opening the session, Files or Changes, the
+terminal's Resume) joins one wake per session, including after switching to
+another session and back, and the Files and Pull Requests views say the
+sandbox is starting while it runs or the server reports its launch.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -986,12 +997,16 @@ plain `uv run pytest`, which starts a private server for the test.
   and a message that waits for the host, not live SSH or the desktop's consent
   console.
 - **`reconnect`, asleep sandbox:**
-  `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_reconnect_host_wakes_asleep_sandbox_in_status_dot`
+  `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_opening_asleep_session_wakes_sandbox_in_status_dot`
   drives the real SPA and server with the session patched to an asleep Arclet
-  host. It checks that Reconnect host sends `retry_session`, spins the chip and
-  menu dots with no toast, and turns them green once `/health` reports the host
-  online. Sibling tests cover a failed wake's error toast and retry, a
-  session opened mid-wake, and a wake whose stage outlasts its limit. None
+  host. It checks that opening the session sends `retry_session` on its own,
+  spins the chip and menu dots with no toast, and turns them green once
+  `/health` reports the host online. Sibling tests cover a failed wake's error
+  toast and Reconnect host retry, a session opened mid-wake, and a wake whose
+  stage outlasts its limit. The open dwell, Files/Changes/Pull Requests picks, and the
+  one-wake-per-session sharing are covered by
+  `web/src/hooks/useSandboxAutoWake.test.ts` and
+  `web/src/hooks/useSessionReconnect.test.ts`. None
   of them resume a live sandbox.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
