@@ -1079,15 +1079,15 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             row.next_run_at = None
             return
         task = _to_entity(row)
+        row.next_run_at = next_scheduled_time(task, after)
         if (
-            self._trigger_poll_seconds is not None
-            and task.state == "active"
+            row.next_run_at is not None
+            and self._trigger_poll_seconds is not None
             and is_trigger_automation(task)
         ):
-            # The scheduler picks a trigger's polls, so a saved trigger polls this soon.
-            row.next_run_at = after + self._trigger_poll_seconds
-            return
-        row.next_run_at = next_scheduled_time(task, after)
+            # The scheduler picks a trigger's polls, so a saved trigger polls this soon,
+            # though never past its schedule's next occurrence.
+            row.next_run_at = min(row.next_run_at, after + self._trigger_poll_seconds)
         if row.next_run_at is None and row.state == encode_scheduled_task_state("active"):
             row.state = encode_scheduled_task_state("completed")
 

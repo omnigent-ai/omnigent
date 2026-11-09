@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -2576,6 +2578,44 @@ async def test_a_saved_trigger_polls_two_minutes_out_only_with_a_busy_check(
         else:
             # Without a busy check, the hourly saved schedule still applies.
             assert saved.next_run_at == next_scheduled_time(saved, at)
+
+
+def _last_occurrence(task) -> int:
+    last, after = None, task.created_at
+    while (occurrence := next_scheduled_time(task, after)) is not None:
+        last, after = occurrence, occurrence
+    assert last is not None
+    return last
+
+
+@pytest.mark.parametrize("end", ["COUNT=2", "UNTIL"])
+async def test_a_trigger_still_ends_when_its_saved_schedule_does(store, end) -> None:
+    if end == "UNTIL":
+        until = datetime.fromtimestamp(int(time.time()) + 25 * 60, UTC)
+        end = "UNTIL=" + until.strftime("%Y%m%dT%H%M%SZ")
+    rrule = f"FREQ=MINUTELY;INTERVAL=10;{end}"
+    task = _task(store, rrule=rrule, prompt=_TRIGGER_PROMPT, session_mode="continue")
+    last = _last_occurrence(task)
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store,
+        fire,
+        AsyncMock(return_value=None),
+        now=clock.now,
+        busy_until=AsyncMock(return_value=None),
+    )
+    for _ in range(25):
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        clock.advance(TRIGGER_POLL_SECONDS)
+    saved = store.get(task.id)
+    assert saved.state == "completed"
+    assert saved.next_run_at is None
+    runs = store.list_runs(task.id)[0]
+    # It polled every two minutes, and never after the schedule's last occurrence.
+    assert len(runs) > 2
+    assert max(run.scheduled_at for run in runs) == last
 
 
 async def test_other_continued_sessions_keep_their_schedule_and_send_while_busy(store) -> None:

@@ -1565,6 +1565,11 @@ def test_an_edit_that_changes_trigger_status_moves_the_next_poll(
     assert plain.next_run_at == next_scheduled_time(plain, plain.updated_at)
     trigger = store.update(task.id, prompt=trigger_prompt)
     assert trigger.next_run_at == trigger.updated_at + 120
+    # Starting a new session each run also makes it an ordinary automation.
+    plain = store.update(task.id, session_mode="new")
+    assert plain.next_run_at == next_scheduled_time(plain, plain.updated_at)
+    trigger = store.update(task.id, session_mode="continue")
+    assert trigger.next_run_at == trigger.updated_at + 120
 
 
 def test_startup_lease_renewal_expiry_and_conditional_reconciliation(

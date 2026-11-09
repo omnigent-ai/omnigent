@@ -663,10 +663,15 @@ class PersistentTaskScheduler:
             self._initialization_cursor = None
 
     async def _next_occurrence(self, task: ScheduledTask, now: int) -> int | None:
-        """The server's next poll for a trigger it can check, else the saved schedule's next."""
-        if self._busy_until is not None and is_trigger_automation(task):
-            return now + TRIGGER_POLL_SECONDS
-        return await asyncio.to_thread(next_scheduled_time, task, now)
+        """The saved schedule's next occurrence, or sooner for a trigger the server can check.
+
+        A trigger polls every ``TRIGGER_POLL_SECONDS`` but never past its saved schedule's
+        next occurrence, so a schedule that ends (``COUNT`` or ``UNTIL``) still ends it.
+        """
+        occurrence = await asyncio.to_thread(next_scheduled_time, task, now)
+        if occurrence is not None and self._busy_until is not None and is_trigger_automation(task):
+            return min(occurrence, now + TRIGGER_POLL_SECONDS)
+        return occurrence
 
     async def _skip_busy_occurrence(self, task: ScheduledTask, *, now: int) -> bool:
         """Move a busy trigger automation's due poll to its next check, recording no run.
