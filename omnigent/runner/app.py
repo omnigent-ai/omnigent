@@ -6512,6 +6512,9 @@ def create_runner_app(
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
             _response_data: _JsonObject = {}
+            _terminal_response_type: str | None = None
+            _dispatch_tasks: list[_asyncio.Task[object]] = []
+            _stream_failed_error: _JsonObject | None = None
             # A sign-in refusal kept from the chat while its message waits to be resent.
             _held_refusal: _JsonObject | None = None
             _held_body: _JsonObject | None = None
@@ -6525,6 +6528,66 @@ def create_runner_app(
                     _held_refusal.update(turn_input_identity)
                 _publish_event(conv_id, _held_refusal)
                 _held_refusal = None
+
+            def _owns_live_turn() -> bool:
+                live = _live_response_id.get(conv_id)
+                return _response_id is None or live == _response_id
+
+            async def _finish_harness_stream() -> _JsonObject | None:
+                """Settle the owned outcome after stream close and pending dispatches."""
+                nonlocal _held_refusal
+                if _dispatch_tasks:
+                    await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
+                lifecycle_event: _JsonObject | None = None
+                lifecycle_error: _JsonObject | None = None
+                cancelled = _terminal_response_type == "response.cancelled"
+                if _owns_live_turn():
+                    if (
+                        conv_id in _clean_terminal_exit_responses
+                        and _clean_terminal_exit_responses[conv_id] == _response_id
+                    ):
+                        _clean_terminal_exit_responses.pop(conv_id)
+                        cancelled = True
+                        if _response_id is not None:
+                            lifecycle_event = {
+                                "type": "response.cancelled",
+                                "response": {
+                                    **_response_data,
+                                    "status": "cancelled",
+                                    "completed_at": int(time.time()),
+                                },
+                                **turn_input_identity,
+                            }
+                    elif (
+                        exit_error := _required_terminal_exit_errors.pop(conv_id, None)
+                    ) is not None:
+                        cancelled = False
+                        lifecycle_error = {**exit_error, "type": exit_error["code"]}
+                        lifecycle_event = _response_failed_payload(
+                            lifecycle_error, source="harness", input_identity=turn_input_identity
+                        )
+                if (
+                    not _owns_live_turn()
+                    or _turn_message_bodies.get(conv_id) is not _held_body
+                    or lifecycle_event is not None
+                    or cancelled
+                ):
+                    _report_held_refusal()
+                holding = _held_refusal is not None and _stream_failed_error is not None
+                if holding:
+                    _hold_message_for_sign_in(conv_id, _stream_failed_error)
+                    _held_refusal = None
+                if lifecycle_event is not None:
+                    _publish_event(conv_id, lifecycle_event)
+                _on_proxy_stream_end(
+                    conv_id,
+                    error=lifecycle_error
+                    or (None if holding or cancelled else _stream_failed_error),
+                    owner_response_id=_response_id,
+                    sign_in_hold=holding,
+                    cancelled=cancelled,
+                )
+                return lifecycle_event
 
             try:
                 async with client.stream(
@@ -6573,7 +6636,6 @@ def create_runner_app(
 
                     _omnigent_task_id = cast(str | None, body.get("task_id"))
                     _buffer = ""
-                    _dispatch_tasks: list[_asyncio.Task[object]] = []
                     # Sub-agent start edge → minted child id, so the completion
                     # edge can address the child it created. Per-stream.
                     _subagent_child_futures: dict[str, _asyncio.Future[str]] = {}
@@ -6588,12 +6650,6 @@ def create_runner_app(
                     # Parts of _text_acc the server stored before the last completed tool
                     # call, so a later compaction snapshot already covers them.
                     _text_acc_before_tool = 0
-                    _stream_failed_error: _JsonObject | None = None
-
-                    def _owns_live_turn() -> bool:
-                        live = _live_response_id.get(conv_id)
-                        return _response_id is None or live == _response_id
-
                     async for chunk in harness_resp.aiter_text():
                         _buffer += chunk
                         while "\n\n" in _buffer:
@@ -6624,6 +6680,7 @@ def create_runner_app(
                                     resp_obj = event.get("response") or {}
                                     _response_data = dict(resp_obj)
                                     _response_id = resp_obj.get("id")
+                                    _terminal_response_type = None
                                     if _response_id and conv_id:
                                         _resp_to_conv[_response_id] = conv_id
                                         _live_response_id[conv_id] = _response_id
@@ -6639,6 +6696,22 @@ def create_runner_app(
                                     )
 
                                 _evt_type = event.get("type")
+                                if _evt_type in {
+                                    "response.completed",
+                                    "response.failed",
+                                    "response.cancelled",
+                                }:
+                                    terminal_response = event.get("response")
+                                    _terminal_response_type = (
+                                        _evt_type
+                                        if isinstance(_response_id, str)
+                                        and _response_id
+                                        and isinstance(terminal_response, dict)
+                                        and terminal_response.get("id") == _response_id
+                                        and terminal_response.get("status")
+                                        == _evt_type.split(".")[1]
+                                        else None
+                                    )
                                 if (
                                     _evt_type == "response.compaction.in_progress"
                                     and conv_id in _sdk_compact_inprogress
@@ -6693,6 +6766,11 @@ def create_runner_app(
                                         )
                                         _text_acc.clear()
                                     _text_acc_before_tool = 0
+                                elif (
+                                    _evt_type == "response.cancelled"
+                                    and _terminal_response_type == _evt_type
+                                ):
+                                    _stream_failed_error = None
                                 elif _evt_type == "response.failed":
                                     _err = event.get("error") or (event.get("response") or {}).get(
                                         "error"
@@ -6702,6 +6780,12 @@ def create_runner_app(
                                         if isinstance(_err, dict)
                                         else {"message": "harness turn failed"}
                                     )
+                                    if (
+                                        _terminal_response_type == "response.failed"
+                                        and _owns_live_turn()
+                                    ):
+                                        # The turn's own error supersedes an earlier exit stand-in.
+                                        _required_terminal_exit_errors.pop(conv_id, None)
                                     if (
                                         dispatch is not None
                                         and _owns_live_turn()
@@ -6990,30 +7074,8 @@ def create_runner_app(
                             else:
                                 yield raw_sse_bytes
 
-                    if _dispatch_tasks:
-                        await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
-
-                    if (
-                        not _owns_live_turn()
-                        or _turn_message_bodies.get(conv_id) is not _held_body
-                    ):
-                        # A newer turn took the session, or an interrupt or Stop cancelled
-                        # this one meanwhile: report the refusal as usual.
-                        _report_held_refusal()
-                    _holding = _held_refusal is not None and _stream_failed_error is not None
-                    if _holding:
-                        _hold_message_for_sign_in(conv_id, _stream_failed_error)
-                        # Queued again: there is nothing left to report however the turn ends.
-                        _held_refusal = None
-                    # _on_proxy_stream_end clears any claude-sdk `/compact`
-                    # spinner (publishing `failed` when no compaction landed);
-                    # it is the single convergence point for every turn-end path.
-                    _on_proxy_stream_end(
-                        conv_id,
-                        error=None if _holding else _stream_failed_error,
-                        owner_response_id=_response_id,
-                        sign_in_hold=_holding,
-                    )
+                if terminal_event := await _finish_harness_stream():
+                    yield _encode_sse_event(terminal_event)
 
             except _ContextWindowOverflow as overflow:
                 _report_held_refusal()
@@ -7040,6 +7102,10 @@ def create_runner_app(
                 )
 
             except (httpx.HTTPError, RuntimeError) as exc:
+                if isinstance(exc, httpx.HTTPError) and _terminal_response_type is not None:
+                    if terminal_event := await _finish_harness_stream():
+                        yield _encode_sse_event(terminal_event)
+                    return
                 # A refusal kept before the stream broke still reports its message undelivered.
                 _report_held_refusal()
                 if (
