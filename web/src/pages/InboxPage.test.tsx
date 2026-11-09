@@ -25,6 +25,8 @@ import type { ComponentProps } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
+import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
+import type { Suggestion } from "@/lib/proactiveInbox";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
 import { resetLocalElicitationResolutionsForTests } from "@/lib/localElicitationResolutions";
 import * as sessionsApi from "@/lib/sessionsApi";
@@ -82,6 +84,7 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useConversations: vi.fn(),
 }));
 vi.mock("@/hooks/useAutomationInbox", () => ({ useAutomationInbox: vi.fn() }));
+vi.mock("@/hooks/useProactiveInbox", () => ({ useProactiveInbox: vi.fn() }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
 // Real exports (ApiError, codes) so failure handling sees genuine error types.
 vi.mock("@/lib/sessionsApi", async (importActual) => ({
@@ -180,8 +183,21 @@ function automationInboxStub(overrides: Record<string, unknown> = {}) {
   } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>;
 }
 
+function proactiveInboxStub(overrides: Record<string, unknown> = {}) {
+  return {
+    items: [],
+    unreadCount: 0,
+    isLoading: false,
+    isError: false,
+    refetch: vi.fn(),
+    update: vi.fn(),
+    ...overrides,
+  } as unknown as ReturnType<typeof proactiveInboxHook.useProactiveInbox>;
+}
+
 beforeEach(() => {
   vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(automationInboxStub());
+  vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(proactiveInboxStub());
   vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([]));
   vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(commentInboxStub());
   vi.mocked(sessionsApi.getSession).mockResolvedValue({
@@ -1670,5 +1686,65 @@ describe("automation failures", () => {
       expect(fetchNextPage).toHaveBeenCalledOnce();
     }
     if (state !== "continuation") expect(screen.queryByText(/Nothing waiting/)).toBeNull();
+  });
+});
+
+describe("agent suggestions", () => {
+  function suggestion(overrides: Partial<Suggestion> = {}): Suggestion {
+    return {
+      id: "sug_1",
+      kind: "followup",
+      title: "Ramp up the flag",
+      bodyMd: "The PR merged yesterday.",
+      links: [
+        { type: "pr", ref: "https://github.com/acme/app/pull/7", label: "PR 7" },
+        { type: "session", ref: "sess_src" },
+      ],
+      suggestedPrompt: "Ramp up the flag to 50%",
+      sourceSessionId: "sess_src",
+      state: "unread",
+      feedback: "none",
+      createdAt: 1_700_000_000,
+      ...overrides,
+    };
+  }
+
+  it("marks a suggestion read on expand and records the viewer's response", () => {
+    const update = vi.fn();
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({ items: [suggestion()], unreadCount: 1, update }),
+    );
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Suggested follow-up: Ramp up the flag" }));
+    expect(update).toHaveBeenCalledWith("sug_1", { state: "read" });
+    expect(screen.getByRole("link", { name: "PR 7" })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/7",
+    );
+    expect(screen.getByRole("link", { name: "Open session" })).toHaveAttribute(
+      "href",
+      "/c/sess_src",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Useful" }));
+    expect(update).toHaveBeenCalledWith("sug_1", { feedback: "useful" });
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(update).toHaveBeenCalledWith("sug_1", { state: "dismissed" });
+    fireEvent.click(screen.getByRole("button", { name: /Start session/ }));
+    expect(update).toHaveBeenCalledWith("sug_1", { state: "done" });
+  });
+
+  it("keeps read suggestions out of the Unread tab", () => {
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({ items: [suggestion({ state: "read", suggestedPrompt: null })] }),
+    );
+    renderPage();
+
+    expect(screen.getByTestId("inbox-suggestion")).toBeInTheDocument();
+    selectTab("Unread");
+    expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
+    selectTab("Awaiting response");
+    expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
   });
 });

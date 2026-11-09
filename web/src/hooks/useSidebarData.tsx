@@ -42,6 +42,7 @@ import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { useIdentityReady, useViewerId } from "./useViewerId";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { useAutomationInbox } from "./useAutomationInbox";
+import { useProactiveInbox } from "./useProactiveInbox";
 import { useCommentInbox } from "./useCommentInbox";
 import {
   usePinnedConversations,
@@ -237,8 +238,12 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   );
   const comments = useCommentInbox(inboxRows);
   const automationInbox = useAutomationInbox(identityReady);
+  const proactiveInbox = useProactiveInbox(identityReady);
   const inboxCount =
-    sumPendingApprovals(inboxRows) + comments.items.length + automationInbox.items.length;
+    sumPendingApprovals(inboxRows) +
+    comments.items.length +
+    automationInbox.items.length +
+    proactiveInbox.unreadCount;
   const watchedIds = useMemo(() => loadedRows.map((row) => row.id), [loadedRows]);
   const mineCursor = mine.data?.pages.at(-1)?.last_id;
   const sharedCursor = shared.data?.pages.at(-1)?.last_id;
@@ -334,6 +339,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     inboxCountIncomplete: automationInbox.hasNextPage,
     comments,
     automationInbox,
+    proactiveInbox,
     watchedIds,
     registerFolder,
     applyLocalResolutions,
