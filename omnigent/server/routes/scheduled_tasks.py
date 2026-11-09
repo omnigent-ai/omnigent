@@ -644,6 +644,7 @@ def create_scheduled_tasks_router(
                     base_branch=body.base_branch,
                     host_id=body.host_id,
                     execution_target=body.execution_target,
+                    permission_mode=permission_mode,
                     session_mode=body.session_mode,
                     session_id=body.session_id,
                 ),
@@ -1088,6 +1089,7 @@ def create_scheduled_tasks_router(
                             "workspace",
                             "base_branch",
                             "execution_target",
+                            "permission_mode",
                             "session_mode",
                             "session_id",
                         )

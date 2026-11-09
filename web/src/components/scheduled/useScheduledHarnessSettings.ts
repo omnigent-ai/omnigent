@@ -24,6 +24,11 @@ import type { NativeModelOption } from "@/lib/types";
 
 const EMPTY_MODELS: NativeModelOption[] = [];
 
+/** Whether the server accepts automation modes that skip approval; older ones may reject them. */
+export function acceptsApprovalSkippingModes(info: ReturnType<typeof useServerInfo>): boolean {
+  return info !== "loading" && info.scheduled_task_approval_skipping_modes === true;
+}
+
 /** Resolve choices for the automation's execution target without launching it. */
 export function useScheduledHarnessSettings(
   agent: AvailableAgent | undefined,
@@ -119,9 +124,7 @@ export function useScheduledHarnessSettings(
   const supportsHarnessPermissions =
     harness === "claude-native" ||
     (info !== "loading" && info.scheduled_task_harness_settings === true);
-  // Servers that don't advertise the capability may reject these modes on save.
-  const approvalSkippingAccepted =
-    info !== "loading" && info.scheduled_task_approval_skipping_modes === true;
+  const approvalSkippingAccepted = acceptsApprovalSkippingModes(info);
   const permissions = supportsHarnessPermissions
     ? nativePermissionOptions(harness).filter(
         (option) =>

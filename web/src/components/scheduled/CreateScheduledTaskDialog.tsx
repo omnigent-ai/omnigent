@@ -30,7 +30,10 @@ import { Textarea } from "@/components/ui/textarea";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
-import { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
+import {
+  acceptsApprovalSkippingModes,
+  useScheduledHarnessSettings,
+} from "./useScheduledHarnessSettings";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
 import {
@@ -64,7 +67,10 @@ import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
-import { NEW_AUTOMATION_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
+import {
+  APPROVAL_SKIPPING_PERMISSION_MODES,
+  NEW_AUTOMATION_PERMISSION_MODES,
+} from "@/lib/nativeHarnessModes";
 import {
   isBackdropOverlay,
   isInsidePopper,
@@ -532,6 +538,10 @@ export function CreateScheduledTaskDialog({
   );
   const supportsModel = harnessSettings.supportsModel;
   const supportsPermission = harnessSettings.permissions.length > 0;
+  const approvalSkippingAccepted = acceptsApprovalSkippingModes(info);
+  // A saved mode the server would refuse edits as the harness default, so saving sends null.
+  const editablePermissionMode = (mode: string | null | undefined): string =>
+    mode && (approvalSkippingAccepted || !APPROVAL_SKIPPING_PERMISSION_MODES.has(mode)) ? mode : "";
   const newAutomationPermission =
     !isEdit && !permissionPicked && harnessSettings.harness
       ? NEW_AUTOMATION_PERMISSION_MODES[harnessSettings.harness]
@@ -540,7 +550,7 @@ export function CreateScheduledTaskDialog({
     newAutomationPermission &&
     harnessSettings.permissions.some((option) => option.value === newAutomationPermission)
       ? newAutomationPermission
-      : pickedPermission;
+      : editablePermissionMode(pickedPermission);
   const effectivePermission =
     harnessSettings.harness !== "claude-native" && permissionChoice === "default"
       ? ""
@@ -679,7 +689,7 @@ export function CreateScheduledTaskDialog({
     ? (editingTask?.reasoningEffort ?? "")
     : pickedEffort;
   const displayedPermission = reusesExistingSession
-    ? (editingTask?.permissionMode ?? "")
+    ? editablePermissionMode(editingTask?.permissionMode)
     : effectivePermission;
   const summarySettings = editingWorkerSettings ? workerHarnessSettings : harnessSettings;
   const summaryModel = editingWorkerSettings ? (workerSettings?.model ?? "") : displayedModel;
@@ -823,9 +833,13 @@ export function CreateScheduledTaskDialog({
         resolveProjectId,
       );
       if (editingTask) {
-        // Continued-session edits omit launch settings; new targets clear stale overrides.
+        // Continued-session edits omit launch settings, except to clear a stored mode
+        // the server refuses; new targets clear stale overrides.
         const overrides = reusesExistingSession
-          ? {}
+          ? editablePermissionMode(editingTask.permissionMode) !==
+            (editingTask.permissionMode ?? "")
+            ? { permissionMode: null }
+            : {}
           : {
               ...(supportsModel || !originalTargetSelected
                 ? {

@@ -3037,6 +3037,20 @@ async def test_create_can_continue_a_session_the_owner_picked(
     # The task runs the session's own agent rather than taking a copy.
     assert body["agent_id"] == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
 
+    # A session that skips approval takes only a task that selects such a mode itself.
+    bypassing = _owned_session(
+        db_uri, labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+    )
+    for permission_mode, status in ((None, 400), ("auto", 400), ("bypassPermissions", 200)):
+        picked = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(
+                session_mode="continue", session_id=bypassing, permission_mode=permission_mode
+            ),
+            headers=_headers(),
+        )
+        assert picked.status_code == status, (permission_mode, picked.text)
+
 
 async def test_a_picked_session_must_be_the_owners_and_fit_the_task(
     auth_client: httpx.AsyncClient, db_uri: str
@@ -3104,6 +3118,25 @@ async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
 
     assert patched.status_code == 200, patched.text
     assert (patched.json()["agent_id"], patched.json()["session_id"]) == (codex, session_id)
+
+    # Picking a session that skips approval checks the requested mode, else the stored one.
+    full_access = _owned_session(
+        db_uri,
+        agent_id=codex,
+        terminal_launch_args=["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+    )
+    for update, status in (
+        ({"permission_mode": "full-access"}, 200),
+        ({}, 200),
+        ({"permission_mode": "approve-for-me"}, 400),
+        ({"permission_mode": None}, 400),
+    ):
+        picked = await auth_client.patch(
+            f"/v1/scheduled-tasks/{created['id']}",
+            json={"session_id": full_access, **update},
+            headers=_headers(),
+        )
+        assert picked.status_code == status, (update, picked.text)
     assert copies == []
 
 

@@ -269,6 +269,20 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
   };
 }
 
+/** A server with harness settings that predates modes that skip approval. */
+const REFUSES_APPROVAL_SKIPPING = {
+  ...SERVER_INFO_OFFLINE_FALLBACK,
+  features: { automations_v2: true },
+  scheduled_task_harness_settings: true,
+  scheduled_task_worktrees: true,
+};
+
+function serverInfo(acceptsApprovalSkipping: boolean) {
+  return acceptsApprovalSkipping
+    ? { ...REFUSES_APPROVAL_SKIPPING, scheduled_task_approval_skipping_modes: true }
+    : REFUSES_APPROVAL_SKIPPING;
+}
+
 function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
   return render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
 }
@@ -405,6 +419,36 @@ describe("prompt-first automation setup", () => {
       hostId: "host_1",
     });
   });
+
+  it.each([
+    [false, null],
+    [true, "bypassPermissions"],
+  ])(
+    "on an instructions-only edit, keeps a saved approval-skipping mode only if the server accepts it (%s)",
+    async (accepted, expected) => {
+      render(
+        <CapabilitiesProvider info={serverInfo(accepted)}>
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              permissionMode: "bypassPermissions",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      fireEvent.change(screen.getByLabelText("Instructions"), {
+        target: { value: "Also summarize CI failures" },
+      });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+        prompt: "Also summarize CI failures",
+        permissionMode: expected,
+      });
+    },
+  );
 
   it("keeps saved names and overrides when editing instructions with Advanced collapsed", async () => {
     render(
@@ -2185,6 +2229,51 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
         for (const field of ["modelOverride", "reasoningEffort", "permissionMode", "sessionId"]) {
           expect(input).not.toHaveProperty(field);
         }
+      }
+    },
+  );
+
+  it.each([
+    ["bypassPermissions", false, { permissionMode: null }],
+    ["bypassPermissions", true, {}],
+    ["acceptEdits", false, {}],
+  ])(
+    "on a continued-session edit, clears a saved %s only for a server that refuses it (accepts: %s)",
+    async (savedMode, accepted, expectedPermission) => {
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            scheduled_task_session_modes: true,
+            scheduled_task_approval_skipping_modes: accepted,
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+              modelOverride: "opus",
+              reasoningEffort: "high",
+              permissionMode: savedMode,
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
+      fireEvent.change(screen.getByLabelText("Instructions"), { target: { value: "Keep going" } });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input).toMatchObject({ prompt: "Keep going", ...expectedPermission });
+      // The session binding and the session's own model settings are left alone.
+      expect(input).not.toHaveProperty("sessionId");
+      expect(input).not.toHaveProperty("modelOverride");
+      expect(input).not.toHaveProperty("reasoningEffort");
+      if (!("permissionMode" in expectedPermission)) {
+        expect(input).not.toHaveProperty("permissionMode");
       }
     },
   );
@@ -4242,15 +4331,8 @@ describe("automation harness settings", () => {
     "hides %s modes that skip approval from a server that refuses them",
     async (harness, kept, hidden) => {
       mockHarness(harness);
-      // The server supports harness settings but predates approval-skipping modes.
       render(
-        <CapabilitiesProvider
-          info={{
-            ...SERVER_INFO_OFFLINE_FALLBACK,
-            features: { automations_v2: true },
-            scheduled_task_harness_settings: true,
-          }}
-        >
+        <CapabilitiesProvider info={REFUSES_APPROVAL_SKIPPING}>
           <CreateScheduledTaskDialog
             open
             onOpenChange={vi.fn()}
@@ -4303,6 +4385,40 @@ describe("automation harness settings", () => {
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input.permissionMode).toBeNull();
   });
+
+  it.each([
+    [false, null],
+    [true, "skip"],
+  ])(
+    "on edit, keeps Antigravity's saved skip mode only if the server accepts it (%s)",
+    async (accepted, expected) => {
+      mockHarness("antigravity-native");
+      render(
+        <CapabilitiesProvider info={serverInfo(accepted)}>
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({ agentId: "selected-agent", permissionMode: "skip" })}
+          />
+        </CapabilitiesProvider>,
+      );
+      // Without the mode the picker has nothing to offer, so it is hidden.
+      if (accepted) {
+        expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Skip permissions");
+      } else {
+        expect(screen.queryByTestId("task-permission-trigger")).toBeNull();
+      }
+      fireEvent.change(screen.getByLabelText("Instructions"), {
+        target: { value: "Review again" },
+      });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+        prompt: "Review again",
+        permissionMode: expected,
+      });
+    },
+  );
 
   it("creates Codex settings and resets an effort the next model cannot support", async () => {
     mockHarness("codex-native");
