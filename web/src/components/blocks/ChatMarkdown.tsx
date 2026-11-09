@@ -11,6 +11,7 @@
 // without importing the block dispatcher that renders them.
 
 import type React from "react";
+import { useInRouterContext, useNavigate } from "react-router-dom";
 import { useMemo } from "react";
 import {
   BotIcon,
@@ -574,16 +575,44 @@ function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) 
   );
 }
 
-/** A session pill (e.g. ``@Fix CI``) that opens session ``id``. */
-export function SessionMentionPill({
-  id,
-  isSubagent,
-  children,
-}: {
+interface SessionMentionPillProps {
   id: string;
   isSubagent: boolean;
   children: React.ReactNode;
-}) {
+}
+
+/** A session pill (e.g. ``@Fix CI``) that opens session ``id`` without reloading the page. */
+export function SessionMentionPill(props: SessionMentionPillProps) {
+  // Markdown also renders outside the router (stories, embeds); there the href navigates.
+  return useInRouterContext() ? (
+    <RoutedSessionMentionPill {...props} />
+  ) : (
+    <SessionPillLink {...props} />
+  );
+}
+
+function RoutedSessionMentionPill(props: SessionMentionPillProps) {
+  const navigate = useNavigate();
+  return (
+    <SessionPillLink
+      {...props}
+      onNavigate={(event) => {
+        // Modified clicks keep the browser's new-tab / new-window behaviour.
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)
+          return;
+        event.preventDefault();
+        navigate(`/c/${encodeURIComponent(props.id)}`);
+      }}
+    />
+  );
+}
+
+function SessionPillLink({
+  id,
+  isSubagent,
+  children,
+  onNavigate,
+}: SessionMentionPillProps & { onNavigate?: (event: React.MouseEvent) => void }) {
   const Icon = isSubagent ? BotIcon : MessageSquareIcon;
   return (
     <a
@@ -591,7 +620,10 @@ export function SessionMentionPill({
       href={withBasePath(`/c/${encodeURIComponent(id)}`)}
       className={MENTION_PILL_CLASS}
       title={isSubagent ? "Subagent" : "Session"}
-      onClick={(event) => event.stopPropagation()}
+      onClick={(event) => {
+        event.stopPropagation();
+        onNavigate?.(event);
+      }}
     >
       <Icon className="size-3 shrink-0" />
       <span className="truncate">{children}</span>

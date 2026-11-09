@@ -287,6 +287,35 @@ describe("UserBubble messages from another session", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("opens the sender in-app on a plain click instead of reloading the page", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "s_src"], { title: "Casual greeting", parentSessionId: null });
+    function LocationProbe() {
+      return <div data-testid="location">{useLocation().pathname}</div>;
+    }
+    render(
+      <MemoryRouter initialEntries={["/c/s_here"]}>
+        <QueryClientProvider client={client}>
+          <BubbleView
+            bubble={{
+              kind: "user",
+              itemId: "user_origin_nav",
+              content: [{ type: "input_text", text: "[Message from session s_src]\nhi" }],
+            }}
+            isLastAssistant={false}
+          />
+          <LocationProbe />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    const pill = screen.getByTestId("mention-pill");
+    // A plain click routes in-app; the click event is cancelled, so no document load.
+    expect(fireEvent.click(pill)).toBe(false);
+    expect(screen.getByTestId("location").textContent).toBe("/c/s_src");
+    // A modified click is left to the browser (new tab).
+    expect(fireEvent.click(pill, { metaKey: true })).toBe(true);
+  });
+
   it("names a subagent of the viewed session from its cached child list", () => {
     const client = new QueryClient();
     client.setQueryData(childSessionsQueryKey("s_here"), [
