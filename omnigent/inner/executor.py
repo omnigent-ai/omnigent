@@ -329,6 +329,24 @@ class TurnCancelled(ExecutorEvent):
 
 
 @dataclass
+class TurnRetrying(ExecutorEvent):
+    """The executor will retry the turn after a transient failure that produced no output.
+
+    :param attempt: 1-based number of the upcoming attempt, e.g. ``2`` for the first retry.
+    :param max_attempts: Total attempts the retry policy allows, e.g. ``8``.
+    :param delay_seconds: Seconds the executor waits before the next attempt.
+    :param code: Classified failure being retried, e.g. ``"rate_limit_exceeded"``.
+    :param message: Human-readable summary, e.g. ``"Rate limited, retrying in 4s"``.
+    """
+
+    attempt: int
+    max_attempts: int
+    delay_seconds: float
+    code: str
+    message: str
+
+
+@dataclass
 class ExecutorError(ExecutorEvent):
     """Something went wrong.
 
