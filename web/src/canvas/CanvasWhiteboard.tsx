@@ -2,7 +2,7 @@
 // viewport, so strokes, frames, notes and arrows pan and zoom with the session
 // cards. Drawing tools cover the board with a capture surface; the Select tool
 // lets cards and drawings be moved as before. Drawings are saved per canvas in
-// localStorage (`whiteboardStorage.ts`).
+// localStorage (`whiteboardStorage.ts`) and merged with other tabs' saves.
 
 import {
   useCallback,
@@ -35,7 +35,9 @@ import {
   boxFromCorners,
   isBoundEnd,
   isBoxed,
+  MAX_ELEMENTS,
   MAX_TEXT_LENGTH,
+  mergeBoards,
   MIN_DRAG_SIZE,
   moveElement,
   newWhiteboardElementId,
@@ -53,7 +55,12 @@ import {
   type WhiteboardPoint,
   type WhiteboardTool,
 } from "./whiteboardScene";
-import { readWhiteboard, whiteboardStorageKey, writeWhiteboard } from "./whiteboardStorage";
+import {
+  readStoredWhiteboard,
+  whiteboardStorageKey,
+  writeWhiteboard,
+  type StoredWhiteboardEntry,
+} from "./whiteboardStorage";
 
 const TOOLS: {
   tool: WhiteboardTool;
@@ -109,10 +116,19 @@ export function CanvasWhiteboard({
   const nodes = useNodes();
   const markerId = `whiteboard-arrow-${useId().replace(/[^\w-]/g, "")}`;
   const storageKey = whiteboardStorageKey(viewerId, canvasId);
-  const [board, setBoard] = useState(() => ({
-    key: storageKey,
-    elements: readWhiteboard(viewerId, canvasId),
-  }));
+  const currentKeyRef = useRef(storageKey);
+  currentKeyRef.current = storageKey;
+  // What this tab last read from or wrote to each board's entry. A save merges
+  // this tab's changes since then onto what is stored now, so a board edited in
+  // two tabs keeps both tabs' drawings.
+  const basesRef = useRef(new Map<string, StoredWhiteboardEntry>());
+  const load = (viewer: string | null, canvas: string) => {
+    const key = whiteboardStorageKey(viewer, canvas);
+    const stored = readStoredWhiteboard(viewer, canvas);
+    if (stored) basesRef.current.set(key, stored);
+    return { key, elements: stored?.elements ?? NO_ELEMENTS };
+  };
+  const [board, setBoard] = useState(() => load(viewerId, canvasId));
   const [tool, setTool] = useState<WhiteboardTool>("select");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -123,13 +139,14 @@ export function CanvasWhiteboard({
     setDraftState(next);
   }, []);
   const [saveFailed, setSaveFailed] = useState(false);
+  const [refusedFull, setRefusedFull] = useState(false);
   const moveRef = useRef<MoveDrag | null>(null);
   const drawRef = useRef<DrawGesture | null>(null);
 
   // Each canvas has its own drawing; switching tabs (or identity resolving)
   // swaps it in during render so the previous board never flashes.
   if (board.key !== storageKey) {
-    setBoard({ key: storageKey, elements: readWhiteboard(viewerId, canvasId) });
+    setBoard(load(viewerId, canvasId));
     setSelectedId(null);
     setEditingId(null);
     setDraft(null);
@@ -146,31 +163,49 @@ export function CanvasWhiteboard({
     [storageKey],
   );
 
+  /** Write a board and return what is now stored, which may include another tab's drawings. */
   const persist = useCallback(
-    (next: readonly WhiteboardElement[], viewer: string | null, canvas: string) => {
+    (local: readonly WhiteboardElement[], viewer: string | null, canvas: string) => {
+      const key = whiteboardStorageKey(viewer, canvas);
+      const base = basesRef.current.get(key) ?? { raw: null, elements: [] };
+      const stored = readStoredWhiteboard(viewer, canvas);
+      const next =
+        stored && stored.raw !== base.raw
+          ? mergeBoards(stored.elements, base.elements, local)
+          : [...local];
       try {
-        writeWhiteboard(next, viewer, canvas);
+        const raw = writeWhiteboard(next, viewer, canvas);
+        basesRef.current.set(key, { raw, elements: next });
         setSaveFailed(false);
       } catch {
         setSaveFailed(true);
       }
+      return next;
     },
     [],
   );
 
   // Typing saves after a short pause; blur, unmount and page hide write any
   // pending edit at once, so a reload mid-edit keeps the text. A pending edit
-  // carries its own canvas, so switching tabs can't write it to the new one.
-  const pendingTextRef = useRef<{ timer: number; write: () => void } | null>(null);
-  const cancelPendingText = useCallback(() => {
-    const pending = pendingTextRef.current;
-    if (pending) window.clearTimeout(pending.timer);
-    pendingTextRef.current = null;
-    return pending;
-  }, []);
+  // carries its own board, so switching canvases writes it there, not here.
+  const pendingTextRef = useRef<{ key: string; timer: number; write: () => void } | null>(null);
   const flushPendingText = useCallback(() => {
-    cancelPendingText()?.write();
-  }, [cancelPendingText]);
+    const pending = pendingTextRef.current;
+    if (!pending) return;
+    pendingTextRef.current = null;
+    window.clearTimeout(pending.timer);
+    pending.write();
+  }, []);
+  /** Drop this board's pending edit (the caller writes it), or write another board's now. */
+  const settlePendingText = useCallback(() => {
+    const pending = pendingTextRef.current;
+    if (pending && pending.key !== currentKeyRef.current) {
+      flushPendingText();
+    } else if (pending) {
+      window.clearTimeout(pending.timer);
+      pendingTextRef.current = null;
+    }
+  }, [flushPendingText]);
   useEffect(() => {
     window.addEventListener("pagehide", flushPendingText);
     return () => {
@@ -181,13 +216,28 @@ export function CanvasWhiteboard({
 
   const save = useCallback(
     (next: WhiteboardElement[]) => {
-      // ``next`` already includes any text still waiting to be written.
-      cancelPendingText();
-      show(next);
-      persist(next, viewerId, canvasId);
+      // ``next`` already includes this board's pending text.
+      settlePendingText();
+      show(persist(next, viewerId, canvasId));
     },
-    [canvasId, cancelPendingText, persist, show, viewerId],
+    [canvasId, persist, settlePendingText, show, viewerId],
   );
+
+  // Another tab saved this board: show its drawings, keeping this tab's
+  // unsaved changes on top until they are written.
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea !== window.localStorage) return;
+      if (event.key !== null && event.key !== storageKey) return;
+      const stored = readStoredWhiteboard(viewerId, canvasId);
+      const base = basesRef.current.get(storageKey) ?? { raw: null, elements: [] };
+      if (!stored || stored.raw === base.raw) return;
+      basesRef.current.set(storageKey, stored);
+      show(mergeBoards(stored.elements, base.elements, elementsRef.current));
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [canvasId, show, storageKey, viewerId]);
 
   // Bind targets in drawing order (frames, cards, notes) so the topmost one wins.
   const bindTargets = useMemo(() => {
@@ -347,7 +397,12 @@ export function CanvasWhiteboard({
       created = finishArrow(current, point);
     }
     if (!created) return;
-    save(addElement(elementsRef.current, created));
+    const next = addElement(elementsRef.current, created);
+    if (!next) {
+      setRefusedFull(true);
+      return;
+    }
+    save(next);
     // The pen keeps drawing; shapes hand the board back to Select like most whiteboards.
     if (tool === "pen") return;
     setTool("select");
@@ -404,9 +459,17 @@ export function CanvasWhiteboard({
   const editText = (id: string, text: string) => {
     const next = withText(elementsRef.current, id, text);
     show(next);
-    cancelPendingText();
-    const write = () => persist(next, viewerId, canvasId);
+    settlePendingText();
+    const key = storageKey;
+    const [viewer, canvas] = [viewerId, canvasId];
+    const write = () => {
+      // Still on this board: write all of it, which includes the text.
+      const onBoard = currentKeyRef.current === key;
+      const stored = persist(onBoard ? elementsRef.current : next, viewer, canvas);
+      if (onBoard) show(stored);
+    };
     pendingTextRef.current = {
+      key,
       timer: window.setTimeout(flushPendingText, TEXT_SAVE_DELAY_MS),
       write,
     };
@@ -606,6 +669,8 @@ export function CanvasWhiteboard({
   };
 
   const interactive = tool === "select";
+  // Shown after a refused drawing, until something is deleted.
+  const boardFull = refusedFull && elements.length >= MAX_ELEMENTS;
   const shapes = elements.filter(isBoxed);
 
   return (
@@ -688,12 +753,14 @@ export function CanvasWhiteboard({
           <Trash2Icon className="size-4" />
         </button>
       </div>
-      {saveFailed && (
+      {(saveFailed || boardFull) && (
         <div
           role="status"
           className="absolute left-3 top-14 z-10 rounded-md border bg-card px-2 py-1 text-xs text-muted-foreground"
         >
-          Drawing could not be saved.
+          {boardFull && "This board is full. Delete a drawing to add another."}
+          {boardFull && saveFailed && " "}
+          {saveFailed && "Drawing could not be saved."}
         </div>
       )}
     </>

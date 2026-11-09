@@ -6,6 +6,7 @@ import {
   type WhiteboardElement,
 } from "./whiteboardScene";
 import {
+  readStoredWhiteboard,
   readWhiteboard,
   WHITEBOARD_VERSION,
   whiteboardStorageKey,
@@ -61,6 +62,8 @@ describe("whiteboard storage", () => {
       throw new DOMException("denied", "SecurityError");
     });
     expect(readWhiteboard("u", "main")).toEqual([]);
+    // Unreadable is not the same as empty, so a save doesn't treat it as another tab's write.
+    expect(readStoredWhiteboard("u", "main")).toBeNull();
   });
 
   it("drops malformed and duplicate elements and bounds the rest", () => {
@@ -98,6 +101,23 @@ describe("whiteboard storage", () => {
     expect(note).toMatchObject({ id: "wb-f", text: "x".repeat(MAX_TEXT_LENGTH) });
     expect(stroke).toMatchObject({ id: "wb-g", kind: "stroke" });
     expect((stroke as { points: unknown[] }).points).toHaveLength(MAX_STROKE_POINTS);
+  });
+
+  it("reads only the newest elements of an oversized entry", () => {
+    window.localStorage.setItem(
+      whiteboardStorageKey("u", "main"),
+      JSON.stringify({
+        version: WHITEBOARD_VERSION,
+        elements: Array.from({ length: MAX_ELEMENTS + 3 }, (_, index) => ({
+          id: `wb-${index}`,
+          kind: "stroke",
+          points: [index, 0, index, 1],
+        })),
+      }),
+    );
+    const stored = readWhiteboard("u", "main");
+    expect(stored).toHaveLength(MAX_ELEMENTS);
+    expect(stored[0].id).toBe("wb-3");
   });
 
   it("keeps only the newest elements beyond the cap", () => {

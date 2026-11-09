@@ -6,7 +6,8 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 import { CanvasWhiteboard } from "./CanvasWhiteboard";
-import { readWhiteboard, writeWhiteboard } from "./whiteboardStorage";
+import { MAX_ELEMENTS } from "./whiteboardScene";
+import { readWhiteboard, whiteboardStorageKey, writeWhiteboard } from "./whiteboardStorage";
 
 const { nodesRef, zoomRef, snapRequests } = vi.hoisted(() => ({
   nodesRef: {
@@ -237,6 +238,110 @@ describe("CanvasWhiteboard", () => {
 
     rerender(<CanvasWhiteboard canvasId="main" viewerId="u" />);
     expect(screen.getByRole("note", { name: "Main only" })).toBeInTheDocument();
+  });
+
+  it("writes a note edit to its own canvas when the canvas changes before it is saved", () => {
+    writeWhiteboard(
+      [{ id: "wb-note", kind: "note", x: 0, y: 0, width: 192, height: 128, text: "" }],
+      "u",
+      "main",
+    );
+    const { rerender } = render(<CanvasWhiteboard canvasId="main" viewerId="u" />);
+    fireEvent.doubleClick(screen.getByRole("note", { name: "Empty note" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Note text" }), {
+      target: { value: "Main draft" },
+    });
+
+    // No blur: the canvas changes while the edit is still waiting to be saved.
+    rerender(<CanvasWhiteboard canvasId="project-1" viewerId="u" />);
+    chooseTool("Frame");
+    drag(surface(), [0, 0], [100, 100]);
+
+    expect(readWhiteboard("u", "main")).toEqual([
+      expect.objectContaining({ id: "wb-note", text: "Main draft" }),
+    ]);
+    expect(readWhiteboard("u", "project-1")).toEqual([
+      expect.objectContaining({ kind: "rectangle" }),
+    ]);
+  });
+
+  it("keeps both tabs' drawings when two tabs edit the same board", () => {
+    const tabA = within(render(<CanvasWhiteboard canvasId="main" viewerId="u" />).container);
+    const tabB = within(render(<CanvasWhiteboard canvasId="main" viewerId="u" />).container);
+
+    fireEvent.click(tabA.getByRole("button", { name: "Frame" }));
+    drag(tabA.getByTestId("whiteboard-surface"), [0, 0], [100, 100]);
+    // Tab B still shows the empty board it loaded.
+    expect(tabB.queryByTestId("whiteboard-frame")).toBeNull();
+    fireEvent.click(tabB.getByRole("button", { name: "Draw" }));
+    drag(tabB.getByTestId("whiteboard-surface"), [200, 0], [240, 40]);
+
+    expect(readWhiteboard("u", "main").map((element) => element.kind)).toEqual([
+      "rectangle",
+      "stroke",
+    ]);
+    expect(tabB.getAllByTestId("whiteboard-frame")).toHaveLength(1);
+  });
+
+  it("shows another tab's saved drawing without losing an unsaved note edit", () => {
+    writeWhiteboard(
+      [{ id: "wb-note", kind: "note", x: 0, y: 0, width: 192, height: 128, text: "" }],
+      "u",
+      "main",
+    );
+    render(<CanvasWhiteboard canvasId="main" viewerId="u" />);
+    fireEvent.doubleClick(screen.getByRole("note", { name: "Empty note" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Note text" }), {
+      target: { value: "Typed here" },
+    });
+
+    // The other tab adds a frame; the browser tells this tab with a storage event.
+    writeWhiteboard(
+      [
+        { id: "wb-note", kind: "note", x: 0, y: 0, width: 192, height: 128, text: "" },
+        { id: "wb-frame", kind: "rectangle", x: 300, y: 0, width: 320, height: 192, text: "" },
+      ],
+      "u",
+      "main",
+    );
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: whiteboardStorageKey("u", "main"),
+          storageArea: window.localStorage,
+        }),
+      );
+    });
+    expect(screen.getAllByTestId("whiteboard-frame")).toHaveLength(1);
+
+    fireEvent.blur(screen.getByRole("textbox", { name: "Note text" }));
+    expect(readWhiteboard("u", "main")).toEqual([
+      expect.objectContaining({ id: "wb-note", text: "Typed here" }),
+      expect.objectContaining({ id: "wb-frame" }),
+    ]);
+  });
+
+  it("refuses a new drawing on a full board and says why, keeping every saved one", () => {
+    const full = Array.from({ length: MAX_ELEMENTS }, (_, index) => ({
+      id: `wb-${index}`,
+      kind: "stroke" as const,
+      points: [
+        { x: index, y: 0 },
+        { x: index, y: 1 },
+      ],
+    }));
+    writeWhiteboard(full, "u", "main");
+    render(<CanvasWhiteboard canvasId="main" viewerId="u" />);
+    chooseTool("Frame");
+    drag(surface(), [0, 0], [100, 100]);
+
+    expect(screen.queryByTestId("whiteboard-frame")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "This board is full. Delete a drawing to add another.",
+    );
+    const stored = readWhiteboard("u", "main");
+    expect(stored).toHaveLength(MAX_ELEMENTS);
+    expect(stored[0].id).toBe("wb-0");
   });
 
   it("says so when the drawing cannot be saved", () => {

@@ -2,7 +2,8 @@
 // the card layout in `canvasStorage.ts`: the server never sees the drawing.
 // Reads never throw — a missing, malformed or other-version entry reads as an
 // empty board, and malformed elements are dropped. Writes may throw (quota);
-// callers surface that as a warning.
+// callers surface that as a warning. Tabs share one entry per board, so a
+// writer merges onto what is stored (`mergeBoards`) instead of replacing it.
 
 import { getOmnigentServerIdentity } from "@/lib/host";
 import {
@@ -106,11 +107,9 @@ function parseElement(value: unknown): WhiteboardElement | null {
   }
 }
 
-export function readWhiteboard(viewerId: string | null, canvasId: string): WhiteboardElement[] {
-  if (typeof window === "undefined") return [];
+function parseWhiteboard(raw: string | null): WhiteboardElement[] {
+  if (!raw) return [];
   try {
-    const raw = window.localStorage.getItem(whiteboardStorageKey(viewerId, canvasId));
-    if (!raw) return [];
     const parsed = JSON.parse(raw) as Partial<StoredWhiteboard> | null;
     if (!parsed || parsed.version !== WHITEBOARD_VERSION || !Array.isArray(parsed.elements)) {
       return [];
@@ -127,6 +126,34 @@ export function readWhiteboard(viewerId: string | null, canvasId: string): White
   } catch {
     return [];
   }
+}
+
+/**
+ * One board as stored: its raw entry, so a later read can tell whether another
+ * tab wrote to it, and its elements.
+ */
+export interface StoredWhiteboardEntry {
+  raw: string | null;
+  elements: WhiteboardElement[];
+}
+
+/** The stored board, or null when storage can't be read at all. */
+export function readStoredWhiteboard(
+  viewerId: string | null,
+  canvasId: string,
+): StoredWhiteboardEntry | null {
+  if (typeof window === "undefined") return null;
+  let raw: string | null;
+  try {
+    raw = window.localStorage.getItem(whiteboardStorageKey(viewerId, canvasId));
+  } catch {
+    return null;
+  }
+  return { raw, elements: parseWhiteboard(raw) };
+}
+
+export function readWhiteboard(viewerId: string | null, canvasId: string): WhiteboardElement[] {
+  return readStoredWhiteboard(viewerId, canvasId)?.elements ?? [];
 }
 
 function storeEnd(end: ArrowEnd): StoredEnd {
@@ -160,20 +187,25 @@ function storeElement(element: WhiteboardElement): StoredElement {
   }
 }
 
-/** Persist the drawing; an empty board removes the entry. Throws when storage is unavailable or full. */
+/**
+ * Persist the drawing; an empty board removes the entry. Returns the raw entry
+ * now stored. Throws when storage is unavailable or full.
+ */
 export function writeWhiteboard(
   elements: readonly WhiteboardElement[],
   viewerId: string | null,
   canvasId: string,
-): void {
+): string | null {
   const key = whiteboardStorageKey(viewerId, canvasId);
   if (elements.length === 0) {
     window.localStorage.removeItem(key);
-    return;
+    return null;
   }
   const stored: StoredWhiteboard = {
     version: WHITEBOARD_VERSION,
     elements: elements.slice(-MAX_ELEMENTS).map(storeElement),
   };
-  window.localStorage.setItem(key, JSON.stringify(stored));
+  const raw = JSON.stringify(stored);
+  window.localStorage.setItem(key, raw);
+  return raw;
 }

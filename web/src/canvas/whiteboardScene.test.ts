@@ -9,6 +9,7 @@ import {
   MAX_ELEMENTS,
   MAX_STROKE_POINTS,
   MAX_TEXT_LENGTH,
+  mergeBoards,
   moveElement,
   NOTE_HEIGHT,
   NOTE_WIDTH,
@@ -176,15 +177,61 @@ describe("whiteboard elements", () => {
     expect(updated).toMatchObject({ text: "x".repeat(MAX_TEXT_LENGTH) });
   });
 
-  it("keeps only the newest elements beyond the cap", () => {
-    const many = Array.from({ length: MAX_ELEMENTS }, (_, index): WhiteboardElement => ({
-      id: `wb-${index}`,
-      kind: "stroke",
-      points: [{ x: index, y: 0 }],
-    }));
-    const next = addElement(many, frame);
-    expect(next).toHaveLength(MAX_ELEMENTS);
-    expect(next[0].id).toBe("wb-1");
-    expect(next.at(-1)).toBe(frame);
+  it("refuses a new element on a full board instead of evicting one", () => {
+    // The oldest element is a frame with an arrow bound to it.
+    const arrow: ArrowElement = {
+      id: "wb-arrow",
+      kind: "arrow",
+      from: { bind: "wb-frame" },
+      to: { x: 0, y: 0 },
+    };
+    const full: WhiteboardElement[] = [
+      frame,
+      arrow,
+      ...Array.from({ length: MAX_ELEMENTS - 2 }, (_, index): WhiteboardElement => ({
+        id: `wb-${index}`,
+        kind: "stroke",
+        points: [{ x: index, y: 0 }],
+      })),
+    ];
+    const extra: WhiteboardElement = { id: "wb-extra", kind: "stroke", points: [{ x: 0, y: 0 }] };
+    expect(addElement(full, extra)).toBeNull();
+    expect(
+      resolveArrow(arrow, (id) => (id === "wb-frame" ? (frame as WhiteboardBox) : null)),
+    ).not.toBeNull();
+    expect(addElement(full.slice(1), extra)?.at(-1)).toBe(extra);
+  });
+});
+
+describe("whiteboard merge across tabs", () => {
+  const stroke = (id: string, x = 0): WhiteboardElement => ({
+    id,
+    kind: "stroke",
+    points: [{ x, y: 0 }],
+  });
+
+  it("keeps the other tab's drawings and this tab's additions", () => {
+    // Both tabs started from an empty board; the other tab saved a frame first.
+    expect(mergeBoards([frame], [], [stroke("wb-mine")])).toEqual([frame, stroke("wb-mine")]);
+  });
+
+  it("applies this tab's edits and deletions and the other tab's deletions", () => {
+    const base = [frame, stroke("wb-a"), stroke("wb-b"), stroke("wb-c")];
+    // The other tab deleted wb-c and added wb-d; this tab moved wb-a and deleted wb-b.
+    const stored = [frame, stroke("wb-a"), stroke("wb-b"), stroke("wb-d")];
+    const local = [frame, stroke("wb-a", 40), stroke("wb-c")];
+    expect(mergeBoards(stored, base, local)).toEqual([frame, stroke("wb-a", 40), stroke("wb-d")]);
+  });
+
+  it("keeps this tab's edit to an element the other tab deleted", () => {
+    const edited = { ...(frame as RectangleElement), text: "Release" };
+    expect(mergeBoards([], [frame], [edited])).toEqual([edited]);
+  });
+
+  it("leaves out new elements that no longer fit under the cap", () => {
+    const stored = Array.from({ length: MAX_ELEMENTS }, (_, index) => stroke(`wb-${index}`));
+    const merged = mergeBoards(stored, [], [stroke("wb-mine")]);
+    expect(merged).toHaveLength(MAX_ELEMENTS);
+    expect(merged.some((element) => element.id === "wb-mine")).toBe(false);
   });
 });

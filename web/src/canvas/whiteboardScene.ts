@@ -258,10 +258,40 @@ export function removeElement(
   });
 }
 
-/** Append a new element, dropping the oldest ones beyond the cap. */
+/** Append a new element, or null when the board is full; existing drawings are never evicted. */
 export function addElement(
   elements: readonly WhiteboardElement[],
   element: WhiteboardElement,
+): WhiteboardElement[] | null {
+  return elements.length < MAX_ELEMENTS ? [...elements, element] : null;
+}
+
+/**
+ * Apply this tab's changes since ``base`` onto ``stored``, which another tab
+ * may have written meanwhile. Elements added or edited here replace stored
+ * ones by id, elements deleted here are dropped, and everything else stored is
+ * kept in order. New elements that no longer fit under the cap are left out.
+ */
+export function mergeBoards(
+  stored: readonly WhiteboardElement[],
+  base: readonly WhiteboardElement[],
+  local: readonly WhiteboardElement[],
 ): WhiteboardElement[] {
-  return [...elements, element].slice(-MAX_ELEMENTS);
+  const baseVersions = new Map(base.map((element) => [element.id, JSON.stringify(element)]));
+  const localIds = new Set(local.map((element) => element.id));
+  const changed = new Map(
+    local
+      .filter((element) => baseVersions.get(element.id) !== JSON.stringify(element))
+      .map((element) => [element.id, element]),
+  );
+  const merged = stored
+    .filter((element) => !baseVersions.has(element.id) || localIds.has(element.id))
+    .map((element) => changed.get(element.id) ?? element);
+  const present = new Set(merged.map((element) => element.id));
+  for (const element of changed.values()) {
+    if (present.has(element.id)) continue;
+    if (merged.length >= MAX_ELEMENTS) break;
+    merged.push(element);
+  }
+  return merged;
 }

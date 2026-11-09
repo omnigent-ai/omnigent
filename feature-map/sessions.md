@@ -420,6 +420,11 @@ On mobile, the top-left hamburger opens the sidebar from the board or a selected
 session. Back to canvas returns to the selected project. A Canvas session link
 opens the same layout directly. If a session is replaced, for example after `/clear`,
 its replacement stays beside the same board.
+With `canvas_whiteboard` on, the toolbar at the board's top-left picks Select,
+Draw, Frame, Note or Arrow. Escape returns to Select. Double-click a note or a
+frame to edit its text. Select a drawing and press Delete or Backspace, or use
+the toolbar's Delete button. Drawings made in another tab on the same board
+show up here too, and a full board says so instead of dropping older drawings.
 The plus button starts a new session in the selected canvas. After sending,
 the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. Reloading a temporary session before creation finishes returns to
