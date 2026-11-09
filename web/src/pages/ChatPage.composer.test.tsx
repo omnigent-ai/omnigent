@@ -7155,6 +7155,24 @@ describe("Composer — editing a sent message", () => {
     expect(screen.getByText("notes.txt")).toBeInTheDocument();
   });
 
+  it("treats an attachment-only draft as a draft worth asking about", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    const draftFile = new File(["draft"], "draft.txt", { type: "text/plain" });
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [draftFile] },
+    });
+    expect(screen.getByText("draft.txt")).toBeInTheDocument();
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Keep draft" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.getByText("draft.txt")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("keeps the dialog open while a confirmed replacement downloads", async () => {
     let finishDownload: () => void = () => {};
     fetchMock.mockImplementation(
