@@ -481,7 +481,12 @@ describe("change events", () => {
     );
     expect(roundTrip.linkBack).toBe(false);
     const checked = { ...review, linkBack: true, linkBackTouched: true };
-    expect(withTriggerEvent("github", checked, "review").linkBack).toBe(true);
+    const checkedRoundTrip = withTriggerEvent(
+      "github",
+      withTriggerEvent("github", checked, "pr"),
+      "review",
+    );
+    expect(checkedRoundTrip.linkBack).toBe(true);
     expect(withTriggerEvent("github", { ...review, target: "alice" }, "review").target).toBe(
       "alice",
     );
@@ -1171,7 +1176,6 @@ describe("change-event prompts", () => {
     expect(prompt).toContain("Leave out review requests made after the time you noted");
     expect(prompt).toContain('title "GitHub <owner/repo>#<number> review <event id>"');
     expect(prompt).toContain("whether you started a session for an earlier review request");
-    // Requests from before the automation existed never count.
     // Requests from before activation never count, even inside the search overlap.
     expect(prompt).toContain(
       'On the first run, use the current time as both the check time and the "Watching since:" time',
@@ -1213,7 +1217,7 @@ describe("change-event prompts", () => {
       "starts one Omnigent session for each ticket assigned to you that matches.",
     );
     expect(prompt).toContain(
-      'search for (project = "ES" AND assignee = currentUser()) AND assignee CHANGED TO currentUser() AFTER "-<A>m", through every page, where A is the whole minutes from that time until now, rounded up.',
+      'search for (project = "ES" AND assignee = currentUser()) AND assignee CHANGED TO currentUser() AFTER "-<A>m", through every page, where A is the whole minutes from that time until now, rounded up; when that time is the "Watching since:" time, round down instead, so nothing from before it counts.',
     );
     // Day offsets snap to calendar days and malformed times silently match nothing.
     expect(prompt).toContain(

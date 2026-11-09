@@ -1120,7 +1120,7 @@ function sourceText(source: TriggerSource, fields: TriggerFields): SourceText {
     return {
       watch: () => `Watch: Jira tickets ${assignedTo}, matching this JQL:\n${jql}`,
       search: () =>
-        `Use your Jira tools to search for (${jql}) AND ${change} AFTER "-<A>m", through every page, where A is the whole minutes from that time until now, rounded up. Write it as a minute offset such as "-95m", never days, hours or dates: Jira snaps those to calendar days or reads them in your profile's time zone, and a malformed time silently matches nothing. This finds tickets whose assignee changed since then, however long ago they were created. When the search returns, note its search time: the current UTC time rounded up to the next whole minute.`,
+        `Use your Jira tools to search for (${jql}) AND ${change} AFTER "-<A>m", through every page, where A is the whole minutes from that time until now, rounded up; when that time is the "${WATCHING_SINCE}" time, round down instead, so nothing from before it counts. Write it as a minute offset such as "-95m", never days, hours or dates: Jira snaps those to calendar days or reads them in your profile's time zone, and a malformed time silently matches nothing. This finds tickets whose assignee changed since then, however long ago they were created. When the search returns, note its search time: the current UTC time rounded up to the next whole minute.`,
       readOrder:
         "Read every page of results; a search that errors counts as unread. If you can't read them all, start no sessions in this run and keep the previous check time.",
       createdAt: "assigned",
