@@ -31,6 +31,7 @@ _TEXT_FIELDS = frozenset(
         "native_agent_role",
         "native_parent_session_id",
         "native_record_id",
+        "native_record_timestamp",
         "native_hook_event",
         "runner_version",
         "native_cli_version",

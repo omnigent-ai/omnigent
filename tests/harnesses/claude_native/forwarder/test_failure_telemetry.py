@@ -1157,3 +1157,142 @@ def test_hook_inference_fields_are_parsed_before_display_truncation(tmp_path: Pa
     assert record.failure_context["provider_error_type"] == "invalid_request_error"
     assert record.failure_context["provider_error_param"] == "user"
     assert len(record.failure_context["native_error_message"]) == 1024
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "current",
+        "stale",
+        "missing_timestamp",
+        "foreign_session",
+        "subagent",
+        "unmarked",
+        "settled",
+        "new_prompt",
+        "stopped",
+        "replaced_launch",
+        "missing_lifecycle",
+        "foreign_response",
+        "missing_response",
+        "unknown_role",
+        "future_timestamp",
+        "missing_forward_state",
+        "new_prompt_during_read",
+        "new_output_during_read",
+    ],
+)
+async def test_program_failure_uses_only_current_launch_transcript_detail(
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native import lifecycle
+    from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
+    from omnigent.inner.terminal_lifecycle import TerminalLifecycleTrace
+
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    instance_id = "a" * 32
+    trace = TerminalLifecycleTrace(session_id="conv_synthetic")
+    env = trace.launch_environment(instance_id)
+    for name, at in [("SessionStart", 100.0), ("UserPromptSubmit", 101.0)]:
+        record_hook_lifecycle(
+            bridge_dir,
+            {"hook_event_name": name, "session_id": "native-session", "source": "startup"},
+            at,
+            env,
+        )
+    entry = {
+        "type": "assistant",
+        "uuid": "current-error",
+        "timestamp": None
+        if scenario == "missing_timestamp"
+        else "1970-01-01T00:01:40Z"
+        if scenario == "stale"
+        else "1970-01-01T00:01:42Z",
+        "sessionId": "foreign-session" if scenario == "foreign_session" else "native-session",
+        "isSidechain": scenario == "subagent",
+        "isApiErrorMessage": scenario != "unmarked",
+        "message": {"role": "assistant", "content": "Prompt is too long"},
+    }
+    if scenario == "unknown_role":
+        entry.pop("isSidechain")
+    if scenario == "future_timestamp":
+        entry["timestamp"] = "2999-01-01T00:00:00Z"
+    transcript_path.write_text(json.dumps(entry) + "\n")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(202, json={})),
+        base_url="http://test",
+    ) as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_synthetic",
+            bridge_dir=bridge_dir,
+            agent_name="test-agent",
+            state=forwarder.TranscriptForwardState(transcript_path, 0),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+    if scenario == "settled":
+        forwarder._write_forward_state(
+            bridge_dir, replace(state, settled_response_id=state.current_response_id)
+        )
+    elif scenario in {"foreign_response", "missing_response"}:
+        forwarder._write_forward_state(
+            bridge_dir,
+            replace(
+                state,
+                api_error_response_id="different-response"
+                if scenario == "foreign_response"
+                else None,
+            ),
+        )
+    elif scenario in {"new_prompt", "stopped"}:
+        record_hook_lifecycle(
+            bridge_dir,
+            {
+                "hook_event_name": "UserPromptSubmit" if scenario == "new_prompt" else "Stop",
+                "session_id": "native-session",
+            },
+            103.0,
+            env,
+        )
+    elif scenario == "missing_lifecycle":
+        (bridge_dir / f"lifecycle-{trace.launch_id}.json").unlink()
+    elif scenario == "missing_forward_state":
+        (bridge_dir / forwarder._FORWARDER_STATE_FILE).unlink()
+    elif scenario == "new_prompt_during_read":
+        read_snapshot = lifecycle.read_lifecycle_snapshot
+
+        def advance_after_read(*args):
+            snapshot = read_snapshot(*args)
+            record_hook_lifecycle(
+                bridge_dir,
+                {"hook_event_name": "UserPromptSubmit", "session_id": "native-session"},
+                103.0,
+                env,
+            )
+            return snapshot
+
+        monkeypatch.setattr(lifecycle, "read_lifecycle_snapshot", advance_after_read)
+    elif scenario == "new_output_during_read":
+        read_state = forwarder._read_forward_state
+
+        def advance_after_state_read(directory):
+            captured = read_state(directory)
+            forwarder._write_forward_state(
+                bridge_dir, replace(state, api_error_context=None, api_error_response_id=None)
+            )
+            return captured
+
+        monkeypatch.setattr(forwarder, "_read_forward_state", advance_after_state_read)
+    context = forwarder.read_program_status_failure(
+        bridge_dir, instance_id, "b" * 32 if scenario == "replaced_launch" else trace.launch_id
+    )
+    if scenario == "current":
+        assert context is not None
+        assert context["native_error_message"] == "Prompt is too long"
+        assert context["native_record_timestamp"] == "1970-01-01T00:01:42Z"
+        assert context["detail_source"] == "explicit_api_error"
+    else:
+        assert context is None

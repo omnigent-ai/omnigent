@@ -27,6 +27,7 @@ def claude_failure_context(
         "native_session_id": entry.get("sessionId", entry.get("session_id")),
         "native_agent_id": entry.get("agentId", entry.get("agent_id")),
         "native_record_id": entry.get("uuid"),
+        "native_record_timestamp": entry.get("timestamp"),
         "native_request_id": entry.get("requestId"),
         "native_cli_version": entry.get("version"),
         "native_model": concrete_reported_model(message.get("model")),

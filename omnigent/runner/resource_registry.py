@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
+    from omnigent.native.failure_telemetry import FailureContext
     from omnigent.spec.types import AgentSpec
     from omnigent.terminals.registry import TerminalRegistry
 
@@ -709,6 +710,43 @@ class SessionResourceRegistry:
     def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
         """Publish a native status failure with its available error detail on the event loop."""
         self._session_failure_publisher = publisher
+
+    def native_failure_context(self, session_id: str) -> FailureContext | None:
+        """Read error detail only from the session's current Claude terminal launch."""
+        from omnigent.harnesses.claude_native.bridge import bridge_dir_from_launch_args
+        from omnigent.harnesses.claude_native.forwarder import read_program_status_failure
+
+        terminals = self._terminal_registry
+        if terminals is None:
+            return None
+        candidates = [
+            entry
+            for entry in terminals.list_for_conversation(session_id)
+            if self.terminal_resource_role(
+                session_id, terminal_resource_id(entry.terminal_name, entry.session_key)
+            )
+            == CLAUDE_NATIVE_TERMINAL_ROLE
+        ]
+        if len(candidates) != 1:
+            return None
+        entry = candidates[0]
+        instance = entry.instance
+        bridge_dir = bridge_dir_from_launch_args(instance.args)
+        if bridge_dir is None or not instance.running:
+            return None
+        instance_id = instance.diagnostic_id
+        launch_id = instance.lifecycle_trace.launch_id
+        try:
+            context = read_program_status_failure(bridge_dir, instance_id, launch_id)
+        except Exception:  # noqa: BLE001 - missing evidence retains the original failure.
+            return None
+        if (
+            terminals.get(session_id, entry.terminal_name, entry.session_key) is not instance
+            or instance.diagnostic_id != instance_id
+            or instance.lifecycle_trace.launch_id != launch_id
+        ):
+            return None
+        return context
 
     def set_session_background_publisher(
         self,

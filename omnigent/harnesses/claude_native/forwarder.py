@@ -3834,6 +3834,62 @@ def _transcript_api_error_for_hook(
     return context, "matched", owner
 
 
+def read_program_status_failure(
+    bridge_dir: Path, instance_id: str, launch_id: str
+) -> FailureContext | None:
+    """Enrich a bare terminal failure with fresh evidence from its unfinished root turn."""
+    from omnigent.harnesses.claude_native.bridge import _transcript_timestamp
+    from omnigent.harnesses.claude_native.lifecycle import read_lifecycle_snapshot
+
+    lifecycle = read_lifecycle_snapshot(bridge_dir, instance_id, launch_id)
+    if lifecycle.get("read_status") != "ok" or lifecycle.get("hook_turn_in_progress") is not True:
+        return None
+    native_session_id = lifecycle.get("claude_session_id")
+    state = _read_forward_state(bridge_dir)
+    if state is None or not native_session_id or not state.current_response_id:
+        return None
+    context = state.api_error_context
+    if (
+        not context
+        or context.get("native_api_error_message") is not True
+        or context.get("native_agent_role") != "session_agent"
+        or context.get("native_agent_id")
+        or context.get("native_session_id") != native_session_id
+        or not context.get("native_record_id")
+        or not context.get("native_error_message")
+        or state.api_error_response_id != state.current_response_id
+        or state.current_response_id
+        in (state.settled_response_id, state.pending_settled_response_id)
+    ):
+        return None
+    recorded_at = _transcript_timestamp(context.get("native_record_timestamp"))
+    hooks = lifecycle.get("recent_hooks")
+    if recorded_at is None or not isinstance(hooks, list):
+        return None
+    submitted_at = max(
+        (
+            float(event["recorded_at"])
+            for event in hooks
+            if isinstance(event, dict)
+            and event.get("event_name") == "UserPromptSubmit"
+            and event.get("claude_session_id") == native_session_id
+        ),
+        default=None,
+    )
+    if submitted_at is None or not submitted_at <= recorded_at <= time.time():
+        return None
+    if (
+        read_lifecycle_snapshot(bridge_dir, instance_id, launch_id) != lifecycle
+        or _read_forward_state(bridge_dir) != state
+    ):
+        return None
+    return {
+        **context,
+        "failure_source": "claude_program_status",
+        "detail_source": "explicit_api_error",
+    }
+
+
 def _is_subagent_hook_record(
     record: ClaudeHookRecord,
     *,

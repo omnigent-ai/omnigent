@@ -883,3 +883,107 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
                 background(conv_id, False)
                 assert app.state.has_active_work() is False
                 assert app.state.has_sandbox_work() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pane_detail", [None, "API Error: 499 Request cancelled"])
+@pytest.mark.parametrize(
+    "terminal_state", ["current", "removed", "relaunched", "relaunched_during_read"]
+)
+async def test_bare_native_failure_recovers_current_transcript_cause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pane_detail: str | None,
+    terminal_state: str,
+) -> None:
+    from omnigent.harnesses.claude_native import bridge, forwarder
+    from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
+    from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.helpers import make_test_terminal_instance
+
+    session_id = "conv_transcript_cause"
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    terminal = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal.args = ["--settings", str(bridge_dir / "claude-settings.json")]
+    monkeypatch.setattr(terminal, "start_idle_watcher_thread", Mock())
+    env = terminal.lifecycle_trace.launch_environment(terminal.diagnostic_id)
+    for name, at in [("SessionStart", 100.0), ("UserPromptSubmit", 101.0)]:
+        record_hook_lifecycle(
+            bridge_dir,
+            {"hook_event_name": name, "session_id": "native-session", "source": "startup"},
+            at,
+            env,
+        )
+    context = claude_failure_context(
+        {
+            "uuid": "current-error",
+            "sessionId": "native-session",
+            "isSidechain": False,
+            "timestamp": "1970-01-01T00:01:42Z",
+            "isApiErrorMessage": True,
+        },
+        error_text="Prompt is too long",
+    )
+    forwarder._write_forward_state(
+        bridge_dir,
+        forwarder.TranscriptForwardState(
+            tmp_path / "transcript.jsonl",
+            2,
+            current_response_id="current-response",
+            api_error_response_id="current-response",
+            api_error_context=context,
+        ),
+    )
+    terminals = TerminalRegistry()
+    terminals._by_conversation.setdefault(session_id, {})[("claude", "main")] = terminal
+    app = create_runner_app(
+        terminal_registry=terminals,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resources = app.state.session_resource_registry
+    await resources.observe_required_terminal(
+        session_id, "claude", "main", terminal, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    publish = resources._session_status_publisher
+    publish(session_id, "running", None)
+    if terminal_state == "removed":
+        terminals._by_conversation.pop(session_id)
+    elif terminal_state == "relaunched":
+        terminal.lifecycle_trace.launch_environment(terminal.diagnostic_id)
+    elif terminal_state == "relaunched_during_read":
+        read_failure = forwarder.read_program_status_failure
+
+        def relaunch_after_read(*args):
+            captured = read_failure(*args)
+            terminal.lifecycle_trace.launch_environment(terminal.diagnostic_id)
+            return captured
+
+        monkeypatch.setattr(forwarder, "read_program_status_failure", relaunch_after_read)
+    if pane_detail is None:
+        publish(session_id, "failed", None)
+    else:
+        resources._session_failure_publisher(session_id, pane_detail)
+    queue = _session_event_queues_ref.pop(session_id)
+    events = [queue.get_nowait() for _ in range(queue.qsize())]
+    failures = [event for event in events if event.get("status") == "failed"]
+    assert len(failures) == 1
+    failure = failures[0]
+    if pane_detail is None and terminal_state != "current":
+        assert failure["error"]["code"] == "native_failure_detail_unavailable"
+        assert "failure_context" not in failure
+    elif pane_detail is None:
+        assert failure["error"]["code"] == "context_length_exceeded"
+        assert "/compact" in failure["error"]["message"]
+        assert "/clear" in failure["error"]["message"]
+        assert failure["failure_context"]["detail_source"] == "explicit_api_error"
+        assert failure["failure_context"]["native_record_id"] == "current-error"
+    else:
+        assert failure["error"]["code"] == "native_turn_error"
+        assert failure["error"]["message"] == pane_detail
+        assert failure["failure_context"]["detail_source"] == "program_status_error"
+    assert not app.state.has_active_work()

@@ -1876,17 +1876,26 @@ def create_runner_app(
                     "arrive. Open the terminal to inspect the error before retrying."
                 ),
             }
-            if failure_detail:
+            transcript_context = (
+                resource_registry.native_failure_context(session_id)
+                if not failure_detail
+                else None
+            )
+            if failure_detail or transcript_context:
                 from omnigent.harnesses.claude_native.bridge import program_status_turn_error
                 from omnigent.harnesses.claude_native.failure_telemetry import (
                     claude_failure_context,
                 )
 
-                raw_context: dict[str, object] = {
-                    **claude_failure_context({}, error_text=failure_detail),
-                    "failure_source": "claude_program_status",
-                    "detail_source": "program_status_error",
-                }
+                raw_context: dict[str, object] = (
+                    dict(transcript_context)
+                    if transcript_context
+                    else {
+                        **claude_failure_context({}, error_text=failure_detail),
+                        "failure_source": "claude_program_status",
+                        "detail_source": "program_status_error",
+                    }
+                )
                 # An API error envelope decodes to its cause; the raw report is only the fallback.
                 raw_context.setdefault("native_error_message", failure_detail)
                 context = normalize_failure_context(raw_context)
