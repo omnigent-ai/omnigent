@@ -558,6 +558,9 @@ class SandboxLifecycle(ABC):
             return False
         return self_method is not base_method
 
+    # Provider ID learned during start; managed launch persists it over the reserved ID.
+    started_sandbox_id: str | None = None
+
     @abstractmethod
     def prepare(self) -> None:
         """
