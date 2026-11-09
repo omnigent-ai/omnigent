@@ -61,8 +61,9 @@ MCP independent creation.
 - `scheduled`: scheduled runs, their forks and children use the new sends and
   independent creates like any private session their owner owns, so an
   automation can message the owner's other sessions or start workers. The
-  Automations page's Jira/Slack/GitHub trigger templates rely on this: their
-  kept session starts one worker per match (`docs/AUTOMATIONS.md`).
+  Automations page's Jira, Slack, GitHub, Linear and PagerDuty trigger templates
+  rely on this: their kept session starts one worker per match
+  (`docs/AUTOMATIONS.md`).
 - `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
@@ -92,8 +93,9 @@ MCP independent creation.
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.
-- On Automations, pick a _Jira tickets_, _Slack messages_, or _GitHub issues_
-  card from suggestions on **Your automations** or the **Templates** tab at
+- On Automations, pick a _Jira tickets_, _Slack messages_, _GitHub_, _Linear
+  issues_, or _PagerDuty incidents_ card from suggestions on **Your
+  automations** or the **Templates** tab at
   `/tasks?view=templates`. Suggestions appear below saved automations or the
   empty-state message with All selected and search cleared. The old
   `/tasks/templates` URL redirects to the Templates tab.

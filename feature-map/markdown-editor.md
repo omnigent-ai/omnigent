@@ -231,7 +231,10 @@ instead of treating one comparison clip as complete feature verification.
   256 KiB the rich editor is unavailable regardless of the saved view preference:
   the file opens in Preview (or source when Source is the saved preference, or a
   comment link or line citation needs source), and Edit opens source for that
-  visit only, without changing the saved preference. Above 1 MiB, or when the
+  visit only, without changing the saved preference. A line citation's source
+  also stays for the visit, so clearing the citation doesn't return to Preview;
+  leaving editable source through the view picker asks before discarding
+  unsaved edits. Above 1 MiB, or when the
   file is truncated, it opens in source with no Preview. The routing stays fixed
   for that file visit so an autosave cannot replace an editor with newer unsaved
   edits. Reopen another file and return, or reload, to reassess. This is an

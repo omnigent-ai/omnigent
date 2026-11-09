@@ -230,9 +230,12 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 
 ## Gotchas
 
-- Templates poll every hour, or every ten minutes for new templates with
-  sub-hour support enabled. The server can configure
-  new-template polling from 10 to 240 minutes; they do not receive webhooks.
+- On the database scheduler without custom dispatch hooks, the server, not the
+  saved schedule, decides when a trigger polls: once its session has been quiet
+  for two minutes, rechecking every two minutes while it is busy, and anyway ten
+  minutes after the previous poll. Skipped checks record no run, and polls never
+  go past the saved schedule's next occurrence. Elsewhere the saved schedule
+  applies. Triggers poll; they do not receive webhooks.
 - Templates remain available even if loading the user's automation list fails.
 - Selecting a template does not create an automation until the modal is submitted.
 - The introduction's Example automations are read-only educational content and
