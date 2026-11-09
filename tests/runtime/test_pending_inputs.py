@@ -226,20 +226,32 @@ def test_record_then_snapshot_preserves_order_and_content() -> None:
     assert snap[1]["content"] == [_text_block("second")]
 
 
-def test_snapshot_returns_deep_copies() -> None:
+@pytest.mark.parametrize("content_source", ["enqueue", "snapshot", "held_drain"])
+def test_snapshot_returns_deep_copies(content_source: str) -> None:
     """
-    Mutating a snapshot entry must not corrupt the stored content.
+    Mutating caller-owned or returned content must not corrupt the queue.
 
     The snapshot is serialized onto the wire; a shallow copy would let
     a caller's mutation leak back into the index and poison a later
     replay. Asserts the stored content is unchanged after mutation.
     """
-    pending_inputs.record("conv_a", [_text_block("orig")])
-    snap = pending_inputs.snapshot_for("conv_a")
-    snap[0]["content"][0]["text"] = "mutated"
+    content = [_text_block("orig"), {"type": "input_image", "file_id": "file_original"}]
+    pending_id = pending_inputs.record("conv_a", content)
+    if content_source == "snapshot":
+        content = pending_inputs.snapshot_for("conv_a")[0]["content"]
+    elif content_source == "held_drain":
+        pending = pending_inputs.resolve_oldest("conv_a", hold=True)
+        assert pending is not None
+        content = pending.content
+    content[0]["text"] = "mutated"
+    content[1]["file_id"] = "file_replaced"
+    content.append(_text_block("added later"))
 
     # Re-read: the index still holds the original text, not "mutated".
-    assert pending_inputs.snapshot_for("conv_a")[0]["content"] == [_text_block("orig")]
+    expected = [_text_block("orig"), {"type": "input_image", "file_id": "file_original"}]
+    assert pending_inputs.snapshot_for("conv_a")[0]["content"] == expected
+    drained = pending_inputs.resolve("conv_a", pending_id)
+    assert drained is not None and drained.content == expected
 
 
 def test_resolve_oldest_drains_fifo_and_returns_entry() -> None:
