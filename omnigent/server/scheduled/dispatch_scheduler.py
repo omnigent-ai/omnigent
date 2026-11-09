@@ -358,6 +358,10 @@ FireIdentity = Callable[[ScheduledTask], AbstractAsyncContextManager[object]]
 DispatchEnabled = Callable[[], bool]
 # Read before each wait between polls.
 PollInterval = Callable[[], float]
+# Checked after a run is claimed, before anything starts. Refusing records a skipped run.
+RunAllowed = Callable[[ScheduledTask], bool]
+# Error code on a run that was claimed but refused by ``run_allowed``.
+RUN_NOT_ALLOWED_ERROR_CODE = "run_not_allowed"
 
 
 class FireIdentityRevoked(Exception):
@@ -379,6 +383,10 @@ def _always_enabled() -> bool:
     return True
 
 
+def _always_allowed(_task: ScheduledTask) -> bool:
+    return True
+
+
 @dataclass(frozen=True)
 class ScheduledTaskDispatchHooks:
     """Execution, recovery, host-ownership, and owner-identity callbacks; see README.md.
@@ -393,6 +401,7 @@ class ScheduledTaskDispatchHooks:
     fire_identity: FireIdentity | None = None
     dispatch_enabled: DispatchEnabled = _always_enabled
     poll_interval: PollInterval | None = None
+    run_allowed: RunAllowed = _always_allowed
 
     def __post_init__(self) -> None:
         if (self.on_fire is None) != (self.on_expired is None):
@@ -419,6 +428,7 @@ class PersistentTaskScheduler:
         owned_hosts: OwnedHosts = _owns_every_host,
         dispatch_enabled: DispatchEnabled = _always_enabled,
         poll_interval: PollInterval | None = None,
+        run_allowed: RunAllowed = _always_allowed,
         now: Callable[[], float] = time.time,
         poll_seconds: float = DEFAULT_SCHEDULER_CONFIG.poll_seconds,
         renewal_seconds: float = DEFAULT_SCHEDULER_CONFIG.renewal_seconds,
@@ -443,6 +453,7 @@ class PersistentTaskScheduler:
         self._owned_hosts = owned_hosts
         self._dispatch_enabled = dispatch_enabled
         self._poll_interval = poll_interval
+        self._run_allowed = run_allowed
         self._now = now
         self._poll_seconds = config.poll_seconds
         self._renewal_seconds = config.renewal_seconds
@@ -1006,8 +1017,28 @@ class PersistentTaskScheduler:
                 # A cancelled finish can still commit; log only if it did not.
                 lease._when_writes_settle(log_unfinished)
 
+    def _run_permitted(self, task: ScheduledTask) -> bool:
+        """Whether a claimed run may start; a failing check refuses it."""
+        try:
+            return bool(self._run_allowed(task))
+        except Exception:
+            _logger.exception("Could not check whether task %s may run; skipping the run", task.id)
+            return False
+
     async def _fire(self, task: ScheduledTask, lease: StartupLease) -> None:
         await lease.check()
+        if not self._run_permitted(task):
+            _logger.info(
+                "Skipped scheduled run %s: the host application does not allow it to run",
+                lease.run.id,
+                extra=_run_event("scheduled_run_skipped", lease.run, target=task.execution_target),
+            )
+            await lease.finish(
+                "skipped",
+                error="This run was not allowed to start, so no session was created.",
+                error_code=RUN_NOT_ALLOWED_ERROR_CODE,
+            )
+            return
         await self._on_fire(task, lease)
         if lease.run.status == "starting":
             _logger.warning(
