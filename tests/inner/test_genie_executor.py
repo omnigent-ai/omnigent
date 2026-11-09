@@ -189,7 +189,7 @@ class TestGenieExecutor:
             assert genie_model_id(model.slug) == model.slug
 
     @pytest.mark.parametrize(
-        ("base_url", "strict"),
+        ("gateway_url", "strict"),
         [
             (_GATEWAY_BASE_URL, True),
             (f"{_GATEWAY_BASE_URL}/", True),
@@ -197,11 +197,12 @@ class TestGenieExecutor:
         ],
     )
     def test_catalog_is_enforced_only_on_the_databricks_gateway(
-        self, base_url: str, strict: bool
+        self, gateway_url: str, strict: bool
     ) -> None:
         # Off the gateway genie forwards an unknown model to the provider
         # instead of swapping it, so only the gateway route is held to it.
-        gateway = _gateway_kwargs(base_url)
+        # Not ``base_url``: that name is pytest-base-url's session fixture.
+        gateway = _gateway_kwargs(gateway_url)
         genie = _genie_executor(**gateway)
         assert genie._app_session_factory.keywords["strict_model_catalog"] is strict
         assert genie._app_session_factory.keywords["effort_vocabulary"] == GENIE_EFFORTS
