@@ -1,6 +1,6 @@
 "use strict";
 
-/** Public macOS Managed Preferences key in the ai.omnigent.desktop domain. */
+/** macOS Managed Preferences key in the ai.omnigent.desktop domain. */
 const SERVER_URLS_KEY = "serverUrls";
 
 /** Optional query parameter on a serverUrls entry naming that server. */
@@ -80,7 +80,7 @@ function parseManagedServerUrls(value) {
 }
 
 /**
- * Read effective macOS preferences. MDM-forced values and ordinary defaults
+ * Read effective macOS preferences. Forced values and ordinary defaults
  * share NSUserDefaults' effective-value API; callers treat the result as
  * read-only and never copy the configured list into settings.json.
  *

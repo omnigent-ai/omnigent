@@ -374,7 +374,7 @@ def render_host_config_write_command(host_config: dict[str, object]) -> str:
     in the destination directory followed by :func:`os.replace`, so an
     interrupted write cannot expose a truncated destination file. A pre-existing
     ``config.yaml`` symlink is replaced by a real file — durability of the write
-    is favored over following the link, which an internal sandbox config never
+    is favored over following the link, which a sandbox config never
     relies on.
 
     The payload travels as base64-encoded JSON substituted into a fixed
@@ -505,7 +505,7 @@ class SandboxLifecycle(ABC):
     # Package index URL exported as ``UV_INDEX_URL`` for the local wheel
     # build, or ``None`` to use ambient uv configuration. Providers tied
     # to networks where public PyPI is unreachable (for example, Lakebox on a
-    # corporate network) override this.
+    # restricted network) override this.
     wheel_build_index_url: ClassVar[str | None] = None
 
     # Legacy class vars — kept for backward compat while providers migrate
