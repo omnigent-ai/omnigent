@@ -27,7 +27,8 @@ and a changed file is flagged.
   `Opening files isn’t supported for <provider>`.
 - `viewed`: Per-file **Viewed** checkbox in each file header. Marking collapses the
   file; unmarking leaves it as it is. Viewed files show a check and a dimmed name in
-  the file list. Viewed controls are hidden when viewed state is unavailable.
+  the file list. A mark made in another tab on the same head also collapses the file.
+  Viewed controls are hidden when viewed state is unavailable.
 - `progress`: `X / Y files viewed`, with `(partial)` when the changed-file list is
   truncated. A bar sits beside it outside the mobile layout; mobile shows the text only.
 - `hide-viewed`: **Hide viewed** toggle, off by default. When every file the path
@@ -202,8 +203,7 @@ Component coverage for these helpers and views lives in
   clearing that filter first and showing `Filter cleared to show <file>`. Other
   conversations on hidden files stay hidden with their files.
 - **Known rough edges.** Marking a file while Hide viewed is on removes it from the
-  list and drops keyboard focus. Marks made in another tab on the same head check the
-  file and collapse it, as a mark made here does.
+  list and drops keyboard focus.
 - **Commits need GitHub and a current server.** GitLab and Azure DevOps show Changes
   only. If the Omnigent server predates the commit view, the switch disappears for that
   pull request and the toast `Commits need an updated Omnigent server.` appears.
