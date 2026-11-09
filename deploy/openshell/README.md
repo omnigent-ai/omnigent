@@ -110,8 +110,9 @@ The `host` target also carries the two things OpenShell's image contract require
 user/group** and **`iproute2`/`nftables`** for the per-sandbox network namespace.
 A custom image used with OpenShell must include both, or the supervisor refuses to
 start. (The launcher handles the remaining non-root detail — pinning each exec's
-cwd and `$HOME` to `/home/sandbox` — so the image's `/root` default still works
-for the other providers.)
+cwd and `$HOME` to `/sandbox` — so the image's `/root` default still works
+for the other providers. The image's `/opt/venv` is owned by `sandbox` so the
+launcher can install wheels into it.)
 
 Before using an image with OpenShell, smoke-test that contract from the same
 Docker daemon the gateway uses:
@@ -133,6 +134,22 @@ docker push docker.io/<you>/omnigent-host:latest
 ```
 
 Then point Omnigent at it with `OMNIGENT_OPENSHELL_HOST_IMAGE`.
+
+### Kubernetes driver
+
+OpenShell's Kubernetes driver needs the `host-openshell` target instead. That
+driver runs every sandbox container as UID 10001 without group 0. Its
+`workspace-init` container copies the image's `/sandbox` into a workspace volume
+that then mounts over `/sandbox`, and Landlock leaves only `/sandbox` and `/tmp`
+writable. The `host-openshell` target builds its venv at `/sandbox/.venv` and
+lets any user read `/sandbox`, so the copied venv runs and accepts the launcher's
+wheel installs. CI does not publish this target, so build it from a checkout:
+
+```bash
+docker build -f deploy/docker/Dockerfile --target host-openshell \
+  --platform linux/amd64 \
+  -t docker.io/<you>/omnigent-host-openshell:latest .
+```
 
 > [!NOTE]
 > **Air-gapped?** Pre-load the host image (and OpenShell's supervisor image) into
@@ -246,8 +263,19 @@ egress forced through a policy proxy, and anything not explicitly allowed is
 blocked (the in-sandbox `https_proxy` returns `403`). The agent and host run with
 *no* outbound access until the sandbox policy grants it. The policy is resolved
 from `/etc/openshell/policy.yaml` baked into the image, or set per-sandbox; see
-the [OpenShell policy schema](https://docs.nvidia.com/openshell). A managed host
-needs egress to:
+the [OpenShell policy schema](https://docs.nvidia.com/openshell). The published
+`omnigent-host` image ships no policy because the server URL differs per
+deployment, so bake yours into a derived image and point `sandbox.openshell.image`
+(or `OMNIGENT_OPENSHELL_HOST_IMAGE`) at it:
+
+```dockerfile
+FROM ghcr.io/omnigent-ai/omnigent-host:latest
+COPY policy.yaml /etc/openshell/policy.yaml
+```
+
+On the Kubernetes driver, derive it from your `host-openshell` build instead.
+
+A managed host needs egress to:
 
 - **the server URL** (`server_url`) — the host and runner dial it back over a
   WebSocket tunnel; without it the host can connect but the runner never registers;
@@ -258,9 +286,21 @@ needs egress to:
   `*.blob.core.windows.net` (the openai-agents harness downloads the `tiktoken`
   encoding).
 
-A minimal `network_policies` block (in the image's `policy.yaml`) looks like:
+A minimal `policy.yaml` looks like this. With the `host` image, also add
+`/opt/venv` to `read_write`: the host runs from that venv and the launcher
+installs wheels into it. The `host-openshell` venv is already under `/sandbox`.
 
 ```yaml
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /lib64, /proc, /dev/urandom, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null, /dev/pts]
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
 network_policies:
   server:
     endpoints: [{ host: "your-host.example.com", port: 443, tls: skip }]
@@ -282,6 +322,10 @@ network_policies:
 >     env: [OMNIGENT_RUNNER_ENV_PASSTHROUGH, …]   # value set in the server env:
 > # OMNIGENT_RUNNER_ENV_PASSTHROUGH=https_proxy,http_proxy,HTTPS_PROXY,HTTP_PROXY,NO_PROXY,no_proxy
 > ```
+
+The host and runner open their WebSocket tunnels through that proxy with HTTP
+`CONNECT`. Only `http://` proxy URLs are supported; for a SOCKS or `https://`
+proxy URL they log a warning and dial the server directly, which the sandbox blocks.
 
 > [!TIP]
 > For LLM traffic specifically, OpenShell recommends its **inference routing**
@@ -336,7 +380,7 @@ match the [Modal git guide](../modal/README.md#git-credentials-private-repositor
   `touched-urial`); that name is the handle Omnigent prints and reuses. The
   requested `--name` is advisory.
 - **Non-root execution.** OpenShell runs the agent as the `sandbox` user, so the
-  launcher pins every exec's cwd and `$HOME` to `/home/sandbox` (the image keeps
+  launcher pins every exec's cwd and `$HOME` to `/sandbox` (the image keeps
   `/root` as its default for the root-based providers).
 - **Long-lived host.** OpenShell terminates an exec's process tree the moment the
   exec returns, so the in-sandbox host can't be detached with the usual
