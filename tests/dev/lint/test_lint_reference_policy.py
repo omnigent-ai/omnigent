@@ -299,17 +299,36 @@ def test_cli_uses_push_range_and_does_not_echo_values(
     (repository / "notes.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
     git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
-    result = subprocess.run(
-        [sys.executable, str(script)],
-        cwd=repository,
-        env={**os.environ, "PRE_COMMIT_FROM_REF": base, "PRE_COMMIT_TO_REF": "HEAD"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 1
-    assert "notes.txt:1: prohibited reference" in result.stdout
-    assert prohibited_name not in result.stdout
+    for arguments in [[], ["--pre-push"]]:
+        result = subprocess.run(
+            [sys.executable, str(script), *arguments],
+            cwd=repository,
+            env={**os.environ, "PRE_COMMIT_FROM_REF": base, "PRE_COMMIT_TO_REF": "HEAD"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1
+        assert "notes.txt:1: prohibited reference" in result.stdout
+        assert prohibited_name not in result.stdout
+    for missing in [
+        ("PRE_COMMIT_FROM_REF",),
+        ("PRE_COMMIT_TO_REF",),
+        ("PRE_COMMIT_FROM_REF", "PRE_COMMIT_TO_REF"),
+    ]:
+        environment = {**os.environ, "PRE_COMMIT_FROM_REF": base, "PRE_COMMIT_TO_REF": "HEAD"}
+        for variable in missing:
+            del environment[variable]
+        incomplete = subprocess.run(
+            [sys.executable, str(script), "--pre-push"],
+            cwd=repository,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert incomplete.returncode == 2
+        assert "reference-policy: cannot determine changes" in incomplete.stderr
     failed = subprocess.run(
         [sys.executable, str(script), "--base", "missing-ref", "--head", "HEAD"],
         cwd=repository,
@@ -320,32 +339,54 @@ def test_cli_uses_push_range_and_does_not_echo_values(
     assert failed.returncode == 2
 
 
-@pytest.mark.parametrize("base", ["", "0" * 40, "missing-ref"])
+@pytest.mark.parametrize("base", ["", "0" * 40, "missing-ref", "pull-request"])
 @pytest.mark.skipif(sys.platform == "win32", reason="The CI step runs in Bash on Linux")
 def test_hook_and_ci_enforce_policy(repository: Path, prohibited_name: str, base: str) -> None:
     root = Path(__file__).resolve().parents[3]
     hook = (root / ".pre-commit-config.yaml").read_text()
     workflow = (root / ".github/workflows/lint.yml").read_text()
     assert "entry: python3 dev/lint/lint_reference_policy.py" in hook
-    assert 'lint_reference_policy.py --base "$POLICY_BASE" --head HEAD' in workflow
+    hooks = {
+        item["id"]: item
+        for repo in yaml.safe_load(hook)["repos"]
+        for item in repo["hooks"]
+        if item["id"].startswith("reference-policy")
+    }
+    assert hooks["reference-policy"]["stages"] == ["pre-commit"]
+    assert hooks["reference-policy-push"]["stages"] == ["pre-push"]
+    assert hooks["reference-policy-push"]["entry"].endswith(" --pre-push")
+    assert 'lint_reference_policy.py --base "$POLICY_BASE" --head "$POLICY_HEAD"' in workflow
     assert "fetch-depth: 0" in workflow
     step = next(
         step
         for step in yaml.safe_load(workflow)["jobs"]["pre-commit"]["steps"]
         if step.get("name") == "Check reference policy"
     )
+    assert step["env"]["POLICY_HEAD"] == "${{ github.event.pull_request.head.sha || github.sha }}"
+    event_base = git(repository, "rev-parse", "HEAD").decode().strip()
     git(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
     (repository / "notes.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
     git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "first")
     git(repository, "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-qm", "second")
+    head = git(repository, "rev-parse", "HEAD").decode().strip()
+    if base == "pull-request":
+        git(repository, "switch", "-c", "updated-base", event_base)
+        (repository / "upstream.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
+        git(repository, "add", ".")
+        git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "upstream")
+        git(repository, "-c", "core.hooksPath=/dev/null", "merge", "--no-ff", "-m", "merge", head)
     script = repository / "dev/lint/lint_reference_policy.py"
     script.parent.mkdir(parents=True)
     script.write_text((root / "dev/lint/lint_reference_policy.py").read_text(), encoding="utf-8")
     result = subprocess.run(
         ["bash", "-e", "-c", step["run"]],
         cwd=repository,
-        env={**os.environ, "POLICY_BASE": base},
+        env={
+            **os.environ,
+            "POLICY_BASE": event_base if base == "pull-request" else base,
+            "POLICY_HEAD": head,
+        },
         capture_output=True,
         text=True,
         check=False,
@@ -354,3 +395,4 @@ def test_hook_and_ci_enforce_policy(repository: Path, prohibited_name: str, base
     if base != "missing-ref":
         assert result.returncode == 1
         assert "notes.txt:1: prohibited reference" in result.stdout
+        assert "upstream.txt" not in result.stdout
