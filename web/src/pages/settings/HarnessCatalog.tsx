@@ -280,7 +280,7 @@ function CatalogRow({
     <>
       <span className="flex shrink-0 items-center">{icon}</span>
       <span className="shrink-0 text-ui font-medium text-foreground">{label}</span>
-      {detail && <span className="min-w-0 truncate text-ui text-muted-foreground">{detail}</span>}
+      {detail && <span className="min-w-0 truncate text-sm text-muted-foreground">{detail}</span>}
     </>
   );
   const mainClass = "flex min-w-0 flex-1 items-center gap-2 px-4 py-2.5 text-left";
@@ -358,11 +358,11 @@ function PluginPage({
         </span>
         <div className="flex min-w-0 flex-col">
           <h1 className="settings-page-title truncate text-2xl font-medium">{plugin.name}</h1>
-          <span className="text-ui text-muted-foreground">{pluginDetail(plugin, mcps.length)}</span>
+          <span className="text-sm text-muted-foreground">{pluginDetail(plugin, mcps.length)}</span>
         </div>
       </div>
       {plugin.description && (
-        <p className="mt-4 text-ui text-muted-foreground">{plugin.description}</p>
+        <p className="mt-4 text-sm text-muted-foreground">{plugin.description}</p>
       )}
       <Tabs defaultValue="skills" className="mt-6 gap-4">
         <TabsList variant="line" className="w-full justify-start border-b border-border pb-1">
@@ -446,7 +446,7 @@ function SkillPage({
       ) : query.data ? (
         <>
           {query.data.description && (
-            <p className="mt-4 text-ui text-muted-foreground">{query.data.description}</p>
+            <p className="mt-4 text-sm text-muted-foreground">{query.data.description}</p>
           )}
           <h2 className="mt-6 text-ui font-medium">Contents</h2>
           {query.data.truncated && <Notice>Contents truncated (256 KiB limit).</Notice>}

@@ -53,12 +53,11 @@ def test_workspace_tab_hover_tooltip(
     tab.hover()
     tip = page.get_by_role("tooltip")
     expect(tip).to_contain_text(tooltip)
+    # ⌃digit on macOS; Alt+digit elsewhere, where Ctrl+digit opens sidebar sessions.
     keycaps = tip.locator('[data-slot="kbd"]')
-    expect(keycaps).to_have_count(4)
-    expect(keycaps.nth(0)).to_have_text("⌘" if sys.platform == "darwin" else "Ctrl")
-    expect(keycaps.nth(1)).to_have_text("⌥" if sys.platform == "darwin" else "Alt")
-    expect(keycaps.nth(2)).to_have_text("]")
-    expect(keycaps.nth(3)).to_have_text(shortcut)
+    expect(keycaps).to_have_count(2)
+    expect(keycaps.nth(0)).to_have_text("⌃" if sys.platform == "darwin" else "Alt")
+    expect(keycaps.nth(1)).to_have_text(shortcut)
     expect(tab).to_have_attribute("data-state", expected_state)
 
 

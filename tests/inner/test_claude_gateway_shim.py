@@ -299,7 +299,7 @@ async def test_shim_forwards_non_opus_and_non_messages_traffic_verbatim(upstream
     [
         (
             "https://ws.cloud.databricks.com/ai-gateway/anthropic",
-            "omnigent, omnigent-desktop, ug, inner",
+            "omnigent-desktop, ug, inner",
         ),
         ("https://ws.cloud.databricks.com/serving-endpoints/anthropic", "ug, inner"),
     ],

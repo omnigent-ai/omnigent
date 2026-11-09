@@ -27,6 +27,8 @@ const {
   daemonServerUrl,
   getHostConnectionFast,
   probeServerAuth,
+  probeHostTunnel,
+  hostRoutingEnabled,
   localHostId,
   readLocalHostId,
   liveDaemonRecordFor,
@@ -643,5 +645,63 @@ describe("localHostId", () => {
     // prefixed form would make "this machine" unmatchable in the host list.
     assert.equal(localHostId(), "abc123");
     assert.equal(localHostId(), "abc123");
+  });
+});
+
+describe("probeHostTunnel slice key", () => {
+  const HOST_ID = "0f50e4dd924d941d15ae083645926dc3";
+  const WORKSPACE = "https://example.cloud.databricks.com/api/2.0/omnigent";
+  const prevSetting = process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+  afterEach(() => {
+    mock.restoreAll();
+    if (prevSetting === undefined) delete process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+    else process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED = prevSetting;
+  });
+
+  // A stored live token for `serverUrl`, and a fetch that reports the host online.
+  function probeWithToken(serverUrl) {
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({ [serverUrl]: { token: "tok", expires_at: Date.now() / 1000 + 3600 } }),
+    );
+    return mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({ status: "online" }),
+    }));
+  }
+
+  const sliceKey = (fetch, call = 0) =>
+    fetch.mock.calls[call].arguments[1].headers["X-Databricks-Omnigent-Slice-Key"];
+
+  it("keys the probe by host on the workspace mount", async () => {
+    delete process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+    const fetch = probeWithToken(WORKSPACE);
+    assert.equal((await probeHostTunnel(WORKSPACE, HOST_ID)).status, "online");
+    assert.equal(sliceKey(fetch), HOST_ID);
+  });
+
+  it("sends no key to other servers unless opted in", async () => {
+    delete process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+    const server = "https://omnigent.example.com";
+    const fetch = probeWithToken(server);
+    await probeHostTunnel(server, HOST_ID);
+    assert.equal(sliceKey(fetch), undefined);
+    process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED = "1";
+    await probeHostTunnel(server, HOST_ID);
+    assert.equal(sliceKey(fetch, 1), HOST_ID);
+  });
+
+  it("sends no key on the workspace mount when disabled", async () => {
+    process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED = "0";
+    const fetch = probeWithToken(WORKSPACE);
+    await probeHostTunnel(WORKSPACE, HOST_ID);
+    assert.equal(sliceKey(fetch), undefined);
+  });
+
+  it("matches the workspace mount the way the Python CLI does", () => {
+    delete process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+    assert.equal(hostRoutingEnabled(`${WORKSPACE}/`), true);
+    assert.equal(hostRoutingEnabled(`${WORKSPACE}?o=123`), true);
+    assert.equal(hostRoutingEnabled("https://example.cloud.databricks.com/omnigent"), false);
+    assert.equal(hostRoutingEnabled("not a url"), false);
   });
 });
