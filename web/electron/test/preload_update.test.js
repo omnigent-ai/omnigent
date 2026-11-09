@@ -286,3 +286,17 @@ describe("global show shortcut bridge", () => {
     assert.equal(h.invokes.at(-1).channel, "omnigent:cancel-global-shortcut-recording");
   });
 });
+
+describe("system dictation bridge", () => {
+  it("is exposed on macOS only", async () => {
+    assert.equal(loadPreload({ platform: "linux" }).desktop.startSystemDictation, undefined);
+    assert.equal(loadPreload({ platform: "win32" }).desktop.startSystemDictation, undefined);
+
+    const h = loadPreload({ platform: "darwin" });
+    await h.desktop.startSystemDictation();
+    assert.deepEqual(h.invokes.at(-1), {
+      channel: "omnigent:start-system-dictation",
+      args: undefined,
+    });
+  });
+});

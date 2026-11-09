@@ -5266,8 +5266,8 @@ describe("AppShell share action", () => {
       expect(
         screen.getByText(/This session's working directory \(a home or root directory\)/),
       ).toBeInTheDocument();
-      expect(screen.getByText(/This Omnigent server allows read-only sharing/)).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /^add$/i })).toBeDisabled();
+      expect(screen.getByText(/Please be careful when sharing/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^grant$/i })).toBeInTheDocument();
     });
   });
 

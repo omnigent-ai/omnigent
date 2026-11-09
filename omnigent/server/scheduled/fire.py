@@ -113,7 +113,7 @@ from omnigent.server.scheduled.harness_settings import (
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
 from omnigent.server.scheduled.source_session import (
     SourceHistoryUnsupportedError,
     carries_native_history,
@@ -374,12 +374,7 @@ class _NewRunRecorder:
 
 
 def _scheduled_session_title(task: ScheduledTask) -> str:
-    if task.session_mode == "continue" and task.prompt.startswith(
-        tuple(
-            f"This automation watches {source} and starts one Omnigent session"
-            for source in ("Jira", "Slack", "GitHub", "Linear")
-        )
-    ):
+    if is_trigger_automation(task):
         return f"[automation job] {task.name}"
     return task.name
 
@@ -445,6 +440,73 @@ def build_on_fire(
         return result is not _FireResult.INACTIVE
 
     return on_fire
+
+
+# A trigger's session must be quiet this long after its last change before it is polled,
+# since an agent can pause between steps.
+BUSY_QUIET_SECONDS = 2 * 60
+# A session still shown as running is checked again this often, since its work could end
+# at any time.
+BUSY_RECHECK_SECONDS = 2 * 60
+# While its session looks busy, a trigger automation still gets a prompt this often, so a
+# stale "running" status cannot stall it.
+BUSY_SKIP_MAX_SECONDS = 10 * 60
+
+
+def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable[int | None]]:
+    """Build the persistent scheduler's check for when to poll a trigger automation.
+
+    The check returns ``None`` to poll now, or the time to check again. A continue task
+    with a recorded session waits while the session is busy: until
+    :data:`BUSY_QUIET_SECONDS` after its last change if it is idle, or
+    :data:`BUSY_RECHECK_SECONDS` from now while it shows as running (a turn in progress,
+    or waiting on an approval or question), has an approval or question pending, or the
+    previous poll is still being delivered. It never waits past
+    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out.
+    """
+
+    async def busy_until(task: ScheduledTask, now: int) -> int | None:
+        from omnigent.server.routes._sessions.helpers import _session_status_from_cache
+
+        session_id = task.session_id
+        if task.session_mode != "continue" or session_id is None:
+            return None
+        # The scheduler polls without the owner's identity, which only a fire assumes, so
+        # read the persisted status from session activity, which needs no caller access
+        # check. The fire itself still checks the session before it sends anything.
+        activity = await asyncio.to_thread(
+            deps.conversation_store.get_session_activity, [session_id]
+        )
+        session = activity.get(session_id)
+        if session is None:
+            return None
+        runs, _ = await asyncio.to_thread(deps.scheduled_task_store.list_runs, task.id, limit=1)
+        latest = runs[0] if runs else None
+        running = _session_status_from_cache(session_id, session.live_status) == "running"
+        # A native session can report idle while it waits on an approval or a question.
+        waiting = session.runner_id is not None and bool(session.pending_elicitation_count)
+        # The previous poll may still be on its way in, e.g. while a sandbox starts.
+        delivering = latest is not None and latest.status in ("scheduled", "starting")
+        if running or waiting or delivering:
+            until = now + BUSY_RECHECK_SECONDS
+        else:
+            until = session.updated_at + BUSY_QUIET_SECONDS
+        if until <= now:
+            return None
+        # The latest poll went out at the task's last firing or when its newest run started,
+        # whichever is later; either can be later than the poll was due.
+        sent_times = [task.last_run_at]
+        if latest is not None:
+            sent_times.append(
+                latest.fired_at if latest.fired_at is not None else latest.scheduled_at
+            )
+        sent_at = max((t for t in sent_times if t is not None), default=None)
+        if sent_at is None:
+            return None
+        backstop = sent_at + BUSY_SKIP_MAX_SECONDS
+        return min(until, backstop) if backstop > now else None
+
+    return busy_until
 
 
 def build_run_now(
