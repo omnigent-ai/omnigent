@@ -869,7 +869,11 @@ class AzureDevOpsPullRequests:
         When a page of changes cannot be read, such as when the request budget runs out,
         the files already read come back with ``has_more`` set.
         """
-        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
+        return self._changed_files(root, reference, time.monotonic() + _REQUEST_BUDGET_SECONDS)
+
+    def _changed_files(
+        self, root: str, reference: PullRequestRef | None, deadline: float
+    ) -> dict[str, Any]:
         empty: dict[str, Any] = {"object": "list", "data": [], "has_more": False}
         repo = _target_repo(root, reference)
         token = _token() if repo is not None else None
@@ -911,12 +915,20 @@ class AzureDevOpsPullRequests:
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
         """List the files, checking the pinned revisions before and after the read."""
-        self._check_pinned(reference, head_sha=head_sha, base_sha=base_sha)
-        result = self.changed_files(root, reference)
-        self._check_pinned(reference, head_sha=head_sha, base_sha=base_sha)
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
+        self._check_pinned(reference, head_sha=head_sha, base_sha=base_sha, deadline=deadline)
+        result = self._changed_files(root, reference, deadline)
+        self._check_pinned(reference, head_sha=head_sha, base_sha=base_sha, deadline=deadline)
         return {**result, "head_sha": head_sha, "base_sha": base_sha}
 
-    def _check_pinned(self, reference: PullRequestRef, *, head_sha: str, base_sha: str) -> None:
+    def _check_pinned(
+        self,
+        reference: PullRequestRef,
+        *,
+        head_sha: str,
+        base_sha: str,
+        deadline: float,
+    ) -> None:
         """Raise unless the PR's last merge commits are the pinned head and base.
 
         :raises ValueError: When the PR moved, or its revisions cannot be read.
@@ -925,7 +937,6 @@ class AzureDevOpsPullRequests:
         token = _token() if repo is not None else None
         if repo is None or token is None:
             raise ValueError(_PR_REVISION_UNAVAILABLE)
-        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
         try:
             with self._client(repo.org, token, deadline=deadline) as client:
                 pr = _call(client.get_pull_request, repo.project, repo.repo, reference.number)

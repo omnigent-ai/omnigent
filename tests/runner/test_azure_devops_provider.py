@@ -1184,6 +1184,48 @@ def test_pinned_read_without_computed_merge_commits_is_unavailable_not_moved(
         facet.pinned_changed_files(str(tmp_path), reference(), head_sha=HEAD, base_sha=BASE)
 
 
+@pytest.mark.parametrize(
+    "responses",
+    [
+        [httpx.Response(200, json=pull_request(base=None))],
+        [httpx.Response(503, json={"message": "TF400813"})],
+        [httpx.Response(200, json=pull_request()), httpx.Response(503, json={"message": "x"})],
+    ],
+    ids=["missing-base", "first-read-fails", "final-read-fails"],
+)
+def test_pinned_changed_files_are_unconfirmed_when_a_revision_check_cannot_run(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    responses: list[httpx.Response],
+) -> None:
+    queue = iter(responses)
+    ado_transport.route("GET", PULL, handler=lambda _request: next(queue))
+    ado_transport.route("GET", f"{PULL}/iterations", json={"value": [{"id": 1}]})
+    ado_transport.route("GET", f"{PULL}/iterations/1/changes", json={"changeEntries": []})
+
+    with pytest.raises(ValueError, match="could not confirm"):
+        facet.pinned_changed_files(str(tmp_path), reference(), head_sha=HEAD, base_sha=BASE)
+
+
+def test_pinned_final_check_does_not_restart_an_exhausted_budget(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(azure_devops_facet, "_REQUEST_BUDGET_SECONDS", budget(0.5))
+    ado_transport.route("GET", PULL, json=pull_request())
+    ado_transport.route("GET", f"{PULL}/iterations", json={"value": [{"id": 1}]})
+    ado_transport.route("GET", f"{PULL}/iterations/1/changes", handler=never_answers)
+
+    with pytest.raises(ValueError, match="could not confirm"):
+        facet.pinned_changed_files(str(tmp_path), reference(), head_sha=HEAD, base_sha=BASE)
+
+    pull_reads = [r for r in ado_transport.requests if request_path(r) == PULL]
+    assert len(pull_reads) == 1
+
+
 def test_pinned_diff_outside_the_workspace_echoes_no_revision(
     facet: AzureDevOpsPullRequests, workspace: Path
 ) -> None:
