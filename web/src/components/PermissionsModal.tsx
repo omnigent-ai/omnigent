@@ -47,12 +47,7 @@ import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentUserSearch } from "@/lib/host";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import { getCurrentUserId } from "@/lib/identity";
-import {
-  type Permission,
-  grantPermission,
-  revokePermission,
-  workspaceSharingBlocked,
-} from "@/lib/permissionsApi";
+import { type Permission, workspaceSharingBlocked } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
@@ -79,28 +74,28 @@ export function PermissionsModal({
   open,
   onOpenChange,
 }: PermissionsModalProps) {
+  // Server sharing policy. While the boot probe is in flight we treat the
+  // server as "on" (fail open) so the modal renders its full controls; the
+  // server-side gate is the real enforcement point regardless.
   const info = useServerInfo();
   const sharingMode = info === "loading" ? "on" : info.sharing_mode;
   const sharingOff = sharingMode === "off";
   const sharingReadOnly = sharingMode === "read_only" || sharingMode === "restricted_read_only";
+  const workspaceBlocked =
+    sharingMode === "restricted_read_only" && workspaceSharingBlocked(workspace);
+  // Disabling public sharing prevents new grants but still permits revocation.
   const publicSharingEnabled = info === "loading" ? true : info.public_sharing_enabled;
   const { data: livePublicMaxLevel } = usePublicSharingMaxLevel(open && !sharingOff);
   const publicMaxLevel =
     (livePublicMaxLevel ?? (info === "loading" ? "read" : info.public_sharing_max_level)) === "edit"
       ? 2
       : 1;
-  const {
-    data: permissions,
-    isLoading,
-    error: permissionsError,
-  } = usePermissions(open && !sharingOff ? sessionId : null);
-  const { session } = useSession(open && !sharingOff ? sessionId : null);
-  const workspaceBlocked =
-    sharingMode === "restricted_read_only" &&
-    workspaceSharingBlocked(workspace ?? session?.workspace);
+  // In "off" mode never fetch the grant list — the modal short-circuits to a
+  // notice below, so the request would be wasted.
+  const { data: permissions, isLoading } = usePermissions(open && !sharingOff ? sessionId : null);
   const grant = useGrantPermission(sessionId);
   const revoke = useRevokePermission(sessionId);
-  const queryClient = useQueryClient();
+
   const [newUserId, setNewUserId] = useState("");
   const [newLevel, setNewLevel] = useState("1");
   const [error, setError] = useState<string | null>(null);
@@ -108,23 +103,21 @@ export function PermissionsModal({
   const controlsId = useId();
   const blockedNoticeId = useId();
   const currentUserId = getCurrentUserId();
+
+  // Whether the owner shared the workspace files with view-level collaborators.
+  const { session } = useSession(open && !sharingOff ? sessionId : null);
+  const queryClient = useQueryClient();
+  const shareWorkspace = useMutation({
+    mutationFn: (next: boolean) => updateSession(sessionId, { shareWorkspaceFiles: next }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["session", sessionId] }),
+    onError: (err: Error) => setError(err.message),
+  });
+
   const people = (permissions ?? []).filter((permission) => permission.user_id !== PUBLIC_USER);
   const publicGrant = permissions?.find((permission) => permission.user_id === PUBLIC_USER);
-  const sharedGrants = (permissions ?? []).filter(
-    (permission) => permission.level < 3 && permission.user_id !== currentUserId,
-  );
-  function displayedLevel(permission: Permission) {
-    return permission.user_id === PUBLIC_USER
-      ? Math.min(permission.level, publicMaxLevel, sharingReadOnly ? 1 : 2)
-      : permission.level;
-  }
-  const sharedLevels = new Set(sharedGrants.map(displayedLevel));
-  const sharedLevel =
-    sharedLevels.size > 1
-      ? ""
-      : String(sharedGrants[0] ? displayedLevel(sharedGrants[0]) : newLevel);
-  const roleMaxLevel = sharingReadOnly ? 1 : publicGrant ? publicMaxLevel : 2;
-  const selectableLevel = Number(sharedLevel) <= roleMaxLevel ? sharedLevel : "";
+  const publicLevel = publicGrant ? Math.min(publicGrant.level, publicMaxLevel) : 0;
+  const busy = isLoading || grant.isPending || revoke.isPending;
+  // The current user and owners lead the list, then everyone, then the rest.
   const leadingPeople = people
     .filter((permission) => permission.user_id === currentUserId || permission.level === 4)
     .sort(
@@ -136,69 +129,48 @@ export function PermissionsModal({
     ...(publicGrant ? [publicGrant] : []),
     ...people.filter((permission) => !leadingPeople.includes(permission)),
   ];
-  const reportError = (failure: Error) => setError(failure.message);
-  const refreshPermissions = () =>
-    queryClient.invalidateQueries({ queryKey: ["permissions", sessionId] });
-
-  async function applySharedLevel(level: number) {
-    const results = await Promise.allSettled(
-      sharedGrants
-        .filter((permission) => permission.level !== level)
-        .map((permission) => grantPermission(sessionId, permission.user_id, level)),
-    );
-    const failure = results.find((result) => result.status === "rejected");
-    if (failure) throw failure.reason;
-  }
-
-  const sharedPermission = useMutation({
-    mutationFn: async (value: string) => {
-      const level = Number(value);
-      if (workspaceBlocked || level < 1 || level > roleMaxLevel) return;
-      await applySharedLevel(level);
-      setNewLevel(value);
-    },
-    onError: reportError,
-    onSettled: refreshPermissions,
-  });
-  const linkAccess = useMutation({
-    mutationFn: async (access: string) => {
-      if (access === "restricted") {
-        await revokePermission(sessionId, PUBLIC_USER);
-        return;
-      }
-      if (workspaceBlocked || !publicSharingEnabled) return;
-      const level = Math.min(Number(sharedLevel || newLevel), sharingReadOnly ? 1 : publicMaxLevel);
-      await applySharedLevel(level);
-      await grantPermission(sessionId, PUBLIC_USER, level);
-      setNewLevel(String(level));
-    },
-    onError: reportError,
-    onSettled: refreshPermissions,
-  });
-  const busy =
-    isLoading ||
-    !!permissionsError ||
-    grant.isPending ||
-    revoke.isPending ||
-    sharedPermission.isPending ||
-    linkAccess.isPending;
-  const shareWorkspace = useMutation({
-    mutationFn: (next: boolean) => updateSession(sessionId, { shareWorkspaceFiles: next }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["session", sessionId] }),
-    onError: reportError,
-  });
 
   function handleGrant(event: FormEvent) {
     event.preventDefault();
     const userId = newUserId.trim();
-    if (!userId || workspaceBlocked || busy || !selectableLevel || publicGrant) return;
+    if (!userId || workspaceBlocked) return;
     setError(null);
     grant.mutate(
-      { userId, level: Number(selectableLevel) },
-      { onSuccess: () => setNewUserId(""), onError: reportError },
+      { userId, level: Number(newLevel) },
+      {
+        onSuccess: () => {
+          setNewUserId("");
+          setNewLevel("1");
+        },
+        onError: (err) => setError(err.message),
+      },
     );
   }
 
+  function handleRevoke(userId: string) {
+    setError(null);
+    revoke.mutate(userId, { onError: (err) => setError(err.message) });
+  }
+
+  function handleChangeLevel(userId: string, level: number) {
+    if (workspaceBlocked) return;
+    setError(null);
+    grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
+  }
+
+  // Level 0 revokes public access; 1 or 2 grants it at that level.
+  function handlePublicLevel(level: number) {
+    if (level > 0 && (workspaceBlocked || !publicSharingEnabled)) return;
+    setError(null);
+    if (level > 0) {
+      grant.mutate({ userId: PUBLIC_USER, level }, { onError: (err) => setError(err.message) });
+    } else {
+      revoke.mutate(PUBLIC_USER, { onError: (err) => setError(err.message) });
+    }
+  }
+
+  // "off" short-circuit: sharing is disabled server-wide, so skip the whole
+  // grant UI and show a plain notice instead. Mirrors the server's 403.
   if (sharingOff) {
     return (
       <Dialog open={open} onOpenChange={onOpenChange}>
@@ -244,10 +216,7 @@ export function PermissionsModal({
             </label>
             <Select
               value={publicGrant ? "signed-in" : "restricted"}
-              onValueChange={(value) => {
-                setError(null);
-                linkAccess.mutate(value);
-              }}
+              onValueChange={(value) => handlePublicLevel(value === "signed-in" ? 1 : 0)}
               disabled={busy || (workspaceBlocked && !publicGrant)}
               componentId="diagnostics.permissions.public_level"
               valueHasNoPii
@@ -271,36 +240,40 @@ export function PermissionsModal({
               </SelectContent>
             </Select>
           </div>
-          <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-3">
-            <label className="text-sm font-medium" htmlFor={`${controlsId}-role`}>
-              What can they do?
-            </label>
-            <Select
-              value={selectableLevel}
-              onValueChange={(value) => {
-                setError(null);
-                sharedPermission.mutate(value);
-              }}
-              disabled={busy || workspaceBlocked || (!!publicGrant && !publicSharingEnabled)}
-              componentId="diagnostics.permissions.grant_level"
-              valueHasNoPii
-            >
-              <SelectTrigger
-                id={`${controlsId}-role`}
-                className="w-full min-w-0 sm:w-32 sm:justify-self-end"
+          {publicGrant && (
+            <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-3">
+              <label className="text-sm font-medium" htmlFor={`${controlsId}-role`}>
+                What can they do?
+              </label>
+              <Select
+                value={String(publicLevel)}
+                onValueChange={(value) => handlePublicLevel(Number(value))}
+                disabled={busy}
+                componentId="diagnostics.permissions.public_role"
+                valueHasNoPii
               >
-                <SelectValue
-                  placeholder={
-                    sharedLevel ? `${LEVEL_LABELS[Number(sharedLevel)]} (existing)` : "Mixed access"
-                  }
-                />
-              </SelectTrigger>
-              <SelectContent position="popper" align="end">
-                <SelectItem value="1">Read</SelectItem>
-                {roleMaxLevel === 2 && <SelectItem value="2">Edit</SelectItem>}
-              </SelectContent>
-            </Select>
-          </div>
+                <SelectTrigger
+                  id={`${controlsId}-role`}
+                  className="w-full min-w-0 sm:w-32 sm:justify-self-end"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="end">
+                  <SelectItem value="1" disabled={workspaceBlocked || !publicSharingEnabled}>
+                    Read
+                  </SelectItem>
+                  {publicMaxLevel === 2 && (
+                    <SelectItem
+                      value="2"
+                      disabled={sharingReadOnly || workspaceBlocked || !publicSharingEnabled}
+                    >
+                      Edit
+                    </SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
           {workspaceBlocked && (
             <p id={blockedNoticeId} className="text-sm text-destructive">
               This session&apos;s working directory (a home or root directory) cannot be shared on
@@ -314,76 +287,57 @@ export function PermissionsModal({
             <UsersIcon className="size-3.5" aria-hidden="true" />
             People with access
           </p>
-          {!publicGrant && (
-            <form
-              onSubmit={handleGrant}
-              className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2"
+          <form
+            onSubmit={handleGrant}
+            className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2"
+          >
+            <label htmlFor="perm-user" className="sr-only">
+              User ID
+            </label>
+            <AddUserField value={newUserId} onChange={setNewUserId} disabled={workspaceBlocked} />
+            <Select
+              value={newLevel}
+              onValueChange={setNewLevel}
+              disabled={workspaceBlocked}
+              componentId="diagnostics.permissions.grant_level"
+              valueHasNoPii
             >
-              <label htmlFor="perm-user" className="sr-only">
-                User ID
-              </label>
-              <AddUserField
-                value={newUserId}
-                onChange={setNewUserId}
-                disabled={workspaceBlocked || busy}
-              />
-              <Button
-                type="submit"
-                loading={grant.isPending}
-                disabled={workspaceBlocked || busy || !newUserId.trim() || !selectableLevel}
-                aria-describedby={workspaceBlocked ? blockedNoticeId : undefined}
-                componentId="diagnostics.permissions.grant"
-              >
-                Add
-              </Button>
-            </form>
-          )}
+              <SelectTrigger className="h-8 w-24" aria-label="New user permission">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent position="popper" align="end">
+                <SelectItem value="1">Read</SelectItem>
+                {/* Read-only sharing caps new grants at view; hide Edit. */}
+                {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+              </SelectContent>
+            </Select>
+            <Button
+              type="submit"
+              loading={grant.isPending}
+              disabled={workspaceBlocked || !newUserId.trim()}
+              aria-describedby={workspaceBlocked ? blockedNoticeId : undefined}
+              componentId="diagnostics.permissions.grant"
+            >
+              Add
+            </Button>
+          </form>
           {isLoading ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
           ) : accessEntries.length === 0 ? (
             <p className="text-sm text-muted-foreground">No grants yet.</p>
           ) : (
             <ul className="max-h-52 space-y-1 overflow-y-auto" aria-label="People with access">
-              {accessEntries.map((permission) => {
-                const everyone = permission.user_id === PUBLIC_USER;
-                const label = everyone ? "Everyone" : permission.user_id;
-                return (
-                  <li key={permission.user_id} className="flex min-w-0 items-center gap-3 py-2">
-                    <Avatar>
-                      <AvatarFallback>
-                        {everyone ? (
-                          <UsersIcon className="size-4" aria-hidden="true" />
-                        ) : (
-                          label.slice(0, 1).toUpperCase()
-                        )}
-                      </AvatarFallback>
-                    </Avatar>
-                    <p className="min-w-0 flex-1 truncate font-medium" title={label}>
-                      {label}
-                    </p>
-                    <span className="shrink-0 text-sm text-muted-foreground">
-                      {LEVEL_LABELS[displayedLevel(permission)] ?? "Unknown"}
-                    </span>
-                    {permission.level !== 4 && !publicGrant && (
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        disabled={busy}
-                        className="shrink-0 text-muted-foreground hover:text-destructive"
-                        aria-label={`Remove access for ${permission.user_id}`}
-                        title="Remove access"
-                        onClick={() => {
-                          setError(null);
-                          revoke.mutate(permission.user_id, { onError: reportError });
-                        }}
-                        componentId="diagnostics.permissions.revoke"
-                      >
-                        <Trash2Icon className="size-3.5" aria-hidden="true" />
-                      </Button>
-                    )}
-                  </li>
-                );
-              })}
+              {accessEntries.map((permission) => (
+                <AccessRow
+                  key={permission.user_id}
+                  permission={permission}
+                  publicLevel={publicLevel}
+                  readOnly={sharingReadOnly}
+                  busy={busy}
+                  onChangeLevel={handleChangeLevel}
+                  onRevoke={handleRevoke}
+                />
+              ))}
             </ul>
           )}
         </div>
@@ -422,17 +376,15 @@ export function PermissionsModal({
                   setError(null);
                   shareWorkspace.mutate(checked);
                 }}
-                disabled={
-                  shareWorkspace.isPending || (workspaceBlocked && !session.shareWorkspaceFiles)
-                }
+                disabled={shareWorkspace.isPending}
                 componentId="diagnostics.permissions.share_workspace_toggle"
               />
             </div>
           </div>
         )}
-        {(error || permissionsError) && (
+        {error && (
           <p role="alert" className="text-sm text-destructive">
-            {error ?? permissionsError?.message}
+            {error}
           </p>
         )}
         <DialogFooter className="sm:justify-between">
@@ -730,5 +682,82 @@ function QrCodeDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function AccessRow({
+  permission,
+  publicLevel,
+  readOnly,
+  busy,
+  onChangeLevel,
+  onRevoke,
+}: {
+  permission: Permission;
+  publicLevel: number;
+  readOnly: boolean;
+  busy: boolean;
+  onChangeLevel: (userId: string, level: number) => void;
+  onRevoke: (userId: string) => void;
+}) {
+  const everyone = permission.user_id === PUBLIC_USER;
+  const label = everyone ? "Everyone" : permission.user_id;
+  const isOwner = permission.level === 4;
+  // Owner and Manage are never grantable here, and read-only sharing can't
+  // re-level grants, so those rows show a fixed label. Everyone's level is
+  // set by the "What can they do?" control above.
+  const fixedLevel = everyone || isOwner || permission.level === 3 || readOnly;
+
+  return (
+    <li className="flex min-w-0 items-center gap-3 py-2">
+      <Avatar>
+        <AvatarFallback>
+          {everyone ? (
+            <UsersIcon className="size-4" aria-hidden="true" />
+          ) : (
+            label.slice(0, 1).toUpperCase()
+          )}
+        </AvatarFallback>
+      </Avatar>
+      <p className="min-w-0 flex-1 truncate font-medium" title={label}>
+        {label}
+      </p>
+      {fixedLevel ? (
+        <span className="shrink-0 text-sm text-muted-foreground">
+          {LEVEL_LABELS[everyone ? publicLevel : permission.level] ?? "Read"}
+        </span>
+      ) : (
+        <Select
+          value={String(permission.level)}
+          onValueChange={(value) => onChangeLevel(permission.user_id, Number(value))}
+          disabled={busy}
+        >
+          <SelectTrigger
+            className="h-8 w-24 shrink-0"
+            aria-label={`Permission level for ${permission.user_id}`}
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent position="popper" align="end">
+            <SelectItem value="1">Read</SelectItem>
+            <SelectItem value="2">Edit</SelectItem>
+          </SelectContent>
+        </Select>
+      )}
+      {!everyone && !isOwner && (
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          disabled={busy}
+          className="shrink-0 text-muted-foreground hover:text-destructive"
+          aria-label={`Remove access for ${permission.user_id}`}
+          title="Remove access"
+          onClick={() => onRevoke(permission.user_id)}
+          componentId="diagnostics.permissions.revoke"
+        >
+          <Trash2Icon className="size-3.5" aria-hidden="true" />
+        </Button>
+      )}
+    </li>
   );
 }

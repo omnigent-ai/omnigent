@@ -266,7 +266,7 @@ def test_permissions_modal_controls_drive_server_state(
         f"clipboard URL {clipboard!r} is not a /c/<id> session link"
     )
 
-    # Restricted mode reveals the add row and per-person removal controls.
+    # Turning public access back off revokes only the __public__ grant.
     public_level.click()
     page.get_by_role("option", name="Only added people", exact=True).click()
     _wait_for(lambda: _PUBLIC_USER not in _permissions(base_url, session_id))
@@ -278,8 +278,8 @@ def test_permissions_modal_controls_drive_server_state(
     expect(dialog.get_by_title(grantee)).to_be_visible()
     _wait_for(lambda: _permissions(base_url, session_id).get(grantee) == _LEVEL_READ)
 
-    # ── Change collaborator access Read → Edit via the shared selector ──────
-    level_select = dialog.get_by_role("combobox", name="What can they do?")
+    # ── Change that user's level Read → Edit via the row select ──────
+    level_select = dialog.get_by_role("combobox", name=f"Permission level for {grantee}")
     level_select.click()
     page.get_by_role("option", name="Edit").click()
     _wait_for(lambda: _permissions(base_url, session_id).get(grantee) == _LEVEL_EDIT)
@@ -385,13 +385,13 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         dialog = page.get_by_role("dialog")
         general = dialog.get_by_role("combobox", name="Who can access")
         expect(general).to_have_text("Only added people")
-        role = dialog.get_by_role("combobox", name="What can they do?")
-        role.click()
-        page.get_by_role("option", name="Edit", exact=True).click()
-        expect(role).to_have_text("Edit")
         general.click()
         page.get_by_role("option", name="Anyone signed in", exact=True).click()
         expect(general).to_have_text("Anyone signed in")
+        role = dialog.get_by_role("combobox", name="What can they do?")
+        expect(role).to_have_text("Read")
+        role.click()
+        page.get_by_role("option", name="Edit", exact=True).click()
         expect(role).to_have_text("Edit")
         _wait_for(
             lambda: (

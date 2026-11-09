@@ -2,8 +2,8 @@
 
 The iOS/Android apps host this same SPA in a WebView, so the Share modal's
 phone-width layout is a web contract. On a phone-sized viewport the dialog is
-capped to the viewport width, and the user field, Add button, and shared
-permission selector must fit inside it. A row that keeps its desktop
+capped to the viewport width, and the add-grant row (user field, permission
+level select, and Add button) must fit inside it. A row that keeps its desktop
 min-content width pushes controls through the dialog's right edge.
 
 Runs on the dedicated multi-user server (Share chrome is hidden on the
@@ -103,7 +103,7 @@ def test_share_dialog_grant_controls_fit_on_phone_viewport(
         content_right = dialog_right - padding_right
 
         grant_button = dialog.get_by_role("button", name="Add")
-        level_select = dialog.get_by_role("combobox", name="What can they do?")
+        level_select = dialog.get_by_role("combobox", name="New user permission")
         user_field = dialog.get_by_placeholder("alice@example.com")
         expect(grant_button).to_be_visible()
         expect(level_select).to_be_visible()

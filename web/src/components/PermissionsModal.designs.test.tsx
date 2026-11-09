@@ -36,74 +36,57 @@ describe("sharing design shared permissions", () => {
   it.each([
     ["People added", "Only added people"],
     ["Link access enabled", "Anyone signed in"],
-  ] as const)("shows both controls and text-only person roles for %s", async (scenario, access) => {
+  ] as const)("shows per-person controls for %s", async (scenario, access) => {
     render(<meta.component design="access-first" scenario={scenario} />);
 
     await screen.findByText("sam.taylor@example.com");
     expect(screen.getByRole("combobox", { name: "Who can access" })).toHaveTextContent(access);
-    expect(screen.getByRole("combobox", { name: "What can they do?" })).toHaveTextContent("Read");
-    expect(screen.getAllByRole("combobox")).toHaveLength(2);
+    expect(
+      screen.getByRole("combobox", { name: "Permission level for sam.taylor@example.com" }),
+    ).toHaveTextContent("Read");
     const accessRows = within(
       screen.getByRole("list", { name: "People with access" }),
     ).getAllByRole("listitem");
     expect(accessRows[0]).toHaveTextContent("you@example.com");
+    expect(screen.getByRole("button", { name: "Add" })).toBeInTheDocument();
     expect(
-      within(screen.getByRole("list", { name: "People with access" })).getAllByText("Read"),
-    ).toHaveLength(access === "Anyone signed in" ? 3 : 2);
+      screen.getByRole("button", { name: "Remove access for sam.taylor@example.com" }),
+    ).toBeEnabled();
     if (access === "Anyone signed in") {
+      expect(screen.getByRole("combobox", { name: "What can they do?" })).toHaveTextContent("Read");
       expect(accessRows[1]).toHaveTextContent("Everyone");
-      expect(screen.queryByRole("button", { name: "Add" })).not.toBeInTheDocument();
-      expect(screen.queryByRole("textbox", { name: "User ID" })).not.toBeInTheDocument();
-      const everyoneRow = screen.getByText("Everyone").closest("li");
-      if (!everyoneRow) throw new Error("Everyone row not found");
-      expect(everyoneRow).toHaveTextContent("Read");
-      expect(within(everyoneRow).queryByRole("button")).not.toBeInTheDocument();
-      expect(screen.queryAllByRole("button", { name: /^Remove access for / })).toHaveLength(0);
+      expect(within(accessRows[1]).queryByRole("button")).not.toBeInTheDocument();
     } else {
-      expect(screen.getByRole("button", { name: "Add" })).toBeInTheDocument();
+      expect(screen.queryByRole("combobox", { name: "What can they do?" })).not.toBeInTheDocument();
       expect(screen.queryByText("Everyone")).not.toBeInTheDocument();
-      expect(
-        screen.getByRole("button", { name: "Remove access for sam.taylor@example.com" }),
-      ).toBeEnabled();
     }
     expect(
       screen.queryByRole("button", { name: "Remove access for you@example.com" }),
     ).not.toBeInTheDocument();
   });
 
-  it("updates every collaborator and gives new people the selected role", async () => {
+  it("changes one person at a time and leaves people alone when public access changes", async () => {
     render(<meta.component design="access-first" scenario="People added" />);
     await screen.findByText("sam.taylor@example.com");
 
-    await chooseOption("What can they do?", "Edit");
+    await chooseOption("Permission level for sam.taylor@example.com", "Edit");
     expect(await listPermissions(sessionId)).toEqual(
       expect.arrayContaining([
-        { user_id: "you@example.com", conversation_id: sessionId, level: 4 },
-        { user_id: "alex.morgan@example.com", conversation_id: sessionId, level: 2 },
+        { user_id: "alex.morgan@example.com", conversation_id: sessionId, level: 1 },
         { user_id: "sam.taylor@example.com", conversation_id: sessionId, level: 2 },
       ]),
     );
-    expect(
-      within(screen.getByRole("list", { name: "People with access" })).getAllByText("Edit"),
-    ).toHaveLength(2);
 
     await chooseOption("Who can access", "Anyone signed in");
     expect(await listPermissions(sessionId)).toEqual(
       expect.arrayContaining([
         { user_id: "__public__", conversation_id: sessionId, level: 1 },
         { user_id: "alex.morgan@example.com", conversation_id: sessionId, level: 1 },
-        { user_id: "sam.taylor@example.com", conversation_id: sessionId, level: 1 },
+        { user_id: "sam.taylor@example.com", conversation_id: sessionId, level: 2 },
       ]),
     );
-    expect(screen.queryAllByRole("button", { name: /^Remove access for / })).toHaveLength(0);
 
-    await chooseOption("Who can access", "Only added people");
-    await chooseOption("What can they do?", "Edit");
-    expect(screen.queryByText("Everyone")).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Remove access for sam.taylor@example.com" }),
-    ).toBeEnabled();
-
+    await chooseOption("New user permission", "Edit");
     fireEvent.change(screen.getByRole("textbox", { name: "User ID" }), {
       target: { value: "new.person@example.com" },
     });
@@ -124,36 +107,5 @@ describe("sharing design shared permissions", () => {
     expect(
       (await listPermissions(sessionId)).map((permission) => permission.user_id),
     ).not.toContain("sam.taylor@example.com");
-  });
-
-  it("caps public access at Read and preserves the draft email when switching modes", async () => {
-    render(<meta.component design="access-first" scenario="Private" />);
-    await screen.findByText("you@example.com");
-
-    await chooseOption("What can they do?", "Edit");
-    expect(await listPermissions(sessionId)).toEqual([
-      { user_id: "you@example.com", conversation_id: sessionId, level: 4 },
-    ]);
-
-    fireEvent.change(screen.getByRole("textbox", { name: "User ID" }), {
-      target: { value: "draft.person@example.com" },
-    });
-    await chooseOption("Who can access", "Anyone signed in");
-    expect(await listPermissions(sessionId)).toContainEqual({
-      user_id: "__public__",
-      conversation_id: sessionId,
-      level: 1,
-    });
-    expect(screen.queryByRole("textbox", { name: "User ID" })).not.toBeInTheDocument();
-    expect(screen.getByText("Everyone").closest("li")).toHaveTextContent("Read");
-    expect(
-      within(screen.getByRole("list", { name: "People with access" })).getAllByRole("listitem")[0],
-    ).toHaveTextContent("you@example.com");
-    await chooseOption("Who can access", "Only added people");
-    expect(screen.queryByText("Everyone")).not.toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "User ID" })).toHaveValue(
-      "draft.person@example.com",
-    );
-    expect(screen.getByRole("combobox", { name: "What can they do?" })).toHaveTextContent("Read");
   });
 });
