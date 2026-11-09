@@ -64,9 +64,7 @@ import {
   buildSearchCorpus,
   changedFilesFromPatch,
   filterChangedPaths,
-  findMatches,
   firstMatchAtOrBelow,
-  MATCH_LIMIT,
   pullRequestFileUrl,
   pullRequestRepoUrl,
   refreshedMatchIndex,
@@ -75,6 +73,7 @@ import {
   type Match,
 } from "./pullRequestReview";
 import { useChangesViewState, type FindState } from "./useChangesViewState";
+import { useFindSearch } from "./useFindSearch";
 import { useCommitViewState } from "./useCommitViewState";
 
 /** Index of the match a step moves to; with none active, the first or last by direction. */
@@ -906,14 +905,8 @@ export function PullRequestChangesTab({
       files.filter((file) => !shown.has(file.path)),
     );
   }, [findOpen, filesByPath, files, visiblePaths]);
-  const search = useMemo(
-    () => findMatches(searchCorpus, deferredQuery, { matchCase, regex, limit: MATCH_LIMIT }),
-    [searchCorpus, deferredQuery, matchCase, regex],
-  );
-  const hiddenSearch = useMemo(
-    () => findMatches(hiddenCorpus, deferredQuery, { matchCase, regex, limit: MATCH_LIMIT }),
-    [hiddenCorpus, deferredQuery, matchCase, regex],
-  );
+  const search = useFindSearch(searchCorpus, deferredQuery, { matchCase, regex });
+  const hiddenSearch = useFindSearch(hiddenCorpus, deferredQuery, { matchCase, regex });
   const { matches } = search;
   // The match shown after the last render. A refresh measures from it, so repeated refreshes
   // follow the occurrence the reader is on rather than the original target.
@@ -1240,6 +1233,8 @@ export function PullRequestChangesTab({
                 total={matches.length}
                 truncated={search.truncated}
                 invalid={search.invalid}
+                tooSlow={search.tooSlow}
+                searching={search.searching}
                 hiddenCount={hiddenSearch.matches.length}
                 hiddenTruncated={hiddenSearch.truncated}
                 onOpen={() => view.setFind({ open: true })}

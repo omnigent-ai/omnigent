@@ -17,6 +17,10 @@ export interface PullRequestFindBarProps {
   /** The visible matches hit the search cap. */
   truncated: boolean;
   invalid: boolean;
+  /** The regular expression ran past its time budget. */
+  tooSlow: boolean;
+  /** The regular expression is still running. */
+  searching: boolean;
   /** Matches in files the filters hide. */
   hiddenCount: number;
   hiddenTruncated: boolean;
@@ -59,18 +63,24 @@ function OptionToggle({
 function findStatus({
   query,
   invalid,
+  tooSlow,
+  searching,
   total,
   position,
   truncated,
 }: {
   query: string;
   invalid: boolean;
+  tooSlow: boolean;
+  searching: boolean;
   total: number;
   position: number;
   truncated: boolean;
 }): string {
   if (!query.trim()) return "";
   if (invalid) return "Invalid";
+  if (tooSlow) return "Pattern too slow";
+  if (searching) return "Searching…";
   if (total === 0) return "No results";
   const count = `${total}${truncated ? "+" : ""}`;
   // Position is 0 for the moment between a query change and the viewport seeding its match.
@@ -84,6 +94,8 @@ export function PullRequestFindBar({
   total,
   truncated,
   invalid,
+  tooSlow,
+  searching,
   hiddenCount,
   hiddenTruncated,
   onOpen,
@@ -129,7 +141,7 @@ export function PullRequestFindBar({
     );
   }
 
-  const status = findStatus({ query, invalid, total, position, truncated });
+  const status = findStatus({ query, invalid, tooSlow, searching, total, position, truncated });
 
   return (
     <div className="flex min-w-0 flex-1 items-center gap-1.5 text-ui">

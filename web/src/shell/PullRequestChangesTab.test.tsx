@@ -21,6 +21,7 @@ import {
   type PullRequestIdentity,
 } from "@/lib/pullRequestViewed";
 import type * as SonnerModule from "sonner";
+import type * as PatternSearchModule from "./pullRequestPatternSearch";
 import { PullRequestChangesTab } from "./PullRequestChangesTab";
 import { useChangesViewState } from "./useChangesViewState";
 
@@ -41,6 +42,8 @@ const mocks = vi.hoisted(() => ({
   /** The PR's server lacks the commit routes. */
   commitsUnsupported: false,
   /** A saved review draft, anchored to one file's line, as the composer hook reports it. */
+  /** Makes the regex search report the time budget as spent, as a backtracking pattern would. */
+  patternTooSlow: false,
   draftAnchor: null as null | {
     path: string;
     side: "LEFT" | "RIGHT";
@@ -54,6 +57,21 @@ vi.mock("sonner", async (importOriginal) => ({
   ...(await importOriginal<typeof SonnerModule>()),
   toast,
 }));
+// jsdom has no workers, so the regex matcher runs in-process here.
+vi.mock("./pullRequestPatternSearch", async (importOriginal) => {
+  const { findMatches } = await import("./pullRequestReview");
+  return {
+    ...(await importOriginal<typeof PatternSearchModule>()),
+    searchPatternInWorker: async (
+      corpus: Parameters<typeof findMatches>[0],
+      query: string,
+      options: Parameters<typeof findMatches>[2],
+    ) =>
+      mocks.patternTooSlow
+        ? { matches: [], truncated: false, invalid: false, tooSlow: true }
+        : { ...findMatches(corpus, query, options), tooSlow: false },
+  };
+});
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => mocks.mobile }));
 vi.mock("@/lib/clipboard", async (importOriginal) => ({
@@ -226,6 +244,7 @@ const sectionHeader = (path: string, expanded: boolean) =>
 
 describe("PullRequestChangesTab", () => {
   afterEach(() => {
+    mocks.patternTooSlow = false;
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -419,14 +438,28 @@ describe("PullRequestChangesTab", () => {
     expect(screen.getByText("7 of 7")).toBeInTheDocument();
   });
 
-  it("reports no results and an invalid pattern", () => {
+  it("reports no results and an invalid pattern", async () => {
     renderTab({ conversationId: "find-invalid" });
     openFind("zzz");
     expect(screen.getByText("No results")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
     fireEvent.change(findInput(), { target: { value: "(" } });
-    expect(screen.getByText("Invalid")).toBeInTheDocument();
+    expect(await screen.findByText("Invalid")).toBeInTheDocument();
+  });
+
+  it("reports a pattern that exceeds its time budget, and plain find keeps working", async () => {
+    mocks.patternTooSlow = true;
+    renderTab({ conversationId: "find-too-slow" });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    fireEvent.change(findInput(), { target: { value: "(a+)+$" } });
+    expect(await screen.findByText("Pattern too slow")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Next match" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    fireEvent.change(findInput(), { target: { value: "needle" } });
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
   });
 
   it("closes on Escape, returns focus to the trigger, and reopens on the shortcut", () => {
@@ -442,7 +475,7 @@ describe("PullRequestChangesTab", () => {
     expect(findInput()).toHaveFocus();
   });
 
-  it("applies Match case and regular expressions", () => {
+  it("applies Match case and regular expressions", async () => {
     renderTab({ conversationId: "find-options" });
     openFind("NEEDLE");
     expect(screen.getByText("1 of 2")).toBeInTheDocument();
@@ -452,7 +485,7 @@ describe("PullRequestChangesTab", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
     fireEvent.change(findInput(), { target: { value: "needle (here|at)" } });
-    expect(screen.getByText("1 of 2")).toBeInTheDocument();
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
   });
 
   it("re-reveals and re-centres a sole match on explicit navigation", () => {
