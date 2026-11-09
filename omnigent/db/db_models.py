@@ -1842,10 +1842,92 @@ class SqlInboxItem(OmnigentBase):
         CheckConstraint("kind IN (1, 2, 3)", name="ck_inbox_items_kind"),
         CheckConstraint("state IN (1, 2, 3, 4)", name="ck_inbox_items_state"),
         CheckConstraint("resolution IN (0, 1, 2, 3, 4, 5, 6)", name="ck_inbox_items_resolution"),
+        # A discrete set, so SQLite cannot store fractional slots past the cap.
         CheckConstraint(
-            f"session_slot >= 0 AND session_slot < {INBOX_ITEMS_PER_SESSION}",
+            f"session_slot IN ({', '.join(str(slot) for slot in range(INBOX_ITEMS_PER_SESSION))})",
             name="ck_inbox_items_session_slot",
         ),
+        # SQLite enforces neither declared lengths nor types; these bound what it stores.
+        CheckConstraint(
+            "user_id IS NULL OR length(CAST(user_id AS BLOB)) <= 512",
+            name="ck_inbox_items_user_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "prompt_version IS NULL OR length(CAST(prompt_version AS BLOB)) <= 256",
+            name="ck_inbox_items_prompt_version_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "title IS NULL OR length(CAST(title AS BLOB)) <= 1024",
+            name="ck_inbox_items_title_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "primary_link IS NULL OR length(CAST(primary_link AS BLOB)) <= 8192",
+            name="ck_inbox_items_primary_link_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "topic IS NULL OR length(CAST(topic AS BLOB)) <= 512",
+            name="ck_inbox_items_topic_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "dedupe_key IS NULL OR length(CAST(dedupe_key AS BLOB)) <= 512",
+            name="ck_inbox_items_dedupe_key_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "body_md IS NULL OR length(CAST(body_md AS BLOB)) <= 16383",
+            name="ck_inbox_items_body_md_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "links IS NULL OR length(CAST(links AS BLOB)) <= 16383",
+            name="ck_inbox_items_links_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "actions IS NULL OR length(CAST(actions AS BLOB)) <= 16383",
+            name="ck_inbox_items_actions_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "chart IS NULL OR length(CAST(chart AS BLOB)) <= 16383",
+            name="ck_inbox_items_chart_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "feedback_text IS NULL OR length(CAST(feedback_text AS BLOB)) <= 16383",
+            name="ck_inbox_items_feedback_text_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "workspace_id IS NULL OR typeof(workspace_id) = 'integer'",
+            name="ck_inbox_items_workspace_id_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "created_at IS NULL OR typeof(created_at) = 'integer'",
+            name="ck_inbox_items_created_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "read_at IS NULL OR typeof(read_at) = 'integer'",
+            name="ck_inbox_items_read_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "acted_at IS NULL OR typeof(acted_at) = 'integer'",
+            name="ck_inbox_items_acted_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "expires_at IS NULL OR typeof(expires_at) = 'integer'",
+            name="ck_inbox_items_expires_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "resolution_action IS NULL OR typeof(resolution_action) = 'integer'",
+            name="ck_inbox_items_resolution_action_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "length(CAST(id AS BLOB)) = 16",
+            name="ck_inbox_items_id_uuid",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "length(CAST(source_session_id AS BLOB)) = 16",
+            name="ck_inbox_items_source_session_id_uuid",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "length(CAST(agent_id AS BLOB)) = 16",
+            name="ck_inbox_items_agent_id_uuid",
+        ).ddl_if(callable_=_on_sqlite_family),
         # Newest-first list of all of an owner's items.
         Index("ix_inbox_items_user_created", "workspace_id", "user_id", "created_at", "id"),
         # Newest-first list and bounded count of an owner's items in one state.
