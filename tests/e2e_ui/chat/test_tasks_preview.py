@@ -99,13 +99,13 @@ def test_tasks_preview_opens_tasks_tab_tracks_updates_and_clears(
 
     # 1. The list exists BEFORE the page opens: the snapshot cache must seed the
     #    preview on load (the refresh / reconnect channel). 1 of 3 done, and it
-    #    names the task in progress.
+    #    names the task in progress, Stopped because the session isn't working.
     _publish_todos(base_url, session_id, _PLAN)
     page.goto(f"{base_url}/c/{session_id}")
     expect(preview).to_be_visible(timeout=15_000)
     expect(preview).to_contain_text("Tasks")
     expect(preview).to_contain_text("1/3")
-    expect(preview).to_contain_text("Writing the tracker")
+    expect(preview).to_contain_text("Stopped: Write the tracker")
 
     # 2. A preview, not a disclosure: clicking it opens the Tasks tab, which
     #    lists every task with where it stands.

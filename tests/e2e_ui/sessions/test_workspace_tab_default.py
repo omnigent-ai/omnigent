@@ -44,9 +44,9 @@ def test_default_workspace_tab_setting_opens_session_on_chosen_tab(
 @pytest.mark.parametrize(
     ("default_tab", "default_label", "tab_order"),
     [
-        ("changes", "Changes", ["Changes", "Files", "Pull Requests", "Agents"]),
-        ("github", "Pull Requests", ["Pull Requests", "Files", "Changes", "Agents"]),
-        ("subagents", "Agents", ["Agents", "Files", "Changes", "Pull Requests"]),
+        ("changes", "Changes", ["Changes", "Files", "Pull Requests", "Agents", "Tasks"]),
+        ("github", "Pull Requests", ["Pull Requests", "Files", "Changes", "Agents", "Tasks"]),
+        ("subagents", "Agents", ["Agents", "Files", "Changes", "Pull Requests", "Tasks"]),
     ],
 )
 def test_changed_default_applies_to_visited_session_after_reload(
@@ -66,8 +66,8 @@ def test_changed_default_applies_to_visited_session_after_reload(
     page.goto(f"{base_url}/settings/appearance")
     group = page.get_by_role("radiogroup", name="Default Workspace tab")
     options = group.get_by_role("radio")
-    expect(options).to_have_count(4)
-    for index, label in enumerate(["Files", "Changes", "Pull Requests", "Agents"]):
+    expect(options).to_have_count(5)
+    for index, label in enumerate(["Files", "Changes", "Pull Requests", "Tasks", "Agents"]):
         expect(options.nth(index)).to_have_accessible_name(label)
     preference = page.get_by_test_id(f"workspace-tab-default-{default_tab}")
     preference.click()
@@ -80,7 +80,7 @@ def test_changed_default_applies_to_visited_session_after_reload(
     page.reload()
     expect(chosen_tab).to_have_attribute("aria-selected", "true", timeout=60_000)
     nav_tabs = rail.locator(".workspace-tab-strip").get_by_role("tab")
-    expect(nav_tabs).to_have_count(4)
+    expect(nav_tabs).to_have_count(5)
     for index, label in enumerate(tab_order):
         expect(nav_tabs.nth(index)).to_have_accessible_name(re.compile(f"^{label}"))
 

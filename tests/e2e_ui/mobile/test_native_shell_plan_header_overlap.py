@@ -205,7 +205,7 @@ def test_native_shell_plan_header_clears_floating_controls(
 
     tracker = page.locator(_TRACKER)
     expect(tracker).to_be_visible(timeout=15_000)
-    expect(tracker).to_contain_text("Plan")
+    expect(tracker).to_contain_text("Tasks")
 
     # Left floating control: the sidebar-toggle pill (the sidebar starts
     # collapsed on a phone, so the pill is the only way to open it).
