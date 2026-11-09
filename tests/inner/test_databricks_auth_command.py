@@ -457,6 +457,67 @@ def test_the_sdk_entrypoint_withholds_when_no_host_is_given(
     assert capsys.readouterr().out == ""
 
 
+@pytest.mark.parametrize("supports_policy", [False, True], ids=["legacy", "supported"])
+@pytest.mark.parametrize("selector", ["profile", "host", "ambient"])
+def test_sdk_token_fallback_uses_normal_cli_cache_when_supported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    supports_policy: bool,
+    selector: str,
+) -> None:
+    import os
+    import socket
+
+    import databricks.sdk.config as sdk_config
+
+    from omnigent.inner import databricks_token
+    from tests._helpers.databricks_sdk import sdk_config_double
+
+    host = "https://example.databricks.com"
+    calls: list[dict[str, object]] = []
+    attributes = sdk_config.Config.attributes
+    locator = str(tmp_path / "synthetic-config")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", locator)
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "ambient-profile")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "synthetic-ambient-token")
+    monkeypatch.setenv("DATABRICKS_HOST", host)
+
+    def constructed(options: dict[str, object]) -> None:
+        calls.append(options)
+        assert socket.getdefaulttimeout() == databricks_token._SDK_NETWORK_TIMEOUT_S
+        assert os.environ["DATABRICKS_CONFIG_FILE"] == locator
+        if selector == "profile":
+            assert "DATABRICKS_TOKEN" not in os.environ
+            assert "DATABRICKS_HOST" not in os.environ
+        else:
+            assert "DATABRICKS_CONFIG_PROFILE" not in os.environ
+            assert os.environ["DATABRICKS_TOKEN"] == "synthetic-ambient-token"
+
+    config = sdk_config_double(
+        supports_policy=supports_policy,
+        resolved_host=host,
+        headers={"Authorization": "Bearer synthetic"},
+        on_construct=constructed,
+        configuration_attributes=attributes,
+    )
+    monkeypatch.setattr(sdk_config, "Config", config)
+    before_timeout = socket.getdefaulttimeout()
+
+    assert databricks_token._sdk_bearer(
+        "owned" if selector == "profile" else None,
+        None if selector == "ambient" else host,
+    ) == (host, "synthetic")
+
+    assert socket.getdefaulttimeout() == before_timeout
+    expected: dict[str, object] = {
+        "profile": "owned" if selector == "profile" else None,
+        "host": host if selector == "host" else None,
+    }
+    if supports_policy:
+        expected["databricks_cli_force_refresh"] = False
+    assert calls == [expected]
+
+
 def test_profile_pinning_scrubs_the_ambient_credential_env_vars() -> None:
     """Named-profile identity guarantee: the SDK resolves env above the profile
     section, so the scrub set (built from the real SDK attribute table) must

@@ -20,6 +20,7 @@ import importlib
 import sys
 import time
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import NoReturn
 from unittest.mock import MagicMock
 
@@ -71,6 +72,7 @@ def boot_exit_codes(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
     ``sys.exit``; the capture raises ``SystemExit`` so module execution
     stops exactly like a real exit.
     """
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "deploy/databricks/src"))
     for key, val in _BOOT_ENV.items():
         monkeypatch.setenv(key, val)
     # The module setdefault()s these into os.environ; registering them with

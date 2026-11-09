@@ -22,6 +22,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING
 
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.util.databricks_sdk import workspace_client_with_cli_cache
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
@@ -131,7 +132,7 @@ class DatabricksVolumesArtifactStore(ArtifactStore):
         else:
             from databricks.sdk import WorkspaceClient
 
-            self._client = WorkspaceClient()
+            self._client = workspace_client_with_cli_cache(WorkspaceClient)
 
     def _resolve(self, key: str) -> str:
         """
