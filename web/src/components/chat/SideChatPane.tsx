@@ -221,6 +221,9 @@ export function SideChatPane({
     loadingConversation,
     conversationLoadError,
   } = state;
+  const serverInfo = useServerInfo();
+  const sideChatAttachmentPolicy =
+    serverInfo === "loading" ? null : (serverInfo.filesystem_attachments ?? null);
   // Edit on this tab's own messages loads them into this tab's composer. It has
   // no "@"-mention picker, so mentions come back as their attachment markers.
   const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
@@ -230,14 +233,17 @@ export function SideChatPane({
       const draft = useChatStore.getState().sideChatComposers[childId];
       return Boolean(draft && (draft.text.trim() || draft.files.length || draft.quotes?.length));
     },
-    applyDraft: ({ text, files, mentions }) =>
+    applyDraft: ({ text, files, mentions }) => {
+      const { accepted, errors } = validateAttachments(files, sideChatAttachmentPolicy);
       useChatStore.getState().updateSideChatComposer(childId, (current) => ({
         ...current,
         text: buildMentionPreamble(mentions, sessionHarness) + text,
-        files,
+        files: accepted,
         quotes: [],
         autoFocus: true,
-      })),
+      }));
+      errors.forEach((message) => toast.error(message));
+    },
     focusComposer: () =>
       useChatStore.getState().updateSideChatComposer(childId, (current) => ({
         ...current,

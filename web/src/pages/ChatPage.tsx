@@ -3685,13 +3685,22 @@ function ComposerImpl(
   const recallingRef = useRef(false);
 
   // Replace the draft with a message brought back for editing, and focus it.
-  const loadIntoComposer = (text: string, loadedFiles: File[], replyDraft?: StoredReplyDraft) => {
+  // Files recovered from history are validated; queued drafts were checked when added.
+  const loadIntoComposer = (
+    text: string,
+    loadedFiles: File[],
+    {
+      replyDraft,
+      validateFiles = false,
+    }: { replyDraft?: StoredReplyDraft; validateFiles?: boolean } = {},
+  ) => {
     replaceText(text, replyDraft);
     dirtyRef.current = true;
     resetCursor();
     recallingRef.current = false;
     textareaRef.current = tailTextareaRef.current;
-    restoreFiles(loadedFiles);
+    if (validateFiles) replaceFiles(loadedFiles);
+    else restoreFiles(loadedFiles);
     textareaRef.current?.focus();
   };
   // Reply quotes and edited messages may only land in a composer that can send.
@@ -3705,7 +3714,7 @@ function ComposerImpl(
       setMentionedItems(edited.mentions);
       setCommandError(null);
       dismissMention();
-      loadIntoComposer(edited.text, edited.files);
+      loadIntoComposer(edited.text, edited.files, { validateFiles: true });
     },
     focusComposer: () => textareaRef.current?.focus(),
   });
@@ -4153,7 +4162,7 @@ function ComposerImpl(
             const target = queuedMessages.find((m) => m.queueId === queueId);
             if (!target) return;
             dequeueMessage(queueId);
-            loadIntoComposer(target.text, target.files ?? [], target.replyDraft);
+            loadIntoComposer(target.text, target.files ?? [], { replyDraft: target.replyDraft });
           }}
           onSteer={(queueId) => steerMessage(queueId)}
           onReorder={reorderQueuedMessage}

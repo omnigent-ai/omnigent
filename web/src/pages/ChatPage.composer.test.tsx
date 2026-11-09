@@ -7098,6 +7098,37 @@ describe("Composer — editing a sent message", () => {
     expect(await sentFiles?.[0]?.text()).toBe("meeting notes");
   });
 
+  it("drops a recovered attachment this server no longer accepts and says why", async () => {
+    fetchMock.mockImplementation(
+      async () => new Response("zip", { headers: { "Content-Type": "application/zip" } }),
+    );
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          filesystem_attachments: { extensions: [], all_types: false },
+        }}
+      >
+        <Composer {...composerProps()} ref={ref} />
+      </CapabilitiesProvider>,
+    );
+
+    act(() =>
+      ref.current?.editSentMessage({
+        ...sentMessage,
+        content: [
+          { type: "input_file", file_id: "file_zip", filename: "bundle.zip" },
+          { type: "input_text", text: "Summarize these" },
+        ],
+      }),
+    );
+
+    await waitFor(() => expect(textarea()).toHaveValue("Summarize these"));
+    expect(screen.queryByText("bundle.zip")).toBeNull();
+    expect(screen.getByText(/bundle\.zip.*can't be attached/)).toBeInTheDocument();
+  });
+
   it("asks before replacing a draft, keeping it unless the user confirms", async () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...composerProps()} ref={ref} />);

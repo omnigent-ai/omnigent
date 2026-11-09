@@ -194,6 +194,34 @@ describe("editing a sent side-chat message", () => {
     expect(sentFiles?.map((file) => file.name)).toEqual(["build.log"]);
   });
 
+  it("drops a recovered attachment this server no longer accepts and says why", async () => {
+    seedSentMessage();
+    vi.spyOn(filesApi, "downloadSessionFile").mockResolvedValue(
+      new File(["zip"], "bundle.zip", { type: "application/zip" }),
+    );
+    useChatStore.setState({ sideChatComposers: { [childId]: { text: "", files: [] } } });
+    renderPane(
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          filesystem_attachments: { extensions: [], all_types: false },
+        }}
+      >
+        <SideChatPane childId={childId} />
+      </CapabilitiesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("Why did this build fail?"),
+    );
+    expect(useChatStore.getState().sideChatComposers[childId]?.files).toEqual([]);
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/bundle\.zip.*can't be attached/),
+    );
+  });
+
   it("asks before replacing the side chat's draft and downloads only after Replace", async () => {
     seedSentMessage();
     const download = vi.spyOn(filesApi, "downloadSessionFile").mockRejectedValue(new Error("gone"));
