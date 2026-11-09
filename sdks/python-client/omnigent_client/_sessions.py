@@ -208,9 +208,11 @@ class Session:
     :param root_conversation_id: Id of this session's spawn-tree root.
         Equals ``id`` for top-level sessions; for sub-agents it points
         at the top-level ancestor. ``None`` when the server omits it.
-    :param total_cost_usd: Cumulative LLM spend for this session in USD,
-        e.g. ``0.42``. ``None`` while the session is unpriced (no turn
-        has been priced yet) or when ``usage_included`` is ``False``.
+    :param total_cost_usd: Cumulative LLM spend in USD for this session's
+        subtree, i.e. the session plus its sub-agents, e.g. ``0.42``.
+        It is not this session's own spend alone. ``None`` while the
+        session is unpriced (no turn has been priced yet) or when
+        ``usage_included`` is ``False``.
     :param usage_by_model: Per-model breakdown of the same usage, keyed
         by the raw harness model id. Each value is the server's
         ``ModelUsage`` object as a dict (``input_tokens``,
