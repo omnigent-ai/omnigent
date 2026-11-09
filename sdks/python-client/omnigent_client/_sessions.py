@@ -194,6 +194,8 @@ class Session:
         returned with ``visibility="archived"`` or with
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
+    :param host_id: Host owning this session's runner, or ``None`` when unbound.
+    :param sandbox_status: Managed launch progress or failure details, when available.
     :param sub_agent_name: For sub-agent sessions, the sub-agent type
         name within the parent's spec tree, e.g. ``"summarizer"``.
         ``None`` for top-level sessions.
@@ -218,8 +220,6 @@ class Session:
     :param usage_included: ``False`` when the snapshot was fetched with
         ``include_usage=false``, so ``total_cost_usd`` and
         ``usage_by_model`` are unknown rather than zero.
-    :param host_id: Host owning this session's runner, or ``None`` when unbound.
-    :param sandbox_status: Managed launch progress or failure details, when available.
     """
 
     id: str
@@ -241,6 +241,8 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    host_id: str | None = None
+    sandbox_status: dict[str, Any] | None = None
     sub_agent_name: str | None = None
     kind: str = "default"
     parent_session_id: str | None = None
@@ -248,8 +250,6 @@ class Session:
     total_cost_usd: float | None = None
     usage_by_model: dict[str, dict[str, Any]] | None = None
     usage_included: bool = True
-    host_id: str | None = None
-    sandbox_status: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
