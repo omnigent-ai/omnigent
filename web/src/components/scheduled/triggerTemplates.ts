@@ -32,6 +32,15 @@ export const TRIGGER_OPERATOR_LABELS: Record<TriggerOperator, string> = {
 /** Operators that compare against nothing, so their row has no value to fill in. */
 export const VALUELESS_OPERATORS: ReadonlySet<TriggerOperator> = new Set(["empty", "not_empty"]);
 
+/** How the scope matches: one value, any listed value, or names containing some text. */
+export type TriggerScopeOperator = "is" | "in" | "contains";
+
+export const TRIGGER_SCOPE_OPERATOR_LABELS: Record<TriggerScopeOperator, string> = {
+  is: "equals",
+  in: "in",
+  contains: "contains",
+};
+
 /** One "and <field> <operator> <value>" row of a trigger. */
 export interface TriggerCondition {
   /** A field id from the source's {@link TriggerTemplate.fields}, e.g. `"label"`. */
@@ -49,7 +58,7 @@ export interface TriggerFields {
    */
   scope: string;
   /** Omitted by older callers, which infer membership from the number of values. */
-  scopeOperator?: "is" | "in";
+  scopeOperator?: TriggerScopeOperator;
   conditions: TriggerCondition[];
   /** What each started session should do with its item. */
   instructions: string;
@@ -128,6 +137,8 @@ export interface TriggerTemplate {
   /** Scope field, e.g. "project", compared by the selected operator. */
   scopeLabel: string;
   scopePlaceholder: string;
+  /** The scope operators offered, in order; equals and in when omitted. */
+  scopeOperators?: TriggerScopeOperator[];
   fields: TriggerConditionField[];
   instructionsPlaceholder: string;
   /** Label for the checkbox that posts the session link. */
@@ -331,6 +342,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     ],
     scopeLabel: "service",
     scopePlaceholder: "Checkout API, Payments",
+    // Services often share a team or product prefix, so one rule can cover them all.
+    scopeOperators: ["is", "in", "contains"],
     fields: [
       { id: "urgency", label: "Urgency", operators: ["is", "is_not"], placeholder: "high" },
       { id: "priority", label: "Priority", operators: ["is", "is_not"], placeholder: "P1" },
@@ -369,6 +382,11 @@ export function emptyTriggerFields(source: TriggerSource): TriggerFields {
 }
 
 export const TRIGGER_SOURCES: TriggerSource[] = ["jira", "slack", "github", "linear", "pagerduty"];
+
+/** The scope operators a template offers, e.g. PagerDuty's service name `contains`. */
+export function triggerScopeOperators(source: TriggerSource): TriggerScopeOperator[] {
+  return TRIGGER_TEMPLATES[source].scopeOperators ?? ["is", "in"];
+}
 
 /** The selected event of a template, or its default when `eventId` is unknown. */
 export function triggerEvent(source: TriggerSource, eventId: string): TriggerEvent {
@@ -642,11 +660,16 @@ export function triggerFieldsComplete(fields: TriggerFields, source?: TriggerSou
     source === undefined ? scopeList(fields.scope) : triggerScopeEntries(source, fields);
   return (
     entries.length >= (isGroup ? 2 : 1) &&
-    (isGroup || fields.scopeOperator !== "is" || !fields.scope.includes(",")) &&
+    (isGroup || !singleValueScope(fields) || !fields.scope.includes(",")) &&
     fields.conditions.every((c) => VALUELESS_OPERATORS.has(c.operator) || c.value.trim() !== "") &&
     instructions !== "" &&
     instructions.length <= MAX_INSTRUCTIONS_CHARS
   );
+}
+
+/** Whether the scope operator takes one value, so a comma can't separate a list. */
+export function singleValueScope(fields: TriggerFields): boolean {
+  return fields.scopeOperator === "is" || fields.scopeOperator === "contains";
 }
 
 /**
@@ -982,13 +1005,23 @@ function sourceText(source: TriggerSource, fields: TriggerFields): SourceText {
   }
   if (source === "pagerduty") {
     const services = scopeList(fields.scope);
-    const one = services.length === 1;
-    const where = one ? `service ${services[0]}` : `services ${services.join(", ")}`;
+    const nameText = fields.scopeOperator === "contains" ? `"${fields.scope.trim()}"` : null;
+    const one = nameText === null && services.length === 1;
+    const where =
+      nameText !== null
+        ? `services whose name contains ${nameText}`
+        : one
+          ? `service ${services[0]}`
+          : `services ${services.join(", ")}`;
+    const findServices =
+      nameText !== null
+        ? `Use your PagerDuty tools to find every service whose name contains ${nameText}, ignoring case, for example GET /services with query set to ${nameText}, reading every page and keeping only names that contain it. If none does, say so in your reply.`
+        : `Use your PagerDuty tools to find ${one ? "that service" : "each of those services"} by name or ID. A name that matches no service or more than one counts as no match: say so in your reply.`;
     const filter = describePagerDutyFilter(fields);
     return {
       watch: () => `Watch: new PagerDuty incidents on ${where}${filter !== "" ? ` ${filter}` : ""}`,
       search: () =>
-        `Use your PagerDuty tools to find ${one ? "that service" : "each of those services"} by name or ID. A name that matches no service or more than one counts as no match: say so in your reply. Then list the incidents created on ${one ? "it" : "them"} since that time, in any status and not only the ones assigned to you, for example GET /incidents with service_ids[] set to ${one ? "its ID" : "their IDs"}, since set to that time in ISO 8601 and sort_by "created_at:asc".` +
+        `${findServices} Then list the incidents created on ${one ? "it" : "them"} since that time, in any status and not only the ones assigned to you, for example GET /incidents with service_ids[] set to ${one ? "its ID" : "their IDs"}, since set to that time in ISO 8601 and sort_by "created_at:asc".` +
         (filter !== ""
           ? ` Only incidents ${filter} count. Pass the conditions the tool can filter on and check the rest against each incident yourself.`
           : " Every incident counts."),
