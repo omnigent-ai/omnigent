@@ -31,9 +31,9 @@ import { Badge } from "@/components/ui/badge";
 import {
   CompactShortcutKeys,
   newSessionShortcutKeys,
-  RIGHT_SIDEBAR_TOGGLE_KEYS,
+  rightSidebarToggleShortcutKeys,
   settingsShortcutKeys,
-  SIDEBAR_TOGGLE_KEYS,
+  sidebarToggleShortcutKeys,
 } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -220,7 +220,7 @@ export function CommandPalette({
         icon: PanelLeftIcon,
         keywords: ["panel", "left", "sessions list"],
         run: onToggleLeftSidebar,
-        shortcut: SIDEBAR_TOGGLE_KEYS,
+        shortcut: sidebarToggleShortcutKeys(),
       },
       {
         id: "toggle-right-sidebar",
@@ -228,7 +228,7 @@ export function CommandPalette({
         icon: PanelRightIcon,
         keywords: ["panel", "right", "files", "terminal"],
         run: onToggleRightSidebar,
-        shortcut: rightSidebarShortcutEnabled ? RIGHT_SIDEBAR_TOGGLE_KEYS : undefined,
+        shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
       },
     ],
     [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],

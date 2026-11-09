@@ -14,14 +14,20 @@ to customize.
 - `preview`: empty and populated lists show suggested automations in the All
   filter with no search; searches and Active/Paused filters hide the preview.
 - `create`: New automation opens with Trigger type set to Schedule. Choose
-  Jira, Slack, GitHub, or Linear in the same form to configure matching items.
-  Gallery items preselect their integration. Switching types preserves each
+  Jira, Slack, GitHub, Linear, or PagerDuty in the same form to configure matching
+  items; each option shows the service's logo (a clock for Schedule), as do the
+  gallery items. Gallery items preselect their integration. Switching types preserves each
   draft until the dialog closes, including the schedule and any custom prompt edits.
-- `scope`: **equals** matches one project, channel, repository, or team.
+- `scope`: **equals** matches one project, channel, repository, team, or service.
   Choose **in** for a comma-separated list. Equals rejects lists without losing
-  the entered values; Slack placeholders omit the optional leading `#`.
+  the entered values. PagerDuty also offers **contains**, matching every service
+  whose name contains one piece of text; it rejects lists the same way. Slack can watch a channel, direct messages from listed
+  senders, or the one group DM with exactly the listed people (two or more; no
+  operator). A pink `#` or `@` precedes the input, and pasted prefixes are stripped.
+  Switching between channel and people events clears the scope; DMs hide Author.
 - `link-posting`: a checkbox below the trigger controls posting the session link
-  back to Jira, Slack, GitHub, or Linear. Sessions start whether it is checked or not.
+  back to Jira, Slack, GitHub, Linear, or PagerDuty (as an incident note). Sessions
+  start whether it is checked or not.
 - `prompt-editing`: the detail page and edit dialog show Your prompt first. System
   prompt starts collapsed, expands into a read-only preview, and requires Edit
   system prompt to change it. Done editing system prompt returns to the read-only
@@ -69,7 +75,12 @@ to customize.
   Persisted catalogs expire after 24 hours; an open dialog may retain its in-memory
   query data, as New Chat does. Switching targets resets model and effort choices.
   Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog
-  failures still allow Default.
+  failures still allow Default. Modes that skip approval, including Antigravity's
+  only permission choice, appear only when the server advertises
+  `scheduled_task_approval_skipping_modes`. Without it the picker hides them and an
+  edit saves the harness default in place of a saved one; non-Claude harnesses also
+  need `scheduled_task_harness_settings` for that, so convert their overrides before
+  rolling back (Scheduler compatibility and rollback in `docs/AUTOMATIONS.md`).
 - `trigger-controls`: continued trigger templates
   show polling cadence instead of schedule controls, Run now, or next-run times.
   New templates use `automation_trigger_poll_minutes` from the server (10–240 minutes,
@@ -96,7 +107,7 @@ to customize.
   Custom schedule remains available for other recurrence patterns.
   The shared modal supports ten-minute connected-host schedules in
   either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
-- `capabilities`: Jira, Slack, GitHub, and Linear templates require session continuity
+- `capabilities`: Jira, Slack, GitHub, Linear, and PagerDuty templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `tools-note`: the form says which tools the agent needs where the task runs,
   except on an Arclet sandbox, which already has them. Neither the template form
@@ -106,14 +117,15 @@ to customize.
   pointer cursors, and keyboard focus indicators. Continued trigger cadence is
   fixed; other tasks expose schedule controls. Name comes first, followed by
   Trigger type during creation. The modal opens with Instructions focused.
-  Run on and session mode precede Repeat and
-  Time because both determine the minimum interval. Time and timezone are separate
-  controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
+  Agent sits directly below Run on, outside Advanced. When editing a recognized
+  trigger, Harness for matching sessions appears there instead. Run on and session
+  mode precede Repeat and Time because both determine the minimum interval. Time
+  and timezone are separate controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
   opens its searchable dropdown. Custom schedules use the same typed time input.
   Advanced starts collapsed and contains Workspace or
-  Repository, Project, agent settings, and Ends. Name remains required and editable
-  without opening Advanced; changing instructions preserves it. Configured overrides
-  are summarized beside Advanced, and invalid
+  Repository, Project, model/effort/permission settings, and Ends. Name remains
+  required and editable without opening Advanced; changing instructions preserves
+  it. Configured overrides are summarized beside Advanced, and invalid
   settings reveal their controls. Escape closes the active selector or folder browser
   without discarding the automation draft. The footer stays visible while the form scrolls.
   Gallery cards use two columns on desktop and one on narrow screens.
@@ -127,9 +139,9 @@ to customize.
 - **Creation modal:** click New automation on either tab. Schedule is selected
   by default; use Trigger type to select an integration and reveal its conditions
   and session instructions. Returning to Schedule restores the schedule draft.
-  Choose Run on and session mode above Repeat. Expand Advanced to change agent
-  settings or an ending. With `automations_v2` on a server supporting sub-hour
-  schedules, use Repeat → Interval
+  Choose Run on, Agent, and session mode above Repeat. Expand Advanced to change
+  model, effort, permissions, or an ending. With `automations_v2` on a server
+  supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
@@ -200,9 +212,14 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the
   gallery remains directly clickable.
-- In create and edit setup, expand Advanced, then select Claude Code, Codex, Pi, and a permission-only
-  harness such as Cursor. Check that only supported settings appear, model changes
-  clear unsupported effort choices, and saved selections survive reopening. Repeat
+- In create and edit setup, select Claude Code, Codex, Pi, and a permission-only
+  harness such as Cursor below Run on. Selecting an agent keeps Advanced collapsed;
+  expand it to check that only supported settings appear, model changes
+  clear unsupported effort choices, and saved selections survive reopening. A new
+  automation starts Claude on Auto and Codex on Approve for me, because nobody
+  approves an unattended run; choosing Default saves no override. Codex also
+  offers Full Access and Bypass approvals & sandbox, and Antigravity offers Skip
+  permissions; save one and reopen to confirm it persists. Repeat
   with a sandbox and an offline connected host; saved overrides remain readable.
 - With a provider catalog, create an automation from New automation or a template,
   choose the sandbox and a repository, save, and reopen Edit. Change the repository,

@@ -52,7 +52,7 @@ import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
-from omnigent.debug_logging import debug_event, runner_primary_session_id
+from omnigent.debug_logging import StageTimings, debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
     session_resource_view_to_dict,
@@ -9172,6 +9172,7 @@ async def _auto_create_claude_terminal(
         )
     )
     started_at = time.monotonic()
+    timings = StageTimings()
     _logger.info(
         "Claude terminal auto-create starting: session=%s workspace=%s bundle_dir=%s "
         "agent_name=%s skills_filter=%s",
@@ -9264,6 +9265,7 @@ async def _auto_create_claude_terminal(
         session_id,
         extra={"session_id": session_id},
     )
+    timings.mark("bridge")
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     # The Omnigent server URL + auth are needed in two places below: the
@@ -9301,6 +9303,7 @@ async def _auto_create_claude_terminal(
         session_id=session_id,
         session_init=session_init,
     )
+    timings.mark("launch_metadata")
     session_effort = launch_metadata.reasoning_effort
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
@@ -9508,6 +9511,7 @@ async def _auto_create_claude_terminal(
     # Claude's own login — so a host-spawned native-claude session honors the
     # provider selection just like the in-process claude-sdk harness and the
     # CLI path.
+    timings.mark("resume_transcript")
     claude_config: ClaudeNativeUcodeConfig | None = None
     _launch_config_resolution_failed = False
     from omnigent.inference_config import (
@@ -9568,6 +9572,7 @@ async def _auto_create_claude_terminal(
         launch_model = resolve_bound_model(
             inference_config, "claude-native", session_model_override or unpinned_launch_model
         )
+    timings.mark("launch_config")
     # A pick the provider cannot serve is dropped only once the fallback
     # terminal is actually up, so a failed launch never loses it.
     reset_pick_after_launch = False
@@ -9719,6 +9724,7 @@ async def _auto_create_claude_terminal(
     # no gain — nothing later re-picks the launch model there.
     if launch_metadata.routing_enabled:
         claude_config = claude_config_with_launch_model_pinned(claude_config, launch_model)
+    timings.mark("catalog")
     if record_launch_config is not None and not _launch_config_resolution_failed:
         record_launch_config(session_id, claude_config)
     # Persist the vocabulary + launch model onto the bridge so mid-session
@@ -9953,6 +9959,7 @@ async def _auto_create_claude_terminal(
         env_spec.scrollback,
         extra={"session_id": session_id},
     )
+    timings.mark("prepare_terminal")
     try:
         terminal_view = await resource_registry.launch_required_terminal(
             session_id=session_id,
@@ -9978,6 +9985,7 @@ async def _auto_create_claude_terminal(
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         raise
+    timings.mark("tmux_launch")
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
     # Surface the terminal on the live SSE stream so an already-connected
@@ -10002,7 +10010,13 @@ async def _auto_create_claude_terminal(
         terminal_metadata.get("tmux_socket"),
         terminal_metadata.get("tmux_target"),
         (time.monotonic() - started_at) * 1000,
-        extra={"session_id": session_id},
+        # Stage split of this launch, to find which step dominates startup.
+        extra=debug_event(
+            "claude_terminal_launched",
+            session_id=session_id,
+            terminal_id=terminal_payload.get("id"),
+            **timings.attributes(),
+        ),
     )
 
     publish_event(

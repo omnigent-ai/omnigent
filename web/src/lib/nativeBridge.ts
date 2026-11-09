@@ -195,7 +195,7 @@ export interface NativeViewModeParams {
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
   /** The runner picked during onboarding for this server, returned once. */
-  takeOnboardingRunner?: () => Promise<"local" | "remote" | null>;
+  takeOnboardingRunner?: () => Promise<OnboardingRunner | null>;
   /**
    * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
    * notifications are shell-owned (native corner overlay + Server menu); this
@@ -288,12 +288,29 @@ interface ElectronDesktopApi extends NativeShellApi {
       command: string;
       browserViewId: string | null;
       closingQuits?: boolean;
+      quitDetail?: string | null;
     }) => void,
   ) => () => void;
   /** Report which menu commands this page can run now (fire-and-forget). */
   setDesktopCommandState?: (state: DesktopCommandState) => void;
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow?: () => Promise<boolean>;
+  /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
+  confirmQuit?: (options: { dontAskAgain: boolean }) => Promise<boolean>;
+  /**
+   * Start macOS Dictation (Edit > Start Dictation…) in the focused field. Only
+   * macOS shells expose it. Resolves whether the shell started it.
+   */
+  startSystemDictation?: () => Promise<boolean>;
+  /** The "Show Omnigent from anywhere" shortcut; absent on shells predating it. */
+  getGlobalShortcut?: () => Promise<GlobalShortcutStatus | null>;
+  /** Saves the shortcut; resolves `{ ok: false, error }` when the shell refuses the chord. */
+  setGlobalShortcut?: (change: GlobalShortcutChange) => Promise<GlobalShortcutSaveResult>;
+  /** Takes the next chord ahead of the page's shortcuts and the menu; null when cancelled. */
+  recordGlobalShortcut?: () => Promise<string | null>;
+  cancelGlobalShortcutRecording?: () => Promise<boolean>;
+  /** The attached browser page's view id if it has keyboard focus; absent on older shells. */
+  browserFocusedView?: () => Promise<string | null>;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
@@ -305,7 +322,13 @@ export type DesktopCommand =
   | "toggle-pin-session"
   | "fork-session"
   | "go-back"
-  | "go-forward";
+  | "go-forward"
+  | "reload"
+  | "focus-address-bar"
+  | "reopen-closed-tab"
+  | "previous-tab"
+  | "next-tab"
+  | "quit";
 
 const DESKTOP_COMMANDS: readonly string[] = [
   "close",
@@ -316,6 +339,12 @@ const DESKTOP_COMMANDS: readonly string[] = [
   "fork-session",
   "go-back",
   "go-forward",
+  "reload",
+  "focus-address-bar",
+  "reopen-closed-tab",
+  "previous-tab",
+  "next-tab",
+  "quit",
 ] satisfies DesktopCommand[];
 
 export interface DesktopCommandEvent {
@@ -324,6 +353,8 @@ export interface DesktopCommandEvent {
   browserViewId: string | null;
   /** Whether closing this window quits the app (its last window, off macOS). */
   closingQuits: boolean;
+  /** For Quit: what quitting stops (local sessions, a local server), else null. */
+  quitDetail: string | null;
 }
 
 /** What the page tells the shell so it can enable and label its menu items. */
@@ -477,6 +508,27 @@ export interface HostActionResult {
    * generic error. Set by the desktop's `omnigent:host-control` handler.
    */
   authError?: boolean;
+}
+
+/** The "Show Omnigent from anywhere" shortcut; `accelerator` is an Electron accelerator. */
+export interface GlobalShortcutSetting {
+  enabled: boolean;
+  accelerator: string;
+}
+
+/** A chord to save, or `{ enabled: false }` to turn the shortcut off and keep its chord. */
+export type GlobalShortcutChange = GlobalShortcutSetting | { enabled: false; accelerator?: never };
+
+/** `setting` is what the shell saved, which may differ from what a stale window showed. */
+export interface GlobalShortcutSaveResult {
+  ok: boolean;
+  setting?: GlobalShortcutSetting;
+  error?: string;
+}
+
+/** The saved shortcut, with `error` while it is on but the shell couldn't register it. */
+export interface GlobalShortcutStatus extends GlobalShortcutSetting {
+  error?: string;
 }
 
 export type UpdateMode = "none" | "manual" | "start" | "default";
@@ -732,13 +784,14 @@ export function onDesktopCommand(callback: (event: DesktopCommandEvent) => void)
   const electron = electronApi();
   if (!electron?.onDesktopCommand) return () => {};
   try {
-    return electron.onDesktopCommand(({ command, browserViewId, closingQuits }) => {
+    return electron.onDesktopCommand(({ command, browserViewId, closingQuits, quitDetail }) => {
       // A newer shell may send commands this page doesn't know; drop them.
       if (!DESKTOP_COMMANDS.includes(command)) return;
       callback({
         command: command as DesktopCommand,
         browserViewId: browserViewId ?? null,
         closingQuits: closingQuits === true,
+        quitDetail: typeof quitDetail === "string" ? quitDetail : null,
       });
     });
   } catch (err) {
@@ -767,6 +820,109 @@ export async function closeDesktopWindow(): Promise<boolean> {
   } catch (err) {
     console.warn("[nativeBridge] closeWindow failed:", err);
     return false;
+  }
+}
+
+/** True when the desktop shell can hand dictation to macOS Dictation. */
+export function supportsSystemDictation(): boolean {
+  return typeof electronApi()?.startSystemDictation === "function";
+}
+
+/**
+ * Start macOS Dictation in the field that has focus, so focus the target first.
+ * Resolves whether the shell started it.
+ */
+export async function startSystemDictation(): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.startSystemDictation) return false;
+  try {
+    return (await electron.startSystemDictation()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] startSystemDictation failed:", err);
+    return false;
+  }
+}
+
+/** Quit the desktop app once the page's prompt confirmed. Resolves whether the shell took it. */
+export async function confirmDesktopQuit(dontAskAgain: boolean): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.confirmQuit) return false;
+  try {
+    return (await electron.confirmQuit({ dontAskAgain })) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] confirmQuit failed:", err);
+    return false;
+  }
+}
+
+/**
+ * True when the shell can show Omnigent from anywhere. Needs both calls, so a
+ * shell that can read the shortcut but not save it counts as unsupported.
+ */
+export function supportsGlobalShortcut(): boolean {
+  const electron = electronApi();
+  return (
+    typeof electron?.getGlobalShortcut === "function" &&
+    typeof electron.setGlobalShortcut === "function"
+  );
+}
+
+/** The saved "Show Omnigent from anywhere" shortcut; `null` outside the shell or on failure. */
+export async function getGlobalShortcut(): Promise<GlobalShortcutStatus | null> {
+  const electron = electronApi();
+  if (!electron?.getGlobalShortcut) return null;
+  try {
+    return await electron.getGlobalShortcut();
+  } catch (err) {
+    console.warn("[nativeBridge] electron getGlobalShortcut failed:", err);
+    return null;
+  }
+}
+
+/**
+ * Saves a chord, or turns the shortcut off for `{ enabled: false }`. Resolves
+ * `{ ok: false, error }` when refused; the setting is unchanged.
+ */
+export async function setGlobalShortcut(
+  change: GlobalShortcutChange,
+): Promise<GlobalShortcutSaveResult> {
+  const electron = electronApi();
+  if (!electron?.setGlobalShortcut) return { ok: false, error: "Couldn't save the shortcut." };
+  try {
+    return await electron.setGlobalShortcut(change);
+  } catch (err) {
+    console.warn("[nativeBridge] electron setGlobalShortcut failed:", err);
+    return { ok: false, error: "Couldn't save the shortcut." };
+  }
+}
+
+/** Whether the shell records the next chord itself, before the page's shortcuts see it. */
+export function shellRecordsGlobalShortcut(): boolean {
+  return typeof electronApi()?.recordGlobalShortcut === "function";
+}
+
+/** The next chord, taken by the shell; null when recording was cancelled or failed. */
+export async function recordGlobalShortcut(): Promise<string | null> {
+  try {
+    return (await electronApi()?.recordGlobalShortcut?.()) ?? null;
+  } catch (err) {
+    console.warn("[nativeBridge] electron recordGlobalShortcut failed:", err);
+    return null;
+  }
+}
+
+export function cancelGlobalShortcutRecording(): void {
+  void electronApi()
+    ?.cancelGlobalShortcutRecording?.()
+    .catch(() => {});
+}
+
+/** The browser page (its view id) that has keyboard focus in this window, if any. */
+export async function focusedBrowserView(): Promise<string | null> {
+  try {
+    return (await electronApi()?.browserFocusedView?.()) ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -1186,16 +1342,41 @@ export async function getHostIdentity(): Promise<HostIdentity | null> {
   }
 }
 
-/**
- * The runner ("local" | "remote") picked during desktop onboarding for this
- * server, handed over once; null otherwise or outside Electron.
- */
-export async function takeOnboardingRunner(): Promise<"local" | "remote" | null> {
+/** Where desktop onboarding connected a runner: this machine, or a remote host like Arca. */
+export type OnboardingRunner = "local" | "remote";
+
+/** Features that each take the onboarding runner once per page load. */
+export type OnboardingRunnerConsumer = "hostPicker" | "importReview";
+
+// The shell clears its value on the first IPC read, so every consumer shares one.
+let onboardingRunnerRead: Promise<OnboardingRunner | null> | null = null;
+const onboardingRunnerTakenBy = new Set<OnboardingRunnerConsumer>();
+
+async function readOnboardingRunner(): Promise<OnboardingRunner | null> {
   try {
     return (await electronApi()?.takeOnboardingRunner?.()) ?? null;
   } catch {
     return null;
   }
+}
+
+/**
+ * The runner picked during desktop onboarding for this server, handed to
+ * each *consumer* once; null otherwise or outside Electron.
+ */
+export function takeOnboardingRunner(
+  consumer: OnboardingRunnerConsumer,
+): Promise<OnboardingRunner | null> {
+  if (onboardingRunnerTakenBy.has(consumer)) return Promise.resolve(null);
+  onboardingRunnerTakenBy.add(consumer);
+  onboardingRunnerRead ??= readOnboardingRunner();
+  return onboardingRunnerRead;
+}
+
+/** Test-only: forget this page load's onboarding runner read. */
+export function resetOnboardingRunnerForTests(): void {
+  onboardingRunnerRead = null;
+  onboardingRunnerTakenBy.clear();
 }
 
 /**

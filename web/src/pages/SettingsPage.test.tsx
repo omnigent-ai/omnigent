@@ -53,6 +53,7 @@ const mocks = vi.hoisted(() => ({
   // single_user: explicit single-user marker; false for accounts/OIDC/
   // multi-user-header. Gates the settings-route single-user redirect.
   singleUser: false,
+  nestedAgents: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
@@ -81,6 +82,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    sibling_sessions: mocks.nestedAgents,
     enabled_connections: mocks.enabledConnections,
   }),
 }));
@@ -213,6 +215,9 @@ vi.mock("@/pages/MembersPage", () => ({
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
 }));
+vi.mock("@/pages/AdminGeneralPage", () => ({
+  AdminGeneralPage: () => <div>admin-general-page-stub</div>,
+}));
 vi.mock("@/components/McpRegistry", () => ({
   McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
 }));
@@ -270,6 +275,7 @@ beforeEach(() => {
   mocks.theme = "system";
   mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
+  mocks.nestedAgents = false;
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
@@ -385,6 +391,38 @@ describe("SettingsPage", () => {
         "bg-card",
       );
     }
+  });
+
+  it("offers the desktop shortcut only when the shell has both of its calls", async () => {
+    const getGlobalShortcut = vi
+      .fn()
+      .mockResolvedValue({ enabled: false, accelerator: "Alt+Space" });
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-desktop-app")).toBeNull();
+    cleanup();
+
+    // An older shell can read the shortcut but not save it.
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      getGlobalShortcut,
+    };
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-desktop-app")).toBeNull();
+    cleanup();
+
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      getGlobalShortcut,
+      setGlobalShortcut: vi.fn(),
+    };
+    renderPage("/settings/general");
+    expect(
+      await screen.findByRole("switch", { name: "Show Omnigent from anywhere" }),
+    ).toBeInTheDocument();
   });
 
   it("renders session auto-rename enabled by default", async () => {
@@ -1540,6 +1578,12 @@ describe("SettingsPage", () => {
     renderPage("/settings/policies");
     expect(await screen.findByText("policies-page-stub")).toBeInTheDocument();
     expect(screen.queryByText("members-page-stub")).toBeNull();
+  });
+
+  it("renders Admin General at /settings/admin", async () => {
+    mocks.nestedAgents = true;
+    renderPage("/settings/admin");
+    expect(await screen.findByText("admin-general-page-stub")).toBeInTheDocument();
   });
 
   it("still renders the admin sections when accounts is off (OIDC)", async () => {

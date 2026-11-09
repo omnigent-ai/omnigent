@@ -25,6 +25,7 @@ import {
   Routes,
   useLocation,
   useNavigate,
+  useParams,
   useSearchParams,
 } from "react-router-dom";
 import { setEmbedRoot } from "@/lib/host";
@@ -77,7 +78,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
   useDeleteTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
-  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), launch: vi.fn(), isPending: false })),
 }));
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -274,7 +275,12 @@ vi.mock("./TerminalsPanel", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
-import { useCreateTerminal, useTerminals, useDeleteTerminal } from "@/hooks/useTerminals";
+import {
+  useCreateTerminal,
+  useTerminals,
+  useDeleteTerminal,
+  type TerminalLaunchCallbacks,
+} from "@/hooks/useTerminals";
 
 const useConvMock = vi.mocked(useConversations);
 const useTerminalsMock = vi.mocked(useTerminals);
@@ -459,6 +465,16 @@ function PathDisplay() {
  * test can exercise the conversation-switch effect (AppShell stays mounted,
  * only the :conversationId route param changes) without a full remount.
  */
+/** Records the rail's state in the first commit of each session, before paint. */
+function RailFirstFrameProbe({ frames, to }: { frames: string[]; to: string }) {
+  const { conversationId } = useParams();
+  useLayoutEffect(() => {
+    const rail = document.querySelector('aside[aria-label="Workspace"]');
+    frames.push(`${conversationId}:${rail?.getAttribute("data-state") ?? "none"}`);
+  }, [conversationId, frames]);
+  return <SessionNavButton to={to} />;
+}
+
 function SessionNavButton({ to }: { to: string }) {
   const navigate = useNavigate();
   return (
@@ -812,11 +828,12 @@ describe("AppShell header", () => {
   });
 
   it.each([
-    { title: "Off-window owner session", archived: false },
-    { title: null, archived: true },
+    { title: "Off-window owner session", archived: false, sibling: false },
+    { title: null, archived: true, sibling: false },
+    { title: "Archived sibling", archived: true, sibling: true },
   ])(
     "shows owner actions for an off-window session ($title, archived=$archived)",
-    ({ title, archived }) => {
+    ({ title, archived, sibling }) => {
       mockConversations([]);
       useSessionMock.mockReturnValue({
         session: {
@@ -828,6 +845,7 @@ describe("AppShell header", () => {
           createdAt: 1_700_000_000,
           title,
           archived,
+          family: sibling ? { id: "family", representative_id: "other", pinned: false } : undefined,
           labels: {},
           items: [],
           pendingElicitations: [],
@@ -848,6 +866,8 @@ describe("AppShell header", () => {
       expect(
         screen.getByRole("menuitem", { name: archived ? "Unarchive" : "Archive" }),
       ).toBeInTheDocument();
+      if (sibling) expect(screen.queryByTestId("header-move-to-project")).toBeNull();
+      else expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
     },
   );
 
@@ -2997,7 +3017,7 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
   });
 
-  it("focuses the tab strip without replacing its selected soft tab", async () => {
+  it("toggles the rail in one press and picks its fixed tabs by number from anywhere", async () => {
     writeWorkspacePanelDefault("collapsed");
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -3008,37 +3028,51 @@ describe("Right workspace card visibility", () => {
     renderShell("/c/conv_hotkey");
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
 
     const filesTab = await screen.findByRole("tab", { name: "Files" });
     await waitFor(() => expect(filesTab).toHaveFocus());
-    fireEvent.keyDown(filesTab, { key: "2" });
+    // The rail is still sliding in from past the window edge, so focus must not scroll.
+    expect(focus.mock.contexts.at(-1)).toBe(filesTab);
+    expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+    focus.mockRestore();
+    // Alt+2 here (⌃2 on macOS) shows the second fixed tab, wherever focus is.
+    screen.getByRole("button", { name: "Collapse right panel" }).focus();
+    fireEvent.keyDown(document.activeElement!, { code: "Digit2", key: "2", altKey: true });
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
-    const fileTab = screen.getByTitle("README.md");
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
-    expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
 
+    // With focus outside the rail, the hotkey still closes the rail on screen.
     screen.getByRole("button", { name: "Collapse right panel" }).focus();
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
+    // Reopening keeps the selected file tab.
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
-    await waitFor(() => expect(fileTab).toHaveFocus());
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
-    expect(filesTab).toHaveAttribute("aria-selected", "false");
-
-    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
-    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
   });
 
-  it("reveals a collapsed workspace when the Browser hotkey opens a tab", async () => {
+  it("reveals a collapsed workspace when New Browser Tab opens a tab", async () => {
     writeWorkspacePanelDefault("collapsed");
+    let sendCommand: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits: boolean;
+    }) => void = () => {};
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
       setBadgeCount: vi.fn(),
+      onDesktopCommand: (callback: typeof sendCommand) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
     });
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -3050,7 +3084,9 @@ describe("Right workspace card visibility", () => {
       renderShell("/c/conv_browser_hotkey");
       expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
-      fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
+      act(() =>
+        sendCommand({ command: "new-browser-tab", browserViewId: null, closingQuits: false }),
+      );
 
       expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
         "aria-selected",
@@ -3060,14 +3096,25 @@ describe("Right workspace card visibility", () => {
     } finally {
       cleanup();
       vi.unstubAllGlobals();
+      resetDesktopCommandsForTests();
     }
   });
 
   it("reveals a Browser tab over an open Terminal panel", async () => {
+    let sendCommand: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits: boolean;
+    }) => void = () => {};
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
       setBadgeCount: vi.fn(),
+      onDesktopCommand: (callback: typeof sendCommand) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
     });
     sessionStorage.setItem(
       "omnigent.web.panel-key:conv_browser_terminal",
@@ -3084,7 +3131,9 @@ describe("Right workspace card visibility", () => {
       expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
       expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
-      fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
+      act(() =>
+        sendCommand({ command: "new-browser-tab", browserViewId: null, closingQuits: false }),
+      );
 
       expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
       expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
@@ -3095,6 +3144,7 @@ describe("Right workspace card visibility", () => {
     } finally {
       cleanup();
       vi.unstubAllGlobals();
+      resetDesktopCommandsForTests();
     }
   });
 
@@ -3179,7 +3229,7 @@ describe("Right workspace card visibility", () => {
     await waitFor(() => expect(screen.getByTitle("README.md")).toHaveFocus());
   });
 
-  it("focuses the workspace toolbar when its selected fixed tab is hidden", async () => {
+  it("focuses the workspace toolbar on reopen when its selected fixed tab is hidden", async () => {
     writeSessionWorkspaceState("conv_compact_workspace", {
       open: true,
       rightRailTab: "changes",
@@ -3194,6 +3244,9 @@ describe("Right workspace card visibility", () => {
     const selected = screen.getByRole("tab", { name: /changes/i });
     Object.defineProperty(selected, "checkVisibility", { value: () => false });
 
+    // The rail on screen closes; reopening focuses its toolbar, since the selected tab is hidden.
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
 
     await waitFor(() =>
@@ -3588,6 +3641,32 @@ describe("Right workspace card visibility", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it.each([
+    ["open", "closed"],
+    ["closed", "open"],
+  ] as const)(
+    "shows the incoming session's rail state in its first frame (%s to %s)",
+    (from, to) => {
+      writeSessionWorkspaceState("conv_from", { open: from === "open" });
+      writeSessionWorkspaceState("conv_to", { open: to === "open" });
+      mockConversations([
+        { id: "conv_from", permission_level: null },
+        { id: "conv_to", permission_level: null },
+      ]);
+      const frames: string[] = [];
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        sessionShellTree(
+          qc,
+          "/c/conv_from",
+          <RailFirstFrameProbe frames={frames} to="/c/conv_to" />,
+        ),
+      );
+      fireEvent.click(screen.getByTestId("nav-session"));
+      expect(frames).toEqual([`conv_from:${from}`, `conv_to:${to}`]);
+    },
+  );
 
   it("uses the default when navigating from Agents to a child in another tree", () => {
     localStorage.setItem("omnigent:default-workspace-tab", "changes");
@@ -6003,7 +6082,7 @@ describe("AppShell desktop Close", () => {
   it("opens New Terminal over an open file only once its viewer allows it", () => {
     const createShell = vi.fn();
     vi.mocked(useCreateTerminal).mockReturnValue({
-      mutate: createShell,
+      launch: createShell,
       isPending: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
     useSessionAgentMock.mockReturnValue({
@@ -6015,6 +6094,72 @@ describe("AppShell desktop Close", () => {
     expect(createShell).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
     expect(createShell).toHaveBeenCalledWith("zsh", expect.anything());
+  });
+
+  it("restores the open file when a shell opened early fails to create", () => {
+    const shell = { id: "terminal_zsh_u-fail1", name: "zsh", session: "u-fail1", running: true };
+    let callbacks: TerminalLaunchCallbacks = {};
+    vi.mocked(useCreateTerminal).mockReturnValue({
+      launch: (_name: string, next: TerminalLaunchCallbacks) => {
+        callbacks = next;
+      },
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    writeSessionWorkspaceState("conv_shell_fail", {
+      open: true,
+      openFiles: ["a.ts", "b.ts"],
+      selectedFilePath: "b.ts",
+    });
+    mockConversations([{ id: "conv_shell_fail", permission_level: null }]);
+    renderShell("/c/conv_shell_fail");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+
+    act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
+    act(() => callbacks.onOpen?.(shell));
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+
+    act(() => callbacks.onError?.(new Error("launch failed"), shell));
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+  });
+
+  it("keeps a newer selection when a shell opened early fails to create", () => {
+    const shell = { id: "terminal_zsh_u-fail2", name: "zsh", session: "u-fail2", running: true };
+    let callbacks: TerminalLaunchCallbacks = {};
+    vi.mocked(useCreateTerminal).mockReturnValue({
+      launch: (_name: string, next: TerminalLaunchCallbacks) => {
+        callbacks = next;
+      },
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    writeSessionWorkspaceState("conv_shell_moved", {
+      open: true,
+      openFiles: ["a.ts", "b.ts"],
+      selectedFilePath: "b.ts",
+    });
+    mockConversations([{ id: "conv_shell_moved", permission_level: null }]);
+    renderShell("/c/conv_shell_moved");
+
+    act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
+    act(() => callbacks.onOpen?.(shell));
+    // The user moves on to another file before the create fails.
+    fireEvent.click(screen.getByTitle("a.ts"));
+    act(() => callbacks.onError?.(new Error("launch failed"), shell));
+
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "a.ts");
   });
 
   it("leaves the session once an open file's viewer allows dropping its unsaved edits", () => {

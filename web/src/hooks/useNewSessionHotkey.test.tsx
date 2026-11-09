@@ -70,12 +70,12 @@ describe("isNewSessionHotkey", () => {
     expect(isNewSessionHotkey(altGraph, isMac)).toBe(false);
   });
 
-  it("uses Cmd+N in native shells, keeps the older Alt chord, and not in browsers", () => {
+  it("uses Cmd+N in native shells, without the older Alt chord, and not in browsers", () => {
     const native = event({ key: "n", code: "KeyN", metaKey: true });
     expect(isNewSessionHotkey(native, true, true)).toBe(true);
     expect(isNewSessionHotkey(native, true, false)).toBe(false);
     const old = event({ key: "˜", code: "KeyN", metaKey: true, altKey: true });
-    expect(isNewSessionHotkey(old, true, true)).toBe(true);
+    expect(isNewSessionHotkey(old, true, true)).toBe(false);
     expect(isNewSessionHotkey(old, true, false)).toBe(false);
     expect(
       isNewSessionHotkey(
@@ -84,9 +84,16 @@ describe("isNewSessionHotkey", () => {
         true,
       ),
     ).toBe(false);
+    expect(isNewSessionHotkey(event({ key: "n", code: "KeyN", ctrlKey: true }), false, true)).toBe(
+      true,
+    );
     expect(
-      isNewSessionHotkey(event({ code: "KeyN", ctrlKey: true, altKey: true }), false, true),
-    ).toBe(true);
+      isNewSessionHotkey(
+        event({ key: "n", code: "KeyN", ctrlKey: true, altKey: true }),
+        false,
+        true,
+      ),
+    ).toBe(false);
   });
 
   it.each([

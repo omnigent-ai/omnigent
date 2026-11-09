@@ -2080,7 +2080,7 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
     """A safer approval preset clears bypass and reaches the create call.
 
-    Selecting "Full access" in the composer's permissions dropdown must clear
+    Selecting "Full Access" in the composer's permissions dropdown must clear
     a previous bypass choice and reach
     ``POST /v1/sessions`` as
     ``terminal_launch_args: ["--sandbox", "danger-full-access",
@@ -2214,7 +2214,14 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             approval = page.get_by_test_id("new-chat-landing-permission-chip")
             await expect(approval).to_be_visible()
             await approval.click()
-            for label in ("Default", "Full access", "Read only", "Bypass approvals & sandbox"):
+            for label in (
+                "Default",
+                "Ask for approval",
+                "Approve for me",
+                "Full Access",
+                "Read Only",
+                "Bypass approvals & sandbox",
+            ):
                 await expect(
                     page.get_by_role("menuitemradio", name=label, exact=True)
                 ).to_be_visible()
@@ -2224,8 +2231,8 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
                 page.get_by_test_id("new-chat-landing-permission-menu")
             ).not_to_be_visible()
             await approval.click()
-            await page.get_by_role("menuitemradio", name="Full access", exact=True).click()
-            await expect(approval).to_contain_text("Full access")
+            await page.get_by_role("menuitemradio", name="Full Access", exact=True).click()
+            await expect(approval).to_contain_text("Full Access")
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()

@@ -271,10 +271,10 @@ def test_turn_end_eases_a_transcript_at_its_end_down(
     steps = [step for _, step in moves]
     assert sum(steps) > 20, f"the transcript didn't move when the turn ended: {steps}"
     # Timed rather than counted per frame: a slow runner paints few frames of the 180 ms
-    # ease, but the movement still spans most of it, while removing the row at once moves
-    # the transcript in a single frame.
+    # ease, and the sampler only records frames whose layout changed, so the slow tail can
+    # go unrecorded (84 ms was seen). Removing the row at once moves it in one frame (0 ms).
     span = moves[-1][0] - moves[0][0]
-    assert span >= 90, f"the transcript moved within {span:.0f} ms ({steps}), not eased"
+    assert span >= 40, f"the transcript moved within {span:.0f} ms ({steps}), not eased"
 
 
 # Pauses the indicator's animations and steps them through 3.4s, recording what moves.

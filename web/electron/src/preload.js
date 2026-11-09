@@ -18,14 +18,30 @@ const { contextBridge, ipcRenderer, webFrame, webUtils } = require("electron");
 
 // Native window controls stay in window pixels while the page zooms.
 if (process.platform === "darwin") {
+  const setFullScreenAttribute = (fullScreen) => {
+    document.documentElement.toggleAttribute("data-electron-full-screen", fullScreen === true);
+  };
   const syncTitlebarZoom = () => {
     document.documentElement.style.setProperty(
       "--omnigent-electron-zoom",
       String(webFrame.getZoomFactor()),
     );
   };
-  window.addEventListener("DOMContentLoaded", syncTitlebarZoom, { once: true });
+  window.addEventListener(
+    "DOMContentLoaded",
+    () => {
+      syncTitlebarZoom();
+      void ipcRenderer
+        .invoke("omnigent:is-full-screen")
+        .then(setFullScreenAttribute)
+        .catch(() => {});
+    },
+    { once: true },
+  );
   window.addEventListener("resize", syncTitlebarZoom);
+  ipcRenderer.on("omnigent:full-screen-changed", (_event, fullScreen) => {
+    setFullScreenAttribute(fullScreen);
+  });
 }
 
 // Collapse the update states the in-page UpdateBanner renders on
@@ -114,9 +130,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /**
    * Subscribe to native menu commands for this window (Close, New Terminal,
    * New Browser Tab, Pin/Archive Session). `browserViewId` names the embedded
-   * browser view that held focus when Close fired, else null. Returns an
-   * unsubscribe function.
-   * @param {(payload: {command: string, browserViewId: string | null}) => void} callback
+   * browser view that held focus when Close fired, else null; `quitDetail` says
+   * what Quit stops, for its prompt. Returns an unsubscribe function.
+   * @param {(payload: {command: string, browserViewId: string | null, closingQuits: boolean, quitDetail: string | null}) => void} callback
    * @returns {() => void}
    */
   onDesktopCommand: (callback) => {
@@ -126,6 +142,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
         command: payload.command,
         browserViewId: typeof payload.browserViewId === "string" ? payload.browserViewId : null,
         closingQuits: payload.closingQuits === true,
+        quitDetail: typeof payload.quitDetail === "string" ? payload.quitDetail : null,
       });
     };
     ipcRenderer.on("omnigent:desktop-command", listener);
@@ -146,6 +163,37 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   },
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow: () => ipcRenderer.invoke("omnigent:close-window"),
+  /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
+  confirmQuit: (options) =>
+    ipcRenderer.invoke("omnigent:confirm-quit", { dontAskAgain: options?.dontAskAgain === true }),
+  // macOS ships system Dictation; elsewhere the composer mic needs server dictation.
+  ...(process.platform === "darwin"
+    ? {
+        /** Start macOS Dictation in the focused field. Resolves whether it started. */
+        startSystemDictation: () => ipcRenderer.invoke("omnigent:start-system-dictation"),
+      }
+    : {}),
+  /** The "Show Omnigent from anywhere" shortcut (off by default). */
+  getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
+  /**
+   * Saves `{ enabled, accelerator }`, or turns the shortcut off for `{ enabled: false }`,
+   * keeping the saved chord. Resolves `{ ok, setting?, error? }`; `ok: false` means the
+   * saved setting is unchanged.
+   */
+  setGlobalShortcut: ({ enabled, accelerator } = {}) =>
+    ipcRenderer.invoke(
+      "omnigent:set-global-shortcut",
+      enabled !== true && accelerator === undefined
+        ? { enabled: false }
+        : { enabled: enabled === true, accelerator: String(accelerator ?? "") },
+    ),
+  /**
+   * Takes the next chord in the shell, before the page's shortcuts and the menu see it.
+   * Resolves its accelerator, or null when Escape or the cancel call ends recording.
+   */
+  recordGlobalShortcut: () => ipcRenderer.invoke("omnigent:record-global-shortcut"),
+  cancelGlobalShortcutRecording: () =>
+    ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
   takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
@@ -311,8 +359,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * active one). Pass null to detach everything (no pane mounted).
    * @param {string | null} conversationId
    */
-  browserSetActive: (conversationId) =>
-    ipcRenderer.invoke("omnigent:browser-set-active", { conversationId }),
+  browserSetActive: (conversationId, options) =>
+    ipcRenderer.invoke("omnigent:browser-set-active", {
+      conversationId,
+      focus: options?.focus === true,
+    }),
+  /** The attached browser page's view id if it has keyboard focus, else null. */
+  browserFocusedView: () => ipcRenderer.invoke("omnigent:browser-focused-view"),
   /**
    * Hide (true) or show (false) the active browser view while a DOM overlay is
    * open, so the native layer doesn't cover dialogs/menus/tooltips/toasts.
