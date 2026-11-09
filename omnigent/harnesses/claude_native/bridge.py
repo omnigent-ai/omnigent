@@ -10724,19 +10724,23 @@ def _user_transcript_items_from_entry(
         # builds; newer builds use top-level ``local_command`` records.
         # In both shapes, surface the command and result as their own
         # transcript group instead of inheriting the previous assistant
-        # response id.
-        terminal_response_id = (
-            fallback_response_id
-            if _BASH_INPUT_RE.search(content) is not None
-            else current_response_id or fallback_response_id
-        )
-        terminal_items = _terminal_command_items_from_content(
-            content,
-            source_key=source_key,
-            response_id=terminal_response_id,
-        )
-        if terminal_items:
-            return terminal_response_id, terminal_items
+        # response id. Such a record starts with its ``<bash-*>`` markup; a
+        # prompt that merely quotes the markup (a pasted log) is the person's
+        # message, and parsing it as a command would leave the web message it
+        # answers unsettled, reported as never recorded.
+        if stripped.startswith("<bash-"):
+            terminal_response_id = (
+                fallback_response_id
+                if _BASH_INPUT_RE.search(content) is not None
+                else current_response_id or fallback_response_id
+            )
+            terminal_items = _terminal_command_items_from_content(
+                content,
+                source_key=source_key,
+                response_id=terminal_response_id,
+            )
+            if terminal_items:
+                return terminal_response_id, terminal_items
         # Other CLI-scaffolding records (stdout/stderr from /effort, etc.)
         # arrive as standalone ``role=user`` records and must drop instead
         # of leaking as user bubbles.

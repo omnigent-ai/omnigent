@@ -2047,22 +2047,20 @@ def test_read_transcript_items_from_offset_warns_on_unmirrored_human_prompt(
     """
     A human-typed prompt that yields no user message is logged by shape.
 
-    A web message whose pasted text quotes Claude's shell markup parses as a
-    terminal command, so the server never sees its user message and later
-    reports it as never recorded. Plain prompts and real command echoes stay
-    quiet, and the warning never carries the prompt text.
+    A human prompt the forwarder drops as CLI scaffolding leaves the web
+    message it answers unsettled, so the server later reports it as never
+    recorded. Plain prompts and real command echoes stay quiet, and the
+    warning never carries the prompt text.
     """
-    pasted_logs = (
-        '\n\n<pasted_content id="a1">\nwhy did this fail?\n'
-        "<bash-input>make test</bash-input><bash-stdout>secret-output</bash-stdout>\n"
-        '</pasted_content id="a1">\n'
-    )
     records = [
         {
             "type": "user",
             "uuid": "lost",
             "origin": {"kind": "human"},
-            "message": {"role": "user", "content": pasted_logs},
+            "message": {
+                "role": "user",
+                "content": "<command-args>secret-output</command-args> what does this mean?",
+            },
         },
         {
             "type": "user",
@@ -2087,14 +2085,63 @@ def test_read_transcript_items_from_offset_warns_on_unmirrored_human_prompt(
             transcript_path, 0, start_line=0, agent_name="claude-native-ui"
         )
 
-    lost_types = {item.item_type for item in result.items if item.source_id.startswith("lost:")}
-    assert lost_types == {"terminal_command"}
+    assert not [item for item in result.items if item.source_id.startswith("lost:")]
     warnings = [r.getMessage() for r in caplog.records if "human prompt record" in r.getMessage()]
     assert len(warnings) == 1
     assert "line=1 " in warnings[0]
-    assert "has_shell_markup=True" in warnings[0]
-    assert "item_types=['terminal_command']" in warnings[0]
+    assert "has_command_markup=False" in warnings[0]
+    assert "item_types=[]" in warnings[0]
     assert "secret-output" not in warnings[0]
+
+
+def test_user_prompt_quoting_shell_markup_is_mirrored_as_a_message(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A pasted log that quotes ``<bash-*>`` markup is the person's prompt.
+
+    Only a record that starts with the markup is a shell command. Parsing the
+    quoted markup as a terminal command dropped the user message, so the web
+    message it answered was later reported as never recorded.
+    """
+    pasted_logs = (
+        '\n\n<pasted_content id="a1">\nwhy did this fail?\n'
+        "<bash-input>make test</bash-input><bash-stdout>boom</bash-stdout>\n"
+        '</pasted_content id="a1">\n'
+    )
+    records = [
+        {
+            "type": "user",
+            "uuid": "prompt",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": pasted_logs},
+        },
+        {
+            "type": "user",
+            "uuid": "shell",
+            "message": {"role": "user", "content": "<bash-input>pwd</bash-input>"},
+        },
+    ]
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.bridge"):
+        result = read_transcript_items_from_offset(
+            transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+        )
+
+    by_record = {item.source_id.split(":")[0]: item for item in result.items}
+    assert by_record["prompt"].item_type == "message"
+    assert by_record["prompt"].data["role"] == "user"
+    assert by_record["prompt"].data.get("is_meta") is not True
+    assert by_record["prompt"].data["content"][0]["text"] == (
+        "why did this fail?\n<bash-input>make test</bash-input><bash-stdout>boom</bash-stdout>"
+    )
+    assert by_record["shell"].item_type == "terminal_command"
+    assert not [r for r in caplog.records if "human prompt record" in r.getMessage()]
 
 
 def test_read_transcript_items_from_offset_preserves_partial_trailing_line(
