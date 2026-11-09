@@ -1005,6 +1005,78 @@ def test_preload_codex_thread_retries_provider_mismatch_once(
     assert fake_client.closed is (retry_refused or not retain_client)
 
 
+_PROVIDER_NOT_CONFIGURED = {
+    "code": -32600,
+    "message": "This chat uses model provider “Databricks”, which is no longer configured.",
+    "data": {"type": "modelProviderNotConfigured", "modelProvider": "Databricks"},
+}
+
+
+class _ConfiguredProviderResumeClient(_ScriptedResumeClient):
+    """Scripted resume client whose ``config/read`` reports *effective_provider*."""
+
+    def __init__(self, errors: list[Exception], effective_provider: str | None) -> None:
+        super().__init__(errors)
+        self.effective_provider = effective_provider
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method != "config/read":
+            return await super().request(method, params)
+        self.requests.append((method, params))
+        return {"result": {"config": {"model_provider": self.effective_provider}}}
+
+
+@pytest.mark.parametrize(
+    ("launch_provider", "effective_provider", "restamped_to"),
+    [
+        ("omnigent_databricks", None, "omnigent_databricks"),
+        (None, "omnigent_databricks", "omnigent_databricks"),
+        (None, None, None),
+        (None, "Databricks", None),
+    ],
+    ids=["pinned_launch", "config_selected", "no_provider", "same_missing_provider"],
+)
+def test_preload_codex_thread_moves_unconfigured_thread_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    launch_provider: str | None,
+    effective_provider: str | None,
+    restamped_to: str | None,
+) -> None:
+    """A thread whose recorded provider is gone resumes under the launch's provider."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = b'{"type":"session_meta","payload":{"model_provider":"Databricks"}}\n'
+    rollout.write_bytes(original)
+    refusal = codex_native_app_server.CodexAppServerResponseError(_PROVIDER_NOT_CONFIGURED)
+    fake_client = _ConfiguredProviderResumeClient([refusal], effective_provider)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    preload = codex_native_app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:9876",
+        "thread_test",
+        model_provider=launch_provider,
+        rollout_path=rollout,
+    )
+
+    if restamped_to is None:
+        with pytest.raises(codex_native_app_server.CodexAppServerResponseError) as raised:
+            asyncio.run(preload)
+        assert raised.value is refusal
+        assert rollout.read_bytes() == original
+        assert [method for method, _params in fake_client.requests] == [
+            "thread/resume",
+            "config/read",
+        ]
+    else:
+        assert asyncio.run(preload) is None
+        resumes = [params for method, params in fake_client.requests if method == "thread/resume"]
+        assert len(resumes) == 2
+        assert resumes[1]["modelProvider"] == restamped_to
+        assert json.loads(rollout.read_text())["payload"]["model_provider"] == restamped_to
+    assert fake_client.closed
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [
