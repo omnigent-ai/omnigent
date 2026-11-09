@@ -190,11 +190,35 @@ A task that continues a session replaces steps 2 to 4 once it has a
 `session_id`: it checks the session, wakes its runner the way a user message
 would, and sends the prompt, also while the session is busy with an earlier turn.
 It records `succeeded` once the prompt is delivered, without waiting for the turn.
+Trigger automations are the exception. A trigger automation is such a task whose
+prompt starts with the opening sentence of a Jira, Slack, GitHub, Linear or
+PagerDuty trigger template, the same check the web form uses. The database scheduler
+checks a trigger again two minutes after each poll (`TRIGGER_POLL_SECONDS`)
+instead of on its saved schedule, though never past the schedule's next
+occurrence: a schedule that ends (`COUNT` or `UNTIL`) still ends the trigger,
+and its last occurrence is sent even while the session is busy. It also
+configures the store so that a trigger
+that is created or resumed, or edited into a trigger, is first checked two
+minutes later; after an upgrade, an existing trigger switches over at its next
+saved poll. Before claiming a poll, the scheduler asks the check built by
+`build_busy_until` when the session can be polled. A session that shows as
+running (a turn in progress, or waiting on an approval or question) is checked
+again two minutes later. An idle one is polled once it has been quiet for two
+minutes after its last change (`updated_at`), since an agent can pause between
+steps. Either way, a poll goes out once the latest run went out (`fired_at`) ten
+minutes ago, so a stale status cannot stall the trigger. A skip only moves
+`next_run_at` to the next check: it writes no run row and logs
+`scheduled_run_skipped_busy`. The
+status is read from session activity, which needs no caller access check, so the
+poll does not act as the owner. A failed check sends the prompt. Other continued
+tasks, legacy timers and a scheduler with a custom `on_fire` hook (it has no busy
+check) follow the saved schedule and never skip, and neither does Run now.
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run
 never finds a recorded session it cannot continue. Of two first runs, the one that records
-second deletes its unused session and records `skipped`.
+second deletes its unused session and sends its prompt into the recorded session
+through the normal continuation path. Each run keeps its own prompt and run record.
 Sandbox tasks accept an optional repository URL in `workspace`, validated with
 the same repository grammar as a new sandbox session. The selected repository is
 passed to sandbox launch and recorded in the session's repository labels for
@@ -792,9 +816,9 @@ UI events use the host-provided `OmnigentHostConfig.analytics` sink:
 | UI creation attempts, successes, failures, latency | `interactionKind=create_scheduled_task`: `phase=start`, then `phase=complete` with `status=success` or `failure` and duration. `name` is the template ID. |
 | UI / agent / API share | `scheduled_task_created` grouped by `creation_source`. |
 
-Template IDs are bounded: `custom`, `jira`, `slack`, `github`, `linear`,
+Template IDs are bounded: `custom`, `jira`, `slack`, `github`, `linear`, `pagerduty`,
 `follow-up-monitor`, `pr-sweep`, `news-digest`, or server-side `unknown` for
-unattributed/older clients. The current gallery offers Jira, Slack, GitHub, and Linear;
+unattributed/older clients. The current gallery offers Jira, Slack, GitHub, Linear, and PagerDuty;
 the three retired suggestion IDs remain accepted for older clients. Attribution records the selected template even if
 its prompt is edited. No task name, prompt, Jira query, channel, or repository
 text is recorded in these events. Attribution headers are diagnostic client claims;

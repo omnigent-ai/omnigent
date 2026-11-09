@@ -231,7 +231,7 @@ Modal guide.
   isolation between Omnigent users rides on E2B's sandbox boundaries, and
   the shared key can enumerate and kill any user's sandbox. Scope the
   account to this workload.
-- **The launch token's lifetime is ~25 h, derived from the *requested*
+- **The host token's default validity window is ~25 h, derived from the *requested*
   lifetime.** E2B sandboxes share Modal's 24 h hard cap, so the per-launch
   host token outlives the sandbox by an hour to re-authenticate the tunnel
   across reconnects. The TTL is computed from `OMNIGENT_E2B_MAX_LIFETIME_S`
@@ -240,9 +240,10 @@ Modal guide.
   (e.g. Hobby's 1 h), the token over-covers the now-shorter sandbox — safe
   for re-auth, but a leaked token is replayable for the full window. To
   tighten this, **set `OMNIGENT_E2B_MAX_LIFETIME_S` to your account cap** so
-  the token TTL tracks the granted lifetime (or set a shorter `token_ttl_s`
-  on a directly-constructed `ManagedSandboxConfig`). A relaunch mints a
-  fresh token.
+  the default token TTL tracks the granted lifetime, or override
+  [`sandbox.token_ttl_s`](../README.md#run-hosts-in-cloud-sandboxes).
+  Connected hosts renew the same token halfway through its window, extending
+  the validity of any leaked copy too. A relaunch mints a fresh token.
 - **Sandbox URLs are public by default.** E2B exposes sandbox ports via
   public `*.e2b.app` URLs; Omnigent never opens one (the host dials *out*
   to your server), but be aware nothing in a sandbox should bind a

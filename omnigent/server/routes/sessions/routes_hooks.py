@@ -71,6 +71,7 @@ from omnigent.server.routes._content_type import (
     require_json_content_type,
 )
 from omnigent.server.routes._sessions.common import (
+    _CLAUDE_NATIVE_EDIT_TOOLS,
     _EVALUATE_HOOK_ELICITATION_ID_RE,
     _TURN_ACTOR_LABEL,
     _llm_response_denied_turns,
@@ -175,7 +176,10 @@ async def _build_policy_engine_serialized(
 
 
 def _no_policy_allow_body(
-    caps: RuntimeCaps, session_id: str, policy_store: PolicyStore | None
+    caps: RuntimeCaps,
+    session_id: str,
+    policy_store: PolicyStore | None,
+    root_session_id: str | None = None,
 ) -> dict[str, object]:
     """Build the ALLOW body for an evaluation where no policies apply.
 
@@ -187,6 +191,8 @@ def _no_policy_allow_body(
     :param caps: The server's runtime caps.
     :param session_id: The evaluated session, e.g. ``"conv_abc123"``.
     :param policy_store: The policy store the no-policy answer read.
+    :param root_session_id: The session's tree root, e.g. ``"conv_root"``,
+        whose inherited policy list the answer also read.
     :returns: The response body, e.g.
         ``{"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 42.5}``.
     """
@@ -203,7 +209,7 @@ def _no_policy_allow_body(
         _logger.warning("native hook allow-cache window %r is not finite; not caching", seconds)
         return body
     seconds = min(seconds, MAX_ALLOW_CACHE_SECONDS)
-    seconds -= policy_specs_cache_age(session_id, policy_store)
+    seconds -= policy_specs_cache_age(session_id, policy_store, root_session_id)
     if seconds > 0:
         body[ALLOW_CACHE_FIELD] = seconds
     return body
@@ -472,6 +478,14 @@ def register_hooks_routes(
             and tool_input
         ):
             extras["exit_plan_mode"] = tool_input
+        # The full input lets the UI show an edit as a diff; content_preview is truncated.
+        if (
+            is_claude
+            and tool_name in _CLAUDE_NATIVE_EDIT_TOOLS
+            and isinstance(tool_input, dict)
+            and tool_input
+        ):
+            extras["file_edit"] = {"tool_name": tool_name, "tool_input": tool_input}
         asking_name = native_agent.display_name if native_agent is not None else hook_label
         asking_vendor = (
             _NATIVE_POLICY_VENDORS.get(native_agent.key, native_agent.key)
@@ -1005,7 +1019,11 @@ def register_hooks_routes(
             conversation=conv,
         ):
             return Response(
-                content=json.dumps(_no_policy_allow_body(_caps, session_id, policy_store)),
+                content=json.dumps(
+                    _no_policy_allow_body(
+                        _caps, session_id, policy_store, conv.root_conversation_id
+                    )
+                ),
                 media_type="application/json",
             )
 
