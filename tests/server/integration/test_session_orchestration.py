@@ -1018,8 +1018,8 @@ async def test_startup_queue_admission_and_replay(
         else:
             write_peer_session_messaging_override(False)
 
-    async def check_startup(*args):
-        result = await accepts(*args)
+    async def check_startup(*args, **kwargs):
+        result = await accepts(*args, **kwargs)
         assert result is True
         if before_admission:
             restrict_source()
