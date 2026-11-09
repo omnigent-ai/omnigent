@@ -48,7 +48,10 @@ MAX_ACTIONS_PER_ITEM = 3
 # The unread badge counts up to this many; GET reports when the count is capped.
 UNREAD_COUNT_LIMIT = 100
 _POST_ACTION = "Inbox posts"
-_ITEM_ID = re.compile(r"^[0-9a-f]{32}$")
+_ITEM_ID = re.compile(r"[0-9a-f]{32}")
+_CURSOR = re.compile(r"([0-9]{1,19}):([0-9a-f]{32})")
+# Matches the ``topic`` column, measured after normalization.
+MAX_TOPIC_CHARS = 128
 
 InboxItemKind = Literal["followup", "info", "reminder"]
 InboxItemState = Literal["unread", "read", "done", "dismissed"]
@@ -132,10 +135,10 @@ def _item_json(item: InboxItem) -> dict[str, Any]:
 def _parse_cursor(after: str | None) -> tuple[int, str] | None:
     if after is None:
         return None
-    created_at, _, item_id = after.partition(":")
-    if not created_at.isdigit() or _ITEM_ID.match(item_id) is None:
+    match = _CURSOR.fullmatch(after)
+    if match is None:
         raise OmnigentError("Invalid Inbox cursor", code=ErrorCode.INVALID_INPUT)
-    return int(created_at), item_id
+    return int(match.group(1)), match.group(2)
 
 
 def create_inbox_items_router(
@@ -219,8 +222,12 @@ def create_inbox_items_router(
         inputs = DedupeInputs(
             kind=body.kind, primary_link=primary_link, topic=normalize_topic(body.topic)
         )
-        if not inputs.topic:
-            raise OmnigentError("topic must contain a word", code=ErrorCode.INVALID_INPUT)
+        if not inputs.topic or len(inputs.topic) > MAX_TOPIC_CHARS:
+            raise OmnigentError(
+                f"topic must contain a word and be at most {MAX_TOPIC_CHARS} characters "
+                "once lowercased",
+                code=ErrorCode.INVALID_INPUT,
+            )
         match = await asyncio.to_thread(
             lambda: find_duplicate(store, owner, inputs, now=int(time.time()))
         )
@@ -300,7 +307,7 @@ def create_inbox_items_router(
     ) -> dict[str, Any]:
         """Record the caller's response to one of their items."""
         owner = _owner(request)
-        if _ITEM_ID.match(item_id) is None:
+        if _ITEM_ID.fullmatch(item_id) is None:
             raise OmnigentError("Inbox item not found", code=ErrorCode.NOT_FOUND)
         if body.resolution_action is not None:
             current = await asyncio.to_thread(store.get, item_id, owner)

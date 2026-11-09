@@ -39,12 +39,20 @@ def test_other_links() -> None:
         == "docs.example.com/a?x=1"
     )
     assert canonical_link({"type": "url", "ref": "  "}) is None
+    assert canonical_link({"type": "url", "ref": "https://example.test:443/a"}) == "example.test/a"
+    assert canonical_link({"type": "url", "ref": "https://example.test:8443/a"}) != canonical_link(
+        {"type": "url", "ref": "https://example.test:9443/a"}
+    )
 
 
 @pytest.mark.parametrize(
     "link",
-    [{"type": "url", "ref": "https://["}, {"type": "session", "ref": "s" * 2048}],
-    ids=["unparseable", "too-long-once-canonical"],
+    [
+        {"type": "url", "ref": "https://["},
+        {"type": "url", "ref": "https://example.test:99999/a"},
+        {"type": "session", "ref": "s" * 2048},
+    ],
+    ids=["unparseable", "bad-port", "too-long-once-canonical"],
 )
 def test_links_the_server_cannot_store_are_rejected(link: dict[str, str]) -> None:
     with pytest.raises(InvalidLinkError):

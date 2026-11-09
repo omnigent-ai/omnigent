@@ -79,8 +79,8 @@ def canonical_link(link: Mapping[str, Any]) -> str | None:
 
     Sessions become ``session:<id>``. GitHub pull request URLs keep only
     ``github.com/<owner>/<repo>/pull/<n>``, dropping subpages such as
-    ``/files``. Other URLs drop the scheme, fragment, and trailing slash and
-    lowercase the host.
+    ``/files``. Other URLs drop the scheme, fragment, trailing slash, and
+    default port, and lowercase the host.
 
     :param link: A link with ``type`` and ``ref``.
     :returns: The canonical form, or ``None`` when ``ref`` is empty.
@@ -96,6 +96,7 @@ def canonical_link(link: Mapping[str, Any]) -> str | None:
         try:
             parts = urlsplit(ref if "://" in ref else f"https://{ref}")
             host = (parts.hostname or "").lower()
+            port = parts.port
         except ValueError as exc:
             raise InvalidLinkError(f"invalid link: {exc}") from exc
         if host == "www.github.com":
@@ -107,7 +108,9 @@ def canonical_link(link: Mapping[str, Any]) -> str | None:
             canonical = f"github.com/{owner.lower()}/{repo.lower()}/pull/{number}"
         else:
             query = f"?{parts.query}" if parts.query else ""
-            canonical = f"{host}{path}{query}"
+            # Different ports are different services; default ports are dropped.
+            netloc = host if port in (None, 80, 443) else f"{host}:{port}"
+            canonical = f"{netloc}{path}{query}"
     if len(canonical) > MAX_CANONICAL_LINK_CHARS:
         raise InvalidLinkError("link is too long")
     return canonical

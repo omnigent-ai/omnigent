@@ -144,7 +144,9 @@ class InboxItemStore(ABC):
         """Apply the owner's response to an item.
 
         Moving out of ``unread`` stamps ``read_at`` once. Setting a resolution
-        other than ``"none"`` stamps ``acted_at``.
+        other than ``"none"`` stamps ``acted_at``. Without a resolution, *state*
+        changes only an open (unread or read) item, so a late read mark cannot
+        reopen a resolved one.
 
         :param item_id: Hex UUID of the item.
         :param user_id: The owner the item must belong to.
