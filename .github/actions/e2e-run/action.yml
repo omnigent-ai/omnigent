@@ -133,9 +133,23 @@ runs:
       # without the jcode binary refuses the launch ("harness 'jcode' is not
       # configured") and the runner never appears. Pin the version so CI is
       # deterministic; bump to match the image bake's default when it moves.
+      # The vendor installer downloads the release from GitHub on every job and,
+      # when every download fails (as under release-download throttling), falls
+      # back to a cargo build the runner can't do. Retry before failing the shard.
       shell: bash
       run: |
-        sudo bash "${GITHUB_WORKSPACE}/deploy/docker/install-harness-cli.sh" jcode@v0.84.0
+        for attempt in 1 2 3; do
+          if sudo bash "${GITHUB_WORKSPACE}/deploy/docker/install-harness-cli.sh" jcode@v0.84.0; then
+            exit 0
+          fi
+          if [ "$attempt" -lt 3 ]; then
+            delay=$((attempt * 30))
+            echo "::warning::jcode install attempt ${attempt}/3 failed; retrying in ${delay}s"
+            sleep "$delay"
+          fi
+        done
+        echo "::error::jcode install failed after 3 attempts"
+        exit 1
 
     - name: Build pinned old server (backwards-compat only)
       # Only runs when server_version is set. Builds the released tag into an
