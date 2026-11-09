@@ -1,6 +1,6 @@
 import { ArrowLeftIcon, MenuIcon, PanelLeftIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Button } from "@/components/ui/button";
+import { MobileHeaderButton } from "./MobileHeaderButton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 
@@ -55,7 +55,7 @@ export function SidebarOpenButton({
       }}
     >
       <TooltipTrigger asChild>
-        <Button
+        <MobileHeaderButton
           type="button"
           variant="ghost"
           size={size}
@@ -78,7 +78,7 @@ export function SidebarOpenButton({
           ) : (
             <PanelLeftIcon className="size-4" />
           )}
-        </Button>
+        </MobileHeaderButton>
       </TooltipTrigger>
       <TooltipContent side="bottom">{label}</TooltipContent>
     </Tooltip>

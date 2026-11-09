@@ -198,12 +198,14 @@ def test_host_and_runner_discover_the_same_custom_config_directory(
     (directory / "SKILL.md").write_text(_skill("custom"))
     monkeypatch.setenv(variable, str(config_dir))
     expected_names = {"custom"}
+    tiers = [(".agents", "portable")]
     if harness == "claude-native":
-        for tier, name in ((".claude", "native"), (".agents", "portable")):
-            skill = tmp_path / tier / "skills" / name / "SKILL.md"
-            skill.parent.mkdir(parents=True)
-            skill.write_text(_skill(name))
-            expected_names.add(name)
+        tiers.append((".claude", "native"))
+    for tier, name in tiers:
+        skill = tmp_path / tier / "skills" / name / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(_skill(name))
+        expected_names.add(name)
     discovery = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
     frame = HostSkillsFrame("request", harness, str(tmp_path))
     host_catalog = discovery.discover(frame, tmp_path)

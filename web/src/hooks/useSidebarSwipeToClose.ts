@@ -5,20 +5,26 @@ import { useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 
 // Travel (CSS px) before a touch is classified as a horizontal swipe rather
 // than a tap or a vertical scroll of the session list.
-const DECIDE_SLOP_PX = 12;
+export const DECIDE_SLOP_PX = 12;
 // Fraction of the drawer's width the finger must cover to close on release.
 // Mirrors the iOS shell's open threshold so both directions feel the same.
-const CLOSE_DISTANCE_FRACTION = 0.33;
+export const SWIPE_SETTLE_FRACTION = 0.33;
 // Leftward flick speed (CSS px/ms) that closes regardless of distance. Mirrors
 // the iOS shell's 600 pt/s open velocity.
-const CLOSE_FLICK_VELOCITY = 0.6;
+export const SWIPE_FLICK_VELOCITY = 0.6;
 // A finger that rested this long before lifting is not flicking.
-const FLICK_MAX_IDLE_MS = 100;
+export const FLICK_MAX_IDLE_MS = 100;
 // Flick speed is the finger's travel over this trailing window, so one jittery
 // or coalesced touchmove can't read as a flick on its own.
 const VELOCITY_WINDOW_MS = 100;
 
-interface TouchSample {
+/** Append a touch sample, keeping the newest one at or before the velocity window start. */
+export function recordTouchSample(samples: TouchSample[], x: number, time: number): void {
+  samples.push({ x, time });
+  while (samples.length > 2 && samples[1].time <= time - VELOCITY_WINDOW_MS) samples.shift();
+}
+
+export interface TouchSample {
   x: number;
   time: number;
 }
@@ -27,7 +33,7 @@ interface TouchSample {
  * Average speed (leftward is negative) over the trailing window. `samples[0]` is
  * the newest sample at or before the window start, if the gesture is that old.
  */
-function windowVelocity(samples: TouchSample[]): number {
+export function windowVelocity(samples: TouchSample[]): number {
   const latest = samples.at(-1);
   if (!latest || samples.length < 2) return 0;
   const windowStart = latest.time - VELOCITY_WINDOW_MS;
@@ -45,7 +51,7 @@ function windowVelocity(samples: TouchSample[]): number {
 }
 
 /** True when `target` sits inside content that can itself scroll horizontally. */
-function startsInHorizontalScroller(target: EventTarget | null, boundary: Element): boolean {
+export function startsInHorizontalScroller(target: EventTarget | null, boundary: Element): boolean {
   let node = target instanceof Element ? target : null;
   while (node && node !== boundary) {
     if (node.scrollWidth > node.clientWidth + 1) {
@@ -108,11 +114,7 @@ export function useSidebarSwipeToClose({
       dragging = false;
       samples = [];
     };
-    const recordSample = (x: number, time: number) => {
-      samples.push({ x, time });
-      // Keep the newest sample at or before the window start as its reference.
-      while (samples.length > 2 && samples[1].time <= time - VELOCITY_WINDOW_MS) samples.shift();
-    };
+    const recordSample = (x: number, time: number) => recordTouchSample(samples, x, time);
 
     const onTouchStart = (event: TouchEvent) => {
       // A second finger ends the current drag where it is, like a cancel.
@@ -166,8 +168,8 @@ export function useSidebarSwipeToClose({
         const flicking =
           event !== null &&
           event.timeStamp - lastMoveTime <= FLICK_MAX_IDLE_MS &&
-          windowVelocity(samples) <= -CLOSE_FLICK_VELOCITY;
-        const close = flicking || progress <= 1 - CLOSE_DISTANCE_FRACTION;
+          windowVelocity(samples) <= -SWIPE_FLICK_VELOCITY;
+        const close = flicking || progress <= 1 - SWIPE_SETTLE_FRACTION;
         // A completed drag must not also activate the row under the finger.
         if (event?.cancelable) event.preventDefault();
         callbacks.current.onDragProgress(null);

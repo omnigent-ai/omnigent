@@ -4,6 +4,7 @@
 // around the image.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // getEmbedRoot decides the Radix portal container; null → portal to body.
@@ -46,6 +47,19 @@ describe("ZoomableImage + ImageLightboxProvider", () => {
     const dialogImg = screen.getAllByRole("img", { name: "diagram" }).at(-1)!;
     expect(dialog).toContainElement(dialogImg);
     expect(dialogImg).toHaveAttribute("src", "/pic.png");
+  });
+
+  it("opens the full image from a focused thumbnail with Enter", async () => {
+    renderWithProvider();
+    screen.getByRole("button", { name: "Zoom image: diagram" }).focus();
+
+    await userEvent.keyboard("{Enter}");
+
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getAllByRole("img", { name: "diagram" }).at(-1)).toHaveAttribute(
+      "src",
+      "/pic.png",
+    );
   });
 
   it("closes the dialog with Escape", () => {

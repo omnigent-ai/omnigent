@@ -99,6 +99,13 @@ deploy/
 ├── microsandbox/      ← microsandbox sandbox-provider guide (local libkrun
 │   └── README.md         microVMs, embedded SDK, no daemon); NOT a server target.
 │
+├── aws-lambda-microvm/ ← AWS Lambda MicroVMs sandbox-provider guide + MicroVM
+│   ├── Dockerfile        image build inputs (hooks shim on the host image);
+│   ├── entrypoint.sh     server-managed only. NOT a server deploy target.
+│   ├── hooks_server.py
+│   ├── start_host.sh
+│   └── README.md
+│
 ├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
 │   ├── databricks.yml     bundle declarative config
 │   ├── deploy.py          build + `bundle deploy`/`run` orchestrator
@@ -368,6 +375,36 @@ Gensee reads `GENSEE_CONTROLLER_API_TOKEN`; see
 All credentials come from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
+
+**Host token expiry.** Set `sandbox.token_ttl_s` to control the token validity
+window in seconds. Omitted or `null` keeps the provider default (seven days
+for most providers; Modal uses 25 hours, and Blaxel, E2B, and CoreWeave derive
+it from sandbox lifetime). Values must be integers from `300` to `31536000`
+(5 minutes to 365 days). Allow enough time for sandbox startup and repository
+setup before the first host connection.
+
+```yaml
+sandbox:
+  server_url: https://your-host
+  token_ttl_s: 86400                 # shared default: 1 day
+  providers:
+    - provider: daytona
+    - provider: kubernetes
+      token_ttl_s: 604800            # override: 7 days
+```
+
+With a single `provider`, put `token_ttl_s` beside it. In a `providers` list,
+an entry can override the shared value or use `null` to restore its provider
+default. Restart the server after editing the configuration. The setting
+applies to newly issued tokens and future renewals; lowering it does not
+shorten an expiry already granted to an existing token.
+
+Connected hosts renew the same token halfway through this window, on the next
+heartbeat. Ordinary heartbeats keep their existing cost. Expiry is measured
+from the last renewal; disconnected hosts receive no renewals, and an expired
+token cannot open a new connection. Renewal also extends the validity of any
+leaked copy of that token. This setting does not change sandbox lifetime or
+Mac/Arca user-login credentials.
 
 The optional reaper runs once for the whole `sandbox:` deployment, including
 multi-provider configurations. It queries managed host rows directly and

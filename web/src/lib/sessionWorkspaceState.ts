@@ -42,9 +42,10 @@ export interface SessionWorkspaceState {
   selectedTerminalKey?: string | null;
   openBrowsers?: string[];
   selectedBrowserId?: string | null;
-  /** Ordered list of open side-chat tabs (child conversation ids). Browser-local
-   *  by design: side chats are ephemeral and vanish when the app is closed. */
+  /** Ordered list of open side-chat tabs (child conversation ids). */
   openSideChats?: string[];
+  /** Side chats closed on this device; discovery must not reopen them. */
+  closedSideChats?: string[];
   /** Open sub-agent tabs (`subagentTabId` values) in open order, shown after the side chats. */
   openSubagentTabs?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
@@ -61,7 +62,7 @@ const MAX_SESSIONS = 100;
 // Cap the open-file tabs persisted per session so one session that churns
 // through many files can't bloat the store. Tabs are appended in open order, so
 // the most-recent (tail) entries are kept.
-const MAX_OPEN_FILES = 20;
+export const MAX_OPEN_TABS = 20;
 
 function isValidWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -132,6 +133,8 @@ function sanitize(entry: unknown): SessionWorkspaceState {
     state.selectedBrowserId = record.selectedBrowserId;
   }
   if (Array.isArray(record.openSideChats)) state.openSideChats = uniqueIds(record.openSideChats);
+  if (Array.isArray(record.closedSideChats))
+    state.closedSideChats = uniqueIds(record.closedSideChats);
   if (Array.isArray(record.openSubagentTabs))
     state.openSubagentTabs = uniqueIds(record.openSubagentTabs);
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
@@ -190,24 +193,24 @@ export function saveSessionWorkspaceState(
   const prev = existingIdx >= 0 ? store[existingIdx].state : {};
   const next = { ...prev, ...patch };
   // Keep only the most-recent open-file tabs (tabs are appended in open order).
-  if (next.openFiles && next.openFiles.length > MAX_OPEN_FILES) {
-    next.openFiles = next.openFiles.slice(-MAX_OPEN_FILES);
+  if (next.openFiles && next.openFiles.length > MAX_OPEN_TABS) {
+    next.openFiles = next.openFiles.slice(-MAX_OPEN_TABS);
   }
   // Same bound for shell tabs (also appended in open order).
-  if (next.openTerminals && next.openTerminals.length > MAX_OPEN_FILES) {
-    next.openTerminals = next.openTerminals.slice(-MAX_OPEN_FILES);
+  if (next.openTerminals && next.openTerminals.length > MAX_OPEN_TABS) {
+    next.openTerminals = next.openTerminals.slice(-MAX_OPEN_TABS);
   }
   // Same bound for browser tabs. Native view creation enforces its own lower
   // runtime cap; this keeps the persisted rail from growing without bound.
-  if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_FILES) {
-    next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_FILES);
+  if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_TABS) {
+    next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_TABS);
   }
   // Same bound for side-chat tabs (also appended in open order).
-  if (next.openSideChats && next.openSideChats.length > MAX_OPEN_FILES) {
-    next.openSideChats = next.openSideChats.slice(-MAX_OPEN_FILES);
+  if (next.openSideChats && next.openSideChats.length > MAX_OPEN_TABS) {
+    next.openSideChats = next.openSideChats.slice(-MAX_OPEN_TABS);
   }
-  if (next.openSubagentTabs && next.openSubagentTabs.length > MAX_OPEN_FILES) {
-    next.openSubagentTabs = next.openSubagentTabs.slice(-MAX_OPEN_FILES);
+  if (next.openSubagentTabs && next.openSubagentTabs.length > MAX_OPEN_TABS) {
+    next.openSubagentTabs = next.openSubagentTabs.slice(-MAX_OPEN_TABS);
   }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).
