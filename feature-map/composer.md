@@ -449,7 +449,8 @@ pill; later selections apply on the next turn. For other supported harnesses,
 open the side-chat model pill to choose model/effort before or after its
 first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.md)
 for draft persistence and parent-isolation checks. The microphone beside
-**Ask a side question...** starts dictation.
+**Ask a side question...** starts dictation. Edit (pencil) on a sent side-chat
+message loads it into that side chat's composer, not the main one.
 
 ## Driving it with the repro environment
 
@@ -820,7 +821,11 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/pages/ChatPage.userBubble.test.tsx`,
   `web/src/pages/ChatPage.composer.test.tsx`,
   `web/src/components/chat/SideChatPane.test.tsx`, and
-  `web/src/lib/recoverMessageAttachments.test.ts`.
+  `web/src/lib/recoverMessageAttachments.test.ts`. Grid session panes and
+  sub-agent Workspace tabs render the same `SideChatPane`, so its component
+  tests cover them; to check one by hand, open
+  a grid pane or a writable Workspace tab, click Edit on a message you sent
+  there, and confirm that pane's composer fills while the main one stays empty.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport

@@ -7046,7 +7046,7 @@ describe("Composer — editing a sent message", () => {
 
   beforeEach(() => {
     clearSessionDrafts();
-    // A running turn: Edit must not stop it, and the edited send steers like any other.
+    // A running turn, which Edit must not stop.
     useChatStore.setState({
       conversationId: CONV,
       boundAgentId: "agent_xyz",
@@ -7211,6 +7211,74 @@ describe("Composer — editing a sent message", () => {
     expect(textarea()).toHaveValue("");
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.queryByText("notes.txt")).toBeNull();
+  });
+
+  it("lets the newer Edit win when an older download finishes last", async () => {
+    const finishDownloads: (() => void)[] = [];
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishDownloads.push(() => resolve(new Response("meeting notes")));
+        }),
+    );
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    const first = { ...sentMessage, text: "First message", content: notesContent.slice(0, 1) };
+    const second = { ...sentMessage, text: "Second message", content: notesContent.slice(0, 1) };
+
+    act(() => ref.current?.editSentMessage(first));
+    act(() => ref.current?.editSentMessage(second));
+    await act(async () => finishDownloads[1]!());
+    await waitFor(() => expect(textarea()).toHaveValue("Second message"));
+    await act(async () => finishDownloads[0]!());
+
+    expect(textarea()).toHaveValue("Second message");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getAllByText("notes.txt")).toHaveLength(1);
+  });
+
+  it("rejects a download that finishes after the composer stops taking input", async () => {
+    let finishDownload: () => void = () => {};
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishDownload = () => resolve(new Response("meeting notes"));
+        }),
+    );
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { rerender } = renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+
+    act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ disabled: true })} ref={ref} />
+      </TooltipProvider>,
+    );
+    await act(async () => finishDownload());
+
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByText("notes.txt")).toBeNull();
+    expect(toasts).toEqual(["The composer can't take a message right now."]);
+  });
+
+  it("says so when the composer stops taking input before Replace draft", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { rerender } = renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ disabled: true })} ref={ref} />
+      </TooltipProvider>,
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("half-written thought");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(toasts).toEqual(["The composer can't take a message right now."]);
   });
 
   it("ignores Edit while the composer is disabled", async () => {

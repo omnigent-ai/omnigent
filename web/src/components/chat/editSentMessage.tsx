@@ -13,7 +13,10 @@ import {
 import { showToast } from "@/components/ui/toast";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { MentionItem } from "@/lib/composerMentions";
-import { recoverMessageAttachments } from "@/lib/recoverMessageAttachments";
+import {
+  notifyMissingAttachments,
+  recoverMessageAttachments,
+} from "@/lib/recoverMessageAttachments";
 
 /** A sent user message, as its bubble shows it. */
 export interface SentMessage {
@@ -39,6 +42,8 @@ export interface EditedDraft {
  * the message, e.g. a read-only viewer) hides the action.
  */
 export const EditSentMessageContext = createContext<((message: SentMessage) => void) | null>(null);
+
+const COMPOSER_UNAVAILABLE = "The composer can't take a message right now.";
 
 type RecoveredAttachments = Awaited<ReturnType<typeof recoverMessageAttachments>>;
 
@@ -97,9 +102,7 @@ export function useEditSentMessage({
   );
 
   const apply = useCallback((message: SentMessage, { files, missing }: RecoveredAttachments) => {
-    if (missing.length > 0) {
-      showToast(`Couldn't copy ${missing.join(", ")}. Attach again before you send.`);
-    }
+    notifyMissingAttachments(missing);
     appliedRef.current = true;
     latestRef.current.applyDraft({ text: message.text, files, mentions: message.mentions });
   }, []);
@@ -112,8 +115,11 @@ export function useEditSentMessage({
         .then((recovered) => {
           if (sequence !== loadSequenceRef.current) return;
           const latest = latestRef.current;
-          if (latest.target !== startTarget || !latest.canAccept()) {
+          if (latest.target !== startTarget) {
             setPending(null);
+          } else if (!latest.canAccept()) {
+            setPending(null);
+            showToast(COMPOSER_UNAVAILABLE);
           } else if (!confirmed && latest.hasDraft()) {
             setPending({ target: latest.target, message, recovered, replacing: false });
           } else {
@@ -135,7 +141,7 @@ export function useEditSentMessage({
       const latest = latestRef.current;
       appliedRef.current = false;
       if (!latest.canAccept()) {
-        showToast("The composer can't take a message right now.");
+        showToast(COMPOSER_UNAVAILABLE);
         return;
       }
       if (latest.hasDraft()) {
@@ -164,6 +170,7 @@ export function useEditSentMessage({
         if (current === null || current.replacing) return;
         if (!latestRef.current.canAccept()) {
           setPending(null);
+          showToast(COMPOSER_UNAVAILABLE);
         } else if (current.recovered !== null) {
           setPending(null);
           apply(current.message, current.recovered);

@@ -1,10 +1,12 @@
 import { useState } from "react";
 import { CircleAlertIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { showToast } from "@/components/ui/toast";
 import type { MessageContentBlock } from "@/lib/blocks";
 import { newSessionLocation } from "@/lib/newSessionHandoff";
-import { recoverMessageAttachments } from "@/lib/recoverMessageAttachments";
+import {
+  notifyMissingAttachments,
+  recoverMessageAttachments,
+} from "@/lib/recoverMessageAttachments";
 import { useNavigate } from "@/lib/routing";
 
 /**
@@ -29,9 +31,7 @@ export function UndeliveredMessageNotice({
   async function startNewSession() {
     setStarting(true);
     const { files, missing } = await recoverMessageAttachments(sessionId, content);
-    if (missing.length > 0) {
-      showToast(`Couldn't copy ${missing.join(", ")}. Attach again before you send.`);
-    }
+    notifyMissingAttachments(missing);
     navigate(newSessionLocation(text, files));
   }
 

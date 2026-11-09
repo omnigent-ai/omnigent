@@ -4,6 +4,7 @@ import {
   PENDING_FILE_PREFIX,
   type MessageContentBlock,
 } from "@/lib/blocks";
+import { showToast } from "@/components/ui/toast";
 import { downloadSessionFile } from "@/lib/filesApi";
 
 /**
@@ -43,6 +44,13 @@ export async function recoverMessageAttachments(
     else missing.push(attachmentLabel(attachments[index]!));
   });
   return { files, missing };
+}
+
+/** Tell the user which attachments didn't come back, if any. */
+export function notifyMissingAttachments(missing: string[]): void {
+  if (missing.length > 0) {
+    showToast(`Couldn't copy ${missing.join(", ")}. Attach again before you send.`);
+  }
 }
 
 /** Turn a `data:` URI into a File; throws when the URI is malformed. */

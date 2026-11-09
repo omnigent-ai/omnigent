@@ -1882,7 +1882,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     );
   });
 
-  // Read-only composers take no quotes or edited messages.
   const composerReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
 
   // Single return so both surfaces keep stable fragment positions across

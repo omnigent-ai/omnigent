@@ -123,6 +123,7 @@ def test_edit_sent_message_with_image_and_send_revision(
     expect(page.locator(_USER)).to_have_count(2)
     expect(page.locator(_USER).first).to_contain_text(original)
     expect(composer).to_have_value("")
+    expect(remove_chip).to_have_count(0)
     _pause(page)
 
 
