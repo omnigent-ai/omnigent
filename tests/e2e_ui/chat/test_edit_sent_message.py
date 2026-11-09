@@ -26,6 +26,8 @@ _COMPOSER_LABEL = "Message the agent"
 _USER = '[data-testid="message-bubble"][data-role="user"]'
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _IMAGE_NAME = "chart.png"
+# Background titles would send the turn's text to the mock model and take its reply.
+_TITLES_OFF = "localStorage.setItem('omnigent:background-session-titles', 'off')"
 
 # 240x180 PNG (same fixture as test_fork_preserves_image_attachment.py).
 _PNG_B64 = (
@@ -87,6 +89,7 @@ def test_edit_sent_message_with_image_and_send_revision(
     png.write_bytes(base64.b64decode(_PNG_B64))
 
     page: Page = request.getfixturevalue("page")
+    page.add_init_script(_TITLES_OFF)
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_label(_COMPOSER_LABEL)
     expect(composer).to_be_visible(timeout=30_000)
@@ -139,7 +142,7 @@ def test_edit_while_agent_runs_does_not_stop_it_and_sends_mid_turn(
     base_url, session_id = seeded_session
     original = "edit-e2e-c1 Draft the release announcement"
     revised = "edit-e2e-c2 Draft the release announcement for customers"
-    # Titles are off, so turn c1 is the only request that can take the gate.
+    # Titles are off, so turn c1 is the only request that can match.
     configure_mock_llm(
         mock_llm_server_url,
         [{"text": "Here is an internal announcement.", "block": True}],
@@ -152,7 +155,7 @@ def test_edit_while_agent_runs_does_not_stop_it_and_sends_mid_turn(
     )
 
     page: Page = request.getfixturevalue("page")
-    page.add_init_script("localStorage.setItem('omnigent:background-session-titles', 'off')")
+    page.add_init_script(_TITLES_OFF)
     try:
         page.goto(f"{base_url}/c/{session_id}")
         composer = page.get_by_label(_COMPOSER_LABEL)
@@ -214,12 +217,14 @@ def test_edit_in_side_chat_fills_the_side_chat_composer(
 ) -> None:
     """Edit on a side chat's message fills that side chat's composer, not the main one."""
     base_url, session_id = seeded_session
-    question = f"edit-e2e-d1-{session_id} Why might this test be flaky?"
+    marker = f"edit-e2e-d1-{session_id}"
+    question = f"{marker} Why might this test be flaky?"
     configure_mock_llm(
-        mock_llm_server_url, [{"text": "It races the network request."}], match="edit-e2e-d1"
+        mock_llm_server_url, [{"text": "It races the network request."}], match=marker
     )
 
     page: Page = request.getfixturevalue("page")
+    page.add_init_script(_TITLES_OFF)
     child_ids, unroute = _track_side_chat_forks(page, session_id)
     try:
         page.goto(f"{base_url}/c/{session_id}")

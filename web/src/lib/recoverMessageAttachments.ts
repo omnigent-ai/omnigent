@@ -71,12 +71,19 @@ function decodeDataUri(uri: string, filename: string | undefined): File {
 /** Decode `%XX` escapes byte for byte, encoding other characters as UTF-8. */
 function percentDecodeBytes(payload: string): Uint8Array<ArrayBuffer> {
   const encoder = new TextEncoder();
-  const bytes: number[] = [];
+  const chunks: Uint8Array[] = [];
   for (const part of payload.split(/(%[0-9a-f]{2})/i)) {
-    if (/^%[0-9a-f]{2}$/i.test(part)) bytes.push(Number.parseInt(part.slice(1), 16));
-    else bytes.push(...encoder.encode(part));
+    if (/^%[0-9a-f]{2}$/i.test(part))
+      chunks.push(Uint8Array.of(Number.parseInt(part.slice(1), 16)));
+    else if (part) chunks.push(encoder.encode(part));
   }
-  return Uint8Array.from(bytes);
+  const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
 }
 
 function withoutPendingPrefix(label: string): string {

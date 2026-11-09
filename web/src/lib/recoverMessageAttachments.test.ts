@@ -56,6 +56,8 @@ describe("recoverMessageAttachments", () => {
       // "iVBORw==" with its "=" padding percent-encoded.
       { type: "input_image", image_url: "data:image/png;base64,iVBORw%3D%3D", filename: "a.png" },
       { type: "input_image", image_url: "data:image/png,%89PNG%0D", filename: "b.png" },
+      // Long unescaped runs must not be spread into function arguments.
+      { type: "input_image", image_url: `data:image/svg+xml,${"a".repeat(300_000)}` },
     ]);
 
     expect(missing).toEqual([]);
@@ -63,6 +65,7 @@ describe("recoverMessageAttachments", () => {
     expect([...new Uint8Array(await files[1]!.arrayBuffer())]).toEqual([
       0x89, 0x50, 0x4e, 0x47, 0x0d,
     ]);
+    expect(files[2]!.size).toBe(300_000);
   });
 
   it("can't download without the session it was sent in", async () => {
