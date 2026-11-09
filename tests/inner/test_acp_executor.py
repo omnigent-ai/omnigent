@@ -15,6 +15,7 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shlex
 import sys
@@ -1807,6 +1808,26 @@ async def test_interrupt_sends_session_cancel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_interrupt_preserves_original_cancel_grace_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._session_id = "s1"
+    ex._proc = type("P", (), {"returncode": None})()  # type: ignore[assignment]
+    ex._send = AsyncMock()  # type: ignore[method-assign]
+    now = 100.0
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(asyncio.get_running_loop(), "time", lambda: now)
+        assert await ex.interrupt_session("ignored") is True
+        original_deadline = ex._cancel_grace_deadline
+        assert original_deadline == now + acp_executor_module.ACP_CANCEL_GRACE_SECONDS
+
+        now += acp_executor_module.ACP_CANCEL_GRACE_SECONDS / 2
+        assert await ex.interrupt_session("ignored") is True
+        assert ex._cancel_grace_deadline == original_deadline
+
+
+@pytest.mark.asyncio
 async def test_interrupt_noop_without_session() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     assert await ex.interrupt_session("ignored") is False
@@ -1994,7 +2015,10 @@ async def test_pre_prompt_model_report_steers_first_turn_switch(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
+async def test_end_to_end_against_fake_acp_agent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=acp_executor_module.__name__)
     agent_path = tmp_path / "fake_acp_agent.py"
     agent_path.write_text(_FAKE_ACP_AGENT)
     command = shlex.join([sys.executable, str(agent_path)])
@@ -2015,6 +2039,7 @@ async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
     finally:
         await ex.close()
 
+    assert f"acp[Fake] session/prompt {ex._rpc_id} stopReason=end_turn" in caplog.text
     # The permission request surfaced through the elicitation handler.
     assert approvals == [("shell", {"command": "echo hi"})]
 
