@@ -358,18 +358,25 @@ async def test_pane_liveness_reads_the_requested_pane(
         capture_output=True,
         timeout=5,
     )
+    # Older tmux builds may need another child exit to collect the pane's status.
+    subprocess.run(
+        [*tmux, "run-shell", "-b", ":"],
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
     _wait_until(
         lambda: (
             subprocess.run(
-                [*tmux, "display-message", "-p", "-t", exited, "#{pane_dead}"],
+                [*tmux, "display-message", "-p", "-t", exited, "#{pane_dead} #{pane_dead_status}"],
                 check=True,
                 capture_output=True,
                 text=True,
                 timeout=5,
             ).stdout.strip()
-            == "1"
+            == "1 7"
         ),
-        "test pane did not exit",
+        "test pane did not report exit status 7",
     )
 
     assert bridge._claude_pane_state(socket_path, target) == (
