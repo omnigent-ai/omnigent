@@ -97,6 +97,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import (
+    DeploymentGate,
     Feature,
     FeatureFlags,
     deployment_gate_enabled,
@@ -268,6 +269,8 @@ class ServerInfoResponse(BaseModel):
     installable_harnesses: list[str]
     # Whether the scheduled-tasks routes are mounted and enabled for this caller.
     automations_enabled: bool = False
+    # Whether agent-posted Inbox items are enabled for this caller.
+    proactive_agent_enabled: bool = False
     dictation_available: bool
     # Scheduled tasks accept the optional random-worktree base ref.
     scheduled_task_worktrees: bool = True
@@ -1573,7 +1576,6 @@ def create_app(
     agent_cache: AgentCache,
     runner_tunnel_tokens: frozenset[str] | None = None,
     comment_store: CommentStore | None = None,
-    inbox_item_store: InboxItemStore | None = None,
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
@@ -1614,6 +1616,8 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    inbox_item_store: InboxItemStore | None = None,
+    proactive_agent: DeploymentGate | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1640,9 +1644,8 @@ def create_app(
         token-bound runner id, which is the shared remote-server
         behavior.
     :param comment_store: Store for per-conversation review comments.
-    :param inbox_item_store: Store for agent-posted Inbox items. The Inbox
-        item routes are served only with this store and the
-        ``proactive_agent`` feature on.
+    :param inbox_item_store: Store for agent-posted Inbox items; ``None`` leaves
+        the Inbox item routes unmounted.
     :param policy_store: Store for server-persisted policies
         (session-scoped and server-wide defaults). ``None``
         disables both the session policy and default policy
@@ -1660,6 +1663,11 @@ def create_app(
         When off, the ``/v1/scheduled-tasks`` routes return 404 and ``GET /v1/info``
         reports ``automations_enabled`` false. Scheduling of existing tasks is not
         affected.
+    :param proactive_agent: Whether this request's caller can use agent-posted Inbox
+        items. A static bool or a zero-arg callable resolved per request; ``None``
+        follows the ``proactive_agent`` release feature (off by default). When off,
+        ``/v1/inbox/items`` returns 404 and ``GET /v1/info`` reports
+        ``proactive_agent_enabled`` false.
     :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
         the owner identity fires act under, or a replacement executor. ``None``
         uses the built-in executor with every host owned by this replica.
@@ -2359,6 +2367,19 @@ def create_app(
         )
 
     app.state.automations_available = automations_available
+    proactive_agent_gate: DeploymentGate = (
+        resolved_feature_flags.enabled(Feature.PROACTIVE_AGENT)
+        if proactive_agent is None
+        else proactive_agent
+    )
+
+    def proactive_agent_available() -> bool:
+        """Whether this request's caller can use agent-posted Inbox items."""
+        return inbox_item_store is not None and deployment_gate_enabled(
+            proactive_agent_gate, "proactive_agent"
+        )
+
+    app.state.proactive_agent_available = proactive_agent_available
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
@@ -3703,6 +3724,7 @@ def create_app(
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
                 "automations_enabled": automations_enabled,
+                "proactive_agent_enabled": app.state.proactive_agent_available(),
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
@@ -3962,10 +3984,11 @@ def create_app(
         prefix="/v1",
         tags=["session_mcp_servers"],
     )
-    if inbox_item_store is not None and resolved_feature_flags.enabled(Feature.PROACTIVE_AGENT):
+    if inbox_item_store is not None:
         app.include_router(
             create_inbox_items_router(
                 inbox_item_store,
+                enabled=proactive_agent_available,
                 conversation_store=conversation_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,

@@ -32,19 +32,24 @@ def test_upgrade_creates_table_and_downgrade_drops_it(tmp_path: Path) -> None:
         "id",
     ]
     assert inspector.get_foreign_keys("inbox_items") == []
-    indexes = {index["name"]: index for index in inspector.get_indexes("inbox_items")}
-    assert indexes["uq_inbox_items_user_dedupe_key"]["unique"]
-    assert indexes["uq_inbox_items_user_dedupe_key"]["column_names"] == [
-        "workspace_id",
-        "user_id",
-        "dedupe_key",
-    ]
-    assert indexes["ix_inbox_items_user_created"]["column_names"] == [
-        "workspace_id",
-        "user_id",
-        "created_at",
-        "id",
-    ]
+    indexes = {
+        index["name"]: (index["column_names"], bool(index["unique"]))
+        for index in inspector.get_indexes("inbox_items")
+    }
+    assert indexes == {
+        "ix_inbox_items_user_created": (["workspace_id", "user_id", "created_at", "id"], False),
+        "ix_inbox_items_user_state_created": (
+            ["workspace_id", "user_id", "state", "created_at", "id"],
+            False,
+        ),
+        "uq_inbox_items_user_dedupe_key": (["workspace_id", "user_id", "dedupe_key"], True),
+        "uq_inbox_items_session_slot": (
+            ["workspace_id", "user_id", "source_session_id", "session_slot"],
+            True,
+        ),
+    }
+    # The application supplies every value on this new table.
+    assert all(column["default"] is None for column in inspector.get_columns("inbox_items"))
 
     _migrate(uri, engine, _PREVIOUS, down=True)
     assert "inbox_items" not in sa.inspect(engine).get_table_names()
