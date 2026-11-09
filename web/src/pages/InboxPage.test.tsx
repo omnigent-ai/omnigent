@@ -1766,6 +1766,21 @@ describe("agent suggestions", () => {
 
     expect(screen.getByText("The PR merged yesterday.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Ramp to 50%" })).toBeInTheDocument();
+
+    // Collapsing lets it go while the unread-only list is still reloading.
+    fireEvent.click(screen.getByRole("button", { name: "Suggested follow-up: Ramp up the flag" }));
+    expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
+  });
+
+  it("shows a suggestion load failure instead of an empty Inbox", () => {
+    const refetch = vi.fn();
+    stub({ isError: true, refetch });
+    renderPage();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load suggestions.");
+    expect(screen.queryByText("Nothing waiting on you")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry suggestions" }));
+    expect(refetch).toHaveBeenCalledOnce();
   });
 
   it("takes an agent action and opens the composer with its prompt", () => {

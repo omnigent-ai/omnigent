@@ -132,6 +132,7 @@ import {
   suggestionKindLabel,
   suggestionLinkTarget,
   suggestionPreview,
+  unreadCountText,
   type Suggestion,
 } from "@/lib/proactiveInbox";
 import { relativeTime } from "@/lib/relativeTime";
@@ -387,7 +388,7 @@ export function InboxPage() {
         ? "1 failed automation"
         : `${automationInbox.items.length} failed automations`),
     proactiveInbox.unreadCount > 0 &&
-      `${proactiveInbox.unreadCountCapped ? `${proactiveInbox.unreadCount}+` : proactiveInbox.unreadCount} unread ${proactiveInbox.unreadCount === 1 && !proactiveInbox.unreadCountCapped ? "suggestion" : "suggestions"}`,
+      `${unreadCountText(proactiveInbox.unreadCount, proactiveInbox.unreadCountCapped)} unread ${proactiveInbox.unreadCount === 1 && !proactiveInbox.unreadCountCapped ? "suggestion" : "suggestions"}`,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -1110,7 +1111,7 @@ export function InboxPage() {
 
       {!assembling &&
         failedSessionCount === 0 &&
-        !(showUnread && automationInbox.isError) &&
+        !(showUnread && (automationInbox.isError || proactiveInbox.isError)) &&
         visibleCount === 0 && (
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />

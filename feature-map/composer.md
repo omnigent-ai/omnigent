@@ -25,7 +25,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   **Copy message to new session** opens it with a one-time `?handoff=` token
   instead, naming an in-memory copy of the message's text and attachments. That
   copy replaces the whole parked draft, even with no text or no attachments; the
-  token leaves the URL and is released once the composer takes it.
+  token leaves the URL and is released once the composer takes it. An agent
+  suggestion's action button in the Inbox uses the same handoff with the action's
+  prompt, so the viewer edits and sends it.
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.

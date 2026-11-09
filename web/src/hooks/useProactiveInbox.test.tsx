@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { showToast } from "@/components/ui/toast";
 import { setOmnigentHostConfig } from "@/lib/host";
 import {
   listSuggestions,
@@ -21,6 +22,7 @@ vi.mock("@/lib/proactiveInbox", async (importActual) => ({
   updateSuggestion: vi.fn(),
 }));
 vi.mock("./useViewerId", () => ({ useViewerId: () => "alice" }));
+vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 let client: QueryClient;
 let enabled = true;
@@ -66,6 +68,7 @@ beforeEach(() => {
     .mockReset()
     .mockResolvedValue(page([item], 1));
   vi.mocked(updateSuggestion).mockReset();
+  vi.mocked(showToast).mockReset();
 });
 
 afterEach(() => {
@@ -117,4 +120,80 @@ it("pages with the server cursor for the requested states", async () => {
 
   expect(listSuggestions).toHaveBeenLastCalledWith("10:abc", ["unread"]);
   await waitFor(() => expect(result.current.items).toEqual([item]));
+});
+
+it("keeps a suggestion resolved when an earlier read and a dismissal overlap", async () => {
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.items).toEqual([item]));
+  const read = deferred<Suggestion>();
+  const dismiss = deferred<Suggestion>();
+  vi.mocked(updateSuggestion)
+    .mockReturnValueOnce(read.promise)
+    .mockReturnValueOnce(dismiss.promise);
+
+  // Expanding marks the item read; the viewer dismisses it before that settles.
+  act(() => result.current.update("sug", { state: "read" }));
+  act(() => result.current.update("sug", { resolution: "not_relevant" }));
+  expect(result.current.items).toEqual([]);
+  // The dismissal waits for the read, so the server sees them in order.
+  await waitFor(() => expect(updateSuggestion).toHaveBeenCalledTimes(1));
+  await act(async () => {});
+  expect(updateSuggestion).toHaveBeenCalledTimes(1);
+
+  // The read's response says the item is open; it must not bring it back.
+  await act(async () => read.resolve({ ...item, state: "read" }));
+  await waitFor(() => expect(updateSuggestion).toHaveBeenCalledTimes(2));
+  expect(vi.mocked(updateSuggestion).mock.calls[1]).toEqual([
+    "sug",
+    { resolution: "not_relevant" },
+  ]);
+  expect(result.current.items).toEqual([]);
+
+  vi.mocked(listSuggestions).mockResolvedValue(page([], 0));
+  await act(async () =>
+    dismiss.resolve({ ...item, state: "dismissed", resolution: "not_relevant" }),
+  );
+  await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(2));
+  expect(result.current.items).toEqual([]);
+  expect(result.current.unreadCount).toBe(0);
+});
+
+it("ignores a read mark on a suggestion the viewer already resolved", async () => {
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.items).toEqual([item]));
+  const dismiss = deferred<Suggestion>();
+  vi.mocked(updateSuggestion).mockReturnValueOnce(dismiss.promise);
+
+  act(() => result.current.update("sug", { resolution: "already_done" }));
+  act(() => result.current.update("sug", { state: "read" }));
+  vi.mocked(listSuggestions).mockResolvedValue(page([], 0));
+  await act(async () => dismiss.resolve({ ...item, state: "done", resolution: "already_done" }));
+
+  await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(2));
+  expect(updateSuggestion).toHaveBeenCalledTimes(1);
+  expect(result.current.items).toEqual([]);
+});
+
+it("reports a failed update and reloads the list", async () => {
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.items).toEqual([item]));
+  vi.mocked(updateSuggestion).mockRejectedValueOnce(new Error("offline"));
+
+  act(() => result.current.update("sug", { resolution: "not_now" }));
+  expect(result.current.items).toEqual([]);
+
+  await waitFor(() => expect(showToast).toHaveBeenCalledOnce());
+  // The server still has the item open, so the refetch shows it again.
+  await waitFor(() => expect(result.current.items).toEqual([item]));
+  expect(listSuggestions).toHaveBeenCalledTimes(2);
+});
+
+it("lists only the requested states after a read mark", async () => {
+  vi.mocked(updateSuggestion).mockReturnValue(new Promise(() => {}));
+  const { result } = renderHook(() => useProactiveInbox(true, ["unread"]), { wrapper });
+  await waitFor(() => expect(result.current.items).toEqual([item]));
+
+  act(() => result.current.update("sug", { state: "read" }));
+
+  expect(result.current.items).toEqual([]);
 });
