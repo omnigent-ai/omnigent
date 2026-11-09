@@ -959,8 +959,8 @@ export function PullRequestChangesTab({
   }, [activeFilePath, findTarget, revealPane, commitsView]);
 
   const stepMatch = (direction: 1 | -1) => {
-    // Matches for a query still being searched would navigate the previous results.
-    if (!matches.length || deferredQuery !== query) return;
+    // Matches still being searched, or retained across a refresh, would navigate stale results.
+    if (!matches.length || deferredQuery !== query || search.searching) return;
     // With no active match yet, the first step lands on the first or last match by direction.
     const next = matches[stepTarget(activeIndex, direction, matches.length)];
     // A fresh object, so stepping to the sole match again is a new reveal request.

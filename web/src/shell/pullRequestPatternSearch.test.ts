@@ -51,17 +51,32 @@ describe("searchPatternInWorker", () => {
   it("reports too slow and terminates the worker when matching outlasts the budget", async () => {
     const result = searchPatternInWorker(CORPUS, "(a+)+$", OPTIONS);
     FakeWorker.instances[0].reply({ started: true });
-    vi.advanceTimersByTime(PATTERN_TIME_BUDGET_MS);
+    vi.advanceTimersByTime(PATTERN_TIME_BUDGET_MS - 1);
+    expect(FakeWorker.instances[0].terminated).toBe(false);
+    vi.advanceTimersByTime(1);
 
     await expect(result).resolves.toEqual({ ...NO_MATCHES, tooSlow: true });
     expect(FakeWorker.instances[0].terminated).toBe(true);
   });
 
-  it("reports too slow when the worker never starts within the start budget", async () => {
+  it("starts the match budget when the worker reports it has the corpus", async () => {
     const result = searchPatternInWorker(CORPUS, "(a+)+$", OPTIONS);
-    vi.advanceTimersByTime(WORKER_START_TIMEOUT_MS);
+    vi.advanceTimersByTime(WORKER_START_TIMEOUT_MS - 1);
+    FakeWorker.instances[0].reply({ started: true });
+    vi.advanceTimersByTime(PATTERN_TIME_BUDGET_MS - 1);
+    expect(FakeWorker.instances[0].terminated).toBe(false);
+    vi.advanceTimersByTime(1);
 
     await expect(result).resolves.toEqual({ ...NO_MATCHES, tooSlow: true });
+  });
+
+  it("reports a failed search when the worker never starts within the start budget", async () => {
+    const result = searchPatternInWorker(CORPUS, "(a+)+$", OPTIONS);
+    vi.advanceTimersByTime(WORKER_START_TIMEOUT_MS - 1);
+    expect(FakeWorker.instances[0].terminated).toBe(false);
+    vi.advanceTimersByTime(1);
+
+    await expect(result).resolves.toEqual({ ...NO_MATCHES, failed: true });
     expect(FakeWorker.instances[0].terminated).toBe(true);
   });
 
@@ -136,6 +151,6 @@ describe("searchPatternInWorker", () => {
     vi.advanceTimersByTime(WORKER_START_TIMEOUT_MS);
     worker.reply({ matches: [], truncated: false, invalid: false });
 
-    await expect(result).resolves.toEqual({ ...NO_MATCHES, tooSlow: true });
+    await expect(result).resolves.toEqual({ ...NO_MATCHES, failed: true });
   });
 });

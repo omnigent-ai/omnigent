@@ -61,7 +61,8 @@ export function searchPatternInWorker(
       resolve(outcome);
     };
     const abort = () => finish(null);
-    let timer = setTimeout(() => finish(TOO_SLOW), WORKER_START_TIMEOUT_MS);
+    // The pattern never ran if the worker didn't start, so that is a failure, not a slow pattern.
+    let timer = setTimeout(() => finish(FAILED), WORKER_START_TIMEOUT_MS);
     signal?.addEventListener("abort", abort);
     worker.onerror = () => finish(FAILED);
     worker.onmessageerror = () => finish(FAILED);
@@ -100,5 +101,5 @@ export interface PatternSearchReply {
   invalid: boolean;
 }
 
-/** Sent once the worker has the corpus and starts matching, before its reply. */
+/** Either the `{ started: true }` notice sent before matching, or the final reply. */
 export type PatternSearchMessage = { started: true } | PatternSearchReply;

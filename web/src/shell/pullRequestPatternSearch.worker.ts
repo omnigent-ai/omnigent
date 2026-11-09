@@ -10,7 +10,7 @@ import type {
 
 self.addEventListener("message", (event: MessageEvent<PatternSearchRequest>) => {
   const { corpus, query, options } = event.data;
-  // The corpus has arrived, so the caller's match budget starts with the next message.
+  // Tells the caller to start the match budget.
   const started: PatternSearchMessage = { started: true };
   self.postMessage(started);
   const indexOf = new Map(corpus.map((target, index) => [target, index]));

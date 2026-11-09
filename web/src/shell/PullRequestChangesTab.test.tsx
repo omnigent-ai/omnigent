@@ -45,6 +45,8 @@ const mocks = vi.hoisted(() => ({
   patternTooSlow: false,
   /** Makes the regex search report that its worker could not run. */
   patternFailed: false,
+  /** When set, regex searches wait on it, so a test can observe the pending state. */
+  patternGate: null as Promise<void> | null,
   /** A saved review draft, anchored to one file's line, as the composer hook reports it. */
   draftAnchor: null as null | {
     path: string;
@@ -68,12 +70,16 @@ vi.mock("./pullRequestPatternSearch", async (importOriginal) => {
       corpus: Parameters<typeof findMatches>[0],
       query: string,
       options: Parameters<typeof findMatches>[2],
-    ) =>
-      mocks.patternTooSlow
-        ? { matches: [], truncated: false, invalid: false, tooSlow: true, failed: false }
-        : mocks.patternFailed
-          ? { matches: [], truncated: false, invalid: false, tooSlow: false, failed: true }
-          : { ...findMatches(corpus, query, options), tooSlow: false, failed: false },
+    ) => {
+      if (mocks.patternGate) await mocks.patternGate;
+      if (mocks.patternTooSlow) {
+        return { matches: [], truncated: false, invalid: false, tooSlow: true, failed: false };
+      }
+      if (mocks.patternFailed) {
+        return { matches: [], truncated: false, invalid: false, tooSlow: false, failed: true };
+      }
+      return { ...findMatches(corpus, query, options), tooSlow: false, failed: false };
+    },
   };
 });
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
@@ -250,6 +256,7 @@ describe("PullRequestChangesTab", () => {
   afterEach(() => {
     mocks.patternTooSlow = false;
     mocks.patternFailed = false;
+    mocks.patternGate = null;
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -476,6 +483,43 @@ describe("PullRequestChangesTab", () => {
 
     expect(await screen.findByText("Search failed")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Next match" })).toBeDisabled();
+  });
+
+  it("shows Searching until a regex search settles, then its count", async () => {
+    let release!: () => void;
+    mocks.patternGate = new Promise<void>((done) => {
+      release = done;
+    });
+    renderTab({ conversationId: "find-searching" });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    fireEvent.change(findInput(), { target: { value: "needle" } });
+
+    expect(await screen.findByText("Searching…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Next match" })).toBeDisabled();
+
+    await act(async () => release());
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+  });
+
+  it("does not step to retained matches while a regex refresh reruns", async () => {
+    const { rerender } = renderTab({ conversationId: "find-refresh-inert" });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    fireEvent.change(findInput(), { target: { value: "needle" } });
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+
+    let release!: () => void;
+    mocks.patternGate = new Promise<void>((done) => {
+      release = done;
+    });
+    rerender(A + addedFile("b.ts", ["gamma", "x", "needle here"]) + C);
+    // The retained matches stay on screen, but Next must not move through them until the rerun lands.
+    fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+    expect(screen.getByText("1 of 2")).toBeInTheDocument();
+
+    await act(async () => release());
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
   });
 
   it("follows the shown match across regex refreshes while the search reruns", async () => {

@@ -1281,7 +1281,7 @@ _BACKTRACKING_FIND_PATCH = (
     "index e69de29..4b825dc 100644\n"
     "--- a/src/app/main.py\n"
     "+++ b/src/app/main.py\n"
-    "@@ -1,2 +1,3 @@\n"
+    "@@ -1,1 +1,3 @@\n"
     " line1\n"
     "+added line\n"
     f"+{'a' * 40}!\n"

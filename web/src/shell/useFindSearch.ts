@@ -48,7 +48,11 @@ export function useFindSearch(
   );
   const [settled, setSettled] = useState<SettledSearch | null>(null);
   useEffect(() => {
-    if (!onWorker) return;
+    // Leaving worker mode drops the last result, so re-entering it searches again.
+    if (!onWorker) {
+      setSettled(null);
+      return;
+    }
     const controller = new AbortController();
     void searchPatternInWorker(
       corpus,

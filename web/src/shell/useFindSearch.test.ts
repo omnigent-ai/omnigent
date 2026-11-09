@@ -58,6 +58,13 @@ describe("useFindSearch", () => {
     expect(search).not.toHaveBeenCalled();
   });
 
+  it("skips the worker for a blank query against a nonempty corpus", () => {
+    const { result } = renderHook(() => useFindSearch(CORPUS, "  ", OPTIONS));
+
+    expect(result.current).toMatchObject({ searching: false, matches: [] });
+    expect(search).not.toHaveBeenCalled();
+  });
+
   it("reports searching until the worker's result arrives", async () => {
     const pending = deferred<FindOutcome | null>();
     search.mockReturnValueOnce(pending.promise);
@@ -114,6 +121,33 @@ describe("useFindSearch", () => {
     expect(result.current).toMatchObject({ searching: true, matches: [] });
 
     await act(async () => second.resolve(EMPTY));
+    expect(result.current).toMatchObject({ searching: false, matches: [] });
+  });
+
+  it("aborts the running search on unmount", () => {
+    search.mockReturnValueOnce(deferred<FindOutcome | null>().promise);
+    const { unmount } = renderHook(() => useFindSearch(CORPUS, "needle", OPTIONS));
+    const signal = search.mock.calls[0][3];
+
+    unmount();
+
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("searches again when regex mode is re-entered with the same corpus and query", async () => {
+    const rerun = deferred<FindOutcome | null>();
+    search.mockResolvedValueOnce(FOUND).mockReturnValueOnce(rerun.promise);
+    const { result, rerender } = renderHook(
+      ({ regex }) => useFindSearch(CORPUS, "needle", { matchCase: false, regex }),
+      { initialProps: { regex: true } },
+    );
+    await waitFor(() => expect(result.current.searching).toBe(false));
+
+    rerender({ regex: false });
+    rerender({ regex: true });
+
+    expect(result.current).toMatchObject({ searching: true, matches: [] });
+    await act(async () => rerun.resolve(EMPTY));
     expect(result.current).toMatchObject({ searching: false, matches: [] });
   });
 });
