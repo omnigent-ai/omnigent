@@ -820,6 +820,49 @@ describe("Composer @-session mentions", () => {
     );
   });
 
+  describe("recalling a queued tagged message", () => {
+    const queuedText = () =>
+      `Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review\n\n${SESSION_MENTION_HINT}`;
+
+    function renderWithQueued(onSend: (text: string) => void) {
+      useChatStore.setState({
+        queuedMessages: [{ queueId: "q_tagged", text: queuedText(), conversationId: currentId }],
+      });
+      renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    }
+
+    it.each([
+      ["Edit", () => fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }))],
+      ["ArrowUp", () => fireEvent.keyDown(textarea(), { key: "ArrowUp" })],
+    ])("restores the tag as a token on %s, so a resend keeps one trailing hint", (_how, recall) => {
+      const onSend = vi.fn();
+      renderWithQueued(onSend);
+      recall();
+      expect(textarea().value).toBe("Ask @Alpha planning to review");
+      expect(tokens()).toEqual(["@Alpha planning"]);
+      append(" today");
+      fireEvent.submit(textarea().closest("form")!);
+      expect(onSend.mock.calls[0]![0]).toBe(
+        `Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review today\n\n${SESSION_MENTION_HINT}`,
+      );
+    });
+
+    it("adds a newly tagged session to a recalled message with one hint", () => {
+      const onSend = vi.fn();
+      renderWithQueued(onSend);
+      fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+      append(" with @aut");
+      fireEvent.click(screen.getByTitle("Tag subagent auth"));
+      fireEvent.submit(textarea().closest("form")!);
+      const sent = onSend.mock.calls[0]![0] as string;
+      expect(sent).toBe(
+        'Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review with ' +
+          `[Session: "auth" id=s_child subagent=yes]\n\n${SESSION_MENTION_HINT}`,
+      );
+      expect(sent.split("[Tagged sessions:")).toHaveLength(2);
+    });
+  });
+
   it("keeps tagged sessions when the composer remounts with the saved draft", () => {
     const onSend = vi.fn();
     const first = renderWithTooltips(<Composer {...composerProps()} />);

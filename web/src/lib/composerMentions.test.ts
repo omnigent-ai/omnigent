@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   detectMentionAt,
+  recallSessionMentions,
   composerInlineMentions,
   expandMentionTokens,
   findMentionTokens,
@@ -228,5 +229,28 @@ describe("detectMentionAt", () => {
     // A double space or a newline always finishes it.
     expect(detectMentionAt("@casual  ", 9, titles)).toBeNull();
     expect(detectMentionAt("@casual\ng", 9, titles)).toBeNull();
+  });
+});
+
+describe("recallSessionMentions", () => {
+  const plan = (id: string) => `[Session: "Plan" id=${id} subagent=no]`;
+
+  it("turns tagged markers back into unique tokens and drops the hint", () => {
+    const recalled = recallSessionMentions(
+      `compare ${plan("s_aaaaaaaa")} with ${plan("s_bbbbbbbb")} and ${plan("s_aaaaaaaa")}\n\n` +
+        SESSION_MENTION_HINT,
+      [`see ${plan("s_bbbbbbbb")}`],
+    );
+    expect(recalled.sessions.map((s) => [s.id, s.token])).toEqual([
+      ["s_aaaaaaaa", "@Plan"],
+      ["s_bbbbbbbb", "@Plan (s_bbbb)"],
+    ]);
+    expect(recalled.main).toBe("compare @Plan with @Plan (s_bbbb) and @Plan");
+    expect(recalled.others).toEqual(["see @Plan (s_bbbb)"]);
+  });
+
+  it("leaves markers the user typed alone when there is no trailing hint", () => {
+    const text = `why does ${plan("s_x")} look like this?`;
+    expect(recallSessionMentions(text)).toEqual({ main: text, others: [], sessions: [] });
   });
 });

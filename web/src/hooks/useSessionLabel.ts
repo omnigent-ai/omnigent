@@ -41,7 +41,9 @@ export function useSessionLabel(
     queryFn: () => getSessionSlim(sessionId as string),
     enabled: sessionId !== null && !cached,
     staleTime: Infinity,
+    // An unreadable sender stays "another session" for the tab, not one lookup per bubble.
     retry: false,
+    retryOnMount: false,
   });
   if (row) return { title: row.title || "Untitled session", isSubagent: !!row.parent_session_id };
   if (child) return { title: childPrimaryLabel(child), isSubagent: true };

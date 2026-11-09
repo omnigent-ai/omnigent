@@ -142,6 +142,7 @@ import {
   findMentionTokens,
   newFileMentionToken,
   presentMentions,
+  recallSessionMentions,
   type TaggedMentions,
   withSessionMentionHint,
   detectMentionAt,
@@ -4007,9 +4008,33 @@ function ComposerImpl(
     submit({ resetNativeInputSession: true });
   };
 
+  // Load a sent or queued message back into the composer with its session tags
+  // as editable tokens, so a resend adds one trailing hint instead of keeping a
+  // stale one mid-message.
+  const restoreRecalledText = (text: string, replyDraft?: StoredReplyDraft) => {
+    if (replyDraft) {
+      const recalled = recallSessionMentions(
+        replyDraft.text,
+        replyDraft.quotes.map((quote) => quote.before),
+      );
+      const restored: StoredReplyDraft = {
+        ...replyDraft,
+        text: recalled.main,
+        quotes: replyDraft.quotes.map((quote, i) => ({ ...quote, before: recalled.others[i]! })),
+      };
+      replaceText(serializeReplyDraft(restored), restored);
+      setMentionedSessions(recalled.sessions);
+    } else {
+      const recalled = recallSessionMentions(text);
+      replaceText(recalled.main);
+      setMentionedSessions(recalled.sessions);
+    }
+    setMentionedItems([]);
+  };
+
   const applyRecall = (ta: HTMLTextAreaElement, recalled: ComposerDraft) => {
     recallingRef.current = true;
-    replaceText(recalled.text, recalled.replyDraft);
+    restoreRecalledText(recalled.text, recalled.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
     // Move the caret to the end after React applies the new value. Without
@@ -4199,7 +4224,7 @@ function ComposerImpl(
             // Re-sending re-queues it (busy) or sends it (idle).
             const target = queuedMessages.find((m) => m.queueId === queueId);
             if (!target) return;
-            replaceText(target.text, target.replyDraft);
+            restoreRecalledText(target.text, target.replyDraft);
             dirtyRef.current = true;
             resetCursor();
             recallingRef.current = false;

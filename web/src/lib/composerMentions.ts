@@ -368,6 +368,40 @@ export function replaceSentMentions(
   });
 }
 
+/**
+ * Turn a sent or queued message back into an editable draft: when it ends with
+ * the generated hint (so its session markers are tags), drop the hint and
+ * replace each session marker with a token, returning the tags. A message
+ * without the hint is returned unchanged; its markers are the user's text.
+ *
+ * :param main: The segment that carries the hint, e.g. the draft's tail text.
+ * :param others: Other editable segments that may hold session markers.
+ * :returns: The rewritten segments, in order, and the recovered session tags.
+ */
+export function recallSessionMentions(
+  main: string,
+  others: readonly string[] = [],
+): { main: string; others: string[]; sessions: SessionMention[] } {
+  const withoutHint = stripTrailingHint(main);
+  if (withoutHint === null) return { main, others: [...others], sessions: [] };
+  const sessions: SessionMention[] = [];
+  const toToken = (_m: string, title: string, id: string, sub: string) => {
+    let session = sessions.find((it) => it.id === id);
+    if (!session) {
+      const found: SessionMention = { id, title, isSubagent: sub === "yes" };
+      found.token = sessionMentionToken(found, sessions.map(sessionTokenOf));
+      sessions.push(found);
+      session = found;
+    }
+    return sessionTokenOf(session);
+  };
+  return {
+    main: withoutHint.replace(SENT_SESSION_RE, toToken),
+    others: others.map((segment) => segment.replace(SENT_SESSION_RE, toToken)),
+    sessions,
+  };
+}
+
 /** Sent-message text for reading and copying: markers become ``@name``. */
 export function readableSentText(text: string): string {
   return replaceSentMentions(text, (m) => (m.kind === "session" ? `@${m.title}` : `@${m.path}`));

@@ -356,6 +356,14 @@ describe("UserBubble messages from another session", () => {
     expect(String(fetchMock.mock.calls[0]![0])).toContain("/v1/sessions/s_gone");
     expect(screen.getByTestId("message-origin").textContent).toBe("Fromanother session");
     expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
+    // A later bubble from the same sender, or a return to the transcript, does not ask again.
+    cleanup();
+    renderOriginBubble(client, "[Message from session s_gone]\nagain");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(screen.getByTestId("message-origin").textContent).toBe("Fromanother session");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("fetches an uncached sender once and reuses it for later bubbles", async () => {
