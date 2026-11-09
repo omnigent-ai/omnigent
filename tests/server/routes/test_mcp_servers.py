@@ -277,6 +277,7 @@ async def test_owner_put_through_tunnel(mcp_app, status, error_code, expected):
                     status,
                     server={**_GITHUB, "enabled": "false", "locked": "false"},
                     error_code=error_code,
+                    error="Cannot update disabled MCP servers: io" if error_code == "io" else None,
                 )
             )
         )
@@ -285,6 +286,8 @@ async def test_owner_put_through_tunnel(mcp_app, status, error_code, expected):
     assert response.status_code == expected
     if expected == 200:
         assert response.json()["server"]["enabled"] is False
+    elif error_code == "io":
+        assert response.json()["detail"] == "Cannot update disabled MCP servers: io"
     assert not conn.pending_mcp_server_enabled
 
 

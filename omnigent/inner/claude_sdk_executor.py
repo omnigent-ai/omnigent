@@ -1311,6 +1311,18 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
     )
 
 
+def _init_mcp_server_names(data: Mapping[str, object]) -> tuple[str, ...]:
+    """Extract valid server names from an SDK init event."""
+    servers = data.get("mcp_servers", [])
+    if not isinstance(servers, list):
+        return ()
+    return tuple(
+        row["name"]
+        for row in servers
+        if isinstance(row, dict) and isinstance(row.get("name"), str)
+    )
+
+
 def _claude_settings_payload(
     api_key_helper: str | None, model_overrides: dict[str, str]
 ) -> str | None:
@@ -2000,9 +2012,10 @@ class ClaudeSDKExecutor(Executor):
         # the resolved value may be empty (discovery found nothing).
         self._gateway_vocabulary: _GatewayModelVocabulary | None = None
 
+        self._mcp_active_harnesses = active_harnesses
+
         # Eagerly resolve the gateway transport env so errors surface at
         # construction time.
-        self._mcp_active_harnesses = active_harnesses
         self._extra_env: dict[str, str] = {}
         if gateway:
             gateway_env = _resolve_gateway_env(
@@ -3677,18 +3690,9 @@ class ClaudeSDKExecutor(Executor):
                         if subtype == "init":
                             from omnigent.mcp_disabled_servers import claude_loaded_anyway
 
-                            servers = data.get("mcp_servers", [])
-                            loaded = (
-                                (
-                                    row["name"]
-                                    for row in servers
-                                    if isinstance(row, dict) and isinstance(row.get("name"), str)
-                                )
-                                if isinstance(servers, list)
-                                else ()
-                            )
                             for name in claude_loaded_anyway(
-                                loaded, active_harnesses=self._mcp_active_harnesses
+                                _init_mcp_server_names(data),
+                                active_harnesses=self._mcp_active_harnesses,
                             ):
                                 logger.warning("mcp_disabled_server_not_applied server=%s", name)
 

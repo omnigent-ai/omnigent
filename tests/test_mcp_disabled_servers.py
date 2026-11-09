@@ -13,7 +13,6 @@ from omnigent.mcp_disabled_servers import (
     apply_claude_settings,
     claude_loaded_anyway,
     is_disabled,
-    plan_codex_launch,
     set_disabled,
 )
 
@@ -22,19 +21,6 @@ from omnigent.mcp_disabled_servers import (
 def config_home(tmp_path, monkeypatch):
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     return tmp_path / FILENAME
-
-
-class FakeCodexProbe:
-    def __init__(self, servers=None, error=None):
-        self.servers = servers or {}
-        self.error = error
-        self.calls = []
-
-    async def effective_servers(self, argv, **kwargs):
-        self.calls.append((argv, kwargs))
-        if self.error:
-            raise self.error
-        return self.servers
 
 
 def test_round_trip_exact_keys_no_pruning(config_home):
@@ -96,8 +82,36 @@ def test_bad_storage_fails_open_and_logs_once(config_home, content, caplog):
     for _ in range(2):
         assert not is_disabled(ServerKey("claude", "github"))
     assert len(caplog.records) == 1
-    set_disabled(ServerKey("claude", "github"), True)
-    assert is_disabled(ServerKey("claude", "github"))
+    if content is None:
+        set_disabled(ServerKey("claude", "github"), True)
+        assert is_disabled(ServerKey("claude", "github"))
+    else:
+        with pytest.raises(DisabledServerWriteError) as error:
+            set_disabled(ServerKey("claude", "github"), True)
+        assert error.value.code == "io"
+        assert config_home.read_bytes() == content.encode()
+        assert len(caplog.records) == 1
+
+
+def test_unreadable_storage_refuses_write_without_changing_bytes(config_home, monkeypatch):
+    from pathlib import Path
+
+    original = b'{"version":1,"disabled":[{"harness":"codex","server":"keep"}]}'
+    config_home.write_bytes(original)
+    real_open = Path.open
+
+    def denied_open(path, *args, **kwargs):
+        if path == config_home:
+            raise PermissionError("unreadable")
+        return real_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", denied_open)
+        assert not is_disabled(ServerKey("codex", "keep"))
+        with pytest.raises(DisabledServerWriteError) as error:
+            set_disabled(ServerKey("claude", "new"), True)
+        assert error.value.code == "io"
+    assert config_home.read_bytes() == original
 
 
 def test_read_normalization(config_home):
@@ -165,73 +179,6 @@ def test_malformed_sdk_settings_fail_open(settings):
         apply_claude_settings(settings, executor="claude-sdk", active_harnesses=["claude"])
         is settings
     )
-
-
-@pytest.mark.parametrize("executor", ["codex", "codex-native"])
-@pytest.mark.parametrize("active", [None, [], ["claude"], ["codex"]])
-async def test_codex_no_probe_without_entries(executor, active, tmp_path):
-    probe = FakeCodexProbe(error=AssertionError("must not probe"))
-    plan = await plan_codex_launch(
-        "codex",
-        ["base=true"],
-        executor=executor,
-        active_harnesses=active,
-        env={},
-        cwd=tmp_path,
-        probe=probe,
-    )
-    assert plan.config_overrides == plan.fallback_config_overrides == ("base=true",)
-    assert plan.outcome == "none"
-    assert plan.overrides_after_early_exit() is None
-    assert not probe.calls
-
-
-@pytest.mark.parametrize("executor", ["codex", "codex-native"])
-async def test_codex_reported_names_only_and_probe_contract(executor, tmp_path):
-    for name in ["github", "missing", "already_off"]:
-        set_disabled(ServerKey("codex", name), True)
-    probe = FakeCodexProbe({"github": True, "already_off": False})
-    plan = await plan_codex_launch(
-        "/bin/codex",
-        ["base=true"],
-        executor=executor,
-        active_harnesses=["codex"],
-        env={"CODEX_HOME": "private"},
-        cwd=tmp_path,
-        probe=probe,
-    )
-    assert probe.calls == [
-        (
-            ["/bin/codex", "-c", "base=true", "mcp", "list", "--json"],
-            {"env": {"CODEX_HOME": "private"}, "cwd": tmp_path, "timeout_s": 3.0},
-        )
-    ]
-    assert plan.config_overrides == (
-        "base=true",
-        "mcp_servers.github.enabled=false",
-        "mcp_servers.already_off.enabled=false",
-    )
-    assert plan.outcome == "applied"
-    assert plan.dropped == ("missing",)
-    assert plan.overrides_after_early_exit() == ("base=true",)
-
-
-@pytest.mark.parametrize("error", [TimeoutError(), OSError("no CLI"), ValueError("bad json")])
-async def test_codex_probe_failure(error, tmp_path, caplog):
-    set_disabled(ServerKey("codex", "github"), True)
-    plan = await plan_codex_launch(
-        "codex",
-        ["base=true"],
-        executor="codex",
-        active_harnesses=["codex"],
-        env={},
-        cwd=tmp_path,
-        probe=FakeCodexProbe(error=error),
-    )
-    assert plan.config_overrides == plan.fallback_config_overrides == ("base=true",)
-    assert plan.outcome == "probe_failed"
-    assert plan.overrides_after_early_exit() is None
-    assert "mcp_disabled_preflight_failed" in caplog.text
 
 
 def test_thread_writers_do_not_lose_updates():
@@ -302,40 +249,6 @@ def test_unreadable_storage(config_home):
     assert error.value.code == "io"
 
 
-async def test_codex_all_names_dropped(tmp_path):
-    set_disabled(ServerKey("codex", "missing"), True)
-    plan = await plan_codex_launch(
-        "codex",
-        [],
-        executor="codex",
-        active_harnesses=["codex"],
-        env={},
-        cwd=tmp_path,
-        probe=FakeCodexProbe(),
-    )
-    assert plan.outcome == "none"
-    assert plan.dropped == ("missing",)
-    assert plan.overrides_after_early_exit() is None
-
-
-async def test_codex_quoted_key(tmp_path):
-    set_disabled(ServerKey("codex", 'name.with."quotes'), True)
-    plan = await plan_codex_launch(
-        "codex",
-        [],
-        executor="codex",
-        active_harnesses=["codex"],
-        env={},
-        cwd=tmp_path,
-        probe=FakeCodexProbe({'name.with."quotes': True}),
-    )
-    import tomllib
-
-    assert tomllib.loads(plan.config_overrides[0]) == {
-        "mcp_servers": {'name.with."quotes': {"enabled": False}}
-    }
-
-
 def test_default_config_home(tmp_path, monkeypatch):
     import os
     import subprocess
@@ -358,15 +271,18 @@ def test_default_config_home(tmp_path, monkeypatch):
     ]
 
 
-def test_storage_size_boundary_and_replacement_log(config_home, caplog):
+def test_storage_size_boundary_and_write_refusal(config_home, caplog):
     content = json.dumps({"version": 1, "disabled": [{"harness": "claude", "server": "fixture"}]})
     config_home.write_text(content + " " * (65536 - len(content)))
     assert is_disabled(ServerKey("claude", "fixture"))
     config_home.write_text(config_home.read_text() + " ")
     assert not is_disabled(ServerKey("claude", "fixture"))
-    set_disabled(ServerKey("claude", "new"), True)
-    assert "mcp_disabled_servers_replacing_invalid_storage" in caplog.text
-    assert is_disabled(ServerKey("claude", "new"))
+    original = config_home.read_bytes()
+    with pytest.raises(DisabledServerWriteError) as error:
+        set_disabled(ServerKey("claude", "new"), True)
+    assert error.value.code == "io"
+    assert config_home.read_bytes() == original
+    assert "mcp_disabled_servers_replacing_invalid_storage" not in caplog.text
 
 
 @pytest.mark.parametrize(
