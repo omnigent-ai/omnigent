@@ -27,6 +27,57 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+_SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
+# SQLite enforces neither declared lengths nor types; these bound what it stores.
+_SQLITE_CHECKS: tuple[tuple[str, str], ...] = (
+    ("user_id IS NULL OR length(CAST(user_id AS BLOB)) <= 512", "ck_inbox_items_user_id_bytes"),
+    (
+        "prompt_version IS NULL OR length(CAST(prompt_version AS BLOB)) <= 256",
+        "ck_inbox_items_prompt_version_bytes",
+    ),
+    ("title IS NULL OR length(CAST(title AS BLOB)) <= 1024", "ck_inbox_items_title_bytes"),
+    (
+        "primary_link IS NULL OR length(CAST(primary_link AS BLOB)) <= 8192",
+        "ck_inbox_items_primary_link_bytes",
+    ),
+    ("topic IS NULL OR length(CAST(topic AS BLOB)) <= 512", "ck_inbox_items_topic_bytes"),
+    (
+        "dedupe_key IS NULL OR length(CAST(dedupe_key AS BLOB)) <= 512",
+        "ck_inbox_items_dedupe_key_bytes",
+    ),
+    ("body_md IS NULL OR length(CAST(body_md AS BLOB)) <= 16383", "ck_inbox_items_body_md_bytes"),
+    ("links IS NULL OR length(CAST(links AS BLOB)) <= 16383", "ck_inbox_items_links_bytes"),
+    ("actions IS NULL OR length(CAST(actions AS BLOB)) <= 16383", "ck_inbox_items_actions_bytes"),
+    ("chart IS NULL OR length(CAST(chart AS BLOB)) <= 16383", "ck_inbox_items_chart_bytes"),
+    (
+        "feedback_text IS NULL OR length(CAST(feedback_text AS BLOB)) <= 16383",
+        "ck_inbox_items_feedback_text_bytes",
+    ),
+    (
+        "workspace_id IS NULL OR typeof(workspace_id) = 'integer'",
+        "ck_inbox_items_workspace_id_integer",
+    ),
+    ("created_at IS NULL OR typeof(created_at) = 'integer'", "ck_inbox_items_created_at_integer"),
+    ("read_at IS NULL OR typeof(read_at) = 'integer'", "ck_inbox_items_read_at_integer"),
+    ("acted_at IS NULL OR typeof(acted_at) = 'integer'", "ck_inbox_items_acted_at_integer"),
+    ("expires_at IS NULL OR typeof(expires_at) = 'integer'", "ck_inbox_items_expires_at_integer"),
+    (
+        "resolution_action IS NULL OR typeof(resolution_action) = 'integer'",
+        "ck_inbox_items_resolution_action_integer",
+    ),
+    ("length(CAST(id AS BLOB)) = 16", "ck_inbox_items_id_uuid"),
+    ("length(CAST(source_session_id AS BLOB)) = 16", "ck_inbox_items_source_session_id_uuid"),
+    ("length(CAST(agent_id AS BLOB)) = 16", "ck_inbox_items_agent_id_uuid"),
+)
+
+
+def _sqlite_checks() -> list[sa.CheckConstraint]:
+    """The SQLite-only CHECKs, or none on databases that enforce column types."""
+    if op.get_bind().dialect.name not in _SQLITE_FAMILY:
+        return []
+    return [sa.CheckConstraint(expr, name=name) for expr, name in _SQLITE_CHECKS]
+
+
 def upgrade() -> None:
     """Create the ``inbox_items`` table and its indexes."""
     op.create_table(
@@ -66,9 +117,10 @@ def upgrade() -> None:
             "resolution IN (0, 1, 2, 3, 4, 5, 6)", name="ck_inbox_items_resolution"
         ),
         sa.CheckConstraint(
-            "session_slot >= 0 AND session_slot < 10", name="ck_inbox_items_session_slot"
+            "session_slot IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)", name="ck_inbox_items_session_slot"
         ),
         sa.PrimaryKeyConstraint("workspace_id", "id"),
+        *_sqlite_checks(),
     )
     op.create_index(
         "ix_inbox_items_user_created",
