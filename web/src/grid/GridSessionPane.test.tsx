@@ -53,7 +53,10 @@ vi.mock("@/shell/FilesPanel", async (original) => ({
   ...(await original<typeof FilesPanelModule>()),
   revealFolderInFilesPanel: vi.fn(),
 }));
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => ({}) }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => ({}),
+  useOptionalLoadedConversations: () => undefined,
+}));
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id: string) => ({

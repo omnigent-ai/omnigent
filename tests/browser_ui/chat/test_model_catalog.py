@@ -519,10 +519,10 @@ def test_side_chat_model_settings_before_and_after_first_message(
     page.get_by_role("menuitemcheckbox", name="Opus", exact=True).click()
     page.get_by_role("menuitemcheckbox", name="Low", exact=True).click()
     page.keyboard.press("Escape")
-    # The tray creates a live fork; only an unsent draft displays the requested model.
-    expect(picker).to_contain_text("Sonnet" if entrypoint == "tray" else "Opus")
+    # Each entrypoint opens an unsent draft that shows the requested model.
+    expect(picker).to_contain_text("Opus")
     expect(picker).to_contain_text("Low")
-    assert len(forks) == (1 if entrypoint == "tray" else 0)
+    assert len(forks) == 0
     assert chat.session_patches == []
     with page.expect_response(
         lambda response: (
@@ -532,9 +532,8 @@ def test_side_chat_model_settings_before_and_after_first_message(
         page.get_by_test_id("side-chat-send").click()
     expect(page.get_by_test_id("side-chat-input")).to_have_value("")
     assert len(forks) == 1
-    if entrypoint == "workspace":
-        assert forks[0]["model_override"] == "opus"
-        assert forks[0]["reasoning_effort"] == "low"
+    assert forks[0]["model_override"] == "opus"
+    assert forks[0]["reasoning_effort"] == "low"
     assert child["model_override"] == "opus"
     assert child["reasoning_effort"] == "low"
     assert forks[0]["side_chat"] is True

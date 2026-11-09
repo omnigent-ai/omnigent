@@ -1454,29 +1454,33 @@ class HarnessApp:
             HTTP response.
         """
         sequence = 0
-        for initial_event in self._initial_envelope_events(ctx, model=model, start_seq=sequence):
-            yield _format_sse_event(initial_event)
-            sequence += 1
-
-        run_task = asyncio.create_task(
-            self._guarded_run_turn(request, ctx),
-            name=f"harness-run-turn:{ctx.response_id}",
-        )
-        heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(ctx),
-            name=f"harness-heartbeat:{ctx.response_id}",
-        )
-        # Track the sequence_number of the last non-heartbeat
-        # event emitted on this stream so we can stamp the
-        # heartbeat's ``last_event_seq`` field at yield time.
-        # Per the contract (§Heartbeats), heartbeats carry the
-        # *previous* user-visible event's sequence number so
-        # consumers can detect dropped events. ``None`` until
-        # the first non-heartbeat event lands; the initial
-        # response.created / response.in_progress envelope
-        # events count, so this populates immediately.
-        last_event_seq: int | None = sequence - 1 if sequence > 0 else None
+        run_task: asyncio.Task[None] | None = None
+        heartbeat_task: asyncio.Task[None] | None = None
         try:
+            for initial_event in self._initial_envelope_events(
+                ctx, model=model, start_seq=sequence
+            ):
+                yield _format_sse_event(initial_event)
+                sequence += 1
+
+            run_task = asyncio.create_task(
+                self._guarded_run_turn(request, ctx),
+                name=f"harness-run-turn:{ctx.response_id}",
+            )
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(ctx),
+                name=f"harness-heartbeat:{ctx.response_id}",
+            )
+            # Track the sequence_number of the last non-heartbeat
+            # event emitted on this stream so we can stamp the
+            # heartbeat's ``last_event_seq`` field at yield time.
+            # Per the contract (§Heartbeats), heartbeats carry the
+            # *previous* user-visible event's sequence number so
+            # consumers can detect dropped events. ``None`` until
+            # the first non-heartbeat event lands; the initial
+            # response.created / response.in_progress envelope
+            # events count, so this populates immediately.
+            last_event_seq: int | None = sequence - 1 if sequence > 0 else None
             while True:
                 event = await ctx._event_queue.get()
                 if event is None:
@@ -1510,7 +1514,8 @@ class HarnessApp:
             yield _format_sse_event(terminal)
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
-            _freeze_gc_if_armed(run_task, ctx)
+            if run_task is not None:
+                _freeze_gc_if_armed(run_task, ctx)
 
     def _initial_envelope_events(
         self, ctx: TurnContext, model: str, start_seq: int
@@ -1559,8 +1564,8 @@ class HarnessApp:
     async def _teardown_turn(
         self,
         ctx: TurnContext,
-        run_task: asyncio.Task[None],
-        heartbeat_task: asyncio.Task[None],
+        run_task: asyncio.Task[None] | None,
+        heartbeat_task: asyncio.Task[None] | None,
     ) -> None:
         """
         Cancel the heartbeat + (defensively) the run task, then
@@ -1572,16 +1577,15 @@ class HarnessApp:
 
         :param ctx: The per-turn context (used for the response_id
             registry key).
-        :param run_task: The completed (or to-be-cancelled)
-            run_turn task.
-        :param heartbeat_task: The heartbeat emitter task; always
-            still running at this point (it loops forever) and
-            needs explicit cancellation.
+        :param run_task: The completed (or to-be-cancelled) run_turn task,
+            or ``None`` if the stream closed during its initial envelope.
+        :param heartbeat_task: The heartbeat emitter task, if started.
         """
-        heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat_task
-        if not run_task.done():
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+        if run_task is not None and not run_task.done():
             # Defensive: run_turn might still be parked on a
             # Future the cleanup didn't release. Cancel here as a
             # last resort so the task doesn't leak.
