@@ -60,6 +60,7 @@ from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import AutomationFailure, ScheduledTaskStore
+from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
 
@@ -506,7 +507,8 @@ def create_scheduled_tasks_router(
         return task
 
     def _reject_proactive_agent(agent_id: str | None) -> None:
-        if agent_id in PROACTIVE_AGENT_IDS:
+        # Agent lookup accepts dashed and legacy-prefixed spellings of an id.
+        if normalize_uuid(agent_id) in PROACTIVE_AGENT_IDS:
             raise OmnigentError(
                 "This agent runs only on its built-in schedule", code=ErrorCode.INVALID_INPUT
             )
@@ -920,9 +922,9 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
-        _reject_proactive_agent(body.agent_id)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
+        _reject_proactive_agent(body.agent_id)
         legacy_workspace = (
             existing.execution_target == "managed_sandbox"
             and existing.workspace is not None

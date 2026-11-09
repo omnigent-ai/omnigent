@@ -26,9 +26,10 @@ tool_groups:
 
 async: false
 
-# Shell and file reads for tools such as `gh` and `git`; writes are denied and
-# risky shell commands are blocked rather than asked about, since nobody is
-# watching a scheduled run to answer a prompt.
+# A shell for tools such as `gh` and `git`. The policies below deny the file
+# write and edit tools and block risky shell commands rather than ask, since
+# nobody watches a scheduled run; they do not stop every shell write, so the
+# run relies on its fresh, per-run sandbox for isolation.
 os_env:
   type: caller_process
   cwd: .

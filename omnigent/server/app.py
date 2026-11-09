@@ -688,7 +688,8 @@ def _error_audit_extra(
 # Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
-_PROACTIVE_BUNDLE_SOURCE = Path(_proactive_resources.__file__).parent
+# Kept out of the package directory so __init__.py and bytecode never enter the bundle hash.
+_PROACTIVE_BUNDLE_SOURCE = Path(_proactive_resources.__file__).parent / "bundle"
 
 
 class _FastAPICallNext(Protocol):
@@ -1110,8 +1111,7 @@ def _ensure_default_agents(
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
-    :returns: Packaged built-in names to hide from ``GET /v1/agents``, always
-        including the proactive agent.
+    :returns: Packaged built-in names to hide from ``GET /v1/agents``.
     """
     allowlist = seeded_agent_allowlist()
     packaged = (
@@ -1121,11 +1121,10 @@ def _ensure_default_agents(
         | _ensure_default_polly_agent(agent_store, artifact_store, agent_cache, allowlist)
     )
     extras = _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
+    # Outside the allowlist: only hidden tasks run it, and GET /v1/agents never lists it.
     _ensure_default_proactive_agent(agent_store, artifact_store, agent_cache)
-    # Only its hidden scheduled tasks start the proactive agent.
-    always_hidden = frozenset({PROACTIVE_AGENT_NAME}) - extras
     if allowlist is None:
-        return always_hidden
+        return frozenset()
     unknown = allowlist - packaged
     if unknown:
         _logger.warning(
@@ -1144,7 +1143,7 @@ def _ensure_default_agents(
             SEEDED_AGENTS_ENV,
             ", ".join(sorted(suppressed)),
         )
-    return suppressed | always_hidden
+    return suppressed
 
 
 # Env var listing extra built-in agent specs to seed at startup, in addition

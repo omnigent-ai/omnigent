@@ -83,30 +83,33 @@ def request_timezone(value: str | None) -> str:
 
 
 class ProactiveProvisioner:
-    """Creates each user's proactive task once per server process."""
+    """Creates each user's proactive task once per server process.
+
+    A user counts as provisioned only after the row exists and, with the
+    in-process scheduler, its timer is armed, so a failure is retried on the
+    user's next session create.
+    """
 
     def __init__(self) -> None:
         self._checked: set[tuple[int, str | None]] = set()
+        self._running: set[tuple[int, str | None]] = set()
 
     def needed(self, user_id: str | None) -> bool:
-        """Whether this process has not yet provisioned *user_id*."""
-        return (current_workspace_id(), user_id) not in self._checked
+        """Whether *user_id* is neither provisioned nor being provisioned here."""
+        key = (current_workspace_id(), user_id)
+        return key not in self._checked and key not in self._running
 
-    def provision(
-        self, store: Any, user_id: str | None, timezone: str, scheduler: Any | None
-    ) -> ScheduledTask | None:
-        """Create *user_id*'s proactive task if it is missing.
+    def ensure_task(self, store: Any, user_id: str | None, timezone: str) -> ScheduledTask:
+        """Return *user_id*'s proactive task, creating it if missing (database work only).
 
         :param store: The scheduled-task store.
         :param user_id: The owner, or ``None`` in single-user mode.
-        :param timezone: IANA timezone the schedule runs in.
-        :param scheduler: Legacy in-process scheduler to arm, or ``None``.
-        :returns: The created task, or ``None`` when it already existed.
+        :param timezone: IANA timezone a new schedule runs in.
         """
         task_id = proactive_task_id(user_id)
-        if store.get(task_id) is not None:
-            self._checked.add((current_workspace_id(), user_id))
-            return None
+        existing = store.get(task_id)
+        if existing is not None:
+            return existing
         task = store.create(
             scheduled_task_id=task_id,
             name=PROACTIVE_TASK_NAME,
@@ -119,21 +122,37 @@ class ProactiveProvisioner:
             session_mode="new",
             execution_target="managed_sandbox",
         )
-        self._checked.add((current_workspace_id(), user_id))
-        if scheduler is not None:
-            scheduler.add(task)
         _logger.info("Provisioned proactive task %s", task.id)
         return task
 
+    async def provision(
+        self, store: Any, user_id: str | None, timezone: str, scheduler: Any | None
+    ) -> ScheduledTask:
+        """Ensure the row off the event loop, then arm the in-process timer on it.
 
-def start_provisioning(
-    request: Any, user_id: str | None
-) -> asyncio.Task[ScheduledTask | None] | None:
+        :param scheduler: Legacy in-process scheduler, or ``None`` when persistent
+            dispatch picks the row up from the database.
+        """
+        key = (current_workspace_id(), user_id)
+        self._running.add(key)
+        try:
+            task = await asyncio.to_thread(self.ensure_task, store, user_id, timezone)
+            if scheduler is not None:
+                # Re-adding replaces the timer, so a row left by a failed attempt is armed too.
+                scheduler.add(task)
+            self._checked.add(key)
+            return task
+        finally:
+            self._running.discard(key)
+
+
+def start_provisioning(request: Any, user_id: str | None) -> asyncio.Task[ScheduledTask] | None:
     """Start provisioning the caller's proactive task alongside a session create.
 
     Runs inside the request, so a store that creates per-owner authorization
-    acts as the caller. Skipped when the gate is off for the caller, this process already
-    checked the caller, or the deployment cannot launch managed sandboxes.
+    acts as the caller. Skipped when the gate is off for the caller, this
+    process already provisioned the caller, or the deployment cannot launch
+    managed sandboxes.
     """
     state = request.app.state
     provisioner: ProactiveProvisioner | None = getattr(state, "proactive_provisioner", None)
@@ -150,19 +169,17 @@ def start_provisioning(
     scheduler = None
     if not getattr(state, "scheduled_task_dispatch_enabled", False):
         scheduler = getattr(state, "scheduled_task_scheduler", None)
-    task = asyncio.create_task(
-        asyncio.to_thread(provisioner.provision, store, user_id, timezone, scheduler)
-    )
+    task = asyncio.create_task(provisioner.provision(store, user_id, timezone, scheduler))
     task.add_done_callback(_log_provisioning_failure)
     return task
 
 
-def _log_provisioning_failure(task: asyncio.Task[ScheduledTask | None]) -> None:
+def _log_provisioning_failure(task: asyncio.Task[ScheduledTask]) -> None:
     if not task.cancelled() and task.exception() is not None:
         _logger.warning("Proactive task provisioning failed", exc_info=task.exception())
 
 
-async def finish_provisioning(task: asyncio.Task[ScheduledTask | None] | None) -> None:
+async def finish_provisioning(task: asyncio.Task[ScheduledTask] | None) -> None:
     """Wait briefly for provisioning; never fail the session create.
 
     A failure is logged, and the caller's next session create tries again.

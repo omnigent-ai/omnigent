@@ -709,6 +709,8 @@ async def test_proactive_gate_is_checked_as_the_task_owner(store) -> None:
 
     claimed = _claim(store, agent_id=PROACTIVE_AGENT_ID)
     deps = _deps(store)
+    # The agent is shipped, so only the gate can skip the run.
+    deps.agent_store = FakeAgentStore({PROACTIVE_AGENT_ID: _FakeAgent(PROACTIVE_AGENT_ID)})
     deps.app_state = SimpleNamespace(proactive_agent_available=gate)
     dispatch = AsyncMock()
 
@@ -720,6 +722,7 @@ async def test_proactive_gate_is_checked_as_the_task_owner(store) -> None:
     assert (run.status, run.error_code) == ("skipped", "proactive_agent_off")
     assert seen == ["task-owner"]
     dispatch.assert_not_awaited()
+    assert store.get(claimed.task.id).state == "active"
 
 
 async def test_proactive_task_skips_when_its_agent_is_not_shipped(store) -> None:
@@ -735,6 +738,7 @@ async def test_proactive_task_skips_when_its_agent_is_not_shipped(store) -> None
     [run] = _runs(store, claimed.task)
     assert (run.status, run.error_code) == ("skipped", "proactive_agent_off")
     dispatch.assert_not_awaited()
+    assert store.get(claimed.task.id).state == "active"
 
 
 async def test_lost_lease_stops_before_the_prompt_is_sent(store) -> None:
