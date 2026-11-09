@@ -19,6 +19,7 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     StartupLeaseLost,
 )
 from omnigent.server.scheduled.schedule import (
+    next_scheduled_time,
     occurrence_host_id,
     sandbox_host_id,
     scheduled_trigger_key,
@@ -2574,7 +2575,7 @@ async def test_a_saved_trigger_polls_two_minutes_out_only_with_a_busy_check(
             assert saved.next_run_at == at + TRIGGER_POLL_SECONDS
         else:
             # Without a busy check, the hourly saved schedule still applies.
-            assert saved.next_run_at - at > TRIGGER_POLL_SECONDS
+            assert saved.next_run_at == next_scheduled_time(saved, at)
 
 
 async def test_other_continued_sessions_keep_their_schedule_and_send_while_busy(store) -> None:

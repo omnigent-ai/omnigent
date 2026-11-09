@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.server.scheduled.schedule import next_scheduled_time
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
@@ -1561,7 +1562,7 @@ def test_an_edit_that_changes_trigger_status_moves_the_next_poll(
     assert task.next_run_at == task.created_at + 120
     # Without its opening sentence, the task follows its hourly schedule again.
     plain = store.update(task.id, prompt="Check the channel.")
-    assert plain.next_run_at - plain.updated_at > 120
+    assert plain.next_run_at == next_scheduled_time(plain, plain.updated_at)
     trigger = store.update(task.id, prompt=trigger_prompt)
     assert trigger.next_run_at == trigger.updated_at + 120
 

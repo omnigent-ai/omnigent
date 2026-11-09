@@ -450,8 +450,9 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
     with a recorded session waits while the session is busy: until
     :data:`BUSY_QUIET_SECONDS` after its last change if it is idle, or
     :data:`BUSY_RECHECK_SECONDS` from now while it shows as running (a turn in progress,
-    or waiting on an approval or question). It never waits past
-    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out.
+    or waiting on an approval or question) or the previous poll is still being
+    delivered. It never waits past :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll
+    went out.
     """
 
     async def busy_until(task: ScheduledTask, now: int) -> int | None:
@@ -469,17 +470,27 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
         session = activity.get(session_id)
         if session is None:
             return None
-        if _session_status_from_cache(session_id, session.live_status) == "running":
+        runs, _ = await asyncio.to_thread(deps.scheduled_task_store.list_runs, task.id, limit=1)
+        latest = runs[0] if runs else None
+        if _session_status_from_cache(session_id, session.live_status) == "running" or (
+            # The previous poll is still on its way in, e.g. while a sandbox starts.
+            latest is not None and latest.status in ("scheduled", "starting")
+        ):
             until = now + BUSY_RECHECK_SECONDS
         else:
             until = session.updated_at + BUSY_QUIET_SECONDS
         if until <= now:
             return None
-        runs, _ = await asyncio.to_thread(deps.scheduled_task_store.list_runs, task.id, limit=1)
-        if not runs:
+        # The latest poll went out at the task's last firing or when its newest run started,
+        # whichever is later; either can be later than the poll was due.
+        sent_times = [task.last_run_at]
+        if latest is not None:
+            sent_times.append(
+                latest.fired_at if latest.fired_at is not None else latest.scheduled_at
+            )
+        sent_at = max((t for t in sent_times if t is not None), default=None)
+        if sent_at is None:
             return None
-        # Count from when the latest poll went out, which can be later than it was due.
-        sent_at = runs[0].fired_at if runs[0].fired_at is not None else runs[0].scheduled_at
         backstop = sent_at + BUSY_SKIP_MAX_SECONDS
         return min(until, backstop) if backstop > now else None
 
