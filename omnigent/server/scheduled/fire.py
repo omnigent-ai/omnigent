@@ -80,8 +80,8 @@ from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.native.permission_modes import (
+    APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
-    UNATTENDED_DISALLOWED_PERMISSION_MODES,
 )
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
@@ -105,13 +105,11 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     StartupLease,
 )
 from omnigent.server.scheduled.harness_settings import (
-    UNATTENDED_PERMISSION_MODE_MESSAGE,
-    scheduled_agent_default_permission_mode,
+    inherited_approval_skipping_problem,
     scheduled_agent_harness,
-    unattended_permission_mode_allowed,
     validate_scheduled_permission_mode,
 )
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
 from omnigent.server.scheduled.telemetry import (
     current_fire_stage,
     fire_stage,
@@ -364,12 +362,7 @@ class _NewRunRecorder:
 
 
 def _scheduled_session_title(task: ScheduledTask) -> str:
-    if task.session_mode == "continue" and task.prompt.startswith(
-        tuple(
-            f"This automation watches {source} and starts one Omnigent session"
-            for source in ("Jira", "Slack", "GitHub", "Linear")
-        )
-    ):
+    if is_trigger_automation(task):
         return f"[automation job] {task.name}"
     return task.name
 
@@ -435,6 +428,73 @@ def build_on_fire(
         return result is not _FireResult.INACTIVE
 
     return on_fire
+
+
+# A trigger's session must be quiet this long after its last change before it is polled,
+# since an agent can pause between steps.
+BUSY_QUIET_SECONDS = 2 * 60
+# A session still shown as running is checked again this often, since its work could end
+# at any time.
+BUSY_RECHECK_SECONDS = 2 * 60
+# While its session looks busy, a trigger automation still gets a prompt this often, so a
+# stale "running" status cannot stall it.
+BUSY_SKIP_MAX_SECONDS = 10 * 60
+
+
+def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable[int | None]]:
+    """Build the persistent scheduler's check for when to poll a trigger automation.
+
+    The check returns ``None`` to poll now, or the time to check again. A continue task
+    with a recorded session waits while the session is busy: until
+    :data:`BUSY_QUIET_SECONDS` after its last change if it is idle, or
+    :data:`BUSY_RECHECK_SECONDS` from now while it shows as running (a turn in progress,
+    or waiting on an approval or question), has an approval or question pending, or the
+    previous poll is still being delivered. It never waits past
+    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out.
+    """
+
+    async def busy_until(task: ScheduledTask, now: int) -> int | None:
+        from omnigent.server.routes._sessions.helpers import _session_status_from_cache
+
+        session_id = task.session_id
+        if task.session_mode != "continue" or session_id is None:
+            return None
+        # The scheduler polls without the owner's identity, which only a fire assumes, so
+        # read the persisted status from session activity, which needs no caller access
+        # check. The fire itself still checks the session before it sends anything.
+        activity = await asyncio.to_thread(
+            deps.conversation_store.get_session_activity, [session_id]
+        )
+        session = activity.get(session_id)
+        if session is None:
+            return None
+        runs, _ = await asyncio.to_thread(deps.scheduled_task_store.list_runs, task.id, limit=1)
+        latest = runs[0] if runs else None
+        running = _session_status_from_cache(session_id, session.live_status) == "running"
+        # A native session can report idle while it waits on an approval or a question.
+        waiting = session.runner_id is not None and bool(session.pending_elicitation_count)
+        # The previous poll may still be on its way in, e.g. while a sandbox starts.
+        delivering = latest is not None and latest.status in ("scheduled", "starting")
+        if running or waiting or delivering:
+            until = now + BUSY_RECHECK_SECONDS
+        else:
+            until = session.updated_at + BUSY_QUIET_SECONDS
+        if until <= now:
+            return None
+        # The latest poll went out at the task's last firing or when its newest run started,
+        # whichever is later; either can be later than the poll was due.
+        sent_times = [task.last_run_at]
+        if latest is not None:
+            sent_times.append(
+                latest.fired_at if latest.fired_at is not None else latest.scheduled_at
+            )
+        sent_at = max((t for t in sent_times if t is not None), default=None)
+        if sent_at is None:
+            return None
+        backstop = sent_at + BUSY_SKIP_MAX_SECONDS
+        return min(until, backstop) if backstop > now else None
+
+    return busy_until
 
 
 def build_run_now(
@@ -868,9 +928,9 @@ async def _continue_session(
         return
     assert conv is not None
     agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
-    unsafe = await _unattended_permission_problem(deps, task, agent, task_mode=False)
-    if unsafe is not None:
-        reason, error_code = unsafe
+    inherited = await _inherited_permission_problem(deps, task, agent, continued=True)
+    if inherited is not None:
+        reason, error_code = inherited
         await recorder.finish(
             "failed", conversation_id=session_id, error=reason, error_code=error_code
         )
@@ -933,18 +993,16 @@ _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"
 
 UNATTENDED_PERMISSION_ERROR_CODE = "permission_mode_not_allowed"
 
-# Launch flags that start a native CLI without an approval gate, for sessions
-# whose live mode has no label.
-_UNATTENDED_DISALLOWED_LAUNCH_ARGS: tuple[tuple[str, ...], ...] = (
+# Launch flags that start a native CLI without an approval gate, for sessions whose
+# live mode has no label; Codex's full bypass is what spec-derived args emit for ``yolo``.
+_APPROVAL_SKIPPING_LAUNCH_ARGS: tuple[tuple[str, ...], ...] = (
     *(
         tuple(args)
         for modes in PERMISSION_LAUNCH_ARGS.values()
         for mode, args in modes.items()
-        if mode in UNATTENDED_DISALLOWED_PERMISSION_MODES and args
+        if mode in APPROVAL_SKIPPING_PERMISSION_MODES and args
     ),
     ("--dangerously-skip-permissions",),
-    # Codex's full bypass, which spec-derived launch args emit for ``yolo``, and
-    # any launch that turns off its approval prompts.
     ("--dangerously-bypass-approvals-and-sandbox",),
     ("--ask-for-approval", "never"),
 )
@@ -955,44 +1013,42 @@ def _contains_args(args: list[str], needle: tuple[str, ...]) -> bool:
     return any(tuple(args[i : i + width]) == needle for i in range(len(args) - width + 1))
 
 
-def session_unattended_disallowed_mode(conv: Conversation) -> str | None:
-    """The disallowed permission mode *conv* is running in, or ``None``.
+def session_approval_skipping_mode(conv: Conversation) -> str | None:
+    """The approval-skipping permission mode *conv* is running in, or ``None``.
 
     The Claude label tracks the live mode, including switches made inside the
     CLI, so it wins over the launch flags it may have replaced.
     """
     claude_mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
     if claude_mode:
-        return None if unattended_permission_mode_allowed(claude_mode) else claude_mode
+        return claude_mode if claude_mode in APPROVAL_SKIPPING_PERMISSION_MODES else None
     if conv.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
         return "bypass"
     launch_args = list(getattr(conv, "terminal_launch_args", None) or [])
-    for needle in _UNATTENDED_DISALLOWED_LAUNCH_ARGS:
+    for needle in _APPROVAL_SKIPPING_LAUNCH_ARGS:
         if _contains_args(launch_args, needle):
             return " ".join(needle)
     return None
 
 
-async def _unattended_permission_problem(
-    deps: FireDeps, task: ScheduledTask, agent: Any, *, task_mode: bool = True
+async def _inherited_permission_problem(
+    deps: FireDeps, task: ScheduledTask, agent: Any, *, continued: bool = False
 ) -> tuple[str, str] | None:
-    """Why *task* may not run unattended with its saved mode or its agent's default.
+    """Why *task* may not run in its agent's default permission mode.
 
-    ``task_mode=False`` checks only the agent default, for continued sessions,
-    which keep their own mode.
+    A new session applies the task's own mode over that default, so any selected mode
+    opts out of it. A continued session keeps the agent's default, so only a task that
+    selects an approval-skipping mode itself opts in to running in one.
     """
-    if task_mode and task.permission_mode is not None:
-        mode: str | None = task.permission_mode
-        source = "the automation's permission setting"
-    else:
-        mode = await scheduled_agent_default_permission_mode(agent, deps.agent_cache)
-        source = "the agent's default"
-    if unattended_permission_mode_allowed(mode):
-        return None
-    return (
-        f"{UNATTENDED_PERMISSION_MODE_MESSAGE.format(mode=mode)} ({source})",
-        UNATTENDED_PERMISSION_ERROR_CODE,
+    opted_in = (
+        task.permission_mode in APPROVAL_SKIPPING_PERMISSION_MODES
+        if continued
+        else task.permission_mode is not None
     )
+    if opted_in:
+        return None
+    problem = await inherited_approval_skipping_problem(agent, deps.agent_cache)
+    return None if problem is None else (problem, UNATTENDED_PERMISSION_ERROR_CODE)
 
 
 async def continued_session_problem(
@@ -1020,12 +1076,12 @@ async def continued_session_problem(
         return "the session is a sub-agent's session", "continued_session_incompatible"
     if conv.agent_id != task.agent_id:
         return "the session runs a different agent", "continued_session_incompatible"
-    session_mode = session_unattended_disallowed_mode(conv)
-    if session_mode is not None:
+    session_mode = session_approval_skipping_mode(conv)
+    if session_mode is not None and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES:
         return (
-            f"the session is in permission mode {session_mode!r}, which automations cannot "
-            "use; switch the session to a mode that asks for approval or uses the auto "
-            "classifier",
+            f"the session is in permission mode {session_mode!r}, which skips approval, but the "
+            "automation does not select such a mode; switch the session to a mode that asks for "
+            "approval or uses the auto classifier",
             UNATTENDED_PERMISSION_ERROR_CODE,
         )
     # A pin the task changed since would otherwise be ignored silently: the
@@ -1909,10 +1965,10 @@ async def _validate_fire_session_inputs(
             model_override=task.model_override,
             reasoning_effort=task.reasoning_effort,
         )
-        # Tasks saved before modes were restricted still hold them.
-        unsafe = await _unattended_permission_problem(deps, task, agent)
-        if unsafe is not None:
-            return unsafe
+        # The agent's default could change after the task was saved.
+        inherited = await _inherited_permission_problem(deps, task, agent)
+        if inherited is not None:
+            return inherited
         validate_scheduled_permission_mode(task.permission_mode)
         # An unresolvable or incompatible mode fails session creation.
         if validate_workspace:

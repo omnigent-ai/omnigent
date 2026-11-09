@@ -25,6 +25,8 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexMessage,
     CodexParams,
     client_for_transport,
+    codex_resume_current_model_provider,
+    codex_resume_unconfigured_model_provider,
     is_compaction_steer_refusal,
     is_server_draining_error,
     is_stale_active_turn_error,
@@ -111,6 +113,14 @@ _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     code="codex_compacting",
     title="Codex is compacting",
     remediation="Wait for compaction to finish, then send your message again.",
+)
+_CODEX_PROVIDER_CHANGED_FAILURE = CodexStartupFailure(
+    message="Codex rejected this message because the conversation's model provider "
+    "differs from, or is missing in, its current configuration.",
+    code="codex_provider_changed",
+    title="Codex provider configuration changed",
+    remediation="Select and configure the intended provider, restart the session terminal, "
+    "then retry this message.",
 )
 _CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
     message="Codex did not confirm this message. It may already be running.",
@@ -1271,6 +1281,13 @@ class CodexNativeExecutor(Executor):
                             startup_failure = exc.failure
                             undelivered = True
                             preserve_session = exc.preserve_session
+                        elif (
+                            codex_resume_current_model_provider(exc) is not None
+                            or codex_resume_unconfigured_model_provider(exc) is not None
+                        ):
+                            startup_failure = _CODEX_PROVIDER_CHANGED_FAILURE
+                            undelivered = True
+                            preserve_session = True
                         elif isinstance(
                             exc, CodexAppServerResponseError
                         ) and is_server_draining_error(exc):
