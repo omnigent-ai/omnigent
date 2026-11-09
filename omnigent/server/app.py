@@ -276,6 +276,9 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True
+    # Scheduled tasks accept ``source_session_id``: each run starts from a copy
+    # of a session. Older servers reject it.
+    scheduled_task_source_sessions: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
     automation_trigger_poll_minutes: int = 10
@@ -1598,6 +1601,7 @@ def create_app(
         str | list[str] | Callable[[], str | list[str] | None] | None
     ) = None,
     harness_install: bool | Callable[[], bool] | None = None,
+    mcp_disabled_servers: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
@@ -1810,6 +1814,11 @@ def create_app(
         )
     else:
         app_harness_install = harness_install
+    app_mcp_disabled_servers = (
+        resolved_feature_flags.enabled(Feature.MCP_DISABLED_SERVERS)
+        if mcp_disabled_servers is None
+        else mcp_disabled_servers
+    )
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
     if automations_v2_enabled:
         if scheduled_task_store is None:
@@ -1889,7 +1898,9 @@ def create_app(
         on_retire=shutdown_state.note_runner_tunnel_retired,
         on_work_dispatched=managed_host_keepalive.record_work_dispatched,
     )
-    host_registry = HostRegistry()
+    host_registry = HostRegistry(
+        mcp_disabled_servers=app_mcp_disabled_servers, feature_flags=resolved_feature_flags
+    )
     runner_router = RunnerRouter(
         registry=tunnel_registry,
         conversation_store=conversation_store,
@@ -2345,6 +2356,7 @@ def create_app(
     app.state.picker_curation = picker_curation
     app.state.feature_flags = resolved_feature_flags
     app.state.harness_install = app_harness_install
+    app.state.mcp_disabled_servers = app_mcp_disabled_servers
     app.state.automations = True if automations is None else automations
 
     def automations_available() -> bool:
@@ -4000,6 +4012,7 @@ def create_app(
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
                 artifact_store=artifact_store,
+                file_store=file_store,
                 project_store=project_store,
                 automations=app.state.automations,
                 liveness_lookup=_bulk_session_liveness,
@@ -5034,7 +5047,13 @@ def create_app(
             tags=["hosts"],
         )
         app.include_router(
-            create_mcp_servers_router(host_registry, host_store, auth_provider=auth_provider),
+            create_mcp_servers_router(
+                host_registry,
+                host_store,
+                auth_provider=auth_provider,
+                mcp_disabled_servers=app_mcp_disabled_servers,
+                feature_flags=resolved_feature_flags,
+            ),
             prefix="/v1",
             tags=["hosts"],
         )

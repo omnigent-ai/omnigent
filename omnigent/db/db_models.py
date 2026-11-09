@@ -1636,6 +1636,9 @@ class SqlScheduledTask(OmnigentBase):
     session_mode: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     # Relates to conversations.id. No DB foreign key (Rule R032).
     session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # The session each run's new session starts as a copy of. Relates to
+    # conversations.id. No DB foreign key (Rule R032).
+    source_session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 

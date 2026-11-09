@@ -124,6 +124,24 @@ def test_fork_drops_sandbox_repo_label(
     assert REQUESTED_HOST_ID_LABEL_KEY not in fork.labels
 
 
+def test_fork_drops_the_automation_source_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Deleting a session deletes the automation its label names, so a fork of an
+    automation's copy must not name that automation too."""
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id, {SCHEDULED_TASK_SOURCE_LABEL_KEY: "st_1", "kept": "yes"}
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in fork.labels
+
+
 def test_fork_drops_per_repo_sandbox_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

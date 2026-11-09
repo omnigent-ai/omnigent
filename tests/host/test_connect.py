@@ -11931,3 +11931,132 @@ async def test_host_publishes_stored_workspace_at_startup(
 
     assert host._origin_workspace_id == "4242424242424242"
     assert os.environ[debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR] == "4242424242424242"
+
+
+@pytest.mark.parametrize(
+    "harness,plugin", [("claude", None), ("claude", "toolkit"), ("codex", None)]
+)
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_host_saves_mcp_preference_over_tunnel(
+    tmp_path, monkeypatch, harness, plugin, enabled
+):
+    from omnigent.host.frames import (
+        HostSetMcpServerEnabledFrame,
+        HostSetMcpServerEnabledResultFrame,
+    )
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.mcp_disabled_servers import ServerKey, is_disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    summary = {"name": "docs", "harness": harness, "transport": "stdio", "scope": "user"}
+    source_id = "a" * 64 if plugin else None
+    if plugin:
+        summary.update(plugin=plugin, source_id=source_id)
+    monkeypatch.setattr(
+        "omnigent.host.mcp_inventory.configured_mcp_servers",
+        lambda: [ConfiguredMcpServer(summary, {})],
+    )
+    host, ws = _make_host_process(), _RecordingWS()
+    frame = HostSetMcpServerEnabledFrame("save", harness, "docs", enabled, plugin, source_id)
+    host._start_frame_task(ws, encode_host_frame(frame))
+    await _drain_frame_tasks(host)
+    result = decode_host_frame(ws.sent[-1])
+    assert isinstance(result, HostSetMcpServerEnabledResultFrame)
+    assert result.status == "ok"
+    assert result.server["enabled"] == str(enabled).lower()
+    assert is_disabled(ServerKey(harness, "docs", plugin)) is not enabled
+
+
+@pytest.mark.parametrize(
+    "server,plugin,source_id,managed",
+    [
+        ("omnigent", None, None, False),
+        ("missing", None, None, False),
+        ("docs", None, None, True),
+        ("docs", None, "0" * 64, False),
+    ],
+)
+async def test_host_rejects_reserved_managed_or_stale_mcp(
+    tmp_path, monkeypatch, server, plugin, source_id, managed
+):
+    from omnigent.host.frames import HostSetMcpServerEnabledFrame
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.mcp_disabled_servers import FILENAME
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    summary = {"name": "docs", "harness": "claude", "transport": "stdio", "scope": "user"}
+    if managed:
+        summary["managed"] = "true"
+    monkeypatch.setattr(
+        "omnigent.host.mcp_inventory.configured_mcp_servers",
+        lambda: [ConfiguredMcpServer(summary, {})],
+    )
+    result = _make_host_process()._handle_set_mcp_server_enabled(
+        HostSetMcpServerEnabledFrame("save", "claude", server, False, plugin, source_id)
+    )
+    assert result.error_code == "invalid_server"
+    if managed:
+        assert result.error == "Managed MCP servers cannot be toggled"
+    assert not (tmp_path / FILENAME).exists()
+
+
+@pytest.mark.parametrize("stored", ["{broken", '{"version": 2, "disabled": []}'])
+async def test_host_reports_mcp_storage_failure_without_overwriting(tmp_path, monkeypatch, stored):
+    from omnigent.host.frames import (
+        HostSetMcpServerEnabledFrame,
+        HostSetMcpServerEnabledResultFrame,
+    )
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.mcp_disabled_servers import FILENAME
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    path = tmp_path / FILENAME
+    path.write_text(stored)
+    summary = {"name": "docs", "harness": "claude", "transport": "stdio", "scope": "user"}
+    monkeypatch.setattr(
+        "omnigent.host.mcp_inventory.configured_mcp_servers",
+        lambda: [ConfiguredMcpServer(summary, {})],
+    )
+    host, ws = _make_host_process(), _RecordingWS()
+    host._start_frame_task(
+        ws, encode_host_frame(HostSetMcpServerEnabledFrame("save", "claude", "docs", False))
+    )
+    await _drain_frame_tasks(host)
+    result = decode_host_frame(ws.sent[-1])
+    assert isinstance(result, HostSetMcpServerEnabledResultFrame)
+    assert result.status == "failed"
+    assert result.error_code == "io"
+    assert result.error == "Cannot update disabled MCP servers: io"
+    assert path.read_text() == stored
+
+
+@pytest.mark.parametrize("activation", [None, [], ["claude"], ["codex"], ["claude", "codex"]])
+async def test_mcp_activation_launch_frame_to_runner_environment(activation):
+    from omnigent.runner.identity import (
+        RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR,
+        runner_mcp_disabled_servers_active_harnesses,
+    )
+
+    frame = decode_host_frame(
+        encode_host_frame(
+            HostLaunchRunnerFrame(
+                "launch",
+                "binding",
+                "/repo",
+                mcp_disabled_servers_active_harnesses=activation,
+            )
+        )
+    )
+    env = _build_runner_env(
+        {RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR: '["codex"]'},
+        server_url="http://localhost",
+        runner_id="runner",
+        binding_token="binding",
+        workspace="/repo",
+        parent_pid=1,
+        mcp_disabled_servers_active_harnesses=frame.mcp_disabled_servers_active_harnesses,
+    )
+    assert runner_mcp_disabled_servers_active_harnesses(env) == activation
+    assert (RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR in env) is (
+        activation is not None
+    )

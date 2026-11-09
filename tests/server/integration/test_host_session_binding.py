@@ -32,6 +32,7 @@ from omnigent.onboarding.sandboxes.base import render_host_config_write_command
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
@@ -89,13 +90,19 @@ def _make_hello(
 @pytest.fixture()
 def binding_app(
     db_uri: str,
+    request: pytest.FixtureRequest,
 ) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
     """App with host tunnel + REST routes for binding tests.
 
     :param db_uri: SQLite URI.
     :returns: Tuple of (app, registry, host_store, conv_store).
     """
-    registry = HostRegistry()
+    registry = HostRegistry(
+        mcp_disabled_servers=bool(getattr(request, "param", None)),
+        feature_flags=FeatureFlags(
+            frozenset({Feature.MCP_DISABLED_SERVERS_CLAUDE, Feature.MCP_DISABLED_SERVERS_CODEX})
+        ),
+    )
     host_store = HostStore(db_uri)
     registry.launch_authorizer = host_store.admit_launch
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -141,8 +148,10 @@ async def _connect_host(
     return comm
 
 
+@pytest.mark.parametrize("binding_app", [None, ["claude", "codex"]], indirect=True)
 async def test_launch_runner_writes_host_id_and_runner_id(
     binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    request: pytest.FixtureRequest,
 ) -> None:
     """
     Verify that POST /hosts/{id}/runners writes both runner_id and
@@ -153,6 +162,7 @@ async def test_launch_runner_writes_host_id_and_runner_id(
     won't be able to find the session on host reconnect.
     """
     app, registry, _hs, conv_store = binding_app
+    activation = request.node.callspec.params["binding_app"]
     comm = await _connect_host(app, registry)
     conv = conv_store.create_conversation(agent_id=None)
 
@@ -165,6 +175,10 @@ async def test_launch_runner_writes_host_id_and_runner_id(
                 continue
             frame = decode_host_frame(output["text"])
             if isinstance(frame, HostLaunchRunnerFrame):
+                assert frame.mcp_disabled_servers_active_harnesses == activation
+                assert ("mcp_disabled_servers_active_harnesses" in json.loads(output["text"])) is (
+                    activation is not None
+                )
                 await comm.send_input(
                     {
                         "type": "websocket.receive",
