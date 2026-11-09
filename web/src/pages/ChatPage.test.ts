@@ -30,6 +30,7 @@ import {
   isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
+  opensResumePicker,
   reorderCommittedRequestElicitations,
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
@@ -47,6 +48,7 @@ import {
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
@@ -1178,6 +1180,20 @@ describe("workingIndicatorLabel — parked on a dialog", () => {
     expect(workingIndicatorLabel(2, "dialog open")).toMatch(/terminal/i);
   });
 
+  it("tentatively points at the terminal when a hidden prompt replaced its input box", () => {
+    expect(workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON)).toBe(
+      "Something in the agent's terminal may need your input.",
+    );
+    expect(
+      workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON, {
+        terminalView: true,
+        answerableInChat: true,
+      }),
+    ).toBe(
+      "Something in the agent's terminal may need your input. Open the Terminal view to check.",
+    );
+  });
+
   it("falls back to the normal label when not parked", () => {
     expect(workingIndicatorLabel(0, null)).toBe("Working…");
   });
@@ -1992,6 +2008,26 @@ describe("unboundSessionResumableInApp", () => {
     for (const src of ["kimi", "kiro", "qwen"]) {
       expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(false);
     }
+  });
+});
+
+describe("opensResumePicker", () => {
+  it("opens for an unbound fork or a resumable host-less session", () => {
+    const idle = { unboundFork: false, resumableUnbound: false, sandboxLaunching: false };
+    expect(opensResumePicker({ ...idle, unboundFork: true })).toBe(true);
+    expect(opensResumePicker({ ...idle, resumableUnbound: true })).toBe(true);
+    expect(opensResumePicker(idle)).toBe(false);
+  });
+
+  it("stays closed while a managed-sandbox launch places the session", () => {
+    // A sandbox clone remains unbound until its sandbox registers; the server
+    // places it and holds the first send for the launch.
+    expect(
+      opensResumePicker({ unboundFork: true, resumableUnbound: true, sandboxLaunching: true }),
+    ).toBe(false);
+    expect(
+      opensResumePicker({ unboundFork: false, resumableUnbound: true, sandboxLaunching: true }),
+    ).toBe(false);
   });
 });
 
