@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import socket
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
 import httpx
@@ -31,11 +35,11 @@ def token_api(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, Mock]:
         Mock(return_value=subprocess.CompletedProcess([], 0, b"{}", b"")),
     )
     respond = Mock(return_value=httpx.Response(200, json={"iid": 7}))
-    real_client = httpx.Client
+    real_client = httpx.AsyncClient
     factory = Mock(
         side_effect=lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs)
     )
-    monkeypatch.setattr(httpx, "Client", factory)
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
     return respond, factory
 
 
@@ -127,7 +131,9 @@ def test_token_errors_and_redirects_do_not_expose_or_forward_credentials(
     assert respond.call_args.args[0].url.host == "gitlab.com"
 
 
-@pytest.mark.parametrize("failure", ["json", "network", "timeout", "deadline"])
+@pytest.mark.parametrize(
+    "failure", ["json", "network", "timeout", "deadline", "connecting", "progressing"]
+)
 def test_token_failures_are_public_errors(token_api: tuple[Mock, Mock], failure: str) -> None:
     respond, _ = token_api
     client = GitLabClient("/checkout", "gitlab.com")
@@ -139,6 +145,36 @@ def test_token_failures_are_public_errors(token_api: tuple[Mock, Mock], failure:
     elif failure == "timeout":
         respond.side_effect = httpx.ReadTimeout("test-token")
         expected = GitLabTimeoutError
+    elif failure in {"connecting", "progressing"}:
+
+        class ProgressingResponse(httpx.AsyncByteStream):
+            delivered = 0
+            closed = False
+
+            async def __aiter__(self):
+                for _ in range(100):
+                    await asyncio.sleep(0.01)
+                    self.delivered += 1
+                    yield b" "
+                yield b"{}"
+
+            async def aclose(self):
+                self.closed = True
+
+        stream = ProgressingResponse()
+
+        async def connect(_request):
+            try:
+                await asyncio.sleep(1)
+                return httpx.Response(200, json={})
+            finally:
+                await stream.aclose()
+
+        respond.return_value = httpx.Response(200, stream=stream)
+        if failure == "connecting":
+            respond.side_effect = connect
+        client.deadline = time.monotonic() + 0.05
+        expected = GitLabTimeoutError
     else:
         client.deadline = time.monotonic() - 1
         expected = GitLabTimeoutError
@@ -147,6 +183,35 @@ def test_token_failures_are_public_errors(token_api: tuple[Mock, Mock], failure:
     assert "test-token" not in str(error.value)
     assert "secret-response" not in str(error.value)
     assert respond.call_count == (0 if failure == "deadline" else 1)
+    if failure in {"connecting", "progressing"}:
+        assert stream.closed
+        assert stream.delivered < 100
+
+
+def test_token_deadline_does_not_wait_for_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITLAB_TOKEN", "test-token")
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: real_client(trust_env=False, **kwargs)
+    )
+    started, release = threading.Event(), threading.Event()
+
+    def resolve(*_args, **_kwargs):
+        started.set()
+        release.wait(2)
+        return []
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    client = GitLabClient("/checkout", "gitlab.com", deadline=time.monotonic() + 0.2)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        request = executor.submit(client.object, "user")
+        try:
+            assert started.wait(1)
+            with pytest.raises(GitLabTimeoutError):
+                request.result(timeout=1)
+        finally:
+            release.set()
 
 
 def test_token_pagination_keeps_prior_page_on_timeout(token_api: tuple[Mock, Mock]) -> None:

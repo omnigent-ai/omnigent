@@ -1841,31 +1841,40 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText("GitHub")).toBeNull();
   });
 
-  it("shows GitLab and GitHub Enterprise sign-in commands for an unrecognized host", () => {
-    state.info = {
-      data: {
-        object: "session.github.info",
-        available: false,
-        reason: "unsupported_remote",
-        remote_host: "git.example.com",
-        provider: null,
-      },
-      isLoading: false,
-      error: null,
-      isFetching: false,
-    };
-    renderPanel();
-    // A second line under the sentence about the host; commands are set as code.
-    const hint = screen.getByText(/couldn’t identify the git provider/);
-    const note = screen.getByText(/On the execution host, run/);
-    expect(note).not.toBe(hint);
-    expect(hint.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(note).toHaveTextContent(
-      "On the execution host, run glab auth login --hostname git.example.com for GitLab or gh auth login --hostname git.example.com for GitHub Enterprise.",
-    );
-    expect(screen.getByText("glab auth login --hostname git.example.com")).toHaveClass("font-mono");
-    expect(screen.getByText("gh auth login --hostname git.example.com")).toHaveClass("font-mono");
-  });
+  it.each(["git.example.com", "github.com-work"])(
+    "shows provider setup for unrecognized host %s",
+    (remoteHost) => {
+      state.info = {
+        data: {
+          object: "session.github.info",
+          available: false,
+          reason: "unsupported_remote",
+          remote_host: remoteHost,
+          provider: null,
+        },
+        isLoading: false,
+        error: null,
+        isFetching: false,
+      };
+      renderPanel();
+      // A second line under the sentence about the host; commands are set as code.
+      const hint = screen.getByText(/couldn’t identify the git provider/);
+      const note = screen.getByText(/On the execution host, run/);
+      expect(note).not.toBe(hint);
+      expect(hint.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(note).toHaveTextContent(
+        `On the execution host, run glab auth login --hostname ${remoteHost} for GitLab or gh auth login --hostname ${remoteHost} for GitHub Enterprise.`,
+      );
+      expect(screen.getByText(`glab auth login --hostname ${remoteHost}`)).toHaveClass("font-mono");
+      expect(screen.getByText(`gh auth login --hostname ${remoteHost}`)).toHaveClass("font-mono");
+      expect(note).toHaveTextContent(
+        "For a GitHub SSH alias, run git config --local omnigent.gitprovider github in this checkout, then refresh for installation or sign-in help.",
+      );
+      expect(screen.getByText("git config --local omnigent.gitprovider github")).toHaveClass(
+        "font-mono",
+      );
+    },
+  );
 
   it("leaves out the sign-in line when the remote's host is unknown", () => {
     state.info = {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -98,21 +99,31 @@ class GitLabClient:
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise GitLabTimeoutError("GitLab request timed out. Refresh to retry.")
-        try:
-            # shortcut: HTTP timeouts bound inactivity; cap wall time if slow streams delay panels.
-            with httpx.Client(
-                verify=client_ssl_context(), timeout=remaining, follow_redirects=False
-            ) as client:
-                response = client.get(
+
+        async def request() -> httpx.Response:
+            async with (
+                asyncio.timeout(self.deadline - time.monotonic()),
+                httpx.AsyncClient(
+                    verify=client_ssl_context(), timeout=remaining, follow_redirects=False
+                ) as client,
+            ):
+                return await client.get(
                     f"https://{self.host}/api/v4/{endpoint}",
                     headers={"PRIVATE-TOKEN": token, "Accept": "application/json"},
                 )
-        except httpx.TimeoutException:
+
+        loop = asyncio.new_event_loop()
+        try:
+            response = loop.run_until_complete(request())
+        except (TimeoutError, httpx.TimeoutException):
             raise GitLabTimeoutError("GitLab request timed out. Refresh to retry.") from None
         except httpx.HTTPError:
             raise GitLabError(
                 "GitLab could not read this resource. Check access and retry."
             ) from None
+        finally:
+            # Unlike asyncio.run(), close does not wait for an uncancellable OS DNS lookup.
+            loop.close()
         if not response.is_success:
             raise GitLabError(
                 "GitLab could not read this resource. Check the token's access to this instance."
