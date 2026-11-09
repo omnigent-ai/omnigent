@@ -11,6 +11,7 @@ import re
 import secrets
 import shutil
 import socket
+import subprocess
 import time
 import uuid
 from collections import Counter
@@ -35,6 +36,7 @@ from omnigent.entities.conversation import NON_CONTENT_ITEM_TYPES
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
+    HARNESS_CLI_UNRESPONSIVE,
     HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
     HarnessUnavailableReason,
@@ -273,7 +275,9 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     CLI can't stall the readiness refresh, and any resolver failure fails safe
     onto the ``auth.json`` check.
 
-    :returns: ``"binary-missing"`` when the CLI is absent, ``"needs-auth"``
+    :returns: ``"binary-missing"`` when the CLI is absent,
+        ``"cli-unresponsive"`` when its ``--version`` probe times out,
+        ``"version-too-low"`` when it reports an unsupported version, ``"needs-auth"``
         when a config-selected provider's declared env credential is missing
         or the launch uses Codex login without a usable ``auth.json``, and
         ``None`` when a provider will route the launch, Codex's own config is
@@ -289,8 +293,13 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
 
     if _find_codex_cli() is None:
         return HARNESS_BINARY_MISSING
-    if not harness_cli_installed(OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
-        return HARNESS_VERSION_TOO_LOW
+    try:
+        if not harness_cli_installed(
+            OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S, raise_on_timeout=True
+        ):
+            return HARNESS_VERSION_TOO_LOW
+    except subprocess.TimeoutExpired:
+        return HARNESS_CLI_UNRESPONSIVE
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
     defers_to_codex_config = False

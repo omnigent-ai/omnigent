@@ -133,6 +133,7 @@ export const AUTOMATION_TEMPLATE_IDS = [
   "slack",
   "github",
   "linear",
+  "pagerduty",
   "follow-up-monitor",
   "pr-sweep",
   "news-digest",
