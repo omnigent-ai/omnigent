@@ -359,7 +359,16 @@ class FakeConversationStore:
         )
 
     def list_items(self, conversation_id: str, **kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(data=[], has_more=False, last_id=None)
+        if conversation_id != "conv_source":
+            return SimpleNamespace(data=[], has_more=False, last_id=None)
+        # An automation's source copy holds the finished reply it was copied through.
+        reply = SimpleNamespace(
+            type="message",
+            status="completed",
+            response_id="resp_source",
+            data=SimpleNamespace(role="assistant"),
+        )
+        return SimpleNamespace(data=[reply], has_more=False, last_id=None)
 
     def set_host_id(
         self,
@@ -4091,6 +4100,31 @@ async def test_a_run_leaves_out_the_turn_running_in_its_source() -> None:
 
     (fork,) = conv_store.forked
     assert fork["up_to_response_id"] == "resp_done"
+
+
+@pytest.mark.asyncio
+async def test_a_run_whose_source_has_no_finished_reply_in_reach_copies_nothing() -> None:
+    conv_store = FakeConversationStore()
+    # A turn longer than the cutoff search reaches, with no finished reply in it.
+    tool_call = SimpleNamespace(
+        type="function_call", status="completed", response_id="resp_active", data=None
+    )
+    endless = SimpleNamespace(data=[tool_call] * 100, has_more=True, last_id="item_last")
+    conv_store.list_items = lambda conversation_id, **kwargs: endless  # type: ignore[method-assign]
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # Without a cutoff the copy would take the unfinished turn, so the run stops instead.
+    assert conv_store.forked == [] and launched == []
+    (run,) = store.runs
+    assert (run["status"], run.get("error_code")) == ("failed", "source_session_incompatible")
 
 
 @pytest.mark.asyncio

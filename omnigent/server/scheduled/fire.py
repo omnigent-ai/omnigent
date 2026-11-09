@@ -1796,6 +1796,12 @@ async def _copy_source_session_for_run(
         task.source_session_id,
         running=running,
     )
+    if up_to is None:
+        # A cutoff of None copies everything, a turn still running included.
+        raise _CannotLaunchScheduledFire(
+            "no finished reply was found in the session this automation starts from",
+            error_code="source_session_incompatible",
+        )
     from omnigent.server.routes.sessions.routes_core import _require_attachment_compatible_history
 
     try:
