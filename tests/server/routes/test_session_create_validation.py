@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -66,7 +66,7 @@ async def test_single_user_none_authorizes_session_scoped_agent(
 
     The scheduled-task path persists the local owner as ``None``; grants are
     keyed by the ``local`` sentinel. On a single-user server that ``None`` must
-    resolve to ``local`` so the owning-session READ check passes, instead of the
+    resolve to ``local`` so the owning-session check passes, instead of the
     old 401.
     """
     monkeypatch.setattr(
@@ -163,16 +163,16 @@ def _owners_session_and_fork(conv_store: SqlAlchemyConversationStore) -> tuple[s
 
 
 @pytest.mark.asyncio
-async def test_read_on_any_session_sharing_an_agent_authorizes_it(
+async def test_edit_on_any_session_sharing_an_agent_authorizes_it(
     agent_store: SqlAlchemyAgentStore,
     conv_store: SqlAlchemyConversationStore,
     perm_store: SqlAlchemyPermissionStore,
 ) -> None:
-    """Bob can read only the fork; the reverse lookup may pick the other root."""
+    """Bob can edit only the fork; the reverse lookup may pick the other root."""
     agent_id, source_id, fork_id = _owners_session_and_fork(conv_store)
     perm_store.ensure_user("bob@example.com")
-    perm_store.grant("bob@example.com", fork_id, LEVEL_READ)
-    # Worst case for Bob: the lookup returns the session he cannot read.
+    perm_store.grant("bob@example.com", fork_id, LEVEL_EDIT)
+    # Worst case for Bob: the lookup returns the session he cannot edit.
     agent_store._session_id_for_agent = lambda _agent_id: source_id  # type: ignore[method-assign]
 
     result = await validate_session_agent(
@@ -188,6 +188,29 @@ async def test_read_on_any_session_sharing_an_agent_authorizes_it(
     with pytest.raises(OmnigentError) as excinfo:
         await validate_session_agent(
             user_id="carol@example.com",
+            agent_id=agent_id,
+            agent_store=agent_store,
+            permission_store=perm_store,
+            conversation_store=conv_store,
+        )
+    assert excinfo.value.code in (ErrorCode.FORBIDDEN, ErrorCode.NOT_FOUND)
+
+
+@pytest.mark.asyncio
+async def test_read_on_sessions_sharing_an_agent_does_not_authorize_it(
+    agent_store: SqlAlchemyAgentStore,
+    conv_store: SqlAlchemyConversationStore,
+    perm_store: SqlAlchemyPermissionStore,
+) -> None:
+    """READ on the owning session or a fork is not enough to bind the shared agent."""
+    agent_id, source_id, fork_id = _owners_session_and_fork(conv_store)
+    perm_store.ensure_user("bob@example.com")
+    perm_store.grant("bob@example.com", source_id, LEVEL_READ)
+    perm_store.grant("bob@example.com", fork_id, LEVEL_READ)
+
+    with pytest.raises(OmnigentError) as excinfo:
+        await validate_session_agent(
+            user_id="bob@example.com",
             agent_id=agent_id,
             agent_store=agent_store,
             permission_store=perm_store,
@@ -253,7 +276,7 @@ async def test_sandbox_preview_authorizes_a_shared_agent_like_binding(
     conv_store: SqlAlchemyConversationStore,
     perm_store: SqlAlchemyPermissionStore,
 ) -> None:
-    """The model-options preview accepts READ on any session sharing the agent,
+    """The model-options preview accepts EDIT on any session sharing the agent,
     exactly as session binding does, instead of 404ing on the lookup's root."""
     from types import SimpleNamespace
 
@@ -266,7 +289,7 @@ async def test_sandbox_preview_authorizes_a_shared_agent_like_binding(
 
     agent_id, source_id, fork_id = _owners_session_and_fork(conv_store)
     perm_store.ensure_user("bob@example.com")
-    perm_store.grant("bob@example.com", fork_id, LEVEL_READ)
+    perm_store.grant("bob@example.com", fork_id, LEVEL_EDIT)
     agent_store._session_id_for_agent = lambda _agent_id: source_id  # type: ignore[method-assign]
     spec = SimpleNamespace(
         executor=SimpleNamespace(
