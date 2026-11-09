@@ -55,7 +55,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -2934,6 +2934,7 @@ def augment_claude_args(
     allowed_tools: tuple[str, ...] = (),
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
+    active_harnesses: Collection[str] | None = None,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -3003,6 +3004,11 @@ def augment_claude_args(
         launch_effort=_launch_effort_arg(claude_args),
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
+    )
+    from omnigent.mcp_disabled_servers import apply_claude_settings
+
+    hook_settings = apply_claude_settings(
+        hook_settings, executor="claude-native", active_harnesses=active_harnesses
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
@@ -3653,6 +3659,79 @@ def read_transcript_items_since_with_position(
     )
 
 
+def _log_unmirrored_human_prompt(
+    entry: _JsonObject,
+    parsed: list[ClaudeTranscriptItem],
+    *,
+    line_number: int,
+) -> None:
+    """
+    Warn when a prompt Claude marks as human-typed yields no user message.
+
+    The server settles a queued web message only when its mirrored user
+    message arrives, so a dropped record later surfaces as "never recorded".
+    Command echoes are expected to become other item types and are skipped.
+    Only the record's shape is logged, never its text.
+
+    :param entry: Decoded Claude transcript record.
+    :param parsed: Items the forwarder produced for *entry*.
+    :param line_number: One-based transcript line number, for correlation.
+    """
+    attachment = entry.get("attachment")
+    if entry.get("type") == "attachment":
+        if not isinstance(attachment, dict) or attachment.get("type") != "queued_command":
+            return
+        # A queued shell command or notification is dropped on purpose, not lost.
+        if attachment.get("commandMode") != "prompt":
+            return
+        origin = attachment.get("origin")
+        content: object = attachment.get("prompt")
+    else:
+        origin = entry.get("origin")
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(origin, dict) or origin.get("kind") != "human":
+        return
+    if any(
+        item.item_type == "message"
+        and item.data.get("role") == "user"
+        and item.data.get("is_meta") is not True
+        for item in parsed
+    ):
+        return
+    texts = (
+        [content]
+        if isinstance(content, str)
+        else [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        if isinstance(content, list)
+        else []
+    )
+    if any(
+        _is_slash_command_echo(text) or text.lstrip().startswith(("<bash-", "<local-command"))
+        for text in texts
+    ):
+        return
+    joined = "\n".join(texts)
+    _logger.warning(
+        "claude-native: human prompt record produced no user message; record_type=%s "
+        "line=%d content_shape=%s content_chars=%d is_meta=%s command_mode=%s "
+        "item_types=%s has_command_markup=%s has_shell_markup=%s",
+        entry.get("type"),
+        line_number,
+        type(content).__name__,
+        len(joined),
+        entry.get("isMeta") is True,
+        attachment.get("commandMode") if isinstance(attachment, dict) else None,
+        sorted({item.item_type for item in parsed}),
+        "<command-name>" in joined or "<command-message>" in joined,
+        any(marker in joined for marker in ("<bash-input>", "<bash-stdout>", "<bash-stderr>")),
+    )
+
+
 def read_transcript_items_from_offset(
     transcript_path: Path,
     byte_offset: int,
@@ -3744,6 +3823,7 @@ def read_transcript_items_from_offset(
             pending_settled_at=pending_settled_at,
             include_sidechains=include_sidechains,
         )
+        _log_unmirrored_human_prompt(entry, parsed, line_number=record.line_number)
         if legacy_agent_messages and any(item.agent_message_candidate for item in parsed):
             active_response_id = previous_response_id
         items.extend(parsed)
@@ -6192,7 +6272,7 @@ def _request_claude_repaint(
     without a handler ignores it, so running processes under the pane get it:
     a launcher may run Claude Code as its child. Suspended processes stay paused.
 
-    A launcher may also run Claude Code outside that tree: isaac's fast launch
+    A launcher may also run Claude Code outside that tree: a fast launch
     pumps the pane to a pre-started worker's terminal. Claude Code's session
     registry still names its process, so that process gets the signal too.
 
@@ -6329,13 +6409,15 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    # Narrow panes wrap the decision footer across captured lines.
+    footer = " ".join(region.split())
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
         or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
-            any(hint in region for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in region
+            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
+            and "Esc to cancel" in footer
         )
     )
 
@@ -6605,7 +6687,7 @@ def _restore_occupied_input(
     startup dialogs whose Escape quits Claude Code instead of closing them
     (:func:`_escape_quits_claude`): they are left for the person to answer.
 
-    Isaac's idle-compaction log can overwrite the rendered input box. Redraw
+    A launcher's idle-compaction log can overwrite the rendered input box. Redraw
     it once with Ctrl+L before any edit keys can erase its identifying prefix,
     then check the actual composer and pending prompts again.
 
@@ -10695,23 +10777,22 @@ def _user_transcript_items_from_entry(
             # assistant text must inherit this id so it clusters with
             # the indicator, not the prior bubble.
             return fallback_response_id, [item]
-        # ``!cmd`` terminal commands may arrive here in older Claude
-        # builds; newer builds use top-level ``local_command`` records.
-        # In both shapes, surface the command and result as their own
-        # transcript group instead of inheriting the previous assistant
-        # response id.
-        terminal_response_id = (
-            fallback_response_id
-            if _BASH_INPUT_RE.search(content) is not None
-            else current_response_id or fallback_response_id
-        )
-        terminal_items = _terminal_command_items_from_content(
-            content,
-            source_key=source_key,
-            response_id=terminal_response_id,
-        )
-        if terminal_items:
-            return terminal_response_id, terminal_items
+        # Legacy ``!cmd`` records start with ``<bash-*>`` (newer builds use top-level
+        # ``local_command``) and get their own transcript group, not the prior response id.
+        # A prompt that merely quotes the markup (a pasted log) stays the person's message.
+        if stripped.startswith("<bash-"):
+            terminal_response_id = (
+                fallback_response_id
+                if _BASH_INPUT_RE.search(content) is not None
+                else current_response_id or fallback_response_id
+            )
+            terminal_items = _terminal_command_items_from_content(
+                content,
+                source_key=source_key,
+                response_id=terminal_response_id,
+            )
+            if terminal_items:
+                return terminal_response_id, terminal_items
         # Other CLI-scaffolding records (stdout/stderr from /effort, etc.)
         # arrive as standalone ``role=user`` records and must drop instead
         # of leaking as user bubbles.

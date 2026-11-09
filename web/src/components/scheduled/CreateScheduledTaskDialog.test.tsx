@@ -3122,7 +3122,7 @@ describe("automation trigger type", () => {
     },
   );
 
-  // Many timezone and integration switches; slow under CI coverage, so a longer timeout.
+  // This full draft round-trip needs extra time with coverage on shared CI runners.
   it("restores schedule and source drafts without carrying conditions between integrations", async () => {
     async function chooseTimezone(zone: string) {
       await userEvent.click(screen.getByLabelText("Timezone", { exact: true }));
@@ -3175,7 +3175,7 @@ describe("automation trigger type", () => {
     expect(mutateAsync.mock.calls[0][0].timezone).toBe("America/New_York");
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("templateId");
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
-  }, 15_000);
+  }, 10_000);
 
   it("keeps custom prompt edits and attributes a switched gallery template to the selected source", async () => {
     render(dialog({ initialTrigger: "jira", initialTemplateId: "jira" }));
@@ -3690,6 +3690,38 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
     expect(prompt).toContain(
       'Add a note "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" to each incident',
+    );
+  });
+
+  it("matches PagerDuty services by name with contains, which other sources don't offer", async () => {
+    function scopeOperatorOptions() {
+      const scopeOperator = screen.getByTestId("task-trigger-scope-operator");
+      fireEvent.pointerDown(
+        scopeOperator,
+        new MouseEvent("pointerdown", { bubbles: true, button: 0 }),
+      );
+      fireEvent.click(scopeOperator);
+      return screen.getAllByRole("option").map((option) => option.textContent);
+    }
+
+    const { unmount } = renderTrigger("jira");
+    expect(scopeOperatorOptions()).toEqual(["equals", "in"]);
+    unmount();
+
+    renderTrigger("pagerduty");
+    expect(scopeOperatorOptions()).toEqual(["equals", "in", "contains"]);
+    fireEvent.click(screen.getByRole("option", { name: "contains" }));
+    expect(screen.getByTestId("task-trigger-scope-operator")).toHaveTextContent("contains");
+    type("task-trigger-scope", "payments, checkout");
+    type("task-trigger-instructions", "Find the likely cause.");
+    expect(screen.getByRole("alert")).toHaveTextContent("Contains matches one piece of text.");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    type("task-trigger-scope", "payments");
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    const prompt = await submittedPrompt();
+    expect(prompt).toContain(
+      'Watch: new PagerDuty incidents on services whose name contains "payments"',
     );
   });
 

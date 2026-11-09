@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { browserPageLabel } from "@/lib/browserPageLabel";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
@@ -92,6 +93,13 @@ export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
 
 export function useBrowserTabs(conversationId: string) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
+  // Reload on a conversation switch during render, so the session's first frame
+  // (and the rail's tab fallback) never sees the previous session's tabs.
+  const [stateConversationId, setStateConversationId] = useState(conversationId);
+  if (stateConversationId !== conversationId) {
+    setStateConversationId(conversationId);
+    setState(readBrowserTabsState(conversationId));
+  }
   // The session on screen, so a late async update for another one only persists.
   const shownConversationRef = useRef(conversationId);
   shownConversationRef.current = conversationId;
@@ -100,7 +108,6 @@ export function useBrowserTabs(conversationId: string) {
     state.tabs.map((tabId) => browserViewId(conversationId, tabId)),
   );
   useEffect(() => {
-    setState(readBrowserTabsState(conversationId));
     // Showing the session again (or a remounted rail) counts as a selection, so a reopen
     // started before it doesn't move the tab shown now.
     noteBrowserSelection(conversationId);
@@ -159,29 +166,8 @@ export function useBrowserTabs(conversationId: string) {
     };
   }, [viewIdsKey]);
 
-  const labelFor = (tabId: string, index: number): string => {
-    const page = pages[browserViewId(conversationId, tabId)];
-    const title = page?.title?.trim();
-    if (page?.url) {
-      try {
-        const hostname = new URL(page.url).hostname;
-        // Chromium supplies the URL as the title for untitled documents.
-        const urlTitle = page.url.replace(/^https?:\/\//, "");
-        if (
-          title &&
-          title !== page.url &&
-          title !== urlTitle &&
-          title !== urlTitle.replace(/\/$/, "")
-        ) {
-          return title;
-        }
-        if (hostname) return hostname;
-      } catch {
-        // Blank or invalid URLs keep the numbered placeholder.
-      }
-    }
-    return title && title !== "about:blank" ? title : `Browser ${index + 1}`;
-  };
+  const labelFor = (tabId: string, index: number): string =>
+    browserPageLabel(pages[browserViewId(conversationId, tabId)], `Browser ${index + 1}`);
 
   const update = useCallback(
     (mutate: (current: BrowserTabsState) => BrowserTabsState) => {

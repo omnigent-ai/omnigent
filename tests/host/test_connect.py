@@ -5381,7 +5381,7 @@ def test_build_runner_env_propagates_disable_keyring() -> None:
     ``keychain:<name>`` refs. If the flag didn't reach the runner it would fall
     back to the OS keyring and fail with "no stored secret named …" for a key
     the CLI just saved — the headless / file-backend deploy case (and the exact
-    failure hit while dogfooding the first-run flow).
+    failure hit while trying the first-run flow).
     """
     base = {"PATH": "/usr/bin:/bin", "OMNIGENT_DISABLE_KEYRING": "1"}
     env = _build_runner_env(
@@ -7296,7 +7296,7 @@ async def test_connected_host_retries_auth_rejection_indefinitely(
 
     A host that already completed an upgrade proved its credentials and
     authorization are valid. A later 401/403 is almost always a dropped
-    VPN whose corporate proxy answers the upgrade before it reaches the
+    VPN whose proxy answers the upgrade before it reaches the
     server — killing the host would drop its live runners and force a
     manual ``omnigent host`` restart once the VPN reconnects. It must keep
     retrying past the fresh-host fatal threshold instead.
@@ -11920,9 +11920,9 @@ async def test_host_publishes_stored_workspace_at_startup(
 
     server_url = "https://example.databricks.com/api/2.0/omnigent"
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
-    store_databricks_org_id(server_url, "1965859176160743")
+    store_databricks_org_id(server_url, "4242424242424242")
 
     host = _host(server_url)
 
-    assert host._origin_workspace_id == "1965859176160743"
-    assert os.environ[debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR] == "1965859176160743"
+    assert host._origin_workspace_id == "4242424242424242"
+    assert os.environ[debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR] == "4242424242424242"

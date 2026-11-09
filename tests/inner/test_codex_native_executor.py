@@ -695,6 +695,108 @@ def test_persistent_draining_delivery_is_bounded_and_keeps_input_undelivered(
     assert state.active_turn_id == active_turn_id
 
 
+_PROJECT_CONFIG_REFUSAL = (
+    "failed to load configuration: Failed to read project hooks config file "
+    "/workspace/project/.codex/config.toml: Not a directory (os error 20)"
+)
+
+
+@pytest.mark.parametrize(
+    ("rpc_code", "data", "message", "failure_code"),
+    [
+        (
+            -32600,
+            {"type": "modelProviderMismatch", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            "codex_provider_changed",
+        ),
+        (
+            -32600,
+            {"type": "modelProviderNotConfigured", "modelProvider": "previous"},
+            "provider unavailable",
+            "codex_provider_changed",
+        ),
+        (-32600, {"type": "modelProviderMismatch"}, "provider unavailable", None),
+        (
+            -32600,
+            {"type": "anotherError", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            None,
+        ),
+        (
+            -32603,
+            {"type": "modelProviderMismatch", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            None,
+        ),
+        (-32600, {}, _PROJECT_CONFIG_REFUSAL, "codex_project_config_invalid"),
+        (-32603, {}, _PROJECT_CONFIG_REFUSAL, None),
+        (-32600, {}, "other failure: " + _PROJECT_CONFIG_REFUSAL, None),
+        (
+            -32600,
+            {},
+            _PROJECT_CONFIG_REFUSAL.replace("Not a directory (os error 20)", "permission denied"),
+            None,
+        ),
+        (
+            -32600,
+            {},
+            _PROJECT_CONFIG_REFUSAL.replace("/.codex/config.toml", "/unrelated.toml"),
+            None,
+        ),
+    ],
+    ids=[
+        "mismatch",
+        "missing-provider",
+        "missing-detail",
+        "unrelated-type",
+        "internal-error",
+        "project-config",
+        "config-internal-error",
+        "config-quoted-error",
+        "config-other-cause",
+        "config-other-path",
+    ],
+)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_configuration_refusal_retains_input_without_changing_routing(
+    draining_client,
+    tmp_path: Path,
+    rpc_code: int,
+    data: dict[str, str],
+    message: str,
+    failure_code: str | None,
+    active_turn_id: str | None,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    before = read_bridge_state(tmp_path)
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError({"code": rpc_code, "message": message, "data": data})
+    ]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "keep this input")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is (failure_code is not None)
+    assert failure.preserve_session is (failure_code is not None)
+    assert failure.retryable is False
+    assert failure.code == failure_code
+    if failure_code is not None:
+        assert failure.remediation is not None
+        if failure_code == "codex_provider_changed":
+            assert "provider" in failure.remediation
+            assert "restart" in failure.remediation.lower()
+        else:
+            assert ".codex" in failure.remediation
+            assert "directory" in failure.remediation
+    assert draining_client.accepted_inputs == []
+    assert draining_client.connections == draining_client.closes == 1
+    assert [method for method, _ in draining_client.requests] == [
+        "turn/steer" if active_turn_id else "turn/start"
+    ]
+    assert read_bridge_state(tmp_path) == before
+
+
 @pytest.mark.parametrize(
     "error",
     [

@@ -7,12 +7,9 @@
  * ``/login`` / ``/register`` / ``/members`` routes and whether to
  * render the ``AccountMenu``.
  *
- * This is the single gate for accounts UI in the SPA. When the
- * internal hosted product (header / OIDC) syncs from this repo
- * and serves this bundle, ``/v1/info`` returns
- * ``accounts_enabled: false`` and none of the accounts routes
- * are reachable — the bundle behaves identically to a pre-PR-2008
- * build for those deploys.
+ * This is the single gate for accounts UI in the SPA. Deployments that use
+ * header or OIDC auth get ``accounts_enabled: false`` from ``/v1/info``, so
+ * none of the accounts routes are reachable.
  *
  * Mirrors the ``identity.ts`` resolve-once-then-cache pattern.
  * Unauthed by design — must work before any cookie is present.
@@ -109,11 +106,9 @@ export interface ServerInfo {
    */
   needs_setup: boolean;
   /**
-   * True on Databricks/internal deployments (the server's internal lakebox
-   * CLI is present). Gates Databricks-only UI hints — the "Databricks Lakebox"
-   * connect tab in the CLI command snippets. False
-   * on the OSS build, where those modules are excluded from the export, so the
-   * SPA shows the clean, provider-agnostic hints.
+   * True when the server has the lakebox CLI. Gates the Lakebox-specific UI
+   * hints, such as the connect tab in the CLI command snippets. False in
+   * builds that exclude those modules, which show provider-agnostic hints.
    */
   databricks_features: boolean;
   /**

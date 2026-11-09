@@ -423,27 +423,77 @@ export function isSessionArchiving(id: string): boolean {
   return archivingSessions.has(id);
 }
 
+// ── Moving-session tombstones ─────────────────────────────────────────
+//
+// Preserve optimistic membership across stale fetches and frames until the
+// server confirms the move.
+interface MoveTombstone {
+  /** Target folder name; `null` unfiles. */
+  project: string | null;
+  projectId: string | null;
+  /** Legacy label a label-only target is shown through until the PATCH lands. */
+  projectLabel?: string;
+}
+
+const movingSessions = new Map<string, MoveTombstone>();
+
+function markSessionMoving(id: string, entry: MoveTombstone): void {
+  movingSessions.set(id, entry);
+}
+
+function unmarkSessionMoving(id: string, entry?: MoveTombstone): void {
+  if (entry === undefined || movingSessions.get(id) === entry) movingSessions.delete(id);
+}
+
+/** Give a fetched or streamed row the membership of its in-flight move. */
+export function withMoveTombstone<
+  T extends { id: string; project_id?: string | null; labels?: Record<string, string> },
+>(row: T): T {
+  const entry = movingSessions.get(row.id);
+  if (entry === undefined) return row;
+  const label = row.labels?.[PROJECT_LABEL_KEY] || undefined;
+  if ((row.project_id ?? null) === entry.projectId && label === entry.projectLabel) return row;
+  const labels = Object.fromEntries(
+    Object.entries(row.labels ?? {}).filter(([key]) => key !== PROJECT_LABEL_KEY),
+  );
+  if (entry.projectLabel !== undefined) labels[PROJECT_LABEL_KEY] = entry.projectLabel;
+  return { ...row, project_id: entry.projectId, labels };
+}
+
 /** Wipe module-level tombstones between tests. */
 export function clearSessionTombstones(): void {
   unmarkSessionsDeleting();
   unmarkSessionsArchiving();
+  for (const id of [...movingSessions.keys()]) unmarkSessionMoving(id);
 }
 
 /**
- * Apply optimistic delete/archive state to a freshly fetched page.
+ * Apply optimistic delete/archive/move state to a freshly fetched page.
+ *
+ * @param project - The folder the page is scoped to; rows moving out of it are dropped.
  */
 function applySessionTombstones(
   page: ConversationsPage,
   dropArchiving = false,
   originalPage = page,
+  project?: string,
 ): ConversationsPage {
-  if (deletingSessionIds.size === 0 && archivingSessions.size === 0) return page;
+  if (deletingSessionIds.size === 0 && archivingSessions.size === 0 && movingSessions.size === 0)
+    return page;
   let changed = false;
-  let lastArchivingId: string | null = null;
+  let lastDroppedId: string | null = null;
   const data: Conversation[] = [];
-  for (const conv of page.data) {
-    if (isSessionDeleting(conv.id)) {
+  for (const fetched of page.data) {
+    if (isSessionDeleting(fetched.id)) {
       changed = true;
+      continue;
+    }
+    const conv = withMoveTombstone(fetched);
+    if (conv !== fetched) changed = true;
+    const move = movingSessions.get(conv.id);
+    if (project && move !== undefined && move.project !== project) {
+      changed = true;
+      lastDroppedId = conv.id;
       continue;
     }
     if (!isSessionArchiving(conv.id)) {
@@ -452,7 +502,7 @@ function applySessionTombstones(
     }
     changed = true;
     if (dropArchiving) {
-      lastArchivingId = conv.id;
+      lastDroppedId = conv.id;
     } else {
       data.push(conv.archived === true ? conv : { ...conv, archived: true });
     }
@@ -463,7 +513,7 @@ function applySessionTombstones(
     data,
     first_id: data[0]?.id ?? null,
     // Archived anchors remain valid on legacy row-ID backends.
-    last_id: lastIdAfterFiltering(originalPage, data, lastArchivingId),
+    last_id: lastIdAfterFiltering(originalPage, data, lastDroppedId),
   };
 }
 
@@ -602,6 +652,7 @@ export async function fetchConversationsPage({
     ),
     !includeArchived && visibility !== "archived",
     page,
+    project,
   );
 }
 
@@ -753,15 +804,19 @@ export function useConversations(
 /**
  * One palette search group; keyed outside `["conversations"]`, which patches rows
  * live. Dropped once unobserved, so a later search never shows a stale row.
- * Matches archived sessions too, so a search still finds them.
+ * Matches archived sessions too unless ``includeArchived`` is false.
  */
 export function useSessionSearch(
   searchQuery: string,
   searchScope: SessionSearchScope,
-  { enabled = true, limit = 10 }: { enabled?: boolean; limit?: number } = {},
+  {
+    enabled = true,
+    limit = 10,
+    includeArchived = true,
+  }: { enabled?: boolean; limit?: number; includeArchived?: boolean } = {},
 ) {
   const queryClient = useQueryClient();
-  const queryKey = ["session-search", searchQuery, searchScope, limit];
+  const queryKey = ["session-search", searchQuery, searchScope, limit, includeArchived];
   const query = useInfiniteQuery({
     queryKey,
     queryFn: ({ pageParam }) =>
@@ -769,7 +824,7 @@ export function useSessionSearch(
         after: pageParam,
         searchQuery,
         searchScope,
-        includeArchived: true,
+        includeArchived,
         queryClient,
         limit,
       }),
@@ -2578,16 +2633,23 @@ export function useMoveToProject() {
           ? { ...baseLabels, [PROJECT_LABEL_KEY]: project }
           : baseLabels;
       overlayMembership(row, target?.id ?? null, labels, project === "" ? null : project);
-      return previous;
+      const move: MoveTombstone = {
+        project: project === "" ? null : project,
+        projectId: target?.id ?? null,
+        projectLabel: labels[PROJECT_LABEL_KEY],
+      };
+      markSessionMoving(id, move);
+      return { ...previous, move };
     },
     onError: (_err, { id }, previous) => {
       if (previous === undefined) return;
+      unmarkSessionMoving(id, previous.move);
       for (const [key, data] of [...previous.conversations, ...previous.projectSessions]) {
         if (data !== undefined) queryClient.setQueryData(key, data);
       }
       restoreOpenSessionRow(queryClient, id, previous.backfill);
     },
-    onSuccess: (updated, { project }) => {
+    onSuccess: (updated, { id, project }, previous) => {
       markConversationSeen(updated.id, updated.updated_at);
       // Filing can promote a label-only folder to first-class inside the
       // mutation. Seed the confirmed id into the cached projects list before
@@ -2601,10 +2663,20 @@ export function useMoveToProject() {
           old?.map((p) => (p.name === project && p.id === null ? { ...p, id: confirmedId } : p)),
         );
       }
-      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // Reads issued from here on postdate the commit, so the guard holds the
+      // confirmed membership only until the lists below have refetched.
+      if (previous !== undefined) {
+        previous.move.projectId = confirmedId ?? null;
+        previous.move.projectLabel = undefined;
+      }
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["conversations"] }),
+        // Moving into/out of a project changes both folders' paginated lists.
+        queryClient.invalidateQueries({ queryKey: ["project-sessions"] }),
+      ]).finally(() => {
+        if (previous !== undefined) unmarkSessionMoving(id, previous.move);
+      });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      // Moving into/out of a project changes both folders' paginated lists.
-      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       // Moving an archived session relabels which project owns it, shifting the
       // archived-view picker's option set.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
@@ -2694,7 +2766,8 @@ async function fetchProjectSessionsPage(
     // eslint-disable-next-line no-await-in-loop
     if (!res.ok) throw await apiErrorFromResponse(res);
     // eslint-disable-next-line no-await-in-loop
-    const page = applySessionTombstones((await res.json()) as ConversationsPage, !archived);
+    const fetched = (await res.json()) as ConversationsPage;
+    const page = applySessionTombstones(fetched, !archived, fetched, project);
     if (!archived) return page;
     const data = page.data.filter((row) => row.archived === true);
     if (data.length || !page.has_more || !page.last_id) return { ...page, data };

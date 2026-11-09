@@ -1157,7 +1157,7 @@ export function CreateScheduledTaskDialog({
                     fields={triggerFields}
                     onChange={setTriggerFields}
                     onSelectOpenChange={handleSelectOpenChange}
-                    // Arclet sandboxes start agents with Isaac's MCP servers, Jira and Slack included.
+                    // Arclet sandboxes provide their agents' MCP tools, Jira and Slack included.
                     toolsProvided={
                       sandboxMode && info !== "loading" && info.sandbox_provider === "arclet"
                     }
