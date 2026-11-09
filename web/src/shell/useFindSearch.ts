@@ -2,7 +2,7 @@
 // regular expressions match in a worker with a time budget (see pullRequestPatternSearch.ts).
 
 import { useEffect, useMemo, useState } from "react";
-import { searchPatternInWorker, type FindOutcome } from "./pullRequestPatternSearch";
+import { FAILED, searchPatternInWorker, type FindOutcome } from "./pullRequestPatternSearch";
 import { findMatches, MATCH_LIMIT, type PatchMatchTarget } from "./pullRequestReview";
 
 export interface FindSearch extends FindOutcome {
@@ -54,16 +54,24 @@ export function useFindSearch(
       return;
     }
     const controller = new AbortController();
+    // A superseded search must not settle, even if its worker resolves a result late.
+    const settle = (outcome: FindOutcome) => {
+      if (!controller.signal.aborted) {
+        setSettled({ corpus, query, matchCase, search: { ...outcome, searching: false } });
+      }
+    };
     void searchPatternInWorker(
       corpus,
       query,
       { matchCase, regex: true, limit: MATCH_LIMIT },
       controller.signal,
-    ).then((outcome) => {
-      if (outcome) {
-        setSettled({ corpus, query, matchCase, search: { ...outcome, searching: false } });
-      }
-    });
+    ).then(
+      (outcome) => {
+        if (outcome) settle(outcome);
+      },
+      // The worker could not start or post the corpus, so the search has no result.
+      () => settle(FAILED),
+    );
     // Typing a new pattern stops the previous worker, so a runaway pattern can't keep running.
     return () => controller.abort();
   }, [corpus, query, matchCase, onWorker]);

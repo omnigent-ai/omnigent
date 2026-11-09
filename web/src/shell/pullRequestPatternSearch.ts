@@ -31,7 +31,7 @@ const TOO_SLOW: FindOutcome = {
   tooSlow: true,
   failed: false,
 };
-const FAILED: FindOutcome = { ...TOO_SLOW, tooSlow: false, failed: true };
+export const FAILED: FindOutcome = { ...TOO_SLOW, tooSlow: false, failed: true };
 
 /** Resolves to the outcome, or to null when the signal aborts first. */
 export function searchPatternInWorker(

@@ -150,4 +150,30 @@ describe("useFindSearch", () => {
     await act(async () => rerun.resolve(EMPTY));
     expect(result.current).toMatchObject({ searching: false, matches: [] });
   });
+
+  it("settles as failed when the worker promise rejects", async () => {
+    search.mockRejectedValueOnce(new Error("DataCloneError"));
+    const { result } = renderHook(() => useFindSearch(CORPUS, "needle", OPTIONS));
+
+    await waitFor(() => expect(result.current.searching).toBe(false));
+    expect(result.current).toMatchObject({ failed: true, matches: [] });
+  });
+
+  it("ignores a superseded corpus's late result under the same query", async () => {
+    const stale = deferred<FindOutcome | null>();
+    const fresh = deferred<FindOutcome | null>();
+    search.mockReturnValueOnce(stale.promise).mockReturnValueOnce(fresh.promise);
+    const { result, rerender } = renderHook(
+      ({ corpus }) => useFindSearch(corpus, "needle", OPTIONS),
+      { initialProps: { corpus: CORPUS } },
+    );
+
+    rerender({ corpus: OTHER_CORPUS });
+    // The worker ignores the abort and still resolves a match for the old corpus.
+    await act(async () => stale.resolve(FOUND));
+    expect(result.current).toMatchObject({ searching: true, matches: [] });
+
+    await act(async () => fresh.resolve(EMPTY));
+    expect(result.current).toMatchObject({ searching: false, matches: [] });
+  });
 });

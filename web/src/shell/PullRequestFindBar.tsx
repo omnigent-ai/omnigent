@@ -212,7 +212,7 @@ export function PullRequestFindBar({
       <IconButton
         label="Previous match"
         onClick={() => onStep(-1)}
-        disabled={total === 0}
+        disabled={total === 0 || searching}
         className="size-5 text-muted-foreground"
       >
         <ChevronUpIcon className="size-3.5" />
@@ -220,7 +220,7 @@ export function PullRequestFindBar({
       <IconButton
         label="Next match"
         onClick={() => onStep(1)}
-        disabled={total === 0}
+        disabled={total === 0 || searching}
         className="size-5 text-muted-foreground"
       >
         <ChevronDownIcon className="size-3.5" />

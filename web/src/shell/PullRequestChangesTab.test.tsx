@@ -514,8 +514,10 @@ describe("PullRequestChangesTab", () => {
       release = done;
     });
     rerender(A + addedFile("b.ts", ["gamma", "x", "needle here"]) + C);
-    // The retained matches stay on screen, but Next must not move through them until the rerun lands.
-    fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+    // The retained matches stay on screen, but Next is disabled until the rerun lands.
+    const next = screen.getByRole("button", { name: "Next match" });
+    expect(next).toBeDisabled();
+    fireEvent.click(next);
     expect(screen.getByText("1 of 2")).toBeInTheDocument();
 
     await act(async () => release());
