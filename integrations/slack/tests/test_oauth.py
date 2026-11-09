@@ -250,6 +250,22 @@ async def test_device_poll_malformed_200_raises_oauth_error() -> None:
         await client.aclose()
 
 
+@respx.mock
+async def test_device_poll_200_without_refresh_token_raises_oauth_error() -> None:
+    """The device grant always issues a refresh token; a 200 without one is malformed."""
+    respx.post(_TOKEN).mock(
+        return_value=httpx.Response(200, json={"access_token": "at", "expires_in": 3600})
+    )
+    from omnigent_slack import oauth as _oauth
+
+    client = httpx.AsyncClient(base_url=_BASE)
+    try:
+        with pytest.raises(OAuthError):
+            await _oauth._poll_device(client, "dc", interval=0, expires_in=600)
+    finally:
+        await client.aclose()
+
+
 @pytest.mark.parametrize("status", [400, 403, 410])
 @respx.mock
 async def test_oidc_poll_expired_ticket(status: int) -> None:
