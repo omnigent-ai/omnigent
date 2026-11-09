@@ -32,6 +32,7 @@ def _metrics(element: Locator) -> dict[str, Any]:
             contentY: bounds.top + element.clientTop + px('paddingTop'),
             contentWidth: element.clientWidth - px('paddingLeft') - px('paddingRight'),
             contentHeight: element.scrollHeight - px('paddingTop') - px('paddingBottom'),
+            visibleHeight: element.clientHeight - px('paddingTop') - px('paddingBottom'),
             scrollHeight: element.scrollHeight, clientHeight: element.clientHeight,
             horizontalOverflow: element.scrollWidth - element.clientWidth,
         };
@@ -137,7 +138,14 @@ def test_composer_input_font_setting_and_alignment(
     expect(main).to_have_attribute("data-slash-command", "true")
     overlay = page.get_by_test_id("composer-highlight-overlay")
     expect(overlay).to_be_visible()
+    # Text typed at the end of a scrolled draft must be painted under the caret.
+    main.press("Control+End")
+    page.keyboard.type(" typed")
+    draft += " typed"
     assert overlay.evaluate("element => element.textContent") == draft
+    textarea_scroll_top = main.evaluate("element => element.scrollTop")
+    assert textarea_scroll_top > 0
+    expect(overlay).to_have_js_property("scrollTop", textarea_scroll_top)
     observed.update({"slash-input": _metrics(main), "slash-overlay": _metrics(overlay)})
     page.screenshot(path=tmp_path / "slash-command-overlay.png", animations="disabled")
 
@@ -185,7 +193,13 @@ def test_composer_input_font_setting_and_alignment(
     for measured in (textarea_metrics, overlay_metrics):
         assert measured["scrollHeight"] > measured["clientHeight"], measured
         assert measured["horizontalOverflow"] <= 1, measured
-    for property_name in ("contentX", "contentY", "contentWidth", "contentHeight"):
+    for property_name in (
+        "contentX",
+        "contentY",
+        "contentWidth",
+        "contentHeight",
+        "visibleHeight",
+    ):
         assert textarea_metrics[property_name] == pytest.approx(
             overlay_metrics[property_name], abs=2
         ), (property_name, textarea_metrics, overlay_metrics)
