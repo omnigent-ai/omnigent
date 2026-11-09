@@ -7,7 +7,6 @@ import {
   describePagerDutyFilter,
   describeSlackFilter,
   emptyTriggerFields,
-  githubReviewerQualifier,
   jiraAssignee,
   parseGithubReviewer,
   isTriggerPrompt,
@@ -453,14 +452,6 @@ describe("jiraAssignee", () => {
   });
 });
 
-describe("githubReviewerQualifier", () => {
-  it("never counts a team request as the user's own", () => {
-    expect(githubReviewerQualifier("me")).toBe("user-review-requested:@me");
-    expect(githubReviewerQualifier("Me")).toBe("user-review-requested:@me");
-    expect(githubReviewerQualifier("acme/team")).toBe("team-review-requested:acme/team");
-  });
-});
-
 describe("change events", () => {
   const github = (overrides: Partial<TriggerFields> = {}) =>
     fields({ event: "pr", scope: "acme/app", conditions: [], ...overrides });
@@ -563,6 +554,7 @@ describe("compileGithubQuery", () => {
     const review = (target: string) =>
       compileGithubQuery(fields({ event: "review", scope: "acme/app", conditions: [], target }));
     expect(review("me")).toBe("repo:acme/app is:pr is:open -is:draft user-review-requested:@me");
+    expect(review("Me")).toBe("repo:acme/app is:pr is:open -is:draft user-review-requested:@me");
     expect(review("@octocat")).toBe(
       "repo:acme/app is:pr is:open -is:draft user-review-requested:octocat",
     );
@@ -1235,6 +1227,11 @@ describe("change-event prompts", () => {
       'Otherwise search for key = <ticket key> AND assignee CHANGED TO currentUser() AFTER "-<C>m", where C is the whole minutes from that time until now, rounded down',
     );
     expect(prompt).toContain("Rounding down never repeats an assignment");
+    // A pending delivery covers only its own assignment, not a later reassignment.
+    expect(prompt).toContain(
+      "a pending entry covers only that assignment, so a newer one still counts and gets its own session, while the pending one is never resent",
+    );
+    expect(prompt).not.toContain('Skip any ticket on a "Delivery pending:" line');
     expect(prompt).toContain("rely on your earlier replies for archived ones");
     expect(prompt).toContain('or from the "Watching since:" time, whichever is later');
     expect(prompt).toContain(
