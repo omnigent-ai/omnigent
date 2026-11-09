@@ -6380,7 +6380,7 @@ describe("chatStore — send (cross-session routing)", () => {
   });
 
   it("an in-flight send that fails after a switch does not clobber the now-active session", async () => {
-    // Pairs with the routing fix: a send to session B can
+    // Companion to the routing fix (Copilot review): a send to session B can
     // still be in flight when the user switches to A. If B's POST then fails,
     // its catch must NOT reset A's status/activeResponse. The vehicle is a
     // *first* send (B idle → alreadyStreaming=false), so the catch's

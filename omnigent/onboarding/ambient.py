@@ -64,13 +64,12 @@ _OLLAMA_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}"
 _OLLAMA_PROBE_TIMEOUT = 0.25
 
 # Claude Code's enterprise "managed settings" chain, highest precedence first.
-# An enterprise install configures
-# Claude Code here and nowhere else: an ``env`` block pinning
-# ``ANTHROPIC_BASE_URL`` at a gateway plus a top-level ``apiKeyHelper`` that
-# prints the bearer token. Managed settings win at Claude Code's own launch, so
-# this file alone is a complete, working credential — but it belongs to Claude
-# Code, not omnigent: we reflect it (readiness + label), we never adopt it into
-# a ``providers:`` shape (see ``claude_managed_gateway``).
+# An enterprise install configures Claude Code here and nowhere else: an
+# ``env`` block pinning ``ANTHROPIC_BASE_URL`` at a gateway plus a top-level
+# ``apiKeyHelper`` that prints the bearer token. Managed settings win at Claude
+# Code's own launch, so this file alone is a complete, working credential — but
+# it belongs to Claude Code, not omnigent: we reflect it (readiness + label), we
+# never adopt it into a ``providers:`` shape (see ``claude_managed_gateway``).
 _CLAUDE_CODE_MACOS_MANAGED_DIR = Path("/Library/Application Support/ClaudeCode")
 _CLAUDE_CODE_LINUX_MANAGED_DIR = Path("/etc/claude-code")
 CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
@@ -916,12 +915,11 @@ def _detect_providers_now() -> list[DetectedProvider]:
         )
 
     # 3. A custom model provider in ~/.codex/config.toml (e.g. the
-    #    Databricks Unity Gateway set up by a Codex setup, which
-    #    writes config.toml only, never auth.json, so the login check
-    #    below cannot see it). Ordered BEFORE the codex login check so that
-    #    on a machine with both, the auto-default matches what a plain
-    #    ``codex`` invocation does: config.toml's default model_provider
-    #    wins over auth.json.
+    #    Databricks Unity Gateway, whose setup writes config.toml only, never
+    #    auth.json, so the login check below cannot see it). Ordered BEFORE the
+    #    codex login check so that on a machine with both, the auto-default
+    #    matches what a plain ``codex`` invocation does: config.toml's default
+    #    model_provider wins over auth.json.
     codex_config_det = codex_config_detection()
     if codex_config_det is not None:
         detected.append(codex_config_det)
