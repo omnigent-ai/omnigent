@@ -305,6 +305,7 @@ import {
   type NativeCodingAgentIconKind,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
+import { isHeadlessCliHarness } from "@/lib/agentGrouping";
 import AntigravityColor from "@lobehub/icons/es/Antigravity/components/Color";
 import DevinColor from "@lobehub/icons/es/Devin/components/Color";
 import KiroColor from "@lobehub/icons/es/Kiro/components/Color";
@@ -5143,7 +5144,7 @@ function SessionHarnessIcon({
     ? { name: nativeAgent.agentName, harness: nativeAgent.harness }
     : conversation.agent_name === "nessie"
       ? { name: "nessie", harness: null }
-      : withFallback
+      : isHeadlessCliHarness({ harness: conversation.harness ?? null }) || withFallback
         ? { name: conversation.agent_name ?? "", harness: conversation.harness ?? null }
         : null;
   if (!harnessAgent) return null;

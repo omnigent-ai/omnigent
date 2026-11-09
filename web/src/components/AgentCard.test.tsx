@@ -74,6 +74,7 @@ describe("AgentCard icon selection", () => {
     { name: "x", harness: "claude-sdk", expected: "claude" },
     // Genie is a Codex fork but has its own lamp mark, not Codex's.
     { name: "genie", harness: "genie", expected: "genie" },
+    { name: "custom-reviewer", harness: "genie", expected: "genie" },
     { name: "pi", harness: "pi", expected: "pi" },
     // The pi match is exact: a harness merely containing "pi" stays generic.
     { name: "spec-gen", harness: "openapi", expected: "bot" },

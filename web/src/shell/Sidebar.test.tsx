@@ -1,3 +1,4 @@
+import genieCodeLogo from "@/assets/genie-code-logo.svg";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -4486,6 +4487,19 @@ describe("Sidebar view options", () => {
       );
     });
     expect(usePullRequestInfoMock).toHaveBeenCalledWith("conv_gh");
+  });
+
+  it("draws Genie's gradient mark in the session tooltip", async () => {
+    mockConversations([conv("conv_genie", "genie", { harness: "genie" })]);
+    renderGroupingSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_genie" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByTestId("session-tooltip-content");
+    expect(
+      within(tooltip).getByTestId("session-tooltip-harness").querySelector("img"),
+    ).toHaveAttribute("src", genieCodeLogo);
   });
 
   it.each([

@@ -170,6 +170,7 @@ protocol/capabilities, and the allowlist when present.
 | --- | --- |
 | Claude native / SDK | Anthropic Messages |
 | Codex native / SDK | OpenAI Responses |
+| Genie | OpenAI Responses |
 | Pi native / SDK | Configured Anthropic or OpenAI transport |
 | OpenAI Agents SDK | Configured OpenAI transport |
 | Qwen, OpenCode native, Jcode | OpenAI Chat Completions |
