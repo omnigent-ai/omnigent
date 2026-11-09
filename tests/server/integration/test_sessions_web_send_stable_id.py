@@ -15,11 +15,17 @@ import httpx
 import pytest
 
 from omnigent.entities import NewConversationItem
-from omnigent.entities.conversation import ConversationItem
+from omnigent.entities.conversation import (
+    ConversationItem,
+    MessageData,
+    StartupInputOptions,
+    StartupRunnerWait,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes._sessions.helpers import _stable_id_reuse_is_exact_retry
 from omnigent.server.routes.sessions import _build_new_item
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import create_test_agent
 
 _STABLE_ID = "0f" * 16  # 32 lowercase hex chars, the shape web clients mint
@@ -106,6 +112,38 @@ def test_stable_id_reuse_by_the_same_author_is_a_retry_only_when_the_body_matche
     assert _stable_id_reuse_is_exact_retry(_persisted(), _resend(f"{_TEXT}, but edited")) is False
     # Single-user mode: both sides carry no identity and still compare equal.
     assert _stable_id_reuse_is_exact_retry(_persisted(created_by=None), _resend(created_by=None))
+    saved, resend = _persisted(), _resend()
+    assert isinstance(saved.data, MessageData) and isinstance(resend.data, MessageData)
+    options = StartupInputOptions(model_override="chosen", tools=[])
+    saved.data.startup_options = options.model_copy(
+        update={"runner_wait": StartupRunnerWait(runner_id="runner-owned", deadline=1000.0)}
+    )
+    resend.data.startup_options = options
+    assert _stable_id_reuse_is_exact_retry(saved, resend)
+    resend.data.startup_options = options.model_copy(update={"model_override": "different"})
+    assert not _stable_id_reuse_is_exact_retry(saved, resend)
+
+
+@pytest.mark.parametrize("request_options", [None, StartupInputOptions()])
+def test_stable_id_retry_ignores_retention_only_options(request_options) -> None:
+    saved, resend = _persisted(), _resend()
+    assert isinstance(saved.data, MessageData) and isinstance(resend.data, MessageData)
+    saved.data.startup_options = StartupInputOptions(
+        runner_wait=StartupRunnerWait(runner_id="runner-owned", deadline=1000.0)
+    )
+    resend.data.startup_options = request_options
+    assert _stable_id_reuse_is_exact_retry(saved, resend)
+    for options in [
+        StartupInputOptions(model_override="chosen"),
+        StartupInputOptions(tools=[]),
+        StartupInputOptions(background_titles_enabled=True),
+    ]:
+        resend.data.startup_options = options
+        assert not _stable_id_reuse_is_exact_retry(saved, resend)
+    resend.created_by = "another-author"
+    with pytest.raises(OmnigentError) as excinfo:
+        _stable_id_reuse_is_exact_retry(saved, resend)
+    assert excinfo.value.code == ErrorCode.CONFLICT
 
 
 def test_stable_id_reuse_by_another_author_is_refused() -> None:
@@ -173,6 +211,36 @@ async def test_web_send_persists_under_its_stable_id_and_dedupes_a_retry(
     # may have died) -- against the one persisted item, never a second copy.
     turns = [turn for turn in forwarded if turn.get("type") == "message"]
     assert [turn["persisted_item_id"] for turn in turns] == [_STABLE_ID, _STABLE_ID]
+
+
+@pytest.mark.asyncio
+async def test_web_retry_of_retention_only_saved_item_uses_the_original_id(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        agent = await create_test_agent(client)
+        create = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+        assert create.status_code == 201, create.text
+        session_id = create.json()["id"]
+        saved = _resend(created_by=None)
+        assert isinstance(saved.data, MessageData)
+        saved.data.startup_options = StartupInputOptions(
+            runner_wait=StartupRunnerWait(runner_id="runner-owned", deadline=1000.0)
+        )
+        SqlAlchemyConversationStore(db_uri).append(session_id, [saved])
+        retry = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "message", "data": _user_message()},
+        )
+        assert retry.status_code == 202, retry.text
+        items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+        assert [item["id"] for item in items if item["type"] == "message"] == [_STABLE_ID]
+        turns = [turn for turn in forwarded if turn.get("type") == "message"]
+        assert [turn["persisted_item_id"] for turn in turns] == [_STABLE_ID]
+    finally:
+        await runner.aclose()
 
 
 @pytest.mark.asyncio

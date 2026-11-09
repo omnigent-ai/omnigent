@@ -331,6 +331,41 @@ def test_runner_claim_is_immutable_across_restart_and_competing_workers(db_uri):
         )
 
 
+def test_host_age_only_narrows_the_existing_runner_claim(db_uri):
+    store = SqlAlchemyConversationStore(db_uri)
+    session = store.create_conversation()
+    [saved] = store.append(session.id, [_input()])
+    runner_id = uuid4().hex
+    original = store.claim_pending_input_runner(
+        session.id, saved.id, runner_id=runner_id, deadline=1000.0
+    )
+    restarted = SqlAlchemyConversationStore(db_uri)
+    narrowed = restarted.claim_pending_input_runner(
+        session.id, saved.id, runner_id=runner_id, deadline=800.0, tighten_deadline=True
+    )
+    assert narrowed.runner_id == original.runner_id and narrowed.deadline == 800.0
+    for candidate_runner, deadline in [(runner_id, 1200.0), (uuid4().hex, 700.0)]:
+        assert (
+            restarted.claim_pending_input_runner(
+                session.id,
+                saved.id,
+                runner_id=candidate_runner,
+                deadline=deadline,
+                tighten_deadline=True,
+            )
+            == narrowed
+        )
+    connected = restarted.claim_pending_input_runner(
+        session.id, saved.id, runner_id=runner_id, deadline=800.0, connected=True
+    )
+    assert (
+        restarted.claim_pending_input_runner(
+            session.id, saved.id, runner_id=runner_id, deadline=700.0, tighten_deadline=True
+        )
+        == connected
+    )
+
+
 @pytest.mark.parametrize("race", ["cancelled", "submitted", "discarded", "receipt", "claimed"])
 def test_runner_claim_rechecks_queued_input_after_encoding(db_uri, monkeypatch, race):
     store, concurrent = [SqlAlchemyConversationStore(db_uri) for _ in range(2)]

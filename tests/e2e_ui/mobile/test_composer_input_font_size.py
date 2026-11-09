@@ -112,6 +112,11 @@ def test_composer_input_font_setting_and_alignment(
     expect(hint).to_be_visible(timeout=30_000)
     if mobile:
         expect(landing).to_have_attribute("placeholder", "Describe a task...")
+    # A visible mobile DOM can precede its foreground compositor frame.
+    page.bring_to_front()
+    page.evaluate(
+        "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+    )
     observed = {"landing-hint": _metrics(hint)}
     skill_metrics = None if mobile else _metrics(page.get_by_test_id("skill-pill-context"))
     page.screenshot(path=tmp_path / "landing-placeholder.png", animations="disabled")
