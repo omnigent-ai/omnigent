@@ -606,6 +606,14 @@ def test_pinned_read_refuses_a_merge_request_that_moves_during_the_listing(
         getattr(module.PULL_REQUESTS, read)(root, ref(), head_sha=HEAD, base_sha=BASE)
 
 
+def test_pinned_read_without_prepared_diff_refs_is_unavailable_not_moved(
+    root: str, api: Mock, mr: dict
+) -> None:
+    mr["diff_refs"] = None
+    with pytest.raises(ValueError, match="could not confirm"):
+        module.PULL_REQUESTS.pinned_changed_files(root, ref(), head_sha=HEAD, base_sha=BASE)
+
+
 def test_incomplete_pinned_diff_echoes_no_revision(root: str, api: Mock, mr: dict) -> None:
     mr["changes_count"] = "1000+"
     result = module.PULL_REQUESTS.pinned_diff(root, ref(), head_sha=HEAD, base_sha=BASE)

@@ -401,7 +401,13 @@ def _content(client: GitLabClient, project: object, path: str, revision: str) ->
 def _check_revision(mr: dict[str, Any], *, head_sha: str, base_sha: str) -> None:
     """Raise when the merge request is no longer at the pinned revisions."""
     refs = _object(mr.get("diff_refs"))
-    if refs.get("head_sha") != head_sha or refs.get("base_sha") != base_sha:
+    current = (refs.get("head_sha"), refs.get("base_sha"))
+    if None in current:
+        # GitLab has not prepared the diff revisions yet; that is not a moved MR.
+        raise ValueError(
+            "GitLab could not confirm the merge request's revision. Refresh to retry."
+        )
+    if current != (head_sha, base_sha):
         raise ValueError("The merge request changed. Refresh to retry.")
 
 
