@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
+import * as host from "@/lib/host";
 import type { SandboxStatus } from "@/lib/types";
 import {
   sandboxModelOptionsKey,
@@ -35,6 +36,7 @@ const catalog = {
 afterEach(() => {
   cleanup();
   fetchMock.mockReset();
+  vi.restoreAllMocks();
 });
 
 describe("useSandboxModelOptions", () => {
@@ -50,7 +52,8 @@ describe("useSandboxModelOptions", () => {
     );
   });
 
-  it("does not reuse another target or owner's cached catalog", async () => {
+  it("isolates target, owner, and server catalogs within one QueryClient", async () => {
+    const server = vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
     fetchMock.mockResolvedValue(new Response(JSON.stringify(catalog)));
     const { result, rerender } = renderHook(
       ({ provider, user }) => useSandboxModelOptions(provider, "claude-native", "ag_1", user, true),
@@ -64,6 +67,14 @@ describe("useSandboxModelOptions", () => {
     rerender({ provider: "kubernetes", user: "bob" });
     expect(result.current.data).toBeUndefined();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    server.mockReturnValue("server-b");
+    rerender({ provider: "kubernetes", user: "alice" });
+    expect(result.current.data).toBeUndefined();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    server.mockReturnValue("server-a");
+    rerender({ provider: "kubernetes", user: "alice" });
+    expect(result.current.data).toEqual(catalog);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it("keeps successful empty discovery distinct from request failure", async () => {

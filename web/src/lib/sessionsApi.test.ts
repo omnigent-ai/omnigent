@@ -8,7 +8,9 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ApiError,
   apiErrorFromResponse,
+  parseRetryAfterMs,
   approve,
   bindOnlyOnlineRunner,
   createBundledSession,
@@ -97,7 +99,43 @@ describe("fetchSessionRepositoryBranches", () => {
   });
 });
 
+describe("parseRetryAfterMs", () => {
+  it("reads delta-seconds and HTTP dates, and rejects anything else", () => {
+    const now = Date.parse("2026-11-04T00:00:00Z");
+    expect(parseRetryAfterMs("30", now)).toBe(30_000);
+    expect(parseRetryAfterMs(" 0 ", now)).toBe(0);
+    expect(parseRetryAfterMs("Wed, 04 Nov 2026 00:00:05 GMT", now)).toBe(5_000);
+    // A date already past means "now", not a negative wait.
+    expect(parseRetryAfterMs("Wed, 04 Nov 2026 00:00:00 GMT", now + 1_000)).toBe(0);
+    expect(parseRetryAfterMs(null, now)).toBeNull();
+    expect(parseRetryAfterMs("soon", now)).toBeNull();
+    // Malformed numbers aren't dates, so they mustn't read as "retry now".
+    expect(parseRetryAfterMs("-1", now)).toBeNull();
+    expect(parseRetryAfterMs("1.5", now)).toBeNull();
+    expect(parseRetryAfterMs("2026-11-04", now)).toBeNull();
+    // Looser date forms Date.parse would accept, read as "now" or a far-off wait.
+    expect(parseRetryAfterMs("Mon 1", now)).toBeNull();
+    expect(parseRetryAfterMs("January 1, 2027", now)).toBeNull();
+    expect(parseRetryAfterMs("Wednesday, 04-Nov-26 00:00:05 GMT", now)).toBeNull();
+  });
+});
+
 describe("apiErrorFromResponse", () => {
+  it("records the response's Retry-After for the retry policy", async () => {
+    const throttled = new Response(JSON.stringify({ error: { code: "rate_limited" } }), {
+      status: 429,
+      headers: { "Retry-After": "7" },
+    });
+    expect((await apiErrorFromResponse(throttled)).retryAfterMs).toBe(7_000);
+
+    const plain = new Response("{}", { status: 503 });
+    expect((await apiErrorFromResponse(plain)).retryAfterMs).toBeNull();
+    // Hand-built stand-ins have no headers at all.
+    expect(
+      (await apiErrorFromResponse(mockJsonResponse({}, { ok: false, status: 503 }))).retryAfterMs,
+    ).toBeNull();
+  });
+
   it("reads the AP `error` envelope (message + code)", async () => {
     const err = await apiErrorFromResponse(
       mockJsonResponse(
@@ -173,6 +211,8 @@ describe("createSession", () => {
       contextWindow: undefined,
       labels: undefined,
       projectId: null,
+      sideChatParentId: null,
+      sideChatAllowed: null,
       lastTaskError: undefined,
       lastTotalTokens: undefined,
       usageIncluded: true,
@@ -186,6 +226,7 @@ describe("createSession", () => {
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
+      failedInputs: [],
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
@@ -335,11 +376,12 @@ describe("createSession", () => {
     expect(session.queuedItems).toEqual(queued);
   });
 
-  it("maps pending_inputs (snake) to pendingInputs (camel) with content", async () => {
+  it("maps pending_inputs and failed_inputs (snake) to camel with content", async () => {
     // The snapshot replays un-consumed native web messages here so the
     // store re-hydrates the optimistic bubble on rebind. Each entry's
     // pending_id becomes the bubble's stable key and the content is
-    // carried through verbatim for rendering.
+    // carried through verbatim for rendering. Undelivered startup
+    // messages share the shape.
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
@@ -350,12 +392,26 @@ describe("createSession", () => {
         pending_inputs: [
           { pending_id: "pending_1", content: [{ type: "input_text", text: "queued" }] },
         ],
+        failed_inputs: [
+          {
+            pending_id: "pending_2",
+            content: [{ type: "input_text", text: "lost" }],
+            created_by: "alice@example.com",
+          },
+        ],
       }),
     );
 
     const session = await createSession("agent_xyz");
     expect(session.pendingInputs).toEqual([
       { pendingId: "pending_1", content: [{ type: "input_text", text: "queued" }] },
+    ]);
+    expect(session.failedInputs).toEqual([
+      {
+        pendingId: "pending_2",
+        content: [{ type: "input_text", text: "lost" }],
+        createdBy: "alice@example.com",
+      },
     ]);
   });
 
@@ -394,6 +450,23 @@ describe("createSession", () => {
 });
 
 describe("createBundledSession", () => {
+  it("uploads durable first input and its files with the agent bundle", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ session_id: "conv_bundle" }));
+    const task = {
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "Review this file" }] },
+    };
+    const attachment = new File(["hello"], "task.txt");
+    await createBundledSession(
+      new File([], "agent.tar.gz"),
+      { host_type: "managed", initial_input: task },
+      [attachment],
+    );
+    const form = (fetchMock.mock.calls[0][1] as RequestInit).body as FormData;
+    expect(JSON.parse(form.get("metadata") as string).initial_input).toEqual(task);
+    expect(form.getAll("initial_files")).toEqual([attachment]);
+  });
+
   it("sends the local opt-out header when background titles are disabled", async () => {
     localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
     fetchMock.mockResolvedValueOnce(
@@ -1122,6 +1195,8 @@ describe("getSession", () => {
         status: "running",
         created_at: 1704067200,
         items: [],
+        side_chat_parent_id: "conv_parent",
+        side_chat_allowed: false,
       }),
     );
 
@@ -1131,6 +1206,8 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_abc");
     expect(session.agentId).toBe("agent_xyz");
     expect(session.createdAt).toBe(1704067200);
+    expect(session.sideChatParentId).toBe("conv_parent");
+    expect(session.sideChatAllowed).toBe(false);
   });
 
   it("url-encodes the session id", async () => {
@@ -1631,6 +1708,32 @@ describe("postEvent", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual(event);
     expect(out).toEqual({ queued: true, itemId: "ci_123" });
+  });
+
+  it("reports an expired sign-in when the POST is answered with a login page", async () => {
+    // The auth edge's 200 login page: a body that is not JSON, served as text/html.
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+      json: async () => {
+        throw new SyntaxError("Unexpected token '<'");
+      },
+    });
+
+    const error = await postEvent("conv_abc", { type: "clear", data: {} }).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ status: 401, code: "sign_in_expired" });
+  });
+
+  it("reads the session a claude-sdk clear continued in", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, session_id: "conv_new" }));
+
+    const out = await postEvent("conv_abc", { type: "clear", data: {} });
+
+    expect(out.sessionId).toBe("conv_new");
   });
 
   it("surfaces 4xx as a thrown error (does not silently swallow)", async () => {

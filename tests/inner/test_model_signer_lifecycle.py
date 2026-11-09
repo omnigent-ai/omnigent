@@ -254,6 +254,10 @@ async def test_signer_backed_home_excludes_host_credential_files(
     signer = _Signer([])
     process = _Process()
     populate = Mock()
+    config_probe = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.prepare_codex_provider_config", config_probe
+    )
     monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", populate)
     monkeypatch.setattr(
         "omnigent.inner.codex_executor.prepare_codex_worker",
@@ -269,6 +273,7 @@ async def test_signer_backed_home_excludes_host_credential_files(
     await session.start()
 
     assert populate.call_args.kwargs["include_credentials"] is False
+    config_probe.assert_not_awaited()
     assert populate.call_args.kwargs["minimal_config"] is True
     probe_path, probe_cwd, probe_os_env = populate.call_args.kwargs["required_brokered_probe"]
     assert probe_path == "/bin/echo"

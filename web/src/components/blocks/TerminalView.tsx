@@ -7,7 +7,14 @@
 // returned cleanup).
 
 import { Loader2Icon } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -30,7 +37,14 @@ import {
 } from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
-import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
+import {
+  isTerminalLaunching,
+  resolveInitialAttachUrl,
+  subscribeTerminalLaunches,
+  terminalLaunchMode,
+  watchDirectUpgrade,
+  withAttachParams,
+} from "@/lib/terminals";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import {
   TerminalClipboardPrompt,
@@ -84,6 +98,9 @@ export const RECONNECT_BACKOFF_MS = [
  * plain reset-on-connect, a connect→drop hot loop would retry forever.
  */
 export const RECONNECT_STABLE_MS = 30_000;
+
+/** Closes an attach can get when it arrives before its shell exists. */
+const LAUNCH_REFUSAL_CODES: ReadonlySet<number> = new Set([4404, 4500]);
 
 function isReconnectableTerminalClose(code: number): boolean {
   return (
@@ -268,6 +285,9 @@ export function TerminalView({
   // Consecutive re-dial attempts in the current outage. A ref, not
   // state: it only feeds the scheduling effect, never the render.
   const reconnectAttemptsRef = useRef(0);
+  // Whether the current attach was dialed while its shell's create was in
+  // flight (``await_launch``); such an attach gets one re-dial on 4404.
+  const dialedDuringLaunchRef = useRef(false);
   // Epoch ms when the current connection opened, or null while down.
   // Lets the close handler tell "stable connection finally dropped"
   // (reset the budget) from "re-dial died straight away" (burn it).
@@ -320,6 +340,9 @@ export function TerminalView({
   }, []);
 
   const notifyActivity = useCallback(() => {
+    // Terminal output: the attach reached a live shell, so a later close is
+    // not a launch refusal.
+    dialedDuringLaunchRef.current = false;
     onActivityRef.current?.();
   }, []);
 
@@ -523,6 +546,13 @@ export function TerminalView({
     }
   }, [onResume, disposeActiveSession, resumeTarget, resumeGeneration]);
 
+  // A new shell whose create may be waking the runner opens its tab at once
+  // but attaches only once the create returns.
+  const launchMode = useSyncExternalStore(subscribeTerminalLaunches, () =>
+    terminalLaunchMode(terminalId),
+  );
+  const waitingForCreate = launchMode === "wait";
+
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
       if (node === null) return;
@@ -542,6 +572,7 @@ export function TerminalView({
       // handshake. The session's WS ``open`` handler transitions us
       // to ``connected``.
       notifyState({ kind: "connecting" });
+      if (waitingForCreate) return;
 
       // Defer the actual session construction by one microtask so
       // React 19 StrictMode's synchronous attach → cleanup → attach
@@ -577,7 +608,15 @@ export function TerminalView({
           const h = getSessionHost(sessionId);
           return h && (!isDatabricksWorkspace() || !isHostKeyless(h)) ? h : undefined;
         })();
-        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId);
+        const awaitLaunch = isTerminalLaunching(terminalId);
+        dialedDuringLaunchRef.current = awaitLaunch;
+        const relayUrl = buildAttachUrl(
+          sessionId,
+          terminalId,
+          readOnly,
+          computedHostId,
+          awaitLaunch,
+        );
         const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
         // Never keep the user waiting on the direct path: this resolves
         // direct only when the loopback listener is already known
@@ -630,6 +669,7 @@ export function TerminalView({
       notifyClipboardRequest,
       notifyFileLink,
       disposeActiveSession,
+      waitingForCreate,
     ],
   );
 
@@ -644,6 +684,20 @@ export function TerminalView({
 
   const stateRef = useRef(state);
   stateRef.current = state;
+
+  // An early attach can be refused before its shell exists (4404 before
+  // registration, 4500 while the runner is being rebound). After the create
+  // succeeds, retry once without ``await_launch``. Deliberate closes (e.g.
+  // 4405 detached) and closes after the shell produced output are left alone.
+  const closedByOwnLaunch = state.kind === "closed" && LAUNCH_REFUSAL_CODES.has(state.code);
+  useEffect(() => {
+    if (!dialedDuringLaunchRef.current || launchMode !== null || !closedByOwnLaunch) return;
+    dialedDuringLaunchRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    disposeActiveSession();
+    setConnectAttempt((attempt) => attempt + 1);
+  }, [launchMode, closedByOwnLaunch, disposeActiveSession]);
+  const refusedDuringLaunch = launchMode === "attach" && closedByOwnLaunch;
   const previousResumeGeneration = useRef(resumeGeneration);
   useEffect(() => {
     if (previousResumeGeneration.current === resumeGeneration) return;
@@ -795,7 +849,8 @@ export function TerminalView({
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
         {state.kind !== "connected" && (
           <StatusOverlay
-            state={state}
+            state={refusedDuringLaunch ? { kind: "connecting" } : state}
+            startingShell={waitingForCreate || refusedDuringLaunch}
             reconnectPending={reconnectPending}
             onResume={onResume ? handleResume : undefined}
             resumeTarget={resumeTarget}
@@ -810,6 +865,7 @@ export function TerminalView({
 
 function StatusOverlay({
   state,
+  startingShell,
   reconnectPending,
   onResume,
   resumeTarget,
@@ -817,6 +873,8 @@ function StatusOverlay({
   resumeError,
 }: {
   state: ConnectionState;
+  /** True while a new shell waits for its create before attaching. */
+  startingShell: boolean;
   /** True while an automatic re-dial is scheduled for a closed bridge. */
   reconnectPending: boolean;
   onResume?: () => void | Promise<void>;
@@ -831,7 +889,7 @@ function StatusOverlay({
       {state.kind === "connecting" && (
         <span className="flex items-center gap-2">
           <Loader2Icon className="size-4 animate-spin" />
-          Connecting…
+          {startingShell ? "Starting shell…" : "Connecting…"}
         </span>
       )}
       {state.kind === "closed" && reconnectPending && (
@@ -890,6 +948,9 @@ function resumeErrorText(error: unknown, target: string): string {
  *     e.g. ``"terminal_bash_s1"``.
  * :param readOnly: If true, requests a read-only attach. Forwarded
  *     to the server as ``?read_only=true``.
+ * :param hostId: The session's host_id, forwarded as ``?omnigent_slice_key=``.
+ * :param awaitLaunch: If true, the terminal's create request is still in
+ *     flight; ``?await_launch=true`` asks the server to wait for it.
  * :returns: The path-and-query portion of the WS URL, e.g.
  *     ``"/v1/sessions/.../resources/terminals/.../attach"``.
  */
@@ -898,6 +959,7 @@ export function buildAttachPath(
   terminalId: string,
   readOnly: boolean,
   hostId?: string,
+  awaitLaunch = false,
 ): string {
   const path =
     `/v1/sessions/${encodeURIComponent(sessionId)}` +
@@ -911,6 +973,7 @@ export function buildAttachPath(
   const params = new URLSearchParams();
   if (readOnly) params.set("read_only", "true");
   if (hostId) params.set("omnigent_slice_key", hostId);
+  if (awaitLaunch) params.set("await_launch", "true");
   const qs = params.toString();
   return qs ? `${path}?${qs}` : path;
 }
@@ -927,6 +990,7 @@ export function buildAttachPath(
  * :param readOnly: If true, requests a read-only attach.
  * :param hostId: The session's host_id, forwarded as the routing key
  *     ``?omnigent_slice_key=``.
+ * :param awaitLaunch: Wait for a terminal whose create is still in flight.
  * :returns: The fully-qualified ``ws(s)://`` URL.
  */
 function buildAttachUrl(
@@ -934,8 +998,9 @@ function buildAttachUrl(
   terminalId: string,
   readOnly: boolean,
   hostId?: string,
+  awaitLaunch = false,
 ): string {
   // Delegates origin/prefix resolution to the embed host when present
   // (standalone falls back to the current page's origin).
-  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId));
+  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId, awaitLaunch));
 }
