@@ -228,7 +228,7 @@ def test_an_unknown_origin_is_an_unsupported_remote(
 
 
 @pytest.mark.parametrize("gh_state", ["missing", "signed_out"])
-def test_an_unclaimed_origin_keeps_the_cli_and_sign_in_guidance(
+def test_an_unclaimed_origin_does_not_require_github_auth(
     repo: Path, monkeypatch: pytest.MonkeyPatch, gh_state: str
 ) -> None:
     _git(repo, "remote", "add", "origin", "https://unknown-forge.example.test/g/p.git")
@@ -238,9 +238,13 @@ def test_an_unclaimed_origin_keeps_the_cli_and_sign_in_guidance(
 
     info = pr_resource.pr_info(str(repo))
 
-    assert (info["available"], info["provider"], info.get("reason")) == (True, "github", None)
-    assert info["auth"]["cli"] == {"name": "gh", "available": gh_state == "signed_out"}
-    assert info["auth"]["authenticated"] is False
+    assert (info["available"], info["provider"], info["reason"]) == (
+        False,
+        None,
+        "unsupported_remote",
+    )
+    assert info["remote_host"] == "unknown-forge.example.test"
+    assert info["auth"] is None
 
 
 def test_an_unclaimed_origin_keeps_the_account_choice(
