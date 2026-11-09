@@ -1890,6 +1890,26 @@ async def test_delete_sends_delete_request(delete_branch: bool, expected_url: st
 
 
 @pytest.mark.asyncio
+async def test_delete_omits_branch_cleanup_by_default() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url}")
+        return httpx.Response(
+            200,
+            json={"id": "conv_abc", "object": "conversation.deleted", "deleted": True},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.delete("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert calls == ["DELETE http://srv/v1/sessions/conv_abc"]
+
+
+@pytest.mark.asyncio
 async def test_delete_404_raises_omnigent_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         del request

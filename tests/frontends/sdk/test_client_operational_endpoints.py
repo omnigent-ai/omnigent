@@ -80,8 +80,16 @@ async def test_usage_returns_usage_report() -> None:
         "cost_last_7d": 1.25,
         "cost_last_30d": 3.0,
         "total_cost_usd": 3.0,
-        "daily_costs": [],
-        "sessions": [],
+        "daily_costs": [{"day": "2026-11-08", "cost_usd": 0.5}],
+        "sessions": [
+            {
+                "id": "conv_abc",
+                "created_at": 1_700_000_000,
+                "updated_at": 1_700_000_100,
+                "cost_usd": 1.25,
+                "models": {"claude-opus-4-8": 1.0, "claude-haiku-5-5": 0.25},
+            }
+        ],
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -99,6 +107,10 @@ async def test_usage_returns_usage_report() -> None:
     assert usage.total_cost_usd == 3.0
     assert usage.cost_today == 0.5
     assert usage.cost_last_7d == 1.25
+    assert [(day.day, day.cost_usd) for day in usage.daily_costs] == [("2026-11-08", 0.5)]
+    assert [session.id for session in usage.sessions] == ["conv_abc"]
+    assert usage.sessions[0].cost_usd == 1.25
+    assert usage.sessions[0].models == {"claude-opus-4-8": 1.0, "claude-haiku-5-5": 0.25}
 
 
 @pytest.mark.asyncio
