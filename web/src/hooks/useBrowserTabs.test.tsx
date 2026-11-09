@@ -1,4 +1,5 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
@@ -275,6 +276,30 @@ describe("browser soft tabs", () => {
     });
     expect(outcome).toEqual({ ok: false, error });
     expect(result.current.tabs).toEqual([]);
+  });
+
+  it("commits the incoming session's selection in its first render after a switch", () => {
+    writeSessionWorkspaceState("session-a", {
+      openBrowsers: ["a-tab"],
+      selectedBrowserId: "a-tab",
+    });
+    writeSessionWorkspaceState("session-b", {
+      openBrowsers: ["b-tab"],
+      selectedBrowserId: "b-tab",
+    });
+    const committed: (string | null)[] = [];
+    const { rerender } = renderHook(
+      ({ id }) => {
+        const browsers = useBrowserTabs(id);
+        useLayoutEffect(() => {
+          committed.push(browsers.selected);
+        });
+        return browsers;
+      },
+      { initialProps: { id: "session-a" } },
+    );
+    rerender({ id: "session-b" });
+    expect(committed).toEqual(["a-tab", "b-tab"]);
   });
 
   it("keeps a reopen that finishes after a session switch out of the session on screen", async () => {
