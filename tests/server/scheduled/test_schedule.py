@@ -7,7 +7,11 @@ import pytest
 
 from omnigent.entities import ScheduledTask
 from omnigent.server.scheduled.rrule import RRuleSearchError
-from omnigent.server.scheduled.schedule import next_scheduled_time, occurrence_host_id
+from omnigent.server.scheduled.schedule import (
+    is_trigger_automation,
+    next_scheduled_time,
+    occurrence_host_id,
+)
 
 
 @pytest.fixture
@@ -35,6 +39,22 @@ def test_sandbox_identity_is_stable_per_tenant_task_and_trigger(task) -> None:
     assert host != occurrence_host_id(task, "manual:100")
     pinned = replace(task, execution_target="connected_host", host_id=uuid.uuid4().hex)
     assert occurrence_host_id(pinned, "schedule:100") == pinned.host_id
+
+
+@pytest.mark.parametrize("source", ["Jira", "Slack", "GitHub", "Linear", "PagerDuty"])
+def test_trigger_automations_are_recognized_by_their_opening_sentence(task, source) -> None:
+    from dataclasses import replace
+
+    opening = f"This automation watches {source} and starts one Omnigent session per item."
+    assert is_trigger_automation(replace(task, prompt=opening, session_mode="continue"))
+    # The trigger form's saved state line can come first.
+    saved = f'<!-- omnigent-trigger v1 {{"source": "{source.lower()}"}} -->\n{opening}'
+    assert is_trigger_automation(replace(task, prompt=saved, session_mode="continue"))
+    # A trigger keeps one session, and the sentence has to open the prompt.
+    assert not is_trigger_automation(replace(task, prompt=opening, session_mode="new"))
+    assert not is_trigger_automation(
+        replace(task, prompt=f"Summarize this. {opening}", session_mode="continue")
+    )
 
 
 @pytest.mark.parametrize(

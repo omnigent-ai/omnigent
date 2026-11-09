@@ -107,9 +107,18 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
-  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
+  useCreateTerminal: vi.fn(() => ({
+    mutate: vi.fn(),
+    launch: vi.fn(),
+    isPending: false,
+    isError: false,
+  })),
 }));
 // The "+" menu reads the agent's declared terminals to gate the Shell entry.
+const requestSandboxWakeMock = vi.fn();
+vi.mock("@/hooks/useSandboxAutoWake", () => ({
+  requestSandboxWake: (id: string) => requestSandboxWakeMock(id),
+}));
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
@@ -168,6 +177,7 @@ afterEach(() => {
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
   useCreateTerminalMock.mockReturnValue({
     mutate: vi.fn(),
+    launch: vi.fn(),
     isPending: false,
     isError: false,
   } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -370,6 +380,10 @@ describe("WorkspacePanel surface presentation", () => {
 
     expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-flat-view", "true");
+    requestSandboxWakeMock.mockClear();
+    // An opened unpinned tab is a pick like a pinned one.
+    fireEvent.click(screen.getByRole("tab", { name: "Changes" }));
+    expect(requestSandboxWakeMock).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
     expect(onClosePanel).toHaveBeenCalledWith("changes");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
@@ -553,6 +567,22 @@ describe("WorkspacePanel surface presentation", () => {
 
     await waitFor(() => expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus());
     expect(onRightRailTabChange).toHaveBeenCalledWith("files");
+  });
+
+  it("asks to wake the sandbox when Files, Changes or Pull Requests is picked, not Agents", () => {
+    requestSandboxWakeMock.mockClear();
+    writeDefaultWorkspaceTab("changes");
+    renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "changes" });
+
+    expect(pressTabNumber(2)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(1);
+    expect(pressTabNumber(4)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(1);
+    expect(pressTabNumber(1)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(2);
+    // Pull Requests also loads its details from the host.
+    expect(pressTabNumber(3)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(3);
   });
 
   it("selects fixed tabs by their visible number from anywhere, revealing the rail", () => {
@@ -1073,11 +1103,11 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // is handed to openTerminalTab.
     declaresShell();
     const created = { id: "terminal_zsh_s1", name: "zsh", session: "u-1", running: true };
-    const mutate = vi.fn((_name: string, opts?: { onSuccess?: (info: unknown) => void }) =>
-      opts?.onSuccess?.(created),
+    const launch = vi.fn((_name: string, opts?: { onOpen?: (info: unknown) => void }) =>
+      opts?.onOpen?.(created),
     );
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1088,7 +1118,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     fireEvent.click(await screen.findByRole("menuitem", { name: /shell/i }));
 
     // Launches the first declared shell and opens the created terminal's tab.
-    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
+    expect(launch).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
 
     // The menu closes on its own after the launch.
@@ -1103,11 +1133,11 @@ describe('WorkspacePanel "+" new-tab menu', () => {
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
     const created = { id: "terminal_zsh_s1", name: "zsh", session: "u-2", running: true };
-    const mutate = vi.fn((_name: string, opts?: { onSuccess?: (info: unknown) => void }) =>
-      opts?.onSuccess?.(created),
+    const launch = vi.fn((_name: string, opts?: { onOpen?: (info: unknown) => void }) =>
+      opts?.onOpen?.(created),
     );
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1120,7 +1150,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     fireEvent.click(shellItem);
 
     // Launches the default (first-declared) shell without a further pick.
-    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
+    expect(launch).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
 
     // The menu closes on its own after the launch.
@@ -1158,9 +1188,9 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
-    const mutate = vi.fn();
+    const launch = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1172,7 +1202,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(shellItem).toHaveTextContent(/offline/i);
     expect(shellItem).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(shellItem);
-    expect(mutate).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
   });
 
   it("lists only the OTHER types in the flyout and remembers a pick as the new default (persisted)", async () => {
@@ -1180,9 +1210,9 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
-    const mutate = vi.fn();
+    const launch = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1204,20 +1234,20 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     // Pick "bash": launches it and persists as the preferred type (app-global).
     fireEvent.click(screen.getByRole("menuitem", { name: /^bash$/i }));
-    expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
+    expect(launch).toHaveBeenCalledWith("bash", expect.any(Object));
     expect(window.localStorage.getItem("omnigent:preferred-shell")).toBe("bash");
 
     // A fresh menu seeds its default from the persisted pick — the row now reads
     // "Shell (bash)" and launches bash on click.
     cleanup();
-    mutate.mockClear();
+    launch.mockClear();
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
     renderWorkspace({ showBrowserTab: false });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
     fireEvent.click(await screen.findByRole("menuitem", { name: /shell \(bash\)/i }));
-    expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
+    expect(launch).toHaveBeenCalledWith("bash", expect.any(Object));
 
     window.localStorage.removeItem("omnigent:preferred-shell");
   });
@@ -1226,9 +1256,9 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // A runner merely asleep (host up) is reconnected transparently by the
     // server on create, so the item stays clickable and launches as normal.
     declaresShell();
-    const mutate = vi.fn();
+    const launch = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1239,15 +1269,15 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     const shell = await screen.findByRole("menuitem", { name: /shell/i });
     expect(shell).not.toHaveAttribute("aria-disabled", "true");
     fireEvent.click(shell);
-    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
+    expect(launch).toHaveBeenCalledWith("zsh", expect.any(Object));
   });
 
   it("keeps unpinned pages accessible while a shell reconnects", async () => {
     declaresShell();
     writePinnedWorkspaceTabs([]);
-    const mutate = vi.fn();
+    const launch = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: true,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1260,7 +1290,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     const shell = await screen.findByRole("menuitem", { name: /reconnecting/i });
     expect(shell).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(shell);
-    expect(mutate).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("menuitem", { name: "Changes" }));
     expect(onRightRailTabChange).toHaveBeenCalledWith("changes");
   });
@@ -1269,9 +1299,9 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // host_offline / local_stranded need a CLI reconnect — the browser can't
     // wake them, so the item is disabled and marked Offline.
     declaresShell();
-    const mutate = vi.fn();
+    const launch = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1283,7 +1313,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(shell).toHaveTextContent(/offline/i);
     expect(shell).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(shell);
-    expect(mutate).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
   });
 });
 
