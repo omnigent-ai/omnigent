@@ -23,8 +23,9 @@ from tests._helpers.compat import (
 from tests._helpers.host import isolated_host
 from tests._helpers.live_server import isolated_local_server
 from tests._helpers.native_session import create_native_session
+from tests._helpers.polling import poll_until
 from tests._helpers.session import send_user_text
-from tests.e2e_ui.chat.test_sidecar_mcp_allowlist import _wait_for_advertised_tools
+from tests.e2e_ui.chat.test_sidecar_mcp_allowlist import _advertised_tool_names
 from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT, configure_mock_llm
 
 
@@ -88,7 +89,22 @@ def test_disabled_server_absent_from_real_native_session(
     }
     if harness == "codex":
         provider["wire_api"] = "responses"
-    configure_mock_llm(mock_llm_server_url, [{"text": "MCP test complete."}], key=model)
+    responses = [{"text": "MCP test complete."}]
+    if harness == "claude":
+        # Claude can send its first request while MCP servers are still connecting.
+        responses.insert(
+            0,
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "wait_for_mcp",
+                        "name": "WaitForMcpServers",
+                        "arguments": "{}",
+                    }
+                ]
+            },
+        )
+    configure_mock_llm(mock_llm_server_url, responses, key=model)
     with (
         httpx.Client(base_url=mcp_enabled_server, timeout=120) as client,
         isolated_host(
@@ -126,7 +142,19 @@ def test_disabled_server_absent_from_real_native_session(
         session_id = session["session_id"]
         try:
             send_user_text(client, session_id=session_id, text="Say MCP test complete.")
-            tools = _wait_for_advertised_tools(mock_llm_server_url, model, timeout=120)
+            tools: set[str] = set()
+
+            def mcp_controls_advertised() -> bool:
+                nonlocal tools
+                tools = _advertised_tool_names(mock_llm_server_url, model)
+                return all(
+                    any(marker in name for name in tools) for marker in ("on_fixture", "omnigent")
+                )
+
+            try:
+                poll_until(mcp_controls_advertised, timeout_s=120)
+            except AssertionError as exc:
+                raise AssertionError(f"MCP controls never advertised: {sorted(tools)}") from exc
             assert any("on_fixture" in name for name in tools), tools
             assert not any("off_fixture" in name for name in tools), tools
             assert any("omnigent" in name for name in tools), sorted(tools)
