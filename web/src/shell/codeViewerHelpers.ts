@@ -51,13 +51,64 @@ export const MONACO_SPLIT_BREAKPOINT = 900;
  */
 export const SPLIT_DIFF_MIN_WIDTH = 920;
 
-export const MAX_RICH_MARKDOWN_BYTES = 1024 * 1024;
+export const MAX_RICH_MARKDOWN_BYTES = 256 * 1024;
 
-/** Use source for large Markdown to bound the initial rich-rendering work. */
+export const MAX_PREVIEW_MARKDOWN_BYTES = 1024 * 1024;
+
+/** Large Markdown skips the rich editor, whose load and resize cost grow with the document. */
 export function isMarkdownTooLargeForRichView(lang: string, content: string): boolean {
   return (
     lang === "markdown" && new TextEncoder().encode(content).byteLength > MAX_RICH_MARKDOWN_BYTES
   );
+}
+
+/** Very large Markdown opens straight in source; the rendered preview still parses it all. */
+export function isMarkdownTooLargeForPreview(lang: string, content: string): boolean {
+  return (
+    lang === "markdown" && new TextEncoder().encode(content).byteLength > MAX_PREVIEW_MARKDOWN_BYTES
+  );
+}
+
+interface HastNode {
+  type: string;
+  children?: readonly HastNode[];
+}
+
+/** True when a rehype tree holds raw HTML that rehype-raw must parse. */
+export function hasRawHtmlNode(node: HastNode): boolean {
+  return node.type === "raw" || (node.children?.some(hasRawHtmlNode) ?? false);
+}
+
+export type PreviewableViewMode = "editor" | "preview" | "source";
+
+/**
+ * Resolve the surface a file opens on. Large Markdown opens in Preview and edits
+ * in source; HTML and notebooks have no rich editor, so "editor" means Preview.
+ */
+export function resolveFileViewMode({
+  isPreviewable,
+  lang,
+  largeMarkdown,
+  largeMarkdownVisitMode,
+  deepLinkedComment,
+  preference,
+}: {
+  isPreviewable: boolean;
+  lang: string;
+  largeMarkdown: boolean;
+  /** Preview/Source picked during this visit to a large Markdown file. */
+  largeMarkdownVisitMode?: "preview" | "source";
+  /** A ?comment= link targets this file and needs a surface that shows anchors. */
+  deepLinkedComment: boolean;
+  preference: PreviewableViewMode;
+}): PreviewableViewMode {
+  if (!isPreviewable) return "source";
+  if (lang === "markdown" && largeMarkdown) {
+    if (largeMarkdownVisitMode) return largeMarkdownVisitMode;
+    return deepLinkedComment || preference === "source" ? "source" : "preview";
+  }
+  if (lang === "markdown") return deepLinkedComment ? "editor" : preference;
+  return preference === "editor" ? "preview" : preference;
 }
 
 // ---------------------------------------------------------------------------

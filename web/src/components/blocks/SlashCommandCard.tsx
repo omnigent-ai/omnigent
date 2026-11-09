@@ -14,6 +14,7 @@ import { ChevronRightIcon, CommandIcon, WandSparklesIcon, type LucideIcon } from
 import { useMemo } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { slashCommandDisplayName } from "@/lib/blocks";
 
 type SlashCommandKind = "skill" | "command";
 
@@ -52,14 +53,15 @@ interface SlashCommandCardProps {
 }
 
 export function SlashCommandCard({ kind, name, arguments: args, output }: SlashCommandCardProps) {
+  const displayName = slashCommandDisplayName(name);
   const hasArgs = args.length > 0;
   const hasOutput = output !== null && output.length > 0;
   const canExpand = hasArgs || hasOutput;
   const { prefix, Icon, iconClass } = KIND_STYLES[kind];
   // Tooltip keeps the title legible after truncation of long names.
   const tooltip = useMemo(
-    () => (hasArgs ? `${prefix} ${name} ${args}` : `${prefix} ${name}`),
-    [hasArgs, prefix, name, args],
+    () => (hasArgs ? `${prefix} ${displayName} ${args}` : `${prefix} ${displayName}`),
+    [hasArgs, prefix, displayName, args],
   );
 
   const trigger = (
@@ -71,7 +73,7 @@ export function SlashCommandCard({ kind, name, arguments: args, output }: SlashC
     >
       <Icon className={`size-3 shrink-0 ${iconClass}`} />
       <span className="min-w-0 flex-1 truncate">
-        <span className="font-semibold text-foreground">{prefix}</span> <span>{name}</span>
+        <span className="font-semibold text-foreground">{prefix}</span> <span>{displayName}</span>
         {hasArgs && (
           <>
             {" "}

@@ -12025,6 +12025,21 @@ _REVERSE_SEARCH_PANE = """\
   ↑/↓ to nav · Enter to use · Esc to cancel · ctrl+s to scope
 """
 
+# The same search as Claude Code 2.1.295 draws it mid-reply, under the
+# full-width rule that replaces the input box. Widths shortened.
+_OVERLAY_REVERSE_SEARCH_PANE = """\
+✢ Jitterbugging… (29s · ↓ 50 tokens)
+──────────────────────────────────────────────────────────────────────
+  Search prompts · everywhere
+                                  ╭──────────────────────────────╮
+                                  │ Write a long reply.          │
+  ❯ 24s ago  Write a long reply.  ╰──────────────────────────────╯
+  ╭──────────────────────────────────────────────────────────────╮
+  │ ⌕ Filter history…                                            │
+  ╰──────────────────────────────────────────────────────────────╯
+  ↑/↓ to navigate · Enter to use · Esc to cancel · ctrl+s to scope
+"""
+
 # The same ctrl+r search as Claude Code 2.1.212 renders it: the search rides
 # the framed composer as its filter field, so the frame and ❯ glyph read
 # exactly like a free input box — only the lowercase footer under the
@@ -14760,6 +14775,110 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
     frames["pane"] = _EFFORT_DIALOG_PANE
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
     assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
+
+
+# Claude Code 2.1.295 draws the switch confirmation under a ▔ border, with no input box.
+_SWITCH_MODEL_CONFIRM_PANE = """\
+  ⎿  Kept model as Opus 4.8
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ Kept effort level as auto ▔
+   Switch model?
+   Your next response will be slower and use more tokens
+   This conversation is cached for the current model. Switching to Opus 5.5 (default)
+   means the full history gets re-read on your next message.
+   ❯ 1. Yes, switch to Opus 5.5 (default)
+     2. No, go back
+"""
+
+# A search title left in scrollback above the rule-less switch confirmation.
+_SEARCH_TITLE_ABOVE_SWITCH_CONFIRM_PANE = (
+    "  Search prompts · everywhere\n" + _SWITCH_MODEL_CONFIRM_PANE
+)
+
+# The 2.1.295 search in a 40-column pane, its footer wrapped onto two rows.
+_NARROW_OVERLAY_REVERSE_SEARCH_PANE = """\
+✢ Jitterbugging… (29s)
+────────────────────────────────────────
+  Search prompts · everywhere
+  ❯ 24s ago  Write a long reply.
+  ╭────────────────────────────────────╮
+  │ ⌕ Filter history…                  │
+  ╰────────────────────────────────────╯
+  ↑/↓ to navigate · Enter to
+  use · Esc to cancel · ctrl+s to scope
+"""
+
+# A 2.1.295 draft quoting dialog titles, wrapped in a 28-column pane mid-turn.
+_DRAFT_QUOTING_DIALOGS_PANE = """\
+✢ Leavening… (25s)
+────────────────────────────
+❯ Explain Switch model?
+  and Change effort level?
+  and use this session
+  only
+────────────────────────────
+  ⏵⏵ auto mode on
+"""
+
+_REPLY_QUOTING_DIALOGS_PANE = """\
+⏺ Switch model? and Change effort level? confirm a switch; s to use this session only.
+──────────────────────────────
+❯
+──────────────────────────────
+  ? for shortcuts
+"""
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_IDLE_PANE, True),
+        (_SHELL_MODE_PANE, True),
+        (_INLINE_REVERSE_SEARCH_PANE, True),
+        (_REVERSE_SEARCH_PANE, True),
+        (_OVERLAY_REVERSE_SEARCH_PANE, True),
+        (_NARROW_OVERLAY_REVERSE_SEARCH_PANE, True),
+        (_SLIVER_MULTILINE_DRAFT_PANE, True),
+        (_DRAFT_QUOTING_DIALOGS_PANE, True),
+        (_REPLY_QUOTING_DIALOGS_PANE, True),
+        (_MODEL_PICKER_PANE, False),
+        (_EFFORT_DIALOG_PANE, False),
+        (_SWITCH_MODEL_CONFIRM_PANE, False),
+        (_SEARCH_TITLE_ABOVE_SWITCH_CONFIRM_PANE, False),
+        (_PERMISSION_PROMPT_PANE, False),
+        (_REWIND_PANE, False),
+        (_SETTINGS_PANEL_PANE, False),
+        (_TASK_DETAILS_PANE, False),
+        ("", False),
+    ],
+    ids=[
+        "idle",
+        "shell-mode",
+        "inline-history-search",
+        "history-search",
+        "history-search-overlay",
+        "narrow-history-search-overlay",
+        "sliver-draft",
+        "draft-quoting-dialogs",
+        "reply-quoting-dialogs",
+        "model-picker",
+        "effort-dialog",
+        "switch-model-confirm",
+        "search-title-above-switch-confirm",
+        "permission-prompt",
+        "rewind",
+        "settings-panel",
+        "task-details",
+        "empty",
+    ],
+)
+def test_claude_pane_input_box_shown_counts_every_input_mode(pane: str, expected: bool) -> None:
+    """
+    Shell mode and the history search keep the person at the input box.
+
+    Only a dialog or panel drawn in its place means the terminal may need them;
+    a draft or reply quoting a dialog's title does not.
+    """
+    assert claude_native_bridge.claude_pane_input_box_shown(pane) is expected
 
 
 def test_claude_pane_ready_is_false_without_an_advertised_pane(tmp_path: Path) -> None:

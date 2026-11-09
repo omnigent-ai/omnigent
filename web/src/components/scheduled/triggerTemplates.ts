@@ -1,9 +1,15 @@
-// Renders manager prompts for Jira, Slack, GitHub, and Linear trigger automations.
+// Renders manager prompts for Jira, Slack, GitHub, Linear, and PagerDuty trigger automations.
 
-import type { LucideIcon } from "lucide-react";
-import { CircleDotIcon, HashIcon, ListTodoIcon, TicketIcon } from "lucide-react";
+import type { ComponentType } from "react";
+import {
+  GitHubIcon,
+  JiraIcon,
+  LinearIcon,
+  PagerDutyIcon,
+  SlackIcon,
+} from "@/components/icons/IntegrationIcons";
 
-export type TriggerSource = "jira" | "slack" | "github" | "linear";
+export type TriggerSource = "jira" | "slack" | "github" | "linear" | "pagerduty";
 
 /** Where the manager starts each worker: next to itself, or in a new sandbox. */
 export type WorkerPlacement = "same_host" | "managed";
@@ -37,7 +43,10 @@ export interface TriggerCondition {
 export interface TriggerFields {
   /** One of the source's {@link TriggerTemplate.events}, e.g. GitHub's `"issue"`. */
   event: string;
-  /** Jira: project keys. Slack: channels. GitHub: `owner/repo`. Linear: team keys. Comma-separated. */
+  /**
+   * Jira: project keys. Slack: channels, or people for DMs. GitHub: `owner/repo`.
+   * Linear: team keys. PagerDuty: service names or IDs. Comma-separated.
+   */
   scope: string;
   /** Omitted by older callers, which infer membership from the number of values. */
   scopeOperator?: "is" | "in";
@@ -87,19 +96,35 @@ export function triggerOperatorLabel(
   return field.operatorLabels?.[operator] ?? TRIGGER_OPERATOR_LABELS[operator];
 }
 
+/** One event a template can fire on, e.g. Slack's "Direct message received". */
+export interface TriggerEvent {
+  id: string;
+  label: string;
+  /** Who can write what the event watches, e.g. "create a ticket in this project". */
+  authorAction: string;
+  /** Overrides the template's scope label, e.g. "sender" for Slack DMs. */
+  scopeLabel?: string;
+  /** Overrides the template's scope placeholder. */
+  scopePlaceholder?: string;
+  /** Shown before the scope input and stripped from pasted entries, e.g. "#". */
+  scopePrefix?: "#" | "@";
+  /** The scope lists every member of one group, so it has no equals/in operator. */
+  scopeIsGroup?: boolean;
+  /** Condition fields that don't apply to this event, e.g. Author when the scope is the sender. */
+  hiddenFields?: string[];
+}
+
 export interface TriggerTemplate {
   source: TriggerSource;
-  icon: LucideIcon;
+  /** The service's brand mark, drawn in currentColor. */
+  icon: ComponentType<{ className?: string }>;
   iconClassName: string;
   title: string;
   description: string;
   /** Prefilled task name. */
   name: string;
-  /**
-   * The creation events the template can fire on; the first is the default. `authorAction`
-   * names who can write what the event watches, e.g. "create a ticket in this project".
-   */
-  events: { id: string; label: string; authorAction: string }[];
+  /** The creation events the template can fire on; the first is the default. */
+  events: TriggerEvent[];
   /** Scope field, e.g. "project", compared by the selected operator. */
   scopeLabel: string;
   scopePlaceholder: string;
@@ -116,7 +141,7 @@ export interface TriggerTemplate {
 export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
   jira: {
     source: "jira",
-    icon: TicketIcon,
+    icon: JiraIcon,
     iconClassName: "text-blue-600 dark:text-blue-400",
     title: "Jira tickets",
     description:
@@ -153,13 +178,38 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
   },
   slack: {
     source: "slack",
-    icon: HashIcon,
+    icon: SlackIcon,
     iconClassName: "text-purple-600 dark:text-purple-400",
     title: "Slack messages",
     description:
-      "Watch channels for matching messages and start a session to respond or investigate.",
+      "Watch channels or DMs for matching messages and start a session to respond or investigate.",
     name: "Slack messages",
-    events: [{ id: "posted", label: "Message posted", authorAction: "post in this channel" }],
+    events: [
+      {
+        id: "posted",
+        label: "Message posted in a channel",
+        authorAction: "post in this channel",
+        scopePrefix: "#",
+      },
+      {
+        id: "dm",
+        label: "Direct message received",
+        authorAction: "send you a direct message from one of these accounts",
+        scopeLabel: "sender",
+        scopePlaceholder: "alice, bob",
+        scopePrefix: "@",
+        hiddenFields: ["author"],
+      },
+      {
+        id: "group_dm",
+        label: "Group DM message received",
+        authorAction: "post in this group DM",
+        scopeLabel: "group DM with",
+        scopePlaceholder: "alice, bob",
+        scopePrefix: "@",
+        scopeIsGroup: true,
+      },
+    ],
     scopeLabel: "channel",
     scopePlaceholder: "eng-support, bugs",
     fields: [
@@ -179,8 +229,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
   },
   github: {
     source: "github",
-    icon: CircleDotIcon,
-    iconClassName: "text-emerald-600 dark:text-emerald-500",
+    icon: GitHubIcon,
+    iconClassName: "text-foreground",
     title: "GitHub",
     description:
       "Watch for new issues or pull requests and start a session to work on matching items.",
@@ -225,7 +275,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
   },
   linear: {
     source: "linear",
-    icon: ListTodoIcon,
+    icon: LinearIcon,
     iconClassName: "text-indigo-600 dark:text-indigo-400",
     title: "Linear issues",
     description: "Watch teams for matching new issues and start a session to work on each one.",
@@ -265,6 +315,45 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     itemPlural: "issues",
     toolsExample: "a Linear MCP server",
   },
+  pagerduty: {
+    source: "pagerduty",
+    icon: PagerDutyIcon,
+    iconClassName: "text-green-600 dark:text-green-500",
+    title: "PagerDuty incidents",
+    description: "Watch services for new incidents and start a session to investigate each one.",
+    name: "PagerDuty incidents",
+    events: [
+      {
+        id: "triggered",
+        label: "Incident triggered",
+        authorAction: "trigger an incident on this service",
+      },
+    ],
+    scopeLabel: "service",
+    scopePlaceholder: "Checkout API, Payments",
+    fields: [
+      { id: "urgency", label: "Urgency", operators: ["is", "is_not"], placeholder: "high" },
+      { id: "priority", label: "Priority", operators: ["is", "is_not"], placeholder: "P1" },
+      { id: "status", label: "Status", operators: ["is", "is_not"], placeholder: "triggered" },
+      {
+        id: "assignee",
+        label: "Assignee",
+        operators: ["is", "is_not"],
+        placeholder: "me, or a name or email",
+      },
+      {
+        id: "title",
+        label: "Title",
+        operators: ["contains", "not_contains"],
+        placeholder: "database",
+      },
+    ],
+    instructionsPlaceholder:
+      "Investigate the incident, find the likely cause and suggest a mitigation.",
+    linkBackLabel: "Add the session link as a note on the incident",
+    itemPlural: "incidents",
+    toolsExample: "a PagerDuty MCP server",
+  },
 };
 
 /** The fields a new trigger starts with: the default event, nothing else filled. */
@@ -279,7 +368,66 @@ export function emptyTriggerFields(source: TriggerSource): TriggerFields {
   };
 }
 
-export const TRIGGER_SOURCES: TriggerSource[] = ["jira", "slack", "github", "linear"];
+export const TRIGGER_SOURCES: TriggerSource[] = ["jira", "slack", "github", "linear", "pagerduty"];
+
+/** The selected event of a template, or its default when `eventId` is unknown. */
+export function triggerEvent(source: TriggerSource, eventId: string): TriggerEvent {
+  const { events } = TRIGGER_TEMPLATES[source];
+  return events.find((event) => event.id === eventId) ?? events[0];
+}
+
+/** The scope label, placeholder and prefix for the selected event. */
+export function triggerScope(source: TriggerSource, eventId: string) {
+  const template = TRIGGER_TEMPLATES[source];
+  const event = triggerEvent(source, eventId);
+  return {
+    label: event.scopeLabel ?? template.scopeLabel,
+    placeholder: event.scopePlaceholder ?? template.scopePlaceholder,
+    prefix: event.scopePrefix ?? "",
+    isGroup: event.scopeIsGroup === true,
+  };
+}
+
+/** The condition fields the selected event offers. */
+export function triggerConditionFields(
+  source: TriggerSource,
+  eventId: string,
+): TriggerConditionField[] {
+  const hidden = triggerEvent(source, eventId).hiddenFields ?? [];
+  return TRIGGER_TEMPLATES[source].fields.filter((field) => !hidden.includes(field.id));
+}
+
+/** Drops a leading prefix from each entry, e.g. `"#eng, #bugs"` → `"eng, bugs"` for `"#"`. */
+export function stripScopePrefix(scope: string, prefix: string): string {
+  if (prefix === "") return scope;
+  const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return scope.replace(new RegExp(`(^|,)(\\s*)(?:${escaped})+`, "g"), "$1$2");
+}
+
+/**
+ * Switch events, clearing what the new event reads differently: the scope when it
+ * names channels instead of people, and conditions on fields the event hides.
+ */
+export function withTriggerEvent(
+  source: TriggerSource,
+  fields: TriggerFields,
+  eventId: string,
+): TriggerFields {
+  const before = triggerScope(source, fields.event);
+  const after = triggerScope(source, eventId);
+  // "#" scopes name channels and "@" scopes name people; the rest share one kind.
+  const sameScope = before.prefix === after.prefix;
+  const visible = new Set(triggerConditionFields(source, eventId).map((field) => field.id));
+  let scopeOperator = sameScope ? fields.scopeOperator : "is";
+  if (after.isGroup) scopeOperator = "in";
+  return {
+    ...fields,
+    event: eventId,
+    scope: sameScope ? fields.scope : "",
+    scopeOperator,
+    conditions: fields.conditions.filter((c) => visible.has(c.field)),
+  };
+}
 
 /** Workers started per run; the rest wait for the next run. */
 export const MAX_SESSIONS_PER_RUN = 10;
@@ -434,6 +582,7 @@ const SERVICE_NAMES: Record<TriggerSource, string> = {
   slack: "Slack",
   github: "GitHub",
   linear: "Linear",
+  pagerduty: "PagerDuty",
 };
 
 /** The service a template watches, e.g. "Jira". */
@@ -483,17 +632,32 @@ export function splitJqlOrderBy(jql: string): { where: string; orderBy: string }
 /**
  * Whether the fields can render a prompt: at least one scope entry (`","`
  * alone would drop GitHub's repo filter), filled-in rows, and instructions
- * within budget.
+ * within budget. A group scope needs two people besides the owner, since a
+ * group DM with one person is a direct message.
  */
-export function triggerFieldsComplete(fields: TriggerFields): boolean {
+export function triggerFieldsComplete(fields: TriggerFields, source?: TriggerSource): boolean {
   const instructions = fields.instructions.trim();
+  const isGroup = source !== undefined && triggerScope(source, fields.event).isGroup;
+  const entries =
+    source === undefined ? scopeList(fields.scope) : triggerScopeEntries(source, fields);
   return (
-    scopeList(fields.scope).length > 0 &&
-    (fields.scopeOperator !== "is" || !fields.scope.includes(",")) &&
+    entries.length >= (isGroup ? 2 : 1) &&
+    (isGroup || fields.scopeOperator !== "is" || !fields.scope.includes(",")) &&
     fields.conditions.every((c) => VALUELESS_OPERATORS.has(c.operator) || c.value.trim() !== "") &&
     instructions !== "" &&
     instructions.length <= MAX_INSTRUCTIONS_CHARS
   );
+}
+
+/**
+ * The scope's entries with the event's prefix stripped; Slack people are rendered
+ * and deduplicated, so `"alice, @Alice"` is one person.
+ */
+export function triggerScopeEntries(source: TriggerSource, fields: TriggerFields): string[] {
+  const { prefix } = triggerScope(source, fields.event);
+  return prefix === "@"
+    ? slackPeople(fields.scope)
+    : scopeList(stripScopePrefix(fields.scope, prefix));
 }
 
 /** The comma-separated entries of a scope field, e.g. `"ES, OPS"` → `["ES", "OPS"]`. */
@@ -581,6 +745,45 @@ export function compileGithubQuery(fields: TriggerFields): string {
   return parts.join(" ");
 }
 
+/** Slack IDs, e.g. `C0123ABCD` or `U0123ABCD`, which take no `#` or `@`. */
+const SLACK_ID = /^[CDGUW][A-Z0-9]{6,}$/;
+
+/** Slack channels as `#name`, keeping IDs bare, e.g. `"eng, C0123ABCD"` → `"#eng, C0123ABCD"`. */
+export function slackChannels(scope: string): string {
+  return scopeList(stripScopePrefix(scope, "#"))
+    .map((channel) => (SLACK_ID.test(channel) ? channel : `#${channel}`))
+    .join(", ");
+}
+
+/** Slack people as `@handle`, keeping IDs and emails bare; repeats are dropped, ignoring case. */
+export function slackPeople(scope: string): string[] {
+  const seen = new Set<string>();
+  const people: string[] = [];
+  for (const entry of scopeList(stripScopePrefix(scope, "@"))) {
+    const person = SLACK_ID.test(entry) || entry.includes("@") ? entry : `@${entry}`;
+    if (seen.has(person.toLowerCase())) continue;
+    seen.add(person.toLowerCase());
+    people.push(person);
+  }
+  return people;
+}
+
+/** Words joined as a list, e.g. `["a", "b", "c"]` → `"a, b and c"`. */
+function joinAnd(words: string[]): string {
+  return words.length <= 1
+    ? words.join("")
+    : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+}
+
+/** Finding the people a DM trigger lists, without guessing at ambiguous names. */
+function slackFindPeople(people: string[]): string {
+  return `Use your Slack tools to find ${people.length === 1 ? people[0] : `each of ${joinAnd(people)}`} by handle, display name or email. A name that matches no one or more than one person counts as no match: say so in your reply.`;
+}
+
+function slackCantRead(what: string): string {
+  return ` If your Slack tools can't read ${what}, skip to your reply and say that this automation needs a Slack MCP server that can read ${what}.`;
+}
+
 /** The Slack condition rows as a clause, e.g. `whose text contains "error"`; "" with none. */
 export function describeSlackFilter(fields: TriggerFields): string {
   const phrases = fields.conditions.map((c) => {
@@ -621,12 +824,29 @@ export function describeLinearFilter(fields: TriggerFields): string {
         return `${negated ? "don't have" : "have"} ${value} in the title or description`;
     }
   });
-  if (phrases.length === 0) return "";
-  const joined =
-    phrases.length === 1
-      ? phrases[0]
-      : `${phrases.slice(0, -1).join(", ")} and ${phrases[phrases.length - 1]}`;
-  return `that ${joined}`;
+  return phrases.length === 0 ? "" : `that ${joinAnd(phrases)}`;
+}
+
+/** The PagerDuty condition rows as a clause, e.g. `that have urgency "high"`; "" with none. */
+export function describePagerDutyFilter(fields: TriggerFields): string {
+  const phrases = fields.conditions.map((c) => {
+    const value = `"${c.value.trim()}"`;
+    const negated = c.operator === "is_not" || c.operator === "not_contains";
+    switch (c.field) {
+      case "urgency":
+      case "priority":
+      case "status":
+        return `${negated ? "don't have" : "have"} ${c.field} ${value}`;
+      case "assignee": {
+        // "me" is the owner, whose PagerDuty tools the manager runs with.
+        const who = c.value.trim().toLowerCase() === "me" ? "you" : value;
+        return `${negated ? "aren't" : "are"} assigned to ${who}`;
+      }
+      default:
+        return `${negated ? "don't have" : "have"} ${value} in the title`;
+    }
+  });
+  return phrases.length === 0 ? "" : `that ${joinAnd(phrases)}`;
 }
 
 /** How a run reads search results when the service returns them oldest first. */
@@ -693,21 +913,50 @@ function sourceText(source: TriggerSource, fields: TriggerFields): SourceText {
     };
   }
   if (source === "slack") {
-    const channels = scopeList(fields.scope).join(", ");
     const filter = describeSlackFilter(fields);
-    return {
-      watch: () => `Watch: new Slack messages in ${channels}${filter !== "" ? ` ${filter}` : ""}`,
-      search: () =>
-        `Use your Slack tools to read the top-level messages posted in ${channels} since that time, oldest first. Replies inside a thread don't start a new session.` +
-        (filter !== "" ? ` Only messages ${filter} count.` : " Every top-level message counts."),
+    const only = filter !== "" ? ` Only messages ${filter} count.` : "";
+    const slack = {
       readOrder: READ_OLDEST_FIRST,
       createdAt: "posted",
       item: "message",
       fence: "slack-message",
       title: '"Slack <channel> <message ts>"',
-      details: "the channel, author, message text and permalink",
-      linkBack: (link) =>
+      linkBack: (link: string) =>
         `Reply "${link}" in the thread of each message you started a session for.`,
+    };
+    if (fields.event === "dm" || fields.event === "group_dm") {
+      const people = slackPeople(fields.scope);
+      const watched = filter !== "" ? ` ${filter}` : "";
+      if (fields.event === "dm") {
+        return {
+          ...slack,
+          watch: () =>
+            `Watch: new Slack direct messages sent to you by ${joinAnd(people)}${watched}`,
+          search: () =>
+            `${slackFindPeople(people)} Then read the messages ${people.length === 1 ? "they" : "each of them"} sent you since that time in your one-to-one direct message with them, oldest first. Your own messages and replies inside a thread don't start a new session.` +
+            (only || " Every other message counts.") +
+            slackCantRead("your direct messages"),
+          details: "the sender, the direct message's channel ID, the message text and permalink",
+        };
+      }
+      return {
+        ...slack,
+        watch: () => `Watch: new Slack messages in your group DM with ${joinAnd(people)}${watched}`,
+        search: () =>
+          `${slackFindPeople(people)} Then find the group DM whose members are exactly you and those people; a group DM that also includes anyone else doesn't count. If any name has no match, the names resolve to fewer than two people besides you, or there's no such group DM, skip to your reply and say so. Read the top-level messages posted in it since that time, oldest first. Your own messages and replies inside a thread don't start a new session.` +
+          (only || " Every other top-level message counts.") +
+          slackCantRead("your group DMs"),
+        details: "the group DM's channel ID, the author, the message text and permalink",
+      };
+    }
+    const channels = slackChannels(fields.scope);
+    return {
+      ...slack,
+      watch: () => `Watch: new Slack messages in ${channels}${filter !== "" ? ` ${filter}` : ""}`,
+      search: () =>
+        `Use your Slack tools to read the top-level messages posted in ${channels} since that time, oldest first. Replies inside a thread don't start a new session.` +
+        (only || " Every top-level message counts."),
+      details: "the channel, author, message text and permalink",
     };
   }
   if (source === "linear") {
@@ -729,6 +978,29 @@ function sourceText(source: TriggerSource, fields: TriggerFields): SourceText {
       title: '"Linear <issue identifier>"',
       details: "the issue's identifier, link, title and description",
       linkBack: (link) => `Comment "${link}" on each issue you started a session for.`,
+    };
+  }
+  if (source === "pagerduty") {
+    const services = scopeList(fields.scope);
+    const one = services.length === 1;
+    const where = one ? `service ${services[0]}` : `services ${services.join(", ")}`;
+    const filter = describePagerDutyFilter(fields);
+    return {
+      watch: () => `Watch: new PagerDuty incidents on ${where}${filter !== "" ? ` ${filter}` : ""}`,
+      search: () =>
+        `Use your PagerDuty tools to find ${one ? "that service" : "each of those services"} by name or ID. A name that matches no service or more than one counts as no match: say so in your reply. Then list the incidents created on ${one ? "it" : "them"} since that time, in any status and not only the ones assigned to you, for example GET /incidents with service_ids[] set to ${one ? "its ID" : "their IDs"}, since set to that time in ISO 8601 and sort_by "created_at:asc".` +
+        (filter !== ""
+          ? ` Only incidents ${filter} count. Pass the conditions the tool can filter on and check the rest against each incident yourself.`
+          : " Every incident counts."),
+      // A tool may not sort by creation, so a partial read can't checkpoint by its last result.
+      readOrder:
+        "Read every page of results, following the offset while more is true, then work through them oldest first. If you can't read every page, start no sessions in this run and keep the previous check time.",
+      createdAt: "created",
+      item: "incident",
+      fence: "pagerduty-incident",
+      title: '"PagerDuty #<incident number>"',
+      details: "the incident's number, link, title, service, urgency, priority and description",
+      linkBack: (link) => `Add a note "${link}" to each incident you started a session for.`,
     };
   }
   const item = GITHUB_ITEMS[fields.event] ?? GITHUB_ITEMS.any;
