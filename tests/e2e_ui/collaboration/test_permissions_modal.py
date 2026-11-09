@@ -500,7 +500,7 @@ def test_multi_user_admin_sees_members_and_sharing_settings(
     """
     page = _admin_page(browser)
     page.goto(f"{multi_user_server.public_url}/c/{multi_user_server.session_id}")
-    page.get_by_test_id("settings-button").click()
+    page.get_by_test_id("sidebar-profile-settings").click()
     page.wait_for_url("**/settings**", timeout=30_000)
 
     expect(page.get_by_test_id("settings-nav-members")).to_be_visible(timeout=30_000)
