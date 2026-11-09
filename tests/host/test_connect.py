@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -103,6 +104,7 @@ from omnigent.host.git_worktree import CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.onboarding.harness_install import READINESS_CLI_PROBE_TIMEOUT_S
 from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
@@ -1406,7 +1408,8 @@ async def test_handle_launch_refuses_unconfigured_harness(
     inference_config = None
     if inference_bound:
         monkeypatch.setattr(
-            "omnigent.onboarding.harness_install.missing_harness_cli", lambda _harness: None
+            "omnigent.onboarding.harness_install.missing_harness_cli",
+            lambda _harness, _timeout=None: None,
         )
         inference_config = {
             "providers": {"test": {}},
@@ -1437,6 +1440,116 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert result.runner_id is None
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}
+
+
+async def test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_answers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Pi launcher on PATH that hangs on ``--version`` must not be called uninstalled."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    launcher = bindir / "pi"
+    launcher.write_text("#!/bin/sh\nexit 0\n")
+    launcher.chmod(0o755)
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "work": {
+                        "kind": "key",
+                        "default": ["anthropic"],
+                        "anthropic": {"base_url": "https://api.example.com", "api_key": "sk-test"},
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    original_run = subprocess.run
+
+    def _unanswered_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:] != ["--version"]:
+            return original_run(argv, **kwargs)
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    monkeypatch.setattr(subprocess, "run", _unanswered_version)
+    host = _make_host_process()
+    proc = Mock(spec=subprocess.Popen, pid=1234)
+    proc.poll.return_value = None
+    monkeypatch.setattr(
+        host, "_spawn_runner_proc", Mock(return_value=(proc, tmp_path / "runner.log"))
+    )
+    monkeypatch.setattr(host, "_watch_runner", AsyncMock())
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_unanswered_pi",
+        binding_token="token_def",
+        workspace=str(workspace),
+        harness="pi-native",
+    )
+    result = await host._handle_launch(frame)
+
+    assert "install the CLI" not in (result.error or ""), result.error
+    assert result.status == "launched", result.error
+    assert result.runner_id is not None
+
+
+async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound launch lets an unanswered CLI through within the readiness probe budget."""
+    probe_timeouts: list[object] = []
+    original_which = shutil.which
+    original_run = subprocess.run
+
+    def _resolve_claude(name: str, *args: object, **kwargs: object) -> str | None:
+        return "/usr/bin/claude" if name == "claude" else original_which(name, *args, **kwargs)
+
+    def _unanswered_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:] != ["--version"]:
+            return original_run(argv, **kwargs)
+        probe_timeouts.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    host = _make_host_process()
+    proc = Mock(spec=subprocess.Popen, pid=1234)
+    proc.poll.return_value = None
+    monkeypatch.setattr(shutil, "which", _resolve_claude)
+    monkeypatch.setattr(subprocess, "run", _unanswered_version)
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        host, "_spawn_runner_proc", Mock(return_value=(proc, tmp_path / "runner.log"))
+    )
+    monkeypatch.setattr(host, "_watch_runner", AsyncMock())
+    frame = HostLaunchRunnerFrame(
+        request_id="req_bound_unanswered",
+        binding_token="token_bound",
+        workspace=str(tmp_path),
+        harness="claude-native",
+        inference_config={
+            "providers": {
+                "work": {
+                    "kind": "key",
+                    "default": ["anthropic"],
+                    "anthropic": {"base_url": "https://api.example.com", "api_key": "sk-test"},
+                }
+            },
+            "inference": {"harnesses": {"claude-native": {"provider": "work"}}},
+        },
+    )
+    result = await host._handle_launch(frame)
+
+    assert result.status == "launched", result.error
+    assert probe_timeouts == [READINESS_CLI_PROBE_TIMEOUT_S]
 
 
 async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
