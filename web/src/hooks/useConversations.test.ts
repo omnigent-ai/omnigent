@@ -320,6 +320,31 @@ describe("useSessionSearch", () => {
     },
   );
 
+  it("keeps archived and unarchived searches of the same text apart", async () => {
+    fetchMock.mockResolvedValue(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useSessionSearch("kestrel", "title", { limit: 8 }), { wrapper });
+    // The @ menu's search excludes archived sessions.
+    renderHook(() => useSessionSearch("kestrel", "title", { limit: 8, includeArchived: false }), {
+      wrapper,
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const archivedParams = fetchMock.mock.calls.map((call) =>
+      new URL(String(call[0]), "http://localhost").searchParams.get("include_archived"),
+    );
+    expect(archivedParams.sort()).toEqual([null, "true"]);
+    const keys = queryClient
+      .getQueryCache()
+      .findAll({ queryKey: ["session-search", "kestrel"] })
+      .map((query) => query.queryKey);
+    expect(keys).toHaveLength(2);
+  });
+
   it("does not fetch for an empty query", async () => {
     renderGroup("", "title");
     await new Promise((resolve) => {
