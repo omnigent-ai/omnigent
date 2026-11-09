@@ -126,11 +126,11 @@ the header menu), and each place is a separate entry point.
   before submission, including branch clones.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app reconnects a local host
-  itself, and starts a saved Arca host from the same action (the desktop's Arca
-  console still asks before running). A failed attempt opens the dialog for
-  retry; so does an Arca connect after which the server still lists the
-  session's host offline (usually because the host came back under a new ID),
-  with **Switch host** to move the session.
+  itself, and starts an Arca host recognized by its saved ID or default name
+  from the same action (the desktop's Arca console still asks before running).
+  A failed attempt opens the dialog for retry; so does an Arca connect after
+  which the server still lists the session's host offline (usually because the
+  host came back under a new ID), with **Switch host** to move the session.
   States: reconnecting (spinner), reconnect failed (retry), host offline.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory, optionally with a new git

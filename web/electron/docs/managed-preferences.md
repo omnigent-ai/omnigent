@@ -64,7 +64,7 @@ keep the legacy default; `OMNIGENT_SERVER_SELECTOR_V2=1` still
 forces V2.
 
 When `databricksInternalFeaturesEnabled` is `true` **and** the window is
-connected to a managed HTTPS server, the new-session host picker offers
+connected to an eligible HTTPS server, the new-session host picker offers
 **Run on Arca**, which connects the user's Arca instance to the current server
 as a host. On any other server
 the Arca option is disabled. Selecting it opens a connect console that shows the
