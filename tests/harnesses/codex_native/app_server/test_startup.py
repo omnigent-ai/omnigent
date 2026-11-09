@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, Mock
 
 import psutil
 import pytest
+import tomlkit
 from websockets.asyncio.server import ServerConnection, serve
 
 from omnigent.errors import ErrorCode, OmnigentError
@@ -1349,3 +1350,92 @@ async def test_malformed_config_read_keeps_the_launch_model_provider_pin(
 
     assert server.config_overrides == ['model_provider="omnigent_databricks"', 'model="m"']
     assert [method for method, _params in client.requests] == ["config/read"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "account", "model", "refused"),
+    [
+        ("openai", "chatgpt", "system.ai.synthetic-account-model", True),
+        ("openai", "chatgpt", "databricks-synthetic-account-model", True),
+        ("openai", "chatgpt", "databricks/synthetic-account-model", True),
+        ("openai", "chatgpt", "synthetic-account-model", False),
+        ("openai", "apiKey", "system.ai.synthetic-account-model", False),
+        ("custom", "chatgpt", "system.ai.synthetic-account-model", False),
+        ("profile-custom", "chatgpt", "system.ai.synthetic-account-model", False),
+        ("Databricks", "chatgpt", "system.ai.synthetic-account-model", False),
+        (None, "chatgpt", "system.ai.synthetic-account-model", False),
+        ("openai", None, "system.ai.synthetic-account-model", False),
+        ("openai", "futureAuth", "system.ai.synthetic-account-model", False),
+        ("openai", "unsupportedRpc", "system.ai.synthetic-account-model", False),
+        ("openai", "providerAuth", "system.ai.synthetic-account-model", False),
+    ],
+)
+@pytest.mark.parametrize("pin_model", [True, False], ids=["session-pin", "cli-pin"])
+async def test_start_admits_only_compatible_confirmed_account_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str | None,
+    account: str | None,
+    model: str,
+    refused: bool,
+    pin_model: bool,
+) -> None:
+    client = AsyncMock()
+
+    async def request(method: str, params: dict[str, object]) -> dict[str, object]:
+        if method == "config/read":
+            if provider == "profile-custom":
+                return {
+                    "result": {
+                        "config": {
+                            "model_provider": "openai",
+                            "profile": "gateway",
+                            "profiles": {"gateway": {"model_provider": "custom"}},
+                            "model": model,
+                        }
+                    }
+                }
+            return {"result": {"config": {"model_provider": provider, "model": model}}}
+        if method == "account/read":
+            assert params == {"refreshToken": False}
+            if account == "unsupportedRpc":
+                raise RuntimeError("account/read is unavailable")
+            return {
+                "result": {
+                    "account": {"type": "chatgpt" if account == "providerAuth" else account},
+                    "requiresOpenaiAuth": account != "providerAuth",
+                }
+            }
+        raise AssertionError(method)
+
+    client.request.side_effect = request
+
+    async def ready(_server: CodexNativeAppServer):
+        return client
+
+    harness = _respawn_harness(tmp_path, monkeypatch, ready)
+    harness.server.pinned_model = model if pin_model else None
+    harness.server.config_overrides = (
+        [f"model_provider={json.dumps(provider)}", f"model={json.dumps(model)}"]
+        if provider
+        else []
+    )
+    try:
+        if refused:
+            with pytest.raises(OmnigentError) as error:
+                await harness.server.start()
+            assert error.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
+            assert model in str(error.value)
+            assert harness.kill_calls
+        else:
+            await harness.server.start()
+        config = tomlkit.parse((harness.server.codex_home / "config.toml").read_text())
+        assert config.get("model") == (model if pin_model else None)
+        if provider:
+            assert f"model={json.dumps(model)}" in harness.server.config_overrides
+        assert not any(
+            call.args[0] in {"turn/start", "thread/settings/update"}
+            for call in client.request.call_args_list
+        )
+    finally:
+        await harness.server.close()
