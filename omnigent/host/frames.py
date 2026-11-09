@@ -390,6 +390,8 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param mcp_disabled_servers_active_harnesses: Harness families whose MCP preferences
+        apply to this launch. Absent on older servers or while the feature is disabled.
     :param superseded_runner_ids: Runners this launch replaces, which the
         host stops once the new runner is alive. ``None`` (an older server)
         falls back to stopping every runner launched for ``session_id``; an
@@ -405,7 +407,7 @@ class HostLaunchRunnerFrame:
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
     scheduled_run: ScheduledRunLogContext | None = None
-    mcp_disabled_servers_harnesses: list[str] | None = None
+    mcp_disabled_servers_active_harnesses: list[str] | None = None
 
 
 @dataclass
@@ -1725,8 +1727,10 @@ def encode_host_frame(frame: HostFrame) -> str:
             "harness": frame.harness,
             "inference_config": frame.inference_config,
         }
-        if frame.mcp_disabled_servers_harnesses is not None:
-            payload["mcp_disabled_servers_harnesses"] = frame.mcp_disabled_servers_harnesses
+        if frame.mcp_disabled_servers_active_harnesses is not None:
+            payload["mcp_disabled_servers_active_harnesses"] = (
+                frame.mcp_disabled_servers_active_harnesses
+            )
         if frame.scheduled_run is not None:
             payload["scheduled_run"] = frame.scheduled_run.model_dump()
         if frame.superseded_runner_ids is not None:
@@ -2855,9 +2859,9 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
         scheduled_run=parse_scheduled_run(msg.get("scheduled_run")),
-        mcp_disabled_servers_harnesses=(
-            _optional_str_list(msg, "mcp_disabled_servers_harnesses")
-            if "mcp_disabled_servers_harnesses" in msg
+        mcp_disabled_servers_active_harnesses=(
+            _optional_str_list(msg, "mcp_disabled_servers_active_harnesses")
+            if "mcp_disabled_servers_active_harnesses" in msg
             else None
         ),
         # Absent (an older server) is distinct from an empty list.

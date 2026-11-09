@@ -209,7 +209,7 @@ from omnigent.runner.identity import (
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
-    RUNNER_MCP_DISABLED_SERVERS_HARNESSES_ENV_VAR,
+    RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -964,7 +964,7 @@ def _build_runner_env(
     initial_auth_token: str | None = None,
     host_id: str | None = None,
     harness: str | None = None,
-    mcp_disabled_servers_harnesses: list[str] | None = None,
+    mcp_disabled_servers_active_harnesses: list[str] | None = None,
     interactive_shells: list[str] | None = None,
     host_owns_global_cleanup: bool = False,
     harness_tmp_parent: Path | None = None,
@@ -1065,9 +1065,9 @@ def _build_runner_env(
         env[RUNNER_SLICE_KEY_ENV_VAR] = host_id
     if harness:
         env[RUNNER_LAUNCH_HARNESS_ENV_VAR] = harness
-    if mcp_disabled_servers_harnesses is not None:
-        env[RUNNER_MCP_DISABLED_SERVERS_HARNESSES_ENV_VAR] = json.dumps(
-            mcp_disabled_servers_harnesses
+    if mcp_disabled_servers_active_harnesses is not None:
+        env[RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR] = json.dumps(
+            mcp_disabled_servers_active_harnesses
         )
     if interactive_shells is not None:
         env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
@@ -2178,7 +2178,7 @@ class HostProcess:
             initial_auth_token=initial_auth_token,
             host_id=self._identity.host_id,
             harness=frame.harness,
-            mcp_disabled_servers_harnesses=frame.mcp_disabled_servers_harnesses,
+            mcp_disabled_servers_active_harnesses=frame.mcp_disabled_servers_active_harnesses,
             interactive_shells=self._interactive_shells,
             host_owns_global_cleanup=self._maintenance_janitor is not None,
             harness_tmp_parent=self._harness_tmp_parent,
@@ -4035,7 +4035,7 @@ class HostProcess:
     def _handle_set_mcp_server_enabled(
         self, frame: HostSetMcpServerEnabledFrame
     ) -> HostSetMcpServerEnabledResultFrame:
-        from omnigent.host.mcp_inventory import configured_mcp_servers
+        from omnigent.host.mcp_inventory import configured_mcp_servers, find_configured_server
         from omnigent.mcp_disabled_servers import (
             HARNESS_EXECUTORS,
             DisabledServerWriteError,
@@ -4058,15 +4058,11 @@ class HostProcess:
             for server in servers
         ):
             return rejected("Managed MCP servers cannot be toggled")
-        matching = [
-            server.summary
-            for server in servers
-            if server.summary["harness"] == frame.harness
-            and server.summary["name"] == frame.server
-            and server.summary.get("plugin") == frame.plugin
-            and (frame.source_id is None or server.summary.get("source_id") == frame.source_id)
-        ]
-        if len(matching) != 1:
+        try:
+            server = find_configured_server(
+                frame.harness, frame.server, frame.plugin, frame.source_id, servers=servers
+            )
+        except LookupError:
             return rejected("MCP server no longer exists or its source changed; refresh inventory")
         try:
             set_disabled(ServerKey(frame.harness, frame.server, frame.plugin), not frame.enabled)
@@ -4077,8 +4073,7 @@ class HostProcess:
                 error=str(exc),
                 error_code="io" if exc.code == "io" else "invalid_server",
             )
-        self._mcp_inventory.clear()
-        summary = {**matching[0], "enabled": str(frame.enabled).lower(), "locked": "false"}
+        summary = {**server.summary, "enabled": str(frame.enabled).lower(), "locked": "false"}
         return HostSetMcpServerEnabledResultFrame(frame.request_id, "ok", server=summary)
 
     async def _handle_mcp_tools(self, frame: HostMcpToolsFrame) -> HostMcpToolsResultFrame:

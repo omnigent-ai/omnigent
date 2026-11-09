@@ -101,7 +101,6 @@ from omnigent.server.feature_flags import (
     FeatureFlags,
     deployment_gate_enabled,
     harness_install_enabled,
-    mcp_disabled_servers_enabled,
     resolve_feature_flags,
 )
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
@@ -264,7 +263,6 @@ class ServerInfoResponse(BaseModel):
     smart_routing_sources: SmartRoutingSourcesInfo
     features: dict[str, bool]
     harness_install_enabled: bool
-    mcp_disabled_servers_enabled: bool
     installable_harnesses: list[str]
     # Whether the scheduled-tasks routes are mounted and enabled for this caller.
     automations_enabled: bool = False
@@ -1897,7 +1895,9 @@ def create_app(
         on_retire=shutdown_state.note_runner_tunnel_retired,
         on_work_dispatched=managed_host_keepalive.record_work_dispatched,
     )
-    host_registry = HostRegistry()
+    host_registry = HostRegistry(
+        mcp_disabled_servers=app_mcp_disabled_servers, feature_flags=resolved_feature_flags
+    )
     runner_router = RunnerRouter(
         registry=tunnel_registry,
         conversation_store=conversation_store,
@@ -3636,12 +3636,6 @@ def create_app(
         current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
         frontend_features = app.state.feature_flags.frontend_dict()
         frontend_features[Feature.HARNESS_INSTALL.value] = current_harness_install_enabled
-        current_mcp_disabled_servers_enabled = mcp_disabled_servers_enabled(
-            app.state.mcp_disabled_servers
-        )
-        frontend_features[Feature.MCP_DISABLED_SERVERS.value] = (
-            current_mcp_disabled_servers_enabled
-        )
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -3683,7 +3677,6 @@ def create_app(
                 "smart_routing_sources": smart_routing_sources,
                 "features": frontend_features,
                 "harness_install_enabled": current_harness_install_enabled,
-                "mcp_disabled_servers_enabled": current_mcp_disabled_servers_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
                 "scheduled_task_worktrees": True,

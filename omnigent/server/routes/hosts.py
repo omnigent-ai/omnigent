@@ -74,7 +74,6 @@ from omnigent.server.feature_flags import (
     Feature,
     FeatureFlags,
     HarnessInstallGate,
-    active_harnesses,
     harness_install_enabled,
     resolve_feature_flags,
 )
@@ -1480,10 +1479,7 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
-                mcp_disabled_servers_harnesses=active_harnesses(
-                    getattr(request.app.state, "mcp_disabled_servers", False),
-                    getattr(request.app.state, "feature_flags", FeatureFlags()),
-                ),
+                mcp_disabled_servers_active_harnesses=host_registry.mcp_disabled_servers_active_harnesses(),
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
                     if target.conv.inference_snapshot

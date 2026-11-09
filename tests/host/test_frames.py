@@ -3013,11 +3013,13 @@ def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) ->
 @pytest.mark.parametrize("activation", [None, [], ["claude"], ["claude", "codex"]])
 def test_mcp_launch_activation_round_trip(activation):
     frame = HostLaunchRunnerFrame(
-        "request", "token", "/repo", mcp_disabled_servers_harnesses=activation
+        "request", "token", "/repo", mcp_disabled_servers_active_harnesses=activation
     )
     wire = encode_host_frame(frame)
     assert decode_host_frame(wire) == frame
-    assert ("mcp_disabled_servers_harnesses" in json.loads(wire)) is (activation is not None)
+    assert ("mcp_disabled_servers_active_harnesses" in json.loads(wire)) is (
+        activation is not None
+    )
 
 
 def test_enablement_fields_survive_inventory_allow_list():

@@ -12,9 +12,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SkillContent } from "@/hooks/useSkillContent";
 import type { HarnessInventory } from "@/hooks/useHarnessInventory";
+import { toast } from "sonner";
 import { ApiError } from "@/lib/sessionsApi";
 import type { HarnessStartup, Host } from "@/hooks/useHosts";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
+
+vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }));
 
 const setEnabled = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/mcpServerEnabledApi", () => ({ setMcpServerEnabled: setEnabled }));
@@ -1406,7 +1409,7 @@ it.each([false, true])("renders MCP enabled=%s and suppresses off probes", (enab
   if (!enabled) {
     expect(screen.getByText("Off")).toBeInTheDocument();
     expect(mcpLookups.every((lookup) => !lookup[4])).toBe(true);
-    expect(screen.getByTestId("catalog-row-docs")).toHaveStyle({ opacity: "0.5" });
+    expect(screen.getByTestId("catalog-row-docs")).toHaveClass("opacity-50");
   } else expect(mcpLookups).toContainEqual(["h1", "claude", "docs", undefined, true]);
 });
 
@@ -1498,4 +1501,25 @@ it("retains the enablement switch when tool discovery is unavailable", () => {
   fireEvent.click(screen.getByTestId("catalog-row-docs"));
   expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
   expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toBeEnabled();
+});
+
+it.each([
+  [new ApiError("invalid", 422, null), "This server changed. Refresh and try again."],
+  [new ApiError("host is offline", 409, "conflict"), "Host is offline."],
+  [new ApiError("old", 501, null), "Update the host to turn MCP servers on or off."],
+  [new ApiError("Storage is unavailable.", 502, null), "Storage is unavailable."],
+  [new Error(""), "Couldn't update MCP server. Please try again."],
+])("shows the MCP enablement error: %s", async (error, message) => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      mcps: [{ id: "docs", name: "docs", harness: "claude", enabled: true }],
+    },
+  };
+  setEnabled.mockRejectedValue(error);
+  renderHarnesses("claude-native");
+  fireEvent.click(screen.getByRole("switch", { name: "Enable docs for claude" }));
+  await waitFor(() => expect(toast.error).toHaveBeenCalledWith(message));
 });

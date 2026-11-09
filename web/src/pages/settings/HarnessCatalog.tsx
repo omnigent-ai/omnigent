@@ -543,6 +543,8 @@ function McpSwitch({
   enabled: boolean | null | undefined;
   mutation: ReturnType<typeof useSetMcpServerEnabled>;
 }) {
+  const harness = server.harness;
+  if (harness !== "claude" && harness !== "codex") return null;
   return enabled != null ? (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -553,7 +555,7 @@ function McpSwitch({
             disabled={server.locked || mutation.isPending}
             onCheckedChange={(checked) =>
               mutation.mutate({
-                harness: server.harness,
+                harness,
                 server: server.name,
                 plugin: server.plugin,
                 source_id: server.sourceId,
@@ -572,6 +574,7 @@ function McpSwitch({
 
 function McpFallbackRow({ host, server }: { host: Host; server: InventoryMcpServer }) {
   const mutation = useSetMcpServerEnabled(host.host_id);
+  // Keep this row pending even when another row settles and refetches inventory.
   const enabled = mutation.isPending ? mutation.variables.enabled : server.enabled;
   return (
     <CatalogRow
@@ -614,6 +617,7 @@ function McpRow({
   onUnavailable: () => void;
 }) {
   const mutation = useSetMcpServerEnabled(host.host_id);
+  // Keep this row pending even when another row settles and refetches inventory.
   const enabled = mutation.isPending ? mutation.variables.enabled : server.enabled;
   const off = enabled === false;
   const query = useMcpServerTools(host.host_id, server.harness, server.name, server.plugin, {
@@ -630,9 +634,11 @@ function McpRow({
     <AccordionPrimitive.Item value={server.id} className="not-last:border-b" disabled={off}>
       <AccordionPrimitive.Header className="flex">
         <AccordionPrimitive.Trigger
-          className="group flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-4 py-2.5 text-left text-ui outline-none hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50"
+          className={cn(
+            "group flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-4 py-2.5 text-left text-ui outline-none hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50",
+            off && "opacity-50",
+          )}
           data-testid={`catalog-row-${server.name}`}
-          style={off ? { opacity: 0.5 } : undefined}
         >
           <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground group-aria-expanded:rotate-90" />
           <LetterAvatar name={server.name} />

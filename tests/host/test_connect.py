@@ -11952,8 +11952,6 @@ async def test_host_saves_mcp_preference_over_tunnel(
         lambda: [ConfiguredMcpServer(summary, {})],
     )
     host, ws = _make_host_process(), _RecordingWS()
-    clear = Mock(wraps=host._mcp_inventory.clear)
-    monkeypatch.setattr(host._mcp_inventory, "clear", clear)
     frame = HostSetMcpServerEnabledFrame("save", harness, "docs", enabled, plugin, source_id)
     host._start_frame_task(ws, encode_host_frame(frame))
     await _drain_frame_tasks(host)
@@ -11962,7 +11960,6 @@ async def test_host_saves_mcp_preference_over_tunnel(
     assert result.status == "ok"
     assert result.server["enabled"] == str(enabled).lower()
     assert is_disabled(ServerKey(harness, "docs", plugin)) is not enabled
-    clear.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -12014,8 +12011,6 @@ async def test_host_reports_mcp_storage_failure_without_overwriting(tmp_path, mo
         lambda: [ConfiguredMcpServer(summary, {})],
     )
     host, ws = _make_host_process(), _RecordingWS()
-    clear = Mock(wraps=host._mcp_inventory.clear)
-    monkeypatch.setattr(host._mcp_inventory, "clear", clear)
     host._start_frame_task(
         ws, encode_host_frame(HostSetMcpServerEnabledFrame("save", "claude", "docs", False))
     )
@@ -12026,14 +12021,13 @@ async def test_host_reports_mcp_storage_failure_without_overwriting(tmp_path, mo
     assert result.error_code == "io"
     assert result.error == "Cannot update disabled MCP servers: io"
     assert path.read_text() == stored
-    clear.assert_not_called()
 
 
 @pytest.mark.parametrize("activation", [None, [], ["claude"], ["codex"], ["claude", "codex"]])
 async def test_mcp_activation_launch_frame_to_runner_environment(activation):
     from omnigent.runner.identity import (
-        RUNNER_MCP_DISABLED_SERVERS_HARNESSES_ENV_VAR,
-        runner_mcp_disabled_servers_harnesses,
+        RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR,
+        runner_mcp_disabled_servers_active_harnesses,
     )
 
     frame = decode_host_frame(
@@ -12042,17 +12036,20 @@ async def test_mcp_activation_launch_frame_to_runner_environment(activation):
                 "launch",
                 "binding",
                 "/repo",
-                mcp_disabled_servers_harnesses=activation,
+                mcp_disabled_servers_active_harnesses=activation,
             )
         )
     )
     env = _build_runner_env(
-        {RUNNER_MCP_DISABLED_SERVERS_HARNESSES_ENV_VAR: '["codex"]'},
+        {RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR: '["codex"]'},
         server_url="http://localhost",
         runner_id="runner",
         binding_token="binding",
         workspace="/repo",
         parent_pid=1,
-        mcp_disabled_servers_harnesses=frame.mcp_disabled_servers_harnesses,
+        mcp_disabled_servers_active_harnesses=frame.mcp_disabled_servers_active_harnesses,
     )
-    assert runner_mcp_disabled_servers_harnesses(env) == activation
+    assert runner_mcp_disabled_servers_active_harnesses(env) == activation
+    assert (RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR in env) is (
+        activation is not None
+    )

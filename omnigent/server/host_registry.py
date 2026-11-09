@@ -55,6 +55,7 @@ from omnigent.host.frames import (
 )
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
+from omnigent.server.feature_flags import FeatureFlags, McpDisabledServersGate, active_harnesses
 
 _logger = logging.getLogger(__name__)
 
@@ -617,8 +618,15 @@ class HostRegistry:
     don't race.
     """
 
-    def __init__(self) -> None:
-        """Initialize an empty host registry."""
+    def __init__(
+        self,
+        *,
+        mcp_disabled_servers: McpDisabledServersGate = False,
+        feature_flags: FeatureFlags | None = None,
+    ) -> None:
+        """Initialize an empty host registry with fail-closed launch activation."""
+        self._mcp_disabled_servers = mcp_disabled_servers
+        self._feature_flags = feature_flags or FeatureFlags()
         self._lock = threading.RLock()
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
@@ -634,6 +642,10 @@ class HostRegistry:
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
+
+    def mcp_disabled_servers_active_harnesses(self) -> list[str] | None:
+        """Resolve launch activation; omit the wire field when no harness is active."""
+        return active_harnesses(self._mcp_disabled_servers, self._feature_flags) or None
 
     def register(
         self,

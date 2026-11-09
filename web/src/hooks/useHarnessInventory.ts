@@ -106,6 +106,10 @@ export interface HostMcpServer {
   sign_in_url?: string | null;
 }
 
+export function hostMcpServersQueryKey(hostId: string | null | undefined) {
+  return ["host-mcp-servers", hostId] as const;
+}
+
 async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<HostMcpServer[]> {
   const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/mcp-servers`, {
     signal,
@@ -216,7 +220,7 @@ export function useHostMcpServers(
   refetchInterval: (servers: HostMcpServer[] | undefined) => number | false = () => false,
 ) {
   return useQuery({
-    queryKey: ["host-mcp-servers", hostId],
+    queryKey: hostMcpServersQueryKey(hostId),
     queryFn:
       enabled && hostId !== null ? ({ signal }) => fetchMcpServers(hostId, signal) : skipToken,
     staleTime: 30_000,
@@ -290,7 +294,7 @@ export function useHarnessInventory(
     }),
   });
   const mcpQuery = useQuery({
-    queryKey: ["host-mcp-servers", host?.host_id],
+    queryKey: hostMcpServersQueryKey(host?.host_id),
     queryFn: online ? ({ signal }) => fetchMcpServers(host.host_id, signal) : skipToken,
     staleTime: 30_000,
     retry,

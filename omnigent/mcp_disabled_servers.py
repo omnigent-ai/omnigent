@@ -179,9 +179,14 @@ def set_disabled(key: ServerKey, disabled: bool) -> None:
                 Path(temporary).unlink(missing_ok=True)
 
 
+def read_disabled_servers() -> frozenset[ServerKey]:
+    """Read a preference snapshot; unreadable storage behaves as empty."""
+    return frozenset(_read(global_config_path().parent / FILENAME))
+
+
 def is_disabled(key: ServerKey) -> bool:
     """Return normalized saved state; unreadable storage behaves as empty."""
-    return key in _read(global_config_path().parent / FILENAME)
+    return key in read_disabled_servers()
 
 
 def _active_entries(

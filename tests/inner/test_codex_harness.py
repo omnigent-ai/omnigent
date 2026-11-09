@@ -718,13 +718,13 @@ def test_bundle_dir_unset_passes_none(
     [(None, None), ("[]", []), ('["claude","codex"]', ["claude", "codex"]), ("bad", None)],
 )
 def test_mcp_executor_factory_activation(monkeypatch, raw, expected):
-    from omnigent.runner.identity import RUNNER_MCP_DISABLED_SERVERS_HARNESSES_ENV_VAR
+    from omnigent.runner.identity import RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR
 
     monkeypatch.setenv("HARNESS_CODEX_GATEWAY", "false")
     if raw is None:
-        monkeypatch.delenv(RUNNER_MCP_DISABLED_SERVERS_HARNESSES_ENV_VAR, raising=False)
+        monkeypatch.delenv(RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR, raising=False)
     else:
-        monkeypatch.setenv(RUNNER_MCP_DISABLED_SERVERS_HARNESSES_ENV_VAR, raw)
+        monkeypatch.setenv(RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR, raw)
     with patch.object(codex_harness, "CodexExecutor") as executor:
         codex_harness._build_codex_executor()
     assert executor.call_args.kwargs["active_harnesses"] == expected

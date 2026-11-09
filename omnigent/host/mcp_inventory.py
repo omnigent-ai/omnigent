@@ -241,6 +241,28 @@ def configured_mcp_servers() -> list[ConfiguredMcpServer]:
     return out
 
 
+def find_configured_server(
+    harness: str,
+    name: str,
+    plugin: str | None = None,
+    source_id: str | None = None,
+    *,
+    servers: list[ConfiguredMcpServer] | None = None,
+) -> ConfiguredMcpServer:
+    """Resolve one inventory identity, rejecting stale or ambiguous sources."""
+    matches = [
+        server
+        for server in (configured_mcp_servers() if servers is None else servers)
+        if server.summary["harness"] == harness
+        and server.summary["name"] == name
+        and server.summary.get("plugin") == plugin
+        and (source_id is None or server.summary.get("source_id") == source_id)
+    ]
+    if len(matches) != 1:
+        raise LookupError("MCP server unavailable or ambiguous")
+    return matches[0]
+
+
 def discover_mcp_servers() -> list[McpServerSummary]:
     return [server.summary for server in configured_mcp_servers()]
 
@@ -329,8 +351,9 @@ def apply_auth_status(
 
 def apply_enabled_status(servers: list[McpServerSummary]) -> list[McpServerSummary]:
     """Overlay saved preferences without altering the harness configuration."""
-    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS, ServerKey, is_disabled
+    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS, ServerKey, read_disabled_servers
 
+    disabled = read_disabled_servers()
     for server in servers:
         harness = server["harness"]
         if harness not in HARNESS_EXECUTORS:
@@ -338,7 +361,7 @@ def apply_enabled_status(servers: list[McpServerSummary]) -> list[McpServerSumma
         locked = server.get("managed") == "true"
         server["locked"] = str(locked).lower()
         server["enabled"] = str(
-            locked or not is_disabled(ServerKey(harness, server["name"], server.get("plugin")))
+            locked or ServerKey(harness, server["name"], server.get("plugin")) not in disabled
         ).lower()
     return servers
 
@@ -349,11 +372,6 @@ class HostMcpInventory:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._cached: tuple[float, list[McpServerSummary]] | None = None
-
-    def clear(self) -> None:
-        """Invalidate discovery after a successful preference write."""
-        with self._lock:
-            self._cached = None
 
     def discover(self) -> list[McpServerSummary]:
         """Return the cached inventory, rescanning after the TTL; account state is always fresh."""

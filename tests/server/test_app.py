@@ -3070,8 +3070,11 @@ def test_picker_restriction_warning_names_the_agents_new_chat_cannot_offer(
 
 
 @pytest.mark.parametrize("mode", ["snapshot", "off", "on", "callable", "raising"])
-async def test_info_mcp_gate(db_uri, runtime_init, tmp_path, monkeypatch, mode):
-    monkeypatch.setenv("OMNIGENT_FEATURES", "mcp_disabled_servers")
+async def test_mcp_launch_gate_and_hidden_info(db_uri, runtime_init, tmp_path, monkeypatch, mode):
+    monkeypatch.setenv(
+        "OMNIGENT_FEATURES",
+        "mcp_disabled_servers,mcp_disabled_servers_claude,mcp_disabled_servers_codex",
+    )
     values = iter([False, True])
 
     def broken():
@@ -3088,12 +3091,16 @@ async def test_info_mcp_gate(db_uri, runtime_init, tmp_path, monkeypatch, mode):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        first = (await client.get("/v1/info")).json()["features"]["mcp_disabled_servers"]
-        second = (await client.get("/v1/info")).json()["features"]["mcp_disabled_servers"]
+        info = (await client.get("/v1/info")).json()
+    assert "mcp_disabled_servers_enabled" not in info
+    assert not any(name.startswith("mcp_disabled_servers") for name in info["features"])
+    activation = app.state.host_registry.mcp_disabled_servers_active_harnesses
+    first, second = activation(), activation()
+    enabled = ["claude", "codex"]
     assert (first, second) == {
-        "snapshot": (True, True),
-        "off": (False, False),
-        "on": (True, True),
-        "callable": (False, True),
-        "raising": (False, False),
+        "snapshot": (enabled, enabled),
+        "off": (None, None),
+        "on": (enabled, enabled),
+        "callable": (None, enabled),
+        "raising": (None, None),
     }[mode]

@@ -131,18 +131,21 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     ),
     FeatureDefinition(
         feature=Feature.MCP_DISABLED_SERVERS,
+        frontend_visible=False,
         description="Per-harness MCP enablement in Omnigent sessions",
         owner="server",
         review_by_release="0.24.0",
     ),
     FeatureDefinition(
         feature=Feature.MCP_DISABLED_SERVERS_CLAUDE,
+        frontend_visible=False,
         description="Claude MCP enablement at launch",
         owner="server",
         review_by_release="0.24.0",
     ),
     FeatureDefinition(
         feature=Feature.MCP_DISABLED_SERVERS_CODEX,
+        frontend_visible=False,
         description="Codex MCP enablement at launch",
         owner="server",
         review_by_release="0.24.0",
@@ -246,18 +249,22 @@ def mcp_disabled_servers_enabled(gate: McpDisabledServersGate) -> bool:
     return deployment_gate_enabled(gate, "mcp_disabled_servers")
 
 
+MCP_DISABLED_SERVERS_HARNESS_FEATURES = {
+    "claude": Feature.MCP_DISABLED_SERVERS_CLAUDE,
+    "codex": Feature.MCP_DISABLED_SERVERS_CODEX,
+}
+
+
 def active_harnesses(master: McpDisabledServersGate, features: FeatureFlags) -> list[str]:
     """Harnesses with complete launch hooks and both release gates enabled."""
     from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS
 
     if not mcp_disabled_servers_enabled(master):
         return []
-    harness_features = {
-        "claude": Feature.MCP_DISABLED_SERVERS_CLAUDE,
-        "codex": Feature.MCP_DISABLED_SERVERS_CODEX,
-    }
     return [
-        harness for harness in HARNESS_EXECUTORS if features.enabled(harness_features[harness])
+        harness
+        for harness in HARNESS_EXECUTORS
+        if features.enabled(MCP_DISABLED_SERVERS_HARNESS_FEATURES[harness])
     ]
 
 

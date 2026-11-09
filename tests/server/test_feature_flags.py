@@ -35,9 +35,6 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "sandbox_profiles": False,
         "usage_page": False,
         "harness_install": False,
-        "mcp_disabled_servers": False,
-        "mcp_disabled_servers_claude": False,
-        "mcp_disabled_servers_codex": False,
         "canvas": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
@@ -248,3 +245,10 @@ def test_mcp_gate_fails_closed():
         raise RuntimeError("SAFE unavailable")
 
     assert active_harnesses(broken, FeatureFlags(frozenset(Feature))) == []
+
+
+def test_mcp_harness_feature_mapping_is_complete():
+    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS
+    from omnigent.server.feature_flags import MCP_DISABLED_SERVERS_HARNESS_FEATURES
+
+    assert MCP_DISABLED_SERVERS_HARNESS_FEATURES.keys() == HARNESS_EXECUTORS.keys()

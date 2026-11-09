@@ -8,16 +8,45 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
 import pytest
 
+from tests._helpers.compat import (
+    compat_server_cwd,
+    compat_server_python,
+    server_executable,
+    server_pythonpath,
+)
 from tests._helpers.host import isolated_host
+from tests._helpers.live_server import isolated_local_server
 from tests._helpers.native_session import create_native_session
 from tests._helpers.session import send_user_text
 from tests.e2e_ui.chat.test_sidecar_mcp_allowlist import _wait_for_advertised_tools
-from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT, configure_mock_llm
+
+
+@pytest.fixture(scope="module")
+def mcp_enabled_server(built_spa: None, tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """Keep MCP release flags local to this journey, preserving old-server compatibility."""
+    env = {
+        "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
+        "PYTHONPATH": server_pythonpath(_REPO_ROOT),
+    }
+    if compat_server_python() is None:
+        env["OMNIGENT_FEATURES"] = (
+            "mcp_disabled_servers,mcp_disabled_servers_claude,mcp_disabled_servers_codex"
+        )
+    with isolated_local_server(
+        tmp_path_factory.mktemp("mcp_enabled_server"),
+        env=env,
+        executable=server_executable(),
+        cwd=compat_server_cwd(),
+        health_timeout=180.0,
+    ) as base_url:
+        yield base_url
 
 
 @pytest.mark.min_server_version("0.22.0.dev0")
@@ -25,7 +54,7 @@ from tests.e2e_ui.conftest import configure_mock_llm
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("harness", ["claude", "codex"])
 def test_disabled_server_absent_from_real_native_session(
-    live_server: str, mock_llm_server_url: str, tmp_path: Path, harness: str
+    mcp_enabled_server: str, mock_llm_server_url: str, tmp_path: Path, harness: str
 ) -> None:
     if shutil.which(harness) is None:
         pytest.skip(f"needs the {harness} CLI")
@@ -61,10 +90,10 @@ def test_disabled_server_absent_from_real_native_session(
         provider["wire_api"] = "responses"
     configure_mock_llm(mock_llm_server_url, [{"text": "MCP test complete."}], key=model)
     with (
-        httpx.Client(base_url=live_server, timeout=120) as client,
+        httpx.Client(base_url=mcp_enabled_server, timeout=120) as client,
         isolated_host(
             tmp_path / "host",
-            live_server,
+            mcp_enabled_server,
             config={"providers": {"test": {"kind": "key", "default": [family], family: provider}}},
             env={
                 "CLAUDE_CONFIG_DIR": None,
@@ -86,7 +115,7 @@ def test_disabled_server_absent_from_real_native_session(
         response.raise_for_status()
         session = create_native_session(
             client,
-            live_server,
+            mcp_enabled_server,
             harness=harness,
             metadata={
                 "host_id": host.host_id,

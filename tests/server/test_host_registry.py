@@ -658,3 +658,18 @@ def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
     # Deregistering by any spelling removes the entry.
     registry.deregister(prefixed)
     assert registry.get(bare) is None
+
+
+def test_mcp_launch_activation_defaults_closed_and_reads_gate_per_launch():
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+
+    assert HostRegistry().mcp_disabled_servers_active_harnesses() is None
+    gates = iter([True, False])
+    registry = HostRegistry(
+        mcp_disabled_servers=lambda: next(gates),
+        feature_flags=FeatureFlags(frozenset(Feature)),
+    )
+    assert registry.mcp_disabled_servers_active_harnesses() == ["claude", "codex"]
+    assert registry.mcp_disabled_servers_active_harnesses() is None
+    # Exhausting the callable also fails closed.
+    assert registry.mcp_disabled_servers_active_harnesses() is None

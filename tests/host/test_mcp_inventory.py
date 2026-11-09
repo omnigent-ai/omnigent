@@ -534,7 +534,7 @@ def test_the_status_file_can_live_outside_a_read_only_home(
 
 @pytest.mark.parametrize("harness", ["claude", "codex", "cursor"])
 @pytest.mark.parametrize("managed", [False, True])
-def test_enablement_overlay_and_cache_clear(home, monkeypatch, harness, managed):
+def test_enablement_overlay_refreshes_without_rescan(home, monkeypatch, harness, managed):
     from omnigent.mcp_disabled_servers import ServerKey, set_disabled
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(home / "omnigent-config"))
@@ -555,5 +555,34 @@ def test_enablement_overlay_and_cache_clear(home, monkeypatch, harness, managed)
     assert "enabled" not in row
     discovered = [{**row, "name": "new"}]
     assert inventory.discover()[0]["name"] == "docs"
-    inventory.clear()
-    assert inventory.discover()[0]["name"] == "new"
+    if harness != "cursor":
+        set_disabled(ServerKey(harness, "docs"), False)
+        refreshed = inventory.discover()[0]
+        assert refreshed["name"] == "docs"
+        assert refreshed["enabled"] == "true"
+
+
+def test_enablement_reads_one_snapshot_per_discovery(home, monkeypatch):
+    from omnigent import mcp_disabled_servers
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(home / "omnigent-config"))
+    key = mcp_disabled_servers.ServerKey("claude", "docs")
+    mcp_disabled_servers.set_disabled(key, True)
+    reads = []
+    read = mcp_disabled_servers.read_disabled_servers
+
+    def snapshot():
+        reads.append(True)
+        return read()
+
+    monkeypatch.setattr(mcp_disabled_servers, "read_disabled_servers", snapshot)
+    monkeypatch.setattr(
+        mcp_inventory,
+        "discover_mcp_servers",
+        lambda: [
+            {"name": name, "harness": "claude", "transport": "stdio", "scope": "user"}
+            for name in ("docs", "other")
+        ],
+    )
+    assert [row["enabled"] for row in HostMcpInventory().discover()] == ["false", "true"]
+    assert reads == [True]

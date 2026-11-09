@@ -6276,10 +6276,6 @@
             "title": "Managed Sandboxes Enabled",
             "type": "boolean"
           },
-          "mcp_disabled_servers_enabled": {
-            "title": "Mcp Disabled Servers Enabled",
-            "type": "boolean"
-          },
           "needs_setup": {
             "title": "Needs Setup",
             "type": "boolean"
@@ -6473,7 +6469,6 @@
           "smart_routing_sources",
           "features",
           "harness_install_enabled",
-          "mcp_disabled_servers_enabled",
           "installable_harnesses",
           "dictation_available",
           "branding"
