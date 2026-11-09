@@ -1,18 +1,22 @@
 """Pluggable launch-command resolution for the native Claude harness.
 
-The native Claude terminal is normally spawned as ``claude <args>`` -- the
-``command`` defaults to ``"claude"`` in both launch paths:
-:func:`omnigent.harnesses.claude_native.main._claude_terminal_request` (local CLI) and
-``_auto_create_claude_terminal`` in :mod:`omnigent.runner.app` (managed-host
-runner). Downstream integrations need to launch that *same* Claude Code process
-through a wrapper binary so the wrapper's process-level setup -- auth, telemetry,
-cost controls, enforcement hooks, plugin management -- is always applied. The
-motivating case is Databricks' ``isaac``, which wraps Claude/Codex with that
-tooling; running ``isaac claude`` instead of bare ``claude`` keeps it in force.
+The local CLI's
+:func:`omnigent.harnesses.claude_native.main._claude_terminal_request` routes its
+``(command, args)`` pair through :func:`resolve_claude_launch`. Claude print-mode
+model probes and runner background-title generation also use this resolver.
+By default it returns the inputs unchanged. A plugin can wrap the Claude Code
+process with a binary that supplies auth, telemetry, cost controls, enforcement
+hooks, or plugin management. For example, Databricks' ``isaac`` launches
+``isaac claude`` instead of bare ``claude``.
 
-Rather than hardcode the binary at each site, both paths route the
-``(command, args)`` pair through :func:`resolve_claude_launch`. By default this
-is the identity, so behaviour is unchanged.
+Managed-host terminal auto-create (``_auto_create_claude_terminal`` in
+:mod:`omnigent.runner.native.orchestration`) does not use this plugin resolver
+or read ``OMNIGENT_CLAUDE_LAUNCHER``. Configure
+``harness.claude-native.command`` and ``harness.claude-native.args`` in user
+config (``~/.omnigent/config.yaml`` by default) to wrap runner-spawned terminals.
+Project config cannot override these settings. The resolver in
+:mod:`omnigent.harness_startup_config` gives ``OMNIGENT_CLAUDE_PATH`` precedence
+over the configured command.
 
 Launcher plugins follow the same shape as MLflow's plugins: a plugin is a normal
 installed Python package whose class implements the :class:`ClaudeLauncher`
@@ -31,17 +35,19 @@ interface and registers it as a setuptools entry point in the
             return "isaac", ["claude", "--", *args]
 
 Any caller attaches a plugin by ``pip install``-ing such a package into the
-environment the runner runs in -- no Omnigent code change, no in-tree import
-path. At launch time, the ``OMNIGENT_CLAUDE_LAUNCHER`` environment variable
+environment the calling process runs in -- no Omnigent code change, no in-tree
+import path. At launch time, the ``OMNIGENT_CLAUDE_LAUNCHER`` environment variable
 selects *which* registered launcher to use, by entry-point name (e.g.
 ``OMNIGENT_CLAUDE_LAUNCHER=isaac``). Unset -> default launch. The selected
-launcher receives the fully-augmented argv (MCP config, hook settings and skill
-flags injected by :func:`augment_claude_args`), so a launcher that merely wraps
-the command preserves the Omnigent bridge unchanged.
+launcher receives the caller's args. For terminal launches, these are the
+fully-augmented argv (MCP config, hook settings and skill flags injected by
+:func:`augment_claude_args`), so a launcher that merely wraps the command
+preserves the Omnigent bridge unchanged.
 
-Selection is per-process via the environment so the runner (which spawns the
-terminal on managed hosts) and the local CLI each opt in independently; the
-bootstrapping integration sets the env var before the launching process starts.
+Selection is per-process via the environment: the local CLI and runner each
+opt in independently. In the runner, the selector applies to model probes and
+background-title generation. The bootstrapping integration sets the env var
+before the calling process starts.
 """
 
 from __future__ import annotations
@@ -75,12 +81,13 @@ class ClaudeLauncher(abc.ABC):
         """
         Return the ``(command, args)`` to actually spawn for this Claude launch.
 
-        :param command: Default terminal command Omnigent would otherwise spawn,
+        :param command: Default command Omnigent would otherwise spawn,
             e.g. ``"claude"``.
-        :param args: Fully-augmented Claude CLI args (MCP config, hook settings
-            and skill flags already injected by :func:`augment_claude_args`).
-            Forward these unchanged (e.g. after a ``--`` separator) to preserve
-            the Omnigent bridge.
+        :param args: Caller-supplied Claude CLI args. Terminal launches include
+            MCP config, hook settings and skill flags from
+            :func:`augment_claude_args`; model probes and background titles
+            supply their own print-mode args. Forward these unchanged (e.g.
+            after a ``--`` separator) to preserve the caller's behaviour.
         :returns: The ``(command, args)`` Omnigent should spawn instead.
         """
         raise NotImplementedError
@@ -88,7 +95,7 @@ class ClaudeLauncher(abc.ABC):
 
 def resolve_claude_launch(command: str, args: list[str]) -> tuple[str, list[str]]:
     """
-    Resolve the final launch command/args for the native Claude terminal.
+    Resolve the final command/args for a Claude terminal or print-mode launch.
 
     Selects the launcher plugin named by :data:`CLAUDE_LAUNCHER_ENV_VAR` from the
     :data:`CLAUDE_LAUNCHER_ENTRY_POINT_GROUP` entry-point group when set;
@@ -98,9 +105,10 @@ def resolve_claude_launch(command: str, args: list[str]) -> tuple[str, list[str]
     ``(command, args)`` so a broken or missing plugin can never block a Claude
     launch.
 
-    :param command: Default terminal command, e.g. ``"claude"``.
-    :param args: Fully-augmented Claude CLI args (MCP/hooks/skills already
-        injected by :func:`augment_claude_args`).
+    :param command: Default command, e.g. ``"claude"``.
+    :param args: Caller-supplied Claude CLI args: augmented MCP/hooks/skills
+        for terminal launches, or print-mode args for model probes and
+        background titles. This resolver does not augment them.
     :returns: The ``(command, args)`` to spawn. ``args`` is always a fresh list.
     """
     default = (command, list(args))
