@@ -15,7 +15,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // tests also use the real ApprovalCard; other prompts use an Accept-button stub.
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { InboxPage } from "./InboxPage";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -27,6 +27,7 @@ import * as conversationsHook from "@/hooks/useConversations";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
 import type { Suggestion } from "@/lib/proactiveInbox";
+import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
 import { resetLocalElicitationResolutionsForTests } from "@/lib/localElicitationResolutions";
 import * as sessionsApi from "@/lib/sessionsApi";
@@ -163,11 +164,21 @@ function renderPage(
         <SidebarDataProvider>
           <MemoryRouter>
             <InboxPage />
+            <LocationProbe />
           </MemoryRouter>
         </SidebarDataProvider>
       </CapabilitiesProvider>
     </QueryClientProvider>,
   );
+}
+
+let lastLocation = { pathname: "", search: "" };
+
+/** Records where the page navigated, e.g. to the new-session composer. */
+function LocationProbe() {
+  const location = useLocation();
+  lastLocation = { pathname: location.pathname, search: location.search };
+  return null;
 }
 
 function automationInboxStub(overrides: Record<string, unknown> = {}) {
@@ -187,8 +198,12 @@ function proactiveInboxStub(overrides: Record<string, unknown> = {}) {
   return {
     items: [],
     unreadCount: 0,
+    unreadCountCapped: false,
     isLoading: false,
     isError: false,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
     refetch: vi.fn(),
     update: vi.fn(),
     ...overrides,
@@ -1700,23 +1715,30 @@ describe("agent suggestions", () => {
         { type: "pr", ref: "https://github.com/acme/app/pull/7", label: "PR 7" },
         { type: "session", ref: "sess_src" },
       ],
-      suggestedPrompt: "Ramp up the flag to 50%",
+      actions: [
+        { label: "Ramp to 50%", prompt: "Ramp the flag to 50%" },
+        { label: "Check metrics", prompt: "Check the flag's metrics" },
+      ],
+      chart: null,
       sourceSessionId: "sess_src",
       state: "unread",
-      feedback: "none",
+      resolution: "none",
       createdAt: 1_700_000_000,
       ...overrides,
     };
   }
 
-  it("marks a suggestion read on expand and records the viewer's response", () => {
+  function stub(overrides: Record<string, unknown>) {
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(proactiveInboxStub(overrides));
+  }
+
+  it("marks a suggestion read on expand and shows its evidence", () => {
     const update = vi.fn();
-    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
-      proactiveInboxStub({ items: [suggestion()], unreadCount: 1, update }),
-    );
+    stub({ items: [suggestion()], unreadCount: 1, update });
     renderPage();
 
     fireEvent.click(screen.getByRole("button", { name: "Suggested follow-up: Ramp up the flag" }));
+
     expect(update).toHaveBeenCalledWith("sug_1", { state: "read" });
     expect(screen.getByRole("link", { name: "PR 7" })).toHaveAttribute(
       "href",
@@ -1726,24 +1748,72 @@ describe("agent suggestions", () => {
       "href",
       "/c/sess_src",
     );
-
-    fireEvent.click(screen.getByRole("button", { name: "Useful" }));
-    expect(update).toHaveBeenCalledWith("sug_1", { feedback: "useful" });
-    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-    expect(update).toHaveBeenCalledWith("sug_1", { state: "dismissed" });
-    fireEvent.click(screen.getByRole("button", { name: /Start session/ }));
-    expect(update).toHaveBeenCalledWith("sug_1", { state: "done" });
   });
 
-  it("keeps read suggestions out of the Unread tab", () => {
-    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
-      proactiveInboxStub({ items: [suggestion({ state: "read", suggestedPrompt: null })] }),
-    );
+  it("keeps an expanded suggestion on the Unread tab after it is marked read", () => {
+    const item = suggestion();
+    const update = vi.fn();
+    stub({ items: [item], unreadCount: 1, update });
+    renderPage();
+    selectTab("Unread");
+    expect(vi.mocked(proactiveInboxHook.useProactiveInbox).mock.lastCall?.[1]).toEqual(["unread"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Suggested follow-up: Ramp up the flag" }));
+    // The hook drops the read item from the unread-only list.
+    stub({ items: [], unreadCount: 0, update });
+    selectTab("All");
+    selectTab("Unread");
+
+    expect(screen.getByText("The PR merged yesterday.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ramp to 50%" })).toBeInTheDocument();
+  });
+
+  it("takes an agent action and opens the composer with its prompt", () => {
+    const update = vi.fn();
+    stub({ items: [suggestion({ state: "read" })], update });
     renderPage();
 
-    expect(screen.getByTestId("inbox-suggestion")).toBeInTheDocument();
-    selectTab("Unread");
-    expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Suggested follow-up: Ramp up the flag" }));
+    fireEvent.click(screen.getByRole("button", { name: "Check metrics" }));
+
+    expect(update).toHaveBeenCalledWith("sug_1", {
+      resolution: "action_taken",
+      resolutionAction: 1,
+    });
+    const token = new URLSearchParams(lastLocation.search).get(NEW_SESSION_HANDOFF_PARAM);
+    expect(lastLocation.pathname).toBe("/");
+    expect(peekNewSessionHandoff(token)).toEqual({ text: "Check the flag's metrics", files: [] });
+  });
+
+  it("dismisses with a reason from the menu", async () => {
+    const update = vi.fn();
+    stub({ items: [suggestion({ state: "read" })], update });
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Suggested follow-up: Ramp up the flag" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Dismiss/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Useful, no action needed" }));
+
+    expect(update).toHaveBeenCalledWith("sug_1", { resolution: "useful" });
+  });
+
+  it("offers the next page of suggestions", () => {
+    const fetchNextPage = vi.fn();
+    stub({ items: [suggestion({ state: "read" })], hasNextPage: true, fetchNextPage });
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more suggestions" }));
+
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps suggestions off the Awaiting response tab", () => {
+    stub({ items: [suggestion()] });
+    renderPage();
+
     selectTab("Awaiting response");
     expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
   });

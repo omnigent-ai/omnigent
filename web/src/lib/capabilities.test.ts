@@ -259,6 +259,7 @@ describe.each([
   "scheduled_task_subhour",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
+  "proactive_agent_enabled",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],

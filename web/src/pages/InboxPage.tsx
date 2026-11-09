@@ -62,12 +62,18 @@ import {
   LightbulbIcon,
   Loader2Icon,
   SquarePenIcon,
-  ThumbsDownIcon,
-  ThumbsUpIcon,
-  XIcon,
+  ChevronDownIcon,
   type LucideIcon,
 } from "lucide-react";
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
+import { SuggestionChart } from "@/components/inbox/SuggestionChart";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { useProactiveInbox } from "@/hooks/useProactiveInbox";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { PageScroll } from "@/components/PageScroll";
@@ -121,6 +127,8 @@ import {
 } from "@/lib/localElicitationResolutions";
 import { newSessionLocation } from "@/lib/newSessionHandoff";
 import {
+  DISMISS_REASONS,
+  OPEN_SUGGESTION_STATES,
   suggestionKindLabel,
   suggestionLinkTarget,
   suggestionPreview,
@@ -194,6 +202,7 @@ const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
 
 // Enough trailing items to step past a tool call or two after the final reply.
 const PREVIEW_SCAN_ITEMS = 12;
+const UNREAD_ONLY = ["unread"] as const;
 const PREVIEW_MAX_CHARS = 280;
 
 /** One inbox card, tagged by kind, with the epoch-seconds time it sorts and groups by. */
@@ -229,11 +238,20 @@ export function InboxPage() {
     serverInboxRows: allRows,
     comments: commentInbox,
     automationInbox,
-    proactiveInbox,
+    identityReady,
   } = useSidebarData();
   const navigate = useNavigate();
   const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
   const [filter, setFilter] = useState<InboxFilter>(readInboxFilter);
+  // The Unread tab pages through unread suggestions only, so an older unread
+  // one is reachable behind newer read ones.
+  const proactiveInbox = useProactiveInbox(
+    identityReady,
+    filter === "unread" ? UNREAD_ONLY : OPEN_SUGGESTION_STATES,
+  );
+  // Suggestions expanded while unread, kept on screen until collapsed even
+  // though marking them read takes them out of the Unread list.
+  const [pinnedSuggestions, setPinnedSuggestions] = useState<Record<string, Suggestion>>({});
   const [responded, setResponded] = useState<RespondedMap>({});
   const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
   // Manual expand/collapse toggles keyed by entry key. Anything not in
@@ -340,12 +358,13 @@ export function InboxPage() {
   const visibleComments = showUnread ? commentInbox.items : [];
   const visibleUnread = showUnread ? unreadItems : [];
   const visibleAutomations = showUnread ? automationInbox.items : [];
-  // Read suggestions stay listed until acted on; the Unread tab keeps only new ones.
-  const visibleSuggestions = !showUnread
-    ? []
-    : filter === "unread"
-      ? proactiveInbox.items.filter((item) => item.state === "unread")
-      : proactiveInbox.items;
+  const listedSuggestionIds = new Set(proactiveInbox.items.map((item) => item.id));
+  const visibleSuggestions = showUnread
+    ? [
+        ...proactiveInbox.items,
+        ...Object.values(pinnedSuggestions).filter((item) => !listedSuggestionIds.has(item.id)),
+      ]
+    : [];
   const visibleCount =
     visibleApprovals.length +
     visibleComments.length +
@@ -367,10 +386,8 @@ export function InboxPage() {
       (automationInbox.items.length === 1
         ? "1 failed automation"
         : `${automationInbox.items.length} failed automations`),
-    proactiveInbox.items.length > 0 &&
-      (proactiveInbox.items.length === 1
-        ? "1 suggestion"
-        : `${proactiveInbox.items.length} suggestions`),
+    proactiveInbox.unreadCount > 0 &&
+      `${proactiveInbox.unreadCountCapped ? `${proactiveInbox.unreadCount}+` : proactiveInbox.unreadCount} unread ${proactiveInbox.unreadCount === 1 && !proactiveInbox.unreadCountCapped ? "suggestion" : "suggestions"}`,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -522,14 +539,23 @@ export function InboxPage() {
     };
     if (entry.kind === "suggestion") {
       const { item } = entry;
+      const unpin = () => setPinnedSuggestions(({ [item.id]: _pinned, ...rest }) => rest);
       const onToggleSuggestion = () => {
-        if (!expanded && item.state === "unread") proactiveInbox.update(item.id, { state: "read" });
+        if (!expanded && item.state === "unread") {
+          setPinnedSuggestions((prev) => ({ ...prev, [item.id]: { ...item, state: "read" } }));
+          proactiveInbox.update(item.id, { state: "read" });
+        }
+        if (expanded) unpin();
         onToggle();
       };
-      const rate = (feedback: "useful" | "not_useful") =>
-        proactiveInbox.update(item.id, {
-          feedback: item.feedback === feedback ? "none" : feedback,
-        });
+      const takeAction = (index: number) => {
+        const action = item.actions[index];
+        if (!action) return;
+        unpin();
+        proactiveInbox.update(item.id, { resolution: "action_taken", resolutionAction: index });
+        // The user reviews and sends the prompt from the composer.
+        navigate(newSessionLocation(action.prompt, []));
+      };
       return (
         <InboxCard
           key={entry.key}
@@ -549,50 +575,49 @@ export function InboxPage() {
           <FileViewerContext.Provider value={null}>
             <FilePathAwareMessageResponse>{item.bodyMd}</FilePathAwareMessageResponse>
           </FileViewerContext.Provider>
+          <SuggestionChart chart={item.chart} />
           <SuggestionLinks item={item} />
           <InboxActions>
-            <Button
-              variant="outline"
-              size="xs"
-              className={OUTLINE_ACTION}
-              aria-pressed={item.feedback === "useful"}
-              onClick={() => rate("useful")}
-              componentId="inbox.suggestion.useful"
-            >
-              <ThumbsUpIcon className="size-3.5" /> Useful
-            </Button>
-            <Button
-              variant="outline"
-              size="xs"
-              className={OUTLINE_ACTION}
-              aria-pressed={item.feedback === "not_useful"}
-              onClick={() => rate("not_useful")}
-              componentId="inbox.suggestion.not_useful"
-            >
-              <ThumbsDownIcon className="size-3.5" /> Not useful
-            </Button>
-            <Button
-              variant="outline"
-              size="xs"
-              className={OUTLINE_ACTION}
-              onClick={() => proactiveInbox.update(item.id, { state: "dismissed" })}
-              componentId="inbox.suggestion.dismiss"
-            >
-              <XIcon className="size-3.5" /> Dismiss
-            </Button>
-            {item.suggestedPrompt && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="xs"
+                  className={OUTLINE_ACTION}
+                  componentId="inbox.suggestion.dismiss"
+                >
+                  Dismiss <ChevronDownIcon className="size-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-52">
+                {DISMISS_REASONS.map((reason) => (
+                  <DropdownMenuItem
+                    key={reason.resolution}
+                    onSelect={() => {
+                      trackClick(`inbox.suggestion.dismiss.${reason.resolution}`, "button");
+                      unpin();
+                      proactiveInbox.update(item.id, { resolution: reason.resolution });
+                    }}
+                  >
+                    {reason.label}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            {item.actions.map((action, index) => (
               <Button
+                // Agent actions are a fixed list per item; the label can repeat.
+                // oxlint-disable-next-line react/no-array-index-key
+                key={index}
                 size="xs"
-                className={PRIMARY_ACTION}
-                onClick={() => {
-                  proactiveInbox.update(item.id, { state: "done" });
-                  navigate(newSessionLocation(item.suggestedPrompt ?? "", []));
-                }}
-                componentId="inbox.suggestion.start_session"
+                className={index === 0 ? PRIMARY_ACTION : OUTLINE_ACTION}
+                variant={index === 0 ? undefined : "outline"}
+                onClick={() => takeAction(index)}
+                componentId="inbox.suggestion.action"
               >
-                Start session <ArrowRightIcon className="size-3.5" />
+                {action.label}
               </Button>
-            )}
+            ))}
           </InboxActions>
         </InboxCard>
       );
@@ -1090,7 +1115,8 @@ export function InboxPage() {
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />
             <p className="text-ui font-medium">
-              {hasNextPage || (showUnread && automationInbox.hasNextPage)
+              {hasNextPage ||
+              (showUnread && (automationInbox.hasNextPage || proactiveInbox.hasNextPage))
                 ? "Nothing waiting in the loaded items"
                 : emptyState.title}
             </p>
@@ -1121,6 +1147,17 @@ export function InboxPage() {
           className="mt-4"
         >
           {isFetchingNextPage ? "Loading…" : "Load more sessions"}
+        </Button>
+      )}
+      {showUnread && proactiveInbox.hasNextPage && (
+        <Button
+          variant="outline"
+          disabled={proactiveInbox.isFetchingNextPage}
+          onClick={() => void proactiveInbox.fetchNextPage()}
+          componentId="inbox.load_more_suggestions"
+          className="mt-4"
+        >
+          {proactiveInbox.isFetchingNextPage ? "Loading…" : "Load more suggestions"}
         </Button>
       )}
       {showUnread && automationInbox.hasNextPage && (

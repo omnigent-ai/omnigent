@@ -71,8 +71,7 @@ export type FeatureKey =
   | "grid_sessions_display_ui"
   | "automations_v2"
   | "splittable_terminal_view_ui"
-  | "session_orchestration"
-  | "proactive_agent";
+  | "session_orchestration";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -296,6 +295,8 @@ export interface ServerInfo {
   scheduled_task_projects?: boolean;
   /** Latest sessionless automation failures can be listed for Inbox. */
   scheduled_task_inbox?: boolean;
+  /** Agent-posted suggestions can be listed for Inbox, for this caller. */
+  proactive_agent_enabled?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Automations accept modes that skip approval; older servers may reject them. */
@@ -626,6 +627,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
+          proactive_agent_enabled: data.proactive_agent_enabled === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:
             data.scheduled_task_approval_skipping_modes === true,

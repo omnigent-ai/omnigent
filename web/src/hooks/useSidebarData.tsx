@@ -244,6 +244,8 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     comments.items.length +
     automationInbox.items.length +
     proactiveInbox.unreadCount;
+  // The server stops counting unread suggestions at its limit.
+  const inboxCountCapped = proactiveInbox.unreadCountCapped;
   const watchedIds = useMemo(() => loadedRows.map((row) => row.id), [loadedRows]);
   const mineCursor = mine.data?.pages.at(-1)?.last_id;
   const sharedCursor = shared.data?.pages.at(-1)?.last_id;
@@ -337,6 +339,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     serverInboxRows,
     inboxCount,
     inboxCountIncomplete: automationInbox.hasNextPage,
+    inboxCountCapped,
     comments,
     automationInbox,
     proactiveInbox,
