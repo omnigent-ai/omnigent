@@ -699,11 +699,24 @@ def test_draining_delivery_reconnects_and_accepts_input_once(
     )
 
 
-@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
-def test_accepted_steer_keeps_unchanged_state_when_disk_is_full(
-    draining_client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_injection: bool
+@pytest.mark.parametrize(
+    ("live_injection", "active_turn_id"),
+    [
+        (False, None),
+        (False, "turn_existing"),
+        (False, "turn_steered"),
+        (True, "turn_existing"),
+        (True, "turn_steered"),
+    ],
+)
+def test_accepted_input_does_not_retry_when_disk_is_full(
+    draining_client,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_injection: bool,
+    active_turn_id: str | None,
 ) -> None:
-    _seed_bridge(tmp_path, active_turn_id="turn_steered")
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
     before = read_bridge_state(tmp_path)
     draining_client.delivery_errors = []
 
@@ -713,15 +726,23 @@ def test_accepted_steer_keeps_unchanged_state_when_disk_is_full(
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge.tempfile.mkstemp", disk_full)
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
     if live_injection:
-        assert asyncio.run(executor.enqueue_session_message("main", "synthetic input"))
+        if active_turn_id == "turn_steered":
+            assert asyncio.run(executor.enqueue_session_message("main", "synthetic input"))
+        else:
+            with pytest.raises(InjectionDeliveryAmbiguous):
+                asyncio.run(executor.enqueue_session_message("main", "synthetic input"))
     else:
-        assert [type(event) for event in _collect_turn_events(executor, "synthetic input")] == [
-            TurnComplete
-        ]
+        [event] = _collect_turn_events(executor, "synthetic input")
+        if active_turn_id == "turn_steered":
+            assert isinstance(event, TurnComplete)
+        else:
+            assert isinstance(event, ExecutorError)
+            assert event.undelivered is False
+            assert event.code == "codex_delivery_unconfirmed"
 
     assert draining_client.accepted_inputs == [[{"type": "text", "text": "synthetic input"}]]
     assert len(draining_client.requests) == 1
-    assert draining_client.requests[0][0] == "turn/steer"
+    assert draining_client.requests[0][0] == ("turn/steer" if active_turn_id else "turn/start")
     assert read_bridge_state(tmp_path) == before
 
 
@@ -3186,6 +3207,135 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
     ]
     assert outcomes[1]["requested_native_turn_id"] is None
     assert all(a["input_stable_id"] == "a" * 32 for a in outcomes)
+
+
+@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
+@pytest.mark.parametrize(
+    ("outcome", "storage_errno"),
+    [
+        ("recover", errno.ENOSPC),
+        pytest.param(
+            "recover",
+            getattr(errno, "EDQUOT", None),
+            marks=pytest.mark.skipif(not hasattr(errno, "EDQUOT"), reason="POSIX-only errno"),
+        ),
+        ("stop", errno.ENOSPC),
+        ("backend-exit", errno.ENOSPC),
+        ("successor", errno.ENOSPC),
+        ("cancel", errno.ENOSPC),
+        ("rebind", errno.ENOSPC),
+        ("stop-during-clear", errno.ENOSPC),
+        ("rebind-during-clear", errno.ENOSPC),
+        ("fatal", errno.EIO),
+    ],
+)
+async def test_stale_refusal_waits_only_for_recoverable_local_storage(
+    draining_client,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_injection: bool,
+    outcome: str,
+    storage_errno: int,
+) -> None:
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.inner.executor import TurnCancelled
+
+    _seed_bridge(tmp_path, active_turn_id="turn_stale")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError({"code": -32600, "message": "no active turn to steer"})
+    ]
+    waiting = asyncio.Event()
+    writable = False
+    writes = 0
+    clear_stale_turn = codex_native_executor.clear_active_turn_id_if_matches
+
+    def save(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        if not writable:
+            waiting.set()
+            raise OSError(storage_errno, "synthetic storage failure")
+        cleared = clear_stale_turn(*args, **kwargs)
+        if outcome == "stop-during-clear":
+            codex_bridge.record_codex_interrupt(tmp_path, expected=observed)
+            assert codex_bridge.read_interrupt_generations(tmp_path)[observed.session_id] == 1
+        elif outcome == "rebind-during-clear":
+            write_bridge_state(tmp_path, replace(observed, thread_id="replacement"))
+        return cleared
+
+    monkeypatch.setattr(codex_native_executor, "clear_active_turn_id_if_matches", save)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def send():
+        if live_injection:
+            return await executor.enqueue_session_message("main", "held original input")
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "held original input"}], [], ""
+            )
+        ]
+
+    delivery = asyncio.create_task(send())
+    try:
+        await asyncio.wait_for(waiting.wait(), 2)
+        if outcome != "fatal":
+            await asyncio.sleep(0)
+            assert not delivery.done(), "a refused input must wait for local storage recovery"
+        assert len(draining_client.requests) == 1
+        assert draining_client.accepted_inputs == []
+        if outcome in {"recover", "stop-during-clear", "rebind-during-clear"}:
+            writable = True
+        elif outcome == "stop":
+            assert codex_bridge.record_codex_interrupt(tmp_path, expected=observed) is not None
+        elif outcome == "backend-exit":
+            codex_bridge.record_app_server_stopped(tmp_path)
+        elif outcome == "successor":
+            write_bridge_state(tmp_path, replace(observed, active_turn_id="turn_new"))
+            writable = True
+        elif outcome == "rebind":
+            write_bridge_state(tmp_path, replace(observed, thread_id="replacement"))
+        elif outcome == "cancel":
+            delivery.cancel()
+        if outcome == "cancel" or (outcome.startswith("stop") and live_injection):
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(delivery, 2)
+        else:
+            result = await asyncio.wait_for(delivery, 2)
+            if live_injection:
+                assert result is (outcome in {"recover", "successor"})
+            elif outcome in {"recover", "successor"}:
+                assert [type(event) for event in result] == [TurnComplete]
+            elif outcome.startswith("stop"):
+                assert [type(event) for event in result] == [TurnCancelled]
+            else:
+                assert len(result) == 1 and isinstance(result[0], ExecutorError)
+                if outcome == "backend-exit":
+                    assert result[0].code == "codex_app_server_stopped"
+                    assert result[0].undelivered and result[0].preserve_session
+    finally:
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+    assert draining_client.accepted_inputs == (
+        [[{"type": "text", "text": "held original input"}]]
+        if outcome in {"recover", "successor"}
+        else []
+    )
+    assert [method for method, _ in draining_client.requests] == (
+        ["turn/steer", "turn/start"]
+        if outcome == "recover"
+        else ["turn/steer", "turn/steer"]
+        if outcome == "successor"
+        else ["turn/steer"]
+    )
+    if outcome in {"recover", "successor"}:
+        assert writes >= 2
+    if outcome == "successor":
+        assert draining_client.requests[-1][1]["expectedTurnId"] == "turn_new"
+    if outcome == "fatal":
+        assert writes == 1
 
 
 @pytest.mark.parametrize(

@@ -12,14 +12,14 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
 from websockets.exceptions import WebSocketException
 
 from omnigent.debug_logging import debug_event
-from omnigent.errors import OmnigentError
+from omnigent.errors import _DISK_FULL_ERRNOS, OmnigentError
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
@@ -720,8 +720,18 @@ async def _start_codex_turn(
     turn = _json_object(result.get("turn")) if result is not None else None
     turn_id = turn.get("id") if turn is not None else None
     if isinstance(turn_id, str) and turn_id:
-        update_active_turn_id(bridge_dir, turn_id)
+        _record_accepted_turn(bridge_dir, turn_id)
         _logger.info("Codex native started turn: turn_id=%s", turn_id)
+
+
+def _record_accepted_turn(bridge_dir: Path, turn_id: str) -> None:
+    """A local write failure cannot turn acknowledged input into a resendable refusal."""
+    try:
+        update_active_turn_id(bridge_dir, turn_id)
+    except OSError as exc:
+        raise InjectionDeliveryAmbiguous(
+            "Codex accepted this message, but its local turn state could not be saved."
+        ) from exc
 
 
 async def _steer_codex_turn(
@@ -747,7 +757,7 @@ async def _steer_codex_turn(
     result = _json_object(response.get("result")) if response is not None else None
     turn_id = result.get("turnId") if result is not None else None
     if isinstance(turn_id, str) and turn_id:
-        update_active_turn_id(bridge_dir, turn_id)
+        _record_accepted_turn(bridge_dir, turn_id)
         _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
 
 
@@ -1049,10 +1059,7 @@ async def _inject_codex_turn_once(
     # Codex authoritatively says A is no longer the active turn (it ended, or a
     # newer turn B replaced it). Clear A only if it is still the bridge's value;
     # a concurrent turn/started(B) must survive this recovery.
-    clear_active_turn_id_if_matches(bridge_dir, expected_turn_id)
-    recovered_state = read_bridge_state(bridge_dir)
-    if recovered_state is None or recovered_state.session_id != state.session_id:
-        raise RuntimeError("Codex native bridge changed while recovering a stale turn")
+    recovered_state = await _recover_stale_turn_when_writable(bridge_dir, state)
     if recovered_state.active_turn_id is not None:
         _logger.info(
             "Codex native stale steer raced with a newer turn; steering turn_id=%s",
@@ -1073,6 +1080,57 @@ async def _inject_codex_turn_once(
         input_items=input_items,
         settings_overrides=settings_overrides,
     )
+
+
+async def _recover_stale_turn_when_writable(
+    bridge_dir: Path, observed: CodexNativeBridgeState
+) -> CodexNativeBridgeState:
+    """Retry only the local write after Codex explicitly rejected stale-turn input."""
+    storage_wait = False
+    while True:
+        _require_codex_binding(bridge_dir, observed)
+        failure = read_bridge_startup_failure(bridge_dir)
+        if failure is not None:
+            raise _CodexNativeInputUndelivered(failure, preserve_session=True)
+        try:
+            clear_active_turn_id_if_matches(
+                bridge_dir, observed.active_turn_id, expected_owner=observed
+            )
+        except OSError as exc:
+            if exc.errno not in _DISK_FULL_ERRNOS:
+                raise
+            if not storage_wait:
+                storage_wait = True
+                log_input_event(
+                    _logger,
+                    "codex_native_storage_wait",
+                    session_id=observed.session_id,
+                    stage="stale_turn_recovery",
+                    outcome="waiting",
+                    os_errno=exc.errno,
+                )
+            await asyncio.sleep(_BRIDGE_STATE_SLOW_POLL_SECONDS)
+            continue
+        current = read_bridge_state(bridge_dir)
+        _require_codex_binding(bridge_dir, observed)
+        if current is None or not _codex_binding_matches(current, observed):
+            raise _CodexNativeInputUndelivered(
+                CodexStartupFailure(
+                    message="Codex native session changed while recovering a stale turn; "
+                    "this message was not delivered.",
+                    remediation="Send the message again in the current session.",
+                ),
+                preserve_session=True,
+            )
+        if storage_wait:
+            log_input_event(
+                _logger,
+                "codex_native_storage_wait",
+                session_id=observed.session_id,
+                stage="stale_turn_recovery",
+                outcome="recovered",
+            )
+        return replace(current, interrupt_generation=observed.interrupt_generation)
 
 
 class CodexNativeExecutor(Executor):
