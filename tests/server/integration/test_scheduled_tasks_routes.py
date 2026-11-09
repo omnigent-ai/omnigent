@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -3100,8 +3101,13 @@ async def test_a_picked_session_must_be_the_owners_and_fit_the_task(
     assert new_mode.status_code == 422, new_mode.text
 
 
-def _session_with_history(db_uri: str, owner: str = "alice@example.com", **fields: object) -> str:
-    """An owned session with one finished exchange and a turn still in progress."""
+def _session_with_history(
+    db_uri: str, owner: str = "alice@example.com", *, finished: bool = True, **fields: object
+) -> str:
+    """An owned session with one finished exchange and a turn still in progress.
+
+    With ``finished=False`` it holds only the first turn's message, with no reply yet.
+    """
     from omnigent.entities import MessageData, NewConversationItem
 
     def message(role: str, response_id: str, text: str) -> NewConversationItem:
@@ -3117,14 +3123,13 @@ def _session_with_history(db_uri: str, owner: str = "alice@example.com", **field
         )
 
     session_id = _owned_session(db_uri, owner, **fields)
-    SqlAlchemyConversationStore(db_uri).append(
-        session_id,
-        [
-            message("user", "resp_1", "summarize the alerts"),
+    items = [message("user", "resp_1", "summarize the alerts")]
+    if finished:
+        items += [
             message("assistant", "resp_1", "three alerts"),
             message("user", "resp_2", "and the next turn"),
-        ],
-    )
+        ]
+    SqlAlchemyConversationStore(db_uri).append(session_id, items)
     return session_id
 
 
@@ -3174,7 +3179,7 @@ async def test_a_source_session_must_be_the_owners_top_level_session(
     parent = _owned_session(db_uri)
     existing = await auth_client.post(
         "/v1/scheduled-tasks",
-        json=_create_body(source_session_id=_owned_session(db_uri)),
+        json=_create_body(source_session_id=_session_with_history(db_uri)),
         headers=_headers(),
     )
     assert existing.status_code == 200, existing.text
@@ -3183,6 +3188,7 @@ async def test_a_source_session_must_be_the_owners_top_level_session(
         "missing": ("cd" * 16, 404),
         "a sub-agent's": (_owned_session(db_uri, parent_conversation_id=parent), 400),
         "an automation's copy": (existing.json()["source_session_id"], 400),
+        "one with no finished reply yet": (_session_with_history(db_uri, finished=False), 400),
     }
     for label, (session_id, status) in cases.items():
         resp = await auth_client.post(
@@ -3209,7 +3215,7 @@ async def test_a_task_that_starts_from_a_session_can_switch_agents_but_not_conti
     created = (
         await auth_client.post(
             "/v1/scheduled-tasks",
-            json=_create_body(source_session_id=_owned_session(db_uri), agent_id=codex),
+            json=_create_body(source_session_id=_session_with_history(db_uri), agent_id=codex),
             headers=_headers(),
         )
     ).json()
@@ -3242,7 +3248,7 @@ async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(
     created = await auth_client.post(
         "/v1/scheduled-tasks",
         json=_create_body(
-            source_session_id=_owned_session(db_uri),
+            source_session_id=_session_with_history(db_uri),
             agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME),
         ),
         headers=_headers(),
@@ -3256,12 +3262,46 @@ async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(
     assert copy.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
 
 
+async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.scheduled import source_session
+
+    source_id = _session_with_history(db_uri)
+    files = SqlAlchemyFileStore(db_uri)
+    files.create(filename="notes.txt", bytes=5, session_id=source_id)
+    copies: list[str] = []
+    copy_session = source_session.copy_session
+
+    def _recording_copy(**kwargs: Any) -> Any:
+        conv = copy_session(**kwargs)
+        copies.append(conv.id)
+        return conv
+
+    def _failing_create(*args: Any, **kwargs: Any) -> None:
+        raise OmnigentError("store unavailable", code=ErrorCode.INVALID_INPUT)
+
+    monkeypatch.setattr(source_session, "copy_session", _recording_copy)
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "create", _failing_create)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+    assert resp.status_code == 400, resp.text
+
+    # The copy and its file row are gone; the source keeps its own file.
+    (copy_id,) = copies
+    assert SqlAlchemyConversationStore(db_uri).get_conversation(copy_id) is None
+    assert files.list(copy_id).data == []
+    assert [stored.filename for stored in files.list(source_id).data] == ["notes.txt"]
+
+
 async def test_deleting_the_automation_keeps_its_copy_as_an_ordinary_session(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
 
-    source_id = _owned_session(db_uri, title="Daily alerts")
+    source_id = _session_with_history(db_uri, title="Daily alerts")
     created = (
         await auth_client.post(
             "/v1/scheduled-tasks",

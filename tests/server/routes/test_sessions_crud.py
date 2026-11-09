@@ -881,3 +881,18 @@ async def test_patch_rejects_forged_worktree_identity(
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert label_key not in conv.labels
+
+
+async def test_patch_rejects_a_forged_automation_source(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    """Only the server sets the source label; deleting the session deletes its automation."""
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    response = await client.patch(
+        f"/v1/sessions/{session_id}", json={"labels": {SCHEDULED_TASK_SOURCE_LABEL_KEY: "st_1"}}
+    )
+    assert response.status_code == 400, response.text
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in conv.labels

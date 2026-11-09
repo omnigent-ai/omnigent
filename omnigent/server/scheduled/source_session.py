@@ -134,6 +134,7 @@ def copy_session(
     dropped_label_keys: frozenset[str] = frozenset(),
     up_to_response_id: str | None = None,
     copy_model_settings: bool = True,
+    copy_inference_snapshot: bool = True,
     terminal_launch_args: list[str] | None = None,
     override_terminal_launch_args: bool = False,
 ) -> Conversation:
@@ -158,6 +159,8 @@ def copy_session(
     :param up_to_response_id: Copy only through this response, e.g.
         ``"resp_abc123"``. ``None`` copies everything.
     :param copy_model_settings: Keep the source's model and effort.
+    :param copy_inference_snapshot: Keep the source's saved provider binding;
+        a copy on another agent resolves its own instead.
     :param terminal_launch_args: Launch args for the copy, used when
         *override_terminal_launch_args* is set.
     :param override_terminal_launch_args: Use *terminal_launch_args* instead
@@ -184,6 +187,7 @@ def copy_session(
         title=title,
         agent_id=agent_id,
         copy_model_settings=copy_model_settings,
+        copy_inference_snapshot=copy_inference_snapshot,
         override_terminal_launch_args=terminal_launch_args,
         override_terminal_launch_args_set=override_terminal_launch_args,
         dropped_label_keys=_NEVER_COPIED_LABEL_KEYS | dropped_label_keys,

@@ -636,6 +636,14 @@ def create_scheduled_tasks_router(
             )
         if conv.agent_id is None:
             raise OmnigentError("The session has no agent to copy", code=ErrorCode.INVALID_INPUT)
+        from omnigent.server.scheduled.source_session import last_finished_response_id
+
+        # Runs start from the history through the last finished reply, so there must be one.
+        if await asyncio.to_thread(last_finished_response_id, conversation_store, conv.id) is None:
+            raise OmnigentError(
+                "The session has no finished reply to start an automation from yet",
+                code=ErrorCode.INVALID_INPUT,
+            )
         return conv
 
     async def _source_history_carry(agent: Agent) -> bool:
@@ -710,7 +718,13 @@ def create_scheduled_tasks_router(
         return copy
 
     async def _delete_session_quietly(session_id: str) -> None:
+        """Delete an unused copy with its file rows; blobs another session still uses stay."""
         try:
+            if file_store is not None:
+                orphaned = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
+                if artifact_store is not None:
+                    for blob_key in orphaned:
+                        await asyncio.to_thread(artifact_store.delete, blob_key)
             await conversation_store.delete_conversation(session_id)
         except Exception:
             _logger.exception("could not delete the unused session copy %s", session_id)

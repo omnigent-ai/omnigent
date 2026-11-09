@@ -4007,6 +4007,29 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("agent_id", "keeps_binding"), [("ag_1", True), ("ag_2", False)])
+async def test_a_run_on_another_agent_leaves_the_copys_provider_binding(
+    agent_id: str, keeps_binding: bool
+) -> None:
+    conv_store = FakeConversationStore()  # the copy runs ag_1
+    agents = FakeAgentStore({"ag_1": _FakeAgent("ag_1"), "ag_2": _FakeAgent("ag_2")})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(source_session_id="conv_source", agent_id=agent_id)}
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    deps = _deps(store, conversation_store=conv_store, agent_store=agents)
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (fork,) = conv_store.forked
+    assert fork["agent_id"] == agent_id
+    assert fork["copy_inference_snapshot"] is keeps_binding
+
+
+@pytest.mark.asyncio
 async def test_a_run_copy_that_cannot_bind_its_host_is_deleted() -> None:
     conv_store = FakeConversationStore()
 

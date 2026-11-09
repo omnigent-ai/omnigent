@@ -1242,6 +1242,12 @@ async def _discard_session(deps: FireDeps, conv: Conversation) -> None:
                     reason="scheduled-unused-session",
                     expected_root_fingerprint=fingerprint,
                 )
+        # A run's copy has file rows; blobs its source still uses stay.
+        if deps.file_store is not None:
+            orphaned = await asyncio.to_thread(deps.file_store.delete_all_for_session, conv.id)
+            if deps.artifact_store is not None:
+                for blob_key in orphaned:
+                    await asyncio.to_thread(deps.artifact_store.delete, blob_key)
         await deps.conversation_store.delete_conversation(conv.id)
     except Exception:
         _logger.exception("scheduled fire: could not delete the unused session %s", conv.id)
@@ -1778,9 +1784,9 @@ async def _copy_source_session_for_run(
     source = await asyncio.to_thread(
         deps.conversation_store.get_conversation, task.source_session_id
     )
+    agent_changed = source is not None and source.agent_id != task.agent_id
     dropped = run_copy_dropped_label_keys(
-        source.labels if source is not None else {},
-        agent_changed=source is not None and source.agent_id != task.agent_id,
+        source.labels if source is not None else {}, agent_changed=agent_changed
     )
     conv = await asyncio.to_thread(
         copy_session,
@@ -1797,6 +1803,8 @@ async def _copy_source_session_for_run(
         dropped_label_keys=dropped,
         up_to_response_id=up_to,
         copy_model_settings=False,
+        # The copy's provider binding belongs to its agent; another agent resolves its own.
+        copy_inference_snapshot=not agent_changed,
         terminal_launch_args=launch_args,
         override_terminal_launch_args=True,
     )
