@@ -73,9 +73,11 @@ to customize.
   query data, as New Chat does. Switching targets resets model and effort choices.
   Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog
   failures still allow Default. Modes that skip approval, including Antigravity's
-  only permission choice, appear when the server advertises
-  `scheduled_task_approval_skipping_modes`; older servers hide them, and an edit
-  there saves the harness default in place of a saved one.
+  only permission choice, appear only when the server advertises
+  `scheduled_task_approval_skipping_modes`. Without it the picker hides them and an
+  edit saves the harness default in place of a saved one; non-Claude harnesses also
+  need `scheduled_task_harness_settings` for that, so convert their overrides before
+  rolling back (Scheduler compatibility and rollback in `docs/AUTOMATIONS.md`).
 - `trigger-controls`: continued trigger templates
   show polling cadence instead of schedule controls, Run now, or next-run times.
   New templates use `automation_trigger_poll_minutes` from the server (10–240 minutes,
