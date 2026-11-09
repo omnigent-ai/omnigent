@@ -1338,6 +1338,7 @@ class HostProcess:
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
         # to retry credential discovery.
+        self._auth_context_lock = threading.Lock()
         self._auth_token_factory: Callable[[], str | None] | None = None
         self._auth_token_factory_resolved = False
         # This host's owning user, resolved once after the first accepted tunnel
@@ -4043,8 +4044,7 @@ class HostProcess:
         from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 
         path = quote(frame.session_id or "", safe="")
-        headers = self._build_connect_headers()
-        auth_factory = self._auth_token_factory
+        headers, auth_factory = self._build_connect_request()
         response = httpx.get(
             f"{self._server_url}/v1/sessions/{path}/agent/contents",
             headers=headers,
@@ -4056,11 +4056,13 @@ class HostProcess:
             response.status_code == 401
             and headers.get("Authorization")
             and MANAGED_HOST_TOKEN_HEADER not in headers
-            and self._auth_token_factory is auth_factory
+            and auth_factory is not None
         ):
             # Let the next request rediscover repaired credentials without replaying this one.
-            self._auth_token_factory = None
-            self._auth_token_factory_resolved = False
+            with self._auth_context_lock:
+                if self._auth_token_factory is auth_factory:
+                    self._auth_token_factory = None
+                    self._auth_token_factory_resolved = False
         return response
 
     async def _prewarm_model_options(self) -> bool:
@@ -5343,8 +5345,9 @@ class HostProcess:
         except (InvalidURI, InvalidStatus) as exc:
             if isinstance(exc, InvalidURI) or exc.response.status_code in (401, 403):
                 # Rediscover repaired credentials instead of reusing a rejected SDK cache.
-                self._auth_token_factory = None
-                self._auth_token_factory_resolved = False
+                with self._auth_context_lock:
+                    self._auth_token_factory = None
+                    self._auth_token_factory_resolved = False
             # The upgrade itself was rejected. Fail loud on permanent
             # failures (auth / authorization / outdated server); let the
             # reconnect loop retry transient ones.
@@ -5509,7 +5512,13 @@ class HostProcess:
             os.environ[USER_ID_ENV_VAR] = owner
 
     def _build_connect_headers(self) -> dict[str, str]:
-        """Build the WebSocket upgrade headers for the tunnel connection.
+        """Return upgrade headers using the current authentication context."""
+        return self._build_connect_request()[0]
+
+    def _build_connect_request(
+        self,
+    ) -> tuple[dict[str, str], Callable[[], str | None] | None]:
+        """Build request headers and retain the factory that supplied their bearer.
 
         Server-managed sandbox hosts authenticate with the launch token
         the server injected at spawn (:data:`HOST_TOKEN_ENV_VAR`); when
@@ -5522,7 +5531,7 @@ class HostProcess:
         the upgrade proceeds unauthenticated and the server/proxy
         decides.
 
-        :returns: Header mapping for the WS upgrade; carries either the
+        :returns: Header mapping and the factory that supplied its bearer; carries either the
             managed-host token header or — only when a token could be
             minted — ``{"Authorization": "Bearer <token>"}``.
         """
@@ -5556,13 +5565,19 @@ class HostProcess:
             proxy_bearer = read_proxy_bearer(self._server_url)
             if proxy_bearer:
                 headers["Authorization"] = f"Bearer {proxy_bearer}"
-            return headers
-        token = self._current_auth_token()
+            return headers, None
+        token, auth_factory = self._current_auth_context()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        return headers
+        return headers, auth_factory
 
     def _current_auth_token(self, *, initialize: bool = True) -> str | None:
+        """Return a bearer from the retained context, optionally initializing it."""
+        return self._current_auth_context(initialize=initialize)[0]
+
+    def _current_auth_context(
+        self, *, initialize: bool = True
+    ) -> tuple[str | None, Callable[[], str | None] | None]:
         """Return a bearer from the host's retained refreshable auth context.
 
         The first call builds the same factory the host tunnel already used.
@@ -5572,30 +5587,39 @@ class HostProcess:
         :param initialize: Build the factory when it has not been used yet.
             Runner launch passes ``False`` because it must only reuse the
             already-warm host context, never add auth work to the launch path.
-        :returns: Current bearer token, or ``None`` when credentials are not
-            available or this is a managed host authenticated by launch token.
+        :returns: Bearer and supplying factory; managed proxy tokens have no factory.
         """
         from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 
         if os.environ.get(HOST_TOKEN_ENV_VAR):
             from omnigent.util.proxy_bearer import read_proxy_bearer
 
-            return read_proxy_bearer(self._server_url)
+            return read_proxy_bearer(self._server_url), None
         try:
-            if not self._auth_token_factory_resolved:
+            with self._auth_context_lock:
+                resolved = self._auth_token_factory_resolved
+                factory = self._auth_token_factory
+            if not resolved:
                 if not initialize:
-                    return None
+                    return None, None
                 from omnigent.runner._entry import _make_auth_token_factory
 
-                factory = _make_auth_token_factory(server_url=self._server_url)
-                if factory is not None:
-                    self._auth_token_factory = factory
-                    self._auth_token_factory_resolved = True
-            if self._auth_token_factory is not None:
-                return self._auth_token_factory()
+                created_factory = _make_auth_token_factory(server_url=self._server_url)
+                # A reconnect may have selected a newer context during resolution.
+                with self._auth_context_lock:
+                    if (
+                        not self._auth_token_factory_resolved
+                        and self._auth_token_factory is factory
+                    ):
+                        if created_factory is not None:
+                            self._auth_token_factory = created_factory
+                            self._auth_token_factory_resolved = True
+                    factory = self._auth_token_factory
+            if factory is not None:
+                return factory(), factory
         except Exception:
             _logger.debug("Could not obtain auth token", exc_info=True)
-        return None
+        return None, None
 
     def _diagnostics_for(
         self, ws: websockets.asyncio.client.ClientConnection

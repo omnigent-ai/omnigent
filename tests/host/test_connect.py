@@ -410,8 +410,9 @@ async def test_skill_bundle_fetch_survives_a_deleted_ssl_cert_file(
 
 
 @pytest.mark.parametrize("login_repaired", [False, True])
+@pytest.mark.parametrize("factory_initialized", [False, True])
 async def test_skill_bundle_401_rediscovers_repaired_credentials(
-    monkeypatch: pytest.MonkeyPatch, login_repaired: bool
+    monkeypatch: pytest.MonkeyPatch, login_repaired: bool, factory_initialized: bool
 ) -> None:
     """A connected host can recover bundle reads after its saved login changes."""
     import httpx
@@ -440,10 +441,11 @@ async def test_skill_bundle_401_rediscovers_repaired_credentials(
     monkeypatch.setattr(entry_mod, "_make_auth_token_factory", make_factory)
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", respond)
     host = _make_host_process()
-    host._build_connect_headers()
+    if factory_initialized:
+        host._build_connect_headers()
     host._ever_connected = True
     frame = HostSkillsFrame("request", "session", "/workspace", "conv_test", "agent", "1")
-    if login_repaired:
+    if login_repaired and factory_initialized:
         credential = "repaired-token"
 
     first = host._fetch_skill_bundle(frame)
@@ -451,6 +453,8 @@ async def test_skill_bundle_401_rediscovers_repaired_credentials(
     assert first.status_code == 401
     assert len(requests) == 1  # The rejected request is not replayed.
 
+    if login_repaired and not factory_initialized:
+        credential = "repaired-token"
     second = host._fetch_skill_bundle(frame)
     assert second is responses[1]
     assert second.status_code == (200 if login_repaired else 401)
@@ -517,20 +521,43 @@ async def test_skill_bundle_failure_preserves_unrelated_auth_context(
     assert host._auth_token_factory_resolved
 
 
+@pytest.mark.parametrize("factory_initialized", [False, True])
+@pytest.mark.parametrize("replace_during_token", [False, True])
 async def test_skill_bundle_401_preserves_auth_replaced_during_request(
     monkeypatch: pytest.MonkeyPatch,
+    factory_initialized: bool,
+    replace_during_token: bool,
 ) -> None:
-    """A late response must not discard credentials resolved by a reconnect."""
+    """A rejected bearer cannot discard credentials selected during acquisition or transport."""
     import httpx
+
+    import omnigent.runner._entry as entry_mod
 
     monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
     host = _make_host_process()
-    host._auth_token_factory = lambda: "rejected-token"
-    host._auth_token_factory_resolved = True
     repaired_factory = Mock(return_value="repaired-token")
+    requests: list[httpx.Request] = []
+    token_calls: list[str] = []
+
+    def rejected_factory() -> str:
+        token_calls.append("rejected")
+        if replace_during_token:
+            host._auth_token_factory = repaired_factory
+            host._auth_token_factory_resolved = True
+        return "rejected-token"
+
+    make_factory = Mock(return_value=rejected_factory)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", make_factory)
+    if factory_initialized:
+        host._auth_token_factory = rejected_factory
+        host._auth_token_factory_resolved = True
 
     def respond(_transport: object, request: httpx.Request) -> httpx.Response:
-        host._auth_token_factory = repaired_factory
+        requests.append(request)
+        assert request.headers["Authorization"] == "Bearer rejected-token"
+        if not replace_during_token:
+            host._auth_token_factory = repaired_factory
+            host._auth_token_factory_resolved = True
         return httpx.Response(401, request=request)
 
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", respond)
@@ -538,6 +565,9 @@ async def test_skill_bundle_401_preserves_auth_replaced_during_request(
     assert host._fetch_skill_bundle(frame).status_code == 401
     assert host._auth_token_factory is repaired_factory
     assert host._auth_token_factory_resolved
+    assert len(requests) == 1
+    assert token_calls == ["rejected"]
+    assert make_factory.call_count == int(not factory_initialized)
     repaired_factory.assert_not_called()
 
 
@@ -7121,6 +7151,8 @@ def test_build_connect_headers_retains_auth_factory(
     monkeypatch.setattr(entry_mod, "_make_auth_token_factory", _make_factory)
 
     host = _host("https://app.example.databricksapps.com")
+    assert host._current_auth_token(initialize=False) is None
+    assert factory_builds == [] and token_calls == []
     first = host._build_connect_headers()
     second = host._build_connect_headers()
     launch_token = host._current_auth_token(initialize=False)
