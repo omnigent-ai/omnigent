@@ -522,6 +522,10 @@ _AUTO_MODE_BILLING_CONSENT = re.compile(
 # casing has already drifted across releases ("Search prompts" →
 # "search prompts:").
 _HISTORY_SEARCH_FOOTER_PREFIXES = ("search prompts:", "no matching prompt:")
+# Title row of the history search once it draws its own surface (2.1.295).
+_HISTORY_SEARCH_OVERLAY_TITLE = "search prompts"
+# Key hint in that surface's closing footer row, which no dialog carries.
+_HISTORY_SEARCH_OVERLAY_FOOTER_HINT = "enter to use"
 # Surfaces a confirm Enter must never land on: they are never a slash command's
 # own confirmation, and their default answer commits something the person did
 # not ask for — the ``/model`` picker writes a new global default into
@@ -6291,6 +6295,21 @@ def claude_pane_text_ready(pane: str) -> bool:
     return _claude_prompt_rendered(pane)
 
 
+def claude_pane_input_box_shown(pane: str) -> bool:
+    """
+    Return whether Claude's input box is on screen in any input mode.
+
+    Broader than :func:`claude_pane_text_ready`: ``!`` shell mode and the
+    ctrl+r prompt-history search also count, since the person is typing
+    there rather than being held up by a dialog. Dialogs are told apart by the
+    missing input box frame, not their titles, which a draft or reply may quote.
+
+    :param pane: Captured pane text, e.g. the watcher's last capture.
+    :returns: ``False`` when a dialog or picker replaces the input box.
+    """
+    return _composer_box(pane) is not None or _history_search_overlay_shown(pane)
+
+
 def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
     """Provider ``input_ready_probe``: Claude's composer is on screen.
 
@@ -7085,6 +7104,33 @@ def _history_search_footer_shown(pane: str) -> bool:
     # spell the footer out again.
     fragments = (re.split(r"\s{2,}", line.strip(), maxsplit=1)[0] for line in region)
     return " ".join(fragments).lower().startswith(_HISTORY_SEARCH_FOOTER_PREFIXES)
+
+
+def _history_search_overlay_shown(pane: str) -> bool:
+    """
+    Return whether the ctrl+r history search is drawn in place of the input box.
+
+    Claude Code 2.1.295 draws the search as its own surface: a full-width
+    rule, then a ``Search prompts · everywhere`` title row, closed by a
+    ``… Enter to use · Esc to cancel …`` footer. The region under the lowest
+    column-0 rule (the input box's closing rule while the box is up) must
+    open with the title and end with that footer, so neither transcript text
+    nor a scrollback row above a dialog drawn without such a rule can match.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the region under that rule, or the whole pane
+        when no such rule is on screen, is framed by the search's title and footer.
+    """
+    lines = [line for line in pane.splitlines() if line.strip()]
+    last_rule = max(
+        (i for i, line in enumerate(lines) if _box_rule_start(line) == 0), default=None
+    )
+    region = lines[last_rule + 1 :] if last_rule is not None else lines
+    if not region or not region[0].strip().lower().startswith(_HISTORY_SEARCH_OVERLAY_TITLE):
+        return False
+    # A narrow pane may wrap the footer, so its last rows are read as one.
+    footer = " ".join(" ".join(region[-3:]).split()).lower()
+    return _HISTORY_SEARCH_OVERLAY_FOOTER_HINT in footer
 
 
 def _is_box_rule(line: str) -> bool:

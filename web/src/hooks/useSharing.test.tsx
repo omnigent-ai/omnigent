@@ -1,7 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { usePublicSharingMaxLevel, useSetSharing } from "./useSharing";
+import {
+  usePublicSharingMaxLevel,
+  useSetSharing,
+  useSiblingSessionDestinations,
+} from "./useSharing";
 import { authenticatedFetch } from "@/lib/identity";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
@@ -57,4 +61,47 @@ describe("public sharing ceiling", () => {
     await result.current.update.mutateAsync({ public_sharing_max_level: "edit" });
     await waitFor(() => expect(result.current.ceiling.data).toBe("edit"));
   });
+});
+
+it("updates an already-mounted destination reader after an admin saves", async () => {
+  let policy = "current_host";
+  fetchMock.mockImplementation(async (url, options) => {
+    if (url === "/v1/sharing" && options?.method === "PUT") {
+      policy = JSON.parse(options.body as string).sibling_session_destinations;
+    }
+    return Response.json({ sibling_session_destinations: policy });
+  });
+  const { result } = renderHook(
+    () => ({
+      destinations: useSiblingSessionDestinations(true),
+      save: useSetSharing(),
+    }),
+    { wrapper: wrapper() },
+  );
+  await waitFor(() => expect(result.current.destinations.data).toBe("current_host"));
+  await act(() => result.current.save.mutateAsync({ sibling_session_destinations: "any_host" }));
+  await waitFor(() => expect(result.current.destinations.data).toBe("any_host"));
+});
+
+it.each([
+  ["current_host_or_new_sandbox", "current_host_or_new_sandbox"],
+  [undefined, "any_host"],
+  ["unknown", "current_host"],
+])("normalizes a saved %s destination before revalidation", async (value, expected) => {
+  fetchMock
+    .mockResolvedValueOnce(Response.json({ sibling_session_destinations: "any_host" }))
+    .mockResolvedValueOnce(Response.json({ sibling_session_destinations: value }))
+    .mockImplementation(() => new Promise(() => {}));
+  const { result } = renderHook(
+    () => ({
+      destinations: useSiblingSessionDestinations(true),
+      save: useSetSharing(),
+    }),
+    { wrapper: wrapper() },
+  );
+  await waitFor(() => expect(result.current.destinations.data).toBe("any_host"));
+  await act(() =>
+    result.current.save.mutateAsync({ sibling_session_destinations: "current_host" }),
+  );
+  await waitFor(() => expect(result.current.destinations.data).toBe(expected));
 });

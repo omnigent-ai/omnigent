@@ -386,7 +386,21 @@ async def test_multipart_input_keeps_attachment_in_session_namespace(
 ) -> None:
     env = startup_env
     agent = await create_test_agent(env.client)
-    metadata = {"host_type": "managed", "initial_input": _INPUT}
+    repositories = ["https://github.com/acme/api", "https://github.com/acme/web"]
+    monkeypatch.setattr(
+        type(env.app.state.sandbox_config),
+        "provider_ui_capabilities",
+        lambda _: {"modal": {"multi_repo": True}},
+    )
+    metadata = {"host_type": "managed", "initial_input": _INPUT, "workspaces": repositories}
+    launches = []
+    launch = routes_core._run_managed_launch
+
+    async def capture_launch(**kwargs: Any) -> None:
+        launches.append(kwargs)
+        await launch(**kwargs)
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", capture_launch)
     files = [("initial_files", ("context.txt", b"context that outlives the tab", "text/plain"))]
     if bundled:
         files.append(
@@ -400,6 +414,8 @@ async def test_multipart_input_keeps_attachment_in_session_namespace(
         files=files,
     )
     assert response.status_code == 201, response.text
+    await poll_until_async(lambda: bool(launches), timeout_s=5)
+    assert [repo.url for repo in launches[0]["repos"]] == repositories
     session_id = response.json()["session_id" if bundled else "id"]
     snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
     blocks = snapshot["pending_inputs"][0]["content"]
@@ -642,7 +658,7 @@ async def test_native_startup_registration_preserves_the_accepted_actor(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, user_id: str
 ) -> None:
     from omnigent.server.routes._auth_helpers import attribution_user
-    from omnigent.server.routes._sessions.orchestration import _record_codex_native_input
+    from omnigent.server.routes._sessions.orchestration import _record_native_terminal_input
 
     if user_id != "local":
         auth_client.headers["X-Forwarded-Email"] = user_id
@@ -659,10 +675,10 @@ async def test_native_startup_registration_preserves_the_accepted_actor(
         {**_INPUT, "data": {**_INPUT["data"], "stable_id": entry.id}}
     )
     try:
-        first = await _record_codex_native_input(
+        first = await _record_native_terminal_input(
             session_id, event, startup.conversations, attribution_user(user_id), entry.id, True
         )
-        retry = await _record_codex_native_input(
+        retry = await _record_native_terminal_input(
             session_id, event, startup.conversations, attribution_user(user_id), entry.id, True
         )
         assert first[0] is not None and first[1:] == (None, entry.id, True)

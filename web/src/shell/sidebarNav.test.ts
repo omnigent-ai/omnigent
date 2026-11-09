@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { orderSessionFamilies } from "@/lib/sessionFamilies";
 import {
   type ActiveChatOverride,
   bareConversationId,
@@ -194,6 +195,19 @@ describe("orderByPinnedTimestamp", () => {
     ]);
   });
 
+  it("uses the family pin position for every member without pinning each member", () => {
+    const member = pinned("peer", undefined, new Date(2026, 4, 14, 9));
+    member.family = {
+      id: "family",
+      representative_id: "representative",
+      pinned: true,
+      pinned_at: "500",
+    };
+    const other = pinned("other", 1000, new Date(2026, 4, 14, 9));
+    expect(orderByPinnedTimestamp([other, member]).map((row) => row.id)).toEqual(["peer", "other"]);
+    expect(member.labels["omnigent.pinned"]).toBeUndefined();
+  });
+
   it("does not mutate the input array", () => {
     const convA = pinned("conv_a", 2000, new Date(2026, 4, 14, 9));
     const convB = pinned("conv_b", 1000, new Date(2026, 4, 14, 8));
@@ -278,6 +292,20 @@ describe("pinOrderWrites", () => {
   it("is a no-op for a drop on itself or an unknown row", () => {
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "conv_0")).toEqual([]);
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "missing")).toEqual([]);
+  });
+
+  it("reorders family representatives without pinning their context rows", () => {
+    const rows = pins(100, 200, undefined);
+    const family = { id: "family", representative_id: "conv_1", pinned: true, pinned_at: "200" };
+    rows[1].family = family;
+    rows[2].family = family;
+    expect(pinOrderWrites(rows, "conv_0", "conv_1")).toEqual([{ id: "conv_0", pinnedAt: 201 }]);
+    rows[0].labels = { "omnigent.pinned": "200" };
+    expect(pinOrderWrites(rows, "new", "conv_1")).toEqual([
+      { id: "new", pinnedAt: 201 },
+      { id: "conv_1", pinnedAt: 202 },
+    ]);
+    expect(pinOrderWrites(rows, "conv_0", "conv_2")).toEqual([]);
   });
 
   it("produces values that orderByPinnedTimestamp sorts into the dragged order", () => {
@@ -854,6 +882,27 @@ describe("Custom order", () => {
       "history-active",
       "history-tie",
       "history",
+    ]);
+  });
+
+  it("keeps a family's custom slot through new members and representative promotion", () => {
+    const family = { id: "origin", representative_id: "a", pinned: false };
+    const a = { ...row("a", 1), family };
+    const b = { ...row("b", 200), family };
+    const x = row("x", 2);
+    const order = { base: "updated" as const, since: 100, ids: ["x", "origin"] };
+    const ordered = (rows: Conversation[]) =>
+      ids(
+        orderSessionFamilies(
+          sortConversations(rows, null, null, "updated_at", customSortOrder(order)),
+        ),
+      );
+    expect(ordered([a, b, x])).toEqual(["x", "a", "b"]);
+    const promoted = { ...b, family: { ...family, representative_id: "b" } };
+    expect(ordered([promoted, x])).toEqual(["x", "b"]);
+    expect(moveCustomOrder(order, [promoted, x], "b", "x", null, null)?.ids).toEqual([
+      "origin",
+      "x",
     ]);
   });
 

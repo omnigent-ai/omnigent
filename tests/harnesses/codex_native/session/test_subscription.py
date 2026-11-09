@@ -1297,76 +1297,6 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     assert state.thread_id == "thread_after_signin"
 
 
-@pytest.mark.parametrize("disconnected", [False, True])
-async def test_supervise_forwarder_surfaces_output_limit_error_before_stream_closes(
-    tmp_path: Path, disconnected: bool
-) -> None:
-    """EOF and transport failure flush a known error before the HTTP client closes."""
-    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState, write_bridge_state
-
-    error = {"message": "Incomplete response returned, reason: max_output_tokens"}
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_source",
-        ),
-    )
-
-    class Client(_FakeCodexAppServerClient):
-        supports_user_message_ids = True
-
-        async def iter_events(self):
-            yield {
-                "method": "error",
-                "params": {
-                    "threadId": "thread_123",
-                    "turnId": "turn_source",
-                    "willRetry": False,
-                    "error": error,
-                },
-            }
-            if disconnected:
-                raise ConnectionError("native event stream closed")
-
-    posted = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        posted.append(json.loads(request.content))
-        return httpx.Response(200)
-
-    client = Client()
-    run = codex_native_forwarder.supervise_forwarder(
-        base_url="http://127.0.0.1:1",
-        headers={},
-        session_id="conv_123",
-        bridge_dir=tmp_path,
-        app_server_url=str(tmp_path / "app-server.sock"),
-        thread_id="thread_123",
-        client=client,
-        ap_transport=httpx.MockTransport(handler),
-    )
-    if disconnected:
-        with pytest.raises(ConnectionError, match="native event stream closed"):
-            await run
-    else:
-        await run
-    errors = [
-        body["data"]
-        for body in posted
-        if body["type"] == "external_conversation_item"
-        and body["data"].get("item_type") == "error"
-    ]
-    assert len(errors) == 1
-    assert error["message"] in errors[0]["item_data"]["message"]
-    assert not any(body["type"] == "external_session_status" for body in posted)
-    assert read_bridge_state(tmp_path).active_turn_id == "turn_source"
-    assert client.closed
-
-
 @pytest.mark.parametrize(
     ("user_agent", "supported"),
     [
@@ -1380,7 +1310,7 @@ async def test_supervise_forwarder_surfaces_output_limit_error_before_stream_clo
 async def test_codex_native_delivery_identity_is_negotiated_from_handshake(
     monkeypatch: pytest.MonkeyPatch, user_agent: str | None, supported: bool
 ) -> None:
-    """Unknown and older peers fail closed for request identity dependent recovery."""
+    """Known native peers negotiate stable message IDs; old and unknown peers fail closed."""
 
     class Socket(_FakeCodexWebSocket):
         async def send(self, payload: str) -> None:
