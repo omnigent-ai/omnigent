@@ -22,7 +22,7 @@ interface EditorHost {
 const ARCLET_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ARCLET_RESERVED_PREFIX_PATTERN = /^arclet[_-]/i;
 
-/** Infer only the standard SSH aliases provisioned for Databricks hosts. */
+/** Infer only the standard SSH aliases for managed hosts. */
 export function inferHostSshTarget(host: EditorHost | null | undefined): string | null {
   if (host?.sandbox_provider === "databricks-arca") return "arca.ssh";
   if (typeof host?.name !== "string" || host.name !== host.name.trim()) return null;

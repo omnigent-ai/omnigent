@@ -41,3 +41,15 @@ async def test_sdk_agent_whose_spec_bypasses_approval_cannot_be_saved() -> None:
             agent=_AGENT,
             agent_cache=_AgentCache("claude-sdk", "bypassPermissions"),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "mode"),
+    [("claude-native", "bypassPermissions"), ("codex-native", "full-access")],
+)
+async def test_explicit_approval_skipping_mode_can_be_saved(harness: str, mode: str) -> None:
+    """A mode the task selects itself is shown in its settings, so it may skip approval."""
+    await validate_scheduled_permission_support(
+        permission_mode=mode, agent=_AGENT, agent_cache=_AgentCache(harness, None)
+    )

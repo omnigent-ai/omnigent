@@ -695,6 +695,108 @@ def test_persistent_draining_delivery_is_bounded_and_keeps_input_undelivered(
     assert state.active_turn_id == active_turn_id
 
 
+_PROJECT_CONFIG_REFUSAL = (
+    "failed to load configuration: Failed to read project hooks config file "
+    "/workspace/project/.codex/config.toml: Not a directory (os error 20)"
+)
+
+
+@pytest.mark.parametrize(
+    ("rpc_code", "data", "message", "failure_code"),
+    [
+        (
+            -32600,
+            {"type": "modelProviderMismatch", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            "codex_provider_changed",
+        ),
+        (
+            -32600,
+            {"type": "modelProviderNotConfigured", "modelProvider": "previous"},
+            "provider unavailable",
+            "codex_provider_changed",
+        ),
+        (-32600, {"type": "modelProviderMismatch"}, "provider unavailable", None),
+        (
+            -32600,
+            {"type": "anotherError", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            None,
+        ),
+        (
+            -32603,
+            {"type": "modelProviderMismatch", "currentModelProvider": "gateway"},
+            "provider unavailable",
+            None,
+        ),
+        (-32600, {}, _PROJECT_CONFIG_REFUSAL, "codex_project_config_invalid"),
+        (-32603, {}, _PROJECT_CONFIG_REFUSAL, None),
+        (-32600, {}, "other failure: " + _PROJECT_CONFIG_REFUSAL, None),
+        (
+            -32600,
+            {},
+            _PROJECT_CONFIG_REFUSAL.replace("Not a directory (os error 20)", "permission denied"),
+            None,
+        ),
+        (
+            -32600,
+            {},
+            _PROJECT_CONFIG_REFUSAL.replace("/.codex/config.toml", "/unrelated.toml"),
+            None,
+        ),
+    ],
+    ids=[
+        "mismatch",
+        "missing-provider",
+        "missing-detail",
+        "unrelated-type",
+        "internal-error",
+        "project-config",
+        "config-internal-error",
+        "config-quoted-error",
+        "config-other-cause",
+        "config-other-path",
+    ],
+)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_configuration_refusal_retains_input_without_changing_routing(
+    draining_client,
+    tmp_path: Path,
+    rpc_code: int,
+    data: dict[str, str],
+    message: str,
+    failure_code: str | None,
+    active_turn_id: str | None,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    before = read_bridge_state(tmp_path)
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError({"code": rpc_code, "message": message, "data": data})
+    ]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "keep this input")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is (failure_code is not None)
+    assert failure.preserve_session is (failure_code is not None)
+    assert failure.retryable is False
+    assert failure.code == failure_code
+    if failure_code is not None:
+        assert failure.remediation is not None
+        if failure_code == "codex_provider_changed":
+            assert "provider" in failure.remediation
+            assert "restart" in failure.remediation.lower()
+        else:
+            assert ".codex" in failure.remediation
+            assert "directory" in failure.remediation
+    assert draining_client.accepted_inputs == []
+    assert draining_client.connections == draining_client.closes == 1
+    assert [method for method, _ in draining_client.requests] == [
+        "turn/steer" if active_turn_id else "turn/start"
+    ]
+    assert read_bridge_state(tmp_path) == before
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -2727,6 +2829,39 @@ def test_stale_active_turn_mismatch_steer_recovers_to_newer_turn(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_b"
+
+
+def test_steer_ack_does_not_restore_a_turn_completed_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A steer accepted just before its turn ended leaves the bridge idle."""
+
+    class _CompletingSteerClient(_FakeCodexNativeClient):
+        """Complete the steered turn before acknowledging the steer."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Model the forwarder recording ``turn/completed`` ahead of the ack."""
+            type(self).requests.append((method, params))
+            assert method == "turn/steer", method
+            assert clear_active_turn_id_if_matches(tmp_path, "turn_a")
+            return {"result": {"turnId": "turn_a"}}
+
+    _CompletingSteerClient.requests = []
+    _CompletingSteerClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _CompletingSteerClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "follow up")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
 
 
 async def test_concurrent_steering_during_turn_start_is_not_dropped(

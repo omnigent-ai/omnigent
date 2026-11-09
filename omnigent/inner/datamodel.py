@@ -480,7 +480,7 @@ class DatabricksProfileBinding:
     ``oa_cred_*`` placeholder written into a materialized ``.databrickscfg``.
 
     :param profile: The profile (section) name in ``~/.databrickscfg``,
-        e.g. ``"dbc-adb7b1a3-9097"``. Selected in the sandbox with
+        e.g. ``"dbc-87654321-dcba"``. Selected in the sandbox with
         ``databricks --profile <name>`` (or as the default profile).
     """
 
