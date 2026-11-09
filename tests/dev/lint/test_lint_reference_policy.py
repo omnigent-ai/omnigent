@@ -298,38 +298,42 @@ def test_missing_base_fails_closed(repository: Path) -> None:
         check(repository, "missing-ref", "HEAD")
 
 
+@pytest.mark.parametrize("push_context", ["flag", "hook"])
 def test_cli_uses_push_range_and_does_not_echo_values(
-    repository: Path, prohibited_name: str
+    repository: Path, prohibited_name: str, push_context: str
 ) -> None:
     script = Path(__file__).resolve().parents[3] / "dev/lint/lint_reference_policy.py"
     base = git(repository, "rev-parse", "HEAD").decode().strip()
     (repository / "notes.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
     git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
-    for arguments in [[], ["--pre-push"]]:
-        result = subprocess.run(
-            [sys.executable, str(script), *arguments],
-            cwd=repository,
-            env={**os.environ, "PRE_COMMIT_FROM_REF": base, "PRE_COMMIT_TO_REF": "HEAD"},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 1
-        assert "notes.txt:1: prohibited reference" in result.stdout
-        assert prohibited_name not in result.stdout
+    arguments = ["--pre-push"] if push_context == "flag" else []
+    environment = {**os.environ, "PRE_COMMIT_FROM_REF": base, "PRE_COMMIT_TO_REF": "HEAD"}
+    if push_context == "hook":
+        environment["PRE_COMMIT_REMOTE_NAME"] = "origin"
+    result = subprocess.run(
+        [sys.executable, str(script), *arguments],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "notes.txt:1: prohibited reference" in result.stdout
+    assert prohibited_name not in result.stdout
     for missing in [
         ("PRE_COMMIT_FROM_REF",),
         ("PRE_COMMIT_TO_REF",),
         ("PRE_COMMIT_FROM_REF", "PRE_COMMIT_TO_REF"),
     ]:
-        environment = {**os.environ, "PRE_COMMIT_FROM_REF": base, "PRE_COMMIT_TO_REF": "HEAD"}
+        incomplete_environment = dict(environment)
         for variable in missing:
-            del environment[variable]
+            del incomplete_environment[variable]
         incomplete = subprocess.run(
-            [sys.executable, str(script), "--pre-push"],
+            [sys.executable, str(script), *arguments],
             cwd=repository,
-            env=environment,
+            env=incomplete_environment,
             capture_output=True,
             text=True,
             check=False,
@@ -359,9 +363,8 @@ def test_hook_and_ci_enforce_policy(repository: Path, prohibited_name: str, base
         for item in repo["hooks"]
         if item["id"].startswith("reference-policy")
     }
-    assert hooks["reference-policy"]["stages"] == ["pre-commit"]
-    assert hooks["reference-policy-push"]["stages"] == ["pre-push"]
-    assert hooks["reference-policy-push"]["entry"].endswith(" --pre-push")
+    assert set(hooks) == {"reference-policy"}
+    assert "stages" not in hooks["reference-policy"]
     assert 'lint_reference_policy.py --base "$POLICY_BASE" --head "$POLICY_HEAD"' in workflow
     assert "fetch-depth: 0" in workflow
     step = next(

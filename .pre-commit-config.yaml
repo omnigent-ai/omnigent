@@ -18,15 +18,6 @@ repos:
         entry: python3 dev/lint/lint_reference_policy.py
         pass_filenames: false
         always_run: true
-        stages: [pre-commit]
-
-      - id: reference-policy-push
-        name: reference policy (push)
-        language: system
-        entry: python3 dev/lint/lint_reference_policy.py --pre-push
-        pass_filenames: false
-        always_run: true
-        stages: [pre-push]
 
       - id: ruff-check
         name: ruff check

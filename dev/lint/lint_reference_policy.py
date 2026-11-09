@@ -168,7 +168,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default=os.environ.get("PRE_COMMIT_FROM_REF"))
     parser.add_argument("--head", default=os.environ.get("PRE_COMMIT_TO_REF"))
-    parser.add_argument("--pre-push", action="store_true", help="Require both push revisions.")
+    parser.add_argument(
+        "--pre-push",
+        action="store_true",
+        default="PRE_COMMIT_REMOTE_NAME" in os.environ,
+        help="Require both push revisions.",
+    )
     args = parser.parse_args()
     try:
         if args.pre_push and not (args.base and args.head):
