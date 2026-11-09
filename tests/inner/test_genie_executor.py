@@ -404,6 +404,7 @@ _STRICT_CATALOG = [
     },
     {
         "model": "gpt-5.5",
+        "defaultReasoningEffort": "medium",
         "supportedReasoningEfforts": [
             {"reasoningEffort": effort} for effort in ("low", "medium", "high", "xhigh")
         ],
@@ -412,12 +413,14 @@ _STRICT_CATALOG = [
 
 
 def _strict_session(
-    *, served_model: str | None = None
+    *, served_model: str | None = None, inherited_effort: str | None = None
 ) -> tuple[_CodexAppServerSession, list[tuple[str, dict[str, Any]]]]:
     """A strict genie app session whose scripted app-server lists ``_STRICT_CATALOG``.
 
     :param served_model: Model ``thread/start`` reports, e.g. ``"gpt-5.6-sol"``
         to mimic genie's silent swap; ``None`` echoes the requested model.
+    :param inherited_effort: Effort ``thread/start`` reports from the copied
+        config, e.g. ``"max"``; ``None`` reports none.
     :returns: The session and the ``(method, params)`` requests it sends.
     """
     session = _CodexAppServerSession(
@@ -437,7 +440,10 @@ def _strict_session(
             return {"result": {"data": _STRICT_CATALOG, "nextCursor": None}}
         if method == "thread/start":
             model = served_model or params["model"]
-            return {"result": {"thread": {"id": "thread-1"}, "model": model}}
+            result = {"thread": {"id": "thread-1"}, "model": model}
+            if inherited_effort is not None:
+                result["reasoningEffort"] = inherited_effort
+            return {"result": result}
         if method == "turn/start":
             turn = {"id": f"turn-{len(requests)}"}
             asyncio.get_running_loop().call_soon(
@@ -508,6 +514,20 @@ class TestStrictModelCatalog:
         assert "replaced the requested model 'gpt-5.5' with 'gpt-5.6-sol'" in events[-1].message
         assert session.thread_id is None
         assert "turn/start" not in [method for method, _ in requests]
+
+    @pytest.mark.parametrize(("inherited", "sent"), [("max", ["medium"]), ("high", [])])
+    async def test_default_effort_replaces_only_an_inherited_effort_the_model_lacks(
+        self, inherited: str, sent: list[str]
+    ) -> None:
+        """A copied ``max`` would fail on gpt-5.5, so Default runs its own default effort."""
+        session, requests = _strict_session(inherited_effort=inherited)
+        for _ in range(2):
+            events = await _strict_turn(session, model="gpt-5.5", effort=None)
+            assert not any(isinstance(event, ExecutorError) for event in events)
+        efforts = {
+            params["effort"] for method, params in requests if method == "thread/settings/update"
+        }
+        assert sorted(efforts) == sent
 
     async def test_checks_a_later_effort_against_the_thread_model(self) -> None:
         session, requests = _strict_session()

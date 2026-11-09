@@ -4046,6 +4046,22 @@ class _CodexAppServerSession:
                     retryable=False,
                 )
                 return
+            thread_model = self._thread_model
+            if self._strict_model_catalog and reasoning_effort is None and thread_model:
+                # A copied config effort the thread model does not list would reach
+                # the gateway and fail, so Default runs the model's own default.
+                entries = await self._list_models()
+                entry = _model_list_entry(entries, thread_model)
+                fallback = entry.get("defaultReasoningEffort") if entry is not None else None
+                inherited_error = self._default_effort is not None and _model_catalog_error(
+                    entries,
+                    thread_model,
+                    self._default_effort,
+                    cli_name=Path(self._codex_path).name,
+                )
+                if inherited_error and isinstance(fallback, str) and fallback:
+                    self._default_effort = fallback
+                    reasoning_effort = fallback
 
         assert self.thread_id is not None
         latest_user_content = _extract_latest_user_content(messages)
