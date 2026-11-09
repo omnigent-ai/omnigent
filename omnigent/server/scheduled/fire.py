@@ -866,7 +866,7 @@ async def _continue_session(
         return
     assert conv is not None
     agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
-    inherited = await _inherited_permission_problem(deps, task, agent)
+    inherited = await _inherited_permission_problem(deps, task, agent, continued=True)
     if inherited is not None:
         reason, error_code = inherited
         await recorder.finish(
@@ -970,10 +970,20 @@ def session_approval_skipping_mode(conv: Conversation) -> str | None:
 
 
 async def _inherited_permission_problem(
-    deps: FireDeps, task: ScheduledTask, agent: Any
+    deps: FireDeps, task: ScheduledTask, agent: Any, *, continued: bool = False
 ) -> tuple[str, str] | None:
-    """Why *task*, which selects no permission mode, may not run in its agent's default."""
-    if task.permission_mode is not None:
+    """Why *task* may not run in its agent's default permission mode.
+
+    A new session applies the task's own mode over that default, so any selected mode
+    opts out of it. A continued session keeps the agent's default, so only a task that
+    selects an approval-skipping mode itself opts in to running in one.
+    """
+    opted_in = (
+        task.permission_mode in APPROVAL_SKIPPING_PERMISSION_MODES
+        if continued
+        else task.permission_mode is not None
+    )
+    if opted_in:
         return None
     problem = await inherited_approval_skipping_problem(agent, deps.agent_cache)
     return None if problem is None else (problem, UNATTENDED_PERMISSION_ERROR_CODE)

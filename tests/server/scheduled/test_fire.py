@@ -3885,6 +3885,39 @@ async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fire
         assert "spec sets permission mode 'bypassPermissions'" in store.runs[0]["error"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_mode", "fires"),
+    [(None, False), ("auto", False), ("bypassPermissions", True)],
+)
+async def test_sdk_agent_default_mode_gates_a_continued_session(
+    task_mode: str | None, fires: bool
+) -> None:
+    """A continued session keeps the SDK spec's bypassPermissions default.
+
+    Only a task that itself selects an approval-skipping mode may continue in it; a
+    task selecting ``auto`` is refused before dispatch, since continuation does not
+    apply the task's mode over the agent's default.
+    """
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(permission_mode=task_mode)})
+    conv_store = _ExistingConversationStore(_continued_session())
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness="claude-sdk", permission_mode="bypassPermissions"),
+    )
+
+    launched = await _fire_once(deps)
+
+    if fires:
+        assert [conv.id for conv in launched] == ["conv_prev"]
+    else:
+        assert launched == []
+        assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
+        assert "spec sets permission mode 'bypassPermissions'" in store.runs[0]["error"]
+
+
 @pytest.mark.parametrize(
     ("labels", "launch_args", "expected"),
     [
