@@ -1683,13 +1683,20 @@ async def test_managed_wake_waits_for_runner_or_reports_timeout(
 
 
 @pytest.mark.parametrize(
-    "credential_recovers,host_reconnect",
-    [(False, None), (True, None), (True, "replaced"), (True, "absent")],
+    "credential_recovers,host_reconnect,replaced",
+    [
+        (False, None, False),
+        (False, None, True),
+        (True, None, False),
+        (True, "replaced", False),
+        (True, "absent", False),
+    ],
 )
 async def test_managed_launch_waits_for_runner_or_reports_timeout(
     monkeypatch: pytest.MonkeyPatch,
     credential_recovers: bool,
     host_reconnect: str | None,
+    replaced: bool,
 ) -> None:
     """Initial managed launch settlement also depends on the runner tunnel.
 
@@ -1709,7 +1716,10 @@ async def test_managed_launch_waits_for_runner_or_reports_timeout(
     assert launch is not None
     stages: list[tuple[str, str | None]] = []
     terminated: list[object] = []
-    sentinel_host = object()
+    sentinel_host = SimpleNamespace(
+        sandbox_id="replacement" if replaced else "initial", sandbox_provider="modal"
+    )
+    clear_binding = Mock(return_value=conv)
     waits: list[float] = []
     connection = SimpleNamespace(host_id=host_id, pending_runner_status={})
     replacement = SimpleNamespace(host_id=host_id, pending_runner_status={})
@@ -1768,6 +1778,8 @@ async def test_managed_launch_waits_for_runner_or_reports_timeout(
         managed=ManagedHostLaunch(
             host_id=host_id,
             workspace="/root/workspace",
+            sandbox_id="initial",
+            sandbox_provider="modal",
         ),
         sandbox_config=ManagedSandboxDeployment.single(
             ManagedSandboxConfig(
@@ -1780,6 +1792,7 @@ async def test_managed_launch_waits_for_runner_or_reports_timeout(
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
             get_conversation=lambda _sid: conv,
+            clear_host_binding=clear_binding,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=host_registry,
@@ -1792,13 +1805,20 @@ async def test_managed_launch_waits_for_runner_or_reports_timeout(
         assert stages[-1] == ("ready", None)
         assert len(waits) == 2 and waits[1] > waits[0]
         assert terminated == []
+        clear_binding.assert_not_called()
         if host_reconnect is not None:
             assert queried_connections[0] is connection
             assert queried_connections[-1] is replacement
     else:
         assert launch.error == "managed runner did not connect after launch"
         assert stages[-1] == ("failed", "managed runner did not connect after launch")
-        assert terminated == [sentinel_host]
+        clear_binding.assert_called_once_with(
+            session_id,
+            expected_host_id=host_id,
+            expected_sandbox_id="initial",
+            clear_profile=False,
+        )
+        assert terminated == ([] if replaced else [sentinel_host])
 
 
 async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
@@ -1862,6 +1882,7 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            clear_host_binding=lambda _sid, **_kwargs: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
@@ -1932,6 +1953,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
             get_conversation=lambda _sid: conv,
+            clear_host_binding=lambda _sid, **_kwargs: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=host_registry,

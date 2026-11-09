@@ -70,6 +70,9 @@ The system WebView must support AndroidX WebKit's multi-profile feature; the app
 fails closed rather than putting workspace cookies in the process-wide default
 profile. Expired web sessions recover from the retained native grant, and local
 workspace sign-out clears both that grant and its profile before reconnecting.
+On each return to the foreground the shell asks the workspace whether it still
+accepts the session and runs that same recovery when it doesn't, so a session
+the server has revoked is noticed without waiting for a request to fail.
 Build/redirect setup and the security model are documented in
 [`docs/databricks-oauth.md`](docs/databricks-oauth.md).
 

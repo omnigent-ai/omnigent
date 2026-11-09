@@ -426,7 +426,7 @@ def test_slash_rows_follow_the_row_grid(
     assert left == pytest.approx(right, abs=TOLERANCE)
 
 
-def test_mention_chips_follow_the_row_grid(
+def test_mention_tokens_overlay_the_textarea_text(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
@@ -459,15 +459,22 @@ def test_mention_chips_follow_the_row_grid(
         option = page.get_by_role("option", name=re.compile(name))
         expect(option).to_be_visible()
         option.get_by_role("button", name=name).click()
-    chips = [box(page.locator(f"span[title='{name}']").locator("..")) for name in names]
-    for chip in chips[1:]:
-        assert chip["height"] == pytest.approx(chips[0]["height"], abs=TOLERANCE)
-        assert_same_vertical_center(chips[0], chip)
-    gaps = [
-        chips[index + 1]["x"] - chips[index]["x"] - chips[index]["width"] for index in range(2)
-    ]
-    assert gaps[0] == pytest.approx(gaps[1], abs=TOLERANCE)
-    assert chips[0]["x"] == pytest.approx(box(composer)["x"], abs=TOLERANCE)
+    # Picked files are inline tokens; the mirror that paints them as pills must
+    # sit exactly over the textarea so each pill covers its own glyphs.
+    expect(composer).to_have_value("@alpha.md @beta.md @gamma.md ")
+    tokens = page.get_by_test_id("composer-mention-token")
+    expect(tokens).to_have_count(len(names))
+    pills = [box(tokens.nth(index)) for index in range(len(names))]
+    for pill in pills[1:]:
+        assert pill["height"] == pytest.approx(pills[0]["height"], abs=TOLERANCE)
+        assert_same_vertical_center(pills[0], pill)
+    # The first token starts the text, so its pill starts where the textarea's
+    # text does; the mirror is pinned to the textarea's top and height.
+    field = box(composer)
+    assert pills[0]["x"] == pytest.approx(field["x"], abs=TOLERANCE)
+    mirror = box(page.get_by_test_id("composer-highlight-overlay"))
+    for edge in ("y", "height"):
+        assert mirror[edge] == pytest.approx(field[edge], abs=TOLERANCE)
 
 
 @pytest.mark.parametrize("surface", ["landing", "live"])
@@ -974,6 +981,7 @@ def _assert_scrolls_to_reveal(composer: Locator, line: int, scroll_before: float
 @pytest.mark.parametrize(
     ("edit", "expected"),
     [
+        pytest.param("Alt+Enter", _ITEMS + "\n", id="alt-enter"),
         pytest.param("paste", _ITEMS + "\nalpha\nbeta", id="paste"),
         pytest.param(
             "Shift+Enter above more text", _ITEMS + "\n  - " + _TEXT_BELOW, id="list-mid-draft"
@@ -1036,7 +1044,7 @@ def test_inserted_lines_scroll_in_without_jumping_past_the_caret(
         pytest.param(10, 10, "8px 10px", True, id="padded-new-line-below-the-box"),
     ],
 )
-def test_shift_enter_scrolls_only_as_far_as_the_caret_line(
+def test_alt_enter_scrolls_only_as_far_as_the_caret_line(
     page: Page,
     chat_session_contract: ChatSessionContract,
     caret_line: int,
@@ -1056,9 +1064,8 @@ def test_shift_enter_scrolls_only_as_far_as_the_caret_line(
     scroll_before = _align_line(composer, aligned_line, "bottom")
     assert _line_in_view(composer, caret_line + 1) is not scrolls
 
-    # The caret ends a list item, so the new line continues the list.
-    composer.press("Shift+Enter")
-    expect(composer).to_have_value(draft[:caret] + "\n  - " + draft[caret:])
+    composer.press("Alt+Enter")
+    expect(composer).to_have_value(draft[:caret] + "\n" + draft[caret:])
     _assert_scrolls_to_reveal(composer, caret_line + 1, scroll_before)
 
 
