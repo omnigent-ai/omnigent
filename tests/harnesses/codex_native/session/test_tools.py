@@ -785,9 +785,9 @@ def test_command_execution_appends_sandbox_bypass_guidance_on_namespace_error() 
     # The raw bwrap output and the exit code are preserved verbatim...
     assert "No permissions to create new namespace" in tool_call.output
     assert "[exit code: 1]" in tool_call.output
-    # ...with actionable recovery guidance appended (the "Full access" preset
+    # ...with actionable recovery guidance appended (the "Full Access" preset
     # and the config sandbox_mode workaround).
-    assert "Full access" in tool_call.output
+    assert "Full Access" in tool_call.output
     assert "danger-full-access" in tool_call.output
 
 
@@ -798,5 +798,5 @@ def test_command_execution_leaves_normal_output_untouched() -> None:
     tool_call = codex_native_forwarder._command_execution_tool_call("call_1", item)
     assert tool_call is not None
     assert tool_call.output == "/repo\n"
-    assert "Full access" not in tool_call.output
+    assert "Full Access" not in tool_call.output
     assert "danger-full-access" not in tool_call.output

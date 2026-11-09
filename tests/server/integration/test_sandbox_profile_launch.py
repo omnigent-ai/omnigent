@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient, Response
@@ -46,7 +47,87 @@ from tests.server.integration._sandbox_profile_support import env as env
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.mark.parametrize("mode", ["profile", "ordinary", "flag-off"])
+@pytest.mark.parametrize("controller", [False, True])
+@pytest.mark.parametrize("operation", ["wake", "relaunch", "replace-missing"])
+async def test_unprofiled_session_survives_provider_opt_in(env, controller, operation):
+    from omnigent.onboarding.sandboxes.base import SandboxGoneError
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
+
+    class LegacyLauncher(_Launcher):
+        provider = env.provider
+
+    class UpgradedLauncher(_ProviderLauncher):
+        supports_sandbox_profile_lookup = controller
+        provision = _Launcher.provision
+        resume = _Launcher.resume
+
+        def list_profiles(self, context):
+            if context.sandbox_id is not None:
+                if env.recording.gone:
+                    raise SandboxGoneError("Legacy sandbox is gone")
+                return None
+            return super().list_profiles(context)
+
+    enabled_config = dataclasses.replace(
+        env.app.state.sandbox_config.default,
+        launcher_factory=lambda: UpgradedLauncher(env.recording, env.hosts, owner=_OWNER),
+    )
+    env.app.state.feature_flags = FeatureFlags(frozenset())
+    env.app.state.sandbox_profiles = None
+    env.app.state.sandbox_config = ManagedSandboxDeployment.single(
+        dataclasses.replace(
+            enabled_config,
+            manages_profiles=False,
+            launcher_factory=lambda: LegacyLauncher(env.recording, env.hosts, owner=_OWNER),
+        )
+    )
+    session_id = await env.settled(await env.create("json"))
+    before = env.conversations.get_conversation(session_id)
+    assert env.recording.allocations == [None]
+
+    env.app.state.feature_flags = FeatureFlags(frozenset({Feature.SANDBOX_PROFILES}))
+    env.app.state.sandbox_config = ManagedSandboxDeployment.single(enabled_config)
+    env.app.state.sandbox_profiles = SandboxProfileCatalog(
+        env.conversations, env.app.state.sandbox_config, env.hosts
+    )
+    env.hosts.set_offline(before.host_id)
+    env.recording.gone = operation == "replace-missing"
+    if operation == "relaunch":
+        env.app.state.managed_launches.begin(session_id)
+        await _run_managed_launch(
+            session_id=session_id,
+            owner=_OWNER,
+            sandbox_config=env.app.state.sandbox_config,
+            repos=(),
+            tracker=env.app.state.managed_launches,
+            conversation_store=env.conversations,
+            host_store=env.hosts,
+            host_registry=None,
+            tunnel_registry=None,
+            relaunch_host=env.hosts.get_host(before.host_id),
+            sandbox_profiles=env.catalog,
+        )
+    else:
+        await env.wake(session_id)
+    launch = env.app.state.managed_launches.get(session_id)
+    assert launch is None or launch.error is None
+    assert env.conversations.get_conversation(session_id).host_id == before.host_id
+    assert env.catalog.get_session_snapshot(session_id) is None
+    assert env.recording.selections == []
+    assert env.recording.allocations == [None] * (1 if operation == "wake" else 2)
+    if operation != "relaunch":
+        assert env.recording.resumes == [("profile-sandbox-1", None)]
+    response = await env.create("json")
+    assert response.status_code == 422
+    response = await env.client.post(
+        f"/v1/sessions/{session_id}/fork",
+        json={"host_type": "managed", "sandbox_provider": env.provider},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("mode", ["profile", "ordinary", "flag-off", "legacy-managed"])
 @pytest.mark.parametrize("launch_fails", [False, True])
 async def test_daemon_clear_then_launch_recovers_offline_runner(
     env, monkeypatch, mode, launch_fails
@@ -60,6 +141,16 @@ async def test_daemon_clear_then_launch_recovers_offline_runner(
         if mode == "flag-off":
             env.app.state.sandbox_profiles = None
         host_id = uuid.uuid4().hex
+        if mode == "legacy-managed":
+            env.hosts.register_managed_host(
+                host_id=host_id,
+                name="legacy-host",
+                user_id=_OWNER,
+                token="legacy-token",
+                provider=env.provider,
+                sandbox_id="legacy-sandbox",
+                token_expires_at=2_000_000_000,
+            )
         env.hosts.upsert_on_connect(host_id, "ordinary-host", _OWNER)
         response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
         assert response.status_code == 201, response.text
@@ -110,13 +201,23 @@ async def test_daemon_clear_then_launch_recovers_offline_runner(
     current = env.conversations.get_conversation(session_id)
     if launch_fails:
         assert current.runner_id == ("offline-runner" if mode == "profile" else None)
-        assert current.host_id == (host_id if mode == "profile" else None)
+        assert current.host_id == (host_id if mode in {"profile", "legacy-managed"} else None)
     else:
         assert current.runner_id == response.json()["runner_id"] != "offline-runner"
         assert current.host_id == host_id
     assert env.app.state.sandbox_profiles is None or env.catalog.get_session_snapshot(
         session_id
     ) == (env.profile if mode == "profile" else None)
+    if launch_fails and mode == "legacy-managed":
+        launch_fails = False
+        retry = await env.client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": session_id, "workspace": "/workspace"},
+        )
+        assert retry.status_code == 200, retry.text
+        current = env.conversations.get_conversation(session_id)
+        assert current.host_id == host_id and current.runner_id == retry.json()["runner_id"]
+        assert env.catalog.get_session_snapshot(session_id) is None
 
 
 @pytest.mark.parametrize("race", ["local-live", "fresh-heartbeat", "new-binding"])
@@ -933,7 +1034,7 @@ async def test_profile_acceptance_failure_rolls_back_session_and_preserves_reusa
 
 
 class TestProviderManagedProfiles:
-    async def test_legacy_unprofiled_managed_runner_cannot_hide_or_reuse_its_host(
+    async def test_legacy_unprofiled_runner_rotation_retains_host_after_opt_in(
         self, env: _Env, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         env.app.state.tunnel_registry = env.app.state.profile_test_tunnels
@@ -961,14 +1062,18 @@ class TestProviderManagedProfiles:
         response = await env.client.patch(
             f"/v1/sessions/{target_id}", json={"runner_id": "legacy-runner"}
         )
-        assert response.status_code == 422, response.text
-        assert env.conversations.get_conversation(target_id).runner_id is None
+        assert response.status_code == 200, response.text
+        target = env.conversations.get_conversation(target_id)
+        assert target.runner_id == "legacy-runner"
+        assert target.host_id == host_id and target.workspace == "/workspace"
+        assert env.catalog.get_session_snapshot(target_id) is None
         for runner_id in ("", "ordinary-runner"):
             response = await env.client.patch(
                 f"/v1/sessions/{source_id}", json={"runner_id": runner_id}
             )
-            assert response.status_code == 400, response.text
-            assert env.conversations.get_conversation(source_id).runner_id == "legacy-runner"
+            assert response.status_code == 200, response.text
+        assert env.catalog.admit_runner_connection("legacy-runner")
+        assert env.conversations.get_conversation(target_id).host_id == host_id
         assert env.recording.allocations == []
         assert env.recording.selections == []
 
@@ -1291,6 +1396,100 @@ class TestProviderManagedProfiles:
         replacement = env.hosts.get_host(after.host_id)
         assert replacement is not None
         assert (replacement.sandbox_id != host.sandbox_id) is gone
+
+    @pytest.mark.parametrize("revoked", [False, True])
+    async def test_offline_clear_continuation_keeps_the_accepted_profile(
+        self, env: _Env, monkeypatch: pytest.MonkeyPatch, revoked: bool
+    ) -> None:
+        """A claude-sdk ``/clear`` with no live runner hands on the sandbox profile.
+
+        The continuation is bound to the source's host alone, so it must carry
+        the accepted reference itself: after the source is deleted it still
+        wakes the sandbox. A profile revoked since it was accepted refuses the
+        clear, leaving no continuation and the source where it was.
+        """
+        source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+        source = env.conversations.get_conversation(source_id)
+        assert source is not None and source.host_id is not None
+        snapshot = env.catalog.get_session_snapshot(source_id)
+        assert snapshot is not None
+        monkeypatch.setattr(sessions_routes, "_resolve_harness", lambda *_a, **_k: "claude-sdk")
+        monkeypatch.setattr(sessions_routes, "_get_runner_client", AsyncMock(return_value=None))
+        sessions_before = env.persisted()[0]
+        if revoked:
+            env.recording.allowed_users.clear()
+
+        cleared = await env.client.post(
+            f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+        )
+
+        if revoked:
+            assert cleared.status_code == 403, cleared.text
+            assert env.persisted()[0] == sessions_before
+            after = env.conversations.get_conversation(source_id)
+            assert after is not None
+            assert (after.host_id, after.workspace, after.runner_id) == (
+                source.host_id,
+                source.workspace,
+                source.runner_id,
+            )
+            assert env.catalog.get_session_snapshot(source_id) == snapshot
+            return
+        assert cleared.status_code == 202, cleared.text
+        continuation_id = cleared.json()["session_id"]
+        continuation = env.conversations.get_conversation(continuation_id)
+        assert continuation is not None
+        assert (continuation.host_id, continuation.runner_id) == (source.host_id, None)
+        assert env.catalog.get_session_snapshot(continuation_id) == snapshot
+
+        deleted = await env.client.delete(f"/v1/sessions/{source_id}")
+        assert deleted.status_code == 200, deleted.text
+        env.recording.selections.clear()
+        await env.wake(continuation_id)
+
+        launch = env.app.state.managed_launches.get(continuation_id)
+        assert launch is None, launch.error
+        assert env.recording.selections
+        woken = env.conversations.get_conversation(continuation_id)
+        assert woken is not None and woken.host_id == source.host_id
+
+    async def test_refused_live_clear_keeps_the_runner_client(
+        self, env: _Env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``/clear`` its continuation would be refused for never frees the live client.
+
+        The profile is revoked, so the continuation can't take over the
+        sandbox; that is found before the runner is asked to drop the source's
+        SDK client, which would otherwise force a transcript replay next turn.
+        """
+        source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+        env.app.state.tunnel_registry = env.app.state.profile_test_tunnels
+        register_test_runner(env.app, "profile-runner", harnesses=["codex"], owner=_OWNER)
+        env.conversations.replace_runner_id(source_id, "profile-runner")
+        sent: list[str] = []
+
+        def runner(request: httpx.Request) -> httpx.Response:
+            sent.append(request.content.decode())
+            return httpx.Response(200, json={})
+
+        runner_client = AsyncClient(transport=httpx.MockTransport(runner), base_url="http://r")
+        monkeypatch.setattr(sessions_routes, "_resolve_harness", lambda *_a, **_k: "claude-sdk")
+        monkeypatch.setattr(
+            sessions_routes, "_get_runner_client", AsyncMock(return_value=runner_client)
+        )
+        sessions_before = env.persisted()[0]
+        env.recording.allowed_users.clear()
+
+        cleared = await env.client.post(
+            f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+        )
+
+        assert cleared.status_code == 403, cleared.text
+        assert not [body for body in sent if '"clear"' in body]
+        assert env.persisted()[0] == sessions_before
+        source = env.conversations.get_conversation(source_id)
+        assert source is not None and source.runner_id == "profile-runner"
+        await runner_client.aclose()
 
     @pytest.mark.parametrize("failure", ["revoked", "revision-retired", "unavailable"])
     async def test_wake_denial_prevents_resume_and_allocation(

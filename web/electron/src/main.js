@@ -21,6 +21,7 @@ const {
   Notification,
   clipboard,
   dialog,
+  globalShortcut,
   ipcMain,
   nativeImage,
   nativeTheme,
@@ -43,7 +44,8 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
-const { isLocalhostUrl, registerLocalhostCors } = require("./localhost_cors");
+const { registerLocalhostCors } = require("./localhost_cors");
+const { isLoopbackPreviewUrl } = require("./browserUrlPolicy");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -76,7 +78,7 @@ const { createReturnBanner } = require("./return_banner");
 const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
-const { registerBrowserIpc } = require("./browserIpc");
+const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
@@ -122,6 +124,12 @@ const {
   macApplicationMenu,
   settingsMenuItem,
 } = require("./settingsNavigation");
+const { createQuitConfirmation } = require("./quitConfirmation");
+const { acceleratorLabel, createGlobalShowShortcut } = require("./globalShowShortcut");
+const {
+  registerDesktopCommandStateReset,
+  sanitizeDesktopCommandState,
+} = require("./desktopCommands");
 const omnigentCli = require("./omnigent_cli");
 
 const serverManager = require("./server_manager");
@@ -152,7 +160,7 @@ function serverSelectorV2EnvForced() {
   return process.env.OMNIGENT_SERVER_SELECTOR_V2 === "1";
 }
 
-/** V2 defaults on for MDM-enabled Databricks macOS users. */
+/** V2 defaults on for macOS users with managed features enabled. */
 function serverSelectorV2Enabled() {
   // If enforced by the environment variable, enable.
   if (serverSelectorV2EnvForced()) {
@@ -171,7 +179,7 @@ function serverSelectorV2Enabled() {
     return false;
   }
 
-  // Enable on Databricks managed devices.
+  // Enable on managed devices.
   if (isDatabricksManaged) {
     return true;
   }
@@ -202,13 +210,13 @@ function serverSelectorV2DevUrl() {
 
 /**
  * Dev-only onboarding mock, driven by env vars so the wizard's four desktop
- * variants can be exercised in the real Electron shell without MDM / a real
- * server. Translates OMNIGENT_ONBOARDING_MOCK* into the `?mock=1&…` query the
+ * variants can be exercised in the real Electron shell without managed
+ * preferences or a real server. Translates OMNIGENT_ONBOARDING_MOCK* into the `?mock=1&…` query the
  * renderer's mockSetup.ts reads. Empty (no query) unless the mock is on, and
  * never active in a packaged build. See web/src/pages/onboarding/mockSetup.ts.
  *
  *   OMNIGENT_ONBOARDING_MOCK=1                 enable
- *   OMNIGENT_ONBOARDING_MOCK_MANAGED=url,url   MDM-preset servers
+ *   OMNIGENT_ONBOARDING_MOCK_MANAGED=url,url   managed preset servers
  *   OMNIGENT_ONBOARDING_MOCK_RECENTS=url,url   recent servers
  *   OMNIGENT_ONBOARDING_MOCK_INSTALLED=1       returning user
  *   OMNIGENT_ONBOARDING_MOCK_REMOTE_ENV=1      offer the remote environment
@@ -317,30 +325,28 @@ function developerModeEnabled() {
   });
 }
 
-/** Read the current macOS MDM-provided server list without persisting it. */
+/** Read the current managed server list from macOS without persisting it. */
 function managedServerUrls() {
   return getManagedServerUrls({ platform: process.platform, getUserDefault });
 }
 
-/** Display names for the MDM-provided servers, keyed by server URL. */
+/** Display names for managed servers, keyed by server URL. */
 function managedServerNames() {
   return getManagedServerNames({ platform: process.platform, getUserDefault });
 }
 
 /**
- * Whether the MDM-managed Databricks-internal-features flag is set. Read from
- * macOS on every call (never persisted), so profile changes apply live.
+ * Whether the managed features flag is set. Read from macOS on
+ * every call (never persisted), so profile changes apply live.
  */
 function databricksInternalFeaturesEnabled() {
   return getDatabricksInternalFeaturesEnabled({ platform: process.platform, getUserDefault });
 }
 
 /**
- * The Arca connect console: a shell-owned modal that asks consent by showing
- * the exact command, then streams its live output (replaces the bare native
- * dialog — same trust model, full transparency). The flow also de-duplicates:
- * a repeat connect while one is in flight re-focuses the existing console and
- * shares its outcome, so a refreshed SPA can always get back to it.
+ * The Arca connect console: a modal owned by the shell that asks consent by
+ * showing the exact command, then streams its live output. A repeat connect
+ * while one is in flight re-focuses the console and shares its outcome.
  */
 const arcaIdentities = createArcaIdentityStore();
 
@@ -454,8 +460,8 @@ function arcaAutoConnectFeatureEnabled() {
 
 /** Launch-time Arca auto-connect, behind the feature flag above. */
 const arcaAutoConnect = createArcaAutoConnect({
-  // Auto-connect needs arca itself: the MDM flag alone keeps the manual item
-  // (which explains what's missing) but shouldn't fail on every launch.
+  // Auto-connect needs arca itself: the managed flag alone keeps the manual
+  // item (which explains what's missing) but shouldn't fail on every launch.
   isEligible: (serverUrl) =>
     arcaAutoConnectFeatureEnabled() &&
     isDatabricksManagedServerUrl(serverUrl) &&
@@ -1366,6 +1372,11 @@ function applyDockIcon() {
  *   double-counted), then sums across origins.
  * @property {ReturnType<typeof createBrowserViewRegistry>} [browserRegistry]
  *   Per-conversation embedded-browser view registry for this window.
+ * @property {boolean} [unresponsive] True while the page is hung, so Close closes the
+ *   window instead of waiting on it.
+ * @property {import("./desktopCommands").DesktopCommandState | null} [desktopCommands]
+ *   Menu commands this window's SPA last reported it can act on (see
+ *   desktopCommands.js); absent until a supporting web bundle reports.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
@@ -1667,6 +1678,76 @@ const updater = createDesktopUpdater({
   updatesEnabled: !app.isPackaged || !isDevBuild,
 });
 
+/**
+ * Native consent before a system-wide shortcut registers. The IPC gate only proves the
+ * request came from the pinned server's page, not that the user asked for it.
+ */
+async function confirmGlobalShortcut(win, accelerator) {
+  const origin = win ? pinnedOrigin(win) : null;
+  if (!origin) return false;
+  let host = origin;
+  try {
+    host = new URL(origin).host;
+  } catch {
+    // Keep the full origin string if it doesn't parse.
+  }
+  const label = acceleratorLabel(accelerator, process.platform === "darwin");
+  const icon = nativeImage.createFromPath(ICON_PNG);
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    icon: icon.isEmpty() ? undefined : icon,
+    title: "Omnigent",
+    message: `Use ${label} to show Omnigent from any app?`,
+    detail:
+      `${host} wants to set a system-wide shortcut. While Omnigent is running, pressing ` +
+      `${label} in any app brings Omnigent to the front.\n\nOnly allow servers you trust.`,
+    buttons: ["Don't Allow", "Allow"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  return response === 1;
+}
+
+// The Quit menu item asks first, in a window's page; every other quit path
+// calls app.quit().
+const quitConfirmation = createQuitConfirmation({
+  isMac: process.platform === "darwin",
+  appName: () => app.name,
+  loadSettings,
+  saveSettings,
+  runningWork: () => serverManager.runningWork(),
+  ask: (detail) => {
+    const win = quitPromptWindow();
+    if (!win) return false;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+    sendDesktopCommand(win, "quit", { quitDetail: detail });
+    return true;
+  },
+  quit: () => app.quit(),
+});
+
+// "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
+// come forward from another app.
+const globalShowShortcut = createGlobalShowShortcut({
+  globalShortcut,
+  loadSettings,
+  saveSettings,
+  isMac: process.platform === "darwin",
+  show: () => {
+    const win = activeWindow();
+    if (!win) {
+      createWindow();
+      return;
+    }
+    if (win.isMinimized()) win.restore();
+    win.focus();
+    if (process.platform === "darwin") app.focus({ steal: true });
+  },
+});
+
 // Shell-owned About window: available from the native application menu even
 // while the parent is on setup or an external sign-in page.
 const aboutWindow = createAboutWindow({
@@ -1848,11 +1929,11 @@ function rememberOnboardingRunner(serverUrl, runner) {
 const ONBOARDING_RUNNER_TTL_MS = 10 * 60 * 1000;
 
 /**
- * CLI command for desktop host enrollment on `serverUrl`. Databricks-internal
- * windows use `isaac omni` behind the same effective gate as Arca (MDM flag +
- * Databricks-managed HTTPS server); every other window keeps the configured /
- * auto-detected public Omnigent CLI. Returns null when the selected launcher
- * is unavailable.
+ * CLI command for desktop host enrollment on `serverUrl`. Managed
+ * windows use `isaac omni` behind the same effective gate as Arca (managed
+ * features flag + managed HTTPS server); every other window keeps the configured
+ * or auto-detected Omnigent CLI. Returns null when the selected launcher is
+ * unavailable.
  *
  * @param {string | null | undefined} serverUrl
  * @returns {string | {
@@ -1974,7 +2055,7 @@ function rememberServerName(serverUrl, rawName) {
 
 /**
  * The name to show for a server outside trust prompts: the organization's
- * (MDM) name, else the server's own beside its host, else its host.
+ * managed name, else the server's own beside its host, else its host.
  *
  * @param {string} serverUrl
  * @param {string | null} [serverName] A name just read from the server's
@@ -2622,6 +2703,13 @@ function createWindow(targetUrl, opts = {}) {
       spellcheck: true,
     },
   });
+  const sendFullScreenState = () => {
+    if (!win.isDestroyed()) {
+      win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
+    }
+  };
+  win.on("enter-full-screen", sendFullScreenState);
+  win.on("leave-full-screen", sendFullScreenState);
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   // CLI config stores the API mount; Electron boots the browser-facing SPA.
@@ -2661,6 +2749,19 @@ function createWindow(targetUrl, opts = {}) {
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
+  });
+  // A hung page can't act on Close, so ⌘W closes its window directly meanwhile.
+  win.webContents.on("did-navigate", () => {
+    const state = windows.get(win);
+    if (state) state.unresponsive = false;
+  });
+  win.webContents.on("unresponsive", () => {
+    const state = windows.get(win);
+    if (state) state.unresponsive = true;
+  });
+  win.webContents.on("responsive", () => {
+    const state = windows.get(win);
+    if (state) state.unresponsive = false;
   });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
@@ -2754,6 +2855,17 @@ function createWindow(targetUrl, opts = {}) {
 
   registerNavigationFallbacks(win);
   registerBrowserViewDetachOnNavigate(win);
+  registerDesktopCommandStateReset(win.webContents, () => {
+    const state = windows.get(win);
+    if (!state?.desktopCommands) return;
+    state.desktopCommands = null;
+    if (BrowserWindow.getFocusedWindow() === win) buildMenu();
+  });
+  // macOS trackpad swipes step back and forward, like a browser.
+  win.on("swipe", (_event, direction) => {
+    if (direction === "left") goInHistory(win, "go-back");
+    else if (direction === "right") goInHistory(win, "go-forward");
+  });
 
   // Databricks workspace-hosted Omnigent renders inside the workspace's
   // top-nav chrome (the SPA is a workspace page). On a dedicated desktop
@@ -3534,11 +3646,11 @@ function changeServer() {
 }
 
 // ---------------------------------------------------------------------------
-// Application menu — start from Electron's standard menu (which wires up the
-// platform text-editing shortcuts: Cmd/Ctrl-A/C/V/X/Z via the Edit role) and
-// insert our custom "Server" submenu (New Window, Change Server…). This is the
-// Electron way to avoid a common bug: a hand-rolled menu that drops the Edit
-// roles kills those shortcuts inside webview text fields.
+// Application menu — the conventional desktop layout: the app menu (macOS),
+// File, Edit, View, Server, Window, and Help (Windows/Linux). Edit is built
+// from Electron's standard roles, which wire up the platform text-editing
+// shortcuts (Cmd/Ctrl-A/C/V/X/Z); a menu that drops those roles kills the
+// shortcuts inside webview text fields.
 // ---------------------------------------------------------------------------
 
 async function exportDiagnostics() {
@@ -3576,66 +3688,10 @@ function buildMenu() {
     const target = focusedConnectedWindow(BrowserWindow.getFocusedWindow(), windows);
     sendOpenPath(target, SETTINGS_PATH);
   });
-
+  // Update checks open the shell-owned About modal so the menu, update
+  // prompt, and About item all converge on one status/progress surface.
   /** @type {Electron.MenuItemConstructorOptions[]} */
-  const template = [];
-
-  // Settings belongs in the macOS app menu. Keep the standard app roles that
-  // Electron's composite appMenu role would otherwise provide.
-  if (isMac) {
-    template.push(macApplicationMenu(app.name, aboutItem, settingsItem));
-  }
-
-  /** @type {Electron.MenuItemConstructorOptions[]} */
-  const serverSubmenu = [
-    ...(!isMac ? [settingsItem, { type: "separator" }] : []),
-    {
-      id: "new_session",
-      label: "New Session",
-      accelerator: "CmdOrCtrl+N",
-      click: () => sendOpenPath(activeWindow(), "/"),
-    },
-    {
-      id: "new_window",
-      label: "New Window",
-      accelerator: "CmdOrCtrl+Shift+N",
-      click: () => newWindow(),
-    },
-    {
-      id: "new_server_window",
-      // A second server in its own window. The connection is per-window —
-      // it never replaces the saved default server.
-      label: "New Window on Different Server…",
-      click: () => createWindow(undefined, { ephemeral: true }),
-    },
-    { type: "separator" },
-    {
-      id: "change_server",
-      label: "Change Server…",
-      click: () => changeServer(),
-    },
-    {
-      // Shell-owned, so it works whichever web app version the server runs.
-      // Enabled only while the focused window's server sign-in is the shell's.
-      id: "sign_out_server",
-      label: "Sign Out of Server",
-      enabled: (() => {
-        const win = activeWindow();
-        return Boolean(win && canSignOutOfServer(win));
-      })(),
-      click: () => {
-        const win = activeWindow();
-        if (win && canSignOutOfServer(win)) void signOutOfServer(win);
-      },
-    },
-    { type: "separator" },
-    {
-      id: "export_diagnostics",
-      label: "Export Diagnostics…",
-      click: () => void exportDiagnostics(),
-    },
-    // Keep update checks in the shell-owned About modal so the menu, update
-    // prompt, and About item all converge on one status/progress surface.
+  const updateItems = [
     {
       id: "check_for_updates",
       label: "Check for Updates…",
@@ -3660,17 +3716,102 @@ function buildMenu() {
         }
       },
     },
-    { type: "separator" },
-    // `role: "close"` carries the standard CmdOrCtrl+W shortcut and closes
-    // the focused window. There is no File menu, so Close lives under Server.
-    { role: "close", label: "Close Window" },
   ];
+  const quitItems = quitConfirmation.menuItems();
+  // Commands the focused window's SPA performs. Their items stay disabled
+  // until that SPA reports it can run them (see desktopCommands.js).
+  const commandWindow = focusedConnectedWindow(BrowserWindow.getFocusedWindow(), windows);
+  const commandState = commandWindow ? windows.get(commandWindow)?.desktopCommands : null;
+  const canRun = (command) => commandState?.commands.has(command) === true;
+  const runCommand = (command) => sendDesktopCommand(desktopCommandTarget(command), command);
 
-  // Our custom Server menu, inserted right after the leftmost menu — index 1
-  // on macOS (after the app menu), first on Linux/Windows.
+  /** @type {Electron.MenuItemConstructorOptions[]} */
+  const template = [];
+
+  // macOS keeps About, updates, Settings, and Quit in the app menu, next to
+  // the standard roles Electron's composite appMenu role would otherwise provide.
+  if (isMac) {
+    template.push(
+      macApplicationMenu(app.name, {
+        about: aboutItem,
+        updates: updateItems,
+        settings: settingsItem,
+        quit: quitItems,
+      }),
+    );
+  }
+
   template.push({
-    label: "Server",
-    submenu: serverSubmenu,
+    label: "File",
+    submenu: [
+      {
+        id: "new_session",
+        label: "New Session",
+        accelerator: "CmdOrCtrl+N",
+        click: () => sendOpenPath(activeWindow(), "/"),
+      },
+      {
+        id: "new_window",
+        label: "New Window",
+        accelerator: "CmdOrCtrl+Shift+N",
+        click: () => newWindow(),
+      },
+      {
+        id: "new_server_window",
+        // A second server in its own window. The connection is per-window —
+        // it never replaces the saved default server.
+        label: "New Window on Different Server…",
+        click: () => createWindow(undefined, { ephemeral: true }),
+      },
+      { type: "separator" },
+      {
+        id: "new_terminal",
+        label: "New Terminal",
+        // Literal Control on every platform (⌃` on macOS), like most editors.
+        accelerator: "Ctrl+`",
+        enabled: canRun("new-terminal"),
+        click: () => runCommand("new-terminal"),
+      },
+      {
+        id: "new_browser_tab",
+        label: "New Browser Tab",
+        accelerator: "CmdOrCtrl+T",
+        enabled: canRun("new-browser-tab"),
+        click: () => focusAppAndSend("new-browser-tab"),
+      },
+      {
+        id: "focus_address_bar",
+        label: "Focus Address Bar",
+        accelerator: "CmdOrCtrl+L",
+        enabled: canRun("focus-address-bar"),
+        click: () => focusAppAndSend("focus-address-bar"),
+      },
+      {
+        id: "reopen_closed_tab",
+        label: "Reopen Closed Tab",
+        accelerator: "CmdOrCtrl+Shift+T",
+        enabled: canRun("reopen-closed-tab"),
+        click: () => focusAppAndSend("reopen-closed-tab"),
+      },
+      { type: "separator" },
+      // Windows and Linux have no app menu, so Settings and Quit live here.
+      ...(!isMac ? [settingsItem, { type: "separator" }] : []),
+      {
+        id: "close",
+        label: "Close",
+        accelerator: "CmdOrCtrl+W",
+        click: () => closeFocused(),
+      },
+      // `role: "close"` closes the focused window, including shell-owned ones
+      // such as About.
+      {
+        id: "close_window",
+        role: "close",
+        label: "Close Window",
+        accelerator: "CmdOrCtrl+Shift+W",
+      },
+      ...(!isMac ? [{ type: "separator" }, ...quitItems] : []),
+    ],
   });
 
   // The Edit roles (Undo/Redo/Cut/Copy/Paste/Select All) carry the platform
@@ -3708,7 +3849,12 @@ function buildMenu() {
   template.push({
     label: "View",
     submenu: [
-      { role: "reload" },
+      {
+        id: "reload",
+        label: "Reload",
+        accelerator: "CmdOrCtrl+R",
+        click: () => reloadFocused(),
+      },
       { role: "forceReload" },
       { type: "separator" },
       { role: "resetZoom" },
@@ -3718,15 +3864,114 @@ function buildMenu() {
       { role: "togglefullscreen" },
     ],
   });
-  template.push({ role: "windowMenu" });
+  template.push({
+    label: "Go",
+    submenu: [
+      {
+        id: "go_back",
+        label: "Back",
+        accelerator: "CmdOrCtrl+[",
+        enabled: canRun("go-back"),
+        click: () => goInHistory(desktopCommandTarget("go-back"), "go-back"),
+      },
+      {
+        id: "go_forward",
+        label: "Forward",
+        accelerator: "CmdOrCtrl+]",
+        enabled: canRun("go-forward"),
+        click: () => goInHistory(desktopCommandTarget("go-forward"), "go-forward"),
+      },
+      { type: "separator" },
+      {
+        id: "previous_tab",
+        label: "Previous Tab",
+        accelerator: "CmdOrCtrl+Shift+[",
+        enabled: canRun("previous-tab"),
+        click: () => focusAppAndSend("previous-tab"),
+      },
+      {
+        id: "next_tab",
+        label: "Next Tab",
+        accelerator: "CmdOrCtrl+Shift+]",
+        enabled: canRun("next-tab"),
+        click: () => focusAppAndSend("next-tab"),
+      },
+    ],
+  });
+  template.push({
+    label: "Session",
+    submenu: [
+      {
+        id: "toggle_pin_session",
+        label: commandState?.sessionPinned ? "Unpin Session" : "Pin Session",
+        accelerator: "CmdOrCtrl+Alt+P",
+        enabled: canRun("toggle-pin-session"),
+        click: () => runCommand("toggle-pin-session"),
+      },
+      {
+        id: "archive_session",
+        label: commandState?.sessionArchived ? "Unarchive Session" : "Archive Session",
+        accelerator: "CmdOrCtrl+Shift+A",
+        enabled: canRun("archive-session"),
+        click: () => runCommand("archive-session"),
+      },
+      {
+        id: "fork_session",
+        label: "Fork Session…",
+        accelerator: "CmdOrCtrl+Alt+F",
+        enabled: canRun("fork-session"),
+        click: () => runCommand("fork-session"),
+      },
+    ],
+  });
+  template.push({
+    label: "Server",
+    submenu: [
+      {
+        id: "change_server",
+        label: "Change Server…",
+        click: () => changeServer(),
+      },
+      {
+        // Shell-owned, so it works whichever web app version the server runs.
+        // Enabled only while the focused window's server sign-in is the shell's.
+        id: "sign_out_server",
+        label: "Sign Out of Server",
+        enabled: (() => {
+          const win = activeWindow();
+          return Boolean(win && canSignOutOfServer(win));
+        })(),
+        click: () => {
+          const win = activeWindow();
+          if (win && canSignOutOfServer(win)) void signOutOfServer(win);
+        },
+      },
+      { type: "separator" },
+      {
+        id: "export_diagnostics",
+        label: "Export Diagnostics…",
+        click: () => void exportDiagnostics(),
+      },
+    ],
+  });
+  // Off macOS the standard Window role adds its own CmdOrCtrl+W Close, which
+  // would bypass File → Close's focus-aware routing.
+  template.push(
+    isMac
+      ? { role: "windowMenu" }
+      : { label: "Window", submenu: [{ role: "minimize" }, { role: "zoom" }] },
+  );
   if (!isMac) {
-    template.push({ label: "Help", submenu: [aboutItem] });
+    template.push({
+      label: "Help",
+      submenu: [...updateItems, { type: "separator" }, aboutItem],
+    });
   }
 
   // Consolidate developer affordances behind one top-level menu. It is
   // always present in development and can be explicitly enabled in a packaged
-  // macOS app through the DeveloperMode user default. Restart-to-update stays
-  // in the production Server menu because it is a normal install path.
+  // macOS app through the DeveloperMode user default. Restart to Update stays
+  // with the production update items because it is a normal install path.
   if (developerModeEnabled()) {
     /** @type {Electron.MenuItemConstructorOptions[]} */
     const debugSubmenu = [
@@ -3940,7 +4185,7 @@ function guardAgentPartitionRequests(partition, registry) {
 function arcaPreviewRecoveryTargetForEvent(event, url) {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (
-    !isLocalhostUrl(url) ||
+    !isLoopbackPreviewUrl(url) ||
     !isPinnedOriginSender(event) ||
     !win ||
     win.isDestroyed() ||
@@ -4110,8 +4355,8 @@ const WORKSPACE_PICKER_PAGE = path.join(__dirname, "..", "workspace-picker", "in
 /**
  * Show the searchable workspace picker (workspace-picker/index.html) as a modal
  * of `parent`, and resolve with the chosen workspace (or null if dismissed).
- * Used for account-scoped (SPOG) logins to choose which workspace to bridge the
- * account token to. Sibling in spirit to genie-one-desktop's WorkspacePicker.
+ * Used for account-scoped logins to choose which workspace to bridge the
+ * account token to.
  *
  * @param {Electron.BrowserWindow} parent
  * @param {Array<{workspaceId: string, name: string, fqdn: string}>} workspaces
@@ -4184,8 +4429,16 @@ function pickWorkspaceForBridge(parent, workspaces, { signal } = {}) {
   });
 }
 
+// A mic click moves focus off the message box and back. macOS refuses Dictation
+// ("bottom line input") until it has registered the refocused field.
+const SYSTEM_DICTATION_FOCUS_SETTLE_MS = 150;
+
 function registerIpc() {
   registerWorkspacePickerIpc();
+  ipcMain.handle("omnigent:is-full-screen", (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return win?.isFullScreen() === true;
+  });
   ipcMain.handle("omnigent:cancel-server-connection", (event, requestId) => {
     if (!isSetupPageSender(event))
       throw new Error("Connection cancellation is only available to the setup page");
@@ -4393,7 +4646,7 @@ function registerIpc() {
   // Setup page → capabilities that gate wizard chrome. `v2Forced` means the env
   // var pins the selector on, so "Switch to legacy" can't take effect and the
   // menu item is disabled. `connectedBefore` (returning user) reads the raw
-  // recents, which — unlike get-recent-servers — still count MDM presets.
+  // recents, which — unlike get-recent-servers — still count managed presets.
   ipcMain.handle("omnigent:get-setup-capabilities", (event) => {
     if (!isSetupPageSender(event)) {
       throw new Error("get-setup-capabilities is only available to the setup page");
@@ -4625,6 +4878,77 @@ function registerIpc() {
     }
     const bar = BrowserWindow.fromWebContents(event.sender);
     if (bar && !bar.isDestroyed()) bar.close();
+  });
+
+  // Which native menu commands the SPA can act on right now, plus the open
+  // session's pin/archive state for the Session menu labels.
+  ipcMain.on("omnigent:set-desktop-command-state", (event, state) => {
+    if (!isPinnedOriginSender(event)) return;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    windows.get(win).desktopCommands = sanitizeDesktopCommandState(state);
+    if (BrowserWindow.getFocusedWindow() === win) buildMenu();
+  });
+
+  // Close (⌘W) on the new-session page, once the page's own dialog confirmed it.
+  ipcMain.handle("omnigent:close-window", (event) => {
+    if (!isPinnedOriginSender(event)) return false;
+    BrowserWindow.fromWebContents(event.sender)?.close();
+    return true;
+  });
+
+  // Quit (⌘Q), once the page's own dialog confirmed it.
+  ipcMain.handle("omnigent:confirm-quit", (event, options) => {
+    if (!isPinnedOriginSender(event)) return false;
+    quitConfirmation.confirmQuit({ dontAskAgain: options?.dontAskAgain === true });
+    return true;
+  });
+
+  // Composer mic on macOS when the server has no dictation: the same action as
+  // Edit > Start Dictation…, which types into the focused field. The page has
+  // focused its message box; focusing the page too takes native focus back
+  // from an embedded browser view.
+  ipcMain.handle("omnigent:start-system-dictation", async (event) => {
+    if (process.platform !== "darwin" || !isPinnedOriginSender(event)) return false;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const focused = () => !win.isDestroyed() && BrowserWindow.getFocusedWindow() === win;
+    if (!win || !focused()) return false;
+    win.webContents.focus();
+    await new Promise((resolve) => {
+      setTimeout(resolve, SYSTEM_DICTATION_FOCUS_SETTLE_MS);
+    });
+    // Dictation types into the key window, so don't start it if the user switched away.
+    if (!focused()) return false;
+    Menu.sendActionToFirstResponder("startDictation:");
+    return true;
+  });
+
+  // Settings → "Show Omnigent from anywhere" (opt-in, system-wide shortcut).
+  ipcMain.handle("omnigent:get-global-shortcut", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("get-global-shortcut is only available to a connected server page");
+    }
+    return globalShowShortcut.current();
+  });
+  ipcMain.handle("omnigent:set-global-shortcut", (event, setting) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("set-global-shortcut is only available to a connected server page");
+    }
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return globalShowShortcut.set(setting, (accelerator) =>
+      confirmGlobalShortcut(win, accelerator),
+    );
+  });
+  // The Settings recorder takes the next chord here, ahead of the page's shortcuts and the menu.
+  ipcMain.handle("omnigent:record-global-shortcut", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("record-global-shortcut is only available to a connected server page");
+    }
+    return globalShowShortcut.record(event.sender);
+  });
+  ipcMain.handle("omnigent:cancel-global-shortcut-recording", (event) => {
+    if (!isPinnedOriginSender(event)) return false;
+    globalShowShortcut.cancelRecording();
+    return true;
   });
 
   // Dock/taskbar badge. Each window's SPA reports ITS unread count; the
@@ -5009,12 +5333,9 @@ function registerIpc() {
     return result;
   });
 
-  // SPA → desktop feature gates the server can't know about, currently just
-  // the MDM-managed Databricks-internal flag (Arca). Scoped per window: the
-  // flag reads true only when the window's own server is Databricks-managed
-  // (a workspace mount or a Databricks App) — internal features must not
-  // light up against arbitrary self-hosted servers. Read fresh per call so
-  // applying/removing the profile takes effect without a restart.
+  // SPA → desktop feature gates. The managed features flag reads true only when
+  // the window's own server is managed, never on arbitrary self-hosted servers.
+  // Read fresh per call so profile changes apply without a restart.
   const canExtendArca = (event) =>
     databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event));
 
@@ -5068,16 +5389,13 @@ function registerIpc() {
     return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
   });
 
-  // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
-  // the window's server as a host, by running `isaac omni host --background`
-  // on the instance over `arca ssh`. Gated three ways: pinned-origin sender,
-  // the MDM flag re-checked HERE (the renderer is not trusted to have checked
-  // it), and user consent in the shell-owned connect console — which shows
-  // the exact command and streams its live output (arca_connect_window.js).
-  // A connect already in flight is re-surfaced (console focused, outcome
-  // shared), never refused; the runner itself enforces CONNECT_TIMEOUT_MS so
-  // a wedged command always settles. No local process outlives the connect:
-  // the enrolled host keeps its own outbound tunnel from the Arca box.
+  // SPA → connect the user's Arca instance to the window's server as a host,
+  // by running `isaac omni host --background` on the instance over `arca ssh`.
+  // Gated three ways: pinned-origin sender, the managed features flag re-checked
+  // HERE (the renderer is not trusted to have checked it), and user consent in
+  // the connect console (arca_connect_window.js), which shows the exact command.
+  // A connect already in flight is re-surfaced, never refused. The runner
+  // enforces CONNECT_TIMEOUT_MS so a wedged command always settles.
   ipcMain.handle("omnigent:arca-connect", async (event) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("arca-connect is only available to a connected server page");
@@ -5087,8 +5405,8 @@ function registerIpc() {
     }
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
-    // Same scope as get-desktop-features, re-checked here: an Arca box may
-    // only be enrolled against a Databricks-managed server.
+    // Same scope as get-desktop-features, re-checked here: an Arca instance may
+    // only be enrolled against a managed server.
     if (!isDatabricksManagedServerUrl(serverUrl)) {
       return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
     }
@@ -5143,9 +5461,8 @@ function registerIpc() {
     }
   });
 
-  // SPA → renew this machine's dbcert from the expired-dbcert banner; Arca
-  // Companion then copies it to the user's boxes. Same gates as arca-extend.
-  // Clicks from several windows share one sign-in.
+  // SPA → renew this machine's dbcert from the expired-dbcert banner. Same
+  // gates as arca-extend. Clicks from several windows share one sign-in.
   let dbcertPreflight = null;
   let dbcertGeneration = 0;
   let dbcertRefresh = null;
@@ -5392,6 +5709,135 @@ function focusAndRestore(win) {
   if (!win || win.isDestroyed()) return;
   if (win.isMinimized()) win.restore();
   win.focus();
+}
+
+/**
+ * The focused connected window, when its SPA reported it can run `command`.
+ *
+ * @param {string} command
+ * @returns {BrowserWindow | null}
+ */
+function desktopCommandTarget(command) {
+  const target = focusedConnectedWindow(BrowserWindow.getFocusedWindow(), windows);
+  return target && windows.get(target)?.desktopCommands?.commands.has(command) ? target : null;
+}
+
+/**
+ * The window to ask in before quitting: the focused one, else any other whose
+ * SPA can ask.
+ *
+ * @returns {BrowserWindow | null}
+ */
+function quitPromptWindow() {
+  // A hung page can't show the dialog or answer it, so it doesn't count.
+  return (
+    [BrowserWindow.getFocusedWindow(), ...windows.keys()].find(
+      (win) =>
+        focusedConnectedWindow(win, windows) &&
+        !windows.get(win).unresponsive &&
+        windows.get(win).desktopCommands?.commands.has("quit"),
+    ) ?? null
+  );
+}
+
+/**
+ * Hand a native menu command to a window's SPA (see desktopCommands.js).
+ *
+ * @param {BrowserWindow | null} win
+ * @param {string} command
+ * @param {{ browserViewId?: string | null, closingQuits?: boolean, quitDetail?: string | null }} [extra]
+ */
+function sendDesktopCommand(win, command, extra = {}) {
+  if (!win || win.isDestroyed()) return;
+  try {
+    win.webContents.send("omnigent:desktop-command", { command, ...extra });
+  } catch {
+    // Window torn down between the check and the send; ignore.
+  }
+}
+
+/**
+ * The embedded browser view (by view ID) holding keyboard focus in `win`, or
+ * null. Only the attached view can hold focus, so checking it is enough.
+ *
+ * @param {BrowserWindow} win
+ * @returns {string | null}
+ */
+function focusedBrowserViewId(win) {
+  const registry = windows.get(win)?.browserRegistry;
+  const viewId = registry?.activeConversationId() ?? null;
+  if (viewId === null) return null;
+  try {
+    return registry.get(viewId)?.view.webContents.isFocused() ? viewId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Close (⌘W / Ctrl+W). A connected SPA closes whatever has focus: a workspace
+ * tab, the open session, or the window itself after a confirmation. Shell-owned
+ * windows (About, the find bar) and pages without that support close the window.
+ */
+function closeFocused() {
+  const focused = BrowserWindow.getFocusedWindow();
+  if (!focused || focused.isDestroyed()) return;
+  const target = desktopCommandTarget("close");
+  if (target && !windows.get(target)?.unresponsive) {
+    sendDesktopCommand(target, "close", {
+      browserViewId: focusedBrowserViewId(target),
+      // Off macOS, closing the last window quits; the page's confirmation says so.
+      closingQuits: process.platform !== "darwin" && windows.size === 1,
+    });
+    return;
+  }
+  focused.close();
+}
+
+/**
+ * Back/Forward. A focused embedded web page steps its own history, as in a
+ * browser; otherwise the page steps in-app history.
+ *
+ * @param {BrowserWindow | null} win
+ * @param {"go-back" | "go-forward"} command
+ */
+function goInHistory(win, command) {
+  if (!win || !windows.get(win)?.desktopCommands?.commands.has(command)) return;
+  const viewId = focusedBrowserViewId(win);
+  const view = viewId ? windows.get(win).browserRegistry.get(viewId)?.view : null;
+  if (view) {
+    (command === "go-back" ? goBack : goForward)(view.webContents);
+    return;
+  }
+  sendDesktopCommand(win, command);
+}
+
+/**
+ * Reload (⌘R). A focused embedded web page reloads itself instead of the app
+ * around it; otherwise the page decides (its browser toolbar, else the app).
+ */
+function reloadFocused() {
+  const focused = BrowserWindow.getFocusedWindow();
+  if (!focused || focused.isDestroyed()) return;
+  const target = desktopCommandTarget("reload");
+  const viewId = target ? focusedBrowserViewId(target) : null;
+  const view = viewId ? windows.get(target).browserRegistry.get(viewId)?.view : null;
+  if (view) view.webContents.reload();
+  // A hung page can't run its own reload, so its window reloads directly.
+  else if (target && !windows.get(target).unresponsive) sendDesktopCommand(target, "reload");
+  else (target ?? focused).webContents.reload();
+}
+
+/**
+ * Take keyboard focus back from an embedded page, then hand `command` to the
+ * app, naming the page that had focus so the app can return to it.
+ */
+function focusAppAndSend(command) {
+  const target = desktopCommandTarget(command);
+  if (!target) return;
+  const browserViewId = focusedBrowserViewId(target);
+  target.webContents.focus();
+  sendDesktopCommand(target, command, { browserViewId });
 }
 
 /**
@@ -5675,6 +6121,7 @@ if (!gotLock) {
     registerSessionExpiryAccess();
     registerIpc();
     buildMenu();
+    globalShowShortcut.apply();
     // Patch PATH for GUI-launched Electron on macOS/Linux:
     // A desktop launcher inherits a minimal system PATH that omits directories like
     // /opt/homebrew/bin and ~/.nvm/... where CLI tools (claude, codex, tmux) live.
@@ -5707,7 +6154,9 @@ if (!gotLock) {
       createWindow();
     }
     updater.init();
-    app.on("browser-window-focus", () => updateSignOutMenuItem());
+    // The menu reflects the focused window: Sign Out of Server, and the
+    // commands (and Pin/Archive labels) its SPA reported.
+    app.on("browser-window-focus", () => buildMenu());
 
     app.on("activate", () => {
       // macOS: re-create the window when the dock icon is clicked and none
@@ -5718,6 +6167,7 @@ if (!gotLock) {
     });
   });
 
+  app.on("will-quit", () => globalShortcut.unregisterAll());
   app.on("window-all-closed", () => {
     // macOS apps typically stay alive until Cmd-Q.
     if (process.platform !== "darwin") app.quit();
@@ -5751,6 +6201,7 @@ if (!gotLock) {
   };
   app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
+    quitConfirmation.quitStarted();
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
     // re-enter shutdown() concurrently — just keep deferring until the first

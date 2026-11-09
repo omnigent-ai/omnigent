@@ -153,11 +153,16 @@ def test_every_harness_is_covered_by_a_real_builder():
 
 
 @pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))
-def test_real_builder_preserves_forge_cli_config_paths(harness, hostile_env, monkeypatch):
-    paths = {"GH_CONFIG_DIR": "/test/gh", "GLAB_CONFIG_DIR": "/test/glab"}
-    monkeypatch.setattr("os.environ", {**hostile_env, **paths})
+def test_real_builder_preserves_forge_cli_settings(harness, hostile_env, monkeypatch):
+    settings = {
+        "GH_CONFIG_DIR": "/test/gh",
+        "GLAB_CONFIG_DIR": "/test/glab",
+        "GITLAB_HOST": "git.example.test:8443",
+        "GLAB_HOST": "git.example.test:8443",
+    }
+    monkeypatch.setattr("os.environ", {**hostile_env, **settings})
     env = SPAWN_ENV_BUILDERS[harness]()
-    assert {name: env.get(name) for name in paths} == paths
+    assert {name: env.get(name) for name in settings} == settings
     assert not (set(env) & CANARY_SECRETS.keys())
 
 
@@ -191,6 +196,15 @@ def test_real_builders_pass_node_extra_ca_certs(monkeypatch):
     for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
         env = build()
         assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/corp-ca.pem", harness
+
+
+def test_real_builders_pass_git_ca_paths(monkeypatch):
+    """git's CA paths must survive filtering, or git over HTTPS breaks behind a TLS proxy."""
+    git_ca = {"GIT_SSL_CAINFO": "/etc/corp-ca.pem", "GIT_SSL_CAPATH": "/etc/corp-certs"}
+    monkeypatch.setattr("os.environ", dict(git_ca))
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert {name: env.get(name) for name in git_ca} == git_ca, harness
 
 
 def test_real_builders_pass_ssh_auth_sock(monkeypatch):

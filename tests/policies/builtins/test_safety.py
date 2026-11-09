@@ -275,6 +275,60 @@ def test_ask_on_os_tools_asks_for_codex_in_process_shell_tool() -> None:
     assert "rm -rf /" in result["reason"]
 
 
+# ── ask_on_os_tools: Omnigent sys_terminal_* tools ───────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "expected_preview"),
+    [
+        ("sys_terminal_launch", {"terminal": "bash", "session": "s1"}, "bash/s1"),
+        (
+            "sys_terminal_launch",
+            {"terminal": "bash", "session": "s1", "cwd": "/repo"},
+            "bash/s1 cwd='/repo'",
+        ),
+        (
+            "sys_terminal_send",
+            {"terminal": "bash", "session": "s1", "text": "make test"},
+            "bash/s1 text='make test' keys='Enter'",
+        ),
+        (
+            "sys_terminal_send",
+            {"terminal": "bash", "session": "s1", "text": "make test", "keys": ""},
+            "bash/s1 text='make test' keys=''",
+        ),
+        (
+            "sys_terminal_send",
+            {"terminal": "bash", "session": "s1", "keys": "C-c"},
+            "bash/s1 keys='C-c'",
+        ),
+        ("sys_terminal_read", {"terminal": "bash", "session": "s1"}, "bash/s1"),
+        ("sys_terminal_close", {"terminal": "bash", "session": "s1"}, "bash/s1"),
+    ],
+    ids=["launch", "launch-cwd", "send-text", "send-no-keys", "send-keys", "read", "close"],
+)
+def test_ask_on_os_tools_asks_for_sys_terminal_tools(
+    tool: str, args: dict[str, str], expected_preview: str
+) -> None:
+    """Terminal tools that run, read, or stop a process trigger ASK.
+
+    ``sys_terminal_launch`` and ``sys_terminal_send`` run commands like
+    ``sys_os_shell``, so without them in the OS-tool set the policy would let
+    an agent run commands through a terminal with no approval prompt. The
+    preview names the target terminal and, for a send, the typed text and the
+    keys pressed after it (``Enter`` when omitted, as the tool does).
+    """
+    result = ask_on_os_tools(tc(tool, args))
+    assert result["result"] == "ASK"
+    assert f"{tool}({expected_preview!r})" in result["reason"]
+
+
+def test_ask_on_os_tools_allows_sys_terminal_list() -> None:
+    """``sys_terminal_list`` only names terminals, so it passes through."""
+    result = ask_on_os_tools(tc("sys_terminal_list", {}))
+    assert result["result"] == "ALLOW"
+
+
 def test_ask_on_os_tools_allows_non_os_tool() -> None:
     """A tool that is not a file/shell operation passes through.
 
@@ -650,7 +704,34 @@ def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: st
     assert result["result"] == "ASK"
     assert "nightly triage" in result["reason"]
     assert "rrule=FREQ=DAILY;BYHOUR=9" in result["reason"]
-    assert "Effective task permission mode: agent default (no task override)" in result["reason"]
+    assert "Task permission setting: agent default (no task override)" in result["reason"]
+
+
+def test_ask_on_scheduled_task_change_notes_a_continued_sessions_own_mode() -> None:
+    """A continuing task's setting doesn't change the mode of the session it continues."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_create",
+            "data": {
+                "arguments": {
+                    "name": "follow up",
+                    "prompt": "Check the deploy.",
+                    "permission_mode": "dontAsk",
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "session_mode": "continue",
+                    "session_id": "conv_1",
+                },
+            },
+        }
+    )
+    assert result["result"] == "ASK"
+    assert (
+        "Task permission setting: dontAsk (skips approval prompts, so unattended runs act "
+        "without asking); a continued session keeps its own permission mode"
+    ) in result["reason"].splitlines()
 
 
 def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -> None:
@@ -696,7 +777,10 @@ def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -
     ):
         assert setting in reason, reason
     assert prompt in reason
-    assert "Effective task permission mode: bypassPermissions" in reason
+    assert (
+        "Task permission setting: bypassPermissions "
+        "(skips approval prompts, so unattended runs act without asking)"
+    ) in reason.splitlines()
 
 
 @pytest.mark.parametrize(
@@ -916,10 +1000,7 @@ def test_legacy_scheduled_task_approval_identifies_omitted_fields(
                 )
             else:
                 expected_permission = "unchanged (not supplied by legacy caller)"
-        assert (
-            f"Effective task permission mode: {expected_permission}"
-            in result["reason"].splitlines()
-        )
+        assert f"Task permission setting: {expected_permission}" in result["reason"].splitlines()
         assert result["reason"].endswith(
             f"Full automation instructions:\n{expected_prompt}\nApprove?"
         )

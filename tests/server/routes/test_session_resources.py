@@ -11,7 +11,7 @@ import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock
 from urllib.parse import quote
 
@@ -46,6 +46,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 
@@ -1511,16 +1512,24 @@ async def test_create_terminal_proxies_to_runner(
     fake_runner = _FakeRunnerClient(payload=terminal_resource)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.post(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
-        json={"terminal": "bash", "session_key": "s1"},
-    )
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+            json={"terminal": "bash", "session_key": "s1"},
+        )
 
     assert resp.status_code == 200
     assert resp.json()["id"] == "terminal_bash_s1"
     assert fake_runner.calls == [
         ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
+    (finished,) = [row for row in rows if row["event_name"] == "terminal_create_finished"]
+    attributes = cast(dict[str, str], finished["attributes"])
+    assert finished["session_id"] == "79b22ebd2309e48fdeb450c65611d51b"
+    assert attributes["terminal"] == "bash"
+    assert attributes["status_code"] == "200"
+    for stage in ("authorize_ms", "ensure_runner_ms", "runner_launch_ms", "total_ms"):
+        assert int(attributes[stage]) >= 0
 
 
 @pytest.mark.asyncio
@@ -1775,8 +1784,12 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
     fake_runner = _FakeRunnerClient(responses={path: (runner_status, runner_payload)})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.post(path, json={"terminal": "bash", "session_key": "s1"})
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(path, json={"terminal": "bash", "session_key": "s1"})
 
+    # A failed launch still records its timing, with the runner's status.
+    (finished,) = [row for row in rows if row["event_name"] == "terminal_create_finished"]
+    assert int(cast(dict[str, str], finished["attributes"])["status_code"]) >= 400
     # http_status is derived from the surfaced code; 503 here proves the
     # runner's ``runner_unavailable`` propagated (a 500 would mean it was
     # masked by the old TypeError path or a generic internal error).
@@ -3870,6 +3883,80 @@ async def test_github_pr_diff_proxies_whole_patch(client: httpx.AsyncClient) -> 
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff",
     ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_github_commit_diff_forwards_the_commit_to_the_runner(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /resources/github/commit-diff?commit_sha=... proxies that one commit's patch."""
+    payload = {"object": "session.github.pr_diff", "patch": "commit patch\n"}
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    commit = "c" * 40
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/commit-diff",
+        params={"commit_sha": commit},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert {"commit_sha": commit} in fake_runner.get_params
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/commit-diff",
+    ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_github_commit_diff_on_a_runner_without_the_route_is_not_a_whole_pr_patch(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner that predates the commit route answers 404, never the whole-PR patch."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/commit-diff"
+    fake_runner = _FakeRunnerClient(
+        responses={path: (404, {"detail": "Not Found"})},
+        payload={"object": "session.github.pr_diff", "patch": "whole PR patch"},
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(path, params={"commit_sha": "c" * 40})
+
+    assert resp.status_code == 404
+    assert "whole PR patch" not in resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource", "params", "detail"),
+    [
+        ("commits", {}, "Expected head_sha to be a full commit SHA"),
+        (
+            "commits",
+            {"head_sha": "a" * 40},
+            "The pull request changed; refresh to see its latest revision.",
+        ),
+        ("commit-diff", {"commit_sha": "abc"}, "Expected commit_sha to be a full commit SHA"),
+        (
+            "commit-diff",
+            {"commit_sha": "e" * 40},
+            "That commit is not part of the selected pull request.",
+        ),
+    ],
+)
+async def test_github_commit_rejections_keep_the_runner_status_and_detail(
+    client: httpx.AsyncClient, resource: str, params: dict[str, str], detail: str
+) -> None:
+    """A runner 400 keeps its status and detail; the public route must not flatten it to 502."""
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/{resource}"
+    fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(path, params={"pr_url": "https://github.com/a/b/pull/1", **params})
+
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": detail}
 
 
 @pytest.mark.asyncio
@@ -7879,32 +7966,64 @@ async def test_native_dispatch_host_bound_tunnel_drop_forwards_after_runner_reco
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drops_first", [False, True], ids=["timeout_first", "timeout_on_repeat"])
-async def test_native_dispatch_host_bound_non_tunnel_error_stays_durable(
+@pytest.mark.parametrize("initial_status", ["idle", "running"])
+async def test_native_dispatch_host_bound_readiness_timeout_keeps_input(
     drops_first: bool,
+    initial_status: str,
+    published_stream_events: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only a lost tunnel is refused; any other transport error still fails the turn durably."""
+    """A readiness timeout cannot consume input that has not reached the native agent."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
     store = _ConversationStore()
     conv = _host_bound_native_conv(store)
+    monkeypatch.setitem(sessions_module._session_status_cache, conv.id, initial_status)
     terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
-    failures: list[Exception] = [
-        httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))
-    ]
+    timeout = httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))
+    failures: list[Exception] = [timeout]
     if drops_first:
         failures.insert(0, _tunnel_loss("tunnel_closed", terminals_path))
     client = _FailingEnsureRunnerClient(terminals_path, failures)
     router = _ReconnectWaitRouter(reconnects=True)
 
-    result = await _send_native_message(store, conv, client, router)
+    with pytest.raises(OmnigentError) as exc:
+        await _send_native_message(store, conv, client, router)
 
-    # A tunnel drop waits and repeats the ensure once; a timeout does neither.
+    assert exc.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert exc.value.__cause__ is timeout
+    assert "before your message was sent" in exc.value.message
     assert len(router.waits) == int(drops_first)
     ensure_attempts = [("POST", terminals_path)] * len(failures)
     assert [call for call in client.calls if call[0] == "POST"] == ensure_attempts
+    assert store.appended_items == []
+    assert published_stream_events == []
+    assert not pending_inputs.has_pending(conv.id)
+    assert sessions_module._session_status_cache[conv.id] == initial_status
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_host_bound_non_timeout_failure_stays_durable() -> None:
+    """A transport failure outside the readiness timeout keeps its existing failure."""
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path, [httpx.ReadError("read failed", request=_ensure_request(terminals_path))]
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+
+    result = await _send_native_message(store, conv, client, router)
+
+    assert router.waits == []
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
     assert result.pending_id is None
-    assert [i.type for i in store.appended_items] == ["message", "error"]
-    error = store.appended_items[1]
-    assert error.data.code == "native_terminal_ensure_failed"
-    assert error.data.message == "Native Claude terminal ensure request failed. read timed out"
+    assert [item.type for item in store.appended_items] == ["message", "error"]
+    assert store.appended_items[1].data.code == "native_terminal_ensure_failed"
+    assert store.appended_items[1].data.message == (
+        "Native Claude terminal ensure request failed. read failed"
+    )
 
 
 @pytest.mark.asyncio
@@ -8527,10 +8646,12 @@ async def test_relay_fences_cancelled_turn_and_resumes_on_next_turn(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_first_append", [False, True])
+@pytest.mark.parametrize("with_client_id", [False, True])
 async def test_relay_settles_queued_native_message_on_failed_turn(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     fail_first_append: bool,
+    with_client_id: bool,
 ) -> None:
     """A failed native turn commits the queued web message ahead of its error item.
 
@@ -8551,13 +8672,19 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
     sid = "64a784c3aa907d1774f44313546947c6"
     store = _FailOnceStore() if fail_first_append else _ConversationStore()
     content = [{"type": "input_text", "text": "set up the worktree"}]
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d" if with_client_id else None
     pending_id = pending_inputs.record(
         sid,
         content,
         created_by="alice@example.com",
-        stable_id="7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+        stable_id=stable_id,
     )
     original = pending_inputs.delivery_attributes_for(sid, pending_id)
+    identity = {
+        key: value
+        for key, value in original.items()
+        if key in {"input_stable_id", "pending_id", "delivery_attempt_id"}
+    }
     caplog.set_level(logging.INFO)
     # A second message the runner is still holding for the next turn.
     queued_next = pending_inputs.record(
@@ -8583,7 +8710,7 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
                 {
                     "type": "response.failed",
                     # The runner names the message this turn carried.
-                    "input_stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+                    **identity,
                     "response": {
                         "id": "resp_fail",
                         "model": "codex",
@@ -8617,7 +8744,9 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
                 store,  # type: ignore[arg-type]
                 sid,
                 "resp_fail",
-                "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+                stable_id,
+                pending_id=pending_id,
+                delivery_attempt_id=str(original["delivery_attempt_id"]),
             )
             assert store.appended_items == []
             assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
@@ -8633,6 +8762,16 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
             )
             assert not any(e.get("type") == "session.input.consumed" for e in published)
         await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+        if not with_client_id:
+            await _settle_undelivered_native_input(
+                store,  # type: ignore[arg-type]
+                sid,
+                "resp_fail",
+                None,
+                pending_id=pending_id,
+                delivery_attempt_id=str(original["delivery_attempt_id"]),
+            )
 
         types = [i.type for i in store.appended_items]
         assert types == ["message", "error"], types
@@ -8667,12 +8806,14 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         attrs = record.attributes
         assert attrs["outcome"] == "reported_undelivered"
         assert attrs["pending_id"] == pending_id
-        assert attrs["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+        assert attrs.get("input_stable_id") == stable_id
         assert attrs["delivery_attempt_id"] == original["delivery_attempt_id"]
         assert attrs["input_enqueued_at_ms"] == original["input_enqueued_at_ms"]
         assert attrs["item_id"] == consumed[0]["data"]["item_id"]
         assert attrs["response_id"] == message.response_id == "resp_fail"
-        assert attrs["match_method"] == "input_stable_id"
+        assert attrs["match_method"] == (
+            "input_stable_id" if with_client_id else "pending_id_and_delivery_attempt_id"
+        )
         assert attrs["cause_class"] == "rejected_before_handoff"
         assert attrs["reason_code"] == "databricks_sign_in_pending"
         assert attrs["lifecycle_response_id"] == "resp_fail"
@@ -8762,8 +8903,13 @@ async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("undelivered", [True, False])
+@pytest.mark.parametrize(
+    "identity_kind",
+    ["stable", "server", "missing_attempt", "wrong_attempt", "conflicting", "malformed"],
+)
 async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
     undelivered: bool,
+    identity_kind: str,
 ) -> None:
     """Preserve one real error without a second missing-transcript error on the next turn."""
     from omnigent.inner.executor import ExecutorError, MockExecutor
@@ -8781,13 +8927,28 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
     store = _ConversationStore()
     conv = store.get_conversation(sid)
     assert conv is not None
-    first_stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    first_stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d" if identity_kind == "stable" else None
     first_content = [{"type": "input_text", "text": "set up the worktree"}]
     next_content = [{"type": "input_text", "text": "then run the tests"}]
     first_pending = pending_inputs.record(
         sid, first_content, created_by="alice@example.com", stable_id=first_stable_id
     )
     next_pending = pending_inputs.record(sid, next_content, created_by="alice@example.com")
+    identity = {
+        key: value
+        for key, value in pending_inputs.delivery_attributes_for(sid, first_pending).items()
+        if key in {"input_stable_id", "pending_id", "delivery_attempt_id"}
+    }
+    if identity_kind == "stable":
+        identity = {"input_stable_id": first_stable_id}
+    elif identity_kind == "missing_attempt":
+        identity.pop("delivery_attempt_id")
+    elif identity_kind == "wrong_attempt":
+        identity["delivery_attempt_id"] = "f" * 32
+    elif identity_kind == "conflicting":
+        identity["pending_id"] = next_pending
+    elif identity_kind == "malformed":
+        identity["input_stable_id"] = "invalid identity"
     # Script only the executor boundary; the real adapter must transport its evidence.
     executor = MockExecutor()
     executor.enqueue_events(
@@ -8814,7 +8975,7 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
                 _sse_frame(
                     {
                         "type": "response.failed",
-                        "input_stable_id": first_stable_id,
+                        **identity,
                         "response": {
                             "id": "resp_not_ready",
                             "model": "claude",
@@ -8826,7 +8987,7 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
             ]
         )
         await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
-        if not undelivered:
+        if not undelivered or identity_kind not in {"stable", "server"}:
             assert [item.type for item in store.appended_items] == ["error"]
             assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
                 first_pending,
@@ -10525,6 +10686,8 @@ async def test_sibling_environment_routes_are_not_gzipped(
     [
         ("", "github_info"),
         ("/changes", "github_changes"),
+        ("/commits", "github_commits"),
+        ("/commit-diff", "github_commit_diff"),
         ("/diff", "github_pr_diff"),
         ("/diff/new.py", "github_diff"),
         ("/labels", "github_labels"),
@@ -10553,6 +10716,10 @@ async def test_selected_pr_reaches_offline_host(
     params = {"pr_url": url}
     if resource.startswith("/review-threads"):
         params.update(after="cursor", head_sha="a" * 40, base_sha="b" * 40)
+    if resource == "/commits":
+        params["head_sha"] = "a" * 40
+    if resource == "/commit-diff":
+        params["commit_sha"] = "c" * 40
     response = await offline_env_client.get(
         f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params=params
     )
@@ -10560,6 +10727,10 @@ async def test_selected_pr_reaches_offline_host(
     assert captured["op"] == op
     assert captured["session_id"] == _OFFLINE_SESSION
     assert captured["params"]["pr_url"] == url
+    if resource == "/commits":
+        assert captured["params"]["head_sha"] == "a" * 40
+    if resource == "/commit-diff":
+        assert captured["params"]["commit_sha"] == "c" * 40
     if resource.startswith("/review-threads"):
         assert captured["params"]["after"] == "cursor"
         if resource.endswith("/comments"):
