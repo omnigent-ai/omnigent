@@ -4488,6 +4488,7 @@ async def _register_and_start_host(
                 host_store.update_sandbox_id,
                 host_id,
                 expected_sandbox_id=sandbox_id,
+                expected_token=token,
                 sandbox_id=started_id,
             )
             if updated is None:

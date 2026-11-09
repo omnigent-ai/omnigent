@@ -731,24 +731,8 @@ class LambdaMicroVMSandboxLauncher(SandboxHostLauncher):
         ride the same payload so the entrypoint can clone before starting the
         host. The launcher does not declare ``multi_repo``, so the framework
         hands it at most one repository.
-        Because this launcher controls the image, the resulting workspace path is
-        a known constant — ``${HOME}/workspace`` (or the clone directory under
-        it) — computed here without asking the sandbox, mirroring the Kubernetes
-        launcher's ``start_host``. It must NOT be the returned ``microvmId``: the
-        managed-launch framework persists this return value as the session's
-        *workspace* (:class:`~omnigent.server.managed_hosts.ManagedHostLaunch`),
-        never as a new sandbox id — ``host.launch_runner`` then validates it with
-        ``Path(workspace).is_dir()`` **inside the guest**, so a non-path value
-        (e.g. the MicroVM id) makes every launch fail with "workspace path does
-        not exist" and the runner never starts.
-
-        The real ``microvmId`` AWS assigns at ``run-microvm`` is surfaced to the
-        managed-launch framework through :attr:`started_sandbox_id` (not the
-        return value): ``provision`` can only RESERVE a name before the VM
-        exists, and ``run-microvm`` accepts no caller-supplied name, so the id is
-        unknown until here. The framework reads :attr:`started_sandbox_id` after
-        this returns and overwrites the host row's ``sandbox_id`` with it, so
-        later :meth:`terminate` / :meth:`resume` key off the id AWS knows.
+        Returns the guest workspace path; exposes the provider-assigned ID through
+        ``started_sandbox_id`` for persistence.
 
         :param sandbox_id: The reserved name from :meth:`provision` — used only
             for logging (``run-microvm`` has no caller-supplied-name field). The

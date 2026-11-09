@@ -1699,7 +1699,10 @@ async def test_managed_launch_fails_when_runner_never_connects(
     actual_id = started_sandbox_id or "sb-fake-1"
     if replaced:
         host_store.update_sandbox_id(
-            managed.host_id, expected_sandbox_id=actual_id, sandbox_id="replacement"
+            managed.host_id,
+            expected_sandbox_id=actual_id,
+            expected_token=fake.host_starts[0].token,
+            sandbox_id="replacement",
         )
     tracker = ManagedLaunchTracker()
     tracker.begin(conv.id)

@@ -1342,7 +1342,12 @@ class HostStore:
             return _row_to_host(existing)
 
     def update_sandbox_id(
-        self, host_id: str, *, expected_sandbox_id: str, sandbox_id: str
+        self,
+        host_id: str,
+        *,
+        expected_sandbox_id: str,
+        expected_token: str,
+        sandbox_id: str,
     ) -> Host | None:
         """Repoint a managed host's active generation at a provider-assigned id.
 
@@ -1350,16 +1355,17 @@ class HostStore:
         MicroVMs' ``run-microvm`` returns a ``microvmId`` that cannot be known at
         ``provision`` time). The launch registers the row against the reserved
         id, then calls this once ``start_host`` has surfaced the real one, so
-        later terminate / resume key off the id the provider knows. The row lock
-        serializes the swap with :meth:`delete_host`, and the expected id fences
-        it to the generation the caller armed.
+        later terminate / resume key off the id the provider knows. The token
+        fences the launch generation even when reservations reuse the same name.
+        An identity-only write must preserve the last observed heartbeat.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param expected_sandbox_id: The id the caller registered, e.g. the
             reserved ``"managed-a1b2c3d4"``.
+        :param expected_token: Raw launch token armed by this caller.
         :param sandbox_id: The provider-assigned id to persist.
         :returns: The updated host, or ``None`` when the host was deleted or its
-            active generation is no longer *expected_sandbox_id*.
+            active generation no longer matches the expected id and token.
         """
         with self._lifecycle_session("update_host_sandbox_id") as session:
             row = session.execute(
@@ -1368,6 +1374,7 @@ class HostStore:
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
                     SqlHost.sandbox_id == expected_sandbox_id,
+                    SqlHost.token_hash == hash_host_launch_token(expected_token),
                     SqlHost.deleted_at.is_(None),
                 )
                 .with_for_update()
@@ -1375,7 +1382,6 @@ class HostStore:
             if row is None:
                 return None
             row.sandbox_id = sandbox_id
-            row.updated_at = now_epoch()
             return _row_to_host(row)
 
     def rearm_managed_host(

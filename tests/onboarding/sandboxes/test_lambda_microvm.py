@@ -145,34 +145,28 @@ def test_build_run_microvm_kwargs_derives_client_token_from_launch_token() -> No
     assert client_token != hashlib.sha256(_RUN_KW["token"].encode()).hexdigest()
 
 
-def test_max_lifetime_env_rejects_non_numeric(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A non-numeric lifetime override fails loud."""
-    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, "soon")
-    with pytest.raises(click.ClickException):
-        resolve_max_lifetime_s()
-
-
-@pytest.mark.parametrize("bad", ["0", "-1", "-3600", "inf", "nan", "0.5"])
-def test_max_lifetime_env_rejects_non_positive_or_non_finite(
-    monkeypatch: pytest.MonkeyPatch, bad: str
+@pytest.mark.parametrize(
+    ("bad", "message"),
+    [
+        ("soon", "number of seconds"),
+        ("0", "positive, finite"),
+        ("-1", "positive, finite"),
+        ("-3600", "positive, finite"),
+        ("inf", "positive, finite"),
+        ("nan", "positive, finite"),
+        ("0.5", "at least 60"),
+        ("1", "at least 60"),
+        ("30", "at least 60"),
+        ("59", "at least 60"),
+        ("59.9", "at least 60"),
+        ("28801", "exceeds"),
+    ],
+)
+def test_max_lifetime_env_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, bad: str, message: str
 ) -> None:
-    """Zero, negative, non-finite, and sub-second (truncates to 0) overrides fail
-    fast rather than building an invalid maximumDurationInSeconds that run-microvm
-    rejects opaquely later."""
     monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, bad)
-    with pytest.raises(click.ClickException):
-        resolve_max_lifetime_s()
-
-
-@pytest.mark.parametrize("short", ["1", "30", "59", "59.9"])
-def test_max_lifetime_env_rejects_under_sixty_seconds(
-    monkeypatch: pytest.MonkeyPatch, short: str
-) -> None:
-    """The idle policy caps maxIdleDurationSeconds at the lifetime, and the
-    RunMicrovm model requires it to be at least 60, so a shorter lifetime is
-    rejected locally instead of failing run-microvm."""
-    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, short)
-    with pytest.raises(click.ClickException, match="at least 60"):
+    with pytest.raises(click.ClickException, match=message):
         resolve_max_lifetime_s()
 
 
@@ -191,13 +185,6 @@ def test_max_idle_env_rejects_values_outside_sixty_to_lifetime(
     monkeypatch.setenv(MAX_IDLE_ENV_VAR, bad)
     with pytest.raises(click.ClickException, match="OMNIGENT_LAMBDA_MICROVM_MAX_IDLE_S"):
         build_idle_policy()
-
-
-def test_max_lifetime_env_rejects_over_eight_hour_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An override above the 8 h platform cap fails fast with a clear message."""
-    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, str(8 * 60 * 60 + 1))
-    with pytest.raises(click.ClickException, match="exceeds"):
-        resolve_max_lifetime_s()
 
 
 def test_managed_token_ttl_exceeds_lifetime() -> None:
