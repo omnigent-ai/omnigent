@@ -101,6 +101,7 @@ def oauth_mcp_server(title: str = "Demo Issues") -> Iterator[OAuthMcpServer]:
             auth=AuthSettings(
                 issuer_url=base,
                 resource_server_url=f"{base}/mcp",
+                validate_token_resource=True,
                 client_registration_options=ClientRegistrationOptions(enabled=True),
             ),
         )
