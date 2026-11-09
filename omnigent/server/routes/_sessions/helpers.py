@@ -7472,6 +7472,16 @@ async def _persist_native_policy_notice(
     # one-shot flag already prevents re-surfacing; this dedups a same-turn
     # retry against an already-recorded notice).
     if persisted == "persisted":
+        _logger.warning(
+            "%s",
+            error.message,
+            extra=debug_event(
+                _NATIVE_POLICY_NOT_ENFORCED_CODE,
+                session_id=session_id,
+                code=error.code,
+                source=error.source,
+            ),
+        )
         _publish_error_event(session_id, error)
 
 
