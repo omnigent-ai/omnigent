@@ -69,7 +69,9 @@ def test_prompt_wait_repaints_an_overdrawn_composer(
         return 1
 
     monkeypatch.setattr(
-        bridge, "_capture_pane", lambda *_: _READY_PANE if repainted_at else _OVERDRAWN_PANE
+        bridge,
+        "_capture_pane",
+        lambda *_args, **_kwargs: _READY_PANE if repainted_at else _OVERDRAWN_PANE,
     )
     monkeypatch.setattr(bridge, "_request_claude_repaint", repaint)
 
@@ -83,7 +85,7 @@ def test_prompt_wait_leaves_a_ready_composer_alone(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repaints: list[str] = []
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _READY_PANE)
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_args, **_kwargs: _READY_PANE)
     monkeypatch.setattr(
         bridge, "_request_claude_repaint", lambda *args: repaints.append(args[1]) or 1
     )
@@ -98,7 +100,7 @@ def test_repaint_requests_repeat_until_the_wait_gives_up(
 ) -> None:
     repainted_at: list[float] = []
     monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 60.0)
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _OVERDRAWN_PANE)
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_args, **_kwargs: _OVERDRAWN_PANE)
     monkeypatch.setattr(
         bridge, "_request_claude_repaint", lambda *_: repainted_at.append(clock.now) or 1
     )
@@ -112,7 +114,7 @@ def test_repaint_requests_repeat_until_the_wait_gives_up(
 def test_unanswered_repaint_is_not_counted(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
     attempts: list[float] = []
     monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 30.0)
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _OVERDRAWN_PANE)
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_args, **_kwargs: _OVERDRAWN_PANE)
     monkeypatch.setattr(
         bridge, "_request_claude_repaint", lambda *_: attempts.append(clock.now) or 0
     )
@@ -131,7 +133,9 @@ def test_repaint_requests_reach_the_delivery_summary(
 ) -> None:
     repaints: list[float] = []
     monkeypatch.setattr(
-        bridge, "_capture_pane", lambda *_: _READY_PANE if repaints else _OVERDRAWN_PANE
+        bridge,
+        "_capture_pane",
+        lambda *_args, **_kwargs: _READY_PANE if repaints else _OVERDRAWN_PANE,
     )
     monkeypatch.setattr(bridge, "_request_claude_repaint", lambda *_: repaints.append(0.0) or 1)
 
@@ -490,7 +494,7 @@ def test_a_held_message_reads_the_input_box_without_typing(
     """The hold's poll only captures the pane, and repaints only a box that needs it."""
     (tmp_path / "tmux.json").write_text('{"socket_path": "/tmp/sock", "tmux_target": "main"}')
     panes = iter([_OVERDRAWN_PANE, _OVERDRAWN_PANE, _READY_PANE])
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: next(panes))
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_args, **_kwargs: next(panes))
     repaints: list[Path | None] = []
 
     def repaint(socket_path: str, tmux_target: str, bridge_dir: Path | None = None) -> int:
