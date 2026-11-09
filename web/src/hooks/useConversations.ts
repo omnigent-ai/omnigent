@@ -424,18 +424,18 @@ export function isSessionArchiving(id: string): boolean {
 
 // ── Moving-session tombstones ─────────────────────────────────────────
 //
-// A move regroups the row optimistically, but a frame or list fetch read
-// before the PATCH committed still carries the old membership and would put
-// the row back in its old folder (or show it in both). Until the server
-// reports the new membership, every fetched or streamed copy of the row
-// gets the move's membership.
+// Preserve optimistic membership across stale fetches and frames until the
+// server confirms the move.
 interface MoveTombstone {
   /** Target folder name; `null` unfiles. */
   project: string | null;
   projectId: string | null;
   /** Legacy label a label-only target is shown through until the PATCH lands. */
   projectLabel?: string;
+  /** The PATCH succeeded. */
   confirmed: boolean;
+  /** A server copy of the row already reported this membership. */
+  observed: boolean;
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -455,20 +455,25 @@ function unmarkSessionMoving(id: string, entry?: MoveTombstone): void {
 }
 
 /**
- * The PATCH landed: from now on the server's own membership ends the
- * tombstone, with a timeout in case no copy of the row is fetched again.
+ * The PATCH landed. The tombstone ends once a server copy of the row reports
+ * the confirmed membership (possibly already seen), or after a timeout.
  */
 function confirmSessionMoving(id: string, entry: MoveTombstone, projectId: string | null): void {
   if (movingSessions.get(id) !== entry) return;
+  if (entry.observed && entry.projectId === projectId && entry.projectLabel === undefined) {
+    unmarkSessionMoving(id, entry);
+    return;
+  }
   entry.projectId = projectId;
   entry.projectLabel = undefined;
+  entry.observed = false;
   entry.confirmed = true;
   entry.timer = setTimeout(() => unmarkSessionMoving(id, entry), DELETED_TOMBSTONE_MS);
 }
 
 /**
- * Give a fetched or streamed row the membership of its in-flight move. Once
- * the move is confirmed, a row that already reports it releases the tombstone.
+ * Give a fetched or streamed row the membership of its in-flight move. A row
+ * that already reports it releases the tombstone once the move is confirmed.
  */
 export function withMoveTombstone<
   T extends { id: string; project_id?: string | null; labels?: Record<string, string> },
@@ -478,6 +483,7 @@ export function withMoveTombstone<
   const label = row.labels?.[PROJECT_LABEL_KEY] || undefined;
   if ((row.project_id ?? null) === entry.projectId && label === entry.projectLabel) {
     if (entry.confirmed) unmarkSessionMoving(row.id, entry);
+    else entry.observed = true;
     return row;
   }
   const labels = Object.fromEntries(
@@ -2655,6 +2661,7 @@ export function useMoveToProject() {
         projectId: target?.id ?? null,
         projectLabel: labels[PROJECT_LABEL_KEY],
         confirmed: false,
+        observed: false,
       };
       markSessionMoving(id, move);
       return { ...previous, move };

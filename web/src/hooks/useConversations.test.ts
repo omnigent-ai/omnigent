@@ -3665,6 +3665,25 @@ describe("useMoveToProject", () => {
       expect((await fetchRow())?.project_id).toBe("p_old");
     });
 
+    it("releases on a server copy that reported the move before the PATCH answered", async () => {
+      const { result, fetchRow } = setup();
+      result.current.mutate({ id: "conv_move", project: "New" });
+      await waitFor(() =>
+        expect(fetchMock).toHaveBeenCalledWith(
+          "/v1/sessions/conv_move",
+          expect.objectContaining({ method: "PATCH" }),
+        ),
+      );
+      serverProjectId = "p_new";
+      expect((await fetchRow())?.project_id).toBe("p_new");
+
+      settlePatch(true);
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      // Another client moves it on before any further New copy arrives.
+      serverProjectId = "p_third";
+      expect((await fetchRow())?.project_id).toBe("p_third");
+    });
+
     it("stops overriding fetches when the PATCH fails", async () => {
       const { result, fetchRow } = setup();
       result.current.mutate({ id: "conv_move", project: "New" });
