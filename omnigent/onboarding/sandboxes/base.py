@@ -617,9 +617,10 @@ class SandboxLifecycle(ABC):
         ``True`` otherwise.
 
         Called BOTH once after a CLI bootstrap provision AND periodically
-        by the managed path for as long as the sandbox has a live runner
-        (:mod:`omnigent.server.managed_host_keepalive`), so an implementation
-        must be idempotent and cheap enough to repeat. Either shape
+        by the managed path while the sandbox's runner does work, and for the
+        runner idle timeout after (:mod:`omnigent.server.managed_host_keepalive`),
+        so an implementation must be idempotent and cheap enough to repeat.
+        Either shape
         satisfies it: "configure once to maximize lifetime" (disable idle
         autostop, restate a cap) or "push a deadline forward" (refresh an
         absolute expiry). Managed-only launchers that cannot extend a
@@ -1027,6 +1028,20 @@ class SandboxHostLauncher(SandboxLifecycle):
         :param resolve: Zero-argument resolver for this host's owner.
         """
         del resolve
+
+    def host_online_failure_hint(self, sandbox_id: str) -> str | None:
+        """Suggest recovery when a scheduled launch times out before registration.
+
+        Called off the event loop, before cancellation and teardown. Prefer
+        cached observations; bound any I/O because a caller timeout cannot stop
+        a worker thread. Return user-safe guidance, never credentials, and keep
+        unconfirmed causes conditional. ``None`` preserves the generic error.
+
+        :param sandbox_id: The provisioned sandbox that has not registered.
+        :returns: Recovery instructions, or ``None`` when none are available.
+        """
+        del sandbox_id
+        return None
 
     def capture_logs(self, sandbox_id: str) -> str | None:
         """

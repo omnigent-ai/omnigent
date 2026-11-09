@@ -5,7 +5,7 @@ import type { Comment } from "@/hooks/useComments";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
 import { remapMarkdownComment } from "./TipTapEditorHelpers";
-import { isMarkdownTooLargeForRichView } from "./codeViewerHelpers";
+import { isMarkdownTooLargeForPreview } from "./codeViewerHelpers";
 
 installMarkdownParserPatch();
 const extensions = createMarkdownDocumentExtensions("", "");
@@ -17,7 +17,8 @@ export function remapFormattedMarkdownComment(comment: Comment, content: string)
   if (previous?.content !== content) {
     previous = { content, doc: null };
     try {
-      if (!isMarkdownTooLargeForRichView("markdown", content)) {
+      // Bounded by the preview limit, so comments on large previewed files still remap.
+      if (!isMarkdownTooLargeForPreview("markdown", content)) {
         previous.doc = schema.nodeFromJSON(manager.parse(content));
       }
     } catch (error) {

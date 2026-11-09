@@ -632,6 +632,8 @@ function loadNavigationHarness({
             return {
               closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
               setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
+              setRecentSessionSwitchSupported: () => {},
+              activeConversationId: () => null,
             };
           },
         },
@@ -4556,6 +4558,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.equal(eligible(context), false);
     const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
     assert.match(hint(event, "http://localhost"), /New session > Host > Run on Arca/);
+    assert.match(
+      hint(event, "https://spog.dev.localhost:23090/one"),
+      /New session > Host > Run on Arca/,
+    );
+    assert.equal(hint(event, "http://lvh.me"), null, "public aliases get no Arca hint");
     await h.api.startArcaHostConnect(serverUrl).promise;
     assert.equal(eligible(context), true);
     assert.equal(hint(event, "http://localhost"), null);
@@ -5912,5 +5919,38 @@ describe("main-owned local host eligibility", () => {
         .hostIsThisMachine,
       false,
     );
+  });
+});
+
+describe("Close menu item", () => {
+  const server = "https://host.example";
+
+  it("closes a hung page's window directly, and hands Close back once it recovers", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createWindow();
+    h.setUrl(server);
+    let closes = 0;
+    h.win.close = () => {
+      closes++;
+    };
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    const pageEvent = { sender: h.webContents, senderFrame: { url: server } };
+    h.ipc.get("omnigent:set-desktop-command-state")(pageEvent, { commands: ["close"] });
+    h.api.buildMenu();
+    const sentCloses = () =>
+      h.calls.progress.filter((message) => message.channel === "omnigent:desktop-command").length;
+    const clickClose = () => h.calls.appMenu.getMenuItemById("close").click();
+
+    h.emit("unresponsive");
+    clickClose();
+    assert.equal(closes, 1);
+    assert.equal(sentCloses(), 0);
+
+    h.emit("responsive");
+    clickClose();
+    assert.equal(sentCloses(), 1);
+    assert.equal(closes, 1);
   });
 });

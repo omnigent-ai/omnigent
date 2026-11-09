@@ -15,6 +15,7 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shlex
 import sys
@@ -26,6 +27,7 @@ import pytest
 
 from omnigent.inner import _proc
 from omnigent.inner import acp_executor as acp_executor_module
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
 from omnigent.inner.acp_executor import (
     AcpAgentConfig,
@@ -1806,6 +1808,26 @@ async def test_interrupt_sends_session_cancel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_interrupt_preserves_original_cancel_grace_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._session_id = "s1"
+    ex._proc = type("P", (), {"returncode": None})()  # type: ignore[assignment]
+    ex._send = AsyncMock()  # type: ignore[method-assign]
+    now = 100.0
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(asyncio.get_running_loop(), "time", lambda: now)
+        assert await ex.interrupt_session("ignored") is True
+        original_deadline = ex._cancel_grace_deadline
+        assert original_deadline == now + acp_executor_module.ACP_CANCEL_GRACE_SECONDS
+
+        now += acp_executor_module.ACP_CANCEL_GRACE_SECONDS / 2
+        assert await ex.interrupt_session("ignored") is True
+        assert ex._cancel_grace_deadline == original_deadline
+
+
+@pytest.mark.asyncio
 async def test_interrupt_noop_without_session() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     assert await ex.interrupt_session("ignored") is False
@@ -1993,7 +2015,10 @@ async def test_pre_prompt_model_report_steers_first_turn_switch(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
+async def test_end_to_end_against_fake_acp_agent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=acp_executor_module.__name__)
     agent_path = tmp_path / "fake_acp_agent.py"
     agent_path.write_text(_FAKE_ACP_AGENT)
     command = shlex.join([sys.executable, str(agent_path)])
@@ -2014,6 +2039,7 @@ async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
     finally:
         await ex.close()
 
+    assert f"acp[Fake] session/prompt {ex._rpc_id} stopReason=end_turn" in caplog.text
     # The permission request surfaced through the elicitation handler.
     assert approvals == [("shell", {"command": "echo hi"})]
 
@@ -2902,3 +2928,71 @@ async def test_start_process_guard_deleted_process_cwd_relative_cwd() -> None:
     msg = error_events[0].message
     assert "deleted" in msg, f"expected 'deleted' in: {msg!r}"
     assert "/workspace/project" in msg, f"expected path in: {msg!r}"
+
+
+@pytest.mark.parametrize("fresh_session", [False, True], ids=["warm", "history-replay"])
+@pytest.mark.parametrize(
+    ("tail", "expected_id"),
+    [
+        (
+            {"type": "message", "role": "user", "id": "msg_current", "content": "current"},
+            "msg_current",
+        ),
+        (
+            {"type": "message", "role": "user", "id": "msg_empty", "content": []},
+            "msg_empty",
+        ),
+        (
+            {
+                "type": "message",
+                "role": "user",
+                "id": "msg_empty",
+                "content": [{"type": "input_text", "text": ""}],
+            },
+            "msg_empty",
+        ),
+        ({"type": "message", "role": "user", "content": "Your runner was interrupted"}, None),
+        ({"type": "function_call", "name": "read", "call_id": "call_1", "arguments": "{}"}, None),
+        ({"type": "function_call_output", "call_id": "call_1", "output": "done"}, None),
+    ],
+    ids=[
+        "current",
+        "empty-list",
+        "empty-text",
+        "synthetic-recovery",
+        "tool-resume",
+        "tool-result-resume",
+    ],
+)
+async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expected_id) -> None:
+    """History filtering and replay must never select an older user's identity."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    executor = AcpExecutor(AcpAgentConfig(command="unused", omnigent_mcp=False))
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "assistant", "content": "old reply"},
+            tail,
+        ],
+        preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
+    )
+    executor._proc = Mock(returncode=None)
+    executor._initialized = True
+    executor._session_id = "acp-session"
+    executor._system_prompt_sent = not fresh_session
+    prompts = []
+
+    async def send(message):
+        prompts.append(message)
+        executor._pending[message["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = send
+    events = [event async for event in executor.run_turn(messages, [], "system")]
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert len(prompts) == 1
+    assert prompts[0]["params"]["_meta"] == {_META_INPUT_ITEM_ID: expected_id}
+    if expected_id == "msg_empty" and not fresh_session:
+        assert prompts[0]["params"]["prompt"] == [{"type": "text", "text": ""}]
+    if fresh_session and tail.get("role") == "user":
+        assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
