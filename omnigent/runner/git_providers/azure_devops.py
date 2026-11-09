@@ -64,6 +64,8 @@ _CAPABILITIES = ProviderCapabilities(
 _AUTH_HINT = "Run az login on the host or set AZURE_DEVOPS_EXT_PAT."
 _INACCESSIBLE = "Cannot access this pull request with the Azure DevOps credentials on the host"
 _PR_LOAD_FAILED = "Azure DevOps could not load the selected PR's file content"
+_PR_CHANGED = "The pull request changed; refresh to see its latest revision."
+_PR_REVISION_UNAVAILABLE = "Azure DevOps could not confirm the PR's revision. Refresh to retry."
 _UNEXPECTED_RESPONSE = "Azure DevOps returned an unexpected file response"
 _REVISION_LOAD_FAILED = "Azure DevOps could not load the selected file revision"
 _NO_CONTEXT = "Expanded context is unavailable for this file"
@@ -905,8 +907,53 @@ class AzureDevOpsPullRequests:
             result["warning"] = "Azure DevOps could not load every changed file."
         return result
 
+    def pinned_changed_files(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """List the files, checking the pinned revisions before and after the read."""
+        self._check_pinned(reference, head_sha=head_sha, base_sha=base_sha)
+        result = self.changed_files(root, reference)
+        self._check_pinned(reference, head_sha=head_sha, base_sha=base_sha)
+        return {**result, "head_sha": head_sha, "base_sha": base_sha}
+
+    def _check_pinned(self, reference: PullRequestRef, *, head_sha: str, base_sha: str) -> None:
+        """Raise unless the PR's last merge commits are the pinned head and base.
+
+        :raises ValueError: When the PR moved, or its revisions cannot be read.
+        """
+        repo = _reference_repo(reference)
+        token = _token() if repo is not None else None
+        if repo is None or token is None:
+            raise ValueError(_PR_REVISION_UNAVAILABLE)
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
+        try:
+            with self._client(repo.org, token, deadline=deadline) as client:
+                pr = _call(client.get_pull_request, repo.project, repo.repo, reference.number)
+        except _RestFailure as exc:
+            raise ValueError(_PR_REVISION_UNAVAILABLE) from exc
+        current = (_commit(pr, "lastMergeSourceCommit"), _commit(pr, "lastMergeTargetCommit"))
+        if current != (head_sha, base_sha):
+            raise ValueError(_PR_CHANGED)
+
     def pr_diff(self, root: str, reference: PullRequestRef | None) -> dict[str, Any]:
         """Diff the PR's head against its merge base in the workspace, fetching missing commits."""
+        return self._pr_patch(root, reference, pinned=None)
+
+    def pinned_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Diff the pinned revisions; the patch is fixed by the commits, so one check suffices."""
+        patch = self._pr_patch(root, reference, pinned=(head_sha, base_sha))
+        return {**patch, "head_sha": head_sha, "base_sha": base_sha}
+
+    def _pr_patch(
+        self,
+        root: str,
+        reference: PullRequestRef | None,
+        *,
+        pinned: tuple[str, str] | None,
+    ) -> dict[str, Any]:
+        """Return the PR's patch, raising when ``pinned`` ``(head, base)`` is no longer current."""
         deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
         empty: dict[str, Any] = {"object": PR_DIFF_OBJECT, "patch": ""}
         remotes = _remotes(root)
@@ -943,6 +990,8 @@ class AzureDevOpsPullRequests:
                 "revisions_unavailable",
                 "Azure DevOps has no revisions ready for this pull request. Try again shortly.",
             )
+        if pinned is not None and (head, base) != pinned:
+            raise ValueError(_PR_CHANGED)
         if not self._ensure_commits(root, remote, number, pr, (head, base), deadline):
             return _unavailable_diff(
                 "commits_unavailable",

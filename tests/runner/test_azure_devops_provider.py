@@ -1111,6 +1111,70 @@ def test_pr_diff_fetches_the_pr_and_diffs_it_from_the_merge_base(
     git(forge.workspace, "apply", "--check", str(patch_file))
 
 
+def test_pinned_changed_files_echo_the_pinned_revisions(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request())
+    ado_transport.route("GET", f"{PULL}/iterations", json={"value": [{"id": 1}]})
+    changes = [{"changeType": "edit", "item": {"path": "/src/app.py", "gitObjectType": "blob"}}]
+    ado_transport.route("GET", f"{PULL}/iterations/1/changes", json={"changeEntries": changes})
+
+    result = facet.pinned_changed_files(str(tmp_path), reference(), head_sha=HEAD, base_sha=BASE)
+
+    assert result["head_sha"] == HEAD and result["base_sha"] == BASE
+    assert [file["path"] for file in result["data"]] == ["src/app.py"]
+
+
+@pytest.mark.parametrize("moved", [{"head": "d" * 40}, {"base": "d" * 40}], ids=["head", "base"])
+def test_pinned_changed_files_refuse_a_pr_that_moved(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    moved: dict[str, str],
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request(**moved))
+    ado_transport.route("GET", f"{PULL}/iterations", json={"value": [{"id": 1}]})
+
+    with pytest.raises(ValueError, match="pull request changed"):
+        facet.pinned_changed_files(str(tmp_path), reference(), head_sha=HEAD, base_sha=BASE)
+
+
+def test_pinned_changed_files_refuse_a_pr_that_moves_during_the_listing(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    reads = iter([pull_request(), pull_request(head="d" * 40)])
+    ado_transport.route(
+        "GET", PULL, handler=lambda _request: httpx.Response(200, json=next(reads))
+    )
+    ado_transport.route("GET", f"{PULL}/iterations", json={"value": [{"id": 1}]})
+    ado_transport.route("GET", f"{PULL}/iterations/1/changes", json={"changeEntries": []})
+
+    with pytest.raises(ValueError, match="pull request changed"):
+        facet.pinned_changed_files(str(tmp_path), reference(), head_sha=HEAD, base_sha=BASE)
+
+
+def test_pinned_diff_echoes_the_pinned_revisions(
+    facet: AzureDevOpsPullRequests, forge: Forge, ado_transport: RecordingTransport
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request(head=forge.head_sha, base=forge.base_sha))
+
+    result = facet.pinned_diff(
+        str(forge.workspace), reference(), head_sha=forge.head_sha, base_sha=forge.base_sha
+    )
+
+    assert result["head_sha"] == forge.head_sha and result["base_sha"] == forge.base_sha
+    assert diffed_files(result["patch"]) == 4
+
+
+def test_pinned_diff_refuses_a_pr_that_moved(
+    facet: AzureDevOpsPullRequests, workspace: Path, ado_transport: RecordingTransport
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request())
+
+    with pytest.raises(ValueError, match="pull request changed"):
+        facet.pinned_diff(str(workspace), reference(), head_sha="d" * 40, base_sha=BASE)
+
+
 def diffed_files(patch: str) -> int:
     return len(re.findall(r"^diff --git ", patch, flags=re.MULTILINE))
 

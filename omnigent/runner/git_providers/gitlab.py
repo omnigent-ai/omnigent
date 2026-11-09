@@ -398,6 +398,79 @@ def _content(client: GitLabClient, project: object, path: str, revision: str) ->
         ) from exc
 
 
+def _check_revision(mr: dict[str, Any], *, head_sha: str, base_sha: str) -> None:
+    """Raise when the merge request is no longer at the pinned revisions."""
+    refs = _object(mr.get("diff_refs"))
+    if refs.get("head_sha") != head_sha or refs.get("base_sha") != base_sha:
+        raise ValueError("The merge request changed. Refresh to retry.")
+
+
+def _pinned_changes(
+    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+) -> tuple[list[dict[str, Any]], bool]:
+    """List the changes, checking the pinned revisions before and after the read."""
+    client = _client(root, reference.host)
+    mr = _mr(client, reference)
+    _check_revision(mr, head_sha=head_sha, base_sha=base_sha)
+    changes, partial = _changes(client, reference, mr)
+    _check_revision(_mr(client, reference), head_sha=head_sha, base_sha=base_sha)
+    return changes, partial
+
+
+def _file_list(changes: list[dict[str, Any]], partial: bool) -> dict[str, Any]:
+    data = []
+    for change in changes:
+        patch = _text_patch(change)
+        unavailable = patch is None
+        lines = patch.splitlines() if patch is not None else []
+        data.append(
+            {
+                "object": CHANGED_FILE_OBJECT,
+                "path": change["new_path"],
+                "name": change["new_path"],
+                "previous_path": change["old_path"] if change.get("renamed_file") else None,
+                "status": _file_status(change),
+                "lines_added": None
+                if unavailable
+                else sum(line.startswith("+") for line in lines),
+                "lines_removed": None
+                if unavailable
+                else sum(line.startswith("-") for line in lines),
+            }
+        )
+    return {
+        "object": "list",
+        "data": data,
+        "has_more": partial,
+        "warning": "GitLab returned incomplete file changes." if partial else None,
+    }
+
+
+def _whole_patch(changes: list[dict[str, Any]], partial: bool) -> dict[str, Any]:
+    if partial:
+        return {
+            "object": PR_DIFF_OBJECT,
+            "patch": "",
+            "unavailable_reason": "incomplete_diff",
+            "message": "GitLab returned an incomplete diff. "
+            "View the merge request on GitLab for all changes.",
+        }
+    patches = []
+    for change in changes:
+        patch = _text_patch(change)
+        if patch is None:
+            continue
+        old, new = _patch_path("a/", change["old_path"]), _patch_path("b/", change["new_path"])
+        before, after = (
+            ("/dev/null" if change.get("new_file") else old),
+            ("/dev/null" if change.get("deleted_file") else new),
+        )
+        patches.append(
+            f"diff --git {old} {new}\n--- {before}\n+++ {after}\n" + patch.rstrip("\n") + "\n"
+        )
+    return {"object": PR_DIFF_OBJECT, "patch": "".join(patches)}
+
+
 class GitLabPullRequests:
     """Normalize GitLab metadata and exact MR revisions to the shared PR contract."""
 
@@ -435,61 +508,27 @@ class GitLabPullRequests:
         resolved = _resolved(root, reference)
         if resolved is None:
             return {"object": "list", "data": [], "has_more": False}
-        changes, partial = _changes(*resolved)
-        data = []
-        for change in changes:
-            patch = _text_patch(change)
-            unavailable = patch is None
-            lines = patch.splitlines() if patch is not None else []
-            data.append(
-                {
-                    "object": CHANGED_FILE_OBJECT,
-                    "path": change["new_path"],
-                    "name": change["new_path"],
-                    "previous_path": change["old_path"] if change.get("renamed_file") else None,
-                    "status": _file_status(change),
-                    "lines_added": None
-                    if unavailable
-                    else sum(line.startswith("+") for line in lines),
-                    "lines_removed": None
-                    if unavailable
-                    else sum(line.startswith("-") for line in lines),
-                }
-            )
-        return {
-            "object": "list",
-            "data": data,
-            "has_more": partial,
-            "warning": "GitLab returned incomplete file changes." if partial else None,
-        }
+        return _file_list(*_changes(*resolved))
 
     def pr_diff(self, root: str, reference: PullRequestRef | None) -> dict[str, Any]:
         resolved = _resolved(root, reference)
         if resolved is None:
             return {"object": PR_DIFF_OBJECT, "patch": ""}
-        changes, partial = _changes(*resolved)
-        if partial:
-            return {
-                "object": PR_DIFF_OBJECT,
-                "patch": "",
-                "unavailable_reason": "incomplete_diff",
-                "message": "GitLab returned an incomplete diff. "
-                "View the merge request on GitLab for all changes.",
-            }
-        patches = []
-        for change in changes:
-            patch = _text_patch(change)
-            if patch is None:
-                continue
-            old, new = _patch_path("a/", change["old_path"]), _patch_path("b/", change["new_path"])
-            before, after = (
-                ("/dev/null" if change.get("new_file") else old),
-                ("/dev/null" if change.get("deleted_file") else new),
-            )
-            patches.append(
-                f"diff --git {old} {new}\n--- {before}\n+++ {after}\n" + patch.rstrip("\n") + "\n"
-            )
-        return {"object": PR_DIFF_OBJECT, "patch": "".join(patches)}
+        return _whole_patch(*_changes(*resolved))
+
+    def pinned_changed_files(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        files = _file_list(*_pinned_changes(root, reference, head_sha=head_sha, base_sha=base_sha))
+        return {**files, "head_sha": head_sha, "base_sha": base_sha}
+
+    def pinned_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        patch = _whole_patch(
+            *_pinned_changes(root, reference, head_sha=head_sha, base_sha=base_sha)
+        )
+        return {**patch, "head_sha": head_sha, "base_sha": base_sha}
 
     def file_diff(
         self,

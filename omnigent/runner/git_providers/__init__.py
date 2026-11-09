@@ -164,16 +164,28 @@ class ProviderCapabilities:
 
 
 @runtime_checkable
+class PinnedRevisionFacet(Protocol):
+    """Optional support for reading the changed files and patch at an exact revision."""
+
+    def pinned_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Return the whole PR's patch, echoing ``head_sha``/``base_sha``.
+
+        Raise ``ValueError`` when the PR's head or base is no longer the pinned revision.
+        """
+        ...
+
+    def pinned_changed_files(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Return the changed files echoing ``head_sha``/``base_sha``; raise as ``pinned_diff``."""
+        ...
+
+
+@runtime_checkable
 class ReviewThreadsFacet(Protocol):
     """Optional review conversation support, independent of the base provider protocol."""
-
-    def review_diff(
-        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
-    ) -> dict[str, Any]: ...
-
-    def review_changed_files(
-        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
-    ) -> dict[str, Any]: ...
 
     def review_threads(
         self, root: str, reference: PullRequestRef, *, after: str, head_sha: str, base_sha: str
