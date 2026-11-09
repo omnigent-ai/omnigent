@@ -4053,6 +4053,47 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_run_leaves_out_the_turn_running_in_its_source() -> None:
+    conv_store = FakeConversationStore()
+
+    def _message(response_id: str, role: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            type="message",
+            status="completed",
+            response_id=response_id,
+            data=SimpleNamespace(role=role),
+        )
+
+    # Newest first: the running turn's progress text is stored as a completed message too.
+    page = SimpleNamespace(
+        data=[
+            _message("resp_active", "assistant"),
+            _message("resp_active", "user"),
+            _message("resp_done", "assistant"),
+        ],
+        has_more=False,
+        last_id=None,
+    )
+    conv_store.list_items = lambda conversation_id, **kwargs: page  # type: ignore[method-assign]
+    conv_store.get_conversation = lambda conversation_id: _FakeConversation(  # type: ignore[method-assign]
+        id=conversation_id,
+        agent_id="ag_1",
+        live_status="running" if conversation_id == "conv_source" else None,
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    deps = _deps(store, conversation_store=conv_store)
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (fork,) = conv_store.forked
+    assert fork["up_to_response_id"] == "resp_done"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("agent_id", "keeps_binding"), [("ag_1", True), ("ag_2", False)])
 async def test_a_run_on_another_agent_leaves_the_copys_provider_binding(
     agent_id: str, keeps_binding: bool
@@ -4079,6 +4120,17 @@ async def test_a_run_on_another_agent_leaves_the_copys_provider_binding(
 async def test_a_run_copy_that_cannot_bind_its_host_is_deleted() -> None:
     conv_store = FakeConversationStore()
 
+    class _LastRowsFileStore:
+        def list(self, session_id: str, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(data=[], has_more=False, last_id=None)
+
+        def delete_all_for_session(self, session_id: str) -> list[str]:
+            return ["blob_orphaned"]
+
+    class _FailingArtifactStore:
+        def delete(self, key: str) -> None:
+            raise OSError("storage unavailable")
+
     def _no_host(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("host binding failed")
 
@@ -4089,11 +4141,17 @@ async def test_a_run_copy_that_cannot_bind_its_host_is_deleted() -> None:
     async def _launch(conv: Any, task: Any) -> None:
         launched.append(conv)
 
-    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
-    await on_fire(0, "task_1")
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        file_store=_LastRowsFileStore(),
+        artifact_store=_FailingArtifactStore(),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
     await _drain()
 
-    # The copy was made before the bind failed, so the run deletes it rather than orphan it.
+    # The copy was made before the bind failed, so the run deletes it rather than orphan
+    # it, even when a blob only it still used won't delete.
     assert [fork["source_id"] for fork in conv_store.forked] == ["conv_source"]
     assert conv_store.deleted == ["conv_1"]
     assert launched == []

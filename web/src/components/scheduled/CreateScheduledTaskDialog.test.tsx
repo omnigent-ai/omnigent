@@ -5096,6 +5096,7 @@ describe("automation random worktree", () => {
 });
 
 describe("creating an automation from a session", () => {
+  const RUNTIME_REPO = "https://github.com/example/runtime";
   const SOURCE: AutomationSourceSession = {
     id: "conv_src",
     title: "Weekly rubric",
@@ -5185,8 +5186,23 @@ describe("creating an automation from a session", () => {
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "st_new" }));
   });
 
-  it("defaults to an Arclet sandbox when one is offered", async () => {
-    renderFromSession({ info: { managed_sandboxes_enabled: true, sandbox_provider: "arclet" } });
+  it.each<[string, Record<string, string>]>([
+    ["no repository", {}],
+    ["its joined repository label", { "omnigent.sandbox.repo": RUNTIME_REPO }],
+    // A long repository list carries only the indexed labels.
+    ["only indexed repository labels", { "omnigent.sandbox.repo.0": RUNTIME_REPO }],
+  ])("defaults to an Arclet sandbox when one is offered (session with %s)", async (_, labels) => {
+    renderFromSession({
+      source: { ...SOURCE, labels },
+      info: {
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "arclet",
+        scheduled_task_sandbox_workspaces: true,
+        sandbox_provider_capabilities: {
+          arclet: { repo_catalog: [{ name: "runtime", url: RUNTIME_REPO }] },
+        },
+      },
+    });
 
     const input = await submit();
     expect(input).toMatchObject({
@@ -5194,6 +5210,7 @@ describe("creating an automation from a session", () => {
       sourceSessionId: "conv_src",
     });
     expect(input).not.toHaveProperty("hostId");
+    expect(input.workspace ?? "").toBe(Object.keys(labels).length > 0 ? RUNTIME_REPO : "");
   });
 
   it("does not default to another sandbox provider", async () => {

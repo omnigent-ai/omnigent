@@ -99,7 +99,10 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
 )
 from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
-from omnigent.server.routes._sessions.helpers import _announce_session_added
+from omnigent.server.routes._sessions.helpers import (
+    _announce_session_added,
+    _session_status_from_cache,
+)
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentity,
     FireIdentityRevoked,
@@ -1242,7 +1245,13 @@ async def _discard_session(deps: FireDeps, conv: Conversation) -> None:
             orphaned = await asyncio.to_thread(deps.file_store.delete_all_for_session, conv.id)
             if deps.artifact_store is not None:
                 for blob_key in orphaned:
-                    await asyncio.to_thread(deps.artifact_store.delete, blob_key)
+                    try:
+                        await asyncio.to_thread(deps.artifact_store.delete, blob_key)
+                    except Exception:
+                        # A blob that won't delete must not keep the session.
+                        _logger.warning(
+                            "scheduled fire: could not delete blob %s", blob_key, exc_info=True
+                        )
         await deps.conversation_store.delete_conversation(conv.id)
     except Exception:
         _logger.exception("scheduled fire: could not delete the unused session %s", conv.id)
@@ -1773,11 +1782,19 @@ async def _copy_source_session_for_run(
         raise _CannotLaunchScheduledFire(
             str(exc), error_code="source_session_incompatible"
         ) from exc
-    up_to = await asyncio.to_thread(
-        last_finished_response_id, deps.conversation_store, task.source_session_id
-    )
     source = await asyncio.to_thread(
         deps.conversation_store.get_conversation, task.source_session_id
+    )
+    # Its owner can chat in the source too; a turn still running stays out of the run.
+    running = (
+        source is not None
+        and _session_status_from_cache(source.id, source.live_status) == "running"
+    )
+    up_to = await asyncio.to_thread(
+        last_finished_response_id,
+        deps.conversation_store,
+        task.source_session_id,
+        running=running,
     )
     agent_changed = source is not None and source.agent_id != task.agent_id
     dropped = run_copy_dropped_label_keys(

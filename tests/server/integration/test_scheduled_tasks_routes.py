@@ -3359,8 +3359,12 @@ async def test_runs_need_an_agent_that_can_open_the_sessions_file_attachments(
     assert "sample.zip" in switched.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("source_drops_its_file", [False, True])
 async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
-    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    source_drops_its_file: bool,
 ) -> None:
     from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.server.scheduled import source_session
@@ -3377,10 +3381,17 @@ async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
         return conv
 
     def _failing_create(*args: Any, **kwargs: Any) -> None:
+        if source_drops_its_file:
+            # The copy then holds the blob's last row, and the blob won't delete.
+            files.delete_all_for_session(source_id)
         raise OmnigentError("store unavailable", code=ErrorCode.INVALID_INPUT)
+
+    def _failing_blob_delete(self: Any, key: str) -> None:
+        raise OSError("storage unavailable")
 
     monkeypatch.setattr(source_session, "copy_session", _recording_copy)
     monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "create", _failing_create)
+    monkeypatch.setattr(LocalArtifactStore, "delete", _failing_blob_delete)
     resp = await auth_client.post(
         "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
     )
@@ -3391,7 +3402,8 @@ async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
     assert copied_files == ["notes.txt"]
     assert SqlAlchemyConversationStore(db_uri).get_conversation(copy_id) is None
     assert files.list(copy_id).data == []
-    assert [stored.filename for stored in files.list(source_id).data] == ["notes.txt"]
+    kept = [] if source_drops_its_file else ["notes.txt"]
+    assert [stored.filename for stored in files.list(source_id).data] == kept
 
 
 async def test_a_copy_takes_only_attachments_the_deployment_accepts(

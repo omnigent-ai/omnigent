@@ -522,8 +522,11 @@ export function CreateScheduledTaskDialog({
   const sourceHostId = hosts?.some((h) => h.host_id === fromSession?.hostId)
     ? (fromSession?.hostId ?? undefined)
     : undefined;
+  // The first repository's indexed label, or the joined label, which a long list omits.
   const sourceSandboxRepo = splitSandboxWorkspace(
-    (fromSession?.labels[SANDBOX_REPO_LABEL_KEY] ?? "").split(/\s+/)[0] ?? "",
+    fromSession?.labels[`${SANDBOX_REPO_LABEL_KEY}.0`] ??
+      (fromSession?.labels[SANDBOX_REPO_LABEL_KEY] ?? "").split(/\s+/)[0] ??
+      "",
   ).url;
   const sourceRepoInCatalog = sandboxRepoCatalog.some((repo) => repo.url === sourceSandboxRepo);
   const sourceWorkspace = fromSession?.workspace ?? "";
