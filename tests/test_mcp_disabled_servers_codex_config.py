@@ -233,18 +233,29 @@ def test_cli_trust_and_root_markers_precede_discovery(launch):
     set_disabled(ServerKey("codex", "repo"), True)
     overrides = [
         'project_root_markers=["ROOT"]',
-        f'projects.{json.dumps(str(repo))}.trust_level="trusted"',
+        f'projects={{{json.dumps(str(repo))}={{trust_level="trusted"}}}}',
     ]
     assert _plan(home, cwd, overrides).config_overrides[-1] == "mcp_servers.repo.enabled=false"
 
 
-def test_quoted_name(launch):
+@pytest.mark.parametrize("name", ['name.with."quotes', "server😀", "server with spaces"])
+def test_quoted_name(launch, name):
     home, repo = launch
-    name = 'name.with."quotes'
     set_disabled(ServerKey("codex", name), True)
-    _write(home / "config.toml", f'[mcp_servers.{json.dumps(name)}]\ncommand="true"\n')
-    assert tomllib.loads(_plan(home, repo).config_overrides[0]) == {
-        "mcp_servers": {name: {"enabled": False}}
+    _write(
+        home / "config.toml",
+        f'[mcp_servers.{json.dumps(name, ensure_ascii=False)}]\ncommand="true"\n',
+    )
+    overrides = ['mcp_servers={superseded={command="true"}}', 'mcp_servers.cli.command="true"']
+    plan = _plan(home, repo, overrides)
+    assert plan.fallback_config_overrides == tuple(overrides)
+    assert plan.config_overrides[:-1] == tuple(overrides)
+    assert tomllib.loads(plan.config_overrides[-1]) == {
+        "mcp_servers": {
+            "superseded": {"command": "true"},
+            "cli": {"command": "true"},
+            name: {"enabled": False},
+        }
     }
 
 
@@ -286,7 +297,7 @@ def test_malformed_user_layer_does_not_hide_valid_project_layer(launch, caplog):
     _write(home / "config.toml", "[broken")
     _write(repo / ".codex/config.toml", '[mcp_servers.repo]\ncommand="true"\n')
     set_disabled(ServerKey("codex", "repo"), True)
-    overrides = [f'projects.{json.dumps(str(repo))}.trust_level="trusted"']
+    overrides = [f'projects={{{json.dumps(str(repo))}={{trust_level="trusted"}}}}']
     assert _plan(home, repo, overrides).config_overrides[-1] == "mcp_servers.repo.enabled=false"
     assert "mcp_disabled_codex_config_read_failed" in caplog.text
 
@@ -301,7 +312,7 @@ def test_project_layer_cannot_grant_itself_trust(launch):
     assert _plan(home, repo).dropped == ("repo",)
 
 
-@pytest.mark.parametrize("overrides", [["broken key=secret"], ["project_root_markers=42"]])
+@pytest.mark.parametrize("overrides", [["missing-assignment-secret"], ["project_root_markers=42"]])
 def test_invalid_discovery_settings_never_raise_or_log_values(launch, caplog, overrides):
     home, repo = launch
     set_disabled(ServerKey("codex", "user"), True)
@@ -338,12 +349,24 @@ def test_real_codex_config_names_match_in_process_plan(launch):
         f'[mcp_servers.user]\ncommand="true"\n[projects.{json.dumps(str(repo))}]\ntrust_level="trusted"\n',
     )
     _write(repo / ".codex/config.toml", '[mcp_servers.repo]\nurl="http://localhost:1/mcp"\n')
-    overrides = ['mcp_servers.cli.command="true"']
-    for name in ["user", "repo", "cli", "missing"]:
+    quoted_names = ["quoted.name", "server😀", 'with "quotes"']
+    for name in quoted_names:
+        with (home / "config.toml").open("a") as stream:
+            stream.write(f'[mcp_servers.{json.dumps(name, ensure_ascii=False)}]\ncommand="true"\n')
+    overrides = [
+        'mcp_servers={superseded={command="true"}}',
+        'mcp_servers={cli={command="true"},keep={command="true"},'
+        '"cli.dotted"={url="http://localhost:2/mcp"}}',
+        'mcp_servers.cli.args=["--flag"]',
+    ]
+    for name in ["user", "repo", "cli", "cli.dotted", "missing", *quoted_names]:
         set_disabled(ServerKey("codex", name), True)
     plan = _plan(home, repo, overrides)
+    argv = ["codex"]
+    for override in overrides:
+        argv.extend(["-c", override])
     result = subprocess.run(
-        ["codex", "-c", overrides[0], "mcp", "list", "--json"],
+        [*argv, "mcp", "list", "--json"],
         env={**os.environ, "CODEX_HOME": str(home)},
         cwd=repo,
         capture_output=True,
@@ -352,9 +375,26 @@ def test_real_codex_config_names_match_in_process_plan(launch):
         timeout=10,
     )
     cli_names = {row["name"] for row in json.loads(result.stdout)}
-    planned_names = {
-        next(iter(tomllib.loads(value)["mcp_servers"]))
-        for value in plan.config_overrides[len(overrides) :]
-    }
-    assert planned_names == cli_names == {"user", "repo", "cli"}
+    expected_names = {"user", "repo", "cli", "cli.dotted", "keep", *quoted_names}
+    assert cli_names == expected_names
     assert plan.dropped == ("missing",)
+    argv = ["codex"]
+    for override in plan.config_overrides:
+        argv.extend(["-c", override])
+    disabled = subprocess.run(
+        [*argv, "mcp", "list", "--json"],
+        env={**os.environ, "CODEX_HOME": str(home)},
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    rows = json.loads(disabled.stdout)
+    assert {row["name"] for row in rows} == expected_names
+    assert {row["name"]: row["enabled"] for row in rows} == {
+        name: name == "keep" for name in expected_names
+    }
+    assert {row["name"]: row["transport"] for row in rows} == {
+        row["name"]: row["transport"] for row in json.loads(result.stdout)
+    }

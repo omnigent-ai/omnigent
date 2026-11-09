@@ -93,6 +93,7 @@ from omnigent.harnesses.codex_native.timeouts import (
     APP_SERVER_READY_TIMEOUT_SECONDS as _APP_SERVER_READY_TIMEOUT_SECONDS,
 )
 from omnigent.inner import _proc
+from omnigent.inner._subprocess_lifecycle import subprocess_exited
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
@@ -2796,7 +2797,11 @@ class CodexNativeAppServer:
                     startup_client = await self._wait_until_ready()
                 except Exception:
                     fallback = mcp_plan.overrides_after_early_exit()
-                    if fallback is None or self.proc is None or self.proc.returncode is None:
+                    if (
+                        fallback is None
+                        or self.proc is None
+                        or not await subprocess_exited(self.proc)
+                    ):
                         raise
                     _logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
                     await self.close()

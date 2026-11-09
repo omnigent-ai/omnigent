@@ -55,6 +55,8 @@ def test_round_trip_exact_keys_no_pruning(config_home):
         (ServerKey("codex", "ok", "plugin"), "invalid_name"),
         (ServerKey("claude", "ok", ""), "invalid_name"),
         (ServerKey("claude", "x" * 1025), "invalid_name"),
+        (ServerKey("codex", "bad\ud800"), "invalid_name"),
+        (ServerKey("claude", "ok", "bad\udfff"), "invalid_name"),
     ],
 )
 def test_invalid_writes(key, code):
