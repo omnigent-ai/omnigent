@@ -21,6 +21,18 @@ export function relativeTime(timestampMs: number, nowMs: number = Date.now()): s
   return `${Math.floor(diff / YEAR_MS)}y`;
 }
 
+/** "8s", "1m 46s", "1h 2m": an elapsed time, as the native CLIs stamp worked-for times. */
+export function formatDuration(seconds: number): string {
+  const s = Math.max(1, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return mm > 0 ? `${h}h ${mm}m` : `${h}h`;
+}
+
 export function absoluteTime(timestampMs: number): string {
   // Guard the same non-finite case as relativeTime — `new Date(NaN)` renders
   // "Invalid Date" in the row's tooltip.

@@ -28,13 +28,14 @@ import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
 import { DbcertBanner } from "@/components/DbcertBanner";
 import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
+import { useSessionTasks } from "@/hooks/useSessionTasks";
 import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { onFindOpened } from "@/lib/nativeBridge";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
-import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
+import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
 import {
   RunnerStartingIndicator,
   McpStartupIndicator,
@@ -159,8 +160,9 @@ function TranscriptImpl({
   const sandboxFailed = useChatStore((s) => s.sandboxStatus?.stage === "failed");
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
-  const hasTasks = useChatStore((s) => s.todos.length > 0);
   const conversationId = useChatStore((s) => s.conversationId);
+  const tasks = useSessionTasks(conversationId ?? undefined, true);
+  const hasTasks = hasTaskPreview(tasks);
 
   // Build bubbles once per blocks/activeResponse change. Per-surface reuse
   // cache so a streaming append rebuilds only the active bubble, reusing the
@@ -370,10 +372,16 @@ function TranscriptImpl({
   const hasPinnedBanner = display.hasTasks || showArcaBanner;
   return (
     <>
-      {/* Task tracker pinned above the thread. Sibling of the viewport (not an
+      {/* Task preview pinned above the thread. Sibling of the viewport (not an
       overlay) so it shrinks the scroll area rather than covering messages.
       Self-hides with no tasks. */}
-      <ChatPlanAccordion className="mt-14 md:mt-12" />
+      {conversationId && (
+        <ChatTasksPreview
+          conversationId={conversationId}
+          tasks={tasks}
+          className="mt-14 md:mt-12"
+        />
+      )}
       {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
       conversation area without requiring Conversation to forward refs. */}

@@ -6319,6 +6319,11 @@
             "title": "Session Fork Workspaces",
             "type": "boolean"
           },
+          "session_ledger": {
+            "default": false,
+            "title": "Session Ledger",
+            "type": "boolean"
+          },
           "session_pull_requests": {
             "default": false,
             "title": "Session Pull Requests",
@@ -6429,6 +6434,7 @@
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
+            "session.ledger.appended": "#/components/schemas/SessionLedgerAppendedEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
@@ -6525,6 +6531,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionChildSessionUpdatedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionLedgerAppendedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionChangedFilesInvalidatedEvent"
@@ -7491,6 +7500,238 @@
           "id"
         ],
         "title": "SessionLabelsResponse",
+        "type": "object"
+      },
+      "SessionLedgerAppendRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /v1/sessions/{id}/ledger`, sent by the session's runner.",
+        "properties": {
+          "idempotency_key": {
+            "description": "Names the write, e.g. `\"tool:<tool call ID>\"`; a retry with the same key returns the first attempt's entry.",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "kind": {
+            "description": "The kind the agent writes.",
+            "enum": [
+              "status",
+              "note",
+              "plan"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "description": "The kind's fields, e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}`.",
+            "title": "Payload",
+            "type": "object"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The plan step the entry is about.",
+            "title": "Step"
+          }
+        },
+        "required": [
+          "kind",
+          "payload",
+          "idempotency_key"
+        ],
+        "title": "SessionLedgerAppendRequest",
+        "type": "object"
+      },
+      "SessionLedgerAppendedEvent": {
+        "description": "An entry was appended to the session's ledger.\n\nTransient: the ledger itself is the source of truth, and a client that\nreconnects catches up with `GET \u2026/ledger?order=asc&after=<last entry ID>`.",
+        "properties": {
+          "conversation_id": {
+            "description": "The session whose ledger grew.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "entry": {
+            "$ref": "#/components/schemas/SessionLedgerEntry",
+            "description": "The new entry."
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.ledger.appended",
+            "description": "Always `\"session.ledger.appended\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "entry"
+        ],
+        "title": "SessionLedgerAppendedEvent",
+        "type": "object"
+      },
+      "SessionLedgerAuthor": {
+        "description": "Who wrote a ledger entry, derived from its kind and, for plans, its source.",
+        "properties": {
+          "type": {
+            "description": "`\"agent\"` for the session's agent, `\"omnigent\"` for entries Omnigent writes.",
+            "enum": [
+              "agent",
+              "omnigent"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionLedgerAuthor",
+        "type": "object"
+      },
+      "SessionLedgerEntry": {
+        "description": "One entry of a session's ledger.",
+        "properties": {
+          "author": {
+            "$ref": "#/components/schemas/SessionLedgerAuthor"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds when it was appended.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Entry ID, a bare 32-character hex UUID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "description": "The entry kind; `payload` holds its fields.",
+            "enum": [
+              "status",
+              "note",
+              "dispatch",
+              "dispatch_result",
+              "plan",
+              "plan_status"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "description": "e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}` for a status, `{\"body\": \"\u2026\"}` for a note, or `{\"version\": 2, \"source\": \"agent\", \"workflow\": null, \"steps\": [...]}` for a plan.",
+            "title": "Payload",
+            "type": "object"
+          },
+          "position": {
+            "description": "The entry's place in the ledger: 0, 1, 2, \u2026",
+            "format": "int64",
+            "title": "Position",
+            "type": "integer"
+          },
+          "scheduled_task_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The automation run the session was serving, or `None`.",
+            "title": "Scheduled Task Run Id"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The plan step it is about, e.g. `\"propose\"`, or `None`.",
+            "title": "Step"
+          }
+        },
+        "required": [
+          "id",
+          "position",
+          "created_at",
+          "author",
+          "kind",
+          "payload"
+        ],
+        "title": "SessionLedgerEntry",
+        "type": "object"
+      },
+      "SessionLedgerPage": {
+        "description": "One page of a session's ledger, for `GET /v1/sessions/{id}/ledger`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SessionLedgerEntry"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SessionLedgerPage",
         "type": "object"
       },
       "SessionList": {
@@ -16379,6 +16620,198 @@
         "summary": "Get Session Labels",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/ledger": {
+      "get": {
+        "description": "One page of the session's ledger by position; requires read access.\n\n`after` continues in the sort order and `before` goes against it,\nboth taking entry IDs, as for conversation items.",
+        "operationId": "list_session_ledger_v1_sessions__session_id__ledger_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "asc",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "title": "Order",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "status",
+                    "note",
+                    "dispatch",
+                    "dispatch_result",
+                    "plan",
+                    "plan_status"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "step",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Step"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionLedgerPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Ledger",
+        "tags": [
+          "session_ledger"
+        ]
+      },
+      "post": {
+        "description": "Append an entry written by the session's agent; only its runner calls this.",
+        "operationId": "append_session_ledger_entry_v1_sessions__session_id__ledger_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionLedgerAppendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionLedgerEntry"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Session Ledger Entry",
+        "tags": [
+          "session_ledger"
         ]
       }
     },

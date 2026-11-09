@@ -109,6 +109,7 @@ import {
   type PendingUserMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { registerStartWorkflow } from "@/store/sessionTasksActions";
 import { isRetryableRequestError } from "@/lib/queryRetry";
 import { useTrueForAtMost } from "@/hooks/useTrueForAtMost";
 import {
@@ -381,6 +382,8 @@ export function isSubagentRoutingEligible(
 
 /** How often `/mcp` re-reads the host inventory while a server waits on a sign-in. */
 const HOST_MCP_SIGN_IN_POLL_MS = 5_000;
+// The framework skill that plans and runs a described workflow.
+const WORKFLOW_SKILL = "workflow";
 
 /** Only an http(s) page is ever opened from a host's sign-in report. */
 const HOST_SIGN_IN_URL_RE = /^https?:\/\//i;
@@ -2997,6 +3000,23 @@ function ComposerImpl(
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
   const canStartSideChat = useCanStartSideChat(composerSessionId, permissionLevel);
   const showSide = supportsSideChat(sessionHarness, canStartSideChat);
+  // "Run a workflow" puts `/workflow ` into the composer, ready for a
+  // description. The "+" menu offers it, and so does the Tasks tab's empty
+  // state, which reaches it through the registry below.
+  const canStartWorkflow = !isReadOnly && skills.some((skill) => skill.name === WORKFLOW_SKILL);
+  const startWorkflowRef = useRef<() => void>(() => undefined);
+  startWorkflowRef.current = () => {
+    setValue(`${skillPrefix}${WORKFLOW_SKILL} `);
+    setCommandError(null);
+    dirtyRef.current = true;
+  };
+  useEffect(() => {
+    if (!canStartWorkflow || composerSessionId === null) return;
+    return registerStartWorkflow(composerSessionId, () => {
+      startWorkflowRef.current();
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    });
+  }, [canStartWorkflow, composerSessionId]);
   const slashCommands = useMemo(
     () =>
       buildSlashCommandMap(
@@ -4436,6 +4456,7 @@ function ComposerImpl(
                       }
                     : undefined
                 }
+                onWorkflow={canStartWorkflow ? () => startWorkflowRef.current() : undefined}
               />
               {!subAgentLabel && composerSessionId && (
                 <MobileHeaderControlPortal sessionId={composerSessionId}>

@@ -1770,3 +1770,145 @@ class SqlScheduledTaskRun(OmnigentBase):
             "id",
         ),
     )
+
+
+# Largest stored ledger payload: the store's envelope, compression and any
+# encryption included. One byte below the 16 KiB per-value limit.
+LEDGER_PAYLOAD_MAX_STORED_BYTES = 16_383
+
+
+class SqlSessionLedgerEntry(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_ledger_entries`` table.
+
+    One append-only entry in a session's ledger: a plan, a step status, a note,
+    or a record of work sent to another session. Entries are never updated and
+    are deleted only with their session.
+
+    :param conversation_id: The session that owns the ledger (relates to
+        ``conversations.id``; no DB foreign key, Rule R032).
+    :param position: The entry's place in the session's ledger, 0, 1, 2, …,
+        allocated from ``session_ledger_heads.next_position`` under its lock.
+    :param created_at: Unix epoch seconds when the entry was appended. Set once;
+        a deployment can partition the table on it.
+    :param id: UUID of the entry, stored as 16 raw bytes.
+    :param kind: The entry kind as a ``LEDGER_ENTRY_KIND`` code
+        (``omnigent.db.enum_codecs``).
+    :param scheduled_task_run_id: The automation run the session was serving
+        (relates to ``scheduled_task_runs.id``; no DB foreign key); ``None``
+        outside automation runs.
+    :param step: The plan step the entry is about, e.g. ``"propose"``; ``None``
+        for entries about no step, such as plans.
+    :param idempotency_key: Names the write that appended the entry, e.g.
+        ``"tool:toolu_01…"``, so a retried append returns the existing entry.
+    :param payload: The kind's fields in an envelope private to the ledger
+        store, at most :data:`LEDGER_PAYLOAD_MAX_STORED_BYTES` bytes.
+    """
+
+    __tablename__ = "session_ledger_entries"
+
+    # A new table takes no database defaults; writes always name the workspace.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # In the PK so a deployment can partition by time with pure DDL; no unique
+    # key may leave it out. Immutable: entries are insert/delete-only.
+    created_at: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    # No CHECK, so adding a kind needs no migration.
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    scheduled_task_run_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    step: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+    # Every index is non-unique and ends with the primary key: the heads lock,
+    # not the database, keeps positions and idempotency keys unique.
+    __table_args__ = (
+        # Resolves an entry ID to its position for after/before cursors.
+        Index(
+            "ix_session_ledger_entries_id",
+            "workspace_id",
+            "conversation_id",
+            "id",
+            "position",
+            "created_at",
+        ),
+        # Finds an earlier attempt of a retried append.
+        Index(
+            "ix_session_ledger_entries_idempotency_key",
+            "workspace_id",
+            "conversation_id",
+            "idempotency_key",
+            "position",
+            "created_at",
+        ),
+        # Pages one kind in order, e.g. the current plan and plan history.
+        Index(
+            "ix_session_ledger_entries_kind",
+            "workspace_id",
+            "conversation_id",
+            "kind",
+            "position",
+            "created_at",
+        ),
+        # Pages one kind for one step, e.g. a step's newest status.
+        Index(
+            "ix_session_ledger_entries_kind_step",
+            "workspace_id",
+            "conversation_id",
+            "kind",
+            "step",
+            "position",
+            "created_at",
+        ),
+        # One kind recorded during one automation run, e.g. its statuses for the
+        # run history. A run serves a single session.
+        Index(
+            "ix_session_ledger_entries_scheduled_task_run_id",
+            "workspace_id",
+            "scheduled_task_run_id",
+            "conversation_id",
+            "kind",
+            "position",
+            "created_at",
+        ),
+        # Pages one step's entries of every kind in order, for the step drawer.
+        Index(
+            "ix_session_ledger_entries_step",
+            "workspace_id",
+            "conversation_id",
+            "step",
+            "position",
+            "created_at",
+        ),
+        # length() of a binary value counts bytes on every supported engine.
+        CheckConstraint(
+            f"length(payload) <= {LEDGER_PAYLOAD_MAX_STORED_BYTES}",
+            name="ck_session_ledger_entries_payload_size",
+        ),
+    )
+
+
+class SqlSessionLedgerHead(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_ledger_heads`` table.
+
+    A session's ledger counter. Appends lock this row, so a session's appends
+    run one at a time without waiting on its metadata row. Created by the
+    session's first append and deleted with the session.
+
+    :param conversation_id: The session (relates to ``conversations.id``; no DB
+        foreign key, Rule R032).
+    :param next_position: The position the session's next entry gets.
+    """
+
+    __tablename__ = "session_ledger_heads"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    next_position: Mapped[int] = mapped_column(Integer, nullable=False)

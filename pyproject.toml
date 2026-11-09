@@ -467,6 +467,7 @@ include = ["omnigent*"]
 "omnigent.resources.pi_native" = ["*.js", "*.cjs"]
 "omnigent.resources.pi_gateway" = ["*.js"]
 "omnigent.resources.scripts" = ["*.sh"]
+"omnigent.resources.skills" = ["*/SKILL.md"]
 # include UI assets in build, plus the static API-only landing page served
 # at "/" when no web UI bundle is present
 "omnigent.server" = ["static/web-ui/**/*", "static/api_only_landing.html"]

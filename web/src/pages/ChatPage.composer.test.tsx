@@ -6110,6 +6110,32 @@ describe("Composer side-chat entry points", () => {
   });
 });
 
+describe("Composer workflow entry point", () => {
+  afterEach(cleanup);
+
+  it.each([
+    ["openai-agents", "/workflow "],
+    ["codex-native", "$workflow "],
+  ])("prefills the %s session's workflow command from the + menu", (harness, prefill) => {
+    setComposerState({
+      conversationId: "conv_test",
+      sessionHarness: harness,
+      skills: [{ name: "workflow", description: "Plan and run a multi-step workflow" }],
+    });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-workflow-action"));
+    expect(textarea().value).toBe(prefill);
+  });
+
+  it("is absent when the session has no workflow skill", () => {
+    setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    expect(screen.queryByTestId("composer-workflow-action")).toBeNull();
+  });
+});
+
 describe("Composer startSideChat (text-select → Ask in side chat)", () => {
   beforeEach(() => {
     clearSessionDrafts();

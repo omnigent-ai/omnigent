@@ -1,0 +1,89 @@
+---
+name: workflow
+description: Plan and run a multi-step workflow from a description. Keeps the plan and every step's status in the session's ledger, so people can follow along in the Tasks tab and the work resumes cleanly.
+---
+
+# Run a workflow
+
+The user described the work after `/workflow`. Turn it into a plan, then work
+through the plan, recording where each step stands as you go. The user watches
+the plan's steps as tasks in the session's Tasks tab and can steer or stop you
+in chat at any time.
+
+You need the `sys_ledger_*` tools. If you don't have them, tell the user this
+agent can't run workflows and stop.
+
+## Plan
+
+1. Read your ledger first with `sys_ledger_read`. If the session already has a
+   plan, continue it instead of starting over: steps that are done stay done.
+2. Write the plan with `sys_ledger_write_plan` before you start working. Name
+   the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
+   each step a short, stable ID (`profile`, `opt-pool`), a name, and its
+   dependencies. A single goal is a one-step plan.
+3. Ask first only if the description is ambiguous. Otherwise start.
+
+## Work through it
+
+- Track the work in the plan only. Don't also keep your own task list (such as
+  TodoWrite, TaskCreate or update_plan): the user sees the plan, and a second
+  list would only disagree with it.
+- Write `started` with `sys_ledger_write_status` when you begin a step yourself.
+- Start a step only once the steps it depends on are done: the ledger refuses
+  `started` or `done` otherwise (`step_not_ready`). If another step's work
+  covered one, write `done` on it and say which step covered it. If one turned
+  out unnecessary, replan without it.
+- Write `done` when the step achieved its goal. Only `done` lets later steps
+  start.
+- Keep going while any step is ready or started. Don't end your turn until
+  everything left is done, failed, blocked, waiting for the user, or waits on
+  one of those, unless the user or your instructions say to stop sooner.
+- When a step needs the user (an approval or a decision), first finish the
+  ready steps that don't depend on the answer, since asking pauses your turn.
+  Then write `needs_input` on the step saying what you need, such as "Approve
+  the deploy to prod?", and ask with your question tool (such as
+  AskUserQuestion or request_user_input), so the question reaches their Inbox;
+  if you have none, ask in your reply. Write `started` when you resume the step
+  after the answer.
+- If the user asks you to stop and wait for them, write `needs_input` on every
+  ready step, with text like "Paused at your request", then ask once whether
+  to go on.
+- Write `blocked` when something outside the session stops a step, such as CI
+  being down or another team's review, and `failed` when its own work failed.
+  The text says why in a few words.
+- If the user stops you, leave the step you were on `started`; the Tasks tab
+  shows it as stopped while you're idle. A stop isn't the step failing and
+  doesn't block later steps, so don't write `failed` or `blocked` for it. Write
+  a note if it helps to say what's left.
+- When you resume, check your `blocked` and `needs_input` steps first, and
+  write a new status for any that can go ahead.
+- Replan with `sys_ledger_write_plan` whenever the goal grows or changes. Keep
+  step IDs stable across replans, so finished steps keep their status; give a
+  step a new ID only when its work changes. Keep the plan's name while the
+  goal stays the same, and change it when the goal changes.
+- Write a note with `sys_ledger_write_note` before any external side effect
+  (push, merge, tag, deploy), and look for those notes when you resume.
+- Make an approval a step of its own. Write `needs_input` on it with text like
+  "Approve the deploy to prod?", then ask. Write `done` if approved, or `failed`
+  if rejected.
+- Keep entries short, and point to files, PRs and sessions instead of pasting
+  them.
+
+## Measurable goals
+
+For a goal you can measure, such as "cut p95 latency by 20%":
+
+- Measure a baseline first, as its own step.
+- Make each candidate change its own step, and add new candidates by
+  replanning as you learn.
+- Keep tried steps in the plan, failed ones too, so the record shows what you
+  tried.
+- Make the goal step depend on the candidates you keep. When a try fails,
+  replan so the goal no longer waits on it; the failed try stays in the plan.
+- Record each measurement in the status text or a note.
+
+## Finish
+
+Before your final reply, write a status for every step you worked on. In the
+reply, lead with anything the user needs to decide, then summarize what was
+done and what is left.

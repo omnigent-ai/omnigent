@@ -1,5 +1,6 @@
 import type { AssistantMessagePhase } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
+import type { LedgerEntry } from "./sessionLedger";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
 // Hand-ported. When _events.py changes, update this file and the
@@ -902,6 +903,17 @@ export interface SessionChildSessionUpdatedEvent {
 }
 
 /**
+ * `session.ledger.appended` — an entry was appended to the session's ledger.
+ * Transient: a client that reconnects catches up from the REST ledger.
+ */
+export interface SessionLedgerAppendedEvent {
+  type: "session_ledger_appended";
+  conversationId: string;
+  /** The new entry, shaped like a `GET …/ledger` entry. */
+  entry: LedgerEntry;
+}
+
+/**
  * `session.changed_files.invalidated` — the session's changed-files list
  * may have changed; the consumer should refetch it. Coarse signal (no
  * per-file payload).
@@ -1069,6 +1081,7 @@ export type StreamEvent =
   | SessionResourceCreatedEvent
   | SessionResourceDeletedEvent
   | SessionChildSessionUpdatedEvent
+  | SessionLedgerAppendedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionModelOptionsEvent

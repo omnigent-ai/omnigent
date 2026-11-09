@@ -6,6 +6,7 @@ import {
   PaperclipIcon,
   PlusIcon,
   TargetIcon,
+  WorkflowIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -45,6 +46,7 @@ export function ComposerAddMenu({
   onPlan,
   planActive,
   onSideChat,
+  onWorkflow,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
 }: {
@@ -66,6 +68,9 @@ export function ComposerAddMenu({
   /** Start a new side chat (a fork of this conversation opened as a rail tab).
    *  Absent when the session can't host one. */
   onSideChat?: () => void;
+  /** Start a workflow the agent plans from a description (`/workflow …`).
+   *  Absent when the session has no `workflow` skill. */
+  onWorkflow?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
 }) {
@@ -184,7 +189,7 @@ export function ComposerAddMenu({
                 <span>Files and images</span>
               </DropdownMenuItem>
             </div>
-            {(showGoal || showPlan || onProjectSelect || onSideChat) && (
+            {(showGoal || showPlan || onProjectSelect || onSideChat || onWorkflow) && (
               <div className="flex flex-col gap-0.5">
                 <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                 <div className="flex flex-col gap-px">
@@ -200,6 +205,21 @@ export function ComposerAddMenu({
                       <ActionText
                         label="Start a new side chat"
                         description="Ask without affecting this conversation"
+                      />
+                    </DropdownMenuItem>
+                  )}
+                  {onWorkflow && (
+                    <DropdownMenuItem
+                      className="mobile-touch-target"
+                      data-testid="composer-workflow-action"
+                      onSelect={onWorkflow}
+                    >
+                      <span className="flex size-4 shrink-0 items-center justify-center">
+                        <WorkflowIcon className="size-3.5" />
+                      </span>
+                      <ActionText
+                        label="Run a workflow"
+                        description="Describe it, and the agent plans and runs it"
                       />
                     </DropdownMenuItem>
                   )}

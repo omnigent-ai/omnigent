@@ -24,6 +24,7 @@ import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
+import { formatDuration } from "@/lib/relativeTime";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
@@ -641,7 +642,7 @@ function TurnWorkedFold({
   defaultOpen: boolean;
   children: ReactNode;
 }) {
-  const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
+  const label = workedForS !== undefined ? `Worked for ${formatDuration(workedForS)}` : "Worked";
   const [open, setOpen] = useState(animateCollapse || defaultOpen);
   // Closing over the trace it replaces, the fold keeps that trace laid out as it was on
   // screen, so only its height changes; an opened fold indents it under the row.
@@ -770,18 +771,6 @@ function nearestScrollContainer(el: HTMLElement): HTMLElement | null {
     if (overflowY === "auto" || overflowY === "scroll") return p;
   }
   return null;
-}
-
-/** "8s", "1m 46s", "1h 2m" — matches the native CLIs' worked-for stamps. */
-function formatWorkedFor(seconds: number): string {
-  const s = Math.max(1, Math.round(seconds));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const rem = s % 60;
-  if (m < 60) return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
-  const h = Math.floor(m / 60);
-  const mm = m % 60;
-  return mm > 0 ? `${h}h ${mm}m` : `${h}h`;
 }
 
 /**

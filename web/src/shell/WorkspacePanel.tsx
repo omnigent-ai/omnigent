@@ -7,6 +7,7 @@ import {
   FolderTreeIcon,
   FileDiffIcon,
   GitPullRequestIcon,
+  ListChecksIcon,
   GlobeIcon,
   Loader2Icon,
   MaximizeIcon,
@@ -101,6 +102,7 @@ import { FilesPanel } from "./FilesPanel";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
 import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
+import { TasksPanel } from "./TasksPanel";
 import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
@@ -116,6 +118,7 @@ const workspacePanels = {
   files: { label: "Files", icon: FolderTreeIcon },
   changes: { label: "Changes", icon: FileDiffIcon },
   github: { label: "Pull Requests", icon: GitPullRequestIcon },
+  tasks: { label: "Tasks", icon: ListChecksIcon },
   subagents: { label: "Agents", icon: BotIcon },
 };
 
@@ -725,6 +728,8 @@ interface WorkspacePanelProps {
   showContentSearch?: boolean;
   /** Whether the Pull Requests tab is available (same on-disk-workspace gate as Files). */
   showGithubTab: boolean;
+  /** Whether the session has a Tasks tab. */
+  showTasksTab?: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;
   /** Reveal the workspace when a global shortcut opens a tab. */
@@ -902,6 +907,7 @@ function WorkspacePanelImpl({
   showFilesPanel,
   showContentSearch = false,
   showGithubTab,
+  showTasksTab = false,
   showBrowserTab,
   onReveal,
   onHide,
@@ -1406,6 +1412,7 @@ function WorkspacePanelImpl({
   const availablePanels = tabOrder.filter((tab) => {
     if (tab === "subagents") return true;
     if (tab === "github") return pending || showGithubTab;
+    if (tab === "tasks") return showTasksTab;
     return pending || showFilesPanel;
   });
   const pinnedTabs = readPinnedWorkspaceTabs();
@@ -1618,6 +1625,21 @@ function WorkspacePanelImpl({
         </TabsTrigger>
       </WorkspaceTabTooltip>
     ),
+    tasks: showTasksTab && (
+      <WorkspaceTabTooltip key="tasks" label="Tasks" shortcut={shortcutFor("tasks")}>
+        <TabsTrigger
+          value="tasks"
+          disabled={pending}
+          aria-keyshortcuts={tabAriaShortcut("tasks")}
+          data-workspace-tab="tasks"
+          aria-label="Tasks"
+          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+        >
+          <ListChecksIcon />
+          <span className="sr-only">Tasks</span>
+        </TabsTrigger>
+      </WorkspaceTabTooltip>
+    ),
     subagents: (
       <WorkspaceTabTooltip key="subagents" label="Agents" shortcut={shortcutFor("subagents")}>
         <TabsTrigger
@@ -1655,13 +1677,15 @@ function WorkspacePanelImpl({
         ? "browser"
         : rightRailTab === "github" && showGithubTab
           ? "github"
-          : rightRailTab === "subagents" && rootSessionId
-            ? "subagents"
-            : rightRailTab === null
-              ? "empty"
-              : rightRailTab === "content-search" && showContentSearch
-                ? "content-search"
-                : "files";
+          : rightRailTab === "tasks" && showTasksTab && conversationId
+            ? "tasks"
+            : rightRailTab === "subagents" && rootSessionId
+              ? "subagents"
+              : rightRailTab === null
+                ? "empty"
+                : rightRailTab === "content-search" && showContentSearch
+                  ? "content-search"
+                  : "files";
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
   const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
@@ -2283,6 +2307,10 @@ function WorkspacePanelImpl({
           ) : scopeView === "github" ? (
             <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
               <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+            </RenderErrorBoundary>
+          ) : scopeView === "tasks" && conversationId ? (
+            <RenderErrorBoundary name="tasks" resetKey={conversationId}>
+              <TasksPanel conversationId={conversationId} active={open && !inert} />
             </RenderErrorBoundary>
           ) : scopeView === "subagents" && rootSessionId ? (
             <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>

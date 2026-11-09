@@ -80,6 +80,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import (
     managed_host_keepalive,
+    session_ledger,
     session_live_state,
     session_pull_requests,
     shutdown_state,
@@ -309,6 +310,9 @@ class ServerInfoResponse(BaseModel):
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
+    # GET/POST /v1/sessions/{id}/ledger and session.ledger.appended; absent on
+    # older servers, which clients treat as unsupported.
+    session_ledger: bool = False
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
@@ -3682,6 +3686,7 @@ def create_app(
                 "session_claude_sdk_clear": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
+                "session_ledger": session_ledger.open_store(conversation_store) is not None,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
@@ -3947,6 +3952,15 @@ def create_app(
         ),
         prefix="/v1",
         tags=["session_mcp_servers"],
+    )
+    app.include_router(
+        session_ledger.create_session_ledger_router(
+            conversation_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["session_ledger"],
     )
     if comment_store is not None:
         app.include_router(
