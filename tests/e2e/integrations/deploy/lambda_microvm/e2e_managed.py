@@ -30,7 +30,7 @@ The flow (each step asserts, exits non-zero on failure):
      launched ``microvmId`` is actually TERMINATED/gone — provider teardown is
      deliberately best-effort on the server, so only AWS can prove the VM died.
      A VM still alive at the deadline FAILS the run (this is the teardown-leak
-     check; a surviving MicroVM was observed once during review).
+     check).
 
 Step 2/6's AWS-side id tracking needs boto3 + AWS credentials for the account
 the server launches into (the same account the operator configured). Pass
@@ -150,8 +150,7 @@ def assert_microvm_terminated(client, microvm_id: str, timeout_s: float) -> None
     Provider teardown is deliberately best-effort on the server (a failed AWS
     call is logged and swallowed so session delete never 502s), so a green
     DELETE proves nothing about the VM. Only AWS's own state does — and a VM
-    that outlives session delete bills compute until its lifetime cap, which is
-    exactly the leak observed once during review.
+    that outlives session delete bills compute until its lifetime cap.
     """
     deadline = time.monotonic() + timeout_s
     state = "UNKNOWN"

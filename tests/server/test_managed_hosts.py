@@ -3003,7 +3003,7 @@ async def test_launch_persists_start_assigned_sandbox_id(db_uri: str) -> None:
 
     host = host_store.get_host(result.host_id)
     assert host is not None
-    assert host.sandbox_id == "microvm-real-1"
+    assert host.sandbox_id == result.sandbox_id == "microvm-real-1"
 
     await terminate_managed_host(host, host_store, config)
     assert fake.terminated == ["microvm-real-1"]
@@ -6848,8 +6848,9 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
 
 
 @pytest.mark.parametrize("waiter_timeout", [False, True])
+@pytest.mark.parametrize("started_sandbox_id", [None, "microvm-recovered"])
 async def test_siblings_share_one_recovery_across_host_stores(
-    db_uri, monkeypatch, waiter_timeout
+    db_uri, monkeypatch, waiter_timeout, started_sandbox_id
 ) -> None:
     if waiter_timeout:
         monkeypatch.setattr(
@@ -6900,6 +6901,7 @@ async def test_siblings_share_one_recovery_across_host_stores(
     gate = threading.Event()
     fake = FakeSandboxLauncher(
         provision_gate=gate,
+        started_sandbox_id=started_sandbox_id,
         on_host_start=lambda invocation: store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,

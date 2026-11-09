@@ -69,7 +69,7 @@ def _run_start_host(
     }
     if repo is not None:
         env["OMNIGENT_REPO_URL"] = str(repo)
-        env["OMNIGENT_REPO_NAME"] = "myrepo"
+        env.setdefault("OMNIGENT_REPO_NAME", "myrepo")
     return subprocess.run(
         ["bash", str(_SCRIPT)], env=env, capture_output=True, text=True, timeout=60
     )
@@ -82,8 +82,12 @@ def _fake_omnigent(bin_dir: Path, body: str) -> None:
     fake.chmod(0o755)
 
 
+@pytest.mark.parametrize(
+    ("repo_name", "clone_name"),
+    [("myrepo", "myrepo"), ("..", "repo"), ("-rf", "repo"), ("../../etc", "etc")],
+)
 def test_second_run_keeps_the_checkout_and_starts_the_host(
-    tmp_path: Path, bare_repo: Path
+    tmp_path: Path, bare_repo: Path, repo_name: str, clone_name: str
 ) -> None:
     """A /resume restart reruns the script against the existing clone."""
     home = tmp_path / "home"
@@ -92,13 +96,17 @@ def test_second_run_keeps_the_checkout_and_starts_the_host(
     bin_dir.mkdir()
     _fake_omnigent(bin_dir, 'echo "fake omnigent $*"\nexit 0')
 
-    first = _run_start_host(home, bin_dir, bare_repo)
+    extra_env = {"OMNIGENT_REPO_NAME": repo_name}
+    first = _run_start_host(home, bin_dir, bare_repo, extra_env)
     assert first.returncode == 0, first.stderr
     assert "fake omnigent host --server https://srv.example.com" in first.stdout
-    marker = home / "workspace" / "myrepo" / "session-work.txt"
+    clone = home / "workspace" / clone_name
+    assert (clone / ".git").is_dir()
+    assert (clone / "README").read_text() == "hello\n"
+    marker = clone / "session-work.txt"
     marker.write_text("keep me\n")
 
-    second = _run_start_host(home, bin_dir, bare_repo)
+    second = _run_start_host(home, bin_dir, bare_repo, extra_env)
     assert second.returncode == 0, second.stderr
     assert "fake omnigent host --server https://srv.example.com" in second.stdout
     assert marker.read_text() == "keep me\n"

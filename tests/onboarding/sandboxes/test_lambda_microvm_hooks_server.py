@@ -14,12 +14,13 @@ import http.client
 import importlib.util
 import json
 import threading
-import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from tests._helpers.polling import poll_until
 
 _HOOKS = Path(__file__).resolve().parents[3] / "deploy" / "aws-lambda-microvm" / "hooks_server.py"
 
@@ -43,28 +44,26 @@ _IDENTITY = {
 }
 
 
-def test_extract_wrapped_string_payload() -> None:
-    """Shape 1: the launcher's {microvmId, runHookPayload: '<json string>'}."""
-    body = json.dumps({"microvmId": "mv-1", "runHookPayload": json.dumps(_IDENTITY)}).encode()
-    assert _hooks._extract_identity_payload(body) == _IDENTITY
+@pytest.fixture(autouse=True)
+def reset_host_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(_hooks, "_host_started", False)
+    monkeypatch.setattr(_hooks, "_host_env", None)
+    monkeypatch.setattr(_hooks, "_host_exit_code", None)
+    monkeypatch.setattr(_hooks, "_HOST_LOG_PATH", str(tmp_path / "host.log"))
 
 
-def test_extract_wrapped_object_payload() -> None:
-    """Shape 1 variant: runHookPayload delivered as an object, not a string."""
-    body = json.dumps({"microvmId": "mv-1", "runHookPayload": _IDENTITY}).encode()
-    assert _hooks._extract_identity_payload(body) == _IDENTITY
-
-
-def test_extract_bare_identity_map() -> None:
-    """Shape 2: the identity map delivered directly as the JSON body."""
-    body = json.dumps(_IDENTITY).encode()
-    assert _hooks._extract_identity_payload(body) == _IDENTITY
-
-
-def test_extract_inner_json_string_as_whole_body() -> None:
-    """Shape 3: the inner runHookPayload JSON string delivered as the body."""
-    body = json.dumps(json.dumps(_IDENTITY)).encode()
-    assert _hooks._extract_identity_payload(body) == _IDENTITY
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"microvmId": "mv-1", "runHookPayload": json.dumps(_IDENTITY)},
+        {"microvmId": "mv-1", "runHookPayload": _IDENTITY},
+        _IDENTITY,
+        json.dumps(_IDENTITY),
+    ],
+    ids=["wrapped-string", "wrapped-object", "bare", "json-string"],
+)
+def test_extract_identity_payload(body: Any) -> None:
+    assert _hooks._extract_identity_payload(json.dumps(body).encode()) == _IDENTITY
 
 
 @pytest.mark.parametrize("raw", [b"not json", b"[1, 2, 3]", b"123"])
@@ -115,7 +114,7 @@ def test_spawn_failure_clears_started_flag_so_retry_can_succeed(
     assert calls["n"] == 2
     assert _hooks._host_started is True
     proc.exit(0)
-    _wait_until(lambda: _hooks._host_started is False)
+    poll_until(lambda: _hooks._host_started is False, timeout_s=5, interval_s=0.01)
 
 
 class _FakeHostProc:
@@ -135,21 +134,11 @@ class _FakeHostProc:
         return self.returncode
 
 
-def _wait_until(predicate: Callable[[], bool]) -> None:
-    deadline = time.monotonic() + 5
-    while not predicate():
-        assert time.monotonic() < deadline, "condition not reached within 5s"
-        time.sleep(0.01)
-
-
 @pytest.fixture
 def spawned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[list[tuple[_FakeHostProc, dict[str, str]]]]:
     """Reset the hooks server's host state and record every start_host.sh spawn."""
-    monkeypatch.setattr(_hooks, "_host_started", False)
-    monkeypatch.setattr(_hooks, "_host_env", None)
-    monkeypatch.setattr(_hooks, "_host_exit_code", None)
     procs: list[tuple[_FakeHostProc, dict[str, str]]] = []
 
     def _popen(*_args: Any, env: dict[str, str], **_kwargs: Any) -> _FakeHostProc:
@@ -161,6 +150,8 @@ def spawned(
     yield procs
     for proc, _env in procs:
         proc.exit(0)
+    # Finish the exit callback before monkeypatch restores module state.
+    poll_until(lambda: not _hooks._host_started, timeout_s=5, interval_s=0.01)
 
 
 def test_host_exit_clears_started_flag_and_records_status(
@@ -170,7 +161,7 @@ def test_host_exit_clears_started_flag_and_records_status(
     _hooks._start_host_from_payload(json.dumps(_IDENTITY).encode())
     assert _hooks._host_started is True
     spawned[0][0].exit(0)
-    _wait_until(lambda: _hooks._host_started is False)
+    poll_until(lambda: _hooks._host_started is False, timeout_s=5, interval_s=0.01)
     assert _hooks._host_exit_code == 0
 
 
@@ -182,7 +173,7 @@ def test_resume_restarts_a_host_that_stood_down(
     kept."""
     _hooks._start_host_from_payload(json.dumps(_IDENTITY).encode())
     spawned[0][0].exit(0)
-    _wait_until(lambda: _hooks._host_started is False)
+    poll_until(lambda: _hooks._host_started is False, timeout_s=5, interval_s=0.01)
 
     _hooks._restart_host_after_resume()
 
@@ -198,7 +189,7 @@ def test_resume_leaves_a_fatally_exited_host_down(
     """The fatal status means no restart can succeed, so /resume does not retry it."""
     _hooks._start_host_from_payload(json.dumps(_IDENTITY).encode())
     spawned[0][0].exit(_hooks._HOST_FATAL_EXIT_CODE)
-    _wait_until(lambda: _hooks._host_started is False)
+    poll_until(lambda: _hooks._host_started is False, timeout_s=5, interval_s=0.01)
 
     _hooks._restart_host_after_resume()
 
@@ -324,7 +315,7 @@ def test_resume_hook_restarts_a_host_that_stood_down(
     """POST /resume reaches the restart path with the identity /run delivered."""
     assert _request(hooks_port, "POST", _hooks._RUN_PATH, json.dumps(_IDENTITY).encode()) == 200
     spawned[0][0].exit(0)
-    _wait_until(lambda: _hooks._host_started is False)
+    poll_until(lambda: _hooks._host_started is False, timeout_s=5, interval_s=0.01)
 
     assert _request(hooks_port, "POST", _hooks._RESUME_PATH) == 200
 

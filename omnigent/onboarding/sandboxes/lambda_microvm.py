@@ -158,8 +158,7 @@ _RUN_HOOK_PAYLOAD_MAX_CHARS: int = 4_096
 
 # The /run payload key carrying the deployment's host config as compact JSON.
 # start_host.sh renders the shared config-write command from the image's own
-# omnigent install, so the payload carries only the config (about 2,000
-# characters less than shipping the rendered script).
+# omnigent install, so the payload carries only the config.
 _HOST_CONFIG_PAYLOAD_KEY: str = "OMNIGENT_HOST_CONFIG_JSON"
 
 # RunMicrovm attempts per launch. A transport failure or a 5xx leaves it unknown

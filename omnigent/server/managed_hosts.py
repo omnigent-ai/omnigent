@@ -4044,7 +4044,7 @@ async def launch_managed_host(
             detail=f"managed sandbox launch failed: {exc.message}",
         ) from exc
     with _provider_recovery_hint(launch_state, launcher, sandbox_id):
-        workspace = await _register_and_start_host(
+        return await _register_and_start_host(
             launcher=launcher,
             config=entry,
             host_store=host_store,
@@ -4058,12 +4058,6 @@ async def launch_managed_host(
             slice_key_enabled=slice_key_enabled,
             owner_credentials=config.owner_credentials,
         )
-    return ManagedHostLaunch(
-        host_id=host_id,
-        workspace=workspace,
-        sandbox_id=sandbox_id,
-        sandbox_provider=launcher.provider,
-    )
 
 
 async def relaunch_managed_host(
@@ -4249,7 +4243,7 @@ async def _relaunch_managed_host(
         ) from exc
     try:
         with _provider_recovery_hint(launch_state, launcher, sandbox_id):
-            workspace = await _register_and_start_host(
+            return await _register_and_start_host(
                 launcher=launcher,
                 config=entry,
                 host_store=host_store,
@@ -4270,12 +4264,6 @@ async def _relaunch_managed_host(
             status_code=409,
             detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
         ) from exc
-    return ManagedHostLaunch(
-        host_id=host.host_id,
-        workspace=workspace,
-        sandbox_id=sandbox_id,
-        sandbox_provider=launcher.provider,
-    )
 
 
 def _apply_git_clone_options(
@@ -4395,7 +4383,7 @@ async def _register_and_start_host(
     expected_host: Host | None = None,
     slice_key_enabled: bool = False,
     owner_credentials: Mapping[str, Callable[[str], Mapping[str, object] | None]] | None = None,
-) -> str:
+) -> ManagedHostLaunch:
     """
     Arm the credential, start the in-sandbox host, and await its
     registration — tearing the sandbox down on any failure.
@@ -4436,7 +4424,7 @@ async def _register_and_start_host(
         (:attr:`ManagedSandboxDeployment.owner_credentials`), so a first
         launch's failure teardown still acts as the owner. ``None`` binds
         none.
-    :returns: The absolute in-sandbox workspace path.
+    :returns: The registered host, workspace, and canonical sandbox identity.
     :raises HTTPException: 502 when cloning, host startup, or
         registration fails.
     """
@@ -4473,10 +4461,8 @@ async def _register_and_start_host(
                 sandbox_id=sandbox_id,
                 token_expires_at=now_epoch() + config.token_ttl_s,
             )
-        # Uniform across providers: provision() fixed the sandbox id and the
-        # token was armed against it above, so start_host starts the host with
-        # a token that already resolves. The exec-model default execs in; the
-        # entrypoint model (k8s) creates the Pod that boots the host.
+        # Arm the token before the host starts so its first dial-back authenticates.
+        # Providers may replace the reserved sandbox ID during startup.
         workspace = await _start_sandbox_host(
             launcher,
             sandbox_id,
@@ -4596,7 +4582,12 @@ async def _register_and_start_host(
             status_code=502,
             detail=f"managed sandbox host startup failed: {message}",
         ) from exc
-    return workspace
+    return ManagedHostLaunch(
+        host_id=host_id,
+        workspace=workspace,
+        sandbox_id=record.sandbox_id,
+        sandbox_provider=launcher.provider,
+    )
 
 
 async def _wait_for_host_online(

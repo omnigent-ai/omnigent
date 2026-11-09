@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import sys
+from types import SimpleNamespace
 
 import boto3
 import httpx
@@ -13,7 +14,9 @@ from botocore.stub import Stubber
 from tests.e2e.integrations.deploy.lambda_microvm import e2e_managed as driver
 
 
-@pytest.mark.parametrize("fault", [None, "not_suspended", "replacement", "marker_lost"])
+@pytest.mark.parametrize(
+    "fault", [None, "not_suspended", "still_running", "no_new_reply", "replacement", "marker_lost"]
+)
 def test_driver_requires_same_vm_and_workspace(
     monkeypatch: pytest.MonkeyPatch, fault: str | None
 ) -> None:
@@ -24,7 +27,16 @@ def test_driver_requires_same_vm_and_workspace(
         aws_secret_access_key="test",
     )
     monkeypatch.setattr(driver, "_microvm_client", lambda: client)
-    monkeypatch.setattr(sys, "argv", ["driver", "--server", "https://server.test", "--suspend"])
+    monkeypatch.setattr(
+        sys, "argv", ["driver", "--server", "https://server.test", "--suspend", "--timeout", "5"]
+    )
+    clock = 0.0
+
+    def advance(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+
+    monkeypatch.setattr(driver, "time", SimpleNamespace(monotonic=lambda: clock, sleep=advance))
     followed_up = False
     deleted = False
     marker = ""
@@ -47,6 +59,10 @@ def test_driver_requires_same_vm_and_workspace(
             deleted = True
             return httpx.Response(200, json={})
         if path == "/v1/sessions/session":
+            # An old reply containing 6 must not satisfy the follow-up deadline.
+            replies = (
+                ["4 and 6"] if fault == "no_new_reply" else (["4", "6"] if followed_up else ["4"])
+            )
             return httpx.Response(
                 200,
                 json={
@@ -60,7 +76,7 @@ def test_driver_requires_same_vm_and_workspace(
                                 "content": [{"type": "output_text", "text": text}],
                             },
                         }
-                        for text in (["4", "6"] if followed_up else ["4"])
+                        for text in replies
                     ],
                 },
             )
@@ -98,12 +114,14 @@ def test_driver_requires_same_vm_and_workspace(
                 {},
             )
             stub.add_response("suspend_microvm", {}, {"microvmIdentifier": "original"})
-            stub.add_response(
-                "get_microvm",
-                {**vm, "state": "TERMINATED" if fault == "not_suspended" else "SUSPENDED"},
-                {"microvmIdentifier": "original"},
+            state = {"not_suspended": "TERMINATED", "still_running": "RUNNING"}.get(
+                fault or "", "SUSPENDED"
             )
-            if fault != "not_suspended":
+            for _ in range(3 if fault == "still_running" else 1):
+                stub.add_response(
+                    "get_microvm", {**vm, "state": state}, {"microvmIdentifier": "original"}
+                )
+            if fault not in {"not_suspended", "still_running", "no_new_reply"}:
                 stub.add_response(
                     "get_microvm", {**vm, "state": "RUNNING"}, {"microvmIdentifier": "original"}
                 )
@@ -125,14 +143,19 @@ def test_driver_requires_same_vm_and_workspace(
                 with pytest.raises(httpx.HTTPStatusError, match="404"):
                     driver.main()
             elif fault:
-                with pytest.raises(SystemExit, match=r"expected SUSPENDED|replaced"):
+                with pytest.raises(
+                    SystemExit,
+                    match=r"expected SUSPENDED|replaced|follow-up turn did not complete",
+                ):
                     driver.main()
             else:
                 assert driver.main() == 0
             stub.assert_no_pending_responses()
     assert deleted
     assert marker.startswith("/root/workspace/.microvm-resume-")
-    assert followed_up is (fault != "not_suspended")
+    assert followed_up is (fault not in {"not_suspended", "still_running"})
+    if fault in {"still_running", "no_new_reply"}:
+        assert clock >= 5
 
 
 @pytest.mark.parametrize("skip", ["--skip-aws-check", "--skip-wake"])

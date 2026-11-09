@@ -90,74 +90,22 @@ def test_build_run_microvm_kwargs_includes_version_when_set() -> None:
     assert kwargs["imageVersion"] == "2.1"
 
 
-def test_build_idle_policy_enables_auto_resume() -> None:
-    """The idle policy auto-suspends on idle; autoResumeEnabled stays on as a
-    backstop (this host receives no inbound endpoint traffic, so every real
-    wake is the server's explicit resume-microvm)."""
-    policy = build_idle_policy()
-    assert policy["autoResumeEnabled"] is True
-    assert policy["maxIdleDurationSeconds"] > 0
-    assert policy["suspendedDurationSeconds"] > 0
-
-
-def test_build_idle_policy_suspends_for_the_full_lifetime() -> None:
-    """
-    A suspended VM survives to the lifetime cap, not less.
-
-    ``suspendedDurationSeconds`` is when Lambda TERMINATES a suspended VM, so
-    anything below the lifetime silently kills sessions idle longer than it and
-    the next wake fails with ResourceNotFoundException.
-    """
-    policy = build_idle_policy()
-    assert policy["suspendedDurationSeconds"] == resolve_max_lifetime_s()
-    assert policy["maxIdleDurationSeconds"] == policy["suspendedDurationSeconds"]
-
-
-@pytest.mark.parametrize("lifetime_s", [3600, 7200])
-def test_build_idle_policy_follows_lowered_lifetime(
-    monkeypatch: pytest.MonkeyPatch, lifetime_s: int
+@pytest.mark.parametrize("lifetime", [None, 60, 600, 3600, 7200, 28800])
+def test_run_request_uses_full_lifetime_before_idle_suspend(
+    monkeypatch: pytest.MonkeyPatch, lifetime: int | None
 ) -> None:
-    """A lowered lifetime override propagates into the idle policy.
-
-    A fixed 8 h suspendedDurationSeconds would contradict a lowered
-    maximumDurationInSeconds — the policy must track the resolved lifetime.
-    """
-    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, str(lifetime_s))
-    policy = build_idle_policy()
-    assert policy["suspendedDurationSeconds"] == lifetime_s
-    assert policy["maxIdleDurationSeconds"] <= lifetime_s
-
-
-def test_build_idle_policy_matches_short_lifetime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Even a short lifetime uses its full budget before idle suspension."""
-    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, "600")
-    policy = build_idle_policy()
-    assert policy["maxIdleDurationSeconds"] == 600
-    assert policy["suspendedDurationSeconds"] == 600
-
-
-def test_build_run_microvm_kwargs_idle_policy_matches_lifetime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The built request's idle policy agrees with its maximumDurationInSeconds."""
-    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, "3600")
-    kwargs = build_run_microvm_kwargs(**_RUN_KW)
-    assert kwargs["maximumDurationInSeconds"] == 3600
-    assert kwargs["idlePolicy"]["suspendedDurationSeconds"] == 3600
-
-
-def test_build_run_microvm_kwargs_rejects_oversized_payload() -> None:
-    """A launch payload over the runHookPayload cap fails fast.
-
-    Passthrough credentials and repo fields aggregate into one string with a
-    hard AWS-side 4,096-character limit; the builder pre-checks so the failure
-    is a pointed ClickException, not a run-time ValidationException.
-    """
-    oversized = {**_RUN_KW, "env_literals": {"BIG_SECRET": "x" * 17_000}}
-    with pytest.raises(click.ClickException, match="runHookPayload"):
-        build_run_microvm_kwargs(**oversized)
+    monkeypatch.delenv(MAX_IDLE_ENV_VAR, raising=False)
+    monkeypatch.delenv(MAX_LIFETIME_ENV_VAR, raising=False)
+    if lifetime is not None:
+        monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, str(lifetime))
+    expected = 28800 if lifetime is None else lifetime
+    request = build_run_microvm_kwargs(**_RUN_KW)
+    assert request["maximumDurationInSeconds"] == expected
+    assert request["idlePolicy"] == {
+        "maxIdleDurationSeconds": expected,
+        "suspendedDurationSeconds": expected,
+        "autoResumeEnabled": True,
+    }
 
 
 def test_build_run_microvm_kwargs_counts_escaped_non_ascii() -> None:
@@ -195,17 +143,6 @@ def test_build_run_microvm_kwargs_derives_client_token_from_launch_token() -> No
     # digest the host store keeps.
     assert _RUN_KW["token"] not in client_token
     assert client_token != hashlib.sha256(_RUN_KW["token"].encode()).hexdigest()
-
-
-def test_resolve_max_lifetime_defaults_to_eight_hours() -> None:
-    """Absent an override, the requested lifetime is the 8 h platform cap."""
-    assert resolve_max_lifetime_s() == 8 * 60 * 60
-
-
-def test_max_lifetime_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The lifetime env var overrides the default."""
-    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, "3600")
-    assert resolve_max_lifetime_s() == 3600
 
 
 def test_max_lifetime_env_rejects_non_numeric(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -256,24 +193,11 @@ def test_max_idle_env_rejects_values_outside_sixty_to_lifetime(
         build_idle_policy()
 
 
-def test_max_lifetime_env_accepts_sixty_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
-    """60 s is the smallest lifetime that builds a valid idle policy."""
-    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, "60")
-    assert resolve_max_lifetime_s() == 60
-    assert build_idle_policy()["maxIdleDurationSeconds"] == 60
-
-
 def test_max_lifetime_env_rejects_over_eight_hour_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     """An override above the 8 h platform cap fails fast with a clear message."""
     monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, str(8 * 60 * 60 + 1))
     with pytest.raises(click.ClickException, match="exceeds"):
         resolve_max_lifetime_s()
-
-
-def test_max_lifetime_env_accepts_exact_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The 8 h cap itself is valid (boundary)."""
-    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, str(8 * 60 * 60))
-    assert resolve_max_lifetime_s() == 8 * 60 * 60
 
 
 def test_managed_token_ttl_exceeds_lifetime() -> None:
@@ -353,6 +277,7 @@ def test_start_host_runs_microvm_and_returns_workspace_path(
     """
     client = _FakeMicroVMClient(run_id="microvm-run-42")
     launcher = _launcher_with_fake(monkeypatch, client)
+    assert launcher.started_sandbox_id is None
     workspace = launcher.start_host(
         "managed-abc",
         token="tok",
@@ -369,46 +294,6 @@ def test_start_host_runs_microvm_and_returns_workspace_path(
     # above) — it is surfaced on started_sandbox_id for the framework to persist
     # as the host row's sandbox_id, so terminate/resume key off the real id.
     assert launcher.started_sandbox_id == "microvm-run-42"
-
-
-def test_start_host_records_real_microvm_id_for_framework(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The provider-assigned microvmId lands on started_sandbox_id (not the
-    reserved provision name), so the managed-launch framework can persist the id
-    AWS actually knows for later terminate / resume."""
-    client = _FakeMicroVMClient(run_id="microvm-real-99")
-    launcher = _launcher_with_fake(monkeypatch, client)
-    assert launcher.started_sandbox_id is None
-    launcher.start_host(
-        "managed-reserved",
-        token="tok",
-        host_id="host_x",
-        host_name="managed-x",
-        server_url="https://srv.example.com",
-    )
-    assert launcher.started_sandbox_id == "microvm-real-99"
-    assert launcher.started_sandbox_id != "managed-reserved"
-
-
-def test_start_host_returns_clone_dir_when_repo_name_set(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A repo workspace's returned path is the clone directory, not the bare
-    workspace root — the runner's cwd must match where entrypoint.sh cloned."""
-    client = _FakeMicroVMClient()
-    launcher = _launcher_with_fake(monkeypatch, client)
-    workspace = launcher.start_host(
-        "managed-abc",
-        token="tok",
-        host_id="host_x",
-        host_name="managed-x",
-        server_url="https://srv.example.com",
-        repos=[
-            RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")
-        ],
-    )
-    assert workspace == "/root/workspace/repo"
 
 
 @pytest.mark.parametrize(
@@ -460,10 +345,12 @@ _GATEWAY_HOST_CONFIG: dict[str, object] = {
 def _start_with_fake(
     monkeypatch: pytest.MonkeyPatch,
     client: _FakeMicroVMClient,
+    *,
+    launcher: LambdaMicroVMSandboxLauncher | None = None,
     **kwargs: Any,
 ) -> LambdaMicroVMSandboxLauncher:
     """Run start_host against *client* with a fixed identity."""
-    launcher = _launcher_with_fake(monkeypatch, client)
+    launcher = launcher or _launcher_with_fake(monkeypatch, client)
     launcher.start_host(
         "managed-abc",
         token="tok",
@@ -489,18 +376,6 @@ def test_start_host_threads_host_config_as_json(
     env = json.loads(client.run_calls[0]["runHookPayload"])
     assert json.loads(env["OMNIGENT_HOST_CONFIG_JSON"]) == _GATEWAY_HOST_CONFIG
     assert "OMNIGENT_HOST_CONFIG_CMD" not in env
-
-
-def test_host_config_leaves_most_of_the_payload_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A one-provider config costs a few hundred characters of the 4,096.
-
-    Shipping the rendered write command spent about 2,070 characters on the
-    fixed script alone, before any passthrough secret.
-    """
-    client = _FakeMicroVMClient()
-    _start_with_fake(monkeypatch, client, host_config=_GATEWAY_HOST_CONFIG)
     assert len(client.run_calls[0]["runHookPayload"]) < 1_000
 
 
@@ -867,21 +742,6 @@ def test_build_run_microvm_kwargs_attaches_egress_connectors() -> None:
 _EGRESS_ARN = "arn:aws:lambda:us-east-1:123456789012:network-connector:vpc-egress"
 
 
-def _start_and_capture_run(
-    launcher: LambdaMicroVMSandboxLauncher, client: _FakeMicroVMClient
-) -> dict[str, Any]:
-    """Run start_host once and return the RunMicrovm request it sent."""
-    launcher.start_host(
-        "managed-abc",
-        token="tok",
-        host_id="host_x",
-        host_name="managed-x",
-        server_url="https://srv.example.com",
-    )
-    assert len(client.run_calls) == 1
-    return client.run_calls[0]
-
-
 def test_start_host_sends_the_configured_egress_connectors_and_image_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -897,7 +757,9 @@ def test_start_host_sends_the_configured_egress_connectors_and_image_version(
         monkeypatch, client, image_version="3", egress_network_connectors=[_EGRESS_ARN]
     )
 
-    call = _start_and_capture_run(launcher, client)
+    _start_with_fake(monkeypatch, client, launcher=launcher)
+    assert len(client.run_calls) == 1
+    call = client.run_calls[0]
 
     assert call["egressNetworkConnectors"] == [_EGRESS_ARN]
     assert call["imageVersion"] == "3"
@@ -912,7 +774,9 @@ def test_start_host_reads_egress_connectors_and_image_version_from_the_env(
     client = _FakeMicroVMClient()
     launcher = _launcher_with_fake(monkeypatch, client)
 
-    call = _start_and_capture_run(launcher, client)
+    _start_with_fake(monkeypatch, client, launcher=launcher)
+    assert len(client.run_calls) == 1
+    call = client.run_calls[0]
 
     assert call["egressNetworkConnectors"] == [_EGRESS_ARN]
     assert call["imageVersion"] == "4"
@@ -927,7 +791,9 @@ def test_start_host_without_egress_or_version_uses_the_account_defaults(
     client = _FakeMicroVMClient()
     launcher = _launcher_with_fake(monkeypatch, client)
 
-    call = _start_and_capture_run(launcher, client)
+    _start_with_fake(monkeypatch, client, launcher=launcher)
+    assert len(client.run_calls) == 1
+    call = client.run_calls[0]
 
     assert "egressNetworkConnectors" not in call
     assert "imageVersion" not in call
