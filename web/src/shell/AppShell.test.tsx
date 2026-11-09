@@ -606,6 +606,7 @@ function renderShell(
           <>
             <div>settings</div>
             <NavProbe />
+            {options.sessionNavTo && <SessionNavButton to={options.sessionNavTo} />}
             <LocationDisplay />
           </>
         }
@@ -2136,20 +2137,28 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
   });
 
-  it("restores an open sidebar after leaving /settings", () => {
-    // The mirror case: someone who had it open keeps it open, so the restore is
-    // genuinely "put it back", not "always collapse".
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-    renderShell("/c/conv_abc");
+  it.each(["", "?sidebar=closed"])(
+    "honors the sidebar preference after leaving settings for %s",
+    (query) => {
+      mockConversations([
+        { id: "conv_abc", permission_level: null },
+        { id: "conv_next", permission_level: null },
+      ]);
+      renderShell("/c/conv_abc", undefined, { sessionNavTo: `/c/conv_next${query}` });
 
-    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
 
-    fireEvent.click(screen.getByTestId("nav-settings"));
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
-    fireEvent.click(screen.getByTestId("nav-home"));
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
-  });
+      fireEvent.click(screen.getByTestId("nav-settings"));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      fireEvent.click(screen.getByTestId("nav-session"));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(query === ""));
+      if (query) {
+        fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+        expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      }
+    },
+  );
 
   it("keeps the sidebar collapsed after exiting full screen if it was collapsed before", () => {
     useEnvironmentMock.mockReturnValue({
@@ -2169,38 +2178,41 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
   });
 
-  it("restores the collapsed sidebar when a session switch un-maximizes the rail", () => {
-    // Maximizing collapses the sidebar; the toggle handler restores it on exit,
-    // but a session switch un-maximizes directly (setRightPanelMaximized(false))
-    // — it must restore the sidebar too, or the user's open sidebar is silently
-    // lost. Same AppShell mount, only the :conversationId route param changes,
-    // so we build a tree with SessionNavButton (renderShell has none).
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([
-      { id: "conv_abc", permission_level: null },
-      { id: "conv_xyz", permission_level: null },
-    ]);
+  it.each(["", "?sidebar=closed"])(
+    "honors the sidebar preference when a session switch un-maximizes the rail with %s",
+    (query) => {
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([
+        { id: "conv_abc", permission_level: null },
+        { id: "conv_xyz", permission_level: null },
+      ]);
 
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(sessionShellTree(qc, "/c/conv_abc", <SessionNavButton to="/c/conv_xyz" />));
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(sessionShellTree(qc, "/c/conv_abc", <SessionNavButton to={`/c/conv_xyz${query}`} />));
 
-    // Open the sidebar, then maximize → sidebar collapses (state stashed).
-    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
-    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+      // Open the sidebar, then maximize → sidebar collapses (state stashed).
+      fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
-    // Switch conversation — the rail un-maximizes AND the sidebar is restored.
-    fireEvent.click(screen.getByTestId("nav-session"));
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
-    // Back to docked (a fresh session starts docked).
-    expect(screen.getByRole("complementary", { name: "Workspace" }).className).not.toContain(
-      "md:absolute",
-    );
-  });
+      fireEvent.click(screen.getByTestId("nav-session"));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(query === ""));
+      // Back to docked (a fresh session starts docked).
+      expect(screen.getByRole("complementary", { name: "Workspace" }).className).not.toContain(
+        "md:absolute",
+      );
+      if (query) {
+        fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+        fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+        fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+        expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      }
+    },
+  );
 });
 
 describe("Sidebar across the md breakpoint", () => {
@@ -2241,6 +2253,72 @@ describe("Sidebar across the md breakpoint", () => {
         }
       });
   }
+
+  it.each([
+    [1280, "", true],
+    [390, "", false],
+    [1280, "?sidebar=closed", false],
+    [390, "?sidebar=closed", false],
+    [1280, "?sidebar=open", true],
+    [390, "?sidebar=open", true],
+    [1280, "?sidebar=unknown", true],
+    [390, "?sidebar=unknown", false],
+  ] as const)("honors sidebar presentation at width %i with %s", (width, query, open) => {
+    mockViewportWidth(width);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell(`/c/conv_abc${query}`);
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(open));
+    if (query === "?sidebar=closed") {
+      expect(screen.getByTestId("url-params")).toHaveTextContent("sidebar=closed");
+    } else if (query === "?sidebar=open") {
+      expect(screen.getByTestId("url-params")).not.toHaveTextContent("sidebar=");
+    }
+  });
+
+  it("retains closed across reload and resizing while allowing manual expansion", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    const first = renderShell("/c/conv_abc?sidebar=closed&debug=1");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    resize(390);
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("sidebar=closed&debug=1");
+    first.unmount();
+    renderShell("/c/conv_abc?sidebar=closed&debug=1");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+  });
+
+  it("applies closed to a new session across resizing without preventing manual expansion or workspace use", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc?sidebar=closed", undefined, {
+      rerenderable: true,
+      sessionNavTo: "/c/conv_next?sidebar=closed&panel=agents",
+    });
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    fireEvent.click(screen.getByTestId("rerender-shell"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Files" }), { button: 0 });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("files-panel")).toBeInTheDocument();
+
+    resize(390);
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("sidebar=closed&panel=agents");
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    resize(390);
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
 
   it("leaves the session without closing a selected file in a responsive-hidden rail", () => {
     const resize = mockViewportWidth(1280);
