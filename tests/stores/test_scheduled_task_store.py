@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.server.scheduled.schedule import next_scheduled_time
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
@@ -59,6 +60,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         session_mode="continue",
         session_id=_uid("conv_abc"),
         workspace="/home/alice/repo",
+        base_branch="HEAD",
         host_id=_uid("host_abc123"),
         project_id=_uid("proj_abc"),
         delegation_ref="workspaces/1/omnigent-scheduled-tasks/st_1/delegations/owner",
@@ -77,7 +79,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.session_mode == "continue"
     assert task.session_id == _uid("conv_abc")
     assert task.workspace == "/home/alice/repo"
-    assert task.base_branch is None
+    assert task.base_branch == "HEAD"
     assert task.execution_target == "connected_host"
     assert task.host_id == _uid("host_abc123")
     assert task.project_id == _uid("proj_abc")
@@ -210,15 +212,18 @@ def test_update_workspace_explicit_null_clears_it(
         agent_id=_uid("ag"),
         timezone="UTC",
         workspace="/repo",
+        base_branch="HEAD",
         host_id=_uid("h"),
     )
     # Omitting workspace leaves it unchanged.
     unchanged = store.update(_uid("st_ws"), name="renamed")
     assert unchanged is not None and unchanged.workspace == "/repo"
+    assert unchanged.base_branch == "HEAD"
     # Explicit None clears both host and workspace (the managed-switch shape).
-    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None)
+    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None, base_branch=None)
     assert cleared is not None
     assert cleared.workspace is None
+    assert cleared.base_branch is None
     assert cleared.host_id is None
 
 
@@ -1423,6 +1428,9 @@ def test_dispatch_rejects_edited_snapshot(store: SqlAlchemyScheduledTaskStore, e
         )
         is None
     )
+    assert not store.skip_scheduled_occurrence(
+        task, now=task.next_run_at, next_run_at=task.next_run_at + 3600
+    )
     assert store.get(task.id) == updated
     assert store.list_runs(task.id)[0] == []
 
@@ -1499,12 +1507,84 @@ def test_dispatch_mutations_require_workspace_scope(store: SqlAlchemyScheduledTa
         )
         is None
     )
+    assert not store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 3600)
     with workspace_scope(task.workspace_id):
         run = store.claim_scheduled_run(
             task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
         )
     assert store.renew_starting_run(run.id, now=lambda: now + 30, lease_seconds=120) is None
     assert store.transition_starting_run(run, now=lambda: now + 30, status="failed") is None
+
+
+def test_skipping_an_occurrence_advances_the_schedule_without_a_run(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from dataclasses import replace
+
+    task = _due_task(store)
+    now = task.next_run_at
+    with pytest.raises(ValueError, match="later than now"):
+        store.skip_scheduled_occurrence(task, now=now, next_run_at=now)
+    # Nothing to skip before the occurrence is due, or once the task isn't active.
+    assert store.skip_scheduled_occurrence(task, now=now - 1, next_run_at=now + 3600) is False
+    paused = replace(task, state="paused")
+    assert store.skip_scheduled_occurrence(paused, now=now, next_run_at=now + 3600) is False
+    assert store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 3600) is True
+    assert store.get(task.id).next_run_at == now + 3600
+    assert store.list_runs(task.id)[0] == []
+    # The listed snapshot is now stale, so neither a second skip nor a claim of it acts.
+    assert store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 7200) is False
+    claimed = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 7200, host_id=task.host_id, lease_seconds=120
+    )
+    assert claimed is None
+    assert store.get(task.id).next_run_at == now + 3600
+    assert store.list_runs(task.id)[0] == []
+
+
+@pytest.mark.parametrize(
+    ("now", "poll_in"),
+    [
+        (1_800_000_000 + 30 * 60, 120),
+        # The hourly schedule's next occurrence is sooner than two minutes out, so it wins.
+        (1_800_000_000 + 3600 - 30, 30),
+    ],
+    ids=["half-past", "just-before-the-hour"],
+)
+def test_an_edit_that_changes_trigger_status_moves_the_next_poll(
+    store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+    now: int,
+    poll_in: int,
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: now)
+    trigger_prompt = "This automation watches Slack and starts one Omnigent session per message."
+    store.configure_dispatch(True)
+    store.configure_trigger_polling(120)
+    task = store.create(
+        _uid("trigger"),
+        "trigger",
+        trigger_prompt,
+        "FREQ=HOURLY",
+        None,
+        _uid("agent"),
+        "UTC",
+        host_id=_uid("host"),
+        session_mode="continue",
+    )
+    assert task.next_run_at == now + poll_in
+    # Without its opening sentence, the task follows its hourly schedule again.
+    plain = store.update(task.id, prompt="Check the channel.")
+    assert plain.next_run_at == next_scheduled_time(plain, now)
+    trigger = store.update(task.id, prompt=trigger_prompt)
+    assert trigger.next_run_at == now + poll_in
+    # Starting a new session each run also makes it an ordinary automation.
+    plain = store.update(task.id, session_mode="new")
+    assert plain.next_run_at == next_scheduled_time(plain, now)
+    trigger = store.update(task.id, session_mode="continue")
+    assert trigger.next_run_at == now + poll_in
 
 
 def test_startup_lease_renewal_expiry_and_conditional_reconciliation(
@@ -2243,6 +2323,34 @@ def test_update_sets_and_clears_the_continued_session(
     assert back_to_new is not None and back_to_new.session_mode == "new"
 
 
+def test_release_session_clears_only_the_session_it_was_given(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _session_task(store, "st_release", session_mode="continue")
+    assert store.adopt_session(task.id, _uid("c1"), snapshot=task) == "adopted"
+    before = store.get(task.id)
+
+    # Another run replaced it, or the caller was looking at a stale id: no change.
+    assert store.release_session(task.id, _uid("other")) is False
+    assert store.get(task.id).session_id == _uid("c1")
+
+    assert store.release_session(task.id, _uid("c1")) is True
+    after = store.get(task.id)
+    assert after.session_id is None
+    # Housekeeping, not an edit: a firing compares updated_at with its own read.
+    assert after.updated_at == before.updated_at
+    assert store.release_session(task.id, _uid("c1")) is False
+    assert store.release_session(_uid("missing"), _uid("c1")) is False
+
+    # A released task takes a new session like a first run, from the firing's own
+    # earlier read of the task.
+    assert store.adopt_session(task.id, _uid("c2"), snapshot=before) == "adopted"
+
+    # A deleted task releases nothing.
+    store.delete(task.id)
+    assert store.release_session(task.id, _uid("c2")) is False
+
+
 def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
     store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2268,6 +2376,7 @@ def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
     monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_800_000_000)
     for name, value in (
         ("workspace", "/elsewhere"),
+        ("base_branch", "HEAD"),
         ("model_override", "claude-opus"),
         ("reasoning_effort", "high"),
         ("permission_mode", "acceptEdits"),

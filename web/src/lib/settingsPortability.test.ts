@@ -1,12 +1,23 @@
+import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
-import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
+import {
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  useFoldAssistantNarration,
+} from "./foldNarrationPreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   readHiddenPickerAgents,
   subscribeHiddenPickerAgents,
   writeHiddenPickerAgents,
 } from "./pickerEntryVisibility";
+import {
+  PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+  PROJECT_FOLDER_PAGE_SIZE,
+  PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+  useProjectFolderCollapse,
+  useProjectFolderPageSize,
+} from "./projectFolderPaginationPreferences";
 import { applyImportedSettings, collectSettings } from "./settingsPortability";
 import {
   type SessionWorkspaceState,
@@ -131,6 +142,19 @@ describe.each([
   });
 });
 
+it("updates a mounted final-answer fold reader on import", () => {
+  const { result } = renderHook(() => useFoldAssistantNarration());
+  expect(result.current).toBe(false);
+
+  act(() => {
+    applyImportedSettings({
+      version: 1,
+      settings: { [FOLD_ASSISTANT_NARRATION_STORAGE_KEY]: "true" },
+    });
+  });
+  expect(result.current).toBe(true);
+});
+
 it("carries hidden picker entries through export and import and tells an open picker", () => {
   writeHiddenPickerAgents(new Set(["polly"]));
   const exported = collectSettings()!;
@@ -144,4 +168,25 @@ it("carries hidden picker entries through export and import and tells an open pi
   expect(readHiddenPickerAgents()).toEqual(new Set(["polly"]));
   expect(listener).toHaveBeenCalledTimes(2);
   unsubscribe();
+});
+
+it("carries project folder pagination through export and import and updates mounted readers", () => {
+  localStorage.setItem(PROJECT_FOLDER_COLLAPSE_STORAGE_KEY, "false");
+  localStorage.setItem(PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY, "3");
+  const exported = collectSettings()!;
+  expect(exported.settings[PROJECT_FOLDER_COLLAPSE_STORAGE_KEY]).toBe("false");
+  expect(exported.settings[PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY]).toBe("3");
+  const { result } = renderHook(() => [useProjectFolderCollapse(), useProjectFolderPageSize()]);
+  expect(result.current).toEqual([false, 3]);
+
+  act(() => {
+    applyImportedSettings({ version: 1, settings: {} });
+  });
+  expect(localStorage.getItem(PROJECT_FOLDER_COLLAPSE_STORAGE_KEY)).toBeNull();
+  expect(localStorage.getItem(PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY)).toBeNull();
+  expect(result.current).toEqual([true, PROJECT_FOLDER_PAGE_SIZE]);
+  act(() => {
+    applyImportedSettings(exported);
+  });
+  expect(result.current).toEqual([false, 3]);
 });

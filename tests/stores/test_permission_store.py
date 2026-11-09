@@ -1112,6 +1112,12 @@ def test_list_for_sessions_returns_grouped_grants(
     assert len(result[conv_b]) == 1
     assert result[conv_b][0].user_id == "alice"
 
+    for user_id in {grant.user_id for grants in result.values() for grant in grants}:
+        assert store.list_for_sessions([conv_a, conv_b], user_id=user_id) == {
+            conversation_id: [grant for grant in grants if grant.user_id == user_id]
+            for conversation_id, grants in result.items()
+        }
+
 
 def test_list_for_sessions_empty_input(store: SqlAlchemyPermissionStore) -> None:
     """list_for_sessions with empty list returns empty dict."""

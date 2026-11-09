@@ -89,6 +89,14 @@ def _run(coro):
         loop.close()
 
 
+def _long_prior_messages():
+    """Four prior messages of roughly 1,000 estimated replay tokens each."""
+    return [
+        {"role": role, "content": f"turn-{index} " + "x" * 3000}
+        for index, role in enumerate(("user", "assistant", "user", "assistant"))
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Tests: Prompt extraction
 # ---------------------------------------------------------------------------
@@ -415,6 +423,79 @@ class TestPromptExtraction(unittest.TestCase):
             f"[image: image/png, {len(image_payload)} base64 chars]",
             rendered,
         )
+
+    def test_budgeted_fresh_replay_keeps_the_newest_history(self):
+        executor = self._make_executor()
+        messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+
+        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=2_100)
+
+        marker = "[Earlier messages omitted to fit the model's context window: 2.]"
+        self.assertNotIn("turn-0", prompt)
+        self.assertNotIn("turn-1", prompt)
+        self.assertLess(prompt.index("Conversation so far:"), prompt.index(marker))
+        self.assertLess(prompt.index(marker), prompt.index("user: turn-2"))
+        self.assertLess(prompt.index("user: turn-2"), prompt.index("assistant: turn-3"))
+        self.assertTrue(prompt.endswith("user: What next?"))
+
+    def test_budgeted_fresh_replay_always_sends_the_latest_user_message(self):
+        executor = self._make_executor()
+        messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+
+        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=0)
+
+        self.assertIn("[Earlier messages omitted to fit the model's context window: 4.]", prompt)
+        self.assertNotIn("turn-", prompt)
+        self.assertTrue(prompt.endswith("user: What next?"))
+
+    def test_budgeted_replay_counts_an_image_by_estimate_not_encoded_size(self):
+        executor = self._make_executor()
+        image_payload = base64.b64encode(b"\0" * 300_000).decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{image_payload}"},
+                    {"type": "input_text", "text": "Keep this image."},
+                ],
+            },
+            {"role": "assistant", "content": "Kept."},
+            {"role": "user", "content": "What next?"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=2_100)
+
+        self.assertEqual(len([block for block in prompt if block.get("type") == "image"]), 1)
+        text = self._text_of(prompt)
+        self.assertIn("Keep this image.", text)
+        self.assertNotIn("omitted", text)
+
+    def test_budgeted_replay_counts_a_pdf_by_its_encoded_size(self):
+        executor = self._make_executor()
+        pdf_payload = base64.b64encode(b"%PDF-1.7" + b"\0" * 300_000).decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": f"data:application/pdf;base64,{pdf_payload}",
+                    },
+                    {"type": "input_text", "text": "Read this report."},
+                ],
+            },
+            {"role": "assistant", "content": "Read."},
+            {"role": "user", "content": "What next?"},
+        ]
+
+        prompt = executor._build_prompt(
+            messages, resume_session=False, history_token_budget=100_000
+        )
+
+        self.assertIsInstance(prompt, str)
+        self.assertIn("[Earlier messages omitted to fit the model's context window: 1.]", prompt)
+        self.assertNotIn("Read this report.", prompt)
+        self.assertIn("assistant: Read.", prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -1901,7 +1982,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
             env["ANTHROPIC_CUSTOM_HEADERS"].splitlines(),
             [
                 "Databricks-Custom-Coding-Agent: claude-code",
-                "Databricks-Custom-Client-Surfaces: omnigent, omnigent-web",
+                "Databricks-Custom-Client-Surfaces: omnigent-web",
             ],
         )
 
@@ -3731,6 +3812,159 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_timeout(monke
     # ``_tee_stderr`` must be unwired in the finally so the buffer can be
     # GC'd and post-connect stderr flows directly to the original callback.
     assert options.stderr is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_servers_signed_in_mid_session_reconnect_before_the_next_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    status_file = tmp_path / "mcp-auth-status.json"
+    monkeypatch.setenv("OMNIGENT_MCP_AUTH_STATUS_FILE", str(status_file))
+    reported = dict.fromkeys(
+        ("notes", "wiki", "docs", "figjam", "drive", "calendar", "slow", "late"),
+        "sign_in_required",
+    )
+    reported["jira"] = "connected"
+
+    def report(**statuses: str) -> None:
+        reported.update(statuses)
+        entries = [{"harness": "claude", "name": n, "status": s} for n, s in reported.items()]
+        entries.append({"harness": "codex", "name": "codex-docs", "status": "connected"})
+        status_file.write_text(json.dumps({"servers": entries}))
+
+    live = {
+        "notes": "failed",
+        "wiki": "needs-auth",
+        "docs": "pending",
+        # The CLI names plugin servers ``plugin:<plugin>:<server>``; the host reports ``<server>``.
+        "plugin:figma:figjam": "failed",
+        "drive": "failed",
+        "calendar": "failed",
+        "slow": "failed",
+        "late": "failed",
+        "linear": "connected",
+        "jira": "failed",
+        "codex-docs": "failed",
+    }
+    status_reply = "ok"
+    fail_once = {"notes"}
+    reconnects: list[str] = []
+    in_flight: set[str] = set()
+    overlapped = False
+    reconnect_hung = asyncio.Event()
+    fake_sdk = _make_recovery_fake_sdk()
+
+    class _McpClient(fake_sdk.ClaudeSDKClient):
+        async def get_mcp_status(self) -> dict[str, object]:
+            if status_reply == "error":
+                raise RuntimeError("control channel busy")
+            if status_reply == "hang":
+                await asyncio.Event().wait()
+            return {"mcpServers": [{"name": n, "status": s} for n, s in live.items()]}
+
+        async def reconnect_mcp_server(self, server_name: str) -> None:
+            nonlocal overlapped
+            overlapped = overlapped or bool(in_flight)
+            reconnects.append(server_name)
+            in_flight.add(server_name)
+            try:
+                if server_name == "late":
+                    reconnect_hung.set()
+                    await asyncio.Event().wait()
+                await asyncio.sleep(0.3 if server_name in ("drive", "calendar") else 0)
+            finally:
+                in_flight.discard(server_name)
+            if server_name in fail_once:
+                fail_once.discard(server_name)
+                raise RuntimeError("still unauthorized")
+            live[server_name] = "connected"
+
+    fake_sdk.ClaudeSDKClient = _McpClient
+    executor = ClaudeSDKExecutor()
+    messages: list[dict[str, object]] = []
+
+    async def turn(text: str) -> _McpClient:
+        messages.append({"role": "user", "content": text, "session_id": "mcp"})
+        events = [event async for event in executor.run_turn(messages, [], "")]
+        assert not [event for event in events if isinstance(event, ExecutorError)]
+        assert any(isinstance(event, TurnComplete) for event in events)
+        messages.append({"role": "assistant", "content": f"answer to {text}"})
+        return executor._clients["mcp"].client
+
+    report()
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch.object(executor, "_force_close_client", new_callable=AsyncMock) as close,
+    ):
+        first = await turn("q0")
+        assert await turn("q1") is first
+        assert reconnects == []
+
+        report(notes="connected", wiki="connected", docs="connected", figjam="connected")
+        report(linear="connected")
+        status_reply = "error"
+        assert await turn("q2") is first
+        assert reconnects == []
+
+        # One failed reconnect neither fails the turn nor stops the others.
+        status_reply = "ok"
+        assert await turn("q3") is first
+        assert reconnects == ["notes", "wiki", "plugin:figma:figjam"]
+        # The CLI handles control requests one at a time.
+        assert not overlapped
+
+        # The failed and still-pending servers are checked again.
+        live["docs"] = "failed"
+        assert await turn("q4") is first
+        assert reconnects[3:] == ["notes", "docs"]
+        assert await turn("q5") is first
+        assert len(reconnects) == 5
+
+        report(drive="connected", calendar="connected")
+        assert await turn("/compact") is first
+        assert len(reconnects) == 5
+
+        # Reconnects share one budget. A CLI still busy when it runs out would hold the prompt,
+        # so a new one runs it.
+        monkeypatch.setattr(
+            "omnigent.inner.claude_sdk_executor._MCP_RECONNECT_TIMEOUT_SECONDS", 0.5
+        )
+        second = await turn("q6")
+        assert second is not first
+        assert reconnects[5:] == ["drive", "calendar"]
+        close.assert_awaited_once_with(first)
+        assert "answer to q5" in second.prompts[-1]
+        # The new CLI connects every server as it starts.
+        assert await turn("q7") is second
+        assert len(reconnects) == 7
+
+        report(slow="connected")
+        status_reply = "hang"
+        monkeypatch.setattr("omnigent.inner.claude_sdk_executor._MCP_STATUS_TIMEOUT_SECONDS", 0.05)
+        third = await turn("q8")
+        assert third is not second
+        assert len(reconnects) == 7
+        assert "answer to q7" in third.prompts[-1]
+
+        # A turn cancelled mid-reconnect does not leave the busy CLI for the next turn.
+        report(late="connected")
+        status_reply = "ok"
+        monkeypatch.setattr(
+            "omnigent.inner.claude_sdk_executor._MCP_RECONNECT_TIMEOUT_SECONDS", 30
+        )
+        messages.append({"role": "user", "content": "q9", "session_id": "mcp"})
+        reconnect_hung.clear()
+        cancelled = asyncio.ensure_future(executor.run_turn(messages, [], "").__anext__())
+        await asyncio.wait_for(reconnect_hung.wait(), timeout=5)
+        assert reconnects[-1] == "late"
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        assert "mcp" not in executor._clients
+        await asyncio.gather(*executor._cancel_close_tasks)
+        close.assert_awaited_with(third)
 
 
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
@@ -6132,6 +6366,128 @@ async def test_live_cached_client_is_reused_between_turns() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("declared_window", "model_override"),
+    [(4_200, None), (1_000_000, "small-window-model")],
+)
+async def test_fresh_client_replays_history_within_the_turn_models_window(
+    declared_window, model_override
+) -> None:
+    """A restarted client's replay fits the declared window, or an override model's."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=declared_window)
+    messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch(
+            "omnigent.llms.context_window.get_model_context_window", return_value=4_200
+        ) as catalog_lookup,
+    ):
+        events = [
+            event
+            async for event in executor.run_turn(
+                messages, [], "", ExecutorConfig(model=model_override)
+            )
+        ]
+
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    [prompt] = fake_sdk.created_clients[0].prompts
+    assert "[Earlier messages omitted to fit the model's context window: 2.]" in prompt
+    assert "turn-1" not in prompt
+    assert "turn-2" in prompt
+    if model_override is None:
+        catalog_lookup.assert_not_called()
+    else:
+        catalog_lookup.assert_called_once_with(model_override)
+
+
+@pytest.mark.asyncio
+async def test_unpinned_databricks_session_replays_within_its_default_models_window() -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.databricks_executor import DatabricksCredentials
+
+    with patch(
+        "omnigent.inner.databricks_executor._read_databrickscfg",
+        return_value=DatabricksCredentials(
+            host="https://example.cloud.databricks.com", token="dapi_test_token"
+        ),
+    ):
+        executor = ClaudeSDKExecutor(gateway=True)
+    fake_sdk = _make_recovery_fake_sdk()
+    messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch(
+            "omnigent.inner.claude_sdk_executor._resolve_databricks_claude_model",
+            return_value="system.ai.claude-opus-5",
+        ) as resolve_default,
+        patch(
+            "omnigent.llms.context_window.get_model_context_window", return_value=4_200
+        ) as catalog_lookup,
+    ):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    [prompt] = fake_sdk.created_clients[0].prompts
+    assert "[Earlier messages omitted to fit the model's context window: 2.]" in prompt
+    assert "turn-1" not in prompt
+    assert "turn-2" in prompt
+    catalog_lookup.assert_called_once_with("system.ai.claude-opus-5")
+    resolve_default.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", ["200k", "-10"])
+async def test_invalid_window_override_replays_within_the_default_window(
+    monkeypatch: pytest.MonkeyPatch, override: str
+) -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.llms.context_window import DEFAULT_CONTEXT_WINDOW
+
+    monkeypatch.setenv("AP_CONTEXT_WINDOW_OVERRIDE", override)
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
+    # Too large for half of the default window, but not for half of a 200k window.
+    oldest = {"role": "user", "content": "oldest " + "x" * (2 * DEFAULT_CONTEXT_WINDOW)}
+    messages = [
+        oldest,
+        {"role": "assistant", "content": "ok"},
+        *_long_prior_messages(),
+        {"role": "user", "content": "What next?"},
+    ]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    [prompt] = fake_sdk.created_clients[0].prompts
+    assert "[Earlier messages omitted to fit the model's context window: 1.]" in prompt
+    assert "oldest" not in prompt
+    assert "turn-0" in prompt
+    assert "What next?" in prompt
+
+
+@pytest.mark.asyncio
+async def test_first_turn_skips_the_context_window_lookup() -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch("omnigent.inner.claude_sdk_executor._resolve_replay_context_window") as resolve,
+    ):
+        events = [
+            event async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "")
+        ]
+
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert fake_sdk.created_clients[0].prompts == ["hi"]
+    resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("initial_effort", [None, "low"])
 @pytest.mark.parametrize(
     "compact_content",
@@ -6404,3 +6760,76 @@ async def test_turn_options_expose_ask_user_question_only_with_its_hook(
     matchers = [m.matcher for m in (options.hooks or {}).get("PreToolUse", [])]
     assert ("AskUserQuestion" in options.tools) is bridge_wired
     assert ("AskUserQuestion" in matchers) is bridge_wired
+
+
+@pytest.mark.parametrize("saved", [False, True])
+@pytest.mark.parametrize("active", [None, [], ["claude"]])
+async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved):
+    from omnigent.mcp_disabled_servers import ServerKey, apply_claude_settings, set_disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    if saved:
+        set_disabled(ServerKey("claude", "fixture"), True)
+    original = ' {"other": true} '
+    with (
+        patch(
+            "omnigent.inner.claude_sdk_executor._claude_settings_payload", return_value=original
+        ),
+        patch(
+            "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
+        ) as hook,
+    ):
+        options = await _turn_options(_default_executor(active_harnesses=active))
+    hook.assert_called_once()
+    assert hook.call_args.kwargs == {"executor": "claude-sdk", "active_harnesses": active}
+    if active and saved:
+        assert json.loads(options.settings) == {
+            "other": True,
+            "deniedMcpServers": [{"serverName": "fixture"}],
+        }
+    else:
+        assert options.settings is original
+
+
+@pytest.mark.parametrize(
+    "data,expected",
+    [
+        ({}, ()),
+        ({"mcp_servers": None}, ()),
+        ({"mcp_servers": "invalid"}, ()),
+        ({"mcp_servers": [None, {}, {"name": 1}, {"name": "fixture"}]}, ("fixture",)),
+    ],
+)
+def test_disabled_mcp_init_server_names(data, expected):
+    from omnigent.inner.claude_sdk_executor import _init_mcp_server_names
+
+    assert _init_mcp_server_names(data) == expected
+
+
+@pytest.mark.parametrize("active", [None, ["claude"]])
+async def test_disabled_mcp_sdk_init_reports_loaded_server(tmp_path, monkeypatch, caplog, active):
+    from claude_agent_sdk.types import SystemMessage as SDKSystemMessage
+
+    from omnigent.mcp_disabled_servers import ServerKey, set_disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    set_disabled(ServerKey("claude", "fixture"), True)
+
+    class FakeSDK(_sdk_types()):
+        class ClaudeSDKClient(_SDKClient):
+            async def receive_response(self):
+                yield SDKSystemMessage(
+                    subtype="init",
+                    data={"mcp_servers": [{"name": "fixture"}, {"name": "omnigent"}]},
+                )
+
+        SystemMessage = SDKSystemMessage
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=FakeSDK):
+        executor = _default_executor(active_harnesses=active)
+        try:
+            async for _ in executor.run_turn([{"role": "user", "content": "hello"}], [], ""):
+                pass
+        finally:
+            await executor.close()
+    assert ("mcp_disabled_server_not_applied server=fixture" in caplog.text) == bool(active)

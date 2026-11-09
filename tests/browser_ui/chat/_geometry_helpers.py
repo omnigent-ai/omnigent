@@ -154,6 +154,10 @@ GEOMETRY_PROBE = """() => {
         lastMessageBottom: Math.round(sections.at(-1).getBoundingClientRect().bottom),
         composerHeight: Math.round(ta.getBoundingClientRect().height),
         composerTop,
+        mobileOverlay: card.hasAttribute('data-mobile-composer'),
+        overlayHeight: Math.round(parseFloat(getComputedStyle(
+            form.closest('[data-chat-surface]')
+        ).getPropertyValue('--session-composer-height')) || 0),
         transcriptBottom,
         overlap: transcriptBottom - composerTop,
         formMarginTop: Math.round(parseFloat(getComputedStyle(form).marginTop) || 0),
@@ -179,18 +183,22 @@ def settled_geometry(page: Page, timeout_s: float = 15.0) -> dict:
 
 
 def scroll_to_distance_from_bottom(page: Page, distance: int) -> dict:
-    return page.evaluate(
-        """distance => {
+    # Scrolling can remeasure virtual rows and change scrollHeight synchronously.
+    return page.wait_for_function(
+        """({distance, tolerance}) => {
           const ta = document.querySelector('textarea[aria-label="Message the agent"]');
           const scroller = ta.closest('form').parentElement.querySelector('[role="log"] > div');
           scroller.dispatchEvent(new WheelEvent('wheel', {deltaY: -100}));
           scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight - distance;
           scroller.dispatchEvent(new Event('scroll'));
-          return {scrollTop: Math.round(scroller.scrollTop), distanceFromBottom: Math.round(
-            scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)};
+          const actualDistance = Math.round(
+            scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop);
+          return Math.abs(actualDistance - distance) <= tolerance && {
+            scrollTop: Math.round(scroller.scrollTop), distanceFromBottom: actualDistance};
         }""",
-        distance,
-    )
+        arg={"distance": distance, "tolerance": TOLERANCE},
+        timeout=5_000,
+    ).json_value()
 
 
 @contextmanager
@@ -249,7 +257,13 @@ def scroll_with_native_touch(page: Page, session: CDPSession | None = None) -> d
         )
         page.wait_for_timeout(16)
     session.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-    page.wait_for_timeout(600)
+    # Native momentum can outlast a fixed delay; measure after the gesture and
+    # any virtual-row remeasurement have both finished.
+    page.wait_for_function(
+        "() => window.__nativeTouchProbe.events.at(-1) === 'scrollend'",
+        timeout=15_000,
+    )
+    settled_geometry(page)
     return page.evaluate(
         """initial => { const {events, scroller} = window.__nativeTouchProbe; return {
           events, initialScrollTop: initial, settledScrollTop: Math.round(scroller.scrollTop),

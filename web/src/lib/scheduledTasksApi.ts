@@ -12,6 +12,8 @@
 import { authenticatedFetch } from "./identity";
 import { startTimedInteraction } from "./analyticsEmit";
 
+export const RANDOM_WORKTREE_BASE_REF = "HEAD";
+
 /** Lifecycle state of a scheduled task. `paused` tasks don't fire. */
 export type ScheduledTaskState = "active" | "paused";
 
@@ -61,6 +63,8 @@ export interface ScheduledTask {
   sessionId: string | null;
   /** Host directory or sandbox repository URL; null uses the target default. */
   workspace: string | null;
+  /** Base ref for a fresh random worktree; null/absent uses the selected directory. */
+  baseBranch?: string | null;
   /** Pinned host, or `null` (server resolves the connected host at fire time). */
   hostId: string | null;
   /** Where firings run — a connected host, or a fresh managed sandbox per fire. */
@@ -91,6 +95,8 @@ export interface ScheduledTask {
 export interface ScheduledTaskRun {
   /** Current cumulative session cost; null when not reported (not a per-run delta). */
   sessionCostUsd: number | null;
+  /** Current session approvals, shared by every run using that session. */
+  conversationPendingApprovals?: number;
   id: string;
   scheduledTaskId: string;
   status: ScheduledTaskRunStatus;
@@ -126,6 +132,8 @@ export const AUTOMATION_TEMPLATE_IDS = [
   "jira",
   "slack",
   "github",
+  "linear",
+  "pagerduty",
   "follow-up-monitor",
   "pr-sweep",
   "news-digest",
@@ -149,6 +157,7 @@ export interface CreateScheduledTaskInput {
   sessionMode?: ScheduledTaskSessionMode;
   /** Host directory (requires hostId), or a repository URL for a sandbox. */
   workspace?: string | null;
+  baseBranch?: string | null;
   /** Optional pinned host. */
   hostId?: string | null;
   /**
@@ -186,6 +195,7 @@ export interface UpdateScheduledTaskInput {
   sessionId?: string | null;
   /** Host directory or sandbox repository; null restores a sandbox provider's default. */
   workspace?: string | null;
+  baseBranch?: string | null;
   hostId?: string;
   /**
    * Switch where firings run. `managed_sandbox` clears any pinned host; do not
@@ -215,6 +225,7 @@ interface ScheduledTaskWire {
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
   workspace: string | null;
+  base_branch?: string | null;
   host_id: string | null;
   execution_target: ScheduledTaskExecutionTarget;
   // Absent on servers that predate task projects.
@@ -229,6 +240,7 @@ interface ScheduledTaskWire {
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
 interface ScheduledTaskRunWire {
   session_cost_usd?: number | null;
+  conversation_pending_approvals?: number;
   id: string;
   scheduled_task_id: string;
   status: ScheduledTaskRunStatus;
@@ -300,6 +312,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
     workspace: wire.workspace,
+    baseBranch: wire.base_branch ?? null,
     hostId: wire.host_id,
     executionTarget: wire.execution_target,
     projectId: wire.project_id ?? null,
@@ -314,6 +327,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
 function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
   return {
     sessionCostUsd: wire.session_cost_usd ?? null,
+    conversationPendingApprovals: wire.conversation_pending_approvals ?? 0,
     id: wire.id,
     scheduledTaskId: wire.scheduled_task_id,
     status: wire.status,
@@ -367,6 +381,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
+  if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
@@ -411,6 +426,7 @@ export async function updateScheduledTask(
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
+  if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.sessionId !== undefined) body.session_id = input.sessionId;
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;
@@ -436,15 +452,17 @@ export async function deleteScheduledTask(id: string): Promise<void> {
 /**
  * Trigger an immediate ("run now") fire of a task. A manual override that
  * reuses the server's shared fire path; paused tasks are runnable. The server
- * responds `202 Accepted` (the run launches in the background), so this returns
- * `void` — callers invalidate the list + runs queries to pick up the new run's
- * status. A `409` (already in flight) surfaces as a {@link ScheduledTaskApiError}.
+ * responds `202 Accepted` with the queued run ID, or no run ID on older servers.
+ * Callers refresh the list and runs queries for its status. A `409` (already
+ * in flight) surfaces as a {@link ScheduledTaskApiError}.
  */
-export async function runScheduledTaskNow(id: string): Promise<void> {
+export async function runScheduledTaskNow(id: string): Promise<string | null> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/run`, {
     method: "POST",
   });
   if (!res.ok) throw await errorFromResponse(res);
+  const body = (await res.json()) as { run_id?: string };
+  return body.run_id ?? null;
 }
 
 /** Latest failed run from an automation without a session Inbox entry. */
