@@ -1,23 +1,28 @@
-"""Host-owned MCP disable state, applied only to explicitly active launches."""
+"""Host-owned MCP disable state, applied only to explicitly active launches.
+
+Codex names are read in-process from prepared private, trusted project and CLI
+config layers; launch never waits for a discovery subprocess. If that best-effort
+reading disagrees with Codex and it exits before initialize, callers retry once
+without the added overrides. Disabled servers may then run, signalled by a warning.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import re
 import tempfile
 import threading
+import tomllib
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal, Protocol, overload
+from typing import Any, Final, Literal, overload
 
 from omnigent.config import global_config_path
-from omnigent.inner._proc import pipe_supervised_command, remember_process_group, spawn_kwargs
-from omnigent.inner._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
+from omnigent.harnesses.codex_native.launch_args import _merge_tables
 
 HarnessKey = Literal["claude", "codex"]
 ExecutorId = Literal["claude-native", "claude-sdk", "codex-native", "codex"]
@@ -32,7 +37,7 @@ _MAX_NAME_LENGTH = 1024
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 _write_lock = threading.Lock()
 _read_failure_lock = threading.Lock()
-_read_failures: set[tuple[Path, str]] = set()
+_read_failures: set[tuple[Path, str, str]] = set()
 _logger = logging.getLogger(__name__)
 
 
@@ -72,12 +77,14 @@ def _validate(key: ServerKey) -> None:
         raise DisabledServerWriteError("invalid_name")
 
 
-def _log_read_failure(path: Path, reason: str) -> None:
+def _log_read_failure(
+    path: Path, reason: str, *, event: str = "mcp_disabled_servers_read_failed"
+) -> None:
     with _read_failure_lock:
-        if (path, reason) in _read_failures:
+        if (path, reason, event) in _read_failures:
             return
-        _read_failures.add((path, reason))
-    _logger.warning("mcp_disabled_servers_read_failed path=%s reason=%s", path, reason)
+        _read_failures.add((path, reason, event))
+    _logger.warning("%s path=%s reason=%s", event, path, reason)
 
 
 def _read(path: Path, *, for_write: bool = False) -> list[ServerKey]:
@@ -251,66 +258,145 @@ def claude_loaded_anyway(
     return tuple(_claude_name(key) for key in entries if _claude_name(key) in loaded)
 
 
-class CodexConfigProbe(Protocol):
-    async def effective_servers(
-        self, argv: Sequence[str], *, env: Mapping[str, str], cwd: Path, timeout_s: float
-    ) -> Mapping[str, bool]: ...
+def _read_codex_config(path: Path) -> dict[str, Any]:
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+        _log_read_failure(
+            path, type(error).__name__, event="mcp_disabled_codex_config_read_failed"
+        )
+        return {}
 
 
-class SubprocessCodexProbe:
-    """Ask Codex to resolve its own layered config without starting MCP servers."""
-
-    def __init__(self, *, launch_args: Sequence[str] = ()) -> None:
-        self._launch_args = tuple(launch_args)
-
-    async def effective_servers(
-        self, argv: Sequence[str], *, env: Mapping[str, str], cwd: Path, timeout_s: float
-    ) -> Mapping[str, bool]:
-        if not argv:
-            raise ValueError("Missing Codex launch command")
-        process = None
+def _codex_cli_overrides(overrides: Sequence[str], config_path: Path) -> dict[str, Any]:
+    """Build Codex's single CLI layer, assigning each dotted path in order."""
+    result: dict[str, Any] = {}
+    for override in overrides:
+        key, separator, value = override.partition("=")
         try:
-            async with asyncio.timeout(timeout_s):
-                process = await asyncio.create_subprocess_exec(
-                    *pipe_supervised_command(argv[0], *self._launch_args, *argv[1:]),
-                    env=env,
-                    cwd=cwd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    **spawn_kwargs(),
-                )
-                remember_process_group(process)
-                stdout, _ = await process.communicate()
-            if process.returncode != 0:
-                raise ValueError("Codex MCP list failed")
-            rows = json.loads(stdout)
-            if not isinstance(rows, list):
-                raise ValueError("Codex MCP list is not an array")
-            result = {}
-            for row in rows:
+            if not separator:
+                raise ValueError("Missing assignment")
+            path = tomllib.loads(f"{key}=0")
+            try:
+                parsed = tomllib.loads(override)
+            except ValueError:
+                # Codex accepts unquoted strings when a value is not valid TOML.
+                parsed = tomllib.loads(f"{key}={json.dumps(value.strip())}")
+            target = result
+            while path:
+                name, child = next(iter(path.items()))
+                parsed = parsed[name]
+                if not isinstance(child, dict):
+                    target[name] = parsed
+                    break
+                if not isinstance(target.get(name), dict):
+                    target[name] = {}
+                target = target[name]
+                path = child
+        except (ValueError, KeyError, TypeError, RecursionError):
+            # Do not log override values: they may contain credentials.
+            _log_read_failure(
+                config_path, "InvalidOverride", event="mcp_disabled_codex_config_read_failed"
+            )
+    return result
+
+
+def _codex_git_root(cwd: Path) -> Path | None:
+    """Resolve the trust root, including linked worktrees, without invoking git."""
+    for directory in (cwd, *cwd.parents):
+        dot_git = directory / ".git"
+        if dot_git.is_dir():
+            if (dot_git / "HEAD").exists():
+                return directory
+        elif dot_git.is_file() and not dot_git.is_symlink():
+            try:
+                pointer = dot_git.read_text().strip()
+                if not pointer.startswith("gitdir:"):
+                    return None
+                git_dir = (directory / pointer.removeprefix("gitdir:").strip()).resolve()
+                common = (git_dir / (git_dir / "commondir").read_text().strip()).resolve()
+                registered = Path((git_dir / "gitdir").read_text().strip())
                 if (
-                    not isinstance(row, dict)
-                    or not isinstance(row.get("name"), str)
-                    or not isinstance(row.get("enabled"), bool)
+                    git_dir.parent.name == "worktrees"
+                    and common == git_dir.parent.parent
+                    and registered.name == ".git"
+                    and registered.parent.resolve() == directory.resolve()
+                    and (common.parent / ".git").resolve() == common
                 ):
-                    raise ValueError("Invalid Codex MCP list entry")
-                result[row["name"]] = row["enabled"]
-            return result
-        finally:
-            if process is not None:
-                try:
-                    await terminate_subprocess(
-                        process, label="Codex MCP probe", terminate_timeout=0.5, kill_timeout=0.5
-                    )
-                finally:
-                    close_subprocess_transport(process)
+                    return common.parent
+            except (OSError, ValueError, RuntimeError, UnicodeError):
+                return None
+            return None
+    return None
+
+
+def _codex_layer_trusted(projects: Any, *candidates: Path | None) -> bool:
+    if not isinstance(projects, dict):
+        return False
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        for key in (str(candidate.resolve()), str(candidate)):
+            project = projects.get(key)
+            level = project.get("trust_level") if isinstance(project, dict) else None
+            if level in ("trusted", "untrusted"):
+                return level == "trusted"
+    return False
+
+
+def _codex_server_names(codex_home: Path, cwd: Path, config_overrides: Sequence[str]) -> set[str]:
+    """Read already-materialized profile MCPs, then trusted project and CLI layers."""
+    config_path = codex_home / "config.toml"
+    config = _read_codex_config(config_path)
+    cli = _codex_cli_overrides(config_overrides, config_path)
+    discovery: dict[str, Any] = {}
+    _merge_tables(discovery, config)
+    _merge_tables(discovery, cli)
+    markers = discovery.get("project_root_markers", [".git"])
+    if not isinstance(markers, list) or any(not isinstance(marker, str) for marker in markers):
+        _log_read_failure(
+            config_path, "InvalidProjectRootMarkers", event="mcp_disabled_codex_config_read_failed"
+        )
+        markers = []
+    directories = (cwd, *cwd.parents)
+    root = cwd
+    for directory in directories:
+        if any(
+            (directory / marker).exists()
+            and (
+                marker != ".git"
+                or not (directory / marker).is_dir()
+                or (directory / marker / "HEAD").exists()
+            )
+            for marker in markers
+        ):
+            root = directory
+            break
+    git_root = _codex_git_root(cwd)
+    projects = discovery.get("projects", {})
+    layers = list(directories[: directories.index(root) + 1])
+    for directory in reversed(layers):
+        # Trust is checked per layer: a trusted cwd does not trust its parents.
+        trusted = _codex_layer_trusted(projects, directory, root, git_root)
+        project_home = directory / ".codex"
+        if trusted and project_home.resolve() != codex_home.resolve():
+            _merge_tables(config, _read_codex_config(project_home / "config.toml"))
+    _merge_tables(config, cli)
+    servers = config.get("mcp_servers", {})
+    return (
+        {name for name, server in servers.items() if isinstance(server, dict)}
+        if isinstance(servers, dict)
+        else set()
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class CodexLaunchPlan:
     config_overrides: tuple[str, ...]
     fallback_config_overrides: tuple[str, ...]
-    outcome: Literal["none", "applied", "probe_failed"]
+    outcome: Literal["none", "applied"]
     dropped: tuple[str, ...]
 
     def overrides_after_early_exit(self) -> tuple[str, ...] | None:
@@ -321,33 +407,32 @@ class CodexLaunchPlan:
         return self.fallback_config_overrides if self.outcome == "applied" else None
 
 
-async def plan_codex_launch(
-    launch_path: str,
+def plan_codex_launch(
     config_overrides: Sequence[str],
     *,
     executor: Literal["codex-native", "codex"],
     active_harnesses: Collection[str] | None,
-    env: Mapping[str, str],
+    codex_home: Path,
     cwd: Path,
-    probe: CodexConfigProbe | None = None,
-    timeout_s: float = 3.0,
 ) -> CodexLaunchPlan:
-    """Plan overrides only for names in Codex's effective launch configuration."""
+    """Plan synchronously from prepared config files; never spawn or await a probe.
+
+    Call after profile/MCP preparation in the session's private CODEX_HOME and
+    before building argv. Unreadable layers are skipped with one warning each.
+    """
     original = tuple(config_overrides)
     entries = _active_entries("codex", active_harnesses)
     if not entries:
         return CodexLaunchPlan(original, original, "none", ())
-    argv = [launch_path]
-    for override in original:
-        argv.extend(["-c", override])
-    argv.extend(["mcp", "list", "--json"])
     try:
-        servers = await (probe or SubprocessCodexProbe()).effective_servers(
-            argv, env=env, cwd=cwd, timeout_s=timeout_s
+        servers = _codex_server_names(codex_home.resolve(), cwd.absolute(), original)
+    except (OSError, ValueError, RuntimeError, RecursionError) as error:
+        _log_read_failure(
+            codex_home / "config.toml",
+            type(error).__name__,
+            event="mcp_disabled_codex_config_read_failed",
         )
-    except Exception:
-        _logger.warning("mcp_disabled_preflight_failed executor=%s", executor, exc_info=True)
-        return CodexLaunchPlan(original, original, "probe_failed", ())
+        servers = set()
     overrides = []
     dropped = []
     for key in entries:
@@ -357,7 +442,11 @@ async def plan_codex_launch(
         name = key.server if _TOML_BARE_KEY.fullmatch(key.server) else json.dumps(key.server)
         overrides.append(f"mcp_servers.{name}.enabled=false")
     if dropped:
-        _logger.warning("mcp_disabled_servers_not_reported names=%s", tuple(dropped))
+        _logger.warning(
+            "mcp_disabled_servers_not_reported names=%s",
+            tuple(dropped),
+            extra={"executor": executor},
+        )
     return CodexLaunchPlan(
         (*original, *overrides), original, "applied" if overrides else "none", tuple(dropped)
     )

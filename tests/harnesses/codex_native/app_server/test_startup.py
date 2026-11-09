@@ -1371,38 +1371,31 @@ async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
     server.active_harnesses = active
     if wrapped:
         server.app_server_command = ("wrapper", "codex", "--")
-    adapter = Mock(wraps=disabled.SubprocessCodexProbe)
 
     (tmp_path / "source-codex-home/config.toml").write_text(
         '[mcp_servers.fixture]\ncommand="true"\n'
     )
-    probe_calls = []
+    real_plan = disabled.plan_codex_launch
 
-    async def probe(self, argv, **kwargs):
-        probe_calls.append((argv, kwargs))
-        private_home = Path(kwargs["env"]["CODEX_HOME"])
+    def plan(*args, **kwargs):
+        private_home = kwargs["codex_home"]
         assert private_home == server.codex_home
         assert "fixture" in (private_home / "config.toml").read_text()
         assert kwargs["cwd"] == server.cwd
-        return {"fixture": True}
+        return real_plan(*args, **kwargs)
 
-    monkeypatch.setattr(disabled.SubprocessCodexProbe, "effective_servers", probe)
-    hook = AsyncMock(wraps=disabled.plan_codex_launch)
+    hook = Mock(side_effect=plan)
     monkeypatch.setattr(disabled, "plan_codex_launch", hook)
-    monkeypatch.setattr(disabled, "SubprocessCodexProbe", adapter)
     await server.start()
     try:
-        hook.assert_awaited_once()
-        assert hook.call_args.args[0] == ("wrapper" if wrapped else server.codex_path)
-        adapter.assert_called_once_with(launch_args=("codex", "--") if wrapped else ())
+        hook.assert_called_once()
         assert hook.call_args.kwargs["executor"] == "codex-native"
         assert hook.call_args.kwargs["active_harnesses"] == active
-        baseline = tuple(hook.call_args.args[1])
+        baseline = tuple(hook.call_args.args[0])
         expected = (
             (*baseline, "mcp_servers.fixture.enabled=false") if active and saved else baseline
         )
         assert tuple(server.config_overrides) == expected
-        assert len(probe_calls) == bool(active and saved)
     finally:
         await server.close()
 
@@ -1416,11 +1409,6 @@ async def test_disabled_mcp_early_exit_retries_once(
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
-    monkeypatch.setattr(
-        disabled.SubprocessCodexProbe,
-        "effective_servers",
-        AsyncMock(return_value={"fixture": True}),
-    )
     attempts = []
 
     async def ready(server):
@@ -1437,6 +1425,9 @@ async def test_disabled_mcp_early_exit_retries_once(
         return _FakeStartupClient()
 
     harness = _respawn_harness(tmp_path, monkeypatch, ready)
+    (tmp_path / "source-codex-home/config.toml").write_text(
+        '[mcp_servers.fixture]\ncommand="true"\n'
+    )
     harness.server.active_harnesses = ["codex"]
     if second_fails:
         with pytest.raises(error_type, match="early exit"):
@@ -1460,11 +1451,6 @@ async def test_disabled_mcp_retry_then_silent_respawn_keeps_fallback(
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
-    monkeypatch.setattr(
-        disabled.SubprocessCodexProbe,
-        "effective_servers",
-        AsyncMock(return_value={"fixture": True}),
-    )
     attempts = []
 
     async def ready(server):
@@ -1477,6 +1463,9 @@ async def test_disabled_mcp_retry_then_silent_respawn_keeps_fallback(
         return _FakeStartupClient()
 
     harness = _respawn_harness(tmp_path, monkeypatch, ready)
+    (tmp_path / "source-codex-home/config.toml").write_text(
+        '[mcp_servers.fixture]\ncommand="true"\n'
+    )
     harness.server.active_harnesses = ["codex"]
     try:
         if last_attempt == "ready":
@@ -1500,16 +1489,14 @@ async def test_disabled_mcp_live_initialize_failure_does_not_retry(
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
-    monkeypatch.setattr(
-        disabled.SubprocessCodexProbe,
-        "effective_servers",
-        AsyncMock(return_value={"fixture": True}),
-    )
 
     async def ready(_server):
         raise error_type("still running")
 
     harness = _respawn_harness(tmp_path, monkeypatch, ready)
+    (tmp_path / "source-codex-home/config.toml").write_text(
+        '[mcp_servers.fixture]\ncommand="true"\n'
+    )
     harness.server.active_harnesses = ["codex"]
     with pytest.raises(error_type, match="still running"):
         await harness.server.start()

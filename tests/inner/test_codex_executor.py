@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -6468,17 +6468,16 @@ def disabled_mcp_session(tmp_path, monkeypatch):
     source_home.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(source_home))
     disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
-    probe = AsyncMock(return_value={"fixture": True})
-    monkeypatch.setattr(disabled.SubprocessCodexProbe, "effective_servers", probe)
+    (source_home / "config.toml").write_text('[mcp_servers.fixture]\ncommand="true"\n')
     plans = []
     real_plan = disabled.plan_codex_launch
 
-    async def plan(*args, **kwargs):
-        result = await real_plan(*args, **kwargs)
+    def plan(*args, **kwargs):
+        result = real_plan(*args, **kwargs)
         plans.append(result)
         return result
 
-    hook = AsyncMock(side_effect=plan)
+    hook = Mock(side_effect=plan)
     monkeypatch.setattr(disabled, "plan_codex_launch", hook)
 
     async def prepare(_home, overrides, **_kwargs):
@@ -6512,7 +6511,7 @@ def disabled_mcp_session(tmp_path, monkeypatch):
         spawns=spawns,
         processes=processes,
         initialize=initialize,
-        probe=probe,
+        source_home=source_home,
         hook=hook,
         plans=plans,
     )
@@ -6547,7 +6546,7 @@ async def test_disabled_mcp_applied_early_exit_relaunches_baseline(
             ("/bin/echo", "app-server", "-c", "base=true"),
         ]
         assert caplog.text.count(RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
-        harness.hook.assert_awaited_once()
+        harness.hook.assert_called_once()
         assert harness.hook.call_args.kwargs["executor"] == "codex"
         assert harness.hook.call_args.kwargs["active_harnesses"] == ["codex"]
     finally:
@@ -6576,7 +6575,7 @@ async def test_disabled_mcp_not_applied_early_exit_does_not_retry(disabled_mcp_s
     from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
 
     harness = disabled_mcp_session
-    harness.probe.return_value = {}
+    (harness.source_home / "config.toml").write_text("")
 
     async def initialize(*_args, **_kwargs):
         harness.processes[-1].returncode = 1
@@ -6589,12 +6588,12 @@ async def test_disabled_mcp_not_applied_early_exit_does_not_retry(disabled_mcp_s
     assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
 
 
-async def test_disabled_mcp_inactive_does_not_probe(disabled_mcp_session):
+async def test_disabled_mcp_inactive_keeps_baseline(disabled_mcp_session):
     harness = disabled_mcp_session
     harness.session._mcp_active_harnesses = None
     try:
         await harness.session.start()
-        harness.probe.assert_not_awaited()
+        assert harness.plans[0].outcome == "none"
         assert harness.spawns == [("/bin/echo", "app-server", "-c", "base=true")]
     finally:
         await harness.session.close()

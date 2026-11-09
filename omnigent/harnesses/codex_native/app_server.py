@@ -2765,18 +2765,14 @@ class CodexNativeAppServer:
         _effort_catalog_misses.pop(effort_catalog_transport, None)
         from omnigent.mcp_disabled_servers import (
             RELAUNCH_WITHOUT_OVERRIDES_EVENT,
-            SubprocessCodexProbe,
             plan_codex_launch,
         )
 
-        launch_command = self.app_server_command or (self.codex_path,)
-        mcp_plan = await plan_codex_launch(
-            launch_command[0],
+        mcp_plan = plan_codex_launch(
             self.config_overrides,
             executor="codex-native",
             active_harnesses=self.active_harnesses,
-            probe=SubprocessCodexProbe(launch_args=launch_command[1:]),
-            env=codex_app_server_diagnostic_env({**self.env, "CODEX_HOME": str(self.codex_home)}),
+            codex_home=self.codex_home,
             cwd=self.cwd,
         )
         self.config_overrides = list(mcp_plan.config_overrides)

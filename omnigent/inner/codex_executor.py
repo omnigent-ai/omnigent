@@ -3241,12 +3241,11 @@ class _CodexAppServerSession:
                 plan_codex_launch,
             )
 
-            mcp_plan = await plan_codex_launch(
-                self._worker_launch.launch_path,
+            mcp_plan = plan_codex_launch(
                 self._codex_config_overrides,
                 executor="codex",
                 active_harnesses=self._mcp_active_harnesses,
-                env=proc_env,
+                codex_home=self._codex_home_dir,
                 cwd=process_cwd,
             )
             try:

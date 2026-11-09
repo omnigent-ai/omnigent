@@ -69,7 +69,7 @@ def _used_launch_hooks(tree, source="fixture"):
 
 def test_hook_coverage_counts_attribute_calls():
     tree = ast.parse("""async def launch():
-    plan = await module.plan_codex_launch(executor="codex")
+    plan = module.plan_codex_launch(executor="codex")
     settings = apply_claude_settings(executor="claude-sdk")
     return plan.config_overrides, settings
 """)
@@ -79,7 +79,9 @@ def test_hook_coverage_counts_attribute_calls():
 @pytest.mark.parametrize(
     "statement",
     [
+        'module.plan_codex_launch(executor="codex")',
         'await module.plan_codex_launch(executor="codex")',
+        'unused = module.plan_codex_launch(executor="codex")',
         'unused = await module.plan_codex_launch(executor="codex")',
     ],
 )
