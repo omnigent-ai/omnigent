@@ -118,6 +118,10 @@ def test_prompt_references_readable_guidance_from_checkout(
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (prompt_workspace / "artifacts/gh_args.json").exists()
+    prompt = (prompt_workspace / "artifacts/review_prompt.txt").read_text()
+    assert "**Reference policy** — treat new violations as blocking contract violations." in prompt
+    assert "dev/lint/lint_reference_policy.py" in prompt
+    assert "Do not explain prohibited names" in prompt
     references = _prompt_references(prompt_workspace)
     assert references == {guidance.resolve()}
     reference = references.pop()

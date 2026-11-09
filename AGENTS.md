@@ -57,6 +57,12 @@ label yourself; a human maintainer adds it after checking the mirror.
 
 ## Committing
 
+New text and filenames must follow the reference policy in
+`dev/lint/lint_reference_policy.py`. Use generic names and synthetic examples;
+do not add deployment-specific identifiers or access instructions. The local
+`reference-policy` hook checks staged changes and pushed commits; CI checks the
+branch diff. Do not add suppressions or expand exemptions to make a change pass.
+
 The `pre-commit` hooks are the local gate, and CI runs the same checks. They
 run on `git commit` and again on `git push` only after they are installed:
 `just ensure` does that (or `just hooks` on its own), once per clone. Worktrees
