@@ -189,6 +189,21 @@ final class DatabricksSessionClientTests: XCTestCase {
         cookie, appliesTo: URL(string: "https://sibling.cloud.databricks.com/omnigent")!))
   }
 
+  func testTransportFailuresKeepTheirDomainAndCode() async throws {
+    for code in [URLError.cannotFindHost, .timedOut, .secureConnectionFailed] {
+      let server = OAuthTestServer { _ in throw URLError(code) }
+      do {
+        _ = try await DatabricksSessionClient(session: server.session).create(
+          context: webContext(server.workspaceURL.absoluteString), tokens: credentialTokens())
+        XCTFail("Expected network failure")
+      } catch {
+        XCTAssertEqual(
+          error as? DatabricksSessionError,
+          .networkUnavailable(DatabricksTransportFailure(URLError(code))))
+      }
+    }
+  }
+
   func testErrorStatusAndLoginPageAreNotSuccessfulSessions() async throws {
     for status in [401, 403, 500] {
       let server = OAuthTestServer { _ in .init(status: status) }
