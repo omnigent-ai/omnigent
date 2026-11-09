@@ -154,26 +154,41 @@ def test_an_occupied_input_box_refusal_awaits_no_answer(
 
 
 @pytest.mark.parametrize(
-    ("pane", "expected"),
+    ("pane", "joined_pane", "expected"),
     [
-        (_SETTINGS_ERROR_DIALOG, True),
-        # The launcher's install question is answered in the same terminal.
-        ("No Claude Code installation found. Would you like to install it? [Y/n]:", True),
-        ("Would you like to install it? [Y/n]: y\nInstalling Claude Code...", False),
-        # The launcher's install or update holds the terminal until Claude Code redraws it.
-        ("Updating Claude Code from 2.1.314 to 2.1.316\n", True),
-        ("No Claude Code installation found; installing it now.\n", True),
+        (_SETTINGS_ERROR_DIALOG, None, True),
+        ("No Claude Code installation found. Would you like to install it? [Y/n]:", None, True),
+        ("Would you like to install it? [Y/n]: y\nInstalling Claude Code...", None, False),
+        ("Updating Claude Code from 2.1.314 to 2.1.316\n", None, True),
+        ("No Claude Code installation found; installing it now.\n", None, True),
+        (
+            "Updating Clau\nde Code from 2.1.314 to 2.1.316\n",
+            "Updating Claude Code from 2.1.314 to 2.1.316\n",
+            True,
+        ),
+        (
+            "No Claude Code installation found; insta\nlling it now.\n",
+            "No Claude Code installation found; installing it now.\n",
+            True,
+        ),
         (
             "Updating Claude Code from 2.1.314 to 2.1.316\n"
             f"{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n",
+            "Updating Claude Code from 2.1.314 to 2.1.316\n",
             False,
         ),
         (
             "Updating Claude Code from 2.1.314 to 2.1.316\n│ Claude Code exited with code 127 │\n",
+            None,
             False,
         ),
-        (f"{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n", False),
-        ("", False),
+        (
+            "Updating Claude Code from 2.1.314 to 2.1.316\nClaude Code exited with co\nde 127\n",
+            "Updating Claude Code from 2.1.314 to 2.1.316\nClaude Code exited with code 127\n",
+            False,
+        ),
+        (f"{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n", None, False),
+        ("", None, False),
     ],
     ids=[
         "dialog",
@@ -181,16 +196,26 @@ def test_an_occupied_input_box_refusal_awaits_no_answer(
         "install-answered",
         "updating",
         "installing",
+        "wrapped-update",
+        "wrapped-install",
         "updated-and-ready",
         "update-failed",
+        "wrapped-exit",
         "composer",
         "torn-capture",
     ],
 )
 def test_terminal_dialog_pending_reads_the_pane(
-    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str, expected: bool
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pane: str,
+    joined_pane: str | None,
+    expected: bool,
 ) -> None:
-    _show(monkeypatch, pane)
+    def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
+        return joined_pane if join_wrapped and joined_pane is not None else pane
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
 
     assert claude_native_bridge.terminal_dialog_pending(bridge_dir) is expected
 

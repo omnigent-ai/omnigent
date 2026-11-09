@@ -6451,7 +6451,9 @@ def terminal_dialog_pending(bridge_dir: Path) -> bool:
         return True
     # The launcher's install or update banner stays on screen until Claude Code
     # redraws the pane; a rendered input box means the launch is past it.
-    return launcher_install_in_progress(pane) and not _claude_prompt_rendered(pane)
+    if _claude_prompt_rendered(pane):
+        return False
+    return launcher_install_in_progress(_capture_pane(socket_path, target, join_wrapped=True))
 
 
 # Claude Code echoes a ``/model`` command, then prints this acknowledgement
@@ -7553,7 +7555,8 @@ def _wait_for_claude_prompt_ready(
         waited_on_install = at_install_prompt
         # A launcher installing or updating Claude Code before it runs can outlast
         # the budget; the message waits for it instead of the pane being reaped.
-        installing = launcher_install_in_progress(pane)
+        launcher_pane = _capture_pane(socket_path, tmux_target, join_wrapped=True)
+        installing = launcher_install_in_progress(launcher_pane)
         if installing and waited_on_install_banner:
             raise ClaudeTerminalDialog(
                 "Claude Code's launch command is still installing Claude Code in its "
@@ -7567,11 +7570,7 @@ def _wait_for_claude_prompt_ready(
         # on two consecutive polls. Fail now with the link rather than wait out
         # the budget and reap the pane the person needs to finish signing in.
         # The joined capture keeps an address wider than the pane in one piece.
-        sign_in = (
-            detect_sign_in_prompt(_capture_pane(socket_path, tmux_target, join_wrapped=True))
-            if "http" in pane
-            else None
-        )
+        sign_in = detect_sign_in_prompt(launcher_pane) if "http" in pane else None
         if sign_in is not None and sign_in.url == sign_in_url:
             raise ClaudeSignInPending(
                 "Claude Code is waiting for a sign-in in this session's terminal, "

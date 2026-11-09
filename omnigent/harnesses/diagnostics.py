@@ -446,7 +446,7 @@ _INSTALL_BANNER = re.compile(
     r"|\bNo\s+Claude\s+Code\s+installation\s+found;\s+installing\s+it\s+now\b",
     re.IGNORECASE,
 )
-_LAUNCHER_EXIT_BOX = re.compile(r"\bexited with code \d+\b", re.IGNORECASE)
+_LAUNCHER_EXIT_BOX = re.compile(r"\bexited[\s│]+with[\s│]+code[\s│]+\d+\b", re.IGNORECASE)
 
 
 def launcher_install_in_progress(screen: str | None) -> bool:

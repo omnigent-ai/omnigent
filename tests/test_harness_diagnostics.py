@@ -451,6 +451,16 @@ def test_launcher_install_prompt_requires_an_unanswered_confirmation(
             "╭─ Error ─╮\n│ Claude Code exited with code 127 │\n╰─────────╯",
             False,
         ),
+        (
+            "Updating Claude Code from 2.1.314 to 2.1.316\nClaude Code exited with\ncode 127",
+            False,
+        ),
+        (
+            "Updating Claude Code from 2.1.314 to 2.1.316\n"
+            "╭─ Error ─────────────╮\n│ Claude Code exited │\n"
+            "│ with code 127      │\n╰────────────────────╯",
+            False,
+        ),
         ("Generating claude-code MCP client config...", False),
         ("", False),
         (None, False),
@@ -458,10 +468,12 @@ def test_launcher_install_prompt_requires_an_unanswered_confirmation(
     ids=[
         "update-banner",
         "update-banner-wrapped",
-        "exit-box-after-update",
         "install-banner",
         "install-banner-wrapped",
         "exit-box-after-install",
+        "exit-box-after-update",
+        "wrapped-exit-box",
+        "bordered-wrapped-exit-box",
         "no-banner",
         "empty",
         "none",
