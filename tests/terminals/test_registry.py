@@ -242,11 +242,15 @@ async def test_close_expected_closes_its_own_instance(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initially_running", [True, False], ids=["stale-liveness", "stale-error"])
+@pytest.mark.parametrize("publish_replacement", [False, True], ids=["gone-target", "replacement"])
 async def test_launch_replaces_stale_running_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    initially_running: bool,
+    publish_replacement: bool,
 ) -> None:
-    """``launch`` verifies a cached running entry before returning it."""
+    """Stale cache cleanup closes only the entry whose state was observed."""
 
     class _FlagTerminal(TerminalInstance):
         """Terminal instance whose liveness is controlled by a flag."""
@@ -273,7 +277,7 @@ async def test_launch_replaces_stale_running_entry(
         session_key="s1",
         socket_path=tmp_path / "stale.sock",
         private_dir=tmp_path / "stale",
-        running=True,
+        running=initially_running,
     )
     stale.alive = False
     created = _FlagTerminal(
@@ -290,7 +294,33 @@ async def test_launch_replaces_stale_running_entry(
         return TerminalCreateResult(instance=created, cwd=tmp_path)
 
     monkeypatch.setattr(registry_mod, "create_terminal_instance", _fake_create_terminal_instance)
+    replacement = _FlagTerminal(
+        name="shell",
+        session_key="s1",
+        socket_path=tmp_path / "replacement.sock",
+        private_dir=tmp_path / "replacement",
+        running=True,
+    )
+    replacement_lock = threading.Lock()
+    original_close = reg.close
 
+    async def close_after_replacement(
+        conversation_id: str,
+        terminal_name: str,
+        session_key: str,
+        *,
+        expected: TerminalInstance | None = None,
+    ) -> bool:
+        if publish_replacement:
+            # Another launcher takes the slot after the stale entry was read.
+            with reg._lock:
+                reg._by_conversation[conversation_id][(terminal_name, session_key)] = replacement
+                reg._instance_locks[(conversation_id, terminal_name, session_key)] = (
+                    replacement_lock
+                )
+        return await original_close(conversation_id, terminal_name, session_key, expected=expected)
+
+    monkeypatch.setattr(reg, "close", close_after_replacement)
     result = await reg.launch(
         "conv_x",
         "shell",
@@ -298,9 +328,21 @@ async def test_launch_replaces_stale_running_entry(
         TerminalEnvSpec(command="bash"),
     )
 
-    assert result is created
-    assert stale.closed is True
-    assert reg.get("conv_x", "shell", "s1") is created
+    if publish_replacement:
+        assert result is replacement
+        assert replacement.running
+        assert not replacement.closed
+        assert reg.get_instance_lock("conv_x", "shell", "s1") is replacement_lock
+        assert not stale.closed
+        assert created.closed
+        assert not created.running
+    else:
+        assert result is created
+        assert stale.closed
+        assert not stale.running
+        assert created.running
+        assert not created.closed
+    assert reg.get("conv_x", "shell", "s1") is result
     assert created.lifecycle_trace.session_id == "conv_x"
 
 
@@ -463,6 +505,51 @@ async def test_launch_idempotent_returns_existing_instance(
         "first is not second, the registry is spawning a fresh "
         "tmux on every launch — a leak."
     )
+
+
+@pytestmark_tmux
+@pytest.mark.timeout(20)
+async def test_stale_liveness_cleanup_preserves_real_replacement(
+    reg_with_tmux: TerminalRegistry,
+    bash_spec: TerminalEnvSpec,
+    cleanup: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed probe of a dead terminal cannot kill its live replacement."""
+    del cleanup
+    stale = await reg_with_tmux.launch("conv_a", "bash", "s1", bash_spec)
+    await stale._tmux("kill-session", "-t", stale.tmux_target)
+    probed = asyncio.Event()
+    release_probe = asyncio.Event()
+    original_is_alive = stale.is_alive
+
+    async def delayed_is_alive() -> bool:
+        alive = await original_is_alive()
+        assert not alive
+        probed.set()
+        await release_probe.wait()
+        return alive
+
+    monkeypatch.setattr(stale, "is_alive", delayed_is_alive)
+    pending = asyncio.create_task(reg_with_tmux.launch("conv_a", "bash", "s1", bash_spec))
+    try:
+        await asyncio.wait_for(probed.wait(), timeout=5)
+        replacement = await reg_with_tmux.launch("conv_a", "bash", "s1", bash_spec)
+        assert not stale.private_dir.exists()
+        assert await replacement.is_alive()
+        replacement_lock = reg_with_tmux.get_instance_lock("conv_a", "bash", "s1")
+        release_probe.set()
+        result = await asyncio.wait_for(pending, timeout=5)
+
+        assert await replacement.is_alive(), "stale liveness cleanup killed the replacement"
+        assert replacement.socket_path.exists()
+        assert result is replacement
+        assert reg_with_tmux.get("conv_a", "bash", "s1") is replacement
+        assert reg_with_tmux.get_instance_lock("conv_a", "bash", "s1") is replacement_lock
+        assert replacement.lifecycle_trace.cleanup_started_at is None
+    finally:
+        release_probe.set()
+        await asyncio.gather(pending, return_exceptions=True)
 
 
 @pytestmark_tmux

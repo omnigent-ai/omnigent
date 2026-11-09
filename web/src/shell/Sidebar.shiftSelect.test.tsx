@@ -9,6 +9,15 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as IdentityModule from "@/lib/identity";
+import { ARIA_MOD_KEY } from "@/components/KeyboardShortcut";
+import { useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
+import type * as SessionNumberHotkeysModule from "@/hooks/useSessionNumberHotkeys";
+
+vi.mock("@/hooks/useSessionNumberHotkeys", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionNumberHotkeysModule>()),
+  useSessionNumberHotkeys: vi.fn(),
+}));
+import { writeProjectFolderCollapse } from "@/lib/projectFolderPaginationPreferences";
 
 // ── Pure unit tests ─────────────────────────────────────────────────────────
 import { computeShiftSelectRange } from "./Sidebar";
@@ -141,6 +150,56 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Sidebar shift-click selection", () => {
+  it.each([false, true])(
+    "excludes collapsed siblings from shortcuts and bulk ranges (project=%s)",
+    async (project) => {
+      const labels: Record<string, string> = project ? { omni_project: "Alpha" } : {};
+      const family = { id: "a", representative_id: "a", pinned: false };
+      mockConversations(
+        ["a", "b", "c", "x"].map((id, index) =>
+          conv(id, { labels, updated_at: 100 - index, ...(id === "x" ? {} : { family }) }),
+        ),
+      );
+      if (project) {
+        projectsMock.push("Alpha");
+        localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha"]));
+      }
+      renderSidebar();
+      await screen.findByRole("link", { name: "b" });
+      fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+      expect(screen.queryByRole("link", { name: "b" })).toBeNull();
+      expect(screen.queryByRole("link", { name: "c" })).toBeNull();
+      expect(vi.mocked(useSessionNumberHotkeys).mock.lastCall?.[0]).toEqual(["a", "x"]);
+      expect(screen.getByRole("link", { name: "x" })).toHaveAttribute(
+        "aria-keyshortcuts",
+        `${ARIA_MOD_KEY}+Alt+2`,
+      );
+
+      if (project) {
+        fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+          button: 0,
+          ctrlKey: false,
+        });
+        fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+      } else {
+        fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+      }
+      fireEvent.click(screen.getByRole("link", { name: "a" }));
+      fireEvent.click(screen.getByRole("link", { name: "x" }), { shiftKey: true });
+      expect(screen.getByText("2 selected")).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("bulk-archive"));
+      await waitFor(() => expect(bulkArchiveMock.mutate).toHaveBeenCalledTimes(1));
+      expect(bulkArchiveMock.mutate.mock.calls[0][0]).toMatchObject({
+        ids: ["a", "x"],
+        archived: true,
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
+      expect(screen.getByRole("link", { name: "b" })).toBeVisible();
+      expect(vi.mocked(useSessionNumberHotkeys).mock.lastCall?.[0]).toEqual(["a", "b", "c", "x"]);
+    },
+  );
+
   it("shift-click selects range between anchor and target within Sessions", async () => {
     const sessions = [conv("s1"), conv("s2"), conv("s3"), conv("s4")];
     mockConversations(sessions);
@@ -281,30 +340,45 @@ describe("Sidebar shift-click selection", () => {
     expect([...ids].sort()).toEqual(["p1", "p2", "p3"]);
   });
 
-  it("keeps a projects-scope shift range to the rows above Show more", async () => {
-    projectsMock.push("Alpha", "Beta");
-    mockConversations([
-      ...Array.from({ length: 7 }, (_, i) =>
-        conv(`a${i}`, { labels: { omni_project: "Alpha" }, updated_at: 100 - i }),
-      ),
-      conv("b0", { labels: { omni_project: "Beta" }, updated_at: 1 }),
-    ]);
-    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha", "Beta"]));
-    renderSidebar();
+  it.each([
+    { collapse: true, selected: ["a0", "a1", "a2", "a3", "a4", "b0"] },
+    { collapse: false, selected: ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "b0"] },
+  ])(
+    "keeps a projects-scope shift range to the listed rows (collapse behind Show more: $collapse)",
+    async ({ collapse, selected }) => {
+      writeProjectFolderCollapse(collapse);
+      projectsMock.push("Alpha", "Beta");
+      mockConversations([
+        ...Array.from({ length: 7 }, (_, i) =>
+          conv(`a${i}`, { labels: { omni_project: "Alpha" }, updated_at: 100 - i }),
+        ),
+        conv("b0", { labels: { omni_project: "Beta" }, updated_at: 1 }),
+      ]);
+      localStorage.setItem(
+        EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+        JSON.stringify(["Alpha", "Beta"]),
+      );
+      renderSidebar();
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
-    fireEvent.click(await screen.findByRole("link", { name: "a0" }));
-    fireEvent.click(screen.getByRole("link", { name: "b0" }), { shiftKey: true });
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+        button: 0,
+        ctrlKey: false,
+      });
+      fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+      fireEvent.click(await screen.findByRole("link", { name: "a0" }));
+      fireEvent.click(screen.getByRole("link", { name: "b0" }), { shiftKey: true });
 
-    // a0–a4 and b0; a5 and a6 sit behind Alpha's Show more.
-    await waitFor(() => {
-      expect(screen.getByText("6 selected")).toBeInTheDocument();
-    });
-  });
+      // When collapsed, a5 and a6 sit behind Alpha's Show more and fall outside the range.
+      await waitFor(() => {
+        expect(screen.getByText(`${selected.length} selected`)).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByTestId("bulk-archive"));
+      await waitFor(() => {
+        expect(bulkArchiveMock.mutate).toHaveBeenCalledTimes(1);
+      });
+      expect([...bulkArchiveMock.mutate.mock.calls[0][0].ids].sort()).toEqual(selected);
+    },
+  );
 
   it("keeps a selected folder session in bulk actions once it moves behind Show more", async () => {
     projectsMock.push("Alpha");

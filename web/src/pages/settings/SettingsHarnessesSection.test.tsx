@@ -327,6 +327,30 @@ describe("Harnesses grid", () => {
     expect(within(card("codex-native")).getByText("Not installed")).toBeTruthy();
   });
 
+  it.each(["pi-native", "codex-native"])(
+    "says a CLI that missed its version check did not respond, not that it is outdated (%s)",
+    (harness) => {
+      hosts = [{ ...ONLINE, configured_harnesses: { [harness]: "cli-unresponsive" } }];
+      renderHarnesses();
+
+      expect(within(card(harness)).getByText("CLI did not respond")).toBeTruthy();
+      expect(within(card(harness)).queryByLabelText(/Out of date/)).toBeNull();
+      expect(screen.queryByTestId(`harness-action-${harness}`)).toBeNull();
+      expect(card(harness).getAttribute("href")).toBe(
+        `/settings/harnesses/${harness}?tab=settings`,
+      );
+
+      fireEvent.click(screen.getByTestId(`harness-settings-${harness}`));
+      expect(screen.getByText(/CLI on my-laptop didn’t respond to a version check/)).toBeTruthy();
+      expect(screen.queryByText(/out of date|isn’t set up/)).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: /^(Update|Install|Reconfigure|Set up)$/ }),
+      ).toBeNull();
+      expect(screen.getByText("Not checked")).toBeTruthy();
+      expect(screen.getByRole("heading", { name: "Startup configuration" })).toBeTruthy();
+    },
+  );
+
   it("does not offer one-click install for a not-installed Cursor harness", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "binary-missing" } }];
     renderHarnesses();
@@ -745,6 +769,20 @@ describe("Harness details", () => {
     expect(screen.queryByText("Not signed in")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Update" }));
     expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "update");
+  });
+
+  it("uses Set up tmux when the host has no usable tmux", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "tmux-unavailable" } }];
+    renderHarnesses("codex-native");
+
+    expect(
+      screen.getByText(
+        "Codex needs tmux 3.3 or newer on my-laptop. Install or upgrade tmux so new sessions can use Codex.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Set up tmux" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "tmux");
   });
 
   it("uses Set up for a not-installed Cursor harness", () => {

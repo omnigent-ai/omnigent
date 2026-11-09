@@ -891,8 +891,9 @@ function renderItem(
           className={cn("min-w-0", followsText && "mt-2")}
         >
           <FilePathAwareMessageResponse
-            className="chat-markdown"
-            mode={isTextStreaming ? "streaming" : "static"}
+            className="chat-markdown text-message"
+            mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
+            isStreaming={isTextStreaming}
           >
             {item.text}
           </FilePathAwareMessageResponse>
@@ -1019,13 +1020,60 @@ function renderItem(
   }
 }
 
+// Any indent: a list item's continuation lines carry its content indent. A caret
+// followed by more label text is a footnote; a bare `[^]` is an ordinary label.
+const REFERENCE_DEFINITION = /^\s*\[(?!\^[^\]])(?:[^[\]\\]|\\.)+\]:/;
+// A label opened on this line and still open at its end (where a backslash may end
+// it), then the rest of one.
+const LABEL_OPEN = /^\s*\[(?!\^[^\]])((?:[^[\]\\]|\\.)*\\?)$/;
+const LABEL_REST = /^((?:[^[\]\\]|\\.)*\\?)(\]:)?/;
+const LINE_ENDING = /\r\n?|\n/;
+const MAX_LABEL_LENGTH = 999;
+// Blockquote and list markers at any indent, so nested containers are read too.
+const CONTAINER_PREFIX = /^(?:\s*(?:>|[-*+]|\d{1,9}[.)]))+/;
+
 /**
- * Stable key for each render item. Prefer the server-assigned item id;
- * fall back to call_id for tools (unique within a response) or to
- * position for pre-finalization fragments that don't carry an item id
- * yet (text/reasoning chunks emitted before their `output_item.done`).
+ * Conservatively detects a reference link definition, which resolves only when
+ * static mode renders the whole document. It reads past blockquote and list markers
+ * and doesn't exclude code, so it can match where markdown wouldn't but shouldn't
+ * miss a definition. One pass over the lines, so long or pathological text stays linear.
+ */
+export function mayDefineReferenceLink(text: string): boolean {
+  // Length of a label left open by earlier lines, or -1.
+  let openLabel = -1;
+  for (const line of text.split(LINE_ENDING)) {
+    const content = line.replace(CONTAINER_PREFIX, "");
+    if (openLabel >= 0) {
+      // A label continues over non-blank lines of label characters, up to 999 of them.
+      const [matched = "", chars = "", closed] = LABEL_REST.exec(content) ?? [];
+      openLabel += chars.length + 1;
+      if (closed && openLabel <= MAX_LABEL_LENGTH) return true;
+      const continues = matched === content && content.trim() !== "";
+      openLabel = continues && openLabel <= MAX_LABEL_LENGTH ? openLabel : -1;
+      if (openLabel >= 0) continue;
+    }
+    if (REFERENCE_DEFINITION.test(content)) return true;
+    openLabel = LABEL_OPEN.exec(content)?.[1]?.length ?? -1;
+  }
+  return false;
+}
+
+/**
+ * Streamed text stays in streaming mode once it settles: static mode renders a
+ * different tree, so switching would remount every block of the reply.
+ */
+function keepsStreamingMode(item: Extract<RenderItem, { kind: "text" }>): boolean {
+  return item.streamKey !== undefined && !mayDefineReferenceLink(item.text);
+}
+
+/**
+ * Stable key for each render item. Text that streamed into this page keeps
+ * its `streamKey` while its item id commits; otherwise prefer the
+ * server-assigned item id, then call_id for tools (unique within a
+ * response), then position for fragments that don't carry an item id yet.
  */
 function keyFor(item: RenderItem, index: number): string {
+  if (item.kind === "text" && item.streamKey) return item.streamKey;
   if (item.itemId) return `${item.kind}:${item.itemId}`;
   if (item.kind === "tool") return `tool:${item.execution.callId}`;
   if (item.kind === "elicitation") return `elicitation:${item.elicitationId}`;

@@ -48,7 +48,7 @@ export function WorkspacePickerEntry({
         onMouseDown={(event) => event.preventDefault()}
         onClick={() => isDirectory && onOpen(entry.path)}
         className={cn(
-          "w-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+          "mobile-touch-target w-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
           compact ? "gap-2 px-2 py-[3px]" : "h-auto min-h-11 gap-2.5 px-5 py-2 text-base",
           isDirectory
             ? "cursor-pointer text-foreground"

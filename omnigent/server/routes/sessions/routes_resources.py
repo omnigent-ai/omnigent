@@ -31,7 +31,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import StageTimings, debug_event
 from omnigent.entities import (
     Conversation,
     StoredFile,
@@ -570,7 +570,8 @@ def register_resources_routes(
         :raises OmnigentError: ``runner_unavailable`` (503) for an unsupported endpoint;
             typed ``not_found`` (404) or
             ``session_agent_missing`` (410) re-derived from the runner body.
-        :raises HTTPException: 502 on any other runner failure.
+        :raises HTTPException: The runner's 400 with its detail when it rejects the request;
+            502 on any other runner failure.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -613,6 +614,13 @@ def register_resources_routes(
             # Re-derive the typed session-lifecycle 410 (agent deleted or
             # rebound) instead of flattening it to a generic 502.
             _raise_if_runner_session_agent_missing(resp)
+            # A runner 400 is a rejected request (bad SHA, moved PR), so its detail reaches the caller.
+            if (
+                resp.status_code == 400
+                and isinstance(response_payload, dict)
+                and isinstance(response_payload.get("detail"), str)
+            ):
+                raise HTTPException(status_code=400, detail=response_payload["detail"])
             if isinstance(response_payload, dict):
                 error = response_payload.get("error", {})
                 msg = error.get("message") or "runner resource endpoint failed"
@@ -717,7 +725,7 @@ def register_resources_routes(
         :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
             session has no workspace or spec to resolve.
         """
-        from omnigent.inner.sandbox import is_unconfined, reachable_roots, resolve_sandbox
+        from omnigent.inner.sandbox import declared_filesystem_reach
 
         if not conversation.workspace:
             return None
@@ -730,10 +738,10 @@ def register_resources_routes(
         if spec_os_env is None:
             return None
         root = Path(conversation.workspace)
-        policy = resolve_sandbox(spec_os_env, root)
+        roots, unconfined = declared_filesystem_reach(root, spec_os_env)
         return (
-            reachable_roots(root, policy),
-            is_unconfined(policy),
+            roots,
+            unconfined,
             conversation.workspace,
         )
 
@@ -1552,9 +1560,9 @@ def register_resources_routes(
         synthesize-from-body path and predate the gate. The markers
         are client-controlled, so the exemption is narrowed to the
         exact shape those wrappers send — a registered native terminal
-        name with ``session_key`` ``"main"`` — anything else carrying a
-        marker still goes through the declared-name gate (it would
-        otherwise be an arbitrary-terminal bypass).
+        name with ``session_key`` ``"main"`` from a session owner.
+        Other callers still pass the declared-name gate, because the
+        bootstrap path may synthesize a terminal from the request body.
 
         :param session_id: Session/conversation identifier.
         :param request: JSON body with ``terminal`` and
@@ -1564,12 +1572,14 @@ def register_resources_routes(
             declared by the agent spec (or the agent has no
             ``terminals:`` block at all).
         """
+        timings = StageTimings()
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
         is_native_bootstrap = (
             bool(body.get("ensure_native_terminal") or body.get("bridge_inject_dir"))
             and native_coding_agent_for_terminal_name(body.get("terminal")) is not None
             and body.get("session_key") == "main"
+            and await _caller_owns_session(session_id, request)
         )
         if not is_native_bootstrap:
             spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
@@ -1596,6 +1606,7 @@ def register_resources_routes(
                     ),
                     code=ErrorCode.INVALID_INPUT,
                 )
+        timings.mark("authorize")
         # A session whose runner merely went to sleep (host still up, or a
         # resumable managed sandbox) is transparently reconnected here, so
         # opening a shell from the web wakes it instead of dead-ending on a
@@ -1612,6 +1623,7 @@ def register_resources_routes(
             conversation_store=conversation_store,
             runner_router=runner_router or get_server_runner_router(),
         )
+        timings.mark("ensure_runner")
         path = f"/v1/sessions/{session_id}/resources/terminals"
         router = runner_router or get_server_runner_router()
         if router is not None:
@@ -1621,6 +1633,18 @@ def register_resources_routes(
             path,
             body,
             conv,
+        )
+        timings.mark("runner_launch")
+        _logger.info(
+            "Terminal create finished",
+            extra=debug_event(
+                "terminal_create_finished",
+                session_id=session_id,
+                terminal=body.get("terminal"),
+                native_bootstrap=is_native_bootstrap,
+                status_code=status,
+                **timings.attributes(),
+            ),
         )
         if status >= 400:
             error = payload.get("error", {})
@@ -2926,6 +2950,43 @@ def register_resources_routes(
         )
 
     @file_read_router.get(
+        "/sessions/{session_id}/resources/github/commit-diff",
+        # Internal (UI GitHub commit view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_commit_diff(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+        commit_sha: str | None = None,
+    ) -> Any:
+        """
+        Return one commit of the selected PR as a unified diff patch.
+
+        A dedicated route rather than a parameter on ``/diff``: a peer that predates
+        it answers 404 instead of silently returning the whole-PR patch. Falls back
+        to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param commit_sha: A full commit id of the selected PR.
+        :returns: JSON with the ``patch`` text.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if commit_sha is not None:
+            params["commit_sha"] = commit_sha
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_commit_diff",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/commit-diff",
+        )
+
+    @file_read_router.get(
         "/sessions/{session_id}/resources/github/diff/{relative_path:path}",
         # Internal (UI GitHub diff view) — hidden from the public API reference.
         include_in_schema=False,
@@ -3608,16 +3669,24 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         pr_url: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> dict[str, Any]:
         """
         List the PR's changed files (empty when the branch has no PR).
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
+        :param head_sha: With ``base_sha``, the revision of the displayed patch;
+            the list is rejected when the PR moved off it.
         :returns: Flat list of changed files with ``status`` and line counts.
         """
         conv = await _authorize_browse_read(session_id, request)
         params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if head_sha:
+            params["head_sha"] = head_sha
+        if base_sha:
+            params["base_sha"] = base_sha
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -3625,6 +3694,37 @@ def register_resources_routes(
             host_params=params,
             runner_params=params or None,
             runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/commits",
+        response_model=None,
+    )
+    async def list_session_github_commits(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+        head_sha: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        List the PR's commits, oldest first, at the displayed head.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param head_sha: The full head commit id the panel shows; rejected when the PR moved.
+        :returns: ``list`` of ``session.github.commit`` objects with ``has_more``.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if head_sha:
+            params["head_sha"] = head_sha
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_commits",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/commits",
         )
 
     @router.post("/sessions/{session_id}/resources/github/prs", response_model=None)
