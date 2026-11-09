@@ -44,9 +44,9 @@ implements them separately, so a fix for one harness does not reach the others.
   "did not respond", not outdated. New Chat keeps the harness selectable with a
   notice and no **Set up** action, and launches and resumes still start the CLI,
   so its own prompt shows in the terminal. Settings → Harnesses labels the card
-  **CLI did not respond**; the card and its gear open the harness settings,
-  whose warning offers no Install, Update or Reconfigure action and marks the
-  credential **Not checked**.
+  **CLI did not respond**. With `harness_install` enabled on a non-sandbox host,
+  the card and its gear open the harness settings, whose warning offers no
+  Install, Update or Reconfigure action and marks the credential **Not checked**.
 - `new-chat-setup`: with `harness_install` enabled, New Chat’s **Set up**
   action opens the shared Reconfigure flow in place for native agents on
   connected user hosts when a fix is available. Missing binaries install before
