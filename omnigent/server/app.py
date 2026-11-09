@@ -176,6 +176,7 @@ from omnigent.stores import (
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
+    SessionActivity,
     SessionConnectivity,
     runner_seen_is_fresh,
 )
@@ -4400,23 +4401,23 @@ def create_app(
         owners = {conv.id: _held_session_owner(conv.id) for conv in held}
         # Order the snapshot after local status writes so a later terminal row
         # cannot merely be persistence lag behind this replica's running edge.
-        saved: dict[str, Conversation] = {}
+        saved: dict[str, SessionActivity] = {}
         for batch in batched(owners, _HOST_HOLD_SNAPSHOT_BATCH_SIZE):
             snapshot = await asyncio.wrap_future(
                 session_live_state.submit(
                     "runner_host_hold_snapshot",
-                    conversation_store.get_conversations,
+                    conversation_store.get_session_activity,
                     list(batch),
                 )
             )
             saved.update(snapshot or {})
         mid_turn_sessions = frozenset(
-            conv.id
-            for conv in saved.values()
-            if conv.runner_id == runner_id
-            and conv.live_status in _MID_TURN_STATUSES
-            and conv.id in owners
-            and not _held_session_owner_changed(conv.id, owners[conv.id])
+            session_id
+            for session_id, activity in saved.items()
+            if activity.runner_id == runner_id
+            and activity.live_status in _MID_TURN_STATUSES
+            and session_id in owners
+            and not _held_session_owner_changed(session_id, owners[session_id])
         )
         host_back_deadline: float | None = None
         outcome = "cancelled"

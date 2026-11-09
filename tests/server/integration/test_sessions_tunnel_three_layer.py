@@ -2698,9 +2698,12 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
         await asyncio.wait_for(_host_checked(3), timeout=budget(5.0))
         assert sessions_module._session_status_cache.get(session_id) == "running"
         assert host_checks[0] == host_id
+        if unreadable_snapshot:
+            assert len(snapshot_calls) == 1
+            assert snapshot_calls[0] == (store.get_session_activity, ([session_id],))
         if batched_snapshot:
             assert snapshot_calls
-            assert all(fn == store.get_conversations for fn, _ in snapshot_calls)
+            assert all(fn == store.get_session_activity for fn, _ in snapshot_calls)
             batches = [args[0] for _, args in snapshot_calls]
             assert all(0 < len(batch) <= 2 for batch in batches)
             assert sum(len(batch) for batch in batches) == len(snapshot_ids)
@@ -2952,6 +2955,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     finally:
         release_status_write.set()
         sessions_module._runner_relay_tasks.pop(session_id, None)
+        sessions_module._session_active_response_cache.pop(session_id, None)
         for task in relay_tasks:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

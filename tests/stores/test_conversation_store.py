@@ -408,9 +408,22 @@ def test_get_session_activity(
     )
     conversation_store.set_session_usage(child.id, {"total_cost_usd": 5.0})
 
-    result = conversation_store.get_session_activity(
-        [a.id, b.id, child.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
-    )
+    statements: list[str] = []
+
+    def record_query(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        statements.append(statement.lower())
+
+    event.listen(conversation_store._engine, "before_cursor_execute", record_query)
+    try:
+        result = conversation_store.get_session_activity(
+            [a.id, b.id, child.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", record_query)
+
+    reads = [statement for statement in statements if statement.startswith("select")]
+    assert len(reads) == 2
+    assert all("conversation_labels" not in statement for statement in reads)
 
     assert set(result) == {a.id, b.id, child.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
