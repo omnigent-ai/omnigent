@@ -16,7 +16,7 @@ interface ChangesView {
   /** Files expanded temporarily (find, deep links), apart from the reader's collapse state. */
   revealedPaths: ReadonlySet<string>;
   find: FindState;
-  /** The head whose "viewed marks were reset" notice the reader dismissed. */
+  /** The head whose "changed files lost their viewed marks" notice the reader dismissed. */
   dismissedResetHead: string | null;
 }
 

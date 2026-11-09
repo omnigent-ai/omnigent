@@ -78,7 +78,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
   useDeleteTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
-  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), launch: vi.fn(), isPending: false })),
 }));
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -275,7 +275,12 @@ vi.mock("./TerminalsPanel", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
-import { useCreateTerminal, useTerminals, useDeleteTerminal } from "@/hooks/useTerminals";
+import {
+  useCreateTerminal,
+  useTerminals,
+  useDeleteTerminal,
+  type TerminalLaunchCallbacks,
+} from "@/hooks/useTerminals";
 
 const useConvMock = vi.mocked(useConversations);
 const useTerminalsMock = vi.mocked(useTerminals);
@@ -823,11 +828,12 @@ describe("AppShell header", () => {
   });
 
   it.each([
-    { title: "Off-window owner session", archived: false },
-    { title: null, archived: true },
+    { title: "Off-window owner session", archived: false, sibling: false },
+    { title: null, archived: true, sibling: false },
+    { title: "Archived sibling", archived: true, sibling: true },
   ])(
     "shows owner actions for an off-window session ($title, archived=$archived)",
-    ({ title, archived }) => {
+    ({ title, archived, sibling }) => {
       mockConversations([]);
       useSessionMock.mockReturnValue({
         session: {
@@ -839,6 +845,7 @@ describe("AppShell header", () => {
           createdAt: 1_700_000_000,
           title,
           archived,
+          family: sibling ? { id: "family", representative_id: "other", pinned: false } : undefined,
           labels: {},
           items: [],
           pendingElicitations: [],
@@ -859,6 +866,8 @@ describe("AppShell header", () => {
       expect(
         screen.getByRole("menuitem", { name: archived ? "Unarchive" : "Archive" }),
       ).toBeInTheDocument();
+      if (sibling) expect(screen.queryByTestId("header-move-to-project")).toBeNull();
+      else expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
     },
   );
 
@@ -6073,7 +6082,7 @@ describe("AppShell desktop Close", () => {
   it("opens New Terminal over an open file only once its viewer allows it", () => {
     const createShell = vi.fn();
     vi.mocked(useCreateTerminal).mockReturnValue({
-      mutate: createShell,
+      launch: createShell,
       isPending: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
     useSessionAgentMock.mockReturnValue({
@@ -6085,6 +6094,72 @@ describe("AppShell desktop Close", () => {
     expect(createShell).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
     expect(createShell).toHaveBeenCalledWith("zsh", expect.anything());
+  });
+
+  it("restores the open file when a shell opened early fails to create", () => {
+    const shell = { id: "terminal_zsh_u-fail1", name: "zsh", session: "u-fail1", running: true };
+    let callbacks: TerminalLaunchCallbacks = {};
+    vi.mocked(useCreateTerminal).mockReturnValue({
+      launch: (_name: string, next: TerminalLaunchCallbacks) => {
+        callbacks = next;
+      },
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    writeSessionWorkspaceState("conv_shell_fail", {
+      open: true,
+      openFiles: ["a.ts", "b.ts"],
+      selectedFilePath: "b.ts",
+    });
+    mockConversations([{ id: "conv_shell_fail", permission_level: null }]);
+    renderShell("/c/conv_shell_fail");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+
+    act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
+    act(() => callbacks.onOpen?.(shell));
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+
+    act(() => callbacks.onError?.(new Error("launch failed"), shell));
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+  });
+
+  it("keeps a newer selection when a shell opened early fails to create", () => {
+    const shell = { id: "terminal_zsh_u-fail2", name: "zsh", session: "u-fail2", running: true };
+    let callbacks: TerminalLaunchCallbacks = {};
+    vi.mocked(useCreateTerminal).mockReturnValue({
+      launch: (_name: string, next: TerminalLaunchCallbacks) => {
+        callbacks = next;
+      },
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    writeSessionWorkspaceState("conv_shell_moved", {
+      open: true,
+      openFiles: ["a.ts", "b.ts"],
+      selectedFilePath: "b.ts",
+    });
+    mockConversations([{ id: "conv_shell_moved", permission_level: null }]);
+    renderShell("/c/conv_shell_moved");
+
+    act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
+    act(() => callbacks.onOpen?.(shell));
+    // The user moves on to another file before the create fails.
+    fireEvent.click(screen.getByTitle("a.ts"));
+    act(() => callbacks.onError?.(new Error("launch failed"), shell));
+
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "a.ts");
   });
 
   it("leaves the session once an open file's viewer allows dropping its unsaved edits", () => {

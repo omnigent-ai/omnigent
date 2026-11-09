@@ -18,6 +18,8 @@ from sqlalchemy.sql.elements import ColumnElement
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
+    SqlHost,
+    SqlPreference,
     SqlScheduledTask,
     SqlScheduledTaskRun,
     current_workspace_id,
@@ -47,10 +49,12 @@ from omnigent.server.scheduled.run_reconciler import (
     STALE_RUN_MAX_AGE_SECONDS,
 )
 from omnigent.server.scheduled.schedule import (
+    continued_sandbox_host_id,
     next_scheduled_time,
     occurrence_host_id,
     scheduled_trigger_key,
 )
+from omnigent.stores.host_store import delete_unused_host_in_session
 from omnigent.stores.scheduled_task_store import (
     AdoptOutcome,
     AutomationFailure,
@@ -583,15 +587,30 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         """Hide the task, then remove history in bounded transactions, preserving live claims."""
 
         def write(session: Session) -> bool:
+            # Match admission and session deletion's host-before-task lock order.
+            host_id = continued_sandbox_host_id(scheduled_task_id, current_workspace_id())
+            host = session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+            retained = (
+                session.get(
+                    SqlPreference,
+                    (current_workspace_id(), "__host_lifecycle__", "retained_sandbox:" + host_id),
+                    with_for_update=True,
+                )
+                if host is not None
+                else None
+            )
             row = session.get(
                 SqlScheduledTask, (current_workspace_id(), scheduled_task_id), with_for_update=True
             )
-            if row is None or row.state == encode_scheduled_task_state("deleted"):
-                return False
-            row.state = encode_scheduled_task_state("deleted")
-            row.next_run_at = None
-            row.updated_at = now_epoch()
-            return True
+            removed = row is not None and row.state != encode_scheduled_task_state("deleted")
+            if removed:
+                assert row is not None
+                row.state = encode_scheduled_task_state("deleted")
+                row.next_run_at = None
+                row.updated_at = now_epoch()
+            if host is not None and retained is not None and retained.value == scheduled_task_id:
+                delete_unused_host_in_session(session, host)
+            return removed
 
         removed = run_write_transaction(self._session_immediate, "delete_task", write)
         cursor = None

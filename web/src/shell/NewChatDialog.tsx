@@ -1,3 +1,4 @@
+import { useSiblingSessionDestinations } from "@/hooks/useSharing";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useComposerContext } from "@/hooks/useComposerContext";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
@@ -63,7 +64,7 @@ import {
   type SandboxProfileSelection,
 } from "@/components/SandboxProfilePicker";
 import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
   CircleHelpIcon,
@@ -391,11 +392,12 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { installAgentBundle } from "@/lib/agentsApi";
-import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import { createBundledSession, getSessionSlim, launchRunner } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
 import {
   NEW_SESSION_HANDOFF_PARAM,
   forgetNewSessionHandoff,
+  newSessionLocation,
   peekNewSessionHandoff,
 } from "@/lib/newSessionHandoff";
 
@@ -2083,10 +2085,8 @@ export function AgentHarnessPicker({
   );
 }
 
-// In-memory draft for the new-session landing screen, so a half-composed
-// message, attachments and picker selections survive the unmount that happens
-// when the user navigates into an existing session and back. Module-scoped,
-// not persisted to storage (a page refresh starts clean); cleared on create.
+// Drafts survive navigation within this page load, with one slot per source.
+// Successful creation clears only its slot; a page refresh starts clean.
 interface LandingDraft {
   mcpRegistryServices: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
@@ -2123,20 +2123,23 @@ interface LandingDraft {
   workspaceFromConfig: boolean;
 }
 
-let landingDraft: LandingDraft | null = null;
-let landingDraftRevision = 0;
 const LANDING_IMPORT_DISMISSED_STORAGE_KEY = "omnigent:landing-import-dismissed";
+interface LandingDraftState {
+  draft: LandingDraft | null;
+  revision: number;
+}
+const landingDrafts = new Map<string | null, LandingDraftState>();
 
-function writeLandingDraft(draft: LandingDraft | null): void {
-  landingDraft = draft;
-  landingDraftRevision += 1;
+function writeLandingDraft(state: LandingDraftState, draft: LandingDraft | null): void {
+  state.draft = draft;
+  state.revision += 1;
 }
 
 // Test-only: clears the preserved landing draft so each case starts from a
 // clean module state (the draft is module-scoped and survives unmount by
 // design, which would otherwise leak between tests).
 export function resetLandingDraft(): void {
-  writeLandingDraft(null);
+  landingDrafts.clear();
 }
 
 function NewChatWorkspaceControls({
@@ -2160,6 +2163,65 @@ function NewChatWorkspaceControls({
 }
 
 export function NewChatLandingScreen() {
+  const [params] = useSearchParams();
+  const navigate = useNavigate();
+  const siblingSourceId = params.get("sibling");
+  const info = useServerInfo();
+  const supportsNested = info !== "loading" && info.sibling_sessions === true;
+  const source = useQuery({
+    queryKey: ["sibling-source", siblingSourceId],
+    queryFn: () => getSessionSlim(siblingSourceId!),
+    enabled: siblingSourceId !== null && supportsNested,
+  });
+  if (siblingSourceId && info !== "loading" && !supportsNested)
+    return (
+      <div role="alert" className="p-6">
+        Nested agents are not available on this server.
+      </div>
+    );
+  if (siblingSourceId && source.isPending)
+    return (
+      <div role="status" className="p-6">
+        Loading source session…
+      </div>
+    );
+  if (siblingSourceId && source.isError)
+    return (
+      <div role="alert" className="space-y-3 p-6">
+        <p>Source session is unavailable.</p>
+        <Button
+          variant="outline"
+          onClick={() => {
+            const draft = landingDrafts.get(siblingSourceId)?.draft;
+            navigate(draft ? newSessionLocation(draft.message, draft.files) : "/");
+          }}
+        >
+          Continue in a new session
+        </Button>
+      </div>
+    );
+  return (
+    <NewChatLandingContent
+      key={siblingSourceId ?? "standalone"}
+      siblingSourceId={siblingSourceId}
+      siblingSource={source.data}
+    />
+  );
+}
+
+function NewChatLandingContent({
+  siblingSourceId,
+  siblingSource,
+}: {
+  siblingSourceId: string | null;
+  siblingSource?: Awaited<ReturnType<typeof getSessionSlim>>;
+}) {
+  const [draftState] = useState(() => {
+    const state = landingDrafts.get(siblingSourceId) ?? { draft: null, revision: 0 };
+    landingDrafts.set(siblingSourceId, state);
+    return state;
+  });
+  const landingDraft = draftState.draft;
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams] = useSearchParams();
@@ -2196,7 +2258,10 @@ export function NewChatLandingScreen() {
       cancelled = true;
     };
   }, [cacheUser]);
-  const pickerCacheKey = getNewChatPickerCacheKey(projectParam, cacheUser);
+  const pickerCacheKey = getNewChatPickerCacheKey(
+    siblingSourceId ? `sibling:${siblingSourceId}` : projectParam,
+    cacheUser,
+  );
   // Snapshot once per scope: editing a cached menu changes the saved preferences.
   const cachedPickerOptions = useMemo(
     () => readNewChatPickerOptionsCache(pickerCacheKey),
@@ -2288,13 +2353,29 @@ export function NewChatLandingScreen() {
       (id): id is string => id != null,
     ),
   });
+  const info = useServerInfo();
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
   const {
-    data: hosts,
+    data: destinationHosts,
     isLoading: hostsLoading,
     isError: hostsError,
-  } = useHosts({ refetchOnFocus: true });
+  } = useHosts({ refetchOnFocus: true, sourceHostId: siblingSource?.hostId });
+  const { data: liveSiblingDestinations } = useSiblingSessionDestinations(
+    !!siblingSourceId && info !== "loading" && info.sibling_sessions === true,
+  );
+  const siblingDestinationPolicy =
+    liveSiblingDestinations ??
+    (info !== "loading" ? (info.sibling_session_destinations ?? "any_host") : "current_host");
+  const bundleWorkspacesSupported = info !== "loading" && info.session_bundle_workspaces === true;
+  const siblingMayUseOtherHosts = !siblingSourceId || siblingDestinationPolicy === "any_host";
+  const hosts = useMemo(
+    () =>
+      siblingSourceId && siblingDestinationPolicy !== "any_host"
+        ? destinationHosts?.filter((host) => host.host_id === siblingSource?.hostId)
+        : destinationHosts,
+    [destinationHosts, siblingDestinationPolicy, siblingSource?.hostId, siblingSourceId],
+  );
 
   // Offer an import affordance on the empty landing: a brand-new user with no
   // Omnigent sessions can pull in their existing local CLI history. Same query
@@ -2313,7 +2394,6 @@ export function NewChatLandingScreen() {
   });
 
   // Filter and order selectable agents by deployment curation.
-  const info = useServerInfo();
   const curation = pickerCuration(info);
   const agentList = useMemo(
     () =>
@@ -2453,7 +2533,10 @@ export function NewChatLandingScreen() {
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (option hidden) until the boot probe resolves.
   const profilesEnabled = sandboxProfilesEnabled(info);
-  const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const managedSandboxesEnabled =
+    info !== "loading" &&
+    info.managed_sandboxes_enabled &&
+    (!siblingSourceId || siblingDestinationPolicy !== "current_host");
   const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
   const {
     selected: mcpRegistryServices,
@@ -2506,7 +2589,10 @@ export function NewChatLandingScreen() {
   // Embed-only docs seam for Databricks git auth setup. Standalone leaves this
   // undefined, so no tooltip is rendered.
   const databricksGitCredentialsTooltipContent = docsLinks?.databricksGitCredentials;
-  const showDisabledSandboxWithDocs = !managedSandboxesEnabled && !!newSandboxTooltipContent;
+  const showDisabledSandboxWithDocs =
+    !managedSandboxesEnabled &&
+    !!newSandboxTooltipContent &&
+    (!siblingSourceId || siblingDestinationPolicy !== "current_host");
 
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
@@ -2518,7 +2604,7 @@ export function NewChatLandingScreen() {
   );
   const agentExplicitlySelectedRef = useRef(false);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
-    () => restoredDraft?.selectedHostId ?? null,
+    () => restoredDraft?.selectedHostId ?? siblingSource?.hostId ?? null,
   );
   // Sessions on the selected host — fetched only when a host is selected,
   // to avoid registering hundreds of sessions into the health poll at idle.
@@ -2608,7 +2694,30 @@ export function NewChatLandingScreen() {
   const [pendingRepoUrl, setPendingRepoUrl] = useState("");
   const [sandboxRepoPopoverOpen, setSandboxRepoPopoverOpen] = useState(false);
   const sandboxRepoPopoverRef = useRef<HTMLDivElement>(null);
-  const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
+  const [workspace, setWorkspace] = useState<string>(
+    () => restoredDraft?.workspace ?? siblingSource?.workspace ?? "",
+  );
+  useEffect(() => {
+    if (!siblingSourceId || !siblingSource || info === "loading") return;
+    if (
+      (siblingDestinationPolicy === "current_host" && sandboxSelected) ||
+      (siblingDestinationPolicy !== "any_host" &&
+        !sandboxSelected &&
+        selectedHostId !== siblingSource.hostId)
+    ) {
+      if (siblingDestinationPolicy === "current_host") setSandboxSelected(false);
+      setSelectedHostId(siblingSource.hostId ?? null);
+      setWorkspace(siblingSource.workspace ?? "");
+    }
+  }, [
+    info,
+    siblingDestinationPolicy,
+    siblingSourceId,
+    siblingSource,
+    selectedHostId,
+    sandboxSelected,
+  ]);
+
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
   // the config. ANY other write — a picker selection, browsing, a host
@@ -2811,12 +2920,12 @@ export function NewChatLandingScreen() {
     return () => {
       onScreenRef.current = false;
       if (!submittedRef.current) {
-        writeLandingDraft(draftRef.current);
-      } else if (submittedDraftRevisionRef.current === landingDraftRevision) {
-        writeLandingDraft(null);
+        writeLandingDraft(draftState, draftRef.current);
+      } else if (submittedDraftRevisionRef.current === draftState.revision) {
+        writeLandingDraft(draftState, null);
       }
     };
-  }, []);
+  }, [draftState]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
   const { addRecentHarness } = useRecentHarnesses();
@@ -2840,7 +2949,10 @@ export function NewChatLandingScreen() {
     thisMachineHostId != null && allHosts.some((h) => h.host_id === thisMachineHostId);
   const canConnectThisMachine = Boolean(desktopHost?.cliInstalled);
   const showConnectThisMachine =
-    canConnectThisMachine && !thisMachineInList && onlineHosts.length === 0;
+    siblingMayUseOtherHosts &&
+    canConnectThisMachine &&
+    !thisMachineInList &&
+    onlineHosts.length === 0;
 
   // Track this machine's host status from the desktop shell (no-op in a browser).
   useEffect(() => {
@@ -2958,6 +3070,7 @@ export function NewChatLandingScreen() {
   // already in state (or restored from the in-memory draft) is never
   // overridden. Holds off while a project prefill is deciding.
   useEffect(() => {
+    if (siblingSourceId && siblingSource?.hostId) return;
     if (!prefillSettled) return;
     if (!onboardingHostSettled.current) {
       if (onboardingHost.pending) return;
@@ -3019,6 +3132,8 @@ export function NewChatLandingScreen() {
     defaultSandboxProvider,
     onboardingHost.pending,
     onboardingHost.hostId,
+    siblingSourceId,
+    siblingSource?.hostId,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
@@ -3130,7 +3245,7 @@ export function NewChatLandingScreen() {
     const seededWorkspace = workspace === "";
     if (seededWorkspace) {
       workspaceFromConfigRef.current = false;
-      setWorkspace(candidate);
+      setWorkspace((current) => current || candidate);
     }
     // Fork fresh only when we actually seeded the redirect AND no branch is set
     // — a project that supplies its own workspace keeps a plain launch, and a
@@ -3159,11 +3274,6 @@ export function NewChatLandingScreen() {
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
   // The pending custom agent sentinel also wins when set.
-  // A pending (just-created, not-yet-submitted) custom agent can't run on a
-  // managed sandbox — the sandbox create path doesn't provision a runner for a
-  // bundled agent. So a pending pick made before switching to a sandbox is
-  // dropped there, falling back to a real agent; off the sandbox it's kept.
-  const pendingAgentAllowedOnTarget = !sandboxSelected;
   // A configured agent absent from templates and the first 30 Mine sessions
   // stays unavailable until the user explicitly chooses another agent.
   const configuredAgentUnavailable =
@@ -3205,8 +3315,9 @@ export function NewChatLandingScreen() {
     rememberedHarnessResolution.source === "fallback"
       ? rememberedHarnessResolution
       : null;
+  const pendingAgentAllowedOnTarget = !sandboxSelected || bundleWorkspacesSupported;
   const defaultEffectiveAgentId =
-    pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
+    pickedAgentId === PENDING_AGENT_ID && pendingAgent !== null && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
       : agentList.some((a) => a.id === pickedAgentId)
         ? pickedAgentId
@@ -5256,6 +5367,18 @@ export function NewChatLandingScreen() {
     field: "sandboxRepo" | "other";
     message: string | null;
   } | null => {
+    if (
+      effectiveAgentId === PENDING_AGENT_ID &&
+      siblingSourceId &&
+      (shouldCreateWorktree || startInExistingWorktree) &&
+      !bundleWorkspacesSupported
+    ) {
+      return {
+        field: "other",
+        message:
+          "This server needs an update to create a custom agent in a worktree. Choose an existing agent or use the current folder.",
+      };
+    }
     if (mcpAuthorizing || mcpSelectionError !== null) {
       return {
         field: "other",
@@ -5362,7 +5485,10 @@ export function NewChatLandingScreen() {
   // shells keep Run on Arca visible because reconnecting is their only recovery.
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
   const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
-  const showArcaOption = arcaEnabled && (!arcaPreviewRecovery || !arcaHostOnline);
+  const showArcaOption =
+    arcaEnabled &&
+    (siblingMayUseOtherHosts || arcaHostId === siblingSource?.hostId) &&
+    (!arcaPreviewRecovery || !arcaHostOnline);
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : connectingArca
@@ -5507,7 +5633,9 @@ export function NewChatLandingScreen() {
     // Persist the explicit pick even when it matches the current selection, so
     // clicking the auto-selected host still records it as the sticky default
     // for the next visit.
-    writeLastHostChoice(hostId);
+    if (!hosts?.find((host) => host.host_id === hostId)?.sandbox_provider) {
+      writeLastHostChoice(hostId);
+    }
     // Re-selecting the current host is a no-op. Clearing the workspace here
     // would empty the field for good: the seeding effect's deps (host id,
     // recents, derived home) are all unchanged on a same-host pick, so it
@@ -5665,7 +5793,7 @@ export function NewChatLandingScreen() {
       // they come back verbatim rather than through a re-validating replace.
       restoreFiles(returnedDraft.files);
     } else {
-      writeLandingDraft(returnedDraft);
+      writeLandingDraft(draftState, returnedDraft);
     }
   }
 
@@ -5685,6 +5813,7 @@ export function NewChatLandingScreen() {
     // after the user has navigated elsewhere while this component is still
     // mounted in the outgoing transition tree.
     const createLocation = window.location.href;
+    if (siblingSourceId && (!siblingSource || info === "loading" || !info.sibling_sessions)) return;
     const returnToCanvas = searchParams.has(CANVAS_QUERY_PARAM) && isFeatureEnabled(info, "canvas");
     let createdCanvasId = selectedProject
       ? (configProjectId ?? `name:${selectedProject}`)
@@ -5715,7 +5844,11 @@ export function NewChatLandingScreen() {
       const wasViewing = removeLocalConversation(localConv.tempConvId);
       // Gated on `wasViewing` (not `onScreenRef` — the landing already unmounted).
       if (wasViewing && stillOnTempRoute) {
-        navigate(returnToCanvas ? { pathname: "/", search: `?${searchParams.toString()}` } : "/");
+        navigate(
+          returnToCanvas || siblingSourceId
+            ? { pathname: "/", search: `?${searchParams.toString()}` }
+            : "/",
+        );
       }
     };
     try {
@@ -5755,7 +5888,7 @@ export function NewChatLandingScreen() {
         if (needsDbcert) return;
       }
       // Spend the draft only once provisioning starts, after the laptop credential check.
-      submittedDraftRevisionRef.current = landingDraftRevision;
+      submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
@@ -5933,15 +6066,56 @@ export function NewChatLandingScreen() {
       let launchedAgentId = effectiveAgentId;
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
-        // Custom agents upload their bundle with the session, then launch on the host below.
+        // Custom agents upload their bundle with the session. Sibling and managed
+        // creates launch server-side; ordinary connected-host creates launch below.
         const bundle = await buildAgentBundle(pendingAgent);
-        const metadata: Record<string, unknown> = { labels: createLabels };
+        let bundledGitOptions: Parameters<typeof launchRunner>[3];
+        if (shouldCreateWorktree) {
+          bundledGitOptions = {
+            branchName: trimmedBranch,
+            baseBranch: baseBranch.trim() || undefined,
+          };
+        } else if (startInExistingWorktree) {
+          bundledGitOptions = { branchName: activeWorktree!.branch!, existingWorktree: true };
+        }
+        const metadata: Parameters<typeof createBundledSession>[1] = { labels: createLabels };
+        if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
+        if (sandboxSelected) {
+          // Multipart creates allocate their host server-side; they cannot reserve a host ID.
+          metadata.host_type = "managed";
+          metadata.workspaces = composeSandboxWorkspaces(sandboxRepoSelections);
+          if (sandboxProvider !== null) metadata.sandbox_provider = sandboxProvider;
+          if (selectedSandboxProfile !== null) {
+            metadata.sandbox_profile_id = selectedSandboxProfile.id;
+            metadata.sandbox_profile_revision = selectedSandboxProfile.revision;
+          }
+          if (createProjectId !== null) {
+            metadata.workspace = null;
+            metadata.git = null;
+          }
+          if (serverOwnsInitialInput) metadata.initial_input = initialInput;
+        } else if (siblingSourceId && selectedHostId) {
+          metadata.host_id = selectedHostId;
+          if (bundledGitOptions) {
+            metadata.git = {
+              branch_name: bundledGitOptions.branchName,
+              base_branch: bundledGitOptions.baseBranch,
+              existing_worktree: bundledGitOptions.existingWorktree,
+            };
+          }
+        }
         if (mcpServicesForLaunch.length) {
           metadata.mcp_registry_services = mcpServicesForLaunch;
         }
         // A config-seeded workspace is omitted on a `project_id` create so the
         // server default-fills it (same field semantics as the JSON path).
-        if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
+        if (
+          !sandboxSelected &&
+          workspaceTrimmed &&
+          (siblingSourceId || !workspaceFromProjectConfig)
+        ) {
+          metadata.workspace = workspaceTrimmed;
+        }
         if (createProjectId !== null) {
           // Atomic filing: the server sets first-class `project_id` at create.
           metadata.project_id = createProjectId;
@@ -5952,7 +6126,8 @@ export function NewChatLandingScreen() {
         }
         const bundled = await createBundledSession(
           bundle,
-          metadata as Parameters<typeof createBundledSession>[1],
+          metadata,
+          serverOwnsInitialInput ? files : [],
         );
         data = { id: bundled.id };
         launchedAgentId = bundled.agentId ?? null;
@@ -5960,18 +6135,8 @@ export function NewChatLandingScreen() {
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
         markSessionCreated(data.id, sandboxSelected ? "sandbox" : "computer");
-        // Launch the runner on the selected host. The multipart create
-        // only stores DB rows — launchRunner binds + starts the runner.
-        if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
-          // Create a new worktree, bind an existing one (records the branch
-          // for the sidebar + delete flow without creating anything), or
-          // neither — mirrored on the `git` block.
-          const gitOpts = shouldCreateWorktree
-            ? { branchName: trimmedBranch, baseBranch: baseBranch.trim() || undefined }
-            : startInExistingWorktree
-              ? { branchName: activeWorktree!.branch!, existingWorktree: true }
-              : undefined;
-          await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
+        if (!siblingSourceId && !sandboxSelected && selectedHostId && workspaceTrimmed) {
+          await launchRunner(selectedHostId, data.id, workspaceTrimmed, bundledGitOptions);
         }
         // Clear pending agent after successful creation.
         setPendingAgent(null);
@@ -6010,6 +6175,7 @@ export function NewChatLandingScreen() {
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
         const createPayload = JSON.stringify({
+          ...(siblingSourceId ? { sibling_source_id: siblingSourceId } : {}),
           ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
           // Config-seeded agent on a `project_id` create: omitted so the
           // server default-fills it from the project config.
@@ -6293,8 +6459,8 @@ export function NewChatLandingScreen() {
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
-      if (submittedDraftRevisionRef.current === landingDraftRevision) {
-        writeLandingDraft(null);
+      if (submittedDraftRevisionRef.current === draftState.revision) {
+        writeLandingDraft(draftState, null);
       }
 
       // `localConv` is set only when a real agent id was resolved up front.
@@ -6344,11 +6510,13 @@ export function NewChatLandingScreen() {
     }
   }
 
-  const placeholderText = isMobileViewport
-    ? "Describe a task..."
-    : selectedProject
-      ? `Start a new session in ${selectedProject}`
-      : "Describe a task to start a new session…";
+  const placeholderText = siblingSourceId
+    ? "What should this agent work on?"
+    : isMobileViewport
+      ? "Describe a task..."
+      : selectedProject
+        ? `Start a new session in ${selectedProject}`
+        : "Describe a task to start a new session…";
 
   const isCloudHostEntry = (host: Host) =>
     !!host.sandbox_provider || host.name.toLowerCase().includes("cloud");
@@ -6841,7 +7009,13 @@ export function NewChatLandingScreen() {
         {/* On phones the heading yields its height first, so a long draft cannot
             push Send below the keyboard. */}
         <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 max-md:min-h-0 max-md:overflow-hidden md:flex-none">
-          {selectedProject ? (
+          {siblingSourceId ? (
+            <div aria-hidden="true" className="flex h-16 shrink-0 items-center">
+              <span className="flex size-14 items-center justify-center rounded-xl bg-tag-pink">
+                <PlusIcon className="size-6 text-brand-accent" />
+              </span>
+            </div>
+          ) : selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the project's
             // icon — the default pink folder, or a chosen emoji — and name the
             // project. Sized to Otto's h-16 box so the centered composer doesn't
@@ -6862,11 +7036,26 @@ export function NewChatLandingScreen() {
           ) : (
             <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
           )}
-          {isMobileViewport || selectedProject || heading ? (
+          {siblingSourceId || isMobileViewport || selectedProject || heading ? (
             <h1 className="min-w-0 break-words text-center text-[28px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
-              {isMobileViewport ? "Start a new session in" : selectedProject || heading}
+              {siblingSourceId
+                ? "Add nested agent"
+                : isMobileViewport
+                  ? "Start a new session in"
+                  : selectedProject || heading}
             </h1>
           ) : null}
+          {siblingSourceId && (
+            <p
+              className="max-w-full break-words text-center text-sm text-muted-foreground line-clamp-2"
+              data-testid="sibling-composer-context"
+            >
+              A new conversation alongside{" "}
+              <span className="font-medium text-foreground">
+                {siblingSource?.title?.trim() || "Untitled"}
+              </span>
+            </p>
+          )}
           {isMobileViewport && workspaceControls}
         </div>
         {/* Drop cue, spanning the landing surface. */}
@@ -7292,18 +7481,22 @@ export function NewChatLandingScreen() {
                               )}
                             </>
                           )}
-                          <DropdownMenuSeparator />
-                          {/* Persistent escape hatch: open the connect-a-host
+                          {siblingMayUseOtherHosts && (
+                            <>
+                              <DropdownMenuSeparator />
+                              {/* Persistent escape hatch: open the connect-a-host
                     instructions. Present even with zero hosts so a fresh user
                     is never stuck. */}
-                          <DropdownMenuItem
-                            onSelect={() => setConnectOpen(true)}
-                            data-testid="new-chat-landing-connect-host"
-                            className="mobile-touch-target composer-host-connect text-muted-foreground"
-                          >
-                            <PlusIcon className="size-4" />
-                            Connect new host
-                          </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onSelect={() => setConnectOpen(true)}
+                                data-testid="new-chat-landing-connect-host"
+                                className="mobile-touch-target composer-host-connect text-muted-foreground"
+                              >
+                                <PlusIcon className="size-4" />
+                                Connect new host
+                              </DropdownMenuItem>
+                            </>
+                          )}
                         </DropdownMenuContent>
                       </DropdownMenu>
                     </MobileHeaderControlPortal>
