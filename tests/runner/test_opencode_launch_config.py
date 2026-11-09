@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -13,6 +13,7 @@ import omnigent.harnesses.opencode_native.bridge as bridge
 import omnigent.harnesses.opencode_native.provider as provider
 import omnigent.runner._entry as runner_entry
 import omnigent.runner.native.orchestration as orchestration
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec import AgentSpec
 
 
@@ -86,10 +87,12 @@ def launch_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any
     return {"seeded": seeded}
 
 
-async def _launch_until_boot(**kwargs: Any) -> Path:
+async def _launch_until_boot(*, client_surface: str | None = None, **kwargs: Any) -> Path:
+    resource_registry = SessionResourceRegistry()
+    resource_registry.set_client_surface("conv_launch", client_surface)
     with pytest.raises(_StopBeforeBoot):
         await orchestration._auto_create_opencode_terminal(
-            "conv_launch", cast(Any, object()), lambda *a: None, **kwargs
+            "conv_launch", resource_registry, lambda *a: None, **kwargs
         )
     return bridge.bridge_dir_for_bridge_id("conv_launch")
 
@@ -139,7 +142,12 @@ async def test_launch_adopts_managed_connect_providers_plugins_and_model(
 
     ucode_plugin = str(tmp_path / "bridges" / "omnigent-ucode-auth")
     managed = {
-        "providers": {"databricks-ws": {"api": {"id": "databricks-ws"}}},
+        "providers": {
+            "databricks-ws": {
+                "settings": {"baseURL": "https://ws.cloud.databricks.com/ai-gateway/mlflow/v1"},
+                "models": {"served-model": {"name": "served-model"}},
+            }
+        },
         "plugins": [ucode_plugin],
         "model": "databricks-ws/served-model",
     }
@@ -149,11 +157,18 @@ async def test_launch_adopts_managed_connect_providers_plugins_and_model(
     )
     monkeypatch.setattr(databricks_credential, "broker_token_command", lambda host: "mint-token")
 
-    bridge_dir = await _launch_until_boot(server_client=object())
+    bridge_dir = await _launch_until_boot(server_client=object(), client_surface="desktop")
     written = json.loads(
         (bridge_dir / "xdg-config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
     )
-    assert written["providers"] == managed["providers"]
+    assert (
+        written["providers"]["databricks-ws"]["settings"]
+        == managed["providers"]["databricks-ws"]["settings"]
+    )
+    assert written["providers"]["databricks-ws"]["models"]["served-model"]["headers"] == {
+        "Databricks-Custom-Coding-Agent": "opencode",
+        "Databricks-Custom-Client-Surfaces": "omnigent-desktop",
+    }
     assert written["plugins"] == [ucode_plugin, str(bridge_dir / "omnigent-policy")]
     assert written["model"] == "databricks-ws/served-model"
     assert written["permissions"] == [{"action": "*", "resource": "*", "effect": "ask"}]
@@ -181,7 +196,7 @@ async def test_launch_connects_env_provider_keys_before_resolving_session(
 
     with pytest.raises(_StopAtSessionResolve):
         await orchestration._auto_create_opencode_terminal(
-            "conv_launch", cast(Any, object()), lambda *a: None
+            "conv_launch", SessionResourceRegistry(), lambda *a: None
         )
 
     assert len(calls) == 1
@@ -209,7 +224,7 @@ async def test_launch_survives_env_provider_key_hand_off_failure(
 
     with pytest.raises(_StopAtSessionResolve):
         await orchestration._auto_create_opencode_terminal(
-            "conv_launch", cast(Any, object()), lambda *a: None
+            "conv_launch", SessionResourceRegistry(), lambda *a: None
         )
 
     assert resolve_calls == ["reached"]
