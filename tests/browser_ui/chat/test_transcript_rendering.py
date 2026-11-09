@@ -1122,7 +1122,7 @@ def test_tool_rows_read_as_actions_with_their_outcome(
 
 
 _LIGATURE_COMMAND = "python3 -c \"s='a=>b'; assert s.count('=>')==1; print('===')\""
-# Text a ligature-capable fallback mono font would join, such as `==` drawn as one glyph.
+# JS evaluator returning the text nodes under root whose computed style still allows ligatures.
 _LIGATED_TEXT = """root => {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     const ligated = [];
