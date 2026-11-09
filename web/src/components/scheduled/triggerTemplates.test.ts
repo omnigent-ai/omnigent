@@ -9,6 +9,7 @@ import {
   emptyTriggerFields,
   githubReviewerQualifier,
   jiraAssignee,
+  parseGithubReviewer,
   isTriggerPrompt,
   readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
@@ -471,9 +472,16 @@ describe("change events", () => {
     const opened = withTriggerEvent("github", review, "pr");
     expect(opened.linkBack).toBe(true);
     expect(opened).not.toHaveProperty("target");
-    // A changed link-back choice survives switching events.
-    expect(withTriggerEvent("github", github({ linkBack: false }), "review").linkBack).toBe(false);
-    expect(withTriggerEvent("github", { ...review, linkBack: true }, "pr").linkBack).toBe(true);
+    // An explicit link-back choice survives switching events, even a round trip.
+    const unchecked = github({ linkBack: false, linkBackTouched: true });
+    const roundTrip = withTriggerEvent(
+      "github",
+      withTriggerEvent("github", unchecked, "review"),
+      "pr",
+    );
+    expect(roundTrip.linkBack).toBe(false);
+    const checked = { ...review, linkBack: true, linkBackTouched: true };
+    expect(withTriggerEvent("github", checked, "review").linkBack).toBe(true);
     expect(withTriggerEvent("github", { ...review, target: "alice" }, "review").target).toBe(
       "alice",
     );
@@ -492,6 +500,22 @@ describe("change events", () => {
     expect(triggerFieldsComplete(github({ event: "review", target: " " }), "github")).toBe(false);
     expect(triggerFieldsComplete(github({ event: "review", target: "me" }), "github")).toBe(true);
     expect(triggerFieldsComplete(fields({ event: "assigned", target: "" }), "jira")).toBe(true);
+  });
+
+  it.each([
+    ["me", true],
+    ["@octocat", true],
+    ["acme/release-team", true],
+    ["octo cat", false],
+    ["acme/a/b", false],
+    ['"octocat"', false],
+  ])("accepts %j as a GitHub reviewer: %s", (reviewer, valid) => {
+    expect(parseGithubReviewer(reviewer) !== null).toBe(valid);
+    expect(triggerFieldsComplete(github({ event: "review", target: reviewer }), "github")).toBe(
+      valid,
+    );
+    const filter = { field: "reviewer", operator: "is" as const, value: reviewer };
+    expect(triggerFieldsComplete(github({ conditions: [filter] }), "github")).toBe(valid);
   });
 
   it("describes when each event fires", () => {
@@ -688,6 +712,8 @@ describe("renderTriggerPrompt", () => {
   it("renders the Jira manager prompt with the JQL, placement, dedupe title and link", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
     expect(prompt).toContain("On the first run, use one hour ago and nothing pending.");
+    expect(prompt).not.toContain("CHANGED");
+    expect(prompt).not.toContain("Watching since:");
 
     // Only creation fires: an older ticket that's edited or starts matching later doesn't.
     expect(prompt).toContain(
@@ -1146,10 +1172,19 @@ describe("change-event prompts", () => {
     expect(prompt).toContain('title "GitHub <owner/repo>#<number> review <event id>"');
     expect(prompt).toContain("whether you started a session for an earlier review request");
     // Requests from before the automation existed never count.
+    // Requests from before activation never count, even inside the search overlap.
     expect(prompt).toContain(
-      "On the first run, use the current time, so changes made before this automation existed don't count",
+      'On the first run, use the current time as both the check time and the "Watching since:" time',
     );
+    expect(prompt).toContain(
+      'Then search from 5 minutes before the check time or from the "Watching since:" time, whichever is later',
+    );
+    expect(prompt).toContain('Above it, repeat the "Watching since: <time>" line unchanged.');
     expect(prompt).not.toContain("one hour ago");
+    // A queue past the search cap can't be read in full, so the run keeps its check time.
+    expect(prompt).toContain(
+      "if the queue reaches that, start no sessions in this run, keep the previous check time",
+    );
     expect(prompt).not.toContain("created:>=");
     expect(prompt).toContain(
       "the time the last review request you handled (started or skipped) before you stopped was requested",
@@ -1160,13 +1195,15 @@ describe("change-event prompts", () => {
     expect(review("acme/maintainers")).toContain(
       "Watch: review requests for team acme/maintainers on GitHub pull requests",
     );
-    expect(review("acme/maintainers")).toContain('whose requested_team slug is "maintainers"');
+    expect(review("acme/maintainers")).toContain(
+      'whose requested_team slug is "maintainers", ignoring case',
+    );
     expect(review("octocat")).toContain(
       'whose requested_reviewer login is "octocat", ignoring case',
     );
   });
 
-  it("finds Jira assignee changes in a bounded window and rechecks earlier sessions", () => {
+  it("finds Jira assignee changes and rechecks earlier sessions after their search time", () => {
     const prompt = renderTriggerPrompt(
       "jira",
       fields({ event: "assigned", target: "me", conditions: [] }),
@@ -1176,30 +1213,29 @@ describe("change-event prompts", () => {
       "starts one Omnigent session for each ticket assigned to you that matches.",
     );
     expect(prompt).toContain(
-      'search for (project = "ES" AND assignee = currentUser()) AND assignee CHANGED TO currentUser() DURING ("-<A>m", "-<B>m"), through every page, where A and B are the whole minutes from that time and from the time you noted until now.',
+      'search for (project = "ES" AND assignee = currentUser()) AND assignee CHANGED TO currentUser() AFTER "-<A>m", through every page, where A is the whole minutes from that time until now, rounded up.',
     );
     // Day offsets snap to calendar days and malformed times silently match nothing.
     expect(prompt).toContain(
-      'Write both as minute offsets such as "-95m" and "-0m", never days, hours or dates',
+      'Write it as a minute offset such as "-95m", never days, hours or dates',
     );
-    expect(prompt).toContain("The window's end already leaves out later assignments");
-    expect(prompt).toContain('title "Jira <ticket key> assigned <the time you noted>"');
+    // The title's time is after every assignment the search found, so a recheck never repeats one.
     expect(prompt).toContain(
-      'search for key = <ticket key> AND assignee CHANGED TO currentUser() AFTER "-<C>m", where C is the whole minutes from that title\'s time until now, rounded down.',
+      "note its search time: the current UTC time rounded up to the next whole minute.",
     );
-    expect(prompt).toContain("If that finds the ticket, it was assigned again since: handle it.");
-    expect(prompt).toContain("On the first run, use the current time");
+    expect(prompt).toContain('title "Jira <ticket key> assigned <search time>"');
+    expect(prompt).toContain(
+      "the ticket counts again only if its latest matching assignee change is after that time",
+    );
+    expect(prompt).toContain(
+      'Otherwise search for key = <ticket key> AND assignee CHANGED TO currentUser() AFTER "-<C>m", where C is the whole minutes from that time until now, rounded down',
+    );
+    expect(prompt).toContain("Rounding down never repeats an assignment");
+    expect(prompt).toContain("rely on your earlier replies for archived ones");
+    expect(prompt).toContain('or from the "Watching since:" time, whichever is later');
     expect(prompt).toContain(
       "handled every match; otherwise the previous check time, and say why you stopped.",
     );
     expect(prompt).not.toContain("created >=");
-  });
-
-  it("keeps creation-event prompts on their creation search", () => {
-    const prompt = renderTriggerPrompt("jira", fields(), CTX);
-    expect(prompt).toContain("for each newly created ticket that matches");
-    expect(prompt).toContain("On the first run, use one hour ago");
-    expect(prompt).toContain("AND created >= <that time> ORDER BY created ASC");
-    expect(prompt).not.toContain("CHANGED");
   });
 });

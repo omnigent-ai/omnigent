@@ -3729,6 +3729,14 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(
       screen.getByRole("checkbox", { name: "Comment the session link on it" }),
     ).not.toBeChecked();
+    // Unchecking on an opened event survives a round trip through Review requested.
+    const linkBack = () => screen.getByRole("checkbox", { name: "Comment the session link on it" });
+    pick("task-trigger-event", "task-trigger-event-pr");
+    fireEvent.click(linkBack());
+    pick("task-trigger-event", "task-trigger-event-review");
+    pick("task-trigger-event", "task-trigger-event-pr");
+    expect(linkBack()).not.toBeChecked();
+    pick("task-trigger-event", "task-trigger-event-review");
     // Assignee and the opened-only Reviewer filter don't apply to the queue.
     fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
     fireEvent.keyDown(screen.getByTestId("task-trigger-condition-0-field"), { key: "Enter" });
@@ -3740,6 +3748,9 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     type("task-trigger-scope", "acme/app");
     type("task-trigger-instructions", "Review the pull request.");
     type("task-trigger-target", " ");
+    expect(screen.getByTestId("task-trigger-target-hint")).toBeVisible();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    type("task-trigger-target", "octo cat");
     expect(screen.getByTestId("task-trigger-target-hint")).toBeVisible();
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
     type("task-trigger-target", "me");
@@ -3784,7 +3795,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.queryByTestId("task-trigger-target-hint")).toBeNull();
     const prompt = await submittedPrompt();
     expect(prompt).toContain(
-      '(project = "ES" AND assignee is not EMPTY) AND assignee CHANGED DURING ("-<A>m", "-<B>m")',
+      '(project = "ES" AND assignee is not EMPTY) AND assignee CHANGED AFTER "-<A>m"',
     );
   });
 

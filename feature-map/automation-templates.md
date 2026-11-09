@@ -28,7 +28,8 @@ to customize.
 - `change-events`: GitHub **Review requested from [reviewer]** (me, a username, or
   `org/team`; required) fires on each request or re-request on open, non-draft pull
   requests, and Jira **Assignee changed to [assignee]** (empty means anyone) fires on
-  each assignment. Both skip changes made before the automation existed, show their own
+  each assignment. Both skip changes made before the automation existed (a "Watching
+  since" line, kept in every reply, bounds the search overlap), show their own
   help text, and hide the Assignee condition; review requests start with link-back off.
   Pull request opened gains an optional Reviewer filter with a hint that it only sees
   reviewers requested before the first check after opening.
@@ -92,8 +93,9 @@ to customize.
   show polling cadence instead of schedule controls, Run now, or next-run times.
   New templates use `automation_trigger_poll_minutes` from the server (10–240 minutes,
   default 10), otherwise hourly when the requested cadence is unsupported; saved
-  schedules are preserved. The initial search covers at least one polling interval
-  or one hour, whichever is longer, plus the indexing overlap. Both row-menu and detail-page editing keep schedule
+  schedules are preserved. For creation events, the initial search covers at least one polling interval
+  or one hour, whichever is longer, plus the indexing overlap; change events start from a
+  recorded "Watching since" time and never search before it. Both row-menu and detail-page editing keep schedule
   controls hidden, including while customizing the system prompt. Unsupported
   polling offers an explicit Use server default action without exposing schedule
   fields or changing session mode.

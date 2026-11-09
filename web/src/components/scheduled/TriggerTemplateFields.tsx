@@ -30,6 +30,7 @@ import {
   triggerScope,
   triggerScopeEntries,
   triggerScopeOperators,
+  triggerTargetValid,
   triggerServiceName,
   VALUELESS_OPERATORS,
   withTriggerEvent,
@@ -69,7 +70,7 @@ export function TriggerTemplateFields({
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
   const { authorAction, target } = triggerEvent(source, fields.event);
-  const targetMissing = target?.required === true && (fields.target ?? "").trim() === "";
+  const targetInvalid = !triggerTargetValid(fields, source);
   // Reviewers added after the pull request opens never match the opened event.
   const reviewerOnOpen =
     source === "github" &&
@@ -205,7 +206,7 @@ export function TriggerTemplateFields({
             </span>
           </div>
 
-          {targetMissing && target && (
+          {targetInvalid && target && (
             <p
               className="pl-6 text-sm text-muted-foreground"
               data-testid="task-trigger-target-hint"
@@ -370,7 +371,9 @@ export function TriggerTemplateFields({
           <Checkbox
             id="task-trigger-link-back"
             checked={fields.linkBack}
-            onCheckedChange={(checked) => onChange({ ...fields, linkBack: checked === true })}
+            onCheckedChange={(checked) =>
+              onChange({ ...fields, linkBack: checked === true, linkBackTouched: true })
+            }
             data-testid="task-trigger-link-back"
             componentId="tasks.scheduled.trigger_link_back"
           />
