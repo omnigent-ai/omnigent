@@ -110,7 +110,7 @@
   --color-primary-cta: var(--primary-cta);
   --color-link: var(--link);
   --color-popover-foreground: var(--popover-foreground);
-  --color-popover: var(--overlay-surface-bg, var(--popover));
+  --color-popover: var(--popover);
   --color-card-foreground: var(--card-foreground);
   --color-card: var(--card);
   /* Opaque form of --card, for card surfaces that must fully hide
@@ -298,8 +298,7 @@
   --composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white);
   --primary-cta: #e8ecf0;
   --primary-cta-foreground: #11171c;
-  /* Dialogs and menus share a raised variant of the app background. */
-  --overlay-surface-bg: var(--composer-surface-bg);
+  --menu-surface-bg: var(--composer-surface-bg);
   --card-surface-bg: color-mix(
     in srgb,
     color-mix(in srgb, var(--card) 95%, white) 75%,
@@ -1222,10 +1221,6 @@ aside[aria-label="Workspace"][data-maximized] {
   pointer-events: none !important;
 }
 
-.dark [data-slot="dialog-content"] {
-  border: 1px solid var(--menu-surface-border);
-}
-
 /* Popovers/menus — same glass treatment */
 .dark [data-slot="popover-content"],
 .dark [data-slot="select-content"]:not(.menu-surface),
@@ -1238,12 +1233,12 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 
 :root:not(.dark) .menu-surface {
-  background-color: var(--popover);
+  background-color: #fff;
   border: 1px solid rgb(0 0 0 / 8%);
 }
 
 .dark .menu-surface {
-  background-color: var(--overlay-surface-bg);
+  background-color: var(--menu-surface-bg);
   border: 1px solid var(--menu-surface-border);
   -webkit-backdrop-filter: var(--menu-surface-backdrop-filter);
   backdrop-filter: var(--menu-surface-backdrop-filter);
@@ -1264,10 +1259,6 @@ aside[aria-label="Workspace"][data-maximized] {
   .mobile-menu-glass [data-slot="command"] {
     background: transparent;
   }
-
-  .dark .mobile-menu-glass-layer .omni-glass-surface {
-    --omni-glass-background: var(--overlay-surface-bg);
-  }
 }
 
 /* Native clearance uses window pixels, independent of rem and page zoom.
@@ -1276,6 +1267,11 @@ aside[aria-label="Workspace"][data-maximized] {
 html[data-electron-mac] {
   --mac-titlebar-height: calc(48px / var(--omnigent-electron-zoom, 1));
   --mac-traffic-light-width: calc(88px / var(--omnigent-electron-zoom, 1));
+  /* The lights plus the collapsed cluster: four 1.5rem icons with 0.25rem gaps. */
+  --mac-header-actions-clearance: calc(var(--mac-traffic-light-width) + 6.75rem);
+}
+html[data-electron-mac][data-electron-full-screen] {
+  --mac-traffic-light-width: 12px;
 }
 @media (min-width: 48rem) {
   /* Reserve the board's shared sidebar toggle only while navigation is closed. */
@@ -1297,7 +1293,7 @@ html[data-electron-mac] {
     margin-top: 0;
   }
   /* Hide the standard cluster: Search gets its own copy beside the wordmark,
-   * while Settings and the toggle render in AppShell's persistent title bar. */
+   * while the toggle and Back/Forward render in AppShell's persistent title bar. */
   html[data-electron-mac] .conversations-sidebar [data-testid="sidebar-header-actions"] {
     display: none;
   }
@@ -1358,17 +1354,28 @@ html[data-electron-mac] .electron-sidebar-header-actions {
   z-index: 51;
   display: flex;
   align-items: center;
-
-  /* Read Toggle · Search · Settings outward from the window controls when
-   * collapsed (Search is absent here while the sidebar is open). */
-  & > * > *:last-child {
-    order: -1;
-  }
+}
+/* Keep Collapse beside the traffic lights while the sidebar is open, and dock
+ * the Back/Forward pair at its right edge. */
+html[data-electron-mac] .app-shell[data-sidebar-open] .electron-sidebar-header-actions {
+  right: calc(100% - var(--app-sidebar-width) + 0.75rem);
+}
+html[data-electron-mac]
+  .app-shell[data-sidebar-open]
+  .electron-sidebar-header-actions
+  > [data-testid="sidebar-header-actions"] {
+  width: 100%;
+}
+html[data-electron-mac]
+  .app-shell[data-sidebar-open]
+  .electron-sidebar-header-actions
+  [data-testid="history-navigation-buttons"] {
+  margin-left: auto;
 }
 /* Clear the fixed native-control area plus the font-relative action cluster
  * when the collapsed sidebar exposes the chat header at the window edge. */
 html[data-electron-mac] .traffic-light-clearance {
-  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
+  padding-left: var(--mac-header-actions-clearance);
 }
 /* A maximized rail reaches the same window corner while the sidebar is closed.
  * Once the sidebar opens, the rail starts to its right and needs no clearance. */
@@ -1376,7 +1383,7 @@ html[data-electron-mac]
   .app-shell:not([data-sidebar-open])
   aside[aria-label="Workspace"][data-maximized]
   .workspace-tab-strip {
-  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
+  padding-left: var(--mac-header-actions-clearance);
 }
 /* Below md the phone header and drawer carry their own controls, so drop the
  * title-bar cluster and start those headers right of the lights. */
@@ -1844,7 +1851,8 @@ html[data-electron-mac] .breadcrumb-folder {
 /* Fallback mono fonts (e.g. JetBrains Mono) ship ligatures that can visually
  * swallow spaces in CLI flags like `-c --markdown`; code must render literally. */
 [data-streamdown="inline-code"],
-[data-streamdown="code-block-body"] {
+[data-streamdown="code-block-body"],
+.literal-code {
   font-variant-ligatures: none;
   font-feature-settings:
     "liga" 0,

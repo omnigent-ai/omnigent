@@ -1,8 +1,18 @@
-import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  HomeIcon,
+  PanelLeftOpenIcon,
+  PanelRightOpenIcon,
+  SearchIcon,
+  SettingsIcon,
+} from "lucide-react";
 
 import {
   ARIA_MOD_KEY,
+  BACK_KEYS,
   COMMAND_PALETTE_KEYS,
+  FORWARD_KEYS,
   settingsAriaShortcut,
   settingsShortcutKeys,
   sidebarToggleAriaShortcut,
@@ -11,13 +21,17 @@ import {
 import { Button } from "@/components/ui/button";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  requestHistoryNavigation,
+  useHistoryNavigationAvailability,
+} from "@/hooks/useHistoryNavigation";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { MobileHeaderButton } from "./MobileHeaderButton";
 
 /**
- * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
+ * Navigation, Search, Settings, and sidebar-toggle controls from the header row.
  *
  * Extracted so it can render in TWO places without duplicating the markup:
  * inside the sidebar (every browser and non-mac platform, and the macOS shell
@@ -27,7 +41,8 @@ import { MobileHeaderButton } from "./MobileHeaderButton";
  * `inert`, so a cluster living inside it would be clipped and unclickable, and
  * while peeking the card floats at `inset-2` and drags the cluster off the
  * traffic lights' centre line. Hoisting it out of the sidebar is what keeps the
- * three icons in one fixed place across open, collapsed, and peeking.
+ * available header actions in one fixed place across open, collapsed, and
+ * peeking. Current native shells move Settings to the profile footer.
  *
  * Only the toggle's meaning changes with state: it collapses an open sidebar and
  * opens a closed or peeking one, so the caller passes `expanded` and the icon
@@ -39,9 +54,11 @@ export function SidebarHeaderActions({
   onOpenSearch,
   showSearch = true,
   onSettingsClick,
+  showSettings = true,
   onTogglePointerEnter,
   onTogglePointerDown,
   onTogglePointerLeave,
+  showMobileToggle = false,
 }: {
   /**
    * Whether the sidebar currently reads as open — `open || peek`. Drives the
@@ -60,6 +77,8 @@ export function SidebarHeaderActions({
    * list); navigation itself is the Link's job.
    */
   onSettingsClick?: () => void;
+  /** Whether Settings lives in this cluster instead of the native-shell footer. */
+  showSettings?: boolean;
   /**
    * Dwell-to-peek hooks for the toggle. On the macOS shell this cluster replaces
    * ChatHeader's collapsed-state button, which is where peek used to be armed,
@@ -68,11 +87,14 @@ export function SidebarHeaderActions({
   onTogglePointerEnter?: () => void;
   onTogglePointerDown?: () => void;
   onTogglePointerLeave?: () => void;
+  /** Keep the toggle below md, where the layout has no tap-to-dismiss strip. */
+  showMobileToggle?: boolean;
 }) {
+  const { canGoBack, canGoForward } = useHistoryNavigationAvailability();
+  const hasNavigationHistory = canGoBack || canGoForward;
+
   return (
     <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
-      {showSearch && <SidebarSearchButton onOpenSearch={onOpenSearch} />}
-      <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -89,7 +111,10 @@ export function SidebarHeaderActions({
             // that leaves a strip of the chat visible, and tapping that strip
             // is how you get back — a collapse icon would be a second, worse
             // way to do the same thing.
-            className="size-6 text-muted-foreground hover:text-foreground max-md:hidden"
+            className={cn(
+              "size-6 text-muted-foreground hover:text-foreground",
+              !showMobileToggle && "max-md:hidden",
+            )}
           >
             {/* panel-right-open reads as "push the panel away" while the sidebar
             is open; panel-left-open as "bring it back" once it is collapsed or
@@ -105,6 +130,53 @@ export function SidebarHeaderActions({
           <span>{expanded ? "Collapse sidebar" : "Open sidebar"}</span>
         </TooltipContent>
       </Tooltip>
+      {showSettings && (
+        <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
+      )}
+      {showSearch && <SidebarSearchButton onOpenSearch={onOpenSearch} />}
+      <div
+        className={cn("flex items-center gap-1 max-md:hidden", !hasNavigationHistory && "hidden")}
+        data-testid="history-navigation-buttons"
+      >
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Back"
+              aria-keyshortcuts={`${ARIA_MOD_KEY}+[`}
+              disabled={!canGoBack}
+              className="size-6 text-muted-foreground hover:text-foreground"
+              onClick={() => requestHistoryNavigation(-1)}
+            >
+              <ArrowLeftIcon className="size-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" shortcut={BACK_KEYS}>
+            <span>Back</span>
+          </TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Forward"
+              aria-keyshortcuts={`${ARIA_MOD_KEY}+]`}
+              disabled={!canGoForward}
+              className="size-6 text-muted-foreground hover:text-foreground"
+              onClick={() => requestHistoryNavigation(1)}
+            >
+              <ArrowRightIcon className="size-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" shortcut={FORWARD_KEYS}>
+            <span>Forward</span>
+          </TooltipContent>
+        </Tooltip>
+      </div>
     </div>
   );
 }
@@ -172,13 +244,21 @@ export function SidebarSettingsButton({
   onSettingsClick,
   className,
   testId = "settings-button",
+  to = "/settings",
+  label = "Settings",
 }: {
   onSettingsClick?: () => void;
   className?: string;
   /** Distinguishes the header-row copy from the mobile floating copy. */
   testId?: string;
+  /** Destination and accessible action name; the profile-footer copy toggles back home. */
+  to?: string;
+  label?: string;
 }) {
   const isMobile = useIsMobileViewport();
+  // The Settings hotkey always opens Settings, so only that destination shows it.
+  const opensSettings = to === "/settings";
+  const Icon = opensSettings ? SettingsIcon : HomeIcon;
   return (
     <Tooltip delayDuration={750}>
       <TooltipTrigger asChild>
@@ -186,18 +266,18 @@ export function SidebarSettingsButton({
           asChild
           variant="ghost"
           size="icon-xs"
-          aria-label="Settings"
-          aria-keyshortcuts={settingsAriaShortcut()}
+          aria-label={label}
+          aria-keyshortcuts={opensSettings ? settingsAriaShortcut() : undefined}
           className={cn(SIDEBAR_FLOAT_BUTTON, "rounded-[8px] bg-transparent", className)}
         >
-          <Link to="/settings" onClick={onSettingsClick} data-testid={testId}>
-            <SettingsIcon className={cn(SIDEBAR_FLOAT_ICON, isMobile && "relative z-10")} />
+          <Link to={to} onClick={onSettingsClick} data-testid={testId}>
+            <Icon className={cn(SIDEBAR_FLOAT_ICON, isMobile && "relative z-10")} />
             {isMobile && <OmniGlassSurface width={44} height={44} borderRadius={22} />}
           </Link>
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" shortcut={settingsShortcutKeys()}>
-        <span>Settings</span>
+      <TooltipContent side="bottom" shortcut={opensSettings ? settingsShortcutKeys() : undefined}>
+        <span>{label}</span>
       </TooltipContent>
     </Tooltip>
   );
