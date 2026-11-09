@@ -1,15 +1,29 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useProactiveAgents, useSetProactiveAgents } from "@/hooks/useProactiveAgents";
 import { useSharing, useSetSharing } from "@/hooks/useSharing";
 import { AdminGeneralPage } from "./AdminGeneralPage";
 
-const mocks = vi.hoisted(() => ({ isAdmin: true, singleUser: false, nestedAgents: true }));
+const mocks = vi.hoisted(() => ({
+  isAdmin: true,
+  singleUser: false,
+  nestedAgents: true,
+  proactive: false,
+}));
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => mocks.isAdmin }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ single_user: mocks.singleUser, sibling_sessions: mocks.nestedAgents }),
+  useServerInfo: () => ({
+    single_user: mocks.singleUser,
+    sibling_sessions: mocks.nestedAgents,
+    features: { proactive_agent: mocks.proactive },
+  }),
 }));
 vi.mock("@/hooks/useSharing", () => ({ useSharing: vi.fn(), useSetSharing: vi.fn() }));
+vi.mock("@/hooks/useProactiveAgents", () => ({
+  useProactiveAgents: vi.fn(),
+  useSetProactiveAgents: vi.fn(),
+}));
 const mutate = vi.fn();
 
 function renderPage() {
@@ -25,6 +39,7 @@ beforeEach(() => {
   mocks.isAdmin = true;
   mocks.singleUser = false;
   mocks.nestedAgents = true;
+  mocks.proactive = false;
   vi.mocked(useSharing).mockReturnValue({
     data: {
       sibling_session_destinations: "any_host",
@@ -37,6 +52,14 @@ beforeEach(() => {
     },
   } as never);
   vi.mocked(useSetSharing).mockReturnValue({ mutate, isPending: false } as never);
+  vi.mocked(useProactiveAgents).mockReturnValue({
+    data: {
+      enabled: false,
+      editable: true,
+      agents: [{ name: "proactive", label: "Inbox suggestions", description: "d", enabled: true }],
+    },
+  } as never);
+  vi.mocked(useSetProactiveAgents).mockReturnValue({ mutate, isPending: false } as never);
 });
 afterEach(cleanup);
 
@@ -97,5 +120,25 @@ describe("AdminGeneralPage", () => {
     expect(screen.queryByRole("option", { name: /Current host or new sandbox/ })).toBeNull();
     fireEvent.click(await screen.findByRole("option", { name: /Current host only/ }));
     expect(screen.getByRole("alert")).toHaveTextContent("Save failed");
+  });
+
+  it("turns the proactive agent on without the nesting feature", () => {
+    mocks.nestedAgents = false;
+    mocks.proactive = true;
+    renderPage();
+    expect(screen.queryByRole("combobox", { name: "Nested agent destinations" })).toBeNull();
+    const toggle = screen.getByRole("switch", { name: "Inbox suggestions" });
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    expect(mutate).toHaveBeenCalledWith(
+      { enabled: true, agents: { proactive: true } },
+      expect.anything(),
+    );
+  });
+
+  it("hides the proactive section without the feature", () => {
+    renderPage();
+    expect(screen.queryByRole("switch", { name: "Inbox suggestions" })).toBeNull();
+    expect(useProactiveAgents).not.toHaveBeenCalled();
   });
 });

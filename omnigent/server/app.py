@@ -68,6 +68,7 @@ from omnigent.harness_plugins import (
 )
 from omnigent.host.launch_audit import request_client_audit_attributes
 from omnigent.resources import examples as _examples_resources
+from omnigent.resources import proactive as _proactive_resources
 from omnigent.runtime import (
     get_terminal_registry,
     pending_elicitations,
@@ -117,6 +118,12 @@ from omnigent.server.performance_metrics import (
     set_request_user_agent_for_access_log,
 )
 from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
+from omnigent.server.proactive_agent import (
+    PROACTIVE_AGENT_NAME,
+    FileProactiveAgentSettings,
+    ProactiveAgentSettings,
+    ProactiveProvisioner,
+)
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -128,6 +135,7 @@ from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.inbox_items import create_inbox_items_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
+from omnigent.server.routes.proactive_agents import create_proactive_agents_router
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
@@ -683,6 +691,7 @@ def _error_audit_extra(
 # Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
+_PROACTIVE_BUNDLE_SOURCE = Path(_proactive_resources.__file__).parent
 
 
 class _FastAPICallNext(Protocol):
@@ -1104,7 +1113,8 @@ def _ensure_default_agents(
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
-    :returns: Packaged built-in names to hide from ``GET /v1/agents``.
+    :returns: Packaged built-in names to hide from ``GET /v1/agents``, always
+        including the proactive agent.
     """
     allowlist = seeded_agent_allowlist()
     packaged = (
@@ -1114,8 +1124,11 @@ def _ensure_default_agents(
         | _ensure_default_polly_agent(agent_store, artifact_store, agent_cache, allowlist)
     )
     extras = _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
+    _ensure_default_proactive_agent(agent_store, artifact_store, agent_cache)
+    # Only its hidden scheduled tasks start the proactive agent.
+    always_hidden = frozenset({PROACTIVE_AGENT_NAME}) - extras
     if allowlist is None:
-        return frozenset()
+        return always_hidden
     unknown = allowlist - packaged
     if unknown:
         _logger.warning(
@@ -1134,7 +1147,7 @@ def _ensure_default_agents(
             SEEDED_AGENTS_ENV,
             ", ".join(sorted(suppressed)),
         )
-    return suppressed
+    return suppressed | always_hidden
 
 
 # Env var listing extra built-in agent specs to seed at startup, in addition
@@ -1496,6 +1509,32 @@ def _ensure_default_debby_agent(
     return owned
 
 
+def _ensure_default_proactive_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """Register the built-in proactive agent, which only hidden scheduled tasks run.
+
+    Always seeded, so a task created while the agent was enabled still finds
+    it; always hidden from the picker (see :func:`_ensure_default_agents`).
+    """
+    import tempfile
+
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_dir = materialize_bundle(_PROACTIVE_BUNDLE_SOURCE, Path(tmpdir) / "bundle")
+        bundle_bytes = _tar_gz_dir(bundle_dir)
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=PROACTIVE_AGENT_NAME,
+        bundle_bytes=bundle_bytes,
+    )
+
+
 def _build_polly_bundle() -> bytes:
     """
     Build a gzipped tarball of the ``examples/polly`` agent bundle.
@@ -1574,6 +1613,7 @@ def create_app(
     runner_tunnel_tokens: frozenset[str] | None = None,
     comment_store: CommentStore | None = None,
     inbox_item_store: InboxItemStore | None = None,
+    proactive_agent_settings: ProactiveAgentSettings | None = None,
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
@@ -1643,6 +1683,8 @@ def create_app(
     :param inbox_item_store: Store for agent-posted Inbox items. The Inbox
         item routes are served only with this store and the
         ``proactive_agent`` feature on.
+    :param proactive_agent_settings: Where the admin's proactive-agent settings
+        live. ``None`` stores them in a file in the server data dir.
     :param policy_store: Store for server-persisted policies
         (session-scoped and server-wide defaults). ``None``
         disables both the session policy and default policy
@@ -2360,6 +2402,13 @@ def create_app(
 
     app.state.automations_available = automations_available
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
+    app.state.scheduled_task_store = scheduled_task_store
+    app.state.proactive_agent_settings = (
+        proactive_agent_settings
+        if proactive_agent_settings is not None
+        else FileProactiveAgentSettings()
+    )
+    app.state.proactive_provisioner = ProactiveProvisioner()
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
@@ -4039,6 +4088,16 @@ def create_app(
         prefix="/v1",
         tags=["sharing"],
     )
+    if resolved_feature_flags.enabled(Feature.PROACTIVE_AGENT):
+        app.include_router(
+            create_proactive_agents_router(
+                app.state.proactive_agent_settings,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["proactive_agents"],
+        )
     # First-class projects (owner-private session containers). Mounted only
     # when a project store is wired; the endpoints self-scope to the caller.
     if project_store is not None:

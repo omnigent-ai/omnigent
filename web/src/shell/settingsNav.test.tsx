@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   agentInstall: false,
   enabledConnections: [] as string[],
   nestedAgents: false,
+  proactiveAgent: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -35,6 +36,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     single_user: mocks.singleUser,
     features: {
       custom_agents_settings_ui: mocks.customAgentsEnabled,
+      proactive_agent: mocks.proactiveAgent,
     },
     agent_install: mocks.agentInstall,
     enabled_connections: mocks.enabledConnections,
@@ -76,6 +78,7 @@ beforeEach(() => {
   mocks.agentInstall = false;
   mocks.enabledConnections = [];
   mocks.nestedAgents = false;
+  mocks.proactiveAgent = false;
 });
 afterEach(cleanup);
 
@@ -386,6 +389,11 @@ describe("useSettingsRoute", () => {
       inSettings: true,
       section: enabled ? "admin" : "general",
     });
+  });
+
+  it("opens the admin general route for proactive agents without nesting", () => {
+    mocks.proactiveAgent = true;
+    expect(routeHook("/settings/admin")).toEqual({ inSettings: true, section: "admin" });
   });
 
   it("treats /settings/members and /settings/policies as in-settings sections on an accounts deploy", () => {

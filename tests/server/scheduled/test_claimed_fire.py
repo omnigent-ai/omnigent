@@ -14,6 +14,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -104,7 +105,9 @@ class _Claimed:
     clock: FakeClock
 
 
-def _claim(store: SqlAlchemyScheduledTaskStore, **kwargs: Any) -> _Claimed:
+def _claim(
+    store: SqlAlchemyScheduledTaskStore, *, agent_id: str = _AGENT_ID, **kwargs: Any
+) -> _Claimed:
     """Create a due task and claim its first occurrence, as the scheduler's poll would."""
     kwargs.setdefault("workspace", "/repo")
     kwargs.setdefault("host_id", _HOST_ID)
@@ -114,7 +117,7 @@ def _claim(store: SqlAlchemyScheduledTaskStore, **kwargs: Any) -> _Claimed:
         "do the thing",
         "FREQ=HOURLY",
         None,
-        _AGENT_ID,
+        agent_id,
         "UTC",
         **kwargs,
     )
@@ -683,6 +686,34 @@ async def test_unsupported_target_skips_the_claimed_run(store) -> None:
 
     [run] = _runs(store, claimed.task)
     assert (run.status, run.error_code) == ("skipped", "unsupported_target")
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("agent_enabled", [False, True], ids=["turned-off", "not-shipped"])
+async def test_proactive_task_skips_when_its_agent_cannot_run(
+    store, tmp_path: Path, agent_enabled: bool
+) -> None:
+    from omnigent.server.feature_flags import resolve_feature_flags
+    from omnigent.server.proactive_agent import (
+        PROACTIVE_AGENT_ID,
+        FileProactiveAgentSettings,
+        ProactiveAgentState,
+    )
+
+    claimed = _claim(store, agent_id=PROACTIVE_AGENT_ID)
+    settings = FileProactiveAgentSettings(tmp_path / "proactive_agents")
+    settings.write(ProactiveAgentState(enabled=agent_enabled))
+    deps = _deps(store)
+    deps.app_state = SimpleNamespace(
+        feature_flags=resolve_feature_flags({"OMNIGENT_FEATURES": "proactive_agent"}),
+        proactive_agent_settings=settings,
+    )
+    dispatch = AsyncMock()
+
+    await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)
+
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("skipped", "proactive_agent_off")
     dispatch.assert_not_awaited()
 
 

@@ -34,6 +34,7 @@ from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
+from omnigent.server.proactive_agent import PROACTIVE_AGENT_IDS, is_proactive_task
 from omnigent.server.routes._agent_origin import require_agent_origin
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
@@ -499,9 +500,16 @@ def create_scheduled_tasks_router(
         enumerable across users.
         """
         task = store.get(scheduled_task_id)
-        if task is None or not _owns_task(task, owner):
+        # Proactive tasks are framework-owned and never shown to their owner.
+        if task is None or is_proactive_task(task) or not _owns_task(task, owner):
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
+
+    def _reject_proactive_agent(agent_id: str | None) -> None:
+        if agent_id in PROACTIVE_AGENT_IDS:
+            raise OmnigentError(
+                "This agent runs only on its built-in schedule", code=ErrorCode.INVALID_INPUT
+            )
 
     async def _require_continuable(request: Request, task: ScheduledTask) -> Conversation:
         """Return a picked session *task* can continue; reject it otherwise, hiding one
@@ -564,6 +572,7 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
+        _reject_proactive_agent(body.agent_id)
         await _validate_rrule_or_400(body.rrule, body.session_mode, body.execution_target)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
@@ -679,7 +688,11 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
+        tasks = [
+            t
+            for t in store.list(owner_user_id=owner_id, exclude_agent_ids=PROACTIVE_AGENT_IDS)
+            if _owns_task(t, owner_id)
+        ]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
         # Force-fail stale orphans FIRST so the completion badge below reports a
@@ -723,6 +736,7 @@ def create_scheduled_tasks_router(
             check_generation=current_account_user() is not None,
             after=cursor,
             limit=limit,
+            exclude_agent_ids=PROACTIVE_AGENT_IDS,
         )
         return AutomationFailurePage(
             data=failures,
@@ -906,6 +920,7 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
+        _reject_proactive_agent(body.agent_id)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
         legacy_workspace = (

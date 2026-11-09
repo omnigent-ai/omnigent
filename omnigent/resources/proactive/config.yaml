@@ -1,0 +1,79 @@
+# The proactive agent: a built-in agent the server runs on a schedule for each
+# user, when an admin turns it on. It reads the user's recent sessions and posts
+# a few suggestions to their Inbox. It never changes code.
+spec_version: 1
+name: proactive
+description: >-
+  Reads your recent sessions and posts follow-ups, related information, and
+  reminders to your Inbox.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+# Only the Inbox tools are opted in; every other framework tool group the agent
+# does not need is off. The session discovery tools (sys_session_list,
+# sys_session_get_history, sys_session_get_info) are always registered and are
+# limited server-side to sessions the user can see.
+tool_groups:
+  user_inbox: true
+  browser: false
+  scheduled_tasks: false
+  comments: false
+  policies: false
+  agent_discovery: false
+
+async: false
+
+# Shell and file reads for tools such as `gh` and `git`; writes are denied and
+# risky shell commands are blocked rather than asked about, since nobody is
+# watching a scheduled run to answer a prompt.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+guardrails:
+  policies:
+    report_only:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.builtins.orchestration.read_only_os
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.builtins.orchestration.blast_radius
+        arguments:
+          gate_pushes: true
+          risky_action: DENY
+
+prompt: |
+  You are the user's proactive assistant. You run on a schedule, without the
+  user watching, and your only output is a few suggestions in their Inbox.
+
+  1. Call `sys_user_inbox_list` first. It shows what you already posted in the
+     last 30 days and how the user responded. Never post anything the user
+     already has, including items they dismissed or rated not useful. Reuse an
+     existing item's `topic` when you write about the same subject.
+  2. Use `sys_session_list` and `sys_session_get_history` to see what the user
+     worked on recently. You may use the shell to read pull requests or
+     repository state with tools such as `gh` and `git` when they are available.
+  3. Post at most three items with `sys_user_inbox_post`, and only ones the
+     user would want:
+     - `followup`: a next step the user is likely to need, such as checking a
+       change after it merged.
+     - `info`: a discussion, change, or result related to their recent work.
+     - `reminder`: something to raise or send, with `expires_at` when it is
+       tied to a date.
+     Put the thing the item is about first in `links`, keep the title to one
+     line, and explain why in the body. Add a `suggested_prompt` when a new
+     session could act on the item.
+  4. If nothing is worth the user's attention, post nothing. Fewer, better
+     items are the goal.
+
+  You are read-only: do not edit files, push, or open pull requests. End with
+  a one-line summary of what you posted.

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
+import { SettingsLabel } from "@/components/SettingsLabel";
 import {
   Select,
   SelectContent,
@@ -8,10 +9,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
+import { useProactiveAgents, useSetProactiveAgents } from "@/hooks/useProactiveAgents";
 import { useSharing, useSetSharing } from "@/hooks/useSharing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode, type SiblingSessionDestinations } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  isSingleUserMode,
+  type SiblingSessionDestinations,
+} from "@/lib/capabilities";
 
 const AGENT_DESTINATIONS: {
   id: SiblingSessionDestinations;
@@ -41,6 +48,7 @@ export function AdminGeneralPage() {
   const isAdmin = useIsAdmin();
   const canManage = isSingleUserMode(info) || isAdmin;
   const nestedAgentsEnabled = info !== "loading" && info.sibling_sessions === true;
+  const proactiveEnabled = isFeatureEnabled(info, "proactive_agent");
   const {
     data: sharing,
     error: sharingError,
@@ -65,7 +73,7 @@ export function AdminGeneralPage() {
     );
   }
 
-  if (!nestedAgentsEnabled) return null;
+  if (!nestedAgentsEnabled && !proactiveEnabled) return null;
   return (
     <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <h1 className="settings-page-title text-2xl font-medium">Admin settings</h1>
@@ -77,7 +85,7 @@ export function AdminGeneralPage() {
       ) : (
         <>
           {isLoading && <p className="text-ui text-muted-foreground">Loading...</p>}
-          {sharing && (
+          {nestedAgentsEnabled && sharing && (
             <SettingsGroup
               title="Nested agent destinations"
               testId="settings-group-agent-destinations"
@@ -134,8 +142,71 @@ export function AdminGeneralPage() {
               {destinationError ?? sharingError?.message}
             </div>
           )}
+          {proactiveEnabled && <ProactiveAgentsSection />}
         </>
       )}
     </PageScroll>
+  );
+}
+
+/** Turns the built-in proactive agents on or off for every user. */
+function ProactiveAgentsSection() {
+  const { data, error } = useProactiveAgents();
+  const setProactive = useSetProactiveAgents();
+  const [saveError, setSaveError] = useState<string | null>(null);
+  if (!data) {
+    return error ? (
+      <p role="alert" className="mt-6 text-ui text-destructive">
+        {error.message}
+      </p>
+    ) : null;
+  }
+  const disabled = !data.editable || setProactive.isPending;
+  function toggle(name: string, enabled: boolean) {
+    setSaveError(null);
+    // Turning an agent on also turns proactive agents on; turning it off leaves the others.
+    const update = enabled
+      ? { enabled: true, agents: { [name]: true } }
+      : { agents: { [name]: false } };
+    setProactive.mutate(update, { onError: (err) => setSaveError(err.message) });
+  }
+  return (
+    <div className="mt-6">
+      <SettingsGroup title="Proactive agents" testId="settings-group-proactive-agents">
+        {data.agents.map((agent) => (
+          <div key={agent.name} className="flex items-center justify-between gap-4">
+            <SettingsLabel
+              label={agent.label}
+              className="flex-1"
+              description={
+                <>
+                  {agent.description} Runs in a new sandbox session for each user.
+                  {!data.editable && (
+                    <span className="mt-1 block">
+                      Managed by this deployment and can&apos;t be changed here.
+                    </span>
+                  )}
+                </>
+              }
+            />
+            <Switch
+              checked={data.enabled && agent.enabled}
+              onCheckedChange={(checked) => toggle(agent.name, checked)}
+              disabled={disabled}
+              aria-label={agent.label}
+              componentId="settings.admin.proactive_agents"
+            />
+          </div>
+        ))}
+      </SettingsGroup>
+      {saveError && (
+        <div
+          role="alert"
+          className="mt-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+        >
+          {saveError}
+        </div>
+      )}
+    </div>
   );
 }

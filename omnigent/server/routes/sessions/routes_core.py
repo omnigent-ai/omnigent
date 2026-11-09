@@ -90,6 +90,12 @@ from omnigent.server.creation_logging import creation_metadata, creation_stage, 
 from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
+from omnigent.server.proactive_agent import (
+    finish_provisioning as finish_proactive_provisioning,
+)
+from omnigent.server.proactive_agent import (
+    start_provisioning as start_proactive_provisioning,
+)
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
 )
@@ -1088,6 +1094,18 @@ def register_core_routes(
             database creation fails.
         """
         user_id = _require_user(request, auth_provider)
+        # Provision the caller's proactive task alongside the create; it never fails it.
+        provisioning = start_proactive_provisioning(request, user_id)
+        try:
+            return await _create_session(request, user_id)
+        finally:
+            await finish_proactive_provisioning(provisioning)
+
+    async def _create_session(
+        request: Request,
+        user_id: str | None,
+    ) -> SessionResponse | CreatedSessionResponse:
+        """Create a session for *user_id*; see :func:`create_session`."""
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if (
             content_type == "multipart/form-data"
