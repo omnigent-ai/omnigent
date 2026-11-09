@@ -31,6 +31,7 @@ CURRENT_KEY_VERSION = "v1"
 # Older versions still checked while their stored keys are being backfilled.
 LEGACY_KEY_VERSIONS: tuple[str, ...] = ()
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 # Longest canonical link the ``primary_link`` column stores.
 MAX_CANONICAL_LINK_CHARS = 2048
 
@@ -79,13 +80,13 @@ def canonical_link(link: Mapping[str, Any]) -> str | None:
 
     Sessions become ``session:<id>``. GitHub pull request URLs keep only
     ``github.com/<owner>/<repo>/pull/<n>``, dropping subpages such as
-    ``/files``. Other URLs drop the scheme, fragment, trailing slash, and
-    default port, and lowercase the host.
+    ``/files``. Other URLs drop the scheme, fragment, trailing slash, and the
+    scheme's default port, and lowercase the host.
 
     :param link: A link with ``type`` and ``ref``.
     :returns: The canonical form, or ``None`` when ``ref`` is empty.
-    :raises InvalidLinkError: If ``ref`` is not a parseable URL, or its
-        canonical form is longer than :data:`MAX_CANONICAL_LINK_CHARS`.
+    :raises InvalidLinkError: If ``ref`` is not a parseable http(s) URL with a
+        host, or its canonical form is longer than :data:`MAX_CANONICAL_LINK_CHARS`.
     """
     ref = str(link.get("ref") or "").strip()
     if not ref:
@@ -99,6 +100,8 @@ def canonical_link(link: Mapping[str, Any]) -> str | None:
             port = parts.port
         except ValueError as exc:
             raise InvalidLinkError(f"invalid link: {exc}") from exc
+        if parts.scheme.lower() not in _DEFAULT_PORTS or not host:
+            raise InvalidLinkError("links must be http or https URLs with a host")
         if host == "www.github.com":
             host = "github.com"
         path = parts.path.rstrip("/")
@@ -108,8 +111,9 @@ def canonical_link(link: Mapping[str, Any]) -> str | None:
             canonical = f"github.com/{owner.lower()}/{repo.lower()}/pull/{number}"
         else:
             query = f"?{parts.query}" if parts.query else ""
-            # Different ports are different services; default ports are dropped.
-            netloc = host if port in (None, 80, 443) else f"{host}:{port}"
+            # A port other than the scheme's default names a different service.
+            default_port = _DEFAULT_PORTS[parts.scheme.lower()]
+            netloc = host if port in (None, default_port) else f"{host}:{port}"
             canonical = f"{netloc}{path}{query}"
     if len(canonical) > MAX_CANONICAL_LINK_CHARS:
         raise InvalidLinkError("link is too long")

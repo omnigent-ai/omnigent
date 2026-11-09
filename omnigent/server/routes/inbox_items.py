@@ -216,9 +216,11 @@ def create_inbox_items_router(
 
         links = [link.model_dump(exclude_none=True) for link in body.links]
         try:
-            primary_link = canonical_link(links[0]) if links else None
+            # Every link is validated; the first one names what the item is about.
+            canonical = [canonical_link(link) for link in links]
         except InvalidLinkError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        primary_link = canonical[0] if canonical else None
         inputs = DedupeInputs(
             kind=body.kind, primary_link=primary_link, topic=normalize_topic(body.topic)
         )

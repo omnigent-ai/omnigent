@@ -101,9 +101,17 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
             immediate=True,
         )
 
-    def _owned_row(self, session: Session, item_id: str, user_id: str) -> SqlInboxItem | None:
-        """Load an item by primary key, treating another owner's item as missing."""
-        row = session.get(SqlInboxItem, (current_workspace_id(), item_id))
+    def _owned_row(
+        self, session: Session, item_id: str, user_id: str, *, for_update: bool = False
+    ) -> SqlInboxItem | None:
+        """Load an item by primary key, treating another owner's item as missing.
+
+        ``for_update`` locks the row, so concurrent updates apply one after the
+        other and each sees the state the previous one committed.
+        """
+        row = session.get(
+            SqlInboxItem, (current_workspace_id(), item_id), with_for_update=for_update
+        )
         if row is None or row.user_id != user_id:
             return None
         return row
@@ -130,6 +138,11 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         for attempt in range(_SLOT_RETRIES + 1):
             try:
                 return _sized(lambda: self._insert(item, retire_item_id))
+            except InboxSessionCapError:
+                # A concurrent post with the same key may have taken the last slot.
+                if self.get_by_dedupe_key(item.user_id, item.dedupe_key) is not None:
+                    raise DuplicateInboxItemError(item.dedupe_key) from None
+                raise
             except IntegrityError as exc:
                 # Either a concurrent post took our slot, or another item holds the key.
                 if self.get_by_dedupe_key(item.user_id, item.dedupe_key) is not None:
@@ -157,7 +170,7 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
             if not free:
                 raise InboxSessionCapError(item.source_session_id)
             if retire_item_id is not None:
-                retired = self._owned_row(session, retire_item_id, item.user_id)
+                retired = self._owned_row(session, retire_item_id, item.user_id, for_update=True)
                 if retired is not None and retired.dedupe_key == item.dedupe_key:
                     retired.dedupe_key = f"{item.dedupe_key}#{retired.id}"
                     session.flush()
@@ -280,7 +293,7 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         """See base class."""
 
         def write(session: Session) -> InboxItem | None:
-            row = self._owned_row(session, item_id, user_id)
+            row = self._owned_row(session, item_id, user_id, for_update=True)
             if row is None:
                 return None
             if state is not None:
