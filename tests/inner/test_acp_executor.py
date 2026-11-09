@@ -1807,6 +1807,26 @@ async def test_interrupt_sends_session_cancel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_interrupt_preserves_original_cancel_grace_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._session_id = "s1"
+    ex._proc = type("P", (), {"returncode": None})()  # type: ignore[assignment]
+    ex._send = AsyncMock()  # type: ignore[method-assign]
+    now = 100.0
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(asyncio.get_running_loop(), "time", lambda: now)
+        assert await ex.interrupt_session("ignored") is True
+        original_deadline = ex._cancel_grace_deadline
+        assert original_deadline == now + acp_executor_module.ACP_CANCEL_GRACE_SECONDS
+
+        now += acp_executor_module.ACP_CANCEL_GRACE_SECONDS / 2
+        assert await ex.interrupt_session("ignored") is True
+        assert ex._cancel_grace_deadline == original_deadline
+
+
+@pytest.mark.asyncio
 async def test_interrupt_noop_without_session() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     assert await ex.interrupt_session("ignored") is False
