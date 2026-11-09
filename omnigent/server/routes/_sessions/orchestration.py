@@ -3552,6 +3552,9 @@ async def _settle_undelivered_native_input(
     response_id: str | None,
     input_stable_id: str | None,
     reason_code: str | None = None,
+    *,
+    pending_id: str | None = None,
+    delivery_attempt_id: str | None = None,
 ) -> None:
     """
     Commit a failed native turn's own queued web message as a user item.
@@ -3559,8 +3562,9 @@ async def _settle_undelivered_native_input(
     Only native-terminal sessions queue web messages: the transcript forwarder
     normally mirrors each one back and drains its entry. When the runner
     reports the turn failed and names the message it carried
-    (``input_stable_id``), an entry still queued under that id is a message the
-    harness never received. Left in the queue it lingers for the TTL and the
+    (the client id or server pending and attempt ids), an entry still queued
+    under that identity is a message the harness never received. Left in the
+    queue it lingers for the TTL and the
     next mirrored message drains it instead of its own, so the transcript shows
     the reply above a still-queued bubble and the failed message vanishes on
     reload. Settlement is by identity, never by queue order: a turn that fails
@@ -3573,29 +3577,49 @@ async def _settle_undelivered_native_input(
         with the error item persisted right after it; ``None`` mints one.
     :param input_stable_id: The web stable id the runner stamped on the failed
         turn, passed only when the harness reported the failure as undelivered;
-        ``None`` settles nothing.
+        callers without one must supply both server identity fields.
     """
-    if input_stable_id is None:
+    if input_stable_id is None and (pending_id is None or delivery_attempt_id is None):
         return
-    pending_inputs.mark_lifecycle(
-        session_id,
-        input_stable_id,
-        stage="rejected_before_handoff",
-        cause_class="rejected_before_handoff",
-        reason_code=reason_code or "reported_undelivered",
-        lifecycle_response_id=response_id,
-    )
+    if input_stable_id is not None:
+        # Restoring durable inputs regenerates their transient server identities.
+        pending_id = None
+        delivery_attempt_id = None
+    identity = {
+        key: value
+        for key, value in {
+            "input_stable_id": input_stable_id,
+            "pending_id": pending_id,
+            "delivery_attempt_id": delivery_attempt_id,
+        }.items()
+        if value is not None
+    }
+    if input_attributes(identity) != identity:
+        return
+
+    def mark_rejected_input() -> str | None:
+        return pending_inputs.mark_lifecycle(
+            session_id,
+            input_stable_id,
+            pending_id=pending_id,
+            delivery_attempt_id=delivery_attempt_id,
+            stage="rejected_before_handoff",
+            cause_class="rejected_before_handoff",
+            reason_code=reason_code or "reported_undelivered",
+            lifecycle_response_id=response_id,
+        )
+
+    matched_pending_id = mark_rejected_input()
     if conversation_store is None:
         return
-    pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
-    if pending_id is None:
+    if matched_pending_id is None and input_stable_id is not None:
         # A saved startup input submitted before a server restart is matched
         # only once restored.
         await restore_pending_inputs(conversation_store, session_id)
-        pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
-    if pending_id is None:
+        matched_pending_id = mark_rejected_input()
+    if matched_pending_id is None:
         return
-    drained = pending_inputs.resolve(session_id, pending_id)
+    drained = pending_inputs.resolve(session_id, matched_pending_id)
     if drained is None:
         return
     item = NewConversationItem(
@@ -3603,7 +3627,11 @@ async def _settle_undelivered_native_input(
         response_id=response_id or generate_task_id(),
         data=MessageData(role="user", content=drained.content, user_authored=True),
         created_by=drained.created_by,
-        stable_id=drained.stable_id,
+        stable_id=drained.stable_id
+        or uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"omnigent-undelivered-native-user:{session_id}:{drained.pending_id}",
+        ).hex,
         replaces_pending_id=drained.stable_id,
     )
     try:
@@ -3625,7 +3653,11 @@ async def _settle_undelivered_native_input(
             outcome="reported_undelivered",
             item_id=persisted[0].id,
             response_id=persisted[0].response_id,
-            match_method="input_stable_id",
+            match_method=(
+                "input_stable_id"
+                if input_stable_id is not None
+                else "pending_id_and_delivery_attempt_id"
+            ),
         )
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
 
@@ -9796,22 +9828,18 @@ async def _relay_runner_stream_once(
                             "response.cancelled": "cancelled",
                         }.get(evt_type, "completed")
 
-                    if evt_type == "response.failed":
+                    if evt_type == "response.failed" and _failed_event_undelivered(event):
                         # The runner could not hand this turn to a native
                         # harness, so the web message it carried was never
                         # mirrored back: commit it ahead of the error item.
-                        raw_input_stable_id = event.get("input_stable_id")
                         await _settle_undelivered_native_input(
                             conversation_store,
                             session_id,
                             current_response_id,
-                            (
-                                raw_input_stable_id
-                                if isinstance(raw_input_stable_id, str)
-                                and _failed_event_undelivered(event)
-                                else None
-                            ),
+                            event.get("input_stable_id"),
                             reason_code=_native_input_reason_code(event),
+                            pending_id=event.get("pending_id"),
+                            delivery_attempt_id=event.get("delivery_attempt_id"),
                         )
                     error_item = _error_item_from_sse(
                         event,
