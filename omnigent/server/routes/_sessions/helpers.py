@@ -61,6 +61,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
+    humanize_mention_markers,
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
@@ -8124,8 +8125,8 @@ async def _dispatch_skill_slash_command_to_runner(
     response id:
 
     * a visible ``slash_command`` item for the UI transcript;
-    * a hidden ``message`` item with ``is_meta=True`` containing the
-      full skill instructions for runner history replay.
+    * a hidden ``message`` item with ``is_meta=True`` and ``user_authored=True``
+      containing the full skill instructions for runner history replay.
 
     Only the hidden message is sent to the runner as input. The visible
     command is published as ``response.output_item.done`` after the
@@ -8186,6 +8187,7 @@ async def _dispatch_skill_slash_command_to_runner(
             role="user",
             content=meta_content,
             is_meta=True,
+            user_authored=True,
         ),
         created_by=created_by,
     )
@@ -11458,7 +11460,9 @@ def _latest_message_preview(
         for block in item.data.content:
             block_type = block.get("type")
             text = block.get("text")
-            if block_type in ("input_text", "output_text") and isinstance(text, str):
+            if block_type == "input_text" and isinstance(text, str):
+                parts.append(humanize_mention_markers(text))
+            elif block_type == "output_text" and isinstance(text, str):
                 parts.append(text)
         collapsed = " ".join(" ".join(parts).split())
         if not collapsed:
