@@ -258,7 +258,7 @@ function touch(target: Element, type: string, x: number, time: number, fingers =
 
 function stubMobileLayout(mobile: boolean): void {
   vi.stubGlobal("matchMedia", (query: string) => ({
-    matches: mobile && query.includes("max-width"),
+    matches: mobile && query.includes("max-width") && !query.includes("min-width"),
     media: query,
     addEventListener: () => {},
     removeEventListener: () => {},
