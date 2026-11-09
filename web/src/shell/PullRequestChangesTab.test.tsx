@@ -1470,6 +1470,11 @@ describe("PullRequestChangesTab stacked pull requests", () => {
     expect(document.querySelector('[data-review-thread="t1"]')).toBeNull();
     expect(screen.queryByRole("button", { name: "Next unresolved conversation" })).toBeNull();
     expect(screen.queryByRole("checkbox", { name: "Viewed b.ts" })).toBeNull();
+
+    fireEvent.click(toggle());
+
+    expect(document.querySelector('[data-review-thread="t1"]')).not.toBeNull();
+    expect(screen.getByRole("checkbox", { name: "Viewed b.ts" })).toBeInTheDocument();
   });
 
   it("shows a loading state until the PR's own changes arrive", () => {

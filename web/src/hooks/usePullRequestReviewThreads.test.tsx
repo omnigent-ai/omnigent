@@ -76,6 +76,26 @@ it("retains a new range draft, requires reselection after a revision change, and
   expect(result.current.threads.page?.next_cursor).toBe("threads-2");
 });
 
+it("keeps a draft while its file is hidden and remounted, as This PR only does", () => {
+  const client = new QueryClient();
+  const wrapper = ({ children }: PropsWithChildren) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  const renderComposer = () =>
+    renderHook(() => usePullRequestReviewThreadComposer("session", "pr", "a.py", "head", "base"), {
+      wrapper,
+    });
+  const first = renderComposer();
+  act(() => first.result.current.selectLines({ side: "RIGHT", line: 4, start_line: 2 }));
+  act(() => first.result.current.setBody("Keep me"));
+  first.unmount();
+
+  const { draft, stale } = renderComposer().result.current;
+  expect(draft.body).toBe("Keep me");
+  expect(draft.anchor).toMatchObject({ side: "RIGHT", line: 4, start_line: 2, head_sha: "head" });
+  expect(stale).toBe(false);
+});
+
 it("keeps text and coordinates after an uncertain creation without retrying", async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const fetch = vi.fn().mockRejectedValue(new TypeError("Network error"));

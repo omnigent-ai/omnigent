@@ -359,7 +359,7 @@ def test_stack_rejects_a_push_during_the_lookup(monkeypatch: pytest.MonkeyPatch)
 def test_stack_diff_rejects_a_push_during_the_comparison(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake = FakeGitHub(pr=_pr(), commits=[_PARENT, _HEAD], push_after=_COMMITS_ENDPOINT)
+    fake = FakeGitHub(pr=_pr(), commits=[_PARENT, _HEAD], push_after=_COMPARE)
     _install(monkeypatch, fake)
 
     with pytest.raises(ValueError, match="pull request changed"):

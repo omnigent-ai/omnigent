@@ -11,6 +11,7 @@ describe("useChangesViewState", () => {
       first.result.current.setHideViewed(true);
       first.result.current.reveal("src/app.ts");
       first.result.current.setFind({ open: true, query: "needle", regex: true });
+      first.result.current.setOwnChangesOnly(true);
     });
     first.unmount();
 
@@ -19,6 +20,7 @@ describe("useChangesViewState", () => {
     expect(remounted.hideViewed).toBe(true);
     expect([...remounted.revealedPaths]).toEqual(["src/app.ts"]);
     expect(remounted.find).toEqual({ open: true, query: "needle", matchCase: false, regex: true });
+    expect(remounted.ownChangesOnly).toBe(true);
 
     for (const [conversationId, url] of [
       ["view-state-b", prUrl],
@@ -29,6 +31,7 @@ describe("useChangesViewState", () => {
       expect(other.hideViewed).toBe(false);
       expect(other.revealedPaths.size).toBe(0);
       expect(other.find).toEqual({ open: false, query: "", matchCase: false, regex: false });
+      expect(other.ownChangesOnly).toBe(false);
     }
   });
 
