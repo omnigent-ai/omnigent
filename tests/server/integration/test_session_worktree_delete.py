@@ -239,17 +239,13 @@ async def test_delete_shared_worktree_keeps_it_until_the_last_session(
     assert captured[0].delete_branch is True
 
 
-async def test_delete_removes_worktree_shared_only_with_archived_session(
+async def test_delete_preserves_worktree_shared_with_archived_session(
     app: FastAPI,
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
     """
-    An archived session in the same worktree does not keep it alive.
-
-    Archived sessions run nothing, so the directory can go. Counting them
-    would mean a worktree shared by two forks is never cleaned up once
-    either one is archived — the cleanup would silently never happen.
+    Archived sessions retain their workspace so they can be restored.
     """
     captured = await _register_fake_host(app, db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -259,8 +255,8 @@ async def test_delete_removes_worktree_shared_only_with_archived_session(
 
     resp = await client.delete(f"/v1/sessions/{live}?delete_branch=true")
     assert resp.status_code == 200
-    assert len(captured) == 1, "only an archived session shares this path — remove it"
-    assert captured[0].worktree_path == _WORKTREE_PATH
+    assert captured == [], "restoring an archived session must retain its files"
+    assert conv_store.get_conversation(archived).host_id == _HOST_ID
 
 
 def test_has_other_live_session_in_workspace(db_uri: str) -> None:
@@ -750,6 +746,17 @@ async def test_worktree_sharing_includes_descendants(
         include_subdirectories=True,
     )
 
+    assert (
+        store.has_other_live_session_in_workspace(
+            host_id=_HOST_ID,
+            workspace=root,
+            exclude_conversation_id=mine,
+            include_subdirectories=True,
+            include_archived=True,
+        )
+        is in_use
+    )
+
 
 async def test_windows_sharing_limit_preserves_worktree(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
@@ -886,6 +893,7 @@ async def test_cleanup_uses_one_sharing_lookup_for_recorded_root(
         workspace: str,
         exclude_conversation_id: str,
         include_subdirectories: bool = False,
+        include_archived: bool = False,
     ) -> bool:
         calls.append((workspace, include_subdirectories))
         return original(
@@ -894,6 +902,7 @@ async def test_cleanup_uses_one_sharing_lookup_for_recorded_root(
             workspace=workspace,
             exclude_conversation_id=exclude_conversation_id,
             include_subdirectories=include_subdirectories,
+            include_archived=include_archived,
         )
 
     monkeypatch.setattr(SqlAlchemyConversationStore, "has_other_live_session_in_workspace", check)
@@ -901,3 +910,25 @@ async def test_cleanup_uses_one_sharing_lookup_for_recorded_root(
     assert response.status_code == 200, response.text
     assert calls == [(_WORKTREE_PATH, True)]
     assert len(captured) == 1
+
+
+@pytest.mark.parametrize("deleted_host", [False, True])
+async def test_managed_worktree_lives_until_sandbox_teardown(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    deleted_host: bool,
+) -> None:
+    captured = await _register_fake_host(app, db_uri)
+    hosts = HostStore(db_uri)
+    app.state.host_store = hosts
+    assert hosts.bind_sandbox(_HOST_ID, provider="modal", sandbox_id="managed-worktree")
+    session_id = _make_worktree_conversation(db_uri)
+    if deleted_host:
+        hosts.delete_host(_HOST_ID)
+        app.state.host_registry.deregister(_HOST_ID)
+    response = await client.delete(f"/v1/sessions/{session_id}?delete_branch=true")
+    assert response.status_code == 200, response.text
+    assert captured == []
+    tombstone = hosts.get_host(_HOST_ID, include_deleted=True)
+    assert tombstone is not None and tombstone.deleted_at is not None

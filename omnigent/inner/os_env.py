@@ -1183,7 +1183,10 @@ def _handle_helper_request(
 ) -> OpResult:
     op = request.get("op")
     if op == "git":
-        from omnigent.runtime.filesystem_registry import _anchored_git_env
+        from omnigent.runtime.filesystem_registry import (
+            _LOCK_FREE_GIT_READ_OPTIONS,
+            _anchored_git_env,
+        )
 
         args, target, timeout = request.get("argv"), request.get("cwd"), request.get("timeout")
         if (
@@ -1203,11 +1206,9 @@ def _handle_helper_request(
             options = ["--no-ext-diff", "--no-textconv"] if args[0] == "diff" else []
             argv = [
                 "git",
-                "--no-optional-locks",
+                *_LOCK_FREE_GIT_READ_OPTIONS,
                 "-c",
                 "core.fsmonitor=false",
-                "-c",
-                "diff.autoRefreshIndex=false",
                 args[0],
                 *options,
                 *args[1:],

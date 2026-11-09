@@ -522,7 +522,7 @@ function MonacoCodeEditorInner({
     <div className="flex h-full flex-col">
       {largeMarkdown && (
         <div className="shrink-0 border-b border-border bg-muted/50 px-4 py-2 text-sm text-muted-foreground">
-          Large Markdown file opened as source to keep the viewer responsive.
+          Large Markdown file edited as source to keep the viewer responsive.
         </div>
       )}
       {truncated && <TruncatedBanner />}
