@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -15,14 +14,11 @@ from fastapi import FastAPI
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import proactive_agent
 from omnigent.server.app import _ensure_default_agents, create_app
-from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.proactive_agent import (
     PROACTIVE_AGENT_ID,
     PROACTIVE_AGENT_NAME,
     TIMEZONE_HEADER,
-    FileProactiveAgentSettings,
-    ProactiveAgentState,
     proactive_task_id,
     request_timezone,
 )
@@ -31,24 +27,11 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.helpers import FakeSandboxLauncher
 
 _BUNDLE = Path(proactive_agent.__file__).parent.parent / "resources" / "proactive"
-
-
-def test_settings_default_off_and_round_trip(tmp_path: Path) -> None:
-    settings = FileProactiveAgentSettings(tmp_path / "proactive_agents")
-    assert settings.read() == ProactiveAgentState()
-
-    settings.write(ProactiveAgentState(enabled=True, agents={"other": False}))
-
-    state = settings.read()
-    assert state.agent_enabled(PROACTIVE_AGENT_NAME)
-    assert not state.agent_enabled("other")
-    invalid = tmp_path / "invalid"
-    invalid.write_text("not json")
-    assert FileProactiveAgentSettings(invalid).read() == ProactiveAgentState()
 
 
 def test_task_id_is_fixed_per_owner() -> None:
@@ -98,8 +81,6 @@ def _sandbox() -> ManagedSandboxDeployment:
 
 def _app(db_uri: str, tmp_path: Path, *, enabled: bool, sandbox: bool = True) -> FastAPI:
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
-    settings = FileProactiveAgentSettings(tmp_path / "proactive_agents")
-    settings.write(ProactiveAgentState(enabled=enabled))
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
@@ -108,8 +89,9 @@ def _app(db_uri: str, tmp_path: Path, *, enabled: bool, sandbox: bool = True) ->
         agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
         scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
         sandbox_config=_sandbox() if sandbox else None,
-        proactive_agent_settings=settings,
-        feature_flags=resolve_feature_flags({"OMNIGENT_FEATURES": "proactive_agent"}),
+        inbox_item_store=SqlAlchemyInboxItemStore(db_uri),
+        # A callable, like a deployment's per-request gate.
+        proactive_agent=lambda: enabled,
     )
 
 
@@ -194,32 +176,3 @@ async def test_provisioning_failure_does_not_fail_the_create(
     monkeypatch.undo()
     await _create_session(client)
     assert store.get(proactive_task_id(None)) is not None
-
-
-async def test_admin_settings_route(client: httpx.AsyncClient) -> None:
-    state = (await client.get("/v1/admin/proactive-agents")).json()
-    assert (state["enabled"], state["editable"]) == (True, True)
-    assert [agent["name"] for agent in state["agents"]] == [PROACTIVE_AGENT_NAME]
-
-    updated = await client.put(
-        "/v1/admin/proactive-agents", json={"agents": {PROACTIVE_AGENT_NAME: False}}
-    )
-
-    assert updated.status_code == 200
-    assert updated.json()["agents"][0]["enabled"] is False
-    assert (
-        await client.put("/v1/admin/proactive-agents", json={"agents": {"nope": True}})
-    ).status_code == 400
-
-
-def test_admin_route_is_off_without_the_feature(db_uri: str, tmp_path: Path) -> None:
-    app = create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=LocalArtifactStore(str(tmp_path / "a")),
-        agent_cache=SimpleNamespace(),  # type: ignore[arg-type]
-    )
-
-    paths = {getattr(route, "path", "") for route in app.routes}
-    assert "/v1/admin/proactive-agents" not in paths

@@ -119,12 +119,7 @@ from omnigent.server.performance_metrics import (
     set_request_user_agent_for_access_log,
 )
 from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
-from omnigent.server.proactive_agent import (
-    PROACTIVE_AGENT_NAME,
-    FileProactiveAgentSettings,
-    ProactiveAgentSettings,
-    ProactiveProvisioner,
-)
+from omnigent.server.proactive_agent import PROACTIVE_AGENT_NAME, ProactiveProvisioner
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -150,7 +145,6 @@ from omnigent.server.routes.sessions import (
     set_server_host_registry,
     set_server_runner_router,
 )
-from omnigent.server.routes.proactive_agents import create_proactive_agents_router
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
@@ -1657,7 +1651,6 @@ def create_app(
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
     inbox_item_store: InboxItemStore | None = None,
     proactive_agent: DeploymentGate | None = None,
-    proactive_agent_settings: ProactiveAgentSettings | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1707,9 +1700,9 @@ def create_app(
         items. A static bool or a zero-arg callable resolved per request; ``None``
         follows the ``proactive_agent`` release feature (off by default). When off,
         ``/v1/inbox/items`` returns 404 and ``GET /v1/info`` reports
-        ``proactive_agent_enabled`` false.
-    :param proactive_agent_settings: Where the admin's proactive-agent settings
-        live. ``None`` stores them in a file in the server data dir.
+        ``proactive_agent_enabled`` false. The same gate decides, per caller,
+        whether ``POST /v1/sessions`` creates the caller's proactive task and,
+        evaluated as the task owner, whether a proactive run starts.
     :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
         the owner identity fires act under, or a replacement executor. ``None``
         uses the built-in executor with every host owned by this replica.
@@ -2424,11 +2417,6 @@ def create_app(
     app.state.proactive_agent_available = proactive_agent_available
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     app.state.scheduled_task_store = scheduled_task_store
-    app.state.proactive_agent_settings = (
-        proactive_agent_settings
-        if proactive_agent_settings is not None
-        else FileProactiveAgentSettings()
-    )
     app.state.proactive_provisioner = ProactiveProvisioner()
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
@@ -4111,16 +4099,6 @@ def create_app(
         prefix="/v1",
         tags=["sharing"],
     )
-    if resolved_feature_flags.enabled(Feature.PROACTIVE_AGENT):
-        app.include_router(
-            create_proactive_agents_router(
-                app.state.proactive_agent_settings,
-                auth_provider=auth_provider,
-                permission_store=permission_store,
-            ),
-            prefix="/v1",
-            tags=["proactive_agents"],
-        )
     # First-class projects (owner-private session containers). Mounted only
     # when a project store is wired; the endpoints self-scope to the caller.
     if project_store is not None:

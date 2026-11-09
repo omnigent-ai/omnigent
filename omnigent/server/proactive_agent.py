@@ -1,33 +1,26 @@
 """The built-in proactive agent and the hidden scheduled task that runs it.
 
-When the ``proactive_agent`` feature is on and an admin enables the agent,
-each user gets one ordinary ``scheduled_tasks`` row bound to the built-in
-agent. The row has a fixed id, is created during the user's own
-``POST /v1/sessions`` (so a deployment whose store creates per-owner
-authorization does so inside that user's request), and is hidden from every
-scheduled-task route. The agent's instructions live in its bundle, so a new
-release changes them for every later run.
+When the deployment's ``proactive_agent`` gate is on for a user, that user
+gets one ordinary ``scheduled_tasks`` row bound to the built-in agent. The row
+has a fixed id, is created during the user's own ``POST /v1/sessions`` (so a
+deployment whose store creates per-owner authorization does so inside that
+user's request), and is hidden from every scheduled-task route. The agent's
+instructions live in its bundle, so a new release changes them for every
+later run.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import uuid
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import ScheduledTask
-from omnigent.server.admin_list import resolve_data_dir
-from omnigent.server.feature_flags import Feature
-from omnigent.server.sharing_settings import _read_override_text, _write_override_text
 
 _logger = logging.getLogger(__name__)
 
@@ -48,7 +41,6 @@ TIMEZONE_HEADER = "X-Omnigent-Timezone"
 # A slow provisioning step gives up instead of holding the session create.
 _PROVISION_TIMEOUT_S = 5.0
 _TASK_ID_NAMESPACE = uuid.UUID("7b6c3e0a-5a7e-4b55-9a3c-2f1d6e9c8b41")
-_SETTINGS_FILE = "proactive_agents"
 
 
 def is_proactive_task(task: ScheduledTask) -> bool:
@@ -62,77 +54,20 @@ def proactive_task_id(user_id: str | None, agent_name: str = PROACTIVE_AGENT_NAM
     return uuid.uuid5(_TASK_ID_NAMESPACE, f"{current_workspace_id()}:{owner}:{agent_name}").hex
 
 
-@dataclass(frozen=True)
-class ProactiveAgentState:
-    """Admin settings for proactive agents.
+def proactive_agent_available(app_state: Any) -> bool:
+    """Whether the deployment's per-request gate lets the current caller use the agent.
 
-    :param enabled: Whether proactive agents run at all.
-    :param agents: Per-agent override by name; an agent not listed follows
-        ``enabled``.
+    Evaluated in the caller's request context, or in a scheduled fire's owner
+    identity scope, so a deployment gate that reads the current user sees the
+    task owner. A failing gate is off.
     """
-
-    enabled: bool = False
-    agents: dict[str, bool] = field(default_factory=dict)
-
-    def agent_enabled(self, name: str) -> bool:
-        """Whether *name* runs under these settings."""
-        return self.enabled and self.agents.get(name, True)
-
-
-class ProactiveAgentSettings(ABC):
-    """Where the admin's proactive-agent settings are stored."""
-
-    #: Whether admins can change the settings through the API.
-    editable: bool = True
-
-    @abstractmethod
-    def read(self) -> ProactiveAgentState:
-        """Return the current settings."""
-
-    @abstractmethod
-    def write(self, state: ProactiveAgentState) -> None:
-        """Persist *state*."""
-
-
-class FileProactiveAgentSettings(ProactiveAgentSettings):
-    """Settings stored as JSON in ``<data_dir>/proactive_agents``; off when absent."""
-
-    def __init__(self, path: Path | None = None) -> None:
-        """:param path: Settings file; defaults to the server data dir."""
-        self._path = path
-
-    def _file(self) -> Path:
-        return self._path or resolve_data_dir() / _SETTINGS_FILE
-
-    def read(self) -> ProactiveAgentState:
-        """See base class. An unreadable or invalid file reads as off."""
-        raw = _read_override_text(self._file())
-        if not raw:
-            return ProactiveAgentState()
-        try:
-            data = json.loads(raw)
-            agents = {str(k): bool(v) for k, v in dict(data.get("agents") or {}).items()}
-            return ProactiveAgentState(enabled=data.get("enabled") is True, agents=agents)
-        except (ValueError, TypeError, AttributeError):
-            _logger.warning("Ignoring invalid proactive agent settings in %s", self._file())
-            return ProactiveAgentState()
-
-    def write(self, state: ProactiveAgentState) -> None:
-        """See base class."""
-        payload = {"enabled": state.enabled, "agents": state.agents}
-        _write_override_text(self._file(), json.dumps(payload, sort_keys=True))
-
-
-def proactive_agent_runs(app_state: Any, agent_name: str = PROACTIVE_AGENT_NAME) -> bool:
-    """Whether the deployment and the admin settings let *agent_name* run."""
-    flags = getattr(app_state, "feature_flags", None)
-    settings: ProactiveAgentSettings | None = getattr(app_state, "proactive_agent_settings", None)
-    if flags is None or settings is None or not flags.enabled(Feature.PROACTIVE_AGENT):
+    available = getattr(app_state, "proactive_agent_available", None)
+    if available is None:
         return False
     try:
-        return settings.read().agent_enabled(agent_name)
+        return bool(available())
     except Exception:
-        _logger.warning("Cannot read proactive agent settings; treating as off", exc_info=True)
+        _logger.warning("proactive_agent gate failed; treating as off", exc_info=True)
         return False
 
 
@@ -197,7 +132,7 @@ def start_provisioning(
     """Start provisioning the caller's proactive task alongside a session create.
 
     Runs inside the request, so a store that creates per-owner authorization
-    acts as the caller. Skipped when the agent is off, this process already
+    acts as the caller. Skipped when the gate is off for the caller, this process already
     checked the caller, or the deployment cannot launch managed sandboxes.
     """
     state = request.app.state
@@ -205,7 +140,7 @@ def start_provisioning(
     store = getattr(state, "scheduled_task_store", None)
     if provisioner is None or store is None or not provisioner.needed(user_id):
         return None
-    if not proactive_agent_runs(state):
+    if not proactive_agent_available(state):
         return None
     deployment = getattr(state, "sandbox_config", None)
     if deployment is None or not deployment.managed_launch_supported:
@@ -241,7 +176,7 @@ async def finish_provisioning(task: asyncio.Task[ScheduledTask | None] | None) -
 
 def fire_skip_reason(app_state: Any, agent_store: Any, task: ScheduledTask) -> str | None:
     """Why a proactive task should not run now, or ``None`` to run it."""
-    if not proactive_agent_runs(app_state):
+    if not proactive_agent_available(app_state):
         return "proactive agent is turned off"
     if agent_store.get(task.agent_id) is None:
         return "proactive agent is not available"

@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -689,25 +689,45 @@ async def test_unsupported_target_skips_the_claimed_run(store) -> None:
     dispatch.assert_not_awaited()
 
 
-@pytest.mark.parametrize("agent_enabled", [False, True], ids=["turned-off", "not-shipped"])
-async def test_proactive_task_skips_when_its_agent_cannot_run(
-    store, tmp_path: Path, agent_enabled: bool
-) -> None:
-    from omnigent.server.feature_flags import resolve_feature_flags
-    from omnigent.server.proactive_agent import (
-        PROACTIVE_AGENT_ID,
-        FileProactiveAgentSettings,
-        ProactiveAgentState,
-    )
+async def test_proactive_gate_is_checked_as_the_task_owner(store) -> None:
+    from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
+
+    owner: contextvars.ContextVar[str | None] = contextvars.ContextVar("owner", default=None)
+    seen: list[str | None] = []
+
+    @contextlib.asynccontextmanager
+    async def identity(task: ScheduledTask) -> AsyncIterator[None]:
+        token = owner.set("task-owner")
+        try:
+            yield
+        finally:
+            owner.reset(token)
+
+    def gate() -> bool:
+        seen.append(owner.get())
+        return False
 
     claimed = _claim(store, agent_id=PROACTIVE_AGENT_ID)
-    settings = FileProactiveAgentSettings(tmp_path / "proactive_agents")
-    settings.write(ProactiveAgentState(enabled=agent_enabled))
     deps = _deps(store)
-    deps.app_state = SimpleNamespace(
-        feature_flags=resolve_feature_flags({"OMNIGENT_FEATURES": "proactive_agent"}),
-        proactive_agent_settings=settings,
+    deps.app_state = SimpleNamespace(proactive_agent_available=gate)
+    dispatch = AsyncMock()
+
+    await ClaimedRunExecutor(deps, fire_identity=identity, launch_dispatch=dispatch).fire(
+        claimed.task, claimed.lease
     )
+
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("skipped", "proactive_agent_off")
+    assert seen == ["task-owner"]
+    dispatch.assert_not_awaited()
+
+
+async def test_proactive_task_skips_when_its_agent_is_not_shipped(store) -> None:
+    from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
+
+    claimed = _claim(store, agent_id=PROACTIVE_AGENT_ID)
+    deps = _deps(store)
+    deps.app_state = SimpleNamespace(proactive_agent_available=lambda: True)
     dispatch = AsyncMock()
 
     await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)

@@ -28,12 +28,7 @@ import {
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import {
-  customAgentsSettingsEnabled,
-  isFeatureEnabled,
-  isSingleUserMode,
-  type ServerInfo,
-} from "@/lib/capabilities";
+import { customAgentsSettingsEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -100,14 +95,6 @@ interface SettingsNavGroup {
  * the `users.is_admin` flag and the server enforces admin on every route; the
  * Desktop group (Local CLI) appears only in the Electron shell.
  */
-/** Whether the admin General page has a setting to show on this server. */
-export function adminGeneralAvailable(info: ServerInfo | "loading"): boolean {
-  return (
-    info !== "loading" &&
-    (info.sibling_sessions === true || isFeatureEnabled(info, "proactive_agent"))
-  );
-}
-
 export function settingsNavGroups(
   hasAuthSession: boolean,
   isDesktop: boolean,
@@ -116,7 +103,7 @@ export function settingsNavGroups(
   integrationsEnabled = false,
   customAgentsEnabled = false,
   mcpEnabled = false,
-  adminGeneralEnabled = false,
+  nestedAgentsEnabled = false,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
     id: "harnesses",
@@ -166,7 +153,7 @@ export function settingsNavGroups(
   }
   // Single-user servers permit destination settings without an admin identity.
   const adminItems: SettingsNavItem[] = [];
-  if ((isAdmin || isSingleUser) && adminGeneralEnabled) {
+  if ((isAdmin || isSingleUser) && nestedAgentsEnabled) {
     adminItems.push({ id: "admin", label: "General", icon: SettingsIcon });
   }
   if (isAdmin) {
@@ -216,7 +203,7 @@ export function useSettingsRoute(): {
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
     !(singleUser && (next === "members" || next === "sharing")) &&
-    !(next === "admin" && !adminGeneralAvailable(info)) &&
+    !(next === "admin" && (info === "loading" || info.sibling_sessions !== true)) &&
     !(next === "custom-agents" && !customAgentsSettingsEnabled(info));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
@@ -280,7 +267,7 @@ export function SettingsSidebarBody({
     integrationsEnabled,
     customAgentsSettingsEnabled(info),
     mcpEnabled,
-    adminGeneralAvailable(info),
+    info !== "loading" && info.sibling_sessions === true,
   );
 
   return (
