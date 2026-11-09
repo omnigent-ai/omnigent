@@ -38,6 +38,7 @@ import {
   readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
+  type TriggerSource,
 } from "./triggerTemplates";
 
 const gitWorkspace = vi.hoisted(() => ({
@@ -3068,6 +3069,7 @@ describe("automation trigger type", () => {
     ["Slack", "slack", "support"],
     ["GitHub", "github", "acme/app"],
     ["Linear", "linear", "ENG"],
+    ["PagerDuty", "pagerduty", "Checkout API"],
   ])(
     "defaults to Schedule and creates a %s trigger from the selector",
     async (label, source, scope) => {
@@ -3204,7 +3206,7 @@ describe("automation trigger type", () => {
       );
       fireEvent.keyDown(screen.getByLabelText("Trigger type"), { key: "Enter" });
       await screen.findByRole("listbox");
-      for (const label of ["Jira", "Slack", "GitHub", "Linear"]) {
+      for (const label of ["Jira", "Slack", "GitHub", "Linear", "PagerDuty"]) {
         expect(screen.getByRole("option", { name: label })).toHaveAttribute(
           "aria-disabled",
           "true",
@@ -3217,6 +3219,21 @@ describe("automation trigger type", () => {
     },
   );
 
+  it("shows each integration's logo in the Trigger type options and the selected value", async () => {
+    render(dialog());
+    const trigger = screen.getByLabelText("Trigger type");
+    expect(trigger.querySelector("svg.lucide-clock")).not.toBeNull();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    await screen.findByRole("listbox");
+    for (const option of ["schedule", "jira", "slack", "github", "linear", "pagerduty"]) {
+      expect(screen.getByTestId(`task-trigger-type-${option}`).querySelector("svg")).not.toBeNull();
+    }
+    fireEvent.click(screen.getByRole("option", { name: "PagerDuty" }));
+    expect(trigger).toHaveTextContent("PagerDuty");
+    expect(trigger.querySelector("svg.lucide-clock")).toBeNull();
+    expect(trigger.querySelector("svg")).not.toBeNull();
+  });
+
   it("preserves the existing editor for saved automations", () => {
     render(dialog({ editingTask: scheduledTask() }));
     expect(screen.queryByLabelText("Trigger type")).not.toBeInTheDocument();
@@ -3226,7 +3243,7 @@ describe("automation trigger type", () => {
 
 describe("CreateScheduledTaskDialog trigger template", () => {
   function renderTrigger(
-    source: "jira" | "slack" | "github" | "linear",
+    source: TriggerSource,
     extraInfo: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> = {},
     sessionLink = "https://omni.example.com/c/CONVERSATION_ID",
   ) {
@@ -3619,6 +3636,32 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt).toContain("Watch: new Linear issues in team ENG that are unassigned");
     expect(prompt).toContain(
       'Comment "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" on each issue',
+    );
+  });
+
+  it("builds a PagerDuty trigger for a service, with an urgency row and the note link-back", async () => {
+    renderTrigger("pagerduty");
+    expect(screen.getByTestId("task-name-input")).toHaveValue("PagerDuty incidents");
+    expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Incident triggered");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where service");
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can trigger an incident on this service may direct the agent",
+    );
+    expect(showWarnings().getByTestId("task-trigger-tools-note")).toHaveTextContent(
+      "This only works if the agent has a PagerDuty MCP server where this task runs.",
+    );
+    type("task-trigger-scope", "Checkout API");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    type("task-trigger-condition-0-value", "high");
+    type("task-trigger-instructions", "Find the likely cause.");
+
+    const prompt = await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].templateId).toBe("pagerduty");
+    expect(prompt).toContain(
+      'Watch: new PagerDuty incidents on service Checkout API that have urgency "high"',
+    );
+    expect(prompt).toContain(
+      'Add a note "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" to each incident',
     );
   });
 
