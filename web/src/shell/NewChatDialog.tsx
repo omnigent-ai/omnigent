@@ -2478,13 +2478,21 @@ function NewChatLandingContent({
           autoSeededBranch: "",
         };
 
+  // A handoff or prompt link replaces the parked draft's text, and with it the
+  // tags that text's tokens pointed at.
+  const restoresDraftText = handoff === null && !linkedPrompt?.trim();
   const [message, setMessage] = useState<string>(() => {
     if (handoff !== null) return handoff.text;
     return linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? "");
   });
+  // Filled in once the mention browser below owns the tags.
+  const clearTaggedMentionsRef = useRef<() => void>(() => {});
   useEffect(() => {
     if (!searchParams.has("prompt") && handoffToken === null) return;
-    if (linkedPrompt?.trim()) setMessage(linkedPrompt);
+    if (linkedPrompt?.trim()) {
+      setMessage(linkedPrompt);
+      clearTaggedMentionsRef.current();
+    }
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
     remaining.delete("prompt");
@@ -5288,8 +5296,12 @@ function NewChatLandingContent({
     text: message,
     setText: setMessage,
     textareaRef,
-    initialMentions: restoredDraft?.mentions,
+    initialMentions: restoresDraftText ? restoredDraft?.mentions : undefined,
   });
+  clearTaggedMentionsRef.current = () => {
+    setMentionedItems([]);
+    setMentionedSessions([]);
+  };
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
   const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;

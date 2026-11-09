@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  detectMentionAt,
   composerInlineMentions,
   expandMentionTokens,
   findMentionTokens,
@@ -210,5 +211,22 @@ describe("rankSessionMentions", () => {
 
   it("matches nothing for a path-shaped query", () => {
     expect(rankSessionMentions([alpha], "src/")).toEqual([]);
+  });
+});
+
+describe("detectMentionAt", () => {
+  it("continues across a space only while a listed session title still matches", () => {
+    const titles = ["Casual greeting", "Explain Omnigent Repo"];
+    expect(detectMentionAt("hi @casual g", 12, titles)).toEqual({
+      query: "casual g",
+      start: 3,
+      end: 12,
+    });
+    expect(detectMentionAt("@casual ", 8, titles)?.query).toBe("casual ");
+    // No listed title contains the query, so the space finishes the token.
+    expect(detectMentionAt("@casual x", 9, titles)).toBeNull();
+    // A double space or a newline always finishes it.
+    expect(detectMentionAt("@casual  ", 9, titles)).toBeNull();
+    expect(detectMentionAt("@casual\ng", 9, titles)).toBeNull();
   });
 });

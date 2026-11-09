@@ -10635,6 +10635,60 @@ describe("NewChatLandingScreen @-file-mention", () => {
     );
   });
 
+  describe("when a prompt replaces a draft with tags", () => {
+    beforeEach(() => {
+      mockAgents([
+        testAgent("sdk1", "my-sdk-agent", { display_name: "SDK Agent", harness: "claude-sdk" }),
+      ]);
+      useConversationsMock.mockReturnValue({
+        data: {
+          pages: [
+            { data: [{ id: "s_parked", object: "conversation", title: "Plan", labels: {} }] },
+          ],
+        },
+      });
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+    });
+
+    function tagPlan() {
+      fireEvent.change(input(), { target: { value: "Read @pla", selectionStart: 9 } });
+      fireEvent.click(screen.getByTitle("Tag session Plan"));
+      expect(screen.getByTestId("composer-mention-token").textContent).toBe("@Plan");
+    }
+
+    async function sentText(): Promise<string> {
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+      return (setPendingInitialPromptMock.mock.calls[0]![1] as { text: string }).text;
+    }
+
+    it.each([
+      ["a prompt link", () => "/?prompt=Ask+%40Plan"],
+      ["a handoff", () => newSessionLocation("Ask @Plan", [])],
+    ])("drops the parked draft's tags when %s replaces it on mount", async (_case, link) => {
+      const parked = renderLanding();
+      tagPlan();
+      parked.unmount();
+      renderLanding({}, link());
+      expect(input()).toHaveValue("Ask @Plan");
+      // The replacement's "@Plan" is literal text, not the parked session.
+      expect(await sentText()).toBe("Ask @Plan");
+    });
+
+    it("drops the tags when a prompt link replaces the text while mounted", async () => {
+      renderLanding();
+      tagPlan();
+      fireEvent.click(screen.getByRole("button", { name: "Open another prompt link" }));
+      expect(input()).toHaveValue("Another request");
+      const typed = "Another request @Plan";
+      fireEvent.change(input(), { target: { value: typed, selectionStart: typed.length } });
+      expect(await sentText()).toBe(typed);
+    });
+  });
+
   it("deletes a tagged token whole on Backspace", () => {
     renderLanding();
     fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
