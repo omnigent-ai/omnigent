@@ -87,14 +87,14 @@ def host_ownership_key(workspace_id: int, host_id: str | None) -> str:
 # web/src/components/scheduled/triggerTemplates.ts), recognize the opening sentence.
 _TRIGGER_PROMPT_OPENINGS = tuple(
     f"This automation watches {source} and starts one Omnigent session"
-    for source in ("Jira", "Slack", "GitHub", "Linear")
+    for source in ("Jira", "Slack", "GitHub", "Linear", "PagerDuty")
 )
 # A trigger form can save its state as the prompt's first line, before the opening sentence.
 _TRIGGER_HEADER = re.compile(r"<!-- omnigent-trigger v\d+ [^\n]* -->\n")
 
 
 def is_trigger_automation(task: ScheduledTask) -> bool:
-    """Whether a task polls for new items, set up from a Jira, Slack, GitHub or Linear template."""
+    """Whether a task was set up from a trigger template and polls for new items."""
     if task.session_mode != "continue":
         return False
     header = _TRIGGER_HEADER.match(task.prompt)

@@ -191,8 +191,8 @@ A task that continues a session replaces steps 2 to 4 once it has a
 would, and sends the prompt, also while the session is busy with an earlier turn.
 It records `succeeded` once the prompt is delivered, without waiting for the turn.
 Trigger automations are the exception. A trigger automation is such a task whose
-prompt starts with the opening sentence of a Jira, Slack, GitHub or Linear
-trigger template, the same check the web form uses. The database scheduler
+prompt starts with the opening sentence of a Jira, Slack, GitHub, Linear or
+PagerDuty trigger template, the same check the web form uses. The database scheduler
 checks a trigger again two minutes after each poll (`TRIGGER_POLL_SECONDS`)
 instead of on its saved schedule, though never past the schedule's next
 occurrence: a schedule that ends (`COUNT` or `UNTIL`) still ends the trigger,

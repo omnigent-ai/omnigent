@@ -41,7 +41,7 @@ def test_sandbox_identity_is_stable_per_tenant_task_and_trigger(task) -> None:
     assert occurrence_host_id(pinned, "schedule:100") == pinned.host_id
 
 
-@pytest.mark.parametrize("source", ["Jira", "Slack", "GitHub", "Linear"])
+@pytest.mark.parametrize("source", ["Jira", "Slack", "GitHub", "Linear", "PagerDuty"])
 def test_trigger_automations_are_recognized_by_their_opening_sentence(task, source) -> None:
     from dataclasses import replace
 
