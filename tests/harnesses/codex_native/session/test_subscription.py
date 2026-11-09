@@ -1295,3 +1295,42 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.thread_id == "thread_after_signin"
+
+
+@pytest.mark.parametrize(
+    ("user_agent", "supported"),
+    [
+        ("omnigent/0.166.0 (Linux)", True),
+        ("omnigent/0.154.0", True),
+        ("omnigent/0.153.9", False),
+        ("unknown/0.166.0", False),
+        (None, False),
+    ],
+)
+async def test_codex_native_delivery_identity_is_negotiated_from_handshake(
+    monkeypatch: pytest.MonkeyPatch, user_agent: str | None, supported: bool
+) -> None:
+    """Known native peers negotiate stable message IDs; old and unknown peers fail closed."""
+
+    class Socket(_FakeCodexWebSocket):
+        async def send(self, payload: str) -> None:
+            self.sent.append(payload)
+            message = json.loads(payload)
+            if message.get("method") == "initialize":
+                await self.responses.put(
+                    json.dumps({"id": message["id"], "result": {"userAgent": user_agent}})
+                )
+
+    socket = Socket()
+
+    async def connect(*args, **kwargs):
+        return socket
+
+    monkeypatch.setattr(codex_native_app_server.websockets, "connect", connect)
+    client = codex_native_app_server.CodexAppServerClient(ws_url="ws://127.0.0.1:1")
+    assert client.supports_user_message_ids is False
+    try:
+        await client.connect()
+        assert client.supports_user_message_ids is supported
+    finally:
+        await client.close()

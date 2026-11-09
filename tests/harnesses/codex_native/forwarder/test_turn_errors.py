@@ -697,7 +697,26 @@ async def test_correlated_error_recovers_a_missed_turn_start(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("message", "expected_output"),
+    [
+        ("You've hit your usage limit.", "You've hit your usage limit."),
+        (
+            "Incomplete response returned, reason: max_output_tokens",
+            "Incomplete response returned, reason: max_output_tokens\n\n"
+            "The model reached its response length limit. Ask it to continue or split "
+            "the request into smaller parts.",
+        ),
+        (
+            "stream disconnected before completion: connection reset",
+            "stream disconnected before completion: connection reset",
+        ),
+    ],
+    ids=["usage-limit", "output-limit", "stream-disconnect"],
+)
+async def test_handle_event_deduplicates_error_then_terminal_boundary(
+    tmp_path: Path, message: str, expected_output: str
+) -> None:
     """A standalone error owns the terminal status for its turn."""
     write_bridge_state(
         tmp_path,
@@ -712,14 +731,18 @@ async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path: 
     client = _RecordingClient()
     usage_coalescer = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
     elicitation_tracker = fwd._CodexElicitationTaskTracker()
-    forwarder_state = fwd._CodexForwarderState()
+    native_client = _InterruptRecordingCodexClient()
+    native_client.supports_user_message_ids = True
+    forwarder_state = fwd._CodexForwarderState(
+        codex_client=native_client, mcp_startup_settled=True
+    )
     error_event = {
         "method": "error",
         "params": {
             "threadId": "thread_123",
             "turnId": "turn_123",
             "willRetry": False,
-            "error": {"message": "You've hit your usage limit."},
+            "error": {"message": message},
         },
     }
 
@@ -746,6 +769,7 @@ async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path: 
             usage_coalescer=usage_coalescer,
             elicitation_tracker=elicitation_tracker,
             expected_thread_id="thread_123",
+            codex_client=native_client,
             forwarder_state=forwarder_state,
         )
 
@@ -757,14 +781,22 @@ async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path: 
                 "data": {
                     "status": "failed",
                     "response_id": "codex_turn_123",
-                    "output": "You've hit your usage limit.",
+                    "output": expected_output,
                 },
             },
-        )
+        ),
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_background_work",
+                "data": {"running": False, "background_tasks": [], "background_task_count": 0},
+            },
+        ),
     ]
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id is None
+    assert not any(method in {"turn/start", "turn/steer"} for method, _ in native_client.requests)
 
 
 def test_terminal_error_from_turn_none_for_clean_turn() -> None:
