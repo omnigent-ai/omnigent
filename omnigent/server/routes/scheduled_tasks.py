@@ -592,6 +592,29 @@ def create_scheduled_tasks_router(
             f"cannot continue this session: {reason}", code=ErrorCode.INVALID_INPUT
         )
 
+    async def _require_mode_fits_session(request: Request, task: ScheduledTask) -> None:
+        """Reject a mode change that leaves *task*'s continued session unable to take prompts.
+
+        Other session problems are left to the next firing, which records them.
+        """
+        from omnigent.server.scheduled.fire import (
+            UNATTENDED_PERMISSION_ERROR_CODE,
+            continued_session_problem,
+        )
+
+        assert task.session_id is not None
+        conv = await asyncio.to_thread(conversation_store.get_conversation, task.session_id)
+        problem = await continued_session_problem(
+            task,
+            conv,
+            host_store=getattr(request.app.state, "host_store", None),
+            permission_store=permission_store,
+        )
+        if problem is not None and problem[1] == UNATTENDED_PERMISSION_ERROR_CODE:
+            raise OmnigentError(
+                f"cannot continue this session: {problem[0]}", code=ErrorCode.INVALID_INPUT
+            )
+
     @router.post("/scheduled-tasks")
     async def create_scheduled_task(
         request: Request,
@@ -1076,33 +1099,34 @@ def create_scheduled_tasks_router(
             for name in _SESSION_BOUND_FIELDS
         ):
             fields["session_id"] = None
+        # The task as this update leaves it, for checks against the session it continues.
+        continuing = replace(
+            existing,
+            **{
+                name: fields[name]
+                for name in (
+                    "agent_id",
+                    "host_id",
+                    "workspace",
+                    "base_branch",
+                    "execution_target",
+                    "permission_mode",
+                    "session_mode",
+                    "session_id",
+                )
+                if name in fields
+            },
+        )
         if fields.get("session_id") is not None:
-            picked = await _require_continuable(
-                request,
-                replace(
-                    existing,
-                    **{
-                        name: fields[name]
-                        for name in (
-                            "agent_id",
-                            "host_id",
-                            "workspace",
-                            "base_branch",
-                            "execution_target",
-                            "permission_mode",
-                            "session_mode",
-                            "session_id",
-                        )
-                        if name in fields
-                    },
-                ),
-            )
+            picked = await _require_continuable(request, continuing)
             # The session cannot move, so the task routes every run to its host.
             if (
                 fields.get("host_id", existing.host_id) is None
                 and fields.get("execution_target", existing.execution_target) != "managed_sandbox"
             ):
                 fields["host_id"] = picked.host_id
+        elif "permission_mode" in fields and continuing.continues_session:
+            await _require_mode_fits_session(request, continuing)
         project_owner = _project_owner(owner)
         try:
             if fields.get("project_id") is not None:

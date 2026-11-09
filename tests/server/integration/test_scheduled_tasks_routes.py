@@ -780,16 +780,17 @@ async def test_create_persists_permission_mode(
     assert got.status_code == 200
     assert got.json()["permission_mode"] == mode
     if mode == "full-access":
-        # Patch to a different mode so the read-back proves the update was saved.
-        changed = await auth_client.patch(
-            f"/v1/scheduled-tasks/{task_id}",
-            json={"permission_mode": "read-only"},
-            headers=_headers(),
-        )
-        assert changed.status_code == 200, changed.text
-        assert changed.json()["permission_mode"] == "read-only"
-        reread = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
-        assert reread.json()["permission_mode"] == "read-only"
+        # Patch out of and back into modes that skip approval; read-backs prove each saved.
+        for patched_mode in ("read-only", "bypass"):
+            changed = await auth_client.patch(
+                f"/v1/scheduled-tasks/{task_id}",
+                json={"permission_mode": patched_mode},
+                headers=_headers(),
+            )
+            assert changed.status_code == 200, changed.text
+            assert changed.json()["permission_mode"] == patched_mode
+            reread = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+            assert reread.json()["permission_mode"] == patched_mode
 
 
 @pytest.mark.parametrize("operation", ["create", "update"])
@@ -3137,6 +3138,14 @@ async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
             headers=_headers(),
         )
         assert picked.status_code == status, (update, picked.text)
+    # Changing only the mode is checked against the session the task continues.
+    for permission_mode, status in (("approve-for-me", 400), (None, 400), ("bypass", 200)):
+        changed = await auth_client.patch(
+            f"/v1/scheduled-tasks/{created['id']}",
+            json={"permission_mode": permission_mode},
+            headers=_headers(),
+        )
+        assert changed.status_code == status, (permission_mode, changed.text)
     assert copies == []
 
 
