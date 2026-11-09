@@ -6805,7 +6805,11 @@ def _overlay_escape_hint(pane: str) -> bool:
         return (
             last_rule >= 0
             and panel[0] == "Background"
-            and footer.endswith("↑/↓ to select · Enter to view · x to stop · Esc to close")
+            and (
+                footer.endswith("↑/↓ to select · Enter to view · x to stop · Esc to close")
+                or " ".join(" ".join(panel[1:]).split())
+                == "No tasks currently running ↑/↓ to select · Enter to view · Esc to close"
+            )
         )
     return bool(_ESCAPE_DISMISS_HINT.search("\n".join(panel[-3:]))) or _btw_overlay_present(pane)
 

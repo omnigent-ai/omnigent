@@ -12252,6 +12252,14 @@ _WRAPPED_BACKGROUND_PANEL = """\
   close
 """
 
+_WRAPPED_EMPTY_BACKGROUND_PANEL = """\
+──────────────────────────────
+  Background
+  No tasks currently running
+  ↑/↓ to select · Enter to view · Esc to
+  close
+"""
+
 # A sliver-height pane holding a multi-line draft: Claude Code renders the
 # box's opening rule and the draft's first row, then runs out of screen —
 # the closing rule never makes it on. The composer is live, so requiring
@@ -14019,6 +14027,8 @@ _WRAPPED_BTW_PANE = "\n".join(
         (_WRAPPED_BTW_PANE, True),
         (_WRAPPED_BACKGROUND_PANEL, False),
         (_WRAPPED_BACKGROUND_PANEL, True),
+        (_WRAPPED_EMPTY_BACKGROUND_PANEL, False),
+        (_WRAPPED_EMPTY_BACKGROUND_PANEL, True),
     ],
     ids=[
         "reverse-search",
@@ -14034,6 +14044,8 @@ _WRAPPED_BTW_PANE = "\n".join(
         "wrapped-quick-answer-after-preflight",
         "wrapped-background-panel",
         "wrapped-background-panel-after-preflight",
+        "wrapped-empty-background-panel",
+        "wrapped-empty-background-panel-after-preflight",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -14637,8 +14649,13 @@ def test_occupied_input_retries_stay_outside_the_double_escape_window(
 
 @pytest.mark.parametrize(
     "occupied_pane",
-    [_REVERSE_SEARCH_PANE, _WRAPPED_BTW_PANE, _WRAPPED_BACKGROUND_PANEL],
-    ids=["search", "wrapped-quick-answer", "wrapped-background-panel"],
+    [
+        _REVERSE_SEARCH_PANE,
+        _WRAPPED_BTW_PANE,
+        _WRAPPED_BACKGROUND_PANEL,
+        _WRAPPED_EMPTY_BACKGROUND_PANEL,
+    ],
+    ids=["search", "wrapped-quick-answer", "wrapped-background-panel", "wrapped-empty-background"],
 )
 def test_inject_slash_command_restores_an_occupied_input_box_first(
     tmp_path: Path,
@@ -14685,8 +14702,19 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
         _WRAPPED_BACKGROUND_PANEL + "\n──────────────────────────────\nStarting Claude…",
         _WRAPPED_BACKGROUND_PANEL.replace("Background", "Choose an action"),
         _WRAPPED_BACKGROUND_PANEL.replace("Enter to view · x to stop", "Enter to select"),
+        _WRAPPED_EMPTY_BACKGROUND_PANEL.replace("Background", "Choose an action"),
+        _WRAPPED_EMPTY_BACKGROUND_PANEL.replace("No tasks currently running", "Select a task"),
+        _WRAPPED_EMPTY_BACKGROUND_PANEL.replace("Enter to view", "Enter to select"),
     ],
-    ids=["composer", "scrollback", "other-dialog", "decision-footer"],
+    ids=[
+        "composer",
+        "scrollback",
+        "other-dialog",
+        "decision-footer",
+        "empty-other-dialog",
+        "empty-unrecognized-body",
+        "empty-decision-footer",
+    ],
 )
 def test_wrapped_background_footer_does_not_dismiss_other_screens(
     monkeypatch: pytest.MonkeyPatch, pane: str
