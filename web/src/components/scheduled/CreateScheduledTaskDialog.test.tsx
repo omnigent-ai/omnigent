@@ -38,6 +38,7 @@ import {
   readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
+  type TriggerSource,
 } from "./triggerTemplates";
 
 const gitWorkspace = vi.hoisted(() => ({
@@ -246,6 +247,7 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
           ...SERVER_INFO_OFFLINE_FALLBACK,
           features: { automations_v2: true },
           scheduled_task_harness_settings: true,
+          scheduled_task_approval_skipping_modes: true,
           scheduled_task_worktrees: true,
         }}
       >
@@ -266,6 +268,20 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
       expand();
     },
   };
+}
+
+/** A server with harness settings that predates modes that skip approval. */
+const REFUSES_APPROVAL_SKIPPING = {
+  ...SERVER_INFO_OFFLINE_FALLBACK,
+  features: { automations_v2: true },
+  scheduled_task_harness_settings: true,
+  scheduled_task_worktrees: true,
+};
+
+function serverInfo(acceptsApprovalSkipping: boolean) {
+  return acceptsApprovalSkipping
+    ? { ...REFUSES_APPROVAL_SKIPPING, scheduled_task_approval_skipping_modes: true }
+    : REFUSES_APPROVAL_SKIPPING;
 }
 
 function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
@@ -405,27 +421,35 @@ describe("prompt-first automation setup", () => {
     });
   });
 
-  it("clears a saved approval-skipping mode when editing only the instructions", async () => {
-    render(
-      <CreateScheduledTaskDialog
-        open
-        onOpenChange={vi.fn()}
-        editingTask={scheduledTask({
-          agentId: "ag_claude_native",
-          permissionMode: "bypassPermissions",
-        })}
-      />,
-    );
-    fireEvent.change(screen.getByLabelText("Instructions"), {
-      target: { value: "Also summarize CI failures" },
-    });
-    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
-      prompt: "Also summarize CI failures",
-      permissionMode: null,
-    });
-  });
+  it.each([
+    [false, null],
+    [true, "bypassPermissions"],
+  ])(
+    "on an instructions-only edit, keeps a saved approval-skipping mode only if the server accepts it (%s)",
+    async (accepted, expected) => {
+      render(
+        <CapabilitiesProvider info={serverInfo(accepted)}>
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              permissionMode: "bypassPermissions",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      fireEvent.change(screen.getByLabelText("Instructions"), {
+        target: { value: "Also summarize CI failures" },
+      });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+        prompt: "Also summarize CI failures",
+        permissionMode: expected,
+      });
+    },
+  );
 
   it("keeps saved names and overrides when editing instructions with Advanced collapsed", async () => {
     render(
@@ -1005,7 +1029,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
         onOpenChange={vi.fn()}
         editingTask={scheduledTask({
           agentId: "ag_claude_native",
-          permissionMode: "acceptEdits",
+          permissionMode: "bypassPermissions",
         })}
       />,
     );
@@ -1015,7 +1039,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const { input } = updateMutateAsync.mock.calls[0][0];
     expect(input).not.toHaveProperty("agentId");
-    expect(input.permissionMode).toBe("acceptEdits");
+    expect(input.permissionMode).toBe("bypassPermissions");
   });
 
   it.each(["Every day", "Every hour", "Custom schedule"])(
@@ -2005,16 +2029,6 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     ).toBeInTheDocument();
   });
 
-  it("does not offer permission modes that skip approval", async () => {
-    renderDialog();
-
-    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
-
-    expect(await screen.findByRole("option", { name: "Auto" })).toBeInTheDocument();
-    expect(screen.queryByRole("option", { name: "Bypass permissions" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("option", { name: "Don't ask" })).not.toBeInTheDocument();
-  });
-
   it("sends the selected model + effort on create for a capable agent", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
@@ -2221,14 +2235,19 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
   );
 
   it.each([
-    ["bypassPermissions", { permissionMode: null }],
-    ["acceptEdits", {}],
+    ["bypassPermissions", false, { permissionMode: null }],
+    ["bypassPermissions", true, {}],
+    ["acceptEdits", false, {}],
   ])(
-    "on a continued-session edit, clears only a refused %s override",
-    async (savedMode, expectedPermission) => {
+    "on a continued-session edit, clears a saved %s only for a server that refuses it (accepts: %s)",
+    async (savedMode, accepted, expectedPermission) => {
       render(
         <CapabilitiesProvider
-          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            scheduled_task_session_modes: true,
+            scheduled_task_approval_skipping_modes: accepted,
+          }}
         >
           <CreateScheduledTaskDialog
             open
@@ -3068,6 +3087,7 @@ describe("automation trigger type", () => {
     ["Slack", "slack", "support"],
     ["GitHub", "github", "acme/app"],
     ["Linear", "linear", "ENG"],
+    ["PagerDuty", "pagerduty", "Checkout API"],
   ])(
     "defaults to Schedule and creates a %s trigger from the selector",
     async (label, source, scope) => {
@@ -3204,7 +3224,7 @@ describe("automation trigger type", () => {
       );
       fireEvent.keyDown(screen.getByLabelText("Trigger type"), { key: "Enter" });
       await screen.findByRole("listbox");
-      for (const label of ["Jira", "Slack", "GitHub", "Linear"]) {
+      for (const label of ["Jira", "Slack", "GitHub", "Linear", "PagerDuty"]) {
         expect(screen.getByRole("option", { name: label })).toHaveAttribute(
           "aria-disabled",
           "true",
@@ -3217,6 +3237,21 @@ describe("automation trigger type", () => {
     },
   );
 
+  it("shows each integration's logo in the Trigger type options and the selected value", async () => {
+    render(dialog());
+    const trigger = screen.getByLabelText("Trigger type");
+    expect(trigger.querySelector("svg.lucide-clock")).not.toBeNull();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    await screen.findByRole("listbox");
+    for (const option of ["schedule", "jira", "slack", "github", "linear", "pagerduty"]) {
+      expect(screen.getByTestId(`task-trigger-type-${option}`).querySelector("svg")).not.toBeNull();
+    }
+    fireEvent.click(screen.getByRole("option", { name: "PagerDuty" }));
+    expect(trigger).toHaveTextContent("PagerDuty");
+    expect(trigger.querySelector("svg.lucide-clock")).toBeNull();
+    expect(trigger.querySelector("svg")).not.toBeNull();
+  });
+
   it("preserves the existing editor for saved automations", () => {
     render(dialog({ editingTask: scheduledTask() }));
     expect(screen.queryByLabelText("Trigger type")).not.toBeInTheDocument();
@@ -3226,7 +3261,7 @@ describe("automation trigger type", () => {
 
 describe("CreateScheduledTaskDialog trigger template", () => {
   function renderTrigger(
-    source: "jira" | "slack" | "github" | "linear",
+    source: TriggerSource,
     extraInfo: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> = {},
     sessionLink = "https://omni.example.com/c/CONVERSATION_ID",
   ) {
@@ -3619,6 +3654,64 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt).toContain("Watch: new Linear issues in team ENG that are unassigned");
     expect(prompt).toContain(
       'Comment "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" on each issue',
+    );
+  });
+
+  it("builds a PagerDuty trigger for a service, with an urgency row and the note link-back", async () => {
+    renderTrigger("pagerduty");
+    expect(screen.getByTestId("task-name-input")).toHaveValue("PagerDuty incidents");
+    expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Incident triggered");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where service");
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can trigger an incident on this service may direct the agent",
+    );
+    expect(showWarnings().getByTestId("task-trigger-tools-note")).toHaveTextContent(
+      "This only works if the agent has a PagerDuty MCP server where this task runs.",
+    );
+    type("task-trigger-scope", "Checkout API");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    type("task-trigger-condition-0-value", "high");
+    type("task-trigger-instructions", "Find the likely cause.");
+
+    const prompt = await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].templateId).toBe("pagerduty");
+    expect(prompt).toContain(
+      'Watch: new PagerDuty incidents on service Checkout API that have urgency "high"',
+    );
+    expect(prompt).toContain(
+      'Add a note "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" to each incident',
+    );
+  });
+
+  it("matches PagerDuty services by name with contains, which other sources don't offer", async () => {
+    function scopeOperatorOptions() {
+      const scopeOperator = screen.getByTestId("task-trigger-scope-operator");
+      fireEvent.pointerDown(
+        scopeOperator,
+        new MouseEvent("pointerdown", { bubbles: true, button: 0 }),
+      );
+      fireEvent.click(scopeOperator);
+      return screen.getAllByRole("option").map((option) => option.textContent);
+    }
+
+    const { unmount } = renderTrigger("jira");
+    expect(scopeOperatorOptions()).toEqual(["equals", "in"]);
+    unmount();
+
+    renderTrigger("pagerduty");
+    expect(scopeOperatorOptions()).toEqual(["equals", "in", "contains"]);
+    fireEvent.click(screen.getByRole("option", { name: "contains" }));
+    expect(screen.getByTestId("task-trigger-scope-operator")).toHaveTextContent("contains");
+    type("task-trigger-scope", "payments, checkout");
+    type("task-trigger-instructions", "Find the likely cause.");
+    expect(screen.getByRole("alert")).toHaveTextContent("Contains matches one piece of text.");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    type("task-trigger-scope", "payments");
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    const prompt = await submittedPrompt();
+    expect(prompt).toContain(
+      'Watch: new PagerDuty incidents on services whose name contains "payments"',
     );
   });
 
@@ -4280,8 +4373,7 @@ describe("automation harness settings", () => {
     ["pi-native", true, true, false],
     ["devin-native", true, true, true],
     ["cursor-native", false, false, true],
-    // Antigravity's only non-default mode skips approval, which automations cannot use.
-    ["antigravity-native", false, false, false],
+    ["antigravity-native", false, false, true],
     ["opencode-native", false, false, false],
   ])("shows independent settings for %s", (harness, model, effort, permission) => {
     mockHarness(harness);
@@ -4291,6 +4383,46 @@ describe("automation harness settings", () => {
     expect(!!screen.queryByTestId("task-permission-trigger")).toBe(permission);
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", harness, model);
   });
+
+  it.each([
+    ["Full Access", "full-access"],
+    ["Bypass approvals & sandbox", "bypass"],
+  ])("saves Codex's %s mode, which skips approval", async (label, mode) => {
+    mockHarness("codex-native");
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />,
+    );
+    await choose("permission", label);
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent(label);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe(mode);
+  });
+
+  it.each([
+    ["codex-native", "Approve for me", ["Full Access", "Bypass approvals & sandbox"]],
+    ["claude-native", "Auto", ["Bypass permissions", "Don't ask"]],
+  ])(
+    "hides %s modes that skip approval from a server that refuses them",
+    async (harness, kept, hidden) => {
+      mockHarness(harness);
+      render(
+        <CapabilitiesProvider info={REFUSES_APPROVAL_SKIPPING}>
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            initialName="R"
+            initialPrompt="P"
+          />
+        </CapabilitiesProvider>,
+      );
+      fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+      expect(await screen.findByRole("option", { name: kept })).toBeInTheDocument();
+      for (const name of hidden) {
+        expect(screen.queryByRole("option", { name })).not.toBeInTheDocument();
+      }
+    },
+  );
 
   it("starts a new Codex automation on Approve for me", async () => {
     mockHarness("codex-native");
@@ -4329,26 +4461,39 @@ describe("automation harness settings", () => {
     expect(updateMutateAsync.mock.calls[0][0].input.permissionMode).toBeNull();
   });
 
-  it("clears Antigravity's saved skip mode, which has no picker, on edit", async () => {
-    mockHarness("antigravity-native");
-    render(
-      <CreateScheduledTaskDialog
-        open
-        onOpenChange={vi.fn()}
-        editingTask={scheduledTask({ agentId: "selected-agent", permissionMode: "skip" })}
-      />,
-    );
-    expect(screen.queryByTestId("task-permission-trigger")).toBeNull();
-    fireEvent.change(screen.getByLabelText("Instructions"), {
-      target: { value: "Review again" },
-    });
-    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
-      prompt: "Review again",
-      permissionMode: null,
-    });
-  });
+  it.each([
+    [false, null],
+    [true, "skip"],
+  ])(
+    "on edit, keeps Antigravity's saved skip mode only if the server accepts it (%s)",
+    async (accepted, expected) => {
+      mockHarness("antigravity-native");
+      render(
+        <CapabilitiesProvider info={serverInfo(accepted)}>
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({ agentId: "selected-agent", permissionMode: "skip" })}
+          />
+        </CapabilitiesProvider>,
+      );
+      // Without the mode the picker has nothing to offer, so it is hidden.
+      if (accepted) {
+        expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Skip permissions");
+      } else {
+        expect(screen.queryByTestId("task-permission-trigger")).toBeNull();
+      }
+      fireEvent.change(screen.getByLabelText("Instructions"), {
+        target: { value: "Review again" },
+      });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+        prompt: "Review again",
+        permissionMode: expected,
+      });
+    },
+  );
 
   it("creates Codex settings and resets an effort the next model cannot support", async () => {
     mockHarness("codex-native");

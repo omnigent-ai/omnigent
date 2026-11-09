@@ -2705,6 +2705,13 @@ function createWindow(targetUrl, opts = {}) {
       spellcheck: true,
     },
   });
+  const sendFullScreenState = () => {
+    if (!win.isDestroyed()) {
+      win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
+    }
+  };
+  win.on("enter-full-screen", sendFullScreenState);
+  win.on("leave-full-screen", sendFullScreenState);
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   // CLI config stores the API mount; Electron boots the browser-facing SPA.
@@ -4424,8 +4431,16 @@ function pickWorkspaceForBridge(parent, workspaces, { signal } = {}) {
   });
 }
 
+// A mic click moves focus off the message box and back. macOS refuses Dictation
+// ("bottom line input") until it has registered the refocused field.
+const SYSTEM_DICTATION_FOCUS_SETTLE_MS = 150;
+
 function registerIpc() {
   registerWorkspacePickerIpc();
+  ipcMain.handle("omnigent:is-full-screen", (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return win?.isFullScreen() === true;
+  });
   ipcMain.handle("omnigent:cancel-server-connection", (event, requestId) => {
     if (!isSetupPageSender(event))
       throw new Error("Connection cancellation is only available to the setup page");
@@ -4887,6 +4902,25 @@ function registerIpc() {
   ipcMain.handle("omnigent:confirm-quit", (event, options) => {
     if (!isPinnedOriginSender(event)) return false;
     quitConfirmation.confirmQuit({ dontAskAgain: options?.dontAskAgain === true });
+    return true;
+  });
+
+  // Composer mic on macOS when the server has no dictation: the same action as
+  // Edit > Start Dictation…, which types into the focused field. The page has
+  // focused its message box; focusing the page too takes native focus back
+  // from an embedded browser view.
+  ipcMain.handle("omnigent:start-system-dictation", async (event) => {
+    if (process.platform !== "darwin" || !isPinnedOriginSender(event)) return false;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const focused = () => !win.isDestroyed() && BrowserWindow.getFocusedWindow() === win;
+    if (!win || !focused()) return false;
+    win.webContents.focus();
+    await new Promise((resolve) => {
+      setTimeout(resolve, SYSTEM_DICTATION_FOCUS_SETTLE_MS);
+    });
+    // Dictation types into the key window, so don't start it if the user switched away.
+    if (!focused()) return false;
+    Menu.sendActionToFirstResponder("startDictation:");
     return true;
   });
 

@@ -16,7 +16,15 @@ import sqlite3
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
@@ -85,6 +93,7 @@ from omnigent.harnesses.codex_native.timeouts import (
     APP_SERVER_READY_TIMEOUT_SECONDS as _APP_SERVER_READY_TIMEOUT_SECONDS,
 )
 from omnigent.inner import _proc
+from omnigent.inner._subprocess_lifecycle import subprocess_exited
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
@@ -2514,6 +2523,7 @@ class CodexNativeAppServer:
     session_id: str | None = None
     writable_roots: tuple[str, ...] = ()
     app_server_command: tuple[str, ...] = ()
+    active_harnesses: Collection[str] | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
     # First TLS certificate failure the launcher printed; mirrored into the
     # bridge so the forwarder can fail a stuck turn with the cause.
@@ -2754,6 +2764,19 @@ class CodexNativeAppServer:
         effort_catalog_transport = self.listen_url or str(self.socket_path)
         _effort_catalog_cache.pop(effort_catalog_transport, None)
         _effort_catalog_misses.pop(effort_catalog_transport, None)
+        from omnigent.mcp_disabled_servers import (
+            RELAUNCH_WITHOUT_OVERRIDES_EVENT,
+            plan_codex_launch,
+        )
+
+        mcp_plan = plan_codex_launch(
+            self.config_overrides,
+            executor="codex-native",
+            active_harnesses=self.active_harnesses,
+            codex_home=self.codex_home,
+            cwd=self.cwd,
+        )
+        self.config_overrides = list(mcp_plan.config_overrides)
         await self._spawn_app_server_process(resolved_listen)
         # Ordering invariant: hooks.json is written before the spawn above,
         # and the trust handshake must complete before the first turn — codex
@@ -2770,7 +2793,25 @@ class CodexNativeAppServer:
         # outer guard so a cancellation mid-trust still tears down.
         try:
             try:
-                startup_client = await self._wait_until_ready()
+                try:
+                    startup_client = await self._wait_until_ready()
+                except Exception:
+                    fallback = mcp_plan.overrides_after_early_exit()
+                    if (
+                        fallback is None
+                        or self.proc is None
+                        or not await subprocess_exited(self.proc)
+                    ):
+                        raise
+                    _logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
+                    await self.close()
+                    self.certificate_failure = None
+                    clear_certificate_failure(self.bridge_dir)
+                    self.config_overrides = list(fallback)
+                    if resolved_listen.startswith("unix://"):
+                        self.socket_path.unlink(missing_ok=True)
+                    await self._spawn_app_server_process(resolved_listen)
+                    startup_client = await self._wait_until_ready()
             except CodexAppServerSilentStartTimeout as silent:
                 # A fresh app-server can stall before initialization; a second spawn
                 # can recover. Reuse the transport: callers captured the listen
