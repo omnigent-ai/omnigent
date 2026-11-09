@@ -3220,9 +3220,10 @@ function ComposerImpl(
     if (fresh.length > 0) setMentionedItems((prev) => [...prev, ...fresh]);
     // Each attachment lands as an inline token at the end of the draft.
     editText(null, (prev) => {
-      const missing = [...new Set(tokens)].filter(
-        (token) => findMentionTokens(prev, [token]).length === 0,
-      );
+      // Scan with every known token at once, longest first, so a file token is
+      // only present when it stands alone, not as the start of a longer token.
+      const present = new Set(findMentionTokens(prev, taken).map((range) => range.token));
+      const missing = [...new Set(tokens)].filter((token) => !present.has(token));
       if (missing.length === 0) return prev;
       const gap = prev === "" || /\s$/.test(prev) ? "" : " ";
       return `${prev}${gap}${missing.join(" ")} `;

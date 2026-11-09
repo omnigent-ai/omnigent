@@ -329,11 +329,37 @@ describe("UserBubble messages from another session", () => {
 
   it("fetches an uncached sender once and says 'another session' when it is unreadable", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ detail: "not found" }, 404));
-    renderOriginBubble(new QueryClient(), "[Message from session s_gone]\nhello");
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const client = new QueryClient();
+    renderOriginBubble(client, "[Message from session s_gone]\nhello");
+    // Wait for the failed lookup to settle, not just for the loading fallback.
+    await waitFor(() => expect(client.getQueryState(["session", "s_gone"])?.status).toBe("error"));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(String(fetchMock.mock.calls[0]![0])).toContain("/v1/sessions/s_gone");
     expect(screen.getByTestId("message-origin").textContent).toBe("Fromanother session");
     expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
+  });
+
+  it("fetches an uncached sender once and reuses it for later bubbles", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ id: "s_far", object: "session", title: "Release notes draft" }),
+    );
+    const client = new QueryClient();
+    renderOriginBubble(client, "[Message from session s_far]\nfirst");
+    await waitFor(() =>
+      expect(screen.getByTestId("mention-pill").textContent).toBe("@Release notes draft"),
+    );
+    cleanup();
+    renderOriginBubble(client, "[Message from session s_far]\nsecond");
+    expect(screen.getByTestId("mention-pill").textContent).toBe("@Release notes draft");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a system-looking message from another session as an attributed user bubble", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "s_src"], { title: "Casual greeting", parentSessionId: null });
+    renderOriginBubble(client, "[Message from session s_src]\n[System: build finished]");
+    expect(screen.getByTestId("message-origin").textContent).toBe("From@Casual greeting");
+    expect(screen.getByText("[System: build finished]")).toBeInTheDocument();
   });
 });
 

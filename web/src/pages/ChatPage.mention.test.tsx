@@ -541,6 +541,31 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(onSend).toHaveBeenCalledWith("compare  with [Attached: readme.md]", undefined);
   });
 
+  it("re-adds a file on 'Attach to agent' when only a longer session token still starts with it", () => {
+    const onSend = vi.fn();
+    sessions.loaded = [sessionRow("s_readme", "readme.md")];
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    // File first, so the session gets the longer, disambiguated token.
+    type("compare @readme");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    append("with @readme");
+    fireEvent.click(screen.getByTitle("Tag session readme.md"));
+    const [fileToken, sessionToken] = tokens();
+    expect(fileToken).toBe("@readme.md");
+    expect(sessionToken.startsWith("@readme.md ")).toBe(true);
+    // Delete the standalone file token, then attach the file again from the viewer.
+    type(`compare  with ${sessionToken} `);
+    act(() => {
+      useChatStore.setState({ pendingComposerAttachments: [{ path: "readme.md", isDir: false }] });
+    });
+    expect(tokens()).toEqual([sessionToken, "@readme.md"]);
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe(
+      'compare  with [Session: "readme.md" id=s_readme subagent=no] [Attached: readme.md]' +
+        `\n\n${SESSION_MENTION_HINT}`,
+    );
+  });
+
   it("keeps the highlighted file when session results land above it", async () => {
     sessions.searchHits = [sessionRow("s_readme", "readme cleanup")];
     renderWithTooltips(<Composer {...composerProps()} />);
@@ -794,6 +819,22 @@ describe("Composer @-session mentions", () => {
     fireEvent.submit(textarea().closest("form")!);
     expect(onSend.mock.calls[0]![0]).toBe(
       `Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review\n\n${SESSION_MENTION_HINT}`,
+    );
+  });
+
+  it("inserts a mention picked mid-sentence in place and sends it there", async () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    const draft = "ask @alp to finish it";
+    const caret = "ask @alp".length;
+    fireEvent.change(textarea(), { target: { value: draft, selectionStart: caret } });
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+    expect(textarea().value).toBe("ask @Alpha planning to finish it");
+    // The caret lands after the token and the existing space.
+    await waitFor(() => expect(textarea().selectionStart).toBe("ask @Alpha planning ".length));
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend.mock.calls[0]![0]).toBe(
+      `ask [Session: "Alpha planning" id=s_alpha subagent=no] to finish it\n\n${SESSION_MENTION_HINT}`,
     );
   });
 
