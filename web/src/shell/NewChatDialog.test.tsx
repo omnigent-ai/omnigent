@@ -27,7 +27,10 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => useTestConversations(),
+  useOptionalLoadedConversations: () => useTestConversations().data,
+}));
 import { useSkills } from "@/hooks/useSkills";
 
 vi.mock("@/hooks/useSkills", () => ({ useSkills: vi.fn() }));
@@ -399,6 +402,17 @@ const CLAUDE_MODEL_OPTIONS_RESULT = {
     { id: "opus", model: "system.ai.claude-opus-4-8[1m]", displayName: "Opus 4.8" },
     { id: "sonnet", model: "system.ai.claude-sonnet-4-6[1m]", displayName: "Sonnet 4.6" },
     { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
+  ],
+};
+const PI_MODEL_OPTIONS_RESULT = {
+  ...SUCCESS_QUERY_STATE,
+  data: [
+    {
+      id: "omnigent/system.ai.pi-catalog-model",
+      model: "omnigent/system.ai.pi-catalog-model",
+      displayName: "system.ai.pi-catalog-model",
+      isDefault: true,
+    },
   ],
 };
 // Devin's catalog carries per-model effort rungs, which the effort picker derives
@@ -1443,6 +1457,12 @@ function renderLanding(
   };
 }
 
+it.each([false, undefined])("explains unavailable nested-agent links (%s)", (capability) => {
+  renderLanding({ sibling_sessions: capability }, "/?sibling=source");
+  expect(screen.getByRole("alert")).toHaveTextContent("Nested agents are not available");
+  expect(screen.queryByTestId("new-chat-landing-submit")).toBeNull();
+});
+
 function landingInfo(infoOverrides: Partial<ServerInfo>): ServerInfo {
   return {
     accounts_enabled: false,
@@ -2309,6 +2329,50 @@ describe("NewChatLandingScreen cached picker preview", () => {
       useHostModelOptionsMock.mock.calls.filter(([, h]) => h === "claude-native").at(-1),
     ).toEqual(["host_1", "claude-native", false, { poll: false }]);
     expect(readNewChatPickerOptionsCache(snapshot.key)?.models.claude).toEqual(cachedModels);
+  });
+
+  it("does not offer cached models after an unresponsive CLI's catalog request fails", () => {
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
+    ]);
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "pi-native": "cli-unresponsive" },
+      } as Host,
+    ]);
+    localStorage.setItem(LAST_AGENT_KEY, "a_pi");
+    mockModelQueries((harness) =>
+      harness === "pi-native" ? PI_MODEL_OPTIONS_RESULT : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    const { unmount } = renderLanding();
+    const modelValue = () =>
+      within(screen.getByTestId("new-chat-landing-agent-select")).getByTestId(
+        "new-chat-landing-agent-model-value",
+      );
+    expect(modelValue()).toHaveTextContent("pi-catalog-model");
+    unmount();
+    resetLandingDraft();
+    expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey(""))?.models.pi).toEqual(
+      PI_MODEL_OPTIONS_RESULT.data,
+    );
+
+    mockModelQueries((harness) =>
+      harness === "pi-native"
+        ? {
+            ...SUCCESS_QUERY_STATE,
+            status: "error",
+            isError: true,
+            isSuccess: false,
+            data: undefined,
+            error: new Error("Pi catalog request timed out"),
+          }
+        : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    renderLanding();
+    expect(modelValue()).toHaveTextContent("Models unavailable");
+    expect(modelValue()).not.toHaveTextContent("pi-catalog-model");
   });
 
   it("keeps the named preview when a populated catalog becomes offline", () => {
@@ -7030,9 +7094,11 @@ describe("NewChatLandingScreen", () => {
     [false, "{Shift>}{Enter}{/Shift}"],
     [true, "{Enter}"],
     [true, "{Shift>}{Enter}{/Shift}"],
+    [false, "{Alt>}{Enter}{/Alt}"],
+    [true, "{Alt>}{Enter}{/Alt}"],
   ] as const)("preserves newline input (alternate send: %s)", async (alternate, keys) => {
-    // Same newline contract as the in-session composer: Shift+Enter (and, in
-    // alternate mode, plain Enter) inserts a line break instead of creating.
+    // Same newline contract as the in-session composer: Shift+Enter, Alt+Enter
+    // (and, in alternate mode, plain Enter) insert a line break instead of creating.
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
     renderLanding();
     const input = screen.getByTestId("new-chat-landing-input");
@@ -7527,6 +7593,61 @@ describe("NewChatLandingScreen", () => {
       expect(badge).toHaveAccessibleName(badgeName);
       fireEvent.focus(badge);
       expect(await screen.findByRole("tooltip")).toHaveTextContent(warning);
+    },
+  );
+
+  it.each([false, true])(
+    "lets the user pick a harness whose CLI did not respond and warns about it (repair enabled: %s)",
+    (repairEnabled) => {
+      mockAgents([
+        DEFAULT_LANDING_AGENTS[0],
+        {
+          id: "a_pi",
+          name: "pi-native-ui",
+          display_name: "Pi",
+          description: null,
+          harness: "pi-native",
+          skills: [],
+        },
+      ]);
+      mockHosts([
+        {
+          ...host("online"),
+          configured_harnesses: { "claude-native": true, "pi-native": "cli-unresponsive" },
+        } as Host,
+      ]);
+      mockModelQueries((harness) =>
+        harness === "pi-native" ? PI_MODEL_OPTIONS_RESULT : CLAUDE_MODEL_OPTIONS_RESULT,
+      );
+      renderLanding({ harness_install_enabled: repairEnabled });
+      const lastPiModelQuery = () =>
+        useHostModelOptionsMock.mock.calls.filter(([, harness]) => harness === "pi-native").at(-1);
+      expect(lastPiModelQuery()?.[2]).toBe(false);
+      expect(screen.queryByTestId("new-chat-landing-harness-warning")).toBeNull();
+
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+      const row = screen.getByTestId("new-chat-landing-agent-a_pi");
+      expect(row).not.toHaveAttribute("aria-disabled", "true");
+      expect(within(row).queryByTestId("new-chat-landing-agent-warning-a_pi")).toBeNull();
+      fireEvent.click(row);
+      closeMenu();
+
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Harness readiness changed" },
+      });
+      const notice = screen.getByTestId("new-chat-landing-harness-warning");
+      expect(notice).toHaveTextContent("Pi's CLI on machine-1 did not respond to a version check");
+      expect(notice).not.toHaveTextContent("outdated");
+      expect(notice).not.toHaveTextContent("isn't ready");
+      expect(screen.queryByTestId("new-chat-landing-harness-setup")).toBeNull();
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+      expect(lastPiModelQuery()).toEqual(["host_1", "pi-native", true, { poll: true }]);
+      expect(
+        within(screen.getByTestId("new-chat-landing-agent-select")).getByTestId(
+          "new-chat-landing-agent-model-value",
+        ),
+      ).toHaveTextContent("pi-catalog-model");
     },
   );
 
@@ -10454,6 +10575,48 @@ describe("NewChatLandingScreen @-file-mention", () => {
     expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
   });
 
+  it("tags a loaded session for any agent and delivers its marker", async () => {
+    mockAgents([
+      testAgent("sdk1", "my-sdk-agent", { display_name: "SDK Agent", harness: "claude-sdk" }),
+    ]);
+    useConversationsMock.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: [
+              { id: "s_alpha", object: "conversation", title: "Alpha planning", labels: {} },
+              { id: "s_old", object: "conversation", title: "Old", labels: {}, archived: true },
+            ],
+          },
+        ],
+      },
+    });
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+
+    // A bare "@" opens to cached sessions only: no files for an SDK agent, no archived rows.
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("session-mention-category-sessions"));
+    expect(screen.queryByTitle("Tag session Old")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+    expect((input() as HTMLTextAreaElement).value).toBe("@Alpha planning ");
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@Alpha planning");
+
+    const draft = "@Alpha planning continue it";
+    fireEvent.change(input(), { target: { value: draft, selectionStart: draft.length } });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+    const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
+    expect((payload as { text: string }).text).toMatch(
+      /^\[Session: "Alpha planning" id=s_alpha subagent=no\] continue it\n\n\[Tagged sessions:[^\]]*\]$/,
+    );
+  });
+
   it("drills into a folder and delivers the chosen file as a workspace-relative marker", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
@@ -10469,10 +10632,11 @@ describe("NewChatLandingScreen @-file-mention", () => {
     expect(screen.queryByTitle("Attach cli.py")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTitle("Open omnigent"));
     fireEvent.click(screen.getByTitle("Attach cli.py"));
-    // The chip shows the workspace-relative path, not the host-absolute one.
-    expect(screen.getByText("@omnigent/cli.py")).toBeInTheDocument();
+    // The token is the workspace-relative path, not the host-absolute one.
+    expect((input() as HTMLTextAreaElement).value).toBe("@omnigent/cli.py ");
 
-    fireEvent.change(input(), { target: { value: "explain this", selectionStart: 12 } });
+    const draft = "@omnigent/cli.py explain this";
+    fireEvent.change(input(), { target: { value: draft, selectionStart: draft.length } });
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     // The contract: the first message carries "[Attached: <relpath>]" so the
@@ -10480,7 +10644,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
     // the "/Users/corey/repo/…" absolute path the host filesystem returned.
     await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
     const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
-    expect((payload as { text: string }).text).toBe("[Attached: omnigent/cli.py]\n\nexplain this");
+    expect((payload as { text: string }).text).toBe("[Attached: omnigent/cli.py] explain this");
   });
 
   it("suppresses stale parent rows while a drilled directory is still loading", async () => {
@@ -10534,23 +10698,122 @@ describe("NewChatLandingScreen @-file-mention", () => {
     fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
     // The folder row's "+" button attaches the directory as a unit.
     fireEvent.click(screen.getByLabelText("Attach whole folder omnigent"));
-    expect(screen.getByText("@omnigent/")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@omnigent/");
 
-    fireEvent.change(input(), { target: { value: "review it", selectionStart: 9 } });
+    const draft = "@omnigent/ review it";
+    fireEvent.change(input(), { target: { value: draft, selectionStart: draft.length } });
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
     const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
-    expect((payload as { text: string }).text).toBe("[Attached: omnigent/]\n\nreview it");
+    expect((payload as { text: string }).text).toBe("[Attached: omnigent/] review it");
   });
 
-  it("removes a tagged chip when its ✕ is clicked", () => {
+  it("keeps a tagged session when the landing draft is restored after a remount", async () => {
+    mockAgents([
+      testAgent("sdk1", "my-sdk-agent", { display_name: "SDK Agent", harness: "claude-sdk" }),
+    ]);
+    useConversationsMock.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: [{ id: "s_alpha", object: "conversation", title: "Alpha planning", labels: {} }],
+          },
+        ],
+      },
+    });
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const first = renderLanding();
+    fireEvent.change(input(), { target: { value: "Ask @alpha", selectionStart: 10 } });
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+    const draft = "Ask @Alpha planning to review";
+    fireEvent.change(input(), { target: { value: draft, selectionStart: draft.length } });
+    // Navigating into a session and back unmounts and remounts the landing screen.
+    first.unmount();
+    renderLanding();
+    expect((input() as HTMLTextAreaElement).value).toBe(draft);
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@Alpha planning");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+    const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
+    expect((payload as { text: string }).text).toMatch(
+      /^Ask \[Session: "Alpha planning" id=s_alpha subagent=no\] to review\n\n\[Tagged sessions:/,
+    );
+  });
+
+  describe("when a prompt replaces a draft with tags", () => {
+    beforeEach(() => {
+      mockAgents([
+        testAgent("sdk1", "my-sdk-agent", { display_name: "SDK Agent", harness: "claude-sdk" }),
+      ]);
+      useConversationsMock.mockReturnValue({
+        data: {
+          pages: [
+            { data: [{ id: "s_parked", object: "conversation", title: "Plan", labels: {} }] },
+          ],
+        },
+      });
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+    });
+
+    function tagPlan() {
+      fireEvent.change(input(), { target: { value: "Read @pla", selectionStart: 9 } });
+      fireEvent.click(screen.getByTitle("Tag session Plan"));
+      expect(screen.getByTestId("composer-mention-token").textContent).toBe("@Plan");
+    }
+
+    async function sentText(): Promise<string> {
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+      return (setPendingInitialPromptMock.mock.calls[0]![1] as { text: string }).text;
+    }
+
+    it.each([
+      ["a prompt link", () => "/?prompt=Ask+%40Plan"],
+      ["a handoff", () => newSessionLocation("Ask @Plan", [])],
+    ])("drops the parked draft's tags when %s replaces it on mount", async (_case, link) => {
+      const parked = renderLanding();
+      tagPlan();
+      parked.unmount();
+      renderLanding({}, link());
+      expect(input()).toHaveValue("Ask @Plan");
+      // The replacement's "@Plan" is literal text, not the parked session.
+      expect(await sentText()).toBe("Ask @Plan");
+    });
+
+    it("drops the tags when a prompt link replaces the text while mounted", async () => {
+      renderLanding();
+      tagPlan();
+      fireEvent.click(screen.getByRole("button", { name: "Open another prompt link" }));
+      expect(input()).toHaveValue("Another request");
+      const typed = "Another request @Plan";
+      fireEvent.change(input(), { target: { value: typed, selectionStart: typed.length } });
+      expect(await sentText()).toBe(typed);
+    });
+  });
+
+  it("deletes a tagged token whole on Backspace", () => {
     renderLanding();
     fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
     fireEvent.click(screen.getByTitle("Attach README.md"));
-    expect(screen.getByText("@README.md")).toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText("Remove README.md"));
-    expect(screen.queryByText("@README.md")).not.toBeInTheDocument();
+    fireEvent.change(input(), { target: { value: "@README.md", selectionStart: 10 } });
+    fireEvent.keyDown(input(), { key: "Backspace" });
+    expect((input() as HTMLTextAreaElement).value).toBe("");
+    expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
+    // Enter right away must not complete the mention that was just deleted.
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect((input() as HTMLTextAreaElement).value).toBe("");
+    expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
+    // Retyping the same text without picking it is literal, not the deleted tag.
+    fireEvent.change(input(), { target: { value: "read @README.md now", selectionStart: 19 } });
+    expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
   });
 });
 
