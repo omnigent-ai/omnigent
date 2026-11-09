@@ -5966,3 +5966,72 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
         assert session._certificate_failure is None
 
     _run(_t())
+
+
+@pytest.mark.parametrize("saved", [False, True])
+@pytest.mark.parametrize("active", [None, [], ["codex"]])
+@pytest.mark.parametrize("failures", [0, 1, 2])
+async def test_disabled_mcp_launch_hook_and_early_exit(
+    tmp_path, monkeypatch, caplog, active, failures, saved
+):
+    from omnigent import mcp_disabled_servers as disabled
+    from omnigent.errors import HarnessTransportClosedError
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    if saved:
+        disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
+    probe = AsyncMock(return_value={"fixture": True})
+    monkeypatch.setattr(disabled.SubprocessCodexProbe, "effective_servers", probe)
+    hook = AsyncMock(wraps=disabled.plan_codex_launch)
+    monkeypatch.setattr(disabled, "plan_codex_launch", hook)
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd=str(tmp_path),
+        env={},
+        tool_executor=None,
+        active_harnesses=active,
+    )
+    spawns = []
+
+    async def spawn(*args, **kwargs):
+        spawns.append(args)
+        return _FakeProcess()
+
+    async def initialize(*args, **kwargs):
+        assert args[0] == "initialize"
+        if len(spawns) <= failures:
+            raise HarnessTransportClosedError("early EOF", replay_safe=True)
+        return {"result": {}}
+
+    monkeypatch.setattr(session, "_request", initialize)
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    try:
+        if failures and (not (active and saved) or failures == 2):
+            with pytest.raises(HarnessTransportClosedError):
+                await session.start()
+        else:
+            await session.start()
+        hook.assert_awaited_once()
+        assert hook.call_args.kwargs["executor"] == "codex"
+        assert hook.call_args.kwargs["active_harnesses"] == active
+        baseline = ["/bin/echo", "app-server"]
+        for override in hook.call_args.args[1]:
+            baseline.extend(["-c", override])
+        expected = (
+            [*baseline, "-c", "mcp_servers.fixture.enabled=false"]
+            if active and saved
+            else baseline
+        )
+        assert list(spawns[0]) == expected
+        assert probe.await_count == bool(active and saved)
+        if failures and active and saved:
+            assert len(spawns) == 2
+            assert list(spawns[1]) == baseline
+            assert caplog.text.count("mcp_disabled_relaunch_without_overrides") == 1
+        else:
+            assert len(spawns) == 1
+    finally:
+        await session.close()

@@ -36,7 +36,7 @@ import pathlib
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
@@ -1122,7 +1122,7 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
                     " > ".join(("opus", "sonnet", "haiku", "fable")),
                 )
                 return servable
-    except Exception:  # the bundled catalog is the last resort
+    except Exception:  # noqa: BLE001 - the bundled catalog is the last resort
         logger.warning(
             "claude-sdk: live Databricks model discovery failed for profile %r; "
             "falling back to the bundled catalog",
@@ -1194,7 +1194,7 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
     )
     try:
         listing = model_catalog.listing_for_provider(provider)
-    except Exception:  # best-effort; unpinned aliases are the safe default
+    except Exception:  # noqa: BLE001 - best-effort; unpinned aliases are the safe default
         logger.warning(
             "claude-sdk: could not list the gateway's models; leaving "
             "ANTHROPIC_DEFAULT_*_MODEL and modelOverrides unset",
@@ -1704,6 +1704,7 @@ class ClaudeSDKExecutor(Executor):
         self,
         *,
         cwd: str | None = None,
+        active_harnesses: Collection[str] | None = None,
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
         permission_mode: str = "auto",
@@ -1907,6 +1908,7 @@ class ClaudeSDKExecutor(Executor):
 
         # Eagerly resolve the gateway transport env so errors surface at
         # construction time.
+        self._mcp_active_harnesses = active_harnesses
         self._extra_env: dict[str, str] = {}
         if gateway:
             gateway_env = _resolve_gateway_env(
@@ -2871,7 +2873,13 @@ class ClaudeSDKExecutor(Executor):
         # for the canonical ids the CLI names itself (the refusal-fallback).
         # No-op off the gateway transport.
         model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
-        settings_payload = _claude_settings_payload(api_key_helper, model_overrides)
+        from omnigent.mcp_disabled_servers import apply_claude_settings
+
+        settings_payload = apply_claude_settings(
+            _claude_settings_payload(api_key_helper, model_overrides),
+            executor="claude-sdk",
+            active_harnesses=self._mcp_active_harnesses,
+        )
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []
@@ -3154,7 +3162,7 @@ class ClaudeSDKExecutor(Executor):
                     for message in messages
                     if isinstance(message.message, dict)
                 ]
-            except Exception:
+            except Exception:  # noqa: BLE001 - startup recovery boundary
                 logger.warning(
                     "Failed to read Claude post-compaction session messages "
                     "(session=%s); preserving full server history instead of "
@@ -3528,6 +3536,24 @@ class ClaudeSDKExecutor(Executor):
                         system_msg = cast(_SystemMessageObj, message)
                         subtype = system_msg.subtype
                         data = system_msg.data
+
+                        if subtype == "init":
+                            from omnigent.mcp_disabled_servers import claude_loaded_anyway
+
+                            servers = data.get("mcp_servers", [])
+                            loaded = (
+                                (
+                                    row["name"]
+                                    for row in servers
+                                    if isinstance(row, dict) and isinstance(row.get("name"), str)
+                                )
+                                if isinstance(servers, list)
+                                else ()
+                            )
+                            for name in claude_loaded_anyway(
+                                loaded, active_harnesses=self._mcp_active_harnesses
+                            ):
+                                logger.warning("mcp_disabled_server_not_applied server=%s", name)
 
                         if subtype == "api_retry":
                             error_status = data.get("error_status")

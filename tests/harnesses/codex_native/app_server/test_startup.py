@@ -1179,3 +1179,95 @@ async def test_session_app_server_launches_through_the_configured_wrapper(
     )
     # The terminal keeps attaching through Codex itself, not the wrapper.
     assert server.codex_path == sys.executable
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("saved", [False, True])
+@pytest.mark.parametrize("active", [None, [], ["codex"]])
+async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
+    tmp_path, monkeypatch, active, saved, wrapped
+):
+    from omnigent import mcp_disabled_servers as disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    if saved:
+        disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
+
+    async def ready(server):
+        return _FakeStartupClient()
+
+    harness = _respawn_harness(tmp_path, monkeypatch, ready)
+    server = harness.server
+    server.active_harnesses = active
+    if wrapped:
+        server.app_server_command = ("wrapper", "codex", "--")
+    adapter = Mock(wraps=disabled.SubprocessCodexProbe)
+
+    (tmp_path / "source-codex-home/config.toml").write_text(
+        '[mcp_servers.fixture]\ncommand="true"\n'
+    )
+    probe_calls = []
+
+    async def probe(self, argv, **kwargs):
+        probe_calls.append((argv, kwargs))
+        private_home = Path(kwargs["env"]["CODEX_HOME"])
+        assert private_home == server.codex_home
+        assert "fixture" in (private_home / "config.toml").read_text()
+        assert kwargs["cwd"] == server.cwd
+        return {"fixture": True}
+
+    monkeypatch.setattr(disabled.SubprocessCodexProbe, "effective_servers", probe)
+    hook = AsyncMock(wraps=disabled.plan_codex_launch)
+    monkeypatch.setattr(disabled, "plan_codex_launch", hook)
+    monkeypatch.setattr(disabled, "SubprocessCodexProbe", adapter)
+    await server.start()
+    try:
+        hook.assert_awaited_once()
+        assert hook.call_args.args[0] == ("wrapper" if wrapped else server.codex_path)
+        adapter.assert_called_once_with(launch_args=("codex", "--") if wrapped else ())
+        assert hook.call_args.kwargs["executor"] == "codex-native"
+        assert hook.call_args.kwargs["active_harnesses"] == active
+        baseline = tuple(hook.call_args.args[1])
+        expected = (
+            (*baseline, "mcp_servers.fixture.enabled=false") if active and saved else baseline
+        )
+        assert tuple(server.config_overrides) == expected
+        assert len(probe_calls) == bool(active and saved)
+    finally:
+        await server.close()
+
+
+@pytest.mark.parametrize("second_fails", [False, True])
+async def test_disabled_mcp_early_exit_retries_once(tmp_path, monkeypatch, caplog, second_fails):
+    from omnigent import mcp_disabled_servers as disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
+    monkeypatch.setattr(
+        disabled.SubprocessCodexProbe,
+        "effective_servers",
+        AsyncMock(return_value={"fixture": True}),
+    )
+    attempts = []
+
+    async def ready(server):
+        attempts.append(tuple(server.config_overrides))
+        if len(attempts) == 1 or second_fails:
+            server.proc.returncode = 1
+            raise RuntimeError("early exit")
+        return _FakeStartupClient()
+
+    harness = _respawn_harness(tmp_path, monkeypatch, ready)
+    harness.server.active_harnesses = ["codex"]
+    if second_fails:
+        with pytest.raises(RuntimeError, match="early exit"):
+            await harness.server.start()
+    else:
+        await harness.server.start()
+    try:
+        assert len(harness.spawn_calls) == 2
+        assert attempts[0] == (*attempts[1], "mcp_servers.fixture.enabled=false")
+        assert caplog.text.count("mcp_disabled_relaunch_without_overrides") == 1
+        assert "mcp_servers.fixture.enabled=false" not in harness.server.config_overrides
+    finally:
+        await harness.server.close()

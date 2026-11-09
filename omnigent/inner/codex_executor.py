@@ -26,13 +26,14 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Iterable,
     Mapping,
     MutableMapping,
     Sequence,
 )
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
@@ -2788,6 +2789,7 @@ class _CodexAppServerSession:
         env: dict[str, str],
         tool_executor: CodexToolExecutor | None,
         codex_config_overrides: list[str] | None = None,
+        active_harnesses: Collection[str] | None = None,
         retry_policy: RetryPolicy | None = None,
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
@@ -2803,6 +2805,7 @@ class _CodexAppServerSession:
         self._env = env
         self._tool_executor = tool_executor
         self._codex_config_overrides = list(codex_config_overrides or [])
+        self._mcp_active_harnesses = active_harnesses
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
@@ -3065,65 +3068,87 @@ class _CodexAppServerSession:
                 await asyncio.to_thread(worker_launch.close)
                 raise RuntimeError("Codex session closed during worker preparation")
             self._worker_launch = worker_launch
-            argv = [self._worker_launch.launch_path, "app-server"]
-            for override in self._codex_config_overrides:
-                argv.extend(["-c", override])
-            spawn_argv = argv
-            pass_fds: tuple[int, ...] = ()
-            liveness_read_fd: int | None = None
-            await self._require_live_signer()
-            if self._worker_launch.sandboxed and os.name == "posix":
-                liveness_read_fd, self._worker_liveness_fd = os.pipe()
-                os.set_inheritable(liveness_read_fd, True)
-                spawn_argv = [
-                    sys.executable,
-                    str(Path(__file__).with_name("_liveness_exec.py")),
-                    "--liveness-fd",
-                    str(liveness_read_fd),
-                    *argv,
-                ]
-                pass_fds = (liveness_read_fd,)
-            try:
-                spawn_task = asyncio.create_task(
-                    _create_subprocess_exec(
-                        *spawn_argv,
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        env=proc_env,
-                        pass_fds=pass_fds,
-                        **_proc.spawn_kwargs(),
-                        cwd=self._cwd or os.getcwd(),
-                    )
-                )
-                self._worker_spawn_task = spawn_task
-                proc = await asyncio.shield(spawn_task)
-                self._proc = proc
-                if self._worker_spawn_task is spawn_task:
-                    self._worker_spawn_task = None
-                _proc.remember_process_group(self._proc)
-                _proc.refresh_process_tree(self._proc)
-                if self._closing:
-                    raise RuntimeError("Codex session closed during worker spawn")
-                await self._require_live_signer()
-            finally:
-                if liveness_read_fd is not None:
-                    os.close(liveness_read_fd)
-            self._reader_task = asyncio.create_task(self._reader_loop())
-            self._stderr_task = asyncio.create_task(self._stderr_loop())
-            self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
-            initialized = await self._request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "omnigent",
-                        "version": "0.1",
-                    },
-                    "capabilities": {
-                        "experimentalApi": True,
-                    },
-                },
+            from omnigent.mcp_disabled_servers import plan_codex_launch
+
+            mcp_plan = await plan_codex_launch(
+                self._worker_launch.launch_path,
+                self._codex_config_overrides,
+                executor="codex",
+                active_harnesses=self._mcp_active_harnesses,
+                env=proc_env,
+                cwd=process_cwd,
             )
+            self._codex_config_overrides = list(mcp_plan.config_overrides)
+            while True:
+                try:
+                    argv = [self._worker_launch.launch_path, "app-server"]
+                    for override in self._codex_config_overrides:
+                        argv.extend(["-c", override])
+                    spawn_argv = argv
+                    pass_fds: tuple[int, ...] = ()
+                    liveness_read_fd: int | None = None
+                    await self._require_live_signer()
+                    if self._worker_launch.sandboxed and os.name == "posix":
+                        liveness_read_fd, self._worker_liveness_fd = os.pipe()
+                        os.set_inheritable(liveness_read_fd, True)
+                        spawn_argv = [
+                            sys.executable,
+                            str(Path(__file__).with_name("_liveness_exec.py")),
+                            "--liveness-fd",
+                            str(liveness_read_fd),
+                            *argv,
+                        ]
+                        pass_fds = (liveness_read_fd,)
+                    try:
+                        spawn_task = asyncio.create_task(
+                            _create_subprocess_exec(
+                                *spawn_argv,
+                                stdin=asyncio.subprocess.PIPE,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                                env=proc_env,
+                                pass_fds=pass_fds,
+                                **_proc.spawn_kwargs(),
+                                cwd=self._cwd or os.getcwd(),
+                            )
+                        )
+                        self._worker_spawn_task = spawn_task
+                        proc = await asyncio.shield(spawn_task)
+                        self._proc = proc
+                        if self._worker_spawn_task is spawn_task:
+                            self._worker_spawn_task = None
+                        _proc.remember_process_group(self._proc)
+                        _proc.refresh_process_tree(self._proc)
+                        if self._closing:
+                            raise RuntimeError("Codex session closed during worker spawn")
+                        await self._require_live_signer()
+                    finally:
+                        if liveness_read_fd is not None:
+                            os.close(liveness_read_fd)
+                    self._reader_task = asyncio.create_task(self._reader_loop())
+                    self._stderr_task = asyncio.create_task(self._stderr_loop())
+                    self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
+                    initialized = await self._request(
+                        "initialize",
+                        {
+                            "clientInfo": {
+                                "name": "omnigent",
+                                "version": "0.1",
+                            },
+                            "capabilities": {
+                                "experimentalApi": True,
+                            },
+                        },
+                    )
+                    break
+                except HarnessTransportClosedError:
+                    fallback = mcp_plan.overrides_after_early_exit()
+                    if fallback is None:
+                        raise
+                    logger.warning("mcp_disabled_relaunch_without_overrides")
+                    await self._discard_early_exit_worker()
+                    self._codex_config_overrides = list(fallback)
+                    mcp_plan = replace(mcp_plan, outcome="none")
             user_agent = initialized.get("result", {}).get("userAgent")
             version = (
                 re.match(r"^[^/\s]+/(\d+)\.(\d+)\.(\d+)", user_agent)
@@ -3143,7 +3168,7 @@ class _CodexAppServerSession:
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
-                except Exception:  # never block session startup
+                except Exception:  # noqa: BLE001 - never block session startup
                     logger.warning(
                         "codex subagent-routing hook trust failed; "
                         "routing will not be enforced for this session",
@@ -3152,6 +3177,39 @@ class _CodexAppServerSession:
         except BaseException:
             await self.close()
             raise
+
+    async def _discard_early_exit_worker(self) -> None:
+        """Reap a pre-initialize worker while retaining its prepared sandbox and signer."""
+        self._close_worker_liveness()
+        proc = self._proc
+        if proc is not None:
+            reaped = await terminate_subprocess(
+                proc,
+                terminate_timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+                kill_timeout=1,
+                label="Codex app-server",
+                terminate_tree=_terminate_process_tree,
+                kill_tree=_kill_process_tree,
+            )
+            if not reaped:
+                raise RuntimeError("Codex early-exit worker could not be reaped")
+        tasks = [
+            task
+            for task in (self._reader_task, self._stderr_task, self._worker_census_task)
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for future in self._pending_requests.values():
+            if not future.done():
+                future.cancel()
+        self._pending_requests.clear()
+        if proc is not None:
+            close_subprocess_transport(proc)
+        self._proc = None
+        self._transport_error = None
+        self._events = asyncio.Queue()
 
     async def close(self) -> None:
         self._closing = True
@@ -3246,7 +3304,7 @@ class _CodexAppServerSession:
                         terminate_tree=_terminate_process_tree,
                         kill_tree=_kill_process_tree,
                     )
-                except Exception:  # cleanup must continue
+                except Exception:  # noqa: BLE001 - cleanup must continue
                     logger.warning("Codex worker cleanup failed", exc_info=True)
                     reaped = False
                 if not reaped:
@@ -3313,7 +3371,7 @@ class _CodexAppServerSession:
                     self._worker_launch_close_task = None
                     try:
                         launch_close_task.result()
-                    except Exception:  # cleanup must continue
+                    except Exception:  # noqa: BLE001 - cleanup must continue
                         logger.warning("Codex worker launch cleanup failed", exc_info=True)
                         cleanup_complete = False
                     else:
@@ -3421,7 +3479,7 @@ class _CodexAppServerSession:
             await signer.wait()
         except asyncio.CancelledError:
             raise
-        except Exception:  # any signer failure invalidates the worker
+        except Exception:  # noqa: BLE001 - any signer failure invalidates the worker
             logger.debug("model signer watcher failed", exc_info=True)
         self._signer_exited = True
         if not self._closing and self._proc is not None:
@@ -3452,7 +3510,7 @@ class _CodexAppServerSession:
                 await signer.close()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # cleanup state records failure
+            except Exception:  # noqa: BLE001 - cleanup state records failure
                 logger.warning("model signer close failed", exc_info=True)
             else:
                 if self._signer is signer:

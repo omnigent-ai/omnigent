@@ -15,7 +15,7 @@ import socket
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
@@ -533,7 +533,7 @@ def _sync_codex_developer_instructions(
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     try:
         document = tomlkit.parse(existing) if existing else tomlkit.document()
-    except Exception:  # title metadata must never block Codex startup.
+    except Exception:  # noqa: BLE001 - title metadata must never block Codex startup.
         _logger.warning(
             "Could not synchronize native Codex agent instructions: invalid private config",
             exc_info=True,
@@ -1976,7 +1976,7 @@ async def _codex_launch_catalog(
     try:
         if launch is None:
             launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
-    except Exception:  # a broken provider config means no catalog
+    except Exception:  # noqa: BLE001 - a broken provider config means no catalog
         _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
         return None
     fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
@@ -2209,6 +2209,7 @@ class CodexNativeAppServer:
     session_id: str | None = None
     writable_roots: tuple[str, ...] = ()
     app_server_command: tuple[str, ...] = ()
+    active_harnesses: Collection[str] | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
     # First TLS certificate failure the launcher printed; mirrored into the
     # bridge so the forwarder can fail a stuck turn with the cause.
@@ -2436,6 +2437,19 @@ class CodexNativeAppServer:
         effort_catalog_transport = self.listen_url or str(self.socket_path)
         _effort_catalog_cache.pop(effort_catalog_transport, None)
         _effort_catalog_misses.pop(effort_catalog_transport, None)
+        from omnigent.mcp_disabled_servers import SubprocessCodexProbe, plan_codex_launch
+
+        launch_command = self.app_server_command or (self.codex_path,)
+        mcp_plan = await plan_codex_launch(
+            launch_command[0],
+            self.config_overrides,
+            executor="codex-native",
+            active_harnesses=self.active_harnesses,
+            probe=SubprocessCodexProbe(launch_args=launch_command[1:]),
+            env=codex_app_server_diagnostic_env({**self.env, "CODEX_HOME": str(self.codex_home)}),
+            cwd=self.cwd,
+        )
+        self.config_overrides = list(mcp_plan.config_overrides)
         await self._spawn_app_server_process(resolved_listen)
         # Ordering invariant: hooks.json is written before the spawn above,
         # and the trust handshake must complete before the first turn — codex
@@ -2452,7 +2466,19 @@ class CodexNativeAppServer:
         # outer guard so a cancellation mid-trust still tears down.
         try:
             try:
-                startup_client = await self._wait_until_ready()
+                try:
+                    startup_client = await self._wait_until_ready()
+                except Exception:
+                    fallback = mcp_plan.overrides_after_early_exit()
+                    if fallback is None or self.proc is None or self.proc.returncode is None:
+                        raise
+                    _logger.warning("mcp_disabled_relaunch_without_overrides")
+                    await self.close()
+                    self.config_overrides = list(fallback)
+                    if resolved_listen.startswith("unix://"):
+                        self.socket_path.unlink(missing_ok=True)
+                    await self._spawn_app_server_process(resolved_listen)
+                    startup_client = await self._wait_until_ready()
             except CodexAppServerSilentStartTimeout as silent:
                 # A fresh app-server can stall before initialization; a second spawn
                 # can recover. Reuse the transport: callers captured the listen
@@ -2517,7 +2543,7 @@ class CodexNativeAppServer:
                                 ),
                                 timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS,
                             )
-                    except Exception:  # the local write below still repairs it
+                    except Exception:  # noqa: BLE001 - the local write below still repairs it
                         _logger.warning(
                             "Could not persist supported Codex reasoning effort at startup",
                             exc_info=True,
@@ -2536,7 +2562,7 @@ class CodexNativeAppServer:
             finally:
                 try:
                     await startup_client.close()
-                except Exception:  # a dead control socket cannot undo trust
+                except Exception:  # noqa: BLE001 - a dead control socket cannot undo trust
                     _logger.warning("Could not close Codex startup client", exc_info=True)
         except BaseException as exc:
             if isinstance(exc, Exception):
@@ -2613,7 +2639,7 @@ class CodexNativeAppServer:
             if self.router_hooks_registered:
                 try:
                     await trust_codex_router_hooks(client.request, cwd=str(self.cwd))
-                except Exception:  # routing trust never blocks startup
+                except Exception:  # noqa: BLE001 - routing trust never blocks startup
                     _logger.warning(
                         "codex subagent-routing hook trust failed; routing will not be enforced",
                         exc_info=True,
@@ -2637,7 +2663,7 @@ class CodexNativeAppServer:
                             len(still_untrusted),
                             ", ".join(still_untrusted),
                         )
-                except Exception:  # trust-all never blocks startup
+                except Exception:  # noqa: BLE001 - trust-all never blocks startup
                     _logger.warning(
                         "codex hook trust-all failed; the startup hook-review screen "
                         "may appear on resume",
@@ -3641,7 +3667,7 @@ def _resolve_databricks_codex_model(
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
         servable = discover_databricks_codex_models(host, creds.token)
-    except Exception as exc:  # cached ucode state is the launch fallback
+    except Exception as exc:  # noqa: BLE001 - cached ucode state is the launch fallback
         # Recoverable fallback; frames are debug-only so a TTY-mirrored
         # host console stays concise.
         _logger.warning(
@@ -3657,7 +3683,7 @@ def _resolve_databricks_codex_model(
             workspace_state = read_ucode_state(host)
             if workspace_state is not None:
                 servable = tuple(workspace_state.codex_models)
-        except Exception:  # the bundled catalog is the last resort
+        except Exception:  # noqa: BLE001 - the bundled catalog is the last resort
             _logger.warning(
                 "native-codex: could not read ucode state for %r", profile, exc_info=True
             )
