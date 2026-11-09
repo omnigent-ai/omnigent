@@ -2732,10 +2732,8 @@ function AppShellImpl() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
-            {/* Settings and the sidebar toggle live HERE on the macOS shell so
-          they hold one fixed position beside the traffic lights no matter what
-          the sidebar does. Search sits with the wordmark while the sidebar is
-          open, then moves beside the expand button when it collapses. */}
+            {/* macOS shell: the toggle and Back/Forward stay fixed beside the traffic
+          lights. Search joins them when collapsed; Settings is in the profile footer. */}
             {/* Hidden on /settings: the settings nav replaces the session list
           INSIDE the sidebar, and its "Back" row is the only way out. Leaving a
           collapse toggle up here would let the user hide the one exit and strand
@@ -2766,6 +2764,7 @@ function AppShellImpl() {
                     }
                     setSidebarPeek(false);
                   }}
+                  showSettings={false}
                   // Dwell-to-peek moves here with the button: on mac this cluster
                   // replaces ChatHeader's collapsed-state toggle, which is where
                   // peek was armed, so without this the affordance would vanish.

@@ -282,6 +282,9 @@ class ServerInfoResponse(BaseModel):
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
+    # Scheduled tasks accept explicit modes that skip approval; servers that omit
+    # this may reject them, so clients hide those modes.
+    scheduled_task_approval_skipping_modes: bool = True
     scheduled_task_sandbox_workspaces: bool = True
     # Owner-private families and reuse of the source session's sandbox.
     sibling_sessions: bool = False
@@ -2090,6 +2093,7 @@ def create_app(
             from omnigent.server.scheduled.fire import (
                 ClaimedRunExecutor,
                 FireDeps,
+                build_busy_until,
                 build_on_fire,
                 build_run_now,
             )
@@ -2138,6 +2142,10 @@ def create_app(
                     owned_hosts=dispatch_hooks.owned_hosts,
                     dispatch_enabled=dispatch_hooks.dispatch_enabled,
                     poll_interval=dispatch_hooks.poll_interval,
+                    # Skipping assumes the built-in executor's continued-session delivery.
+                    busy_until=(
+                        build_busy_until(fire_deps) if dispatch_hooks.on_fire is None else None
+                    ),
                     poll_seconds=dispatch_config.poll_seconds,
                     renewal_seconds=dispatch_config.renewal_seconds,
                     lease_seconds=dispatch_config.lease_seconds,
