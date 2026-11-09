@@ -182,6 +182,7 @@ class _NativeCode:
     code_challenge: str
     redirect_uri: str
     created_at: float = field(default_factory=time.time)
+    admin_allowed: bool = True
 
 
 def create_auth_router(
@@ -593,6 +594,7 @@ def create_auth_router(
                 user_id=email,
                 code_challenge=native["code_challenge"],
                 redirect_uri=native["redirect_uri"],
+                admin_allowed=effective_admin(True),
             )
             response = _native_redirect(native, {"code": native_code})
             response.delete_cookie(
@@ -923,6 +925,7 @@ def create_auth_router(
             )
 
         ticket.token = mint_session_cookie(
+            admin_allowed=effective_admin(True),
             user_id=user_id,
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
@@ -1110,6 +1113,7 @@ def create_auth_router(
         content: dict[str, object] = {
             "token": mint_session_cookie(
                 user_id=pending.user_id,
+                admin_allowed=pending.admin_allowed,
                 cookie_secret=config.cookie_secret,
                 ttl_hours=config.session_ttl_hours,
                 provider=config.provider_type,
@@ -1124,6 +1128,7 @@ def create_auth_router(
                 content["refresh_token"] = issue_login_grant(
                     device_grant_store,
                     user_id=pending.user_id,
+                    admin_allowed=pending.admin_allowed,
                     cookie_secret=config.cookie_secret,
                 )
             except Exception:

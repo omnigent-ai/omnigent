@@ -297,6 +297,7 @@ class Conversation:
     parent_conversation_id: str | None = None
     agent_id: str | None = None
     runner_id: str | None = None
+    runner_admin_allowed: bool = True
     host_id: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     session_state: dict[str, Any] = field(default_factory=dict)

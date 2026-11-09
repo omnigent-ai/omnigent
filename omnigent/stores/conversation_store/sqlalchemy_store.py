@@ -94,6 +94,7 @@ from omnigent.entities import (
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
+from omnigent.server.admin_mode import effective_admin
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
@@ -259,6 +260,8 @@ def _bind_runner(meta: SqlConversationMetadata, runner_id: str | None) -> None:
         flag_modified(meta, "background_work_running")
         flag_modified(meta, "background_work_reported_at")
     meta.runner_id = runner_id
+    if runner_id is not None:
+        meta.runner_admin_allowed = meta.runner_admin_allowed and effective_admin(True)
 
 
 def _to_conversation(
@@ -306,6 +309,7 @@ def _to_conversation(
         root_conversation_id=row.root_conversation_id,
         agent_id=row.agent_id,
         runner_id=meta.runner_id if meta else None,
+        runner_admin_allowed=meta.runner_admin_allowed if meta else False,
         host_id=meta.host_id if meta else None,
         labels=labels if labels is not None else {},
         session_state=session_state,
@@ -450,6 +454,7 @@ def _new_session_metadata_row(
         id=conversation_id,
         kind=encode_conversation_kind("sub_agent" if parent_conversation_id else "default"),
         runner_id=runner_id,
+        runner_admin_allowed=effective_admin(True),
         project_id=project_id,
         host_id=host_id,
         inference_snapshot=inference_snapshot,
@@ -1260,7 +1265,19 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     meta_sess.delete(previous)
                     meta_sess.flush()
+                parent_meta = (
+                    meta_sess.get(
+                        SqlConversationMetadata, (current_workspace_id(), parent_conversation_id)
+                    )
+                    if parent_conversation_id is not None
+                    else None
+                )
                 meta = SqlConversationMetadata(
+                    runner_admin_allowed=(
+                        effective_admin(True)
+                        and (parent_meta is None or parent_meta.runner_admin_allowed)
+                        and (previous is None or previous.runner_admin_allowed)
+                    ),
                     id=new_id,
                     kind=encoded_kind,
                     runner_id=runner_id,
@@ -4547,6 +4564,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # A flag written while unbound is not the new runner's to report.
                 .values(
                     runner_id=runner_id,
+                    runner_admin_allowed=SqlConversationMetadata.runner_admin_allowed
+                    & effective_admin(True),
                     background_work_running=None,
                     background_work_reported_at=None,
                 )
@@ -4857,7 +4876,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlConversationMetadata.id == conversation_id,
                         SqlConversationMetadata.runner_id == expected_runner_id,
                     )
-                    .values(runner_id=runner_id, **reset)
+                    .values(
+                        runner_id=runner_id,
+                        runner_admin_allowed=SqlConversationMetadata.runner_admin_allowed
+                        & effective_admin(True),
+                        **reset,
+                    )
                 )
                 session.refresh(meta)
             return meta
@@ -5782,6 +5806,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                 host_id=host_id,
                 inference_snapshot=encoded_inference_snapshot,
             )
+            if parent_conversation_id is not None:
+                parent_meta = session.get(
+                    SqlConversationMetadata, (current_workspace_id(), parent_conversation_id)
+                )
+                meta_row.runner_admin_allowed = (
+                    meta_row.runner_admin_allowed
+                    and parent_meta is not None
+                    and parent_meta.runner_admin_allowed
+                )
             session.add(agent_row)
             session.add(meta_row)
             return meta_row, agent_row

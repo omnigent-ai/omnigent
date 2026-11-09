@@ -13,6 +13,7 @@ import httpx
 import jwt
 import pytest
 
+from omnigent.server.admin_mode import admin_mode_scope
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import mint_session_cookie
@@ -54,7 +55,10 @@ async def _complete_callback(
         )
 
 
-async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Path) -> None:
+@pytest.mark.parametrize("admin_enabled", [False, True])
+async def test_cli_ticket_requires_browser_consent_and_issues_grant(
+    tmp_path: Path, admin_enabled: bool
+) -> None:
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db")
     transport = _build_app(store)
     async with httpx.AsyncClient(
@@ -80,11 +84,12 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
         assert "Authorize sign-in" in consent.text
         assert "For CLI or Slack sign-in" in consent.text
 
-        approved = await client.post(
-            "/auth/cli-approve",
-            data={"ticket": ticket},
-            headers={"Origin": "http://test"},
-        )
+        with admin_mode_scope(admin_enabled):
+            approved = await client.post(
+                "/auth/cli-approve",
+                data={"ticket": ticket},
+                headers={"Origin": "http://test"},
+            )
         assert approved.status_code == 200
         assert "Approved" in approved.text
 
@@ -100,6 +105,11 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
         assert "cli_login_ticket" not in payload
         assert body["user_id"] == "alice@example.com"
         assert body["refresh_token"]
+        assert payload.get("admin_allowed", True) is admin_enabled
+        from omnigent.server.device_grant_store import hash_secret
+
+        grant = store.get_by_refresh_hash(hash_secret(body["refresh_token"], TEST_SIGNING_KEY))
+        assert grant is not None and grant.admin_allowed is admin_enabled
 
 
 @pytest.mark.parametrize("proof,status", [(None, 400), ("b" * 64, 403)])

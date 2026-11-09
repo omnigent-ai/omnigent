@@ -1071,6 +1071,51 @@ def test_runner_token_uses_saved_account_authority(
     assert mint().status_code == 401
 
 
+@pytest.mark.parametrize("admin_enabled", [False, True])
+def test_runner_tokens_retain_browser_admin_limit(setup_app, admin_enabled):
+    import uuid
+
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    admin, alice, stores, _ = setup_app
+    private_id = create_session(alice).json()["session_id"]
+    admin.get("/v1/me", headers={"X-Omnigent-Admin-Mode": "browser"})
+    assert admin.post("/v1/me/admin-mode", json={"enabled": admin_enabled}).status_code == 200
+    created = create_session(admin)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["session_id"]
+    binding = "limited-runner-binding"
+    runner_id = token_bound_runner_id(binding)
+    host_id = uuid.uuid4().hex
+    stores["host_store"].upsert_on_connect(host_id, "runner-host", "admin")
+    conversations = stores["conversation_store"]
+    conversations.set_host_id(session_id, host_id, workspace="/tmp/workspace")
+    conversations.replace_runner_id(session_id, runner_id)
+
+    # Renewal uses the saved limit even after the browser has enabled admin mode.
+    assert admin.post("/v1/me/admin-mode", json={"enabled": True}).status_code == 200
+    runner = TestClient(admin.app)
+    for _ in range(2):
+        issued = runner.post(
+            f"/v1/runners/{runner_id}/token",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: binding},
+        )
+        assert issued.status_code == 200, issued.text
+        runner.headers["Authorization"] = f"Bearer {issued.json()['token']}"
+        assert runner.get("/v1/me").json()["is_admin"] is admin_enabled
+        assert runner.get(f"/v1/sessions/{session_id}").status_code == 200
+        assert (
+            runner.patch(f"/v1/sessions/{session_id}", json={"title": "My edit"}).status_code
+            == 200
+        )
+        assert runner.get(f"/v1/sessions/{private_id}").status_code == (
+            200 if admin_enabled else 404
+        )
+        assert runner.patch(
+            f"/v1/sessions/{private_id}", json={"title": "Admin edit"}
+        ).status_code in ((200,) if admin_enabled else (403, 404))
+
+
 def test_oauth_connection_state_cannot_cross_username_reuse(setup_app):
     from urllib.parse import parse_qs, urlsplit
 

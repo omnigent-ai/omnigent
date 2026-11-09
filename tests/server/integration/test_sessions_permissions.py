@@ -1222,6 +1222,19 @@ async def test_browser_admin_mode_rechecks_access_without_changing_eligibility(
     for path in (session_url, f"{session_url}/permissions", "/v1/sharing"):
         response = await auth_client.get(path, headers=admin_headers)
         assert response.status_code in (403, 404), (path, response.text)
+    response = await auth_client.patch(
+        session_url, headers=admin_headers, json={"title": "Admin edit"}
+    )
+    assert response.status_code in (403, 404)
+
+    own_session = await _create_session_as(auth_client, agent["id"], "admin-user")
+    assert (
+        await auth_client.patch(
+            f"/v1/sessions/{own_session['id']}",
+            headers=admin_headers,
+            json={"title": "My session"},
+        )
+    ).status_code == 200
 
     # Explicit grants still work, with the same permission level as a member.
     granted = await _grant_permission(
@@ -1236,6 +1249,10 @@ async def test_browser_admin_mode_rechecks_access_without_changing_eligibility(
     assert response.status_code == 200
     assert response.json()["permission_level"] == LEVEL_READ
 
+    assert (
+        await auth_client.patch(session_url, headers=admin_headers, json={"title": "Admin edit"})
+    ).status_code == 403
+
     response = await auth_client.post(
         "/v1/me/admin-mode", headers=admin_headers, json={"enabled": True}
     )
@@ -1249,6 +1266,9 @@ async def test_browser_admin_mode_rechecks_access_without_changing_eligibility(
     assert (await auth_client.get(session_url, headers=admin_headers)).json()[
         "permission_level"
     ] == LEVEL_OWNER
+    assert (
+        await auth_client.patch(session_url, headers=admin_headers, json={"title": "Admin edit"})
+    ).status_code == 200
     assert (
         await auth_client.post(
             "/v1/me/admin-mode", headers=admin_headers, json={"enabled": "false"}
@@ -1272,6 +1292,12 @@ async def test_browser_admin_mode_rechecks_access_without_changing_eligibility(
         await auth_client.post("/v1/me/admin-mode", headers=admin_headers, json={"enabled": False})
     ).status_code == 200
     assert (await auth_client.get("/v1/sharing", headers=admin_headers)).status_code == 403
+    assert (
+        await auth_client.patch(session_url, headers=admin_headers, json={"title": "Second edit"})
+    ).status_code == 403
+    assert (await auth_client.get(session_url, headers=admin_headers)).json()[
+        "title"
+    ] == "Admin edit"
     assert store.is_admin("admin-user")
 
 

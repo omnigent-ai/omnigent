@@ -27,11 +27,35 @@ if TYPE_CHECKING:
 
 ADMIN_MODE_COOKIE = "omnigent_admin_mode"
 _admin_mode: ContextVar[bool] = ContextVar("admin_mode", default=True)
+_credential_admin: ContextVar[bool] = ContextVar("credential_admin", default=True)
+_credential_admin_limit: ContextVar[bool] = ContextVar("credential_admin_limit", default=True)
+
+
+def credential_admin_allowed() -> bool:
+    """Whether the authenticated credential and its enclosing scope allow admin authority."""
+    return _credential_admin.get() and _credential_admin_limit.get()
+
+
+def bind_credential_admin_allowed(enabled: bool) -> None:
+    """Replace the authenticated credential's ceiling, preserving enclosing restrictions."""
+    _credential_admin.set(enabled)
+
+
+@contextmanager
+def credential_admin_scope(enabled: bool) -> Iterator[None]:
+    """Narrow credential authority for this scope and restore authentication changes on exit."""
+    limit = _credential_admin_limit.set(credential_admin_allowed() and enabled)
+    credential = _credential_admin.set(_credential_admin.get())
+    try:
+        yield
+    finally:
+        _credential_admin.reset(credential)
+        _credential_admin_limit.reset(limit)
 
 
 def effective_admin(eligible: bool) -> bool:
     """Apply the current browser's mode to an uncached or cached eligibility flag."""
-    return eligible and _admin_mode.get()
+    return eligible and _admin_mode.get() and credential_admin_allowed()
 
 
 @contextmanager
@@ -68,6 +92,10 @@ class AdminModeMiddleware:
         if scope["type"] not in ("http", "websocket"):
             await self._app(scope, receive, send)
             return
+        with credential_admin_scope(True):
+            await self._handle_connection(scope, receive, send)
+
+    async def _handle_connection(self, scope: Scope, receive: Receive, send: Send) -> None:
         connection = HTTPConnection(scope)
         state_cookie_name = admin_mode_cookie_name(connection, self._base_path)
         value = connection.cookies.get(state_cookie_name)
@@ -139,14 +167,15 @@ def create_admin_mode_router(
             raise OmnigentError("Authentication required", code=ErrorCode.UNAUTHORIZED)
         eligible = await asyncio.to_thread(permission_store.is_admin, user_id)
         eligible = eligible or admin_list.is_admin(user_id)
-        if body.enabled and not eligible:
+        can_enable = eligible and credential_admin_allowed()
+        if body.enabled and not can_enable:
             raise OmnigentError("Admin privileges required", code=ErrorCode.FORBIDDEN)
-        enabled = body.enabled and eligible
+        enabled = body.enabled and can_enable
         cookie_name = admin_mode_cookie_name(request, base_path)
         response = JSONResponse(
             {
                 "is_admin": enabled,
-                "can_enable_admin_mode": eligible,
+                "can_enable_admin_mode": can_enable,
                 "admin_mode_enabled": enabled,
                 "admin_mode_cookie_name": cookie_name,
             }

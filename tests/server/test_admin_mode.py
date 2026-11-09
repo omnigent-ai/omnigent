@@ -3,22 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from unittest.mock import MagicMock
 
 import pytest
-from starlette.requests import HTTPConnection
+from fastapi.routing import APIRoute
+from starlette.requests import HTTPConnection, Request
+from starlette.types import ASGIApp
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import ResolvedAccess
+from omnigent.errors import OmnigentError
 from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.admin_mode import (
     ADMIN_MODE_COOKIE,
     AdminModeMiddleware,
+    SetAdminModeRequest,
     _enabled_cookie,
     admin_mode_cookie_name,
     admin_mode_scope,
+    create_admin_mode_router,
+    credential_admin_allowed,
+    credential_admin_scope,
     effective_admin,
 )
-from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.auth import AccountAuthenticationMiddleware, UnifiedAuthProvider
+from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.permissions import resolved_allows, resolved_level
 from omnigent.server.routes._sessions.helpers import _permission_level_from_grants
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -210,3 +220,130 @@ async def test_login_cookie_changes_reset_admin_mode_on_the_deployment_path(
         assert cookies[1] == f"{name}=off; Path=/omni; SameSite=lax; Secure"
     else:
         assert len(cookies) == 1
+
+
+@pytest.fixture
+def credential_provider() -> UnifiedAuthProvider:
+    return UnifiedAuthProvider(
+        source="accounts",
+        accounts_config=AccountsConfig(b"a" * 32, 8, "http://test", None, 3600, 600),
+    )
+
+
+def test_credential_scope_cannot_widen_even_after_reauthentication(credential_provider) -> None:
+    token = mint_session_cookie("admin", b"a" * 32, 8, "accounts")
+    connection = HTTPConnection(
+        {"type": "http", "headers": [(b"authorization", f"Bearer {token}".encode())]}
+    )
+    with credential_admin_scope(False):
+        with credential_admin_scope(True), admin_mode_scope(True):
+            assert credential_provider.get_user_id(connection) == "admin"
+            assert not credential_admin_allowed()
+            assert not effective_admin(True)
+    assert credential_admin_allowed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "websocket"])
+@pytest.mark.parametrize("accounts_worker", [False, True])
+async def test_credential_ceiling_survives_request_workers_and_cleanup(
+    credential_provider, transport: str, accounts_worker: bool
+) -> None:
+    provider = credential_provider
+    checks = []
+
+    def check_account(user_id: str, generation: str) -> bool:
+        checks.append((user_id, generation))
+        return generation == "generation"
+
+    if accounts_worker:
+        provider.set_account_check(check_account)
+
+    async def connection(scope, receive, send):
+        request = HTTPConnection(scope)
+        allowed = scope["admin_allowed"]
+        for _ in range(2):
+            assert provider.get_user_id(request) == "admin"
+            assert credential_admin_allowed() is allowed
+        assert await asyncio.to_thread(
+            lambda: (provider.get_user_id(request), credential_admin_allowed())
+        ) == ("admin", allowed)
+        with admin_mode_scope(True):
+            assert effective_admin(True) is allowed
+        assert resolved_allows(ResolvedAccess(True, 4, None), 4)
+        assert resolved_allows(ResolvedAccess(True, 1, None), 1)
+        assert resolved_allows(ResolvedAccess(True, 1, None), 2) is (
+            allowed and scope["browser_enabled"]
+        )
+        if scope["raise"]:
+            raise RuntimeError("handler failed")
+
+    application: ASGIApp = AdminModeMiddleware(connection, provider)
+    if accounts_worker:
+        application = AccountAuthenticationMiddleware(application, provider)
+
+    for allowed, browser_enabled, fails in [
+        (False, True, False),
+        (True, True, False),
+        (False, False, False),
+        (True, False, False),
+        (False, True, True),
+    ]:
+        token = mint_session_cookie(
+            "admin",
+            b"a" * 32,
+            8,
+            "accounts",
+            account_generation="generation",
+            admin_allowed=allowed,
+        )
+        headers = [(b"authorization", f"Bearer {token}".encode()), (b"host", b"test")]
+        scope = {
+            "type": transport,
+            "path": "/v1/me",
+            "headers": headers,
+            "admin_allowed": allowed,
+            "browser_enabled": browser_enabled,
+            "raise": fails,
+        }
+        name = admin_mode_cookie_name(HTTPConnection(scope), "")
+        mode = _enabled_cookie("admin") if browser_enabled else "off"
+        headers.append((b"cookie", f"{name}={mode}".encode()))
+        checks.clear()
+        if fails:
+            with pytest.raises(RuntimeError, match="handler failed"):
+                await application(scope, None, None)
+        else:
+            await application(scope, None, None)
+        assert credential_admin_allowed()
+        assert "omnigent.account_identity" not in scope
+        if accounts_worker:
+            assert checks == [("admin", "generation")]
+
+
+@pytest.mark.asyncio
+async def test_restricted_credential_cannot_enable_admin_mode(credential_provider) -> None:
+    permissions = MagicMock()
+    permissions.is_admin.return_value = True
+    admins = MagicMock()
+    admins.is_admin.return_value = False
+    router = create_admin_mode_router(credential_provider, permissions, admins, "")
+    route = router.routes[0]
+    assert isinstance(route, APIRoute)
+    token = mint_session_cookie("admin", b"a" * 32, 8, "accounts", admin_allowed=False)
+    request = Request(
+        {
+            "type": "http",
+            "scheme": "http",
+            "path": "/v1/me/admin-mode",
+            "headers": [(b"authorization", f"Bearer {token}".encode()), (b"host", b"test")],
+        }
+    )
+    with credential_admin_scope(True):
+        with pytest.raises(OmnigentError) as denied:
+            await route.endpoint(SetAdminModeRequest(enabled=True), request)
+        assert denied.value.http_status == 403
+        response = await route.endpoint(SetAdminModeRequest(enabled=False), request)
+        payload = json.loads(response.body)
+        assert payload["can_enable_admin_mode"] is False
+        assert payload["admin_mode_enabled"] is False

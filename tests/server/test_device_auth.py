@@ -746,8 +746,9 @@ def test_login_grant_refresh_round_trip(disabled_app: TestClient, tmp_path: Path
         assert again.json()["refresh_token"] == refresh
 
 
+@pytest.mark.parametrize("admin_allowed", [False, True])
 def test_login_grant_token_keeps_session_authority(
-    disabled_app: TestClient, tmp_path: Path
+    disabled_app: TestClient, tmp_path: Path, admin_allowed: bool
 ) -> None:
     """A refreshed login-grant token reaches routes OUTSIDE the delegated
     allowlist — it renews the session JWT and must keep its authority.
@@ -762,7 +763,9 @@ def test_login_grant_token_keeps_session_authority(
 
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/test.db")
     secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
-    refresh = issue_login_grant(store, user_id="admin", cookie_secret=secret)
+    refresh = issue_login_grant(
+        store, user_id="admin", cookie_secret=secret, admin_allowed=admin_allowed
+    )
     r = disabled_app.post(
         "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
     )
@@ -777,6 +780,11 @@ def test_login_grant_token_keeps_session_authority(
     claims = jwt.decode(access, options={"verify_signature": False})
     assert claims["grant_id"]
     assert "scope" not in claims
+    assert claims.get("admin_allowed", True) is admin_allowed
+    assert disabled_app.get("/v1/me", headers=auth).json()["is_admin"] is admin_allowed
+    assert disabled_app.get("/auth/users", headers=auth).status_code == (
+        200 if admin_allowed else 403
+    )
 
     # Allowlisted route works...
     assert disabled_app.get("/v1/hosts", headers=auth).status_code == 200
@@ -819,12 +827,15 @@ def _exchange_device_code(client: TestClient, device_code: str):
     return response
 
 
-def test_device_grant_refresh_stays_scope_restricted(app: TestClient) -> None:
+@pytest.mark.parametrize("admin_enabled", [False, True])
+def test_device_grant_refresh_stays_scope_restricted(app: TestClient, admin_enabled: bool) -> None:
     """Third-party device grants keep the delegated scope AND keep rotating —
     the login-grant carve-out must not leak to them."""
     r = app.post("/oauth/device/authorize", json={"client_id": "slack"})
     data = r.json()
     _login_admin(app)
+    app.get("/v1/me", headers={"X-Omnigent-Admin-Mode": "browser"})
+    assert app.post("/v1/me/admin-mode", json={"enabled": admin_enabled}).status_code == 200
     app.post(
         "/oauth/device/approve",
         data={"user_code": data["user_code"]},
@@ -835,6 +846,7 @@ def test_device_grant_refresh_stays_scope_restricted(app: TestClient) -> None:
     body = r.json()
     claims = jwt.decode(body["access_token"], options={"verify_signature": False})
     assert claims["scope"] == "sessions"
+    assert claims.get("admin_allowed", True) is admin_enabled
 
     # And it still rotates.
     r2 = app.post(
@@ -843,6 +855,8 @@ def test_device_grant_refresh_stays_scope_restricted(app: TestClient) -> None:
     )
     assert r2.status_code == 200, r2.text
     assert r2.json()["refresh_token"] != body["refresh_token"]
+    refreshed = jwt.decode(r2.json()["access_token"], options={"verify_signature": False})
+    assert refreshed.get("admin_allowed", True) is admin_enabled
 
 
 def test_device_code_approved_before_password_change_is_refused(app: TestClient) -> None:
@@ -864,6 +878,39 @@ def test_device_code_approved_before_password_change_is_refused(app: TestClient)
     r = _exchange_device_code(app, data["device_code"])
     assert r.status_code == 400 and r.json()["error"] == "invalid_grant", r.text
     assert "access_token" not in r.json()
+
+
+def test_browser_login_exports_ordinary_credentials(disabled_app: TestClient) -> None:
+    _login_admin(disabled_app)
+    disabled_app.get("/v1/me", headers={"X-Omnigent-Admin-Mode": "browser"})
+    response = disabled_app.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": True},
+    )
+    assert response.status_code == 200
+    login = response.json()
+    # The browser remains independently toggleable; exported credentials do not.
+    assert disabled_app.post("/v1/me/admin-mode", json={"enabled": True}).status_code == 200
+    assert disabled_app.get("/auth/users").status_code == 200
+    disabled_app.cookies.clear()
+    for token in [
+        login["token"],
+        disabled_app.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": login["refresh_token"]},
+        ).json()["access_token"],
+    ]:
+        headers = {"Authorization": f"Bearer {token}"}
+        identity = disabled_app.get("/v1/me", headers=headers).json()
+        assert identity["is_admin"] is False
+        assert identity["can_enable_admin_mode"] is False
+        assert disabled_app.get("/auth/users", headers=headers).status_code == 403
+        assert (
+            disabled_app.post(
+                "/v1/me/admin-mode", headers=headers, json={"enabled": True}
+            ).status_code
+            == 403
+        )
 
 
 def test_web_login_never_issues_refresh(disabled_app: TestClient) -> None:

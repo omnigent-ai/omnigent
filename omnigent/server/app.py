@@ -89,6 +89,8 @@ from omnigent.server.admin_mode import (
     AdminModeMiddleware,
     admin_mode_cookie_name,
     create_admin_mode_router,
+    credential_admin_allowed,
+    credential_admin_scope,
     effective_admin,
 )
 from omnigent.server.auth import (
@@ -3862,7 +3864,7 @@ def create_app(
         }
         if admin_mode_supported:
             identity.update(
-                can_enable_admin_mode=eligible,
+                can_enable_admin_mode=eligible and credential_admin_allowed(),
                 admin_mode_enabled=effective_admin(eligible),
                 admin_mode_cookie_name=admin_mode_cookie_name(request, resolved_base_path),
             )
@@ -5063,10 +5065,17 @@ def create_app(
                 recoveries.create_task(recover_root(conv, client), name=f"recover-root-{conv.id}")
 
     def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
-        assert runner_account_store is not None and auth_provider is not None
-        return runner_account_store.with_runner_authority(
-            runner_id, lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds)
-        )
+        assert auth_provider is not None
+        if runner_account_store is not None:
+            return runner_account_store.with_runner_authority(
+                runner_id, lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds)
+            )
+        for conv in conversation_store.list_conversations_by_runner_id(runner_id):
+            owner = conversation_store.get_session_owner(conv.id)
+            if owner is not None:
+                with credential_admin_scope(conv.runner_admin_allowed):
+                    return auth_provider.mint_runner_token(owner, ttl_seconds)
+        return None
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
@@ -5105,7 +5114,13 @@ def create_app(
                 sandbox_profiles.admit_runner_connection if sandbox_profiles is not None else None
             ),
             mint_managed_runner_token=(
-                _mint_managed_runner_token if runner_account_store is not None else None
+                _mint_managed_runner_token
+                if runner_account_store is not None
+                or (
+                    isinstance(auth_provider, UnifiedAuthProvider)
+                    and auth_provider._source == "oidc"
+                )
+                else None
             ),
         ),
         prefix="/v1",
