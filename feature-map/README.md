@@ -125,8 +125,12 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Pull request conversations](./pull-request-conversations.md) covers inline
   GitHub threads and replies through Workspace, composer, mobile and Canvas.
 
-- [Session orchestration](./session-orchestration.md) covers private-owner
-  messaging, top-level worker creation, polling results and sharing restrictions.
+- [Pull request review navigation](./pull-request-review-navigation.md) covers the
+  Changes tab's path filter, find in the fetched patch, copy and open actions, and
+  browser-local viewed marks with progress and hide-viewed.
+
+- [Session orchestration](./session-orchestration.md) covers owner-controlled
+  messaging, sibling worker creation, polling results and sharing restrictions.
 
 - [Workspace content search](./workspace-content-search.md) covers runner-backed
   text search, result navigation and its release flag.
