@@ -679,20 +679,34 @@ export function PullRequestChangesTab({
       return { ...prev, owned };
     });
   }, []);
-  // Marking a file collapses it; unmarking leaves its current state alone.
-  const toggleViewed = useCallback(
+  // A file marked viewed collapses; the collapse belongs to the mark until the reader toggles it.
+  const collapseMarked = useCallback(
     (path: string) => {
-      const markViewed = !viewedFiles.viewed.has(path);
-      viewedFiles.setMany([path], markViewed);
-      if (!markViewed) return;
       if (!collapsedPaths.has(path)) {
         setSeed((prev) => ({ ...prev, owned: new Set(prev.owned).add(path) }));
       }
       clearReveal(path);
       setCollapsedPaths((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
     },
-    [viewedFiles, clearReveal, collapsedPaths],
+    [clearReveal, collapsedPaths],
   );
+  // Unmarking leaves the file's current state alone.
+  const toggleViewed = useCallback(
+    (path: string) => {
+      const markViewed = !viewedFiles.viewed.has(path);
+      viewedFiles.setMany([path], markViewed);
+      if (markViewed) collapseMarked(path);
+    },
+    [viewedFiles, collapseMarked],
+  );
+  // Marks another tab stores arrive as storage events. Only a newly viewed file collapses here, so
+  // a file the reader expands stays open until it is marked again.
+  const previousViewed = useRef(viewedFiles.viewed);
+  useEffect(() => {
+    const newlyViewed = [...viewedFiles.viewed].filter((path) => !previousViewed.current.has(path));
+    previousViewed.current = viewedFiles.viewed;
+    for (const path of newlyViewed) collapseMarked(path);
+  }, [viewedFiles.viewed, collapseMarked]);
 
   // Fixed id keeps repeated failures from stacking toasts.
   useEffect(() => {

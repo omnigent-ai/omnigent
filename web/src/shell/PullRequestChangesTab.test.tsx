@@ -646,6 +646,19 @@ function isListed(path: string): boolean {
 
 const viewedBox = (path: string) => screen.getByRole("checkbox", { name: `Viewed ${path}` });
 
+/**
+ * Stores marks as another tab would: the entry changes in storage, and this tab hears only the
+ * `storage` event.
+ */
+function markInOtherTab(marks: Record<string, string[]>) {
+  const key = viewedStorageKey(window.location.origin, "alice", IDENTITY);
+  const newValue = JSON.stringify({ v: 2, marks, updatedAt: Date.now() });
+  localStorage.setItem(key, newValue);
+  act(() => {
+    window.dispatchEvent(new StorageEvent("storage", { key, newValue, storageArea: localStorage }));
+  });
+}
+
 describe("PullRequestChangesTab viewed files", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -686,6 +699,43 @@ describe("PullRequestChangesTab viewed files", () => {
     expect(viewedBox("a.ts")).not.toBeChecked();
     expect(isCollapsed("a.ts")).toBe(true);
     expect(screen.getByText("0 / 2 files viewed")).toBeInTheDocument();
+  });
+
+  it("collapses a file that another tab marks viewed", () => {
+    render(viewedTab({ conversationId: "viewed-remote" }));
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+  });
+
+  it("keeps a file the reader expanded after another tab marked it viewed", () => {
+    render(viewedTab({ conversationId: "viewed-remote-expand" }));
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    // Another mark from the other tab re-reads storage without a new mark on a.ts.
+    markInOtherTab({
+      "a.ts": [unverifiedPatchHash("head1")],
+      "b.ts": [unverifiedPatchHash("head1")],
+    });
+
+    expect(isCollapsed("a.ts")).toBe(false);
+    expect(isCollapsed("b.ts")).toBe(true);
+  });
+
+  it("expands a file that another tab's mark collapsed once the head moves", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-remote-head", head: "head1" }));
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-remote-head", head: "head2" }));
+
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
   });
 
   it("hides viewed files together with the path filter", () => {
