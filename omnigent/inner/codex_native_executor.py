@@ -852,6 +852,7 @@ async def _wait_for_shell_completion(
     deadline: float | None = asyncio.get_running_loop().time() + (
         timeout if timeout is not None else _SHELL_UNCONFIRMED_WAIT_SECONDS
     )
+    reconnected = False
     while True:
         current = read_bridge_state(bridge_dir)
         try:
@@ -891,10 +892,41 @@ async def _wait_for_shell_completion(
             confirmed = await _reconcile_shell_command(
                 client, bridge_dir, current, min(_SHELL_RECONCILIATION_RPC_SECONDS, remaining)
             )
-        except _CodexNativeInputUndelivered:
+        except _CodexNativeInputUndelivered as exc:
             if not require_idle:
                 return current
-            raise
+            cause = exc.__cause__
+            if reconnected or not isinstance(cause, (OSError, WebSocketException)):
+                raise
+            _require_codex_binding(bridge_dir, state)
+            failure = read_bridge_startup_failure(bridge_dir)
+            if failure is not None:
+                raise _CodexNativeInputUndelivered(failure, preserve_session=True) from exc
+            reconnect_remaining = (
+                deadline - asyncio.get_running_loop().time()
+                if deadline is not None
+                else _SHELL_RECONCILIATION_RPC_SECONDS
+            )
+            if reconnect_remaining <= 0:
+                raise
+            reconnected = True
+            try:
+                async with asyncio.timeout(
+                    min(_SHELL_RECONCILIATION_RPC_SECONDS, reconnect_remaining)
+                ):
+                    await client.close()
+                    _require_codex_binding(bridge_dir, state)
+                    await client.connect()
+            except (_CodexNativeInputStopped, _CodexNativeInputUndelivered):
+                raise
+            except (OSError, RuntimeError, WebSocketException) as reconnect_error:
+                _require_codex_binding(bridge_dir, state)
+                raise _CodexNativeInputUndelivered(
+                    CODEX_APP_SERVER_STOPPED, preserve_session=True
+                ) from reconnect_error
+            _require_codex_binding(bridge_dir, state)
+            # Only the empty queue fence is retried; neither shell nor prompt was resubmitted.
+            continue
         if timeout is None:
             if confirmed:
                 deadline = None

@@ -944,8 +944,13 @@ def test_draining_retry_preserves_stale_steer_recovery(
 
 @pytest.mark.parametrize(
     ("active_turn_id", "refusal_kind"),
-    [(None, "draining"), ("turn_existing", "draining"), ("turn_compact", "compacting")],
-    ids=["start-draining", "steer-draining", "steer-compacting"],
+    [
+        (None, "draining"),
+        ("turn_existing", "draining"),
+        ("turn_compact", "compacting"),
+        (None, "shell-probe-loss"),
+    ],
+    ids=["start-draining", "steer-draining", "steer-compacting", "shell-probe-loss"],
 )
 async def test_native_refusal_recovers_with_real_client(
     active_turn_id: str | None, refusal_kind: str, tmp_path: Path
@@ -954,6 +959,7 @@ async def test_native_refusal_recovers_with_real_client(
     connections = 0
     requests: list[tuple[int, dict[str, Any]]] = []
     accepted_inputs: list[object] = []
+    shell_submissions: list[dict[str, Any]] = []
 
     async def handle(websocket: ServerConnection) -> None:
         nonlocal connections
@@ -964,9 +970,23 @@ async def test_native_refusal_recovers_with_real_client(
             if "id" not in request:
                 continue
             response: dict[str, Any] = {"id": request["id"], "result": {}}
+            if request["method"] == "thread/shellCommand":
+                shell_submissions.append(request)
             if request["method"] in {"turn/start", "turn/steer"}:
                 requests.append((connection_number, request))
-                if len(requests) == 1:
+                if refusal_kind == "shell-probe-loss" and len(requests) == 1:
+                    assert request["method"] == "turn/steer" and request["params"]["input"] == []
+                    websocket.transport.abort()
+                    return
+                if refusal_kind == "shell-probe-loss" and request["method"] == "turn/steer":
+                    response = {
+                        "id": request["id"],
+                        "error": {
+                            "code": -32600,
+                            "message": "no active turn to steer",
+                        },
+                    }
+                elif len(requests) == 1:
                     response = {
                         "id": request["id"],
                         "error": _compact_steer_refusal().error
@@ -994,7 +1014,16 @@ async def test_native_refusal_recovers_with_real_client(
         _seed_bridge(tmp_path, active_turn_id=active_turn_id)
         state = read_bridge_state(tmp_path)
         assert state is not None
-        write_bridge_state(tmp_path, replace(state, socket_path=f"ws://127.0.0.1:{port}"))
+        write_bridge_state(
+            tmp_path,
+            replace(
+                state,
+                socket_path=f"ws://127.0.0.1:{port}",
+                pending_shell_command_id="accepted_shell"
+                if refusal_kind == "shell-probe-loss"
+                else None,
+            ),
+        )
         executor = CodexNativeExecutor(bridge_dir=tmp_path)
         async with asyncio.timeout(5):
             events = [
@@ -1006,11 +1035,19 @@ async def test_native_refusal_recovers_with_real_client(
 
     assert [type(event) for event in events] == [TurnComplete]
     assert connections == (1 if refusal_kind == "compacting" else 2)
-    assert [number for number, _request in requests] == [
-        1,
-        1 if refusal_kind == "compacting" else 2,
-    ]
-    if refusal_kind == "compacting":
+    assert [number for number, _request in requests] == (
+        [1, 2, 2]
+        if refusal_kind == "shell-probe-loss"
+        else [1, 1 if refusal_kind == "compacting" else 2]
+    )
+    if refusal_kind == "shell-probe-loss":
+        assert [request["method"] for _, request in requests] == [
+            "turn/steer",
+            "turn/steer",
+            "turn/start",
+        ]
+        assert not shell_submissions
+    elif refusal_kind == "compacting":
         assert [request["method"] for _number, request in requests] == ["turn/steer", "turn/start"]
     else:
         assert requests[0][1]["params"] == requests[1][1]["params"]
@@ -1367,6 +1404,163 @@ def test_shell_input_wait_for_its_turn_is_bounded(
     assert state is not None
     assert state.active_turn_id is None
     assert state.pending_shell_command_id is not None
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "refused",
+        "lost-again",
+        "owner-before",
+        "owner-after",
+        "owner-close",
+        "stop-close",
+        "stop-before",
+        "stop-after",
+        "unrelated-runtime-error",
+        "cancelled",
+    ],
+)
+def test_shell_probe_reconnect_keeps_unsent_input_and_owner(
+    draining_client,
+    tmp_path: Path,
+    failure_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed recovery, Stop, and replacement owners never receive queued input."""
+    from omnigent.harnesses.codex_native.bridge import record_codex_interrupt
+    from omnigent.inner.executor import TurnCancelled
+
+    _seed_bridge(tmp_path)
+    initial = read_bridge_state(tmp_path)
+    assert initial is not None
+    pending = replace(initial, pending_shell_command_id="accepted_shell")
+    write_bridge_state(tmp_path, pending)
+    draining_client.delivery_errors = [ConnectionResetError("probe connection lost")]
+    if failure_mode == "refused":
+        draining_client.connect_errors = [None, ConnectionRefusedError("backend unavailable")]
+    elif failure_mode == "lost-again":
+        draining_client.delivery_errors.append(ConnectionResetError("second probe lost"))
+    elif failure_mode == "cancelled":
+        draining_client.connect_errors = [None, asyncio.CancelledError()]
+    elif failure_mode == "unrelated-runtime-error":
+        draining_client.delivery_errors = [RuntimeError("unrelated protocol failure")]
+    elif failure_mode.startswith("owner"):
+
+        def changed() -> None:
+            write_bridge_state(tmp_path, replace(pending, thread_id="replacement"))
+
+        if failure_mode.endswith("before"):
+            draining_client.on_refusal = changed
+        elif failure_mode.endswith("close"):
+            close = draining_client.close
+
+            async def close_and_replace(self: Any) -> None:
+                await close(self)
+                if type(self).closes == 1:
+                    changed()
+
+            monkeypatch.setattr(draining_client, "close", close_and_replace)
+        else:
+            draining_client.on_reconnect = changed
+    else:
+
+        def stopped() -> None:
+            record_codex_interrupt(tmp_path, expected=pending)
+
+        if failure_mode.endswith("before"):
+            draining_client.on_refusal = stopped
+        elif failure_mode.endswith("close"):
+            close = draining_client.close
+
+            async def close_and_stop(self: Any) -> None:
+                await close(self)
+                if type(self).closes == 1:
+                    stopped()
+
+            monkeypatch.setattr(draining_client, "close", close_and_stop)
+        else:
+            draining_client.on_reconnect = stopped
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    if failure_mode == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            _collect_turn_events(executor, "follow up")
+    else:
+        events = _collect_turn_events(executor, "follow up")
+        if failure_mode.startswith("stop"):
+            assert [type(event) for event in events] == [TurnCancelled]
+        else:
+            assert len(events) == 1 and isinstance(events[0], ExecutorError)
+            assert events[0].undelivered and events[0].preserve_session
+    assert not executor._inject_lock.locked()
+    assert draining_client.accepted_inputs == []
+    assert all(
+        method == "turn/steer" and params["input"] == []
+        for method, params in draining_client.requests
+    )
+    assert draining_client.connections == (
+        1
+        if failure_mode
+        in {"owner-before", "owner-close", "stop-before", "stop-close", "unrelated-runtime-error"}
+        else 2
+    )
+
+
+async def test_shell_probe_reconnect_handshake_is_bounded(
+    draining_client,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A half-open replacement connection cannot retain the injection lock forever."""
+    _seed_bridge(tmp_path)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    write_bridge_state(tmp_path, replace(state, pending_shell_command_id="accepted_shell"))
+    draining_client.delivery_errors = [ConnectionResetError("lost probe")]
+    connect = draining_client.connect
+
+    async def hung_reconnect(self: Any) -> None:
+        if type(self).connections:
+            type(self).connections += 1
+            await asyncio.Event().wait()
+        await connect(self)
+
+    monkeypatch.setattr(draining_client, "connect", hung_reconnect)
+    monkeypatch.setattr(codex_native_executor, "_SHELL_RECONCILIATION_RPC_SECONDS", 0.02)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    async with asyncio.timeout(2):
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "follow up"}],
+                [],
+                "",
+            )
+        ]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered and events[0].preserve_session
+    assert not executor._inject_lock.locked()
+    assert draining_client.connections == 2 and draining_client.accepted_inputs == []
+
+
+def test_accepted_shell_is_not_reconnected_or_replayed_after_probe_loss(
+    draining_client,
+    tmp_path: Path,
+) -> None:
+    """A shell already accepted remains delivered when its optional reconciliation drops."""
+    _seed_bridge(tmp_path)
+    draining_client.delivery_errors = [ConnectionResetError("lost probe")]
+    events = _collect_turn_events(
+        CodexNativeExecutor(bridge_dir=tmp_path),
+        "!printf once",
+        shell_authorized=True,
+    )
+    assert [type(event) for event in events] == [TurnComplete]
+    assert draining_client.connections == 1
+    assert [method for method, _ in draining_client.requests] == [
+        "thread/shellCommand",
+        "turn/steer",
+    ]
 
 
 @pytest.mark.parametrize("previous_turn", [None, "turn_finishing"])
