@@ -28,7 +28,6 @@ beforeEach(() => {
   mocks.adminMode = null;
 });
 
-
 describe("SidebarHeaderActions shortcut hints", () => {
   it("marks the existing Settings button while admin mode is active", async () => {
     mocks.adminMode = true;
