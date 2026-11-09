@@ -8291,7 +8291,7 @@ def _codex_side_chat_runner_error(resp: httpx.Response) -> OmnigentError:
     )
 
 
-async def _record_codex_native_input(
+async def _record_native_terminal_input(
     session_id: str,
     body: SessionEventInput,
     conversation_store: ConversationStore,
@@ -8553,12 +8553,12 @@ async def _dispatch_session_event_to_runner_impl(
         queues_message = (
             isinstance(content, list) and bool(content) and not opens_side_chat and not is_btw
         )
-        codex_stable_input = (
+        native_stable_input = (
             queues_message
             and web_stable_id is not None
-            and _native_pane_harness(conv) == "codex-native"
+            and native_harness in {"codex-native", "claude-native"}
         )
-        if queues_message and web_stable_id is not None and not codex_stable_input:
+        if queues_message and web_stable_id is not None and not native_stable_input:
             repeated_pending_id = pending_inputs.pending_id_for_stable_id(
                 session_id, web_stable_id
             )
@@ -8585,14 +8585,14 @@ async def _dispatch_session_event_to_runner_impl(
             conversation_store, session_id
         ):
             return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
-        if codex_stable_input:
+        if native_stable_input:
             assert web_stable_id is not None
             (
                 pending_id,
                 persisted_id,
                 delivery_stable_id,
                 should_forward,
-            ) = await _record_codex_native_input(
+            ) = await _record_native_terminal_input(
                 session_id,
                 body,
                 conversation_store,

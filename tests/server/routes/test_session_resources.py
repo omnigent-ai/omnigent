@@ -5972,6 +5972,84 @@ async def test_kiro_native_dispatch_forwards_without_persisting(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wrapper", ["claude-code-native-ui", "codex-native-ui"])
+@pytest.mark.parametrize("retry_kind", ["identical", "edited", "another_author"])
+async def test_native_pending_retry_checks_content_and_author(
+    wrapper: str, retry_kind: str
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = wrapper
+    client = _FakeRunnerClient()
+    original = SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "original message"}],
+            "stable_id": "a" * 32,
+        },
+    )
+
+    async def dispatch(body: SessionEventInput, author: str = "alice@example.com"):
+        return await _dispatch_session_event_to_runner(
+            conv.id,
+            conv,
+            body,
+            store,
+            client,
+            agent_name="native-test",
+            file_store=None,
+            artifact_store=None,
+            created_by=author,
+        )
+
+    pending_inputs.reset_for_tests()
+    try:
+        first = await dispatch(original)
+        assert first.pending_id is not None
+        retry = (
+            original.model_copy(
+                update={
+                    "data": {
+                        **original.data,
+                        "content": [{"type": "input_text", "text": "edited message"}],
+                    }
+                }
+            )
+            if retry_kind == "edited"
+            else original
+        )
+        if retry_kind == "another_author":
+            with pytest.raises(OmnigentError) as raised:
+                await dispatch(retry, "bob@example.com")
+            assert raised.value.code == ErrorCode.CONFLICT
+        else:
+            second = await dispatch(retry)
+            assert (second.pending_id == first.pending_id) is (retry_kind == "identical")
+            assert (await dispatch(retry)).pending_id == second.pending_id
+
+        forwarded = [
+            payload for path, payload in client.post_json_calls if path.endswith("/events")
+        ]
+        assert len(forwarded) == (2 if retry_kind == "edited" else 1)
+        assert forwarded[0]["input_stable_id"] == "a" * 32
+        pending = pending_inputs.snapshot_for(conv.id)
+        assert [entry["content"] for entry in pending] == [
+            payload["content"] for payload in forwarded
+        ]
+        assert all(entry["created_by"] == "alice@example.com" for entry in pending)
+        if retry_kind == "edited":
+            assert forwarded[1]["input_stable_id"] != forwarded[0]["input_stable_id"]
+            assert forwarded[1]["content"] == retry.data["content"]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_codex_side_dispatch_forwards_without_pending_input_diagnostics(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
