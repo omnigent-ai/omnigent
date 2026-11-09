@@ -16,6 +16,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 // Controllable delete mutation, declared via vi.hoisted so the vi.mock
 // factory (hoisted above imports) can reference it. Tests flip
@@ -326,5 +327,45 @@ describe("deleting a session an automation runs from", () => {
     await waitFor(() => expect(deleteScheduledTask).toHaveBeenCalledWith("st_1"));
     await act(async () => {});
     expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
+  it("stays on a session opened while its automation was being deleted", async () => {
+    let finish = () => {};
+    vi.mocked(deleteScheduledTask).mockReturnValue(
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+    );
+    mockConversations([AUTOMATION_SOURCE, CONV_OTHER]);
+    renderSidebarRouted("/c/conv_1");
+    const row = screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement;
+    fireEvent.pointerDown(within(row).getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("delete-conversation"));
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Delete both" }),
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: /Other Session/ }));
+    await act(async () => finish());
+
+    await waitFor(() =>
+      expect(mocks.del.mutate).toHaveBeenCalledWith({ id: "conv_1", deleteBranch: false }),
+    );
+    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_2");
+  });
+
+  it("deletes the session alone when automations are off for the caller", () => {
+    renderSidebar({ info: { ...FALLBACK_SERVER_INFO, automations_enabled: false } });
+    openDeleteDialog();
+
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Delete session?")).toBeInTheDocument();
+    expect(within(dialog).queryByTestId("automation-source-delete-notice")).toBeNull();
+    act(() => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
+    });
+
+    expect(mocks.del.mutate).toHaveBeenCalledWith({ id: "conv_1", deleteBranch: false });
+    expect(deleteScheduledTask).not.toHaveBeenCalled();
   });
 });

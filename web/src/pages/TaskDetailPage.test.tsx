@@ -746,27 +746,27 @@ describe("header actions", () => {
     expect(updateMutate).toHaveBeenCalledWith({ id: "st_1", input: { state: "active" } });
   });
 
-  it("delete fires the mutation and navigates back to the list on success", () => {
-    setTask(task());
-    // Make the delete mutation invoke its onSuccess callback synchronously.
-    deleteMutate.mockImplementation((_id: string, opts?: { onSuccess?: () => void }) =>
-      opts?.onSuccess?.(),
-    );
-    renderPage();
-    fireEvent.click(screen.getByTestId("task-detail-delete"));
-    expect(deleteMutate).toHaveBeenCalledWith(
-      "st_1",
-      expect.objectContaining({ onSuccess: expect.any(Function) }),
-    );
-    expect(navigate).toHaveBeenCalledWith("/tasks");
-  });
-
-  it("deletes an automation that starts from a session right away, like any other", () => {
-    setTask(task({ sourceSessionId: "conv_copy" }));
-    renderPage();
-    fireEvent.click(screen.getByTestId("task-detail-delete"));
-    expect(deleteMutate).toHaveBeenCalledWith("st_1", expect.anything());
-  });
+  // An automation that starts from a session deletes right away, like any other.
+  it.each([
+    ["", null],
+    [" that starts from a session", "conv_copy"],
+  ])(
+    "delete of an automation%s fires the mutation and navigates back to the list on success",
+    (_kind, sourceSessionId) => {
+      setTask(task({ sourceSessionId }));
+      // Make the delete mutation invoke its onSuccess callback synchronously.
+      deleteMutate.mockImplementation((_id: string, opts?: { onSuccess?: () => void }) =>
+        opts?.onSuccess?.(),
+      );
+      renderPage();
+      fireEvent.click(screen.getByTestId("task-detail-delete"));
+      expect(deleteMutate).toHaveBeenCalledWith(
+        "st_1",
+        expect.objectContaining({ onSuccess: expect.any(Function) }),
+      );
+      expect(navigate).toHaveBeenCalledWith("/tasks");
+    },
+  );
 
   it("edit opens the reused create dialog in edit mode", () => {
     setTask(task());

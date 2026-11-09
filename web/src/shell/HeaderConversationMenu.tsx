@@ -73,7 +73,7 @@ import { CreateAutomationFromSessionDialog } from "@/components/scheduled/Create
 import { AutomationSourceDeleteNotice } from "@/components/scheduled/AutomationSourceDeleteNotice";
 import {
   canCreateAutomationFromSession,
-  automationSourceTaskId,
+  automationDeletedWith,
   useDeleteSourceAutomations,
 } from "@/lib/automationFromSession";
 import { ProjectPicker } from "./ProjectPicker";
@@ -164,7 +164,7 @@ export function HeaderConversationMenu({
     conversation,
     isOwner: true,
   });
-  const automationSourceOf = automationSourceTaskId(conversation);
+  const automationSourceOf = automationDeletedWith(info, conversation);
   const deleteSourceAutomations = useDeleteSourceAutomations();
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
@@ -249,11 +249,12 @@ export function HeaderConversationMenu({
     setDeleteOpen(false);
     setDeleteBranch(false);
     // "Delete both": the automation first, so no run starts from a missing session.
-    if (automationSourceOf !== null && !(await deleteSourceAutomations([automationSourceOf]))) {
+    if (automationSourceOf === null) {
+      navigate("/", { replace: true });
+    } else if (!(await deleteSourceAutomations([automationSourceOf], [conversation.id]))) {
       toast.error("Couldn't delete the automation, so the session was kept");
       return;
     }
-    navigate("/", { replace: true });
     deleteConversation.mutate({
       id: conversation.id,
       deleteBranch: gitBranch !== null && deleteBranch,

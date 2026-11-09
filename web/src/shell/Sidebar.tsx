@@ -333,7 +333,7 @@ import {
 } from "@/components/scheduled/AutomationSourceDeleteNotice";
 import {
   canCreateAutomationFromSession,
-  automationSourceTaskId,
+  automationDeletedWith,
   useDeleteSourceAutomations,
 } from "@/lib/automationFromSession";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
@@ -5436,7 +5436,7 @@ function ConversationRowImpl({
     isOwner,
   });
   // Deleting a session an automation runs from deletes the automation first.
-  const automationSourceOf = automationSourceTaskId(conversation);
+  const automationSourceOf = automationDeletedWith(serverInfo, conversation);
   const deleteSourceAutomations = useDeleteSourceAutomations();
   // Single-user mode has no other users to share with, so the Share item is
   // hidden entirely (not just disabled) — mirrors the header Share button.
@@ -5708,11 +5708,10 @@ function ConversationRowImpl({
 
   // "Delete both": the automation first, so no run starts from a missing session.
   async function deleteWithAutomation(taskId: string, deleteLocalBranch: boolean) {
-    if (!(await deleteSourceAutomations([taskId]))) {
+    if (!(await deleteSourceAutomations([taskId], [conversation.id]))) {
       showToast("Couldn't delete the automation, so the session was kept");
       return;
     }
-    if (isActive) navigate("/", { replace: true });
     del.mutate({ id: conversation.id, deleteBranch: deleteLocalBranch });
   }
 
@@ -7317,9 +7316,10 @@ function BulkActionBar({
     [selectedConversations, viewerId],
   );
   // Selected sessions automations run from: those automations are deleted first.
+  const serverInfo = useServerInfo();
   const automationSourceTaskIds = useMemo(
-    () => ownedSelected.flatMap((c) => automationSourceTaskId(c) ?? []),
-    [ownedSelected],
+    () => ownedSelected.flatMap((c) => automationDeletedWith(serverInfo, c) ?? []),
+    [ownedSelected, serverInfo],
   );
   const deleteSourceAutomations = useDeleteSourceAutomations();
 
@@ -7459,19 +7459,17 @@ function BulkActionBar({
     const ids = ownedSelected.map((c) => c.id);
     if (ids.length === 0) return;
     setConfirmDeleteOpen(false);
-    if (
-      automationSourceTaskIds.length > 0 &&
-      !(await deleteSourceAutomations(automationSourceTaskIds))
-    ) {
-      showToast("Couldn't delete every automation, so the sessions were kept");
-      return;
-    }
     // The rows leave the sidebar optimistically, so the selection is already
     // meaningless and the chat surface would be sitting on an id that's about
     // to 404. Both are settled here rather than in a mutate-level callback:
     // this bar unmounts with the selection, and callbacks on an unmounted
-    // observer never fire.
-    if (activeId && ids.includes(activeId)) navigate("/", { replace: true });
+    // observer never fire. Deleting their automations first leaves the page itself.
+    if (automationSourceTaskIds.length === 0) {
+      if (activeId && ids.includes(activeId)) navigate("/", { replace: true });
+    } else if (!(await deleteSourceAutomations(automationSourceTaskIds, ids))) {
+      showToast("Couldn't delete every automation, so the sessions were kept");
+      return;
+    }
     onDeselectAll();
     bulkDelete.mutate({ ids, deleteBranchIds: branchesToDelete });
   }

@@ -291,9 +291,11 @@ then continue from Chat or Terminal.
 offer pin, fork, rename, mark as unread or read, create automation (when
 automations are on), add to project (or move session), archive or unarchive,
 and delete. Create automation opens the New automation dialog for the session;
-saving files its copy in the automation's project and opens the automation.
-Deleting a session an automation runs from asks to Delete both, and leaves the
-automation's page for the automations list.
+saving files its copy in the automation's project and opens the automation. The
+dialog and the automation's page link the session it starts from under Starts
+from. Deleting a session an automation runs from asks to Delete both, and leaves
+the automation's page for the automations list. With automations off for the
+caller, the session is deleted alone and its automation pauses at its next run.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens.

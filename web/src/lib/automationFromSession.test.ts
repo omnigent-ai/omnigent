@@ -17,6 +17,7 @@ import {
   automationPagePath,
   canCreateAutomationFromSession,
   SCHEDULED_TASK_SOURCE_LABEL_KEY,
+  automationDeletedWith,
   automationSourceTaskId,
   useDeleteSourceAutomations,
 } from "./automationFromSession";
@@ -76,6 +77,13 @@ describe("automationSourceTaskId", () => {
     expect(automationSourceTaskId({ labels: {} })).toBeNull();
     expect(automationSourceTaskId(null)).toBeNull();
   });
+
+  it("deletes it with the session unless automations are off for the caller", () => {
+    const session = { labels: { [SCHEDULED_TASK_SOURCE_LABEL_KEY]: "st_1" } };
+    expect(automationDeletedWith(INFO, session)).toBe("st_1");
+    expect(automationDeletedWith("loading", session)).toBe("st_1");
+    expect(automationDeletedWith({ ...INFO, automations_enabled: false }, session)).toBeNull();
+  });
 });
 
 describe("automationPagePath", () => {
@@ -125,7 +133,7 @@ describe("useDeleteSourceAutomations", () => {
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new scheduledTasksApi.ScheduledTaskApiError("gone", 404, "not_found"));
 
-    await expect(renderDelete().current.remove(["st_1", "st_2"])).resolves.toBe(true);
+    await expect(renderDelete().current.remove(["st_1", "st_2"], [])).resolves.toBe(true);
 
     expect(deleteScheduledTask).toHaveBeenCalledWith("st_1");
     expect(deleteScheduledTask).toHaveBeenCalledWith("st_2");
@@ -138,21 +146,29 @@ describe("useDeleteSourceAutomations", () => {
     ["the automations gate", new scheduledTasksApi.ScheduledTaskApiError("not found", 404, null)],
   ])("reports a failed delete (%s) so the caller keeps the sessions", async (_reason, error) => {
     deleteScheduledTask.mockResolvedValueOnce(undefined).mockRejectedValueOnce(error);
+    const result = renderDelete("/c/conv_1");
 
-    await expect(renderDelete().current.remove(["st_1", "st_2"])).resolves.toBe(false);
+    await act(() =>
+      expect(result.current.remove(["st_1", "st_2"], ["conv_1"])).resolves.toBe(false),
+    );
 
     expect(queryClient.getQueryData(SCHEDULED_TASKS_KEY)).toEqual([{ id: "st_2" }, { id: "st_3" }]);
+    // The kept session stays open.
+    expect(result.current.location.pathname).toBe("/c/conv_1");
   });
 
   it.each<[string, string | null, string]>([
     ["/tasks/st_1", null, "/tasks"],
     ["/tasks/st_3", null, "/tasks/st_3"],
-    ["/c/conv_1", null, "/c/conv_1"],
+    ["/c/conv_1", null, "/"],
+    ["/c/conv_2", null, "/c/conv_2"],
     // The page the user is on once the delete finishes decides.
-    ["/tasks/st_1", "/c/conv_1", "/c/conv_1"],
-    ["/c/conv_1", "/tasks/st_1", "/tasks"],
+    ["/tasks/st_1", "/c/conv_2", "/c/conv_2"],
+    ["/c/conv_2", "/tasks/st_1", "/tasks"],
+    ["/c/conv_1", "/c/conv_2", "/c/conv_2"],
+    ["/c/conv_2", "/c/conv_1", "/"],
   ])(
-    "from %s, then %s mid-delete, ends on %s: only a deleted automation's page is left",
+    "deleting conv_1's automation from %s, then %s mid-delete, ends on %s",
     async (from, moved, to) => {
       let finish = () => {};
       deleteScheduledTask.mockReturnValue(
@@ -164,7 +180,7 @@ describe("useDeleteSourceAutomations", () => {
 
       let removal = Promise.resolve(true);
       act(() => {
-        removal = result.current.remove(["st_1"]);
+        removal = result.current.remove(["st_1"], ["conv_1"]);
       });
       if (moved !== null) act(() => result.current.navigate(moved));
       await act(async () => {

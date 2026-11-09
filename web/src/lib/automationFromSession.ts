@@ -4,6 +4,7 @@
 
 import { useCallback, useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import type { Conversation } from "@/hooks/useConversations";
 import { forgetScheduledTasks, refreshAutomationSourceSession } from "@/hooks/useScheduledTasks";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
@@ -91,22 +92,44 @@ export function automationPagePath(info: ServerInfo | "loading", task: Scheduled
 }
 
 /**
+ * The automation that deleting *conversation* deletes too, or `null`. With
+ * automations off for the caller, the session is deleted alone; its
+ * automation keeps its schedule, fails its next run and pauses.
+ */
+export function automationDeletedWith(
+  info: ServerInfo | "loading",
+  conversation: Pick<Conversation, "labels"> | null | undefined,
+): string | null {
+  if (info !== "loading" && info.automations_enabled === false) return null;
+  return automationSourceTaskId(conversation);
+}
+
+/**
  * Delete the automations that run from sessions about to be deleted. An
  * automation that is already gone (404) counts as deleted. Resolves `false`
  * when any other delete fails, so the caller can keep the sessions; deleting a
- * session first would leave its automation failing every run.
+ * session first would leave its automation failing every run. Once the deletes
+ * finish, it leaves the page the user is on then when that page is one of
+ * *sessionIds* (and every delete succeeded) or a deleted automation's.
  */
-export function useDeleteSourceAutomations(): (taskIds: string[]) => Promise<boolean> {
+export function useDeleteSourceAutomations(): (
+  taskIds: string[],
+  sessionIds: string[],
+) => Promise<boolean> {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const { pathname } = useLocation();
-  // The page to leave is the one the user is on once the deletes finish.
-  const pathnameRef = useRef(pathname);
+  const openSessionId = useActiveConversationId();
+  // Where the user is when the deletes finish; unknown once this caller unmounts.
+  const routeRef = useRef<{ pathname: string; openSessionId: string | undefined } | null>(null);
   useEffect(() => {
-    pathnameRef.current = pathname;
-  }, [pathname]);
+    routeRef.current = { pathname, openSessionId };
+    return () => {
+      routeRef.current = null;
+    };
+  }, [pathname, openSessionId]);
   return useCallback(
-    async (taskIds: string[]) => {
+    async (taskIds: string[], sessionIds: string[]) => {
       const results = await Promise.allSettled(
         taskIds.map(async (taskId) => {
           try {
@@ -123,17 +146,24 @@ export function useDeleteSourceAutomations(): (taskIds: string[]) => Promise<boo
         }),
       );
       const deleted = taskIds.filter((_, index) => results[index]?.status === "fulfilled");
-      if (deleted.length > 0) {
+      const allDeleted = deleted.length === taskIds.length;
+      const route = routeRef.current;
+      if (allDeleted && route?.openSessionId && sessionIds.includes(route.openSessionId)) {
+        // The caller deletes this session next, so leave it now, as any session delete does.
+        navigate("/", { replace: true });
+      } else if (
+        route &&
+        deleted.some((taskId) => route.pathname.endsWith(`/tasks/${encodeURIComponent(taskId)}`))
+      ) {
         // Leave the page of an automation deleted with its session, as deleting it there does.
-        const onDeletedPage = deleted.some((taskId) =>
-          pathnameRef.current.endsWith(`/tasks/${encodeURIComponent(taskId)}`),
-        );
-        if (onDeletedPage) navigate("/tasks");
+        navigate("/tasks");
+      }
+      if (deleted.length > 0) {
         forgetScheduledTasks(queryClient, deleted);
         // Sessions kept after a partial failure lost their automation label too.
         refreshAutomationSourceSession(queryClient);
       }
-      return deleted.length === taskIds.length;
+      return allDeleted;
     },
     [queryClient, navigate],
   );
