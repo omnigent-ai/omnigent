@@ -15,8 +15,6 @@ from unittest.mock import patch
 
 import databricks.sdk.config as _sdk_config_mod
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from omnigent.inner.databricks_executor import (
     DatabricksExecutor,
     _convert_messages,
