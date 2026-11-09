@@ -3106,37 +3106,56 @@ def _session_with_history(
 ) -> str:
     """An owned session with one finished exchange and a turn still in progress.
 
-    With ``finished=False`` it holds only the first turn's message, with no reply yet.
+    The turn in progress has sent progress text, a completed message like a
+    reply, and waits on its tool call. With ``finished=False`` the session holds
+    only the first turn's message, with no reply yet.
     """
-    from omnigent.entities import MessageData, NewConversationItem
-
-    def message(role: str, response_id: str, text: str) -> NewConversationItem:
-        part = "input_text" if role == "user" else "output_text"
-        return NewConversationItem(
-            type="message",
-            response_id=response_id,
-            data=MessageData(
-                role=role,
-                content=[{"type": part, "text": text}],
-                agent=None if role == "user" else "claude-native",
-            ),
-        )
+    from omnigent.entities import FunctionCallData, NewConversationItem
 
     session_id = _owned_session(db_uri, owner, **fields)
-    items = [message("user", "resp_1", "summarize the alerts")]
+    items = [_message("user", "resp_1", "summarize the alerts")]
     if finished:
         items += [
-            message("assistant", "resp_1", "three alerts"),
-            message("user", "resp_2", "and the next turn"),
+            _message("assistant", "resp_1", "three alerts"),
+            _message("user", "resp_2", "and the next turn"),
+            _message("assistant", "resp_2", "checking the next one"),
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_2",
+                data=FunctionCallData(
+                    agent="claude-native", name="Bash", arguments="{}", call_id="call_1"
+                ),
+            ),
         ]
     SqlAlchemyConversationStore(db_uri).append(session_id, items)
     return session_id
 
 
+def _message(role: str, response_id: str, text: str) -> Any:
+    from omnigent.entities import MessageData, NewConversationItem
+
+    part = "input_text" if role == "user" else "output_text"
+    return NewConversationItem(
+        type="message",
+        response_id=response_id,
+        data=MessageData(
+            role=role,
+            content=[{"type": part, "text": text}],
+            agent=None if role == "user" else "claude-native",
+        ),
+    )
+
+
 def _item_texts(db_uri: str, session_id: str) -> list[str]:
-    items = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
-    parts = [item.data.content[0] for item in items]
-    return [part["text"] if isinstance(part, dict) else part.text for part in parts]
+    """Each message's text, and the type of any other item."""
+    texts = []
+    for item in SqlAlchemyConversationStore(db_uri).list_items(session_id).data:
+        if item.type != "message":
+            texts.append(item.type)
+            continue
+        part = item.data.content[0]
+        texts.append(part["text"] if isinstance(part, dict) else part.text)
+    return texts
 
 
 async def test_create_from_a_session_copies_it_for_the_runs(
@@ -3164,12 +3183,45 @@ async def test_create_from_a_session_copies_it_for_the_runs(
     assert source_copy.labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] == body["id"]
     # Copied through the last finished reply; the turn in progress stays behind.
     assert _item_texts(db_uri, source_copy_id) == ["summarize the alerts", "three alerts"]
-    assert _item_texts(db_uri, source_id)[-1] == "and the next turn"
+    assert _item_texts(db_uri, source_id)[2:] == [
+        "and the next turn",
+        "checking the next one",
+        "function_call",
+    ]
     assert SqlAlchemyPermissionStore(db_uri).check_access(
         "alice@example.com", source_copy_id, LEVEL_OWNER
     )
     fetched = await auth_client.get(f"/v1/scheduled-tasks/{body['id']}", headers=_headers())
     assert fetched.json()["source_session_id"] == source_copy_id
+
+
+@pytest.mark.parametrize(
+    ("live_status", "last_copied"), [("idle", "all fixed"), ("running", "three alerts")]
+)
+async def test_a_running_sessions_newest_reply_stays_out_of_the_copy(
+    auth_client: httpx.AsyncClient, db_uri: str, live_status: str, last_copied: str
+) -> None:
+    from omnigent.entities import FunctionCallOutputData, NewConversationItem
+
+    source_id = _session_with_history(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    # The tool call returns and the turn replies, which ends the turn only once it goes idle.
+    output = FunctionCallOutputData(call_id="call_1", output="ok")
+    store.append(
+        source_id,
+        [
+            NewConversationItem(type="function_call_output", response_id="resp_2", data=output),
+            _message("assistant", "resp_2", "all fixed"),
+        ],
+    )
+    store.set_session_live_status(source_id, live_status)
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert _item_texts(db_uri, resp.json()["source_session_id"])[-1] == last_copied
 
 
 async def test_a_source_session_must_be_the_owners_top_level_session(
@@ -3328,12 +3380,12 @@ async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
     source_id = _session_with_history(db_uri)
     files = SqlAlchemyFileStore(db_uri)
     files.create(filename="notes.txt", bytes=5, session_id=source_id)
-    copies: list[str] = []
+    copies: list[tuple[str, list[str]]] = []
     copy_session = source_session.copy_session
 
     def _recording_copy(**kwargs: Any) -> Any:
         conv = copy_session(**kwargs)
-        copies.append(conv.id)
+        copies.append((conv.id, [stored.filename for stored in files.list(conv.id).data]))
         return conv
 
     def _failing_create(*args: Any, **kwargs: Any) -> None:
@@ -3346,8 +3398,9 @@ async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
     )
     assert resp.status_code == 400, resp.text
 
-    # The copy and its file row are gone; the source keeps its own file.
-    (copy_id,) = copies
+    # The copy and the file row it had are gone; the source keeps its own file.
+    ((copy_id, copied_files),) = copies
+    assert copied_files == ["notes.txt"]
     assert SqlAlchemyConversationStore(db_uri).get_conversation(copy_id) is None
     assert files.list(copy_id).data == []
     assert [stored.filename for stored in files.list(source_id).data] == ["notes.txt"]

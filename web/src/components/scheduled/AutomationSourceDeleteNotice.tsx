@@ -7,10 +7,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link } from "@/lib/routing";
 import { getScheduledTask, type ScheduledTask } from "@/lib/scheduledTasksApi";
 
-/**
- * Amber callout a delete dialog shows when an automation runs from a session it
- * deletes, because the automation is deleted with the session.
- */
+/** Warns that deleting the session deletes the automations that run from it. */
 function AutomationDeleteCallout({
   title,
   children,
@@ -34,10 +31,7 @@ function AutomationDeleteCallout({
   );
 }
 
-/**
- * An automation's name, quoted and linked to its page; following it closes the
- * dialog. The name wraps as one unit and truncates rather than splitting.
- */
+/** Links to the automation's page; following the link closes the dialog. */
 function AutomationLink({ task, onNavigate }: { task: ScheduledTask; onNavigate: () => void }) {
   const info = useServerInfo();
   return (

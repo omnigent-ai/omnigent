@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from omnigent.entities import Agent, Conversation, ScheduledTask
+from omnigent.entities import NON_CONTENT_ITEM_TYPES, Agent, Conversation, ScheduledTask
 from omnigent.stores.conversation_store import (
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -95,23 +95,39 @@ def carries_native_history(agent: Agent) -> bool:
     return False
 
 
-def last_finished_response_id(conversation_store: Any, conversation_id: str) -> str | None:
+def last_finished_response_id(
+    conversation_store: Any, conversation_id: str, *, running: bool = False
+) -> str | None:
     """The response of the newest finished assistant reply in a session.
 
-    A copy taken through it leaves out a turn that is still in progress.
+    A response is finished when its last content item is a completed assistant
+    message; progress text before a tool call is a completed message too. A
+    copy taken through it leaves out a turn that is still in progress.
 
     :param conversation_store: The conversation store.
     :param conversation_id: The session to read, e.g. ``"conv_abc123"``.
+    :param running: Whether the session's turn is running, so its newest
+        response is still in progress whatever its last item.
     :returns: A response id, e.g. ``"resp_abc123"``, or ``None`` when the
         session has no finished reply yet.
     """
+    seen: set[str] = set()
     after: str | None = None
     for _ in range(50):
-        page = conversation_store.list_items(
-            conversation_id, limit=100, after=after, order="desc", type="message"
-        )
+        page = conversation_store.list_items(conversation_id, limit=100, after=after, order="desc")
         for item in page.data:
-            if item.status == "completed" and getattr(item.data, "role", None) == "assistant":
+            if item.type in NON_CONTENT_ITEM_TYPES or item.response_id in seen:
+                continue
+            newest = not seen
+            seen.add(item.response_id)
+            # Newest first, so this is the response's last content item.
+            if running and newest:
+                continue
+            if (
+                item.type == "message"
+                and item.status == "completed"
+                and getattr(item.data, "role", None) == "assistant"
+            ):
                 return item.response_id
         if not page.has_more or not page.data:
             return None

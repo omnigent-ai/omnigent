@@ -642,7 +642,12 @@ def create_scheduled_tasks_router(
         from omnigent.server.scheduled.source_session import last_finished_response_id
 
         # Runs start from the history through the last finished reply, so there must be one.
-        up_to = await asyncio.to_thread(last_finished_response_id, conversation_store, conv.id)
+        up_to = await asyncio.to_thread(
+            last_finished_response_id,
+            conversation_store,
+            conv.id,
+            running=_session_status_from_cache(conv.id, conv.live_status) == "running",
+        )
         if up_to is None:
             raise OmnigentError(
                 "The session has no finished reply to start an automation from yet",
