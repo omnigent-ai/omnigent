@@ -1471,13 +1471,13 @@ export async function exportSessionTranscript(sessionId: string): Promise<string
 export const INITIAL_WINDOW_ITEMS = 100;
 
 /**
- * Items per scroll-up page (`loadMoreHistory`). Pages are sequential round
- * trips, and a tool-heavy turn folds hundreds of items into one row, so small
- * pages leave the reader waiting at the top. The transcript is virtualized,
- * so a larger page barely adds render work. Equal to the server's
- * per-statement row cap, so a page is still one query.
+ * Items per scroll-up page (`loadMoreHistory`): the same as opening a session.
+ * Pages are sequential round trips, and a tool-heavy turn folds hundreds of
+ * items into one row, so small pages leave the reader waiting at the top.
+ * Past this size, a full scroll-back gets only a little faster, while each
+ * page's download and wait keep growing.
  */
-export const OLDER_HISTORY_PAGE_ITEMS = 200;
+export const OLDER_HISTORY_PAGE_ITEMS = 100;
 
 /**
  * Flatten a `GET /v1/sessions/{id}` item into the flat
