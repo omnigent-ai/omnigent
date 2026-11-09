@@ -9683,6 +9683,18 @@
             "description": "Per-session cost-control switch: `\"on\"` activates the spec's configured cost-control mode, `\"off\"` disables cost control for this session. `None` means no override is active (the spec default applies). Set at create time or via `PATCH /v1/sessions/{id}` (the web \"Cost Optimized\" toggle); read by the cost-control advisor pipeline.",
             "title": "Cost Control Mode Override"
           },
+          "cost_hidden": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`True` when the operator set `OMNIGENT_HIDE_COST`; clients then clear any cached cost instead of keeping it. `None` otherwise.",
+            "title": "Cost Hidden"
+          },
           "created_at": {
             "description": "Unix epoch seconds of creation.",
             "format": "int64",
@@ -11109,6 +11121,19 @@
             "description": "Session identifier.",
             "title": "Conversation Id",
             "type": "string"
+          },
+          "cost_hidden": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "`True` when the operator set `OMNIGENT_HIDE_COST`, telling the client to clear a cached cost rather than keep it.",
+            "title": "Cost Hidden"
           },
           "sequence_number": {
             "anyOf": [

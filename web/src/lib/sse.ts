@@ -630,6 +630,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       }
       totalCostUsd = rawCost;
     }
+    const costHidden = raw.cost_hidden === true;
     // Per-model breakdown (cumulative subtree map). The server sends the full
     // merged map when it changes, so a present value replaces the cached map
     // wholesale. Absent → undefined (keep cached); a malformed entry/bucket
@@ -642,6 +643,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       contextTokens === undefined &&
       contextWindow === undefined &&
       totalCostUsd === undefined &&
+      !costHidden &&
       usageByModel === undefined
     ) {
       return null;
@@ -652,6 +654,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       ...(contextTokens !== undefined ? { contextTokens } : {}),
       ...(contextWindow !== undefined ? { contextWindow } : {}),
       ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
+      ...(costHidden ? { costHidden } : {}),
       ...(usageByModel !== undefined ? { usageByModel } : {}),
     } satisfies SessionUsageEvent;
   }

@@ -827,8 +827,8 @@ usage remain `null`. The response is `Cache-Control: no-store`; read failures
 return an error, never a zero total.
 
 This request runs independently of initial snapshot and transcript loading.
-Display clients consume only `total_cost_usd` and `usage_by_model` from its
-response, keep usage unknown until it arrives, and must not overwrite newer
+Display clients consume only `total_cost_usd`, `cost_hidden` and `usage_by_model`
+from its response, keep usage unknown until it arrives, and must not overwrite newer
 streamed usage with an older in-flight response. Keep this fetch outside the
 shared session-metadata query/cache so it cannot delay metadata reads or
 replace newer metadata. The request performs its own authorization; the initial
@@ -1114,7 +1114,10 @@ Request body matches `SessionEventInput`:
                                   spend, USD) when the session is priced; it is
                                   omitted when unpriced. The same value is seeded
                                   on the session snapshot as `total_cost_usd`
-                                  (`null` when unpriced).
+                                  (`null` when unpriced). With
+                                  `OMNIGENT_HIDE_COST=1` both omit the cost and
+                                  carry `cost_hidden: true`, so clients clear a
+                                  cached cost.
       - "external_reasoning_effort_change"
                                 — internal terminal-observed thinking-level
                                   update from a native forwarder. Persists

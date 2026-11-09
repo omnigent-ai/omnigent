@@ -8278,9 +8278,12 @@ async def test_external_session_usage_event_carries_priced_cost(
     assert published[0][1]["total_cost_usd"] == 0.42
 
 
+@pytest.mark.parametrize("hide_cost", [False, True])
 async def test_external_session_usage_event_carries_token_breakdown(
     client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    hide_cost: bool,
 ) -> None:
     """
     A native ``session.usage`` event carries the per-bucket token breakdown.
@@ -8288,8 +8291,11 @@ async def test_external_session_usage_event_carries_token_breakdown(
     The web token-breakdown rows read these cumulative subtree counts off the
     broadcast so they update live alongside the USD cost. The buckets are
     persisted from the ``cumulative_*`` fields, then surfaced under their
-    canonical keys (``input_tokens`` etc.).
+    canonical keys (``input_tokens`` etc.). With ``OMNIGENT_HIDE_COST`` the
+    cost stays persisted but is replaced by ``cost_hidden`` for clients.
     """
+    if hide_cost:
+        monkeypatch.setenv("OMNIGENT_HIDE_COST", "1")
     published: list[tuple[str, dict[str, Any]]] = []
     _capture_published(monkeypatch, published)
     agent = await create_test_agent(client)
@@ -8314,6 +8320,21 @@ async def test_external_session_usage_event_carries_token_breakdown(
     # The per-model breakdown rides the broadcast, keyed by the event's model.
     assert event["usage_by_model"]["test-model"]["input_tokens"] == 1000
     assert event["usage_by_model"]["test-model"]["output_tokens"] == 500
+    assert _read_session_usage(db_uri, session["id"])["total_cost_usd"] == 0.42
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["usage_by_model"]["test-model"]["input_tokens"] == 1000
+    if hide_cost:
+        assert event["cost_hidden"] is True
+        assert "total_cost_usd" not in event
+        assert "total_cost_usd" not in event["usage_by_model"]["test-model"]
+        assert snapshot["cost_hidden"] is True
+        assert snapshot["total_cost_usd"] is None
+        assert snapshot["usage_by_model"]["test-model"].get("total_cost_usd") is None
+    else:
+        assert "cost_hidden" not in event
+        assert event["total_cost_usd"] == 0.42
+        assert snapshot.get("cost_hidden") is None
+        assert snapshot["total_cost_usd"] == 0.42
 
 
 async def test_external_session_usage_unpriced_omits_cost(
@@ -8362,51 +8383,6 @@ async def test_external_session_usage_unpriced_omits_cost(
     # The broadcast carries no cost field either.
     assert [event["type"] for _, event in published] == ["session.usage"]
     assert "total_cost_usd" not in published[0][1]
-
-
-async def test_hide_cost_setting_keeps_tokens_and_stored_cost(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``OMNIGENT_HIDE_COST`` reports a priced session as unpriced to clients.
-
-    The agent-info popover renders cost only when ``total_cost_usd`` is
-    present, so the broadcast, per-model breakdown and snapshot must omit it
-    while still carrying token counts. The stored cost is kept for budget
-    policies.
-    """
-    monkeypatch.setenv("OMNIGENT_HIDE_COST", "1")
-    published: list[tuple[str, dict[str, Any]]] = []
-    _capture_published(monkeypatch, published)
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
-
-    resp = await client.post(
-        f"/v1/sessions/{session['id']}/events",
-        json={
-            "type": "external_session_usage",
-            "data": {
-                "context_tokens": 1000,
-                "cumulative_input_tokens": 1000,
-                "cumulative_output_tokens": 500,
-                "cumulative_cost_usd": 0.42,
-                "model": "test-model",
-            },
-        },
-    )
-    assert resp.status_code == 202, resp.text
-
-    assert _read_session_usage(db_uri, session["id"])["total_cost_usd"] == 0.42
-    event = published[0][1]
-    assert "total_cost_usd" not in event
-    model_usage = event["usage_by_model"]["test-model"]
-    assert (model_usage["input_tokens"], model_usage["output_tokens"]) == (1000, 500)
-    assert "total_cost_usd" not in model_usage
-    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-    assert snapshot["total_cost_usd"] is None
-    assert snapshot["usage_by_model"]["test-model"]["input_tokens"] == 1000
-    assert snapshot["usage_by_model"]["test-model"].get("total_cost_usd") is None
 
 
 async def test_session_snapshot_includes_priced_cost(

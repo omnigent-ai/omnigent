@@ -2317,6 +2317,11 @@ def _record_daily_cost(
 HIDE_COST_ENV_VAR = "OMNIGENT_HIDE_COST"
 
 
+def cost_display_hidden() -> bool:
+    """Whether the operator hides USD cost from session views."""
+    return env_var_is_truthy(HIDE_COST_ENV_VAR)
+
+
 def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
     """
     Extract ``total_cost_usd`` for client display, or ``None`` when unpriced.
@@ -2335,7 +2340,7 @@ def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
         ``{"input_tokens": 1200}`` (unpriced — no cost key).
     :returns: The cumulative cost in USD when priced, else ``None``.
     """
-    if "total_cost_usd" not in usage or env_var_is_truthy(HIDE_COST_ENV_VAR):
+    if "total_cost_usd" not in usage or cost_display_hidden():
         return None
     try:
         return float(usage["total_cost_usd"])
@@ -12751,5 +12756,6 @@ __all__ = [
     "_wait_for_runner_client",
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
+    "cost_display_hidden",
     "prefetch_session_routing_catalogs",
 ]

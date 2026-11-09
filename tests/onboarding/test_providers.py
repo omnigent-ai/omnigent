@@ -397,7 +397,7 @@ def test_find_catalog_models_family_fallback_handles_dates_and_dotted_versions(
 
     monkeypatch.setitem(_FAKE_CATALOG, "openai", _catalog("gpt-4o", "gpt-4o-2024-08-06"))
     monkeypatch.setitem(_FAKE_CATALOG, "gemini", _catalog("gemini-2.5-pro-preview-05-06"))
-    monkeypatch.setitem(_FAKE_CATALOG, "anthropic", _catalog())
+    monkeypatch.setitem(_FAKE_CATALOG, "anthropic", _catalog("claude-sonnet-4.5"))
     monkeypatch.setitem(
         _FAKE_CATALOG, "openrouter", _catalog("anthropic/claude-sonnet-4.5", "openai/gpt-4o")
     )

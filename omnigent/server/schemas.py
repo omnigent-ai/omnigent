@@ -2384,6 +2384,9 @@ class SessionResponse(BaseModel):
         seed their cost indicator on resume without waiting for the
         next ``session.usage`` SSE event.
         Also ``None`` when ``usage_included`` is ``False``.
+    :param cost_hidden: ``True`` when the operator set ``OMNIGENT_HIDE_COST``;
+        clients then clear any cached cost instead of keeping it. ``None``
+        otherwise.
     :param usage_by_model: Per-model breakdown of the same subtree usage,
         keyed by the raw harness model id, e.g.
         ``{"claude-sonnet-4-6": ModelUsage(input_tokens=12000, ...)}``.
@@ -2533,6 +2536,7 @@ class SessionResponse(BaseModel):
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
+    cost_hidden: bool | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
     usage_included: bool = True
     native_usage_baseline: NativeUsageBaseline | None = None
@@ -3848,6 +3852,8 @@ class SessionUsageEvent(_SSEEventBase):
         so the client keeps its prior value (the snapshot seeds the
         initial "—" for an unpriced session). Once a session is priced
         the total only grows, so it never reverts to unpriced.
+    :param cost_hidden: ``True`` when the operator set ``OMNIGENT_HIDE_COST``,
+        telling the client to clear a cached cost rather than keep it.
     :param usage_by_model: Per-model breakdown of the same subtree usage
         after this update, keyed by raw harness model id, e.g.
         ``{"claude-sonnet-4-6": ModelUsage(input_tokens=12000, ...)}``.
@@ -3865,6 +3871,7 @@ class SessionUsageEvent(_SSEEventBase):
     context_tokens: int | None = None
     context_window: int | None = None
     total_cost_usd: float | None = None
+    cost_hidden: bool | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
 
 
