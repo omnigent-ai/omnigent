@@ -10859,6 +10859,17 @@
             "title": "Name",
             "type": "string"
           },
+          "native_invocation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Native Invocation"
+          },
           "output": {
             "anyOf": [
               {
@@ -11882,7 +11893,7 @@
         "type": "object"
       },
       "SlashCommandData": {
-        "description": "Data payload for a slash-command invocation observed in a\nharness transcript (today: Claude Code's embedded TUI).\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop's\nhistory filter skips it \u2014 a downstream LLM never sees this as a\nphantom tool call. Field names mirror `function_call` so the\nweb renderer can reuse the tool-card layout.\n\n**Parameters**\n\n- `agent` \u2014 Harness/agent name, e.g. `\"claude-native-ui\"`. Serialized as `\"model\"` for parity with other items.",
+        "description": "Data payload for a slash-command invocation observed in a\nharness transcript.\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop's\nhistory filter skips it \u2014 a downstream LLM never sees this as a\nphantom tool call. Field names mirror `function_call` so the\nweb renderer can reuse the tool-card layout.\n\n**Parameters**\n\n- `agent` \u2014 Harness/agent name, e.g. `\"claude-native-ui\"`. Serialized as `\"model\"` for parity with other items.",
         "properties": {
           "arguments": {
             "description": "Raw `<command-args>` text. Empty when none.",
@@ -11907,6 +11918,18 @@
             "description": "Command name with leading `/` stripped, e.g. `\"dev-productivity:simplify\"`.",
             "title": "Name",
             "type": "string"
+          },
+          "native_invocation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Original Codex input text for native history replay.",
+            "title": "Native Invocation"
           },
           "output": {
             "anyOf": [
