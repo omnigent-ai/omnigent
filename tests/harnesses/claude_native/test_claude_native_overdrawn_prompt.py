@@ -358,18 +358,27 @@ async def test_pane_liveness_reads_the_requested_pane(
         capture_output=True,
         timeout=5,
     )
+    # tmux can mark the pane dead on pty EOF before it reaps the child, so on a
+    # loaded runner ``pane_dead`` reads 1 while ``pane_dead_status`` is still empty.
     _wait_until(
         lambda: (
             subprocess.run(
-                [*tmux, "display-message", "-p", "-t", exited, "#{pane_dead}"],
+                [
+                    *tmux,
+                    "display-message",
+                    "-p",
+                    "-t",
+                    exited,
+                    "#{pane_dead} #{pane_dead_status}",
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
                 timeout=5,
             ).stdout.strip()
-            == "1"
+            == "1 7"
         ),
-        "test pane did not exit",
+        "test pane did not exit with its status",
     )
 
     assert bridge._claude_pane_state(socket_path, target) == (
