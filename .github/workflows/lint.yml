@@ -59,7 +59,9 @@ jobs:
           POLICY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           if [ -z "$POLICY_BASE" ] || [ "$POLICY_BASE" = "0000000000000000000000000000000000000000" ]; then
-            POLICY_BASE=HEAD^
+            POLICY_BASE=origin/main
+          elif ! git cat-file -e "${POLICY_BASE}^{commit}"; then
+            git fetch --no-tags origin "$POLICY_BASE"
           fi
           python3 dev/lint/lint_reference_policy.py --base "$POLICY_BASE" --head HEAD
 

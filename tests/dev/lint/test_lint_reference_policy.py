@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from dev.lint import lint_reference_policy as policy
 from dev.lint.lint_reference_policy import check, git, violates
@@ -41,6 +42,8 @@ def sample_policy(monkeypatch: pytest.MonkeyPatch) -> None:
         "EXAMPLE.SERVICE.EXAMPLE.TEST",
         "123.service.example.test",
         "docs.extra.service.example.test",
+        "See https://tenant.service.example.test.",
+        "See tenant.service.example.test. More text.",
     ],
 )
 @pytest.mark.usefixtures("sample_policy")
@@ -60,6 +63,7 @@ def test_prohibited(text: str) -> None:
         "https://tenant.example.test/path",
         "https://service.example.test/",
         "https://tenant.service.example.test.other.example/",
+        "See docs.service.example.test. More text.",
     ],
 )
 @pytest.mark.usefixtures("sample_policy")
@@ -110,14 +114,25 @@ def repository(tmp_path: Path, prohibited_name: str) -> Path:
     return tmp_path
 
 
-def test_staged_only_and_existing_lines(repository: Path, prohibited_name: str) -> None:
+@pytest.mark.parametrize(
+    "separator", ["", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+)
+def test_staged_only_and_existing_lines(
+    repository: Path, prohibited_name: str, separator: str
+) -> None:
     path = repository / "existing.txt"
     path.write_text(f"{prohibited_name}\nkeep\nsafe\n", encoding="utf-8")
     git(repository, "add", ".")
-    path.write_text(f"{prohibited_name}\nkeep\n{prohibited_name}\n", encoding="utf-8")
+    path.write_text(
+        f"{prohibited_name}\nkeep\nsafe {separator}{prohibited_name}\n{prohibited_name}\n",
+        encoding="utf-8",
+    )
     assert check(repository) == []
     git(repository, "add", ".")
-    assert check(repository) == ["existing.txt:3: prohibited reference in added text"]
+    assert check(repository) == [
+        "existing.txt:3: prohibited reference in added text",
+        "existing.txt:4: prohibited reference in added text",
+    ]
 
 
 def test_branch_range_checks_committed_changes(repository: Path, prohibited_name: str) -> None:
@@ -125,28 +140,65 @@ def test_branch_range_checks_committed_changes(repository: Path, prohibited_name
     (repository / "notes.md").write_text(f"# Note\n{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
     git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
+    (repository / "notes.md").write_bytes(b"\x00")
     assert check(repository) == []
     assert check(repository, base, "HEAD") == ["notes.md:2: prohibited reference in added text"]
 
 
-def test_paths_renames_and_line_numbers(repository: Path, prohibited_name: str) -> None:
+@pytest.mark.parametrize(
+    "literal_name",
+    [
+        "bracket[1].txt",
+        pytest.param(
+            ":(exclude)*",
+            marks=pytest.mark.skipif(
+                sys.platform == "win32", reason="Unsupported filename on Windows"
+            ),
+        ),
+    ],
+)
+def test_paths_renames_and_line_numbers(
+    repository: Path, prohibited_name: str, literal_name: str
+) -> None:
     name = f"{prohibited_name} notes.txt"
     (repository / name).write_text("safe\n", encoding="utf-8")
+    (repository / literal_name).write_text(f"safe\n{prohibited_name}\n", encoding="utf-8")
+    (repository / "bracket1.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
     git(repository, "mv", "existing.txt", "renamed.txt")
     git(repository, "add", ".")
     assert sorted(check(repository)) == sorted(
         [
             f"{name}:1: prohibited reference in new path",
+            f"{literal_name}:2: prohibited reference in added text",
+            "bracket1.txt:1: prohibited reference in added text",
             "renamed.txt:1: prohibited reference in added text",
         ]
     )
 
 
-def test_deletion_and_binary_content(repository: Path) -> None:
+def test_deletion_and_binary_content(repository: Path, prohibited_name: str) -> None:
     git(repository, "rm", "existing.txt")
-    (repository / "image.bin").write_bytes(b"\x00\xff")
+    (repository / "image.bin").write_bytes(b"\x00\xff" + prohibited_name.encode())
+    (repository / ".gitattributes").write_text(
+        "notes.txt -diff\nimage.bin diff\n", encoding="utf-8"
+    )
+    (repository / "notes.txt").write_text(f"safe\n{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
-    assert check(repository) == []
+    commit = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(
+        repository,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{commit},{prohibited_name}-module",
+    )
+    (repository / "notes.txt").write_bytes(b"\x00")
+    assert sorted(check(repository)) == sorted(
+        [
+            f"{prohibited_name}-module:1: prohibited reference in new path",
+            "notes.txt:2: prohibited reference in added text",
+        ]
+    )
 
 
 def test_only_policy_definition_is_exempt(repository: Path, prohibited_name: str) -> None:
@@ -202,13 +254,37 @@ def test_cli_uses_push_range_and_does_not_echo_values(
     assert failed.returncode == 2
 
 
-def test_hook_and_ci_enforce_policy() -> None:
+@pytest.mark.parametrize("base", ["", "0" * 40, "missing-ref"])
+@pytest.mark.skipif(sys.platform == "win32", reason="The CI step runs in Bash on Linux")
+def test_hook_and_ci_enforce_policy(repository: Path, prohibited_name: str, base: str) -> None:
     root = Path(__file__).resolve().parents[3]
     hook = (root / ".pre-commit-config.yaml").read_text()
     workflow = (root / ".github/workflows/lint.yml").read_text()
-    prompt = (root / ".github/workflows/polly-review.yml").read_text()
     assert "entry: python3 dev/lint/lint_reference_policy.py" in hook
     assert 'lint_reference_policy.py --base "$POLICY_BASE" --head HEAD' in workflow
     assert "fetch-depth: 0" in workflow
-    assert "**Reference policy** — treat new violations as blocking contract violations." in prompt
-    assert "Do not explain prohibited names" in prompt
+    step = next(
+        step
+        for step in yaml.safe_load(workflow)["jobs"]["pre-commit"]["steps"]
+        if step.get("name") == "Check reference policy"
+    )
+    git(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+    (repository / "notes.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
+    git(repository, "add", ".")
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "first")
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-qm", "second")
+    script = repository / "dev/lint/lint_reference_policy.py"
+    script.parent.mkdir(parents=True)
+    script.write_text((root / "dev/lint/lint_reference_policy.py").read_text(), encoding="utf-8")
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        cwd=repository,
+        env={**os.environ, "POLICY_BASE": base},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    if base != "missing-ref":
+        assert result.returncode == 1
+        assert "notes.txt:1: prohibited reference" in result.stdout

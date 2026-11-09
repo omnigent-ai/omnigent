@@ -685,7 +685,9 @@ jobs:
 
           **Reference policy** — treat new violations as blocking contract violations.
           Read `dev/lint/lint_reference_policy.py` in the trusted checkout for the
-          prohibited patterns and public-host exceptions. Check added code,
+          prohibited patterns and public-host exceptions. Include this path and
+          the policy requirements in every reviewer task. If the policy cannot be
+          read, report an incomplete review; do not claim a clean review. Check added code,
           filenames, tests, comments, docs, and generated text. Also flag clearly
           evidenced non-public deployment details, real workspace addresses or IDs,
           and organization-specific access instructions that the patterns miss.

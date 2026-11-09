@@ -47,7 +47,7 @@ PUBLIC_HOSTS = frozenset(
 def host_pattern(suffixes: tuple[str, ...]) -> re.Pattern[str]:
     alternatives = "|".join(re.escape(suffix) for suffix in suffixes)
     return re.compile(
-        r"(?<![\w.-])(?:[a-z0-9-]+\.)+(?:" + alternatives + r")(?![\w.-])",
+        r"(?<![\w.-])(?:[a-z0-9-]+\.)+(?:" + alternatives + r")(?![\w-]|\.[\w-])",
         re.IGNORECASE,
     )
 
@@ -80,22 +80,32 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
         ancestor = git(root, "merge-base", base, target).decode().strip()
         revisions = [ancestor, target]
     options = ["--no-ext-diff", "--no-textconv", "--no-renames", *revisions]
-    entries = git(root, "diff", *options, "--name-status", "-z", "--diff-filter=ACMT", "--").split(
-        b"\0"
-    )
+    entries = git(
+        root, "diff", *options, "--raw", "--no-abbrev", "-z", "--diff-filter=ACMT", "--"
+    ).split(b"\0")
     findings = []
     for index in range(0, len(entries) - 1, 2):
-        status, raw_path = entries[index : index + 2]
+        metadata, raw_path = entries[index : index + 2]
+        _, mode, _, object_id, status = metadata.split()
         path = os.fsdecode(raw_path)
         if path in POLICY_FILES:
             continue
         if status == b"A" and violates(path):
             findings.append(f"{path}:1: prohibited reference in new path")
-        patch = git(root, "diff", *options, "--unified=0", "--", path).decode(
-            "utf-8", errors="replace"
-        )
+        if mode == b"160000" or b"\0" in git(root, "cat-file", "blob", object_id.decode())[:8000]:
+            continue
+        patch = git(
+            root,
+            "--literal-pathspecs",
+            "diff",
+            *options,
+            "--text",
+            "--unified=0",
+            "--",
+            path,
+        ).decode("utf-8", errors="replace")
         line_number = None
-        for line in patch.splitlines():
+        for line in patch.split("\n"):
             hunk = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
             if hunk:
                 line_number = int(hunk[1])
