@@ -1357,6 +1357,11 @@ def _build_claude_sdk_spawn_env(
             if binding_for_harness(load_runtime_inference_config(), "claude-sdk") is not None
             else model.removeprefix("anthropic/")
         )
+    # Always set, so an inherited window never sizes another agent's history replay.
+    context_window = spec.executor.context_window
+    env["HARNESS_CLAUDE_SDK_CONTEXT_WINDOW"] = (
+        "" if context_window is None else str(context_window)
+    )
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the SDK subprocess inherits the runner's launch cwd — see
     # ``HARNESS_CLAUDE_SDK_CWD`` in ``omnigent/inner/claude_sdk_harness.py``.
@@ -1428,11 +1433,8 @@ def _build_claude_sdk_spawn_env(
     retry_payload = _serialize_retry_policy(_resolve_retry_policy(spec))
     if retry_payload is not None:
         env["HARNESS_CLAUDE_SDK_RETRY_POLICY"] = retry_payload
-    # Permission mode: controls whether Claude asks for approval before
-    # calling native tools. Unless it is ``"bypassPermissions"``, the SDK's
-    # ``can_use_tool`` callback is active and approval requests surface via
-    # Omnigent elicitation. Omitted when not set — the harness falls back to
-    # ``"auto"``.
+    # Forward an explicit spec permission mode; unset, the harness default (``"auto"``)
+    # applies. Any mode but ``"bypassPermissions"`` routes approvals through elicitation.
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = str(permission_mode)
