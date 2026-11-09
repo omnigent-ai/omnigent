@@ -938,7 +938,7 @@ describe("renderTriggerPrompt", () => {
       'Watch: new PagerDuty incidents on services whose name contains "payments"\n',
     );
     expect(prompt).toContain(
-      'Use your PagerDuty tools to find every service whose name contains "payments", ignoring case, for example GET /services with query set to "payments", reading every page and keeping only names that contain it. If none does, say so in your reply. Then list the incidents created on them since that time, in any status and not only the ones assigned to you, for example GET /incidents with service_ids[] set to their IDs,',
+      'Use your PagerDuty tools to find every service whose name contains "payments", ignoring case, for example GET /services with query set to "payments", reading every page and keeping only names that contain it. If none does, say so in your reply and list no incidents, since an incident list without service IDs covers every service. Then list the incidents created on them since that time, in any status and not only the ones assigned to you, for example GET /incidents with service_ids[] set to their IDs,',
     );
     // The text names no single service, so it skips the exact-name lookup.
     expect(prompt).not.toContain("by name or ID");

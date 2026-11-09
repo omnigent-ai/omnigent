@@ -1015,7 +1015,7 @@ function sourceText(source: TriggerSource, fields: TriggerFields): SourceText {
           : `services ${services.join(", ")}`;
     const findServices =
       nameText !== null
-        ? `Use your PagerDuty tools to find every service whose name contains ${nameText}, ignoring case, for example GET /services with query set to ${nameText}, reading every page and keeping only names that contain it. If none does, say so in your reply.`
+        ? `Use your PagerDuty tools to find every service whose name contains ${nameText}, ignoring case, for example GET /services with query set to ${nameText}, reading every page and keeping only names that contain it. If none does, say so in your reply and list no incidents, since an incident list without service IDs covers every service.`
         : `Use your PagerDuty tools to find ${one ? "that service" : "each of those services"} by name or ID. A name that matches no service or more than one counts as no match: say so in your reply.`;
     const filter = describePagerDutyFilter(fields);
     return {
