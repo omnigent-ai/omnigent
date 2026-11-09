@@ -2396,13 +2396,18 @@ async def test_ensure_initialized_image_capability_defaults_false() -> None:
 
 
 @pytest.mark.parametrize("input_item_id", ["msg_current", None])
+@pytest.mark.parametrize("content", ["current", [], [{"type": "input_text", "text": ""}]])
+@pytest.mark.parametrize("fresh_session", [False, True], ids=["warm", "history-replay"])
 @pytest.mark.asyncio
-async def test_prompt_includes_input_item_metadata(input_item_id) -> None:
+async def test_prompt_includes_input_item_metadata(input_item_id, content, fresh_session) -> None:
     """Every ACP prompt names the initiating item or explicitly sends null."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
     executor = QwenExecutor()
     executor._initialized = True
     executor._session_id = "acp-session"
     executor._proc = MagicMock(returncode=None)
+    executor._system_prompt_sent = not fresh_session
     prompts = []
 
     async def send(message):
@@ -2410,12 +2415,25 @@ async def test_prompt_includes_input_item_metadata(input_item_id) -> None:
         executor._pending[message["id"]].set_result({"result": {"stopReason": "end_turn"}})
 
     executor._send = send
-    messages = [{"role": "user", "content": "current"}]
+    tail = {"type": "message", "role": "user", "content": content}
     if input_item_id is not None:
-        messages[-1]["input_item_id"] = input_item_id
+        tail["id"] = input_item_id
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "assistant", "content": "old reply"},
+            tail,
+        ]
+    )
     events = [event async for event in executor.run_turn(messages, [], "")]
 
     assert any(isinstance(event, TurnComplete) for event in events)
     assert len(prompts) == 1
     assert prompts[0]["method"] == "session/prompt"
     assert prompts[0]["params"]["_meta"] == {_META_INPUT_ITEM_ID: input_item_id}
+    if fresh_session:
+        assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
+    else:
+        assert prompts[0]["params"]["prompt"] == [
+            {"type": "text", "text": content if isinstance(content, str) else ""}
+        ]

@@ -1635,12 +1635,14 @@ def _extract_role_keyed_messages(
         content = _normalize_message_content(
             item.get("content"), preserve_content_blocks=preserve_content_blocks
         )
-        if not content:
+        is_initiating_user = role == "user" and item is input_value[-1]
+        # Keep an empty initiating message so its identity and position survive.
+        if not content and not is_initiating_user:
             continue
         message: Message = {"role": role, "content": content}
         # Only the final input item can identify this turn. Filtered tool history
         # must not make an older user message look like the initiating item.
-        if role == "user" and item is input_value[-1]:
+        if is_initiating_user:
             message["input_item_id"] = item.get("id")
         messages.append(message)
     return messages

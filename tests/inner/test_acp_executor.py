@@ -2914,14 +2914,30 @@ async def test_start_process_guard_deleted_process_cwd_relative_cwd() -> None:
             "msg_current",
         ),
         (
-            {"type": "message", "role": "user", "id": "msg_external", "content": "external"},
-            "msg_external",
+            {"type": "message", "role": "user", "id": "msg_empty", "content": []},
+            "msg_empty",
+        ),
+        (
+            {
+                "type": "message",
+                "role": "user",
+                "id": "msg_empty",
+                "content": [{"type": "input_text", "text": ""}],
+            },
+            "msg_empty",
         ),
         ({"type": "message", "role": "user", "content": "Your runner was interrupted"}, None),
         ({"type": "function_call", "name": "read", "call_id": "call_1", "arguments": "{}"}, None),
         ({"type": "function_call_output", "call_id": "call_1", "output": "done"}, None),
     ],
-    ids=["current", "history-resume", "synthetic-recovery", "tool-resume", "tool-result-resume"],
+    ids=[
+        "current",
+        "empty-list",
+        "empty-text",
+        "synthetic-recovery",
+        "tool-resume",
+        "tool-result-resume",
+    ],
 )
 async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expected_id) -> None:
     """History filtering and replay must never select an older user's identity."""
@@ -2950,5 +2966,7 @@ async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expe
     assert any(isinstance(event, TurnComplete) for event in events)
     assert len(prompts) == 1
     assert prompts[0]["params"]["_meta"] == {_META_INPUT_ITEM_ID: expected_id}
+    if expected_id == "msg_empty" and not fresh_session:
+        assert prompts[0]["params"]["prompt"] == [{"type": "text", "text": ""}]
     if fresh_session and tail.get("role") == "user":
         assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]

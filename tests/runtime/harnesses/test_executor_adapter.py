@@ -1333,6 +1333,34 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
     assert [m["role"] for m in messages] == ["user", "user"]
 
 
+@pytest.mark.parametrize("content", [[], [{"type": "input_text", "text": ""}]])
+@pytest.mark.parametrize("preserve_content_blocks", [False, True])
+@pytest.mark.parametrize("include_tool_history", [False, True])
+def test_translate_input_to_messages_preserves_empty_initiating_item(
+    content, preserve_content_blocks, include_tool_history
+) -> None:
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "user", "id": "msg_old_empty", "content": []},
+            {"type": "message", "role": "assistant", "content": []},
+            {"type": "message", "role": "user", "id": "msg_empty", "content": content},
+        ],
+        preserve_content_blocks=preserve_content_blocks,
+        include_tool_history=include_tool_history,
+    )
+
+    assert len(messages) == 2
+    assert "input_item_id" not in messages[0]
+    assert messages[-1] == {
+        "role": "user",
+        "content": content if preserve_content_blocks else "",
+        "input_item_id": "msg_empty",
+    }
+
+
 @pytest.mark.parametrize("has_output", [False, True], ids=["tool-call", "tool-call-and-output"])
 def test_translate_input_to_messages_tool_resume_has_no_input_item_id(has_output) -> None:
     """A tool tail must not reuse the user ID when the agent produced no text."""
