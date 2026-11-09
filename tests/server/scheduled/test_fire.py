@@ -41,9 +41,10 @@ from omnigent.server.routes._host_worktree import (
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import (
     BUSY_QUIET_SECONDS,
+    BUSY_RECHECK_SECONDS,
     BUSY_SKIP_MAX_SECONDS,
     FireDeps,
-    build_occurrence_busy,
+    build_busy_until,
     build_on_fire,
     build_run_now,
 )
@@ -3934,7 +3935,7 @@ def test_session_unattended_disallowed_mode(
     assert fire_mod.session_unattended_disallowed_mode(conv) == expected
 
 
-def _occurrence_busy_check(
+def _busy_until_check(
     live_status: str | None,
     last_scheduled_at: int | None,
     *,
@@ -3955,66 +3956,74 @@ def _occurrence_busy_check(
     )
     sched_store = Mock(list_runs=Mock(return_value=(runs, None)))
     conversation_store = Mock(get_session_activity=Mock(return_value=activity))
-    return build_occurrence_busy(_deps(sched_store, conversation_store=conversation_store))
+    return build_busy_until(_deps(sched_store, conversation_store=conversation_store))
 
 
 @pytest.mark.parametrize(
-    ("session_mode", "live_status", "minutes_since_last_run", "busy"),
+    ("session_mode", "live_status", "minutes_since_last_run", "wait_seconds"),
     [
-        pytest.param("continue", "running", 2, True, id="turn-in-progress"),
-        pytest.param("continue", "waiting", 9, True, id="waiting-on-approval"),
+        pytest.param("continue", "running", 2, BUSY_RECHECK_SECONDS, id="turn-in-progress"),
+        # Never later than ten minutes after the latest poll.
+        pytest.param("continue", "waiting", 9, 60, id="waiting-on-approval-until-backstop"),
         pytest.param(
-            "continue", "running", BUSY_SKIP_MAX_SECONDS // 60, False, id="ten-minute-backstop"
+            "continue", "running", BUSY_SKIP_MAX_SECONDS // 60, None, id="ten-minute-backstop"
         ),
-        pytest.param("continue", "idle", 2, False, id="idle"),
-        pytest.param("continue", None, 2, False, id="session-gone"),
-        pytest.param("continue", "running", None, False, id="no-earlier-run"),
-        pytest.param("new", "running", 2, False, id="new-session-each-run"),
+        pytest.param("continue", "idle", 2, None, id="idle"),
+        pytest.param("continue", None, 2, None, id="session-gone"),
+        pytest.param("continue", "running", None, None, id="no-earlier-run"),
+        pytest.param("new", "running", 2, None, id="new-session-each-run"),
     ],
 )
-async def test_occurrence_is_busy_only_while_its_continued_session_runs(
-    session_mode, live_status, minutes_since_last_run, busy
+async def test_a_busy_session_is_checked_again_later(
+    session_mode, live_status, minutes_since_last_run, wait_seconds
 ) -> None:
     due = 1_800_003_600
     last = None if minutes_since_last_run is None else due - minutes_since_last_run * 60
-    check = _occurrence_busy_check(live_status, last)
+    check = _busy_until_check(live_status, last)
     task = _task(
         session_mode=session_mode,
         session_id="sess_busy_check" if session_mode == "continue" else None,
         next_run_at=due,
     )
-    assert await check(task, due) is busy
+    assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+async def test_a_trigger_without_a_session_yet_polls_now() -> None:
+    due = 1_800_003_600
+    check = _busy_until_check("running", due - 60)
+    task = _task(session_mode="continue", session_id=None, next_run_at=due)
+    assert await check(task, due) is None
 
 
 async def test_a_late_poll_counts_the_ten_minutes_from_the_current_time() -> None:
     due = 1_800_003_600
     # A Run now went out five minutes before this poll was due.
-    check = _occurrence_busy_check("running", due - 5 * 60)
+    check = _busy_until_check("running", due - 5 * 60)
     task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
-    assert await check(task, due) is True
+    assert await check(task, due) == due + BUSY_RECHECK_SECONDS
     # Dispatched half an hour late, the poll is sent even though the session looks busy.
-    assert await check(task, due + 30 * 60) is False
+    assert await check(task, due + 30 * 60) is None
 
 
 async def test_the_ten_minutes_count_from_when_the_latest_poll_went_out() -> None:
     due = 1_800_003_600
     # The latest poll was due half an hour ago but only went out two minutes ago.
-    check = _occurrence_busy_check("running", due - 30 * 60, fired_at=due - 2 * 60)
+    check = _busy_until_check("running", due - 30 * 60, fired_at=due - 2 * 60)
     task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
-    assert await check(task, due) is True
+    assert await check(task, due) == due + BUSY_RECHECK_SECONDS
 
 
 @pytest.mark.parametrize(
-    ("seconds_since_change", "busy"),
+    ("seconds_since_change", "wait_seconds"),
     [
-        pytest.param(60, True, id="pausing-between-steps"),
-        pytest.param(BUSY_QUIET_SECONDS, False, id="quiet-for-two-minutes"),
+        pytest.param(30, BUSY_QUIET_SECONDS - 30, id="pausing-between-steps"),
+        pytest.param(BUSY_QUIET_SECONDS, None, id="quiet-for-two-minutes"),
     ],
 )
-async def test_an_idle_session_that_just_changed_still_counts_as_busy(
-    seconds_since_change, busy
+async def test_an_idle_session_is_polled_two_quiet_minutes_after_its_last_change(
+    seconds_since_change, wait_seconds
 ) -> None:
     due = 1_800_003_600
-    check = _occurrence_busy_check("idle", due - 5 * 60, updated_at=due - seconds_since_change)
+    check = _busy_until_check("idle", due - 5 * 60, updated_at=due - seconds_since_change)
     task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
-    assert await check(task, due) is busy
+    assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)

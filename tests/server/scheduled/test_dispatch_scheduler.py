@@ -2498,9 +2498,10 @@ async def test_busy_trigger_automation_skips_its_poll_without_a_run(store, caplo
     )
     clock = FakeClock(task.next_run_at)
     fire = AsyncMock()
-    busy = AsyncMock(return_value=True)
+    # The session went quiet 30 seconds ago, so it is checked again in 90.
+    busy = AsyncMock(return_value=task.next_run_at + 90)
     scheduler = PersistentTaskScheduler(
-        store, fire, AsyncMock(return_value=None), now=clock.now, occurrence_busy=busy
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
     )
     await scheduler.poll_once()
     await _drain(scheduler)
@@ -2509,15 +2510,16 @@ async def test_busy_trigger_automation_skips_its_poll_without_a_run(store, caplo
     assert store.list_runs(task.id)[0] == []
     saved = store.get(task.id)
     assert saved.state == "active"
-    assert saved.next_run_at == task.next_run_at + TRIGGER_POLL_SECONDS
+    assert saved.next_run_at == task.next_run_at + 90
     [skipped] = _events(caplog, "scheduled_run_skipped_busy")
     assert skipped["scheduled_at"] == task.next_run_at
+    assert skipped["next_check_at"] == task.next_run_at + 90
     assert skipped["advanced"] is True
 
 
 @pytest.mark.parametrize(
     "busy",
-    [AsyncMock(return_value=False), AsyncMock(side_effect=RuntimeError("status unavailable"))],
+    [AsyncMock(return_value=None), AsyncMock(side_effect=RuntimeError("status unavailable"))],
     ids=["idle", "check-failed"],
 )
 async def test_trigger_automations_poll_every_two_minutes_whatever_their_schedule(
@@ -2527,7 +2529,7 @@ async def test_trigger_automations_poll_every_two_minutes_whatever_their_schedul
     clock = FakeClock(task.next_run_at)
     fire = AsyncMock()
     scheduler = PersistentTaskScheduler(
-        store, fire, AsyncMock(return_value=None), now=clock.now, occurrence_busy=busy
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
     )
     await scheduler.poll_once()
     await _drain(scheduler)
@@ -2547,7 +2549,7 @@ async def test_an_uninitialized_trigger_automation_polls_within_two_minutes(stor
         AsyncMock(),
         AsyncMock(return_value=None),
         now=clock.now,
-        occurrence_busy=AsyncMock(return_value=False),
+        busy_until=AsyncMock(return_value=None),
     )
     await scheduler.poll_once()
     await _drain(scheduler)
@@ -2562,7 +2564,7 @@ async def test_a_saved_trigger_polls_two_minutes_out_only_with_a_busy_check(
         store,
         AsyncMock(),
         AsyncMock(return_value=None),
-        occurrence_busy=AsyncMock(return_value=False) if busy_check else None,
+        busy_until=AsyncMock(return_value=None) if busy_check else None,
     )
     created = _task(store, prompt=_TRIGGER_PROMPT, session_mode="continue")
     store.update(created.id, state="paused")
@@ -2579,9 +2581,9 @@ async def test_other_continued_sessions_keep_their_schedule_and_send_while_busy(
     task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=10", session_mode="continue")
     clock = FakeClock(task.next_run_at)
     fire = AsyncMock()
-    busy = AsyncMock(return_value=True)
+    busy = AsyncMock(return_value=task.next_run_at + 90)
     scheduler = PersistentTaskScheduler(
-        store, fire, AsyncMock(return_value=None), now=clock.now, occurrence_busy=busy
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
     )
     await scheduler.poll_once()
     await _drain(scheduler)

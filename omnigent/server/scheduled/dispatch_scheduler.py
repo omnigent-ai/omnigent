@@ -359,9 +359,9 @@ FireIdentity = Callable[[ScheduledTask], AbstractAsyncContextManager[object]]
 DispatchEnabled = Callable[[], bool]
 # Read before each wait between polls.
 PollInterval = Callable[[], float]
-# Whether a due occurrence can be skipped, unrecorded, because the session it continues is
-# busy, given the current time. Asked only for trigger automations.
-OccurrenceBusy = Callable[[ScheduledTask, int], Awaitable[bool]]
+# Given the current time, when a trigger automation's busy session should next be checked,
+# skipping this poll unrecorded; ``None`` polls now. Asked only for trigger automations.
+BusyUntil = Callable[[ScheduledTask, int], Awaitable[int | None]]
 
 # With a busy check, the server tries to poll a trigger automation this often instead of
 # following the trigger's saved schedule.
@@ -427,7 +427,7 @@ class PersistentTaskScheduler:
         owned_hosts: OwnedHosts = _owns_every_host,
         dispatch_enabled: DispatchEnabled = _always_enabled,
         poll_interval: PollInterval | None = None,
-        occurrence_busy: OccurrenceBusy | None = None,
+        busy_until: BusyUntil | None = None,
         now: Callable[[], float] = time.time,
         poll_seconds: float = DEFAULT_SCHEDULER_CONFIG.poll_seconds,
         renewal_seconds: float = DEFAULT_SCHEDULER_CONFIG.renewal_seconds,
@@ -446,16 +446,14 @@ class PersistentTaskScheduler:
         )
         store.check_dispatch_support()
         store.configure_dispatch(True)
-        store.configure_trigger_polling(
-            TRIGGER_POLL_SECONDS if occurrence_busy is not None else None
-        )
+        store.configure_trigger_polling(TRIGGER_POLL_SECONDS if busy_until is not None else None)
         self._store = store
         self._on_fire = on_fire
         self._on_expired = on_expired
         self._owned_hosts = owned_hosts
         self._dispatch_enabled = dispatch_enabled
         self._poll_interval = poll_interval
-        self._occurrence_busy = occurrence_busy
+        self._busy_until = busy_until
         self._now = now
         self._poll_seconds = config.poll_seconds
         self._renewal_seconds = config.renewal_seconds
@@ -666,34 +664,32 @@ class PersistentTaskScheduler:
 
     async def _next_occurrence(self, task: ScheduledTask, now: int) -> int | None:
         """The server's next poll for a trigger it can check, else the saved schedule's next."""
-        if self._occurrence_busy is not None and is_trigger_automation(task):
+        if self._busy_until is not None and is_trigger_automation(task):
             return now + TRIGGER_POLL_SECONDS
         return await asyncio.to_thread(next_scheduled_time, task, now)
 
-    async def _skip_busy_occurrence(
-        self, task: ScheduledTask, *, now: int, next_run_at: int
-    ) -> bool:
-        """Advance past a trigger automation's due poll, recording no run, while it is busy.
+    async def _skip_busy_occurrence(self, task: ScheduledTask, *, now: int) -> bool:
+        """Move a busy trigger automation's due poll to its next check, recording no run.
 
         Returns True when this occurrence must not be claimed. A failed busy check
         returns False, so the occurrence is sent as it would be without skipping.
         """
-        if self._occurrence_busy is None or not is_trigger_automation(task):
+        if self._busy_until is None or not is_trigger_automation(task):
             return False
         assert task.next_run_at is not None
         try:
             with workspace_scope(task.workspace_id):
-                busy = await self._occurrence_busy(task, now)
+                until = await self._busy_until(task, now)
         except Exception:
             _logger.exception(
                 "Could not check whether task %s's session is busy; sending its prompt", task.id
             )
             return False
-        if not busy:
+        if until is None or until <= now:
             return False
         with workspace_scope(task.workspace_id):
             advanced = await asyncio.to_thread(
-                self._store.skip_scheduled_occurrence, task, now=now, next_run_at=next_run_at
+                self._store.skip_scheduled_occurrence, task, now=now, next_run_at=until
             )
         _log_event(
             _logger.info,
@@ -707,6 +703,7 @@ class PersistentTaskScheduler:
                 scheduled_at=task.next_run_at,
                 trigger_key=scheduled_trigger_key(task.next_run_at),
                 target=task.execution_target,
+                next_check_at=until,
                 advanced=advanced,
             ),
         )
@@ -932,9 +929,7 @@ class PersistentTaskScheduler:
                     next_run = await self._next_occurrence(task, now)
                     if self._stopped:
                         return
-                    if next_run is not None and await self._skip_busy_occurrence(
-                        task, now=now, next_run_at=next_run
-                    ):
+                    if await self._skip_busy_occurrence(task, now=now):
                         continue
                     with workspace_scope(task.workspace_id):
                         run = await asyncio.to_thread(

@@ -2086,7 +2086,7 @@ def create_app(
             from omnigent.server.scheduled.fire import (
                 ClaimedRunExecutor,
                 FireDeps,
-                build_occurrence_busy,
+                build_busy_until,
                 build_on_fire,
                 build_run_now,
             )
@@ -2136,10 +2136,8 @@ def create_app(
                     dispatch_enabled=dispatch_hooks.dispatch_enabled,
                     poll_interval=dispatch_hooks.poll_interval,
                     # Skipping assumes the built-in executor's continued-session delivery.
-                    occurrence_busy=(
-                        build_occurrence_busy(fire_deps)
-                        if dispatch_hooks.on_fire is None
-                        else None
+                    busy_until=(
+                        build_busy_until(fire_deps) if dispatch_hooks.on_fire is None else None
                     ),
                     poll_seconds=dispatch_config.poll_seconds,
                     renewal_seconds=dispatch_config.renewal_seconds,

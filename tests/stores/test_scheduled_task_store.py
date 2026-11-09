@@ -1518,8 +1518,16 @@ def test_dispatch_mutations_require_workspace_scope(store: SqlAlchemyScheduledTa
 def test_skipping_an_occurrence_advances_the_schedule_without_a_run(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
+    from dataclasses import replace
+
     task = _due_task(store)
     now = task.next_run_at
+    with pytest.raises(ValueError, match="later than now"):
+        store.skip_scheduled_occurrence(task, now=now, next_run_at=now)
+    # Nothing to skip before the occurrence is due, or once the task isn't active.
+    assert store.skip_scheduled_occurrence(task, now=now - 1, next_run_at=now + 3600) is False
+    paused = replace(task, state="paused")
+    assert store.skip_scheduled_occurrence(paused, now=now, next_run_at=now + 3600) is False
     assert store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 3600) is True
     assert store.get(task.id).next_run_at == now + 3600
     assert store.list_runs(task.id)[0] == []

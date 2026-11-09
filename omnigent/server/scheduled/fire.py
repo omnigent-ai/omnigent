@@ -432,29 +432,34 @@ def build_on_fire(
     return on_fire
 
 
-# A session that changed this recently may only be pausing between steps, so it still
-# counts as busy.
+# A trigger's session must be quiet this long after its last change before it is polled,
+# since an agent can pause between steps.
 BUSY_QUIET_SECONDS = 2 * 60
+# A session still shown as running is checked again this often, since its work could end
+# at any time.
+BUSY_RECHECK_SECONDS = 2 * 60
 # While its session looks busy, a trigger automation still gets a prompt this often, so a
 # stale "running" status cannot stall it.
 BUSY_SKIP_MAX_SECONDS = 10 * 60
 
 
-def build_occurrence_busy(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable[bool]]:
-    """Build the persistent scheduler's check for skipping a trigger automation's poll.
+def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable[int | None]]:
+    """Build the persistent scheduler's check for when to poll a trigger automation.
 
-    Only a continue task with a recorded session skips, and only while the session is
-    busy: it shows as running (a turn in progress, or waiting on an approval or
-    question), or it changed less than :data:`BUSY_QUIET_SECONDS` ago. Even then, a
-    poll goes out once the latest run went out :data:`BUSY_SKIP_MAX_SECONDS` ago.
+    The check returns ``None`` to poll now, or the time to check again. A continue task
+    with a recorded session waits while the session is busy: until
+    :data:`BUSY_QUIET_SECONDS` after its last change if it is idle, or
+    :data:`BUSY_RECHECK_SECONDS` from now while it shows as running (a turn in progress,
+    or waiting on an approval or question). It never waits past
+    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out.
     """
 
-    async def occurrence_busy(task: ScheduledTask, now: int) -> bool:
+    async def busy_until(task: ScheduledTask, now: int) -> int | None:
         from omnigent.server.routes._sessions.helpers import _session_status_from_cache
 
         session_id = task.session_id
         if task.session_mode != "continue" or session_id is None:
-            return False
+            return None
         # The scheduler polls without the owner's identity, which only a fire assumes, so
         # read the persisted status from session activity, which needs no caller access
         # check. The fire itself still checks the session before it sends anything.
@@ -463,20 +468,22 @@ def build_occurrence_busy(deps: FireDeps) -> Callable[[ScheduledTask, int], Awai
         )
         session = activity.get(session_id)
         if session is None:
-            return False
-        if (
-            _session_status_from_cache(session_id, session.live_status) != "running"
-            and now - session.updated_at >= BUSY_QUIET_SECONDS
-        ):
-            return False
+            return None
+        if _session_status_from_cache(session_id, session.live_status) == "running":
+            until = now + BUSY_RECHECK_SECONDS
+        else:
+            until = session.updated_at + BUSY_QUIET_SECONDS
+        if until <= now:
+            return None
         runs, _ = await asyncio.to_thread(deps.scheduled_task_store.list_runs, task.id, limit=1)
         if not runs:
-            return False
+            return None
         # Count from when the latest poll went out, which can be later than it was due.
         sent_at = runs[0].fired_at if runs[0].fired_at is not None else runs[0].scheduled_at
-        return now - sent_at < BUSY_SKIP_MAX_SECONDS
+        backstop = sent_at + BUSY_SKIP_MAX_SECONDS
+        return min(until, backstop) if backstop > now else None
 
-    return occurrence_busy
+    return busy_until
 
 
 def build_run_now(
