@@ -180,6 +180,11 @@ async def test_claude_program_status_real_launch_and_fallback(
         status_file = sessions / f"{status_pid}.json"
         status_file.write_text(json.dumps({"kind": "interactive", "status": "busy"}))
         await wait_status("running")
+        if protocol == "osc":
+            assert reader is not None
+            async with asyncio.timeout(5):
+                while reader.status is None:
+                    await asyncio.sleep(0.02)
         await instance._tmux("resize-window", "-t", "main", "-x", "93", "-y", "37")
         async with asyncio.timeout(5):
             while (
@@ -196,9 +201,7 @@ async def test_claude_program_status_real_launch_and_fallback(
             await wait_background(True)
             return
         assert reader is not None
-        async with asyncio.timeout(5):
-            while reader.status is None:
-                await asyncio.sleep(0.02)
+        assert reader.status is not None
         assert reader.status.state == "working"
         # A contradictory file and a quiet screen must not override live OSC.
         status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
