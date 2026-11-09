@@ -450,9 +450,9 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
     with a recorded session waits while the session is busy: until
     :data:`BUSY_QUIET_SECONDS` after its last change if it is idle, or
     :data:`BUSY_RECHECK_SECONDS` from now while it shows as running (a turn in progress,
-    or waiting on an approval or question) or the previous poll is still being
-    delivered. It never waits past :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll
-    went out.
+    or waiting on an approval or question), has an approval or question pending, or the
+    previous poll is still being delivered. It never waits past
+    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out.
     """
 
     async def busy_until(task: ScheduledTask, now: int) -> int | None:
@@ -472,10 +472,12 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
             return None
         runs, _ = await asyncio.to_thread(deps.scheduled_task_store.list_runs, task.id, limit=1)
         latest = runs[0] if runs else None
-        if _session_status_from_cache(session_id, session.live_status) == "running" or (
-            # The previous poll is still on its way in, e.g. while a sandbox starts.
-            latest is not None and latest.status in ("scheduled", "starting")
-        ):
+        running = _session_status_from_cache(session_id, session.live_status) == "running"
+        # A native session can report idle while it waits on an approval or a question.
+        waiting = session.runner_id is not None and bool(session.pending_elicitation_count)
+        # The previous poll may still be on its way in, e.g. while a sandbox starts.
+        delivering = latest is not None and latest.status in ("scheduled", "starting")
+        if running or waiting or delivering:
             until = now + BUSY_RECHECK_SECONDS
         else:
             until = session.updated_at + BUSY_QUIET_SECONDS

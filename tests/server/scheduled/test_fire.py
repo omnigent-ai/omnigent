@@ -3942,13 +3942,21 @@ def _busy_until_check(
     updated_at: int = 0,
     fired_at: int | None = None,
     status: str = "succeeded",
+    pending: int | None = None,
 ):
     """The busy check over one session's persisted status and the task's latest run."""
     session_id = "sess_busy_check"
     activity = (
         {}
         if live_status is None
-        else {session_id: SessionActivity(updated_at, live_status=live_status)}
+        else {
+            session_id: SessionActivity(
+                updated_at,
+                live_status=live_status,
+                pending_elicitation_count=pending,
+                runner_id="runner_busy_check",
+            )
+        }
     )
     runs = (
         []
@@ -4028,12 +4036,30 @@ async def test_the_ten_minutes_count_from_the_tasks_latest_firing() -> None:
     assert await check(task, due) == due + BUSY_RECHECK_SECONDS
 
 
-async def test_a_poll_still_being_delivered_counts_as_busy() -> None:
+@pytest.mark.parametrize("status", ["scheduled", "starting"])
+async def test_a_poll_still_being_delivered_counts_as_busy(status) -> None:
     due = 1_800_003_600
-    # The session looks quiet, but the previous poll is still starting, e.g. in a sandbox.
-    check = _busy_until_check("idle", due - 60, fired_at=due - 60, status="starting")
+    # The session looks quiet, but the previous poll is still on its way, e.g. in a sandbox.
+    check = _busy_until_check("idle", due - 60, fired_at=due - 60, status=status)
     task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
     assert await check(task, due) == due + BUSY_RECHECK_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("pending", "wait_seconds"),
+    [
+        pytest.param(1, BUSY_RECHECK_SECONDS, id="approval-pending"),
+        pytest.param(0, None, id="nothing-pending"),
+    ],
+)
+async def test_an_idle_native_session_waiting_on_an_approval_counts_as_busy(
+    pending, wait_seconds
+) -> None:
+    due = 1_800_003_600
+    # Quiet for three minutes, and the previous poll went out five minutes ago.
+    check = _busy_until_check("idle", due - 300, updated_at=due - 180, pending=pending)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
 
 
 async def test_the_backstop_caps_the_quiet_wait() -> None:
