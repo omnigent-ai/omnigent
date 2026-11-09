@@ -1795,10 +1795,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     // a mutation of the outer `scroller` state ref.
     const scrollEl = scroller?.el;
     if (!scrollEl) return;
-    const lockState = scroller?.state;
-    if (!lockState?.isAtBottom || lockState.escapedFromLock) return;
-    // A reader who escaped the bottom (or never arrived) keeps their
-    // position: growth must not yank it down.
+    // An escaped reader keeps their position. Check the physical position, not
+    // the lock: rows measuring shorter than estimated clamp scrollTop down, which
+    // StickToBottom can misread as an escape while still at the bottom.
     if (!pinnedToBottomRef.current) return;
     // Park at the same position stick-to-bottom settles on (one pixel short
     // of the maximum); writing the exact bottom would leave the settle one
