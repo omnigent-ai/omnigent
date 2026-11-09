@@ -210,6 +210,21 @@ export function refreshAutomationSourceSession(
   if (sessionId) void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
 }
 
+/**
+ * Drop deleted tasks from every cache, so a page can't render one from a cache
+ * that is still fresh, then refresh the list.
+ */
+export function forgetScheduledTasks(queryClient: QueryClient, ids: string[]): void {
+  queryClient.setQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY, (tasks) =>
+    tasks?.filter((t) => !ids.includes(t.id)),
+  );
+  for (const id of ids) {
+    queryClient.removeQueries({ queryKey: scheduledTaskKey(id), exact: true });
+    queryClient.removeQueries({ queryKey: scheduledTaskRunsKey(id), exact: true });
+  }
+  void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+}
+
 /** Delete a task, then refresh the list. */
 export function useDeleteScheduledTask() {
   const queryClient = useQueryClient();
@@ -219,14 +234,7 @@ export function useDeleteScheduledTask() {
       const deleted =
         queryClient.getQueryData<ScheduledTask>(scheduledTaskKey(id)) ??
         queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id);
-      // Drop the deleted task everywhere it's cached, so Back to its detail
-      // page can't render it from a cache that is still fresh.
-      queryClient.setQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY, (tasks) =>
-        tasks?.filter((t) => t.id !== id),
-      );
-      queryClient.removeQueries({ queryKey: scheduledTaskKey(id), exact: true });
-      queryClient.removeQueries({ queryKey: scheduledTaskRunsKey(id), exact: true });
-      void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+      forgetScheduledTasks(queryClient, [id]);
       // The server cleared the automation's label from the session it ran from,
       // so menus and delete warnings must stop naming the automation.
       if (deleted?.sourceSessionId) {

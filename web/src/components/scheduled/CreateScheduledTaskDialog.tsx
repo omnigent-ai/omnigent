@@ -195,8 +195,8 @@ export function CreateScheduledTaskDialog({
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
   // Runs start from a copy of a session: the one being copied on create, or the
-  // saved session copy on edit. Its agent, schedule-only trigger and new
-  // session per run are fixed.
+  // saved session copy on edit. They use a schedule and start each run in a new
+  // session.
   const fromSession = isEdit ? null : sourceSession;
   const startsFromSessionId = fromSession?.id ?? editingTask?.sourceSessionId ?? null;
   const startsFromSession = startsFromSessionId !== null;

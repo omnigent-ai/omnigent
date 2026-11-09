@@ -311,10 +311,11 @@ describe("deleting a session an automation runs from", () => {
     );
   });
 
-  it("keeps the session when its automation can't be deleted", async () => {
-    vi.mocked(deleteScheduledTask).mockRejectedValue(
-      new ScheduledTaskApiError("Server error", 500, null),
-    );
+  it.each([
+    ["a server error", new ScheduledTaskApiError("Server error", 500, null)],
+    ["the automations gate's 404", new ScheduledTaskApiError("not found", 404, null)],
+  ])("keeps the session when its automation can't be deleted (%s)", async (_reason, error) => {
+    vi.mocked(deleteScheduledTask).mockRejectedValue(error);
     renderSidebar();
     openDeleteDialog();
 

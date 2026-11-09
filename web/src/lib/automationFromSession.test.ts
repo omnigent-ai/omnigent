@@ -115,10 +115,10 @@ describe("useDeleteSourceAutomations", () => {
     }).result;
   }
 
-  it("deletes each automation and drops it from the cached list, counting a 404 as deleted", async () => {
+  it("deletes each automation and drops it from the cached list, counting not_found as deleted", async () => {
     deleteScheduledTask
       .mockResolvedValueOnce(undefined)
-      .mockRejectedValueOnce(new scheduledTasksApi.ScheduledTaskApiError("gone", 404, null));
+      .mockRejectedValueOnce(new scheduledTasksApi.ScheduledTaskApiError("gone", 404, "not_found"));
 
     await expect(renderDelete().current.remove(["st_1", "st_2"])).resolves.toBe(true);
 
@@ -127,10 +127,12 @@ describe("useDeleteSourceAutomations", () => {
     expect(queryClient.getQueryData(SCHEDULED_TASKS_KEY)).toEqual([{ id: "st_3" }]);
   });
 
-  it("reports a failed delete so the caller keeps the sessions", async () => {
-    deleteScheduledTask
-      .mockResolvedValueOnce(undefined)
-      .mockRejectedValueOnce(new scheduledTasksApi.ScheduledTaskApiError("boom", 500, null));
+  it.each([
+    ["a server error", new scheduledTasksApi.ScheduledTaskApiError("boom", 500, null)],
+    // Automations turned off for the caller: the gate's 404 deleted nothing.
+    ["the automations gate", new scheduledTasksApi.ScheduledTaskApiError("not found", 404, null)],
+  ])("reports a failed delete (%s) so the caller keeps the sessions", async (_reason, error) => {
+    deleteScheduledTask.mockResolvedValueOnce(undefined).mockRejectedValueOnce(error);
 
     await expect(renderDelete().current.remove(["st_1", "st_2"])).resolves.toBe(false);
 

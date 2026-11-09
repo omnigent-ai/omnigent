@@ -5,11 +5,7 @@
 import { useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
-import {
-  SCHEDULED_TASKS_KEY,
-  scheduledTaskKey,
-  scheduledTaskRunsKey,
-} from "@/hooks/useScheduledTasks";
+import { forgetScheduledTasks, refreshAutomationSourceSession } from "@/hooks/useScheduledTasks";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { useLocation, useNavigate } from "@/lib/routing";
 import {
@@ -111,7 +107,13 @@ export function useDeleteSourceAutomations(): (taskIds: string[]) => Promise<boo
           try {
             await deleteScheduledTask(taskId);
           } catch (err) {
-            if (!(err instanceof ScheduledTaskApiError && err.status === 404)) throw err;
+            // Only the handler's not_found means the automation is gone; a plain 404 from
+            // the automations gate deletes nothing, so the session must stay.
+            const gone =
+              err instanceof ScheduledTaskApiError &&
+              err.status === 404 &&
+              err.code === "not_found";
+            if (!gone) throw err;
           }
         }),
       );
@@ -121,15 +123,9 @@ export function useDeleteSourceAutomations(): (taskIds: string[]) => Promise<boo
         if (deleted.some((taskId) => pathname.endsWith(`/tasks/${encodeURIComponent(taskId)}`))) {
           navigate("/tasks");
         }
-        // Mirror useDeleteScheduledTask: drop the tasks from every cache.
-        queryClient.setQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY, (tasks) =>
-          tasks?.filter((task) => !deleted.includes(task.id)),
-        );
-        for (const taskId of deleted) {
-          queryClient.removeQueries({ queryKey: scheduledTaskKey(taskId), exact: true });
-          queryClient.removeQueries({ queryKey: scheduledTaskRunsKey(taskId), exact: true });
-        }
-        void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+        forgetScheduledTasks(queryClient, deleted);
+        // Sessions kept after a partial failure lost their automation label too.
+        refreshAutomationSourceSession(queryClient);
       }
       return deleted.length === taskIds.length;
     },
