@@ -1109,7 +1109,7 @@ def live_server(
         env["OMNIGENT_FEATURES"] = ",".join(
             filter(
                 None,
-                [os.environ.get("OMNIGENT_FEATURES", ""), "mcp_server_management"],
+                [os.environ.get("OMNIGENT_FEATURES", ""), "mcp_sign_in"],
             )
         )
     # In normal runs, prepend the worktree so the server imports from the

@@ -151,14 +151,14 @@ vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
 // The "Set up" button is gated on the harness_install feature (like New Chat),
 // so drive that flag through the server-info mock.
 let harnessInstall = true;
-let mcpServerManagement = true;
+let mcpSignIn = true;
 let databricksFeatures = true;
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     databricks_features: databricksFeatures,
     features: {
       harness_install: harnessInstall,
-      mcp_server_management: mcpServerManagement,
+      mcp_sign_in: mcpSignIn,
     },
     installable_harnesses: [
       "claude-native",
@@ -279,7 +279,7 @@ afterEach(() => {
   hosts = [];
   inventory = INVENTORY;
   harnessInstall = true;
-  mcpServerManagement = true;
+  mcpSignIn = true;
   databricksFeatures = true;
   fixDialogProps.mockReset();
   signInDialogProps.mockClear();
@@ -1357,7 +1357,7 @@ it("offers the harness sign-in for a server that needs it", () => {
 
 it("hides cached harness sign-in state when MCP management is disabled", () => {
   hosts = [ONLINE];
-  mcpServerManagement = false;
+  mcpSignIn = false;
   mcpResult = {
     data: { tools: [], connection: "needs_auth", truncated: false, harness_sign_in: "available" },
     isPending: false,

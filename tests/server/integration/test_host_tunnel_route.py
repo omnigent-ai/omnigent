@@ -2355,9 +2355,7 @@ async def test_malformed_mcp_tools_reply_returns_502(
     import httpx
 
     app, registry, store = host_app
-    app.include_router(
-        create_mcp_tools_router(registry, store, mcp_server_management=True), prefix="/v1"
-    )
+    app.include_router(create_mcp_tools_router(registry, store, mcp_sign_in=True), prefix="/v1")
     comm = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry)
     conn = registry.get(_HOST_ID)

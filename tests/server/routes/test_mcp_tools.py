@@ -24,7 +24,7 @@ from omnigent.host.frames import (
     decode_host_frame,
 )
 from omnigent.host.mcp_login import CALLBACK_TIMEOUT_SECONDS, START_TIMEOUT_SECONDS
-from omnigent.server.feature_flags import McpServerManagementGate
+from omnigent.server.feature_flags import McpSignInGate
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes import _host_launch
 from omnigent.server.routes import mcp_tools as mcp_tools_routes
@@ -64,7 +64,7 @@ def _register(registry: HostRegistry, *capabilities: str) -> HostConnection:
 
 
 def _make_tools_app(
-    db_uri: str, mcp_server_management: McpServerManagementGate
+    db_uri: str, mcp_sign_in: McpSignInGate
 ) -> tuple[FastAPI, HostRegistry, HostStore]:
     registry = HostRegistry()
     hosts = HostStore(db_uri)
@@ -75,7 +75,7 @@ def _make_tools_app(
             registry,
             hosts,
             auth_provider=_Auth(),
-            mcp_server_management=mcp_server_management,
+            mcp_sign_in=mcp_sign_in,
         ),
         prefix="/v1",
     )

@@ -101,7 +101,7 @@ from omnigent.server.feature_flags import (
     FeatureFlags,
     deployment_gate_enabled,
     harness_install_enabled,
-    mcp_server_management_enabled,
+    mcp_sign_in_enabled,
     resolve_feature_flags,
 )
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
@@ -1596,7 +1596,7 @@ def create_app(
         str | list[str] | Callable[[], str | list[str] | None] | None
     ) = None,
     harness_install: bool | Callable[[], bool] | None = None,
-    mcp_server_management: bool | Callable[[], bool] | None = None,
+    mcp_sign_in: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
@@ -1809,12 +1809,12 @@ def create_app(
         )
     else:
         app_harness_install = harness_install
-    if mcp_server_management is None:
-        app_mcp_server_management: bool | Callable[[], bool] = resolved_feature_flags.enabled(
-            Feature.MCP_SERVER_MANAGEMENT
+    if mcp_sign_in is None:
+        app_mcp_sign_in: bool | Callable[[], bool] = resolved_feature_flags.enabled(
+            Feature.MCP_SIGN_IN
         )
     else:
-        app_mcp_server_management = mcp_server_management
+        app_mcp_sign_in = mcp_sign_in
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
     if automations_v2_enabled:
         if scheduled_task_store is None:
@@ -2345,7 +2345,7 @@ def create_app(
     app.state.picker_curation = picker_curation
     app.state.feature_flags = resolved_feature_flags
     app.state.harness_install = app_harness_install
-    app.state.mcp_server_management = app_mcp_server_management
+    app.state.mcp_sign_in = app_mcp_sign_in
     app.state.automations = True if automations is None else automations
 
     def automations_available() -> bool:
@@ -3631,14 +3631,10 @@ def create_app(
             smart_routing_sources = {"external": False, "oss": False}
         # Resolve the gate per request with the same resolver used by route enforcement.
         current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
-        current_mcp_server_management_enabled = mcp_server_management_enabled(
-            app.state.mcp_server_management
-        )
+        current_mcp_sign_in_enabled = mcp_sign_in_enabled(app.state.mcp_sign_in)
         frontend_features = app.state.feature_flags.frontend_dict()
         frontend_features[Feature.HARNESS_INSTALL.value] = current_harness_install_enabled
-        frontend_features[Feature.MCP_SERVER_MANAGEMENT.value] = (
-            current_mcp_server_management_enabled
-        )
+        frontend_features[Feature.MCP_SIGN_IN.value] = current_mcp_sign_in_enabled
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -5042,7 +5038,7 @@ def create_app(
                 host_registry,
                 host_store,
                 auth_provider=auth_provider,
-                mcp_server_management=app.state.mcp_server_management,
+                mcp_sign_in=app.state.mcp_sign_in,
             ),
             prefix="/v1",
             tags=["hosts"],
