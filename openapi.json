@@ -15276,7 +15276,7 @@
     },
     "/v1/sessions/{session_id}/agent/contents": {
       "get": {
-        "description": "Download the raw `.tar.gz` agent bundle for the session's\nbound agent.\n\nReplaces `GET /api/agents/{id}/contents`. Runners call this\non cache miss to fetch the spec + bundled files.\n\n**Returns:** Raw bundle bytes as `application/gzip`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session, agent, or bundle is not found.",
+        "description": "Download the `.tar.gz` agent bundle for the session's bound agent.\nREAD-only callers receive a minimal redacted bundle.\n\nReplaces `GET /api/agents/{id}/contents`. Runners call this\non cache miss to fetch the spec + bundled files.\n\n**Returns:** Bundle bytes as `application/gzip`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session, agent, or bundle is not found.",
         "operationId": "get_session_agent_contents_v1_sessions__session_id__agent_contents_get",
         "parameters": [
           {
