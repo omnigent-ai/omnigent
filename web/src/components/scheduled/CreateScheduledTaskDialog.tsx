@@ -262,7 +262,11 @@ export function CreateScheduledTaskDialog({
   const agentChanged =
     isEdit && effectiveAgentId !== null && effectiveAgentId !== editingTask?.agentId;
 
+  // Set once the session's settings are applied, or once the user picks their own.
+  const sourcePrefilledRef = useRef(false);
+
   function handleSelectAgent(agent: AvailableAgent) {
+    sourcePrefilledRef.current = true;
     setPickedAgentId(agent.id);
     // Settings belong to their harness. Returning to the edited task's agent
     // restores its saved values; selecting another agent clears them.
@@ -632,7 +636,6 @@ export function CreateScheduledTaskDialog({
   const showAdvanced = supportsModel || supportsPermission;
   // From a session: start from its model, effort and permission mode once its
   // snapshot and the harness options are known; unattended rules still apply.
-  const sourcePrefilledRef = useRef(false);
   useEffect(() => {
     if (open) sourcePrefilledRef.current = false;
   }, [open]);
@@ -641,6 +644,8 @@ export function CreateScheduledTaskDialog({
   const harnessPermissions = harnessSettings.permissions;
   useEffect(() => {
     if (!open || sourceSettings === null || !harnessName || sourcePrefilledRef.current) return;
+    // The session's settings belong to its own agent's harness.
+    if (effectiveAgentId !== fromSession?.agentId) return;
     sourcePrefilledRef.current = true;
     if (supportsModel) {
       setPickedModel(sourceSettings.modelOverride ?? "");
@@ -657,7 +662,15 @@ export function CreateScheduledTaskDialog({
       setPickedPermission(mode);
       setPermissionPicked(true);
     }
-  }, [open, sourceSettings, harnessName, harnessPermissions, supportsModel]);
+  }, [
+    open,
+    sourceSettings,
+    harnessName,
+    harnessPermissions,
+    supportsModel,
+    effectiveAgentId,
+    fromSession?.agentId,
+  ]);
   function handleTargetChange(value: string) {
     const nextSandbox = value === SANDBOX_HOST;
     const nextHostId = nextSandbox ? "" : value;
@@ -687,6 +700,7 @@ export function CreateScheduledTaskDialog({
     setWorkspaceBrowserOpen(false);
   }
   function handleModelChange(model: string) {
+    sourcePrefilledRef.current = true;
     setPickedModel(model);
     if (
       pickedEffort &&
@@ -1680,8 +1694,12 @@ export function CreateScheduledTaskDialog({
                                 settings={harnessSettings}
                                 disabled={curationPending || reusesExistingSession}
                                 onModelChange={handleModelChange}
-                                onEffortChange={setPickedEffort}
+                                onEffortChange={(effort) => {
+                                  sourcePrefilledRef.current = true;
+                                  setPickedEffort(effort);
+                                }}
                                 onPermissionModeChange={(mode) => {
+                                  sourcePrefilledRef.current = true;
                                   setPickedPermission(mode);
                                   setPermissionPicked(true);
                                 }}

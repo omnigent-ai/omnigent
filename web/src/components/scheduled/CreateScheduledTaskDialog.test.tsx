@@ -5127,9 +5127,15 @@ describe("creating an automation from a session", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "pick codex-native" }));
     expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-effective", "ag_codex");
+    // The session's own settings arrive after the switch; they stay off the Codex automation.
+    sourceSnapshot.current = { id: "conv_src", modelOverride: "opus", labels: {} };
+    fireEvent.change(screen.getByRole("textbox", { name: "Additional instructions" }), {
+      target: { value: "Do it" },
+    });
     const input = await submit();
 
     expect(input).toMatchObject({ agentId: "ag_codex", sourceSessionId: "conv_src" });
+    expect(input).not.toHaveProperty("modelOverride");
   });
 
   it("edits a session-based automation with its source session shown", async () => {
