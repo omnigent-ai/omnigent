@@ -16,6 +16,8 @@ import asyncio
 import json
 import logging
 import os
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -209,6 +211,38 @@ def test_build_claude_native_base_args(
                 "b.json",
             ),
         ),
+        (
+            None,
+            None,
+            ["--session-id", "11111111-2222-3333-4444-555555555555", "--verbose"],
+            "sid-123",
+            False,
+            ("--resume", "sid-123", "--verbose"),
+        ),
+        (
+            None,
+            None,
+            ["--session-id=11111111-2222-3333-4444-555555555555", "--verbose"],
+            "sid-123",
+            False,
+            ("--resume", "sid-123", "--verbose"),
+        ),
+        (
+            None,
+            None,
+            ["--fork-session", "--session-id", "new-id"],
+            "sid-123",
+            False,
+            ("--resume", "sid-123", "--fork-session", "--session-id", "new-id"),
+        ),
+        (
+            None,
+            None,
+            ["--session-id", "11111111-2222-3333-4444-555555555555"],
+            None,
+            False,
+            ("--session-id", "11111111-2222-3333-4444-555555555555"),
+        ),
     ],
     ids=[
         "resume-only",
@@ -219,6 +253,10 @@ def test_build_claude_native_base_args(
         "unconsumed-legacy-prompt-kept-on-resume",
         "legacy-prompt-omitted-without-transcript",
         "flag-values-preserved",
+        "resume-drops-session-id",
+        "resume-drops-joined-session-id",
+        "fork-session-keeps-session-id",
+        "fresh-launch-keeps-session-id",
     ],
 )
 def test_build_claude_native_base_args_resume_prefix(
@@ -929,6 +967,7 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
     session_id = "conv_launch_cancelled_during_drain"
     original_error = httpx.ConnectError("original launch transport failure")
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = original_error
     session_init = _claude_auto_create_session_init(session_id, bridge_dir)
     loop = asyncio.get_running_loop()
@@ -1309,6 +1348,7 @@ async def _auto_create_claude_terminal_for_test(
     session_id: str,
     workspace: Path,
     registry: object,
+    publish_event: object | None = None,
 ) -> None:
     """
     Run ``_auto_create_claude_terminal`` with host config and diagnostics stubbed.
@@ -1317,6 +1357,7 @@ async def _auto_create_claude_terminal_for_test(
     :param session_id: Session id, e.g. ``"conv_seed_launch_env"``.
     :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
     :param registry: Session resource registry double.
+    :param publish_event: Event publisher double; a plain ``Mock`` by default.
     :returns: None. Raises whatever the auto-create path raises.
     """
     from unittest.mock import AsyncMock, Mock
@@ -1333,7 +1374,7 @@ async def _auto_create_claude_terminal_for_test(
     await orchestration._auto_create_claude_terminal(
         session_id,
         registry,
-        Mock(),
+        publish_event if publish_event is not None else Mock(),
         server_client=AsyncMock(spec=httpx.AsyncClient),
         session_init=_claude_auto_create_session_init(session_id, workspace),
         auth_token_factory=lambda: None,
@@ -1357,6 +1398,7 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
 
     seeded: list[tuple[Path, dict[str, str] | None]] = []
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
 
     def record_seed(workspace: Path, env: dict[str, str] | None = None) -> None:
@@ -1390,6 +1432,68 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     assert env is not None
     assert env["CLAUDE_CONFIG_DIR"] == "/launch/claude"
     registry.launch_required_terminal.assert_awaited_once()
+
+
+async def test_auto_create_claude_terminal_logs_stage_timings(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A launched Claude pane logs how long each launch stage took."""
+    import logging
+    from unittest.mock import Mock
+
+    from omnigent.entities.session_resources import SessionResourceView
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.launch_required_terminal.return_value = SessionResourceView(
+        id="terminal_claude_main",
+        type="terminal",
+        session_id="conv_timed_launch",
+        name="claude:main",
+        metadata={"running": True},
+    )
+    # Stop right after the launch row: the steps past it need a live pane.
+    publish_event = Mock(side_effect=RuntimeError("stop after launch"))
+    # Keep the real trust seeder away from the developer's ~/.claude.json.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with (
+        caplog.at_level(logging.INFO, logger="omnigent.runner.app"),
+        pytest.raises(RuntimeError, match="stop after launch"),
+    ):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch,
+            session_id="conv_timed_launch",
+            workspace=bridge_dir,
+            registry=registry,
+            publish_event=publish_event,
+        )
+
+    (record,) = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_terminal_launched"
+    ]
+    assert record.attributes["terminal_id"] == "terminal_claude_main"
+    stages = (
+        "bridge",
+        "launch_metadata",
+        "resume_transcript",
+        "launch_config",
+        "catalog",
+        "prepare_terminal",
+        "tmux_launch",
+    )
+    for stage in stages:
+        assert record.attributes[f"{stage}_ms"] >= 0
+    assert record.attributes["total_ms"] >= sum(
+        record.attributes[f"{stage}_ms"] for stage in stages
+    ) - len(stages)
 
 
 @pytest.mark.parametrize(
@@ -1446,6 +1550,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(ValueError, match="config is not a JSON object"):
         await _auto_create_claude_terminal_for_test(
@@ -1520,6 +1625,7 @@ async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(propagated):
         await _auto_create_claude_terminal_for_test(
@@ -1578,6 +1684,7 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
         ],
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
 
     with pytest.raises(RuntimeError, match="stop after seeding"):
@@ -1634,6 +1741,7 @@ async def test_auto_create_claude_terminal_rejects_missing_env_chdir_target(
         ],
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(OmnigentError) as excinfo:
         await _auto_create_claude_terminal_for_test(
@@ -1644,3 +1752,64 @@ async def test_auto_create_claude_terminal_rejects_missing_env_chdir_target(
     assert sorted(path.name for path in workspace.iterdir()) == []
     assert not (Path.cwd() / config_dir).exists()
     registry.launch_required_terminal.assert_not_called()
+
+
+def test_claude_terminal_env_unsets_tmux_for_bash_tool_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude's Bash commands must not reach the private tmux server running Claude."""
+    monkeypatch.delenv("CLAUDE_ENV_FILE", raising=False)
+    env_file = build_native_claude_terminal_env(None)["CLAUDE_ENV_FILE"]
+
+    # Claude Code sources the env file before each Bash command it runs.
+    result = subprocess.run(
+        ["bash", "-c", f'. {shlex.quote(env_file)}; echo "${{TMUX-unset}} ${{TMUX_PANE-unset}}"'],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TMUX": "/tmp/omnigent-terminal-ab12/tmux.sock,4242,0",
+            "TMUX_PANE": "%0",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "unset unset"
+
+
+@pytest.mark.parametrize("source", ["ambient", "provider"])
+def test_claude_terminal_env_keeps_a_user_claude_env_file(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """A user's own CLAUDE_ENV_FILE is left in place instead of the tmux scrub."""
+    user_file = "/home/user/claude-env.sh"
+    config = None
+    if source == "ambient":
+        monkeypatch.setenv("CLAUDE_ENV_FILE", user_file)
+    else:
+        monkeypatch.delenv("CLAUDE_ENV_FILE", raising=False)
+        config = ClaudeNativeUcodeConfig(env={"CLAUDE_ENV_FILE": user_file})
+
+    terminal_env = build_native_claude_terminal_env(config)
+
+    assert terminal_env.get("CLAUDE_ENV_FILE", user_file) == user_file
+
+
+@pytest.mark.parametrize("source", ["ambient", "provider"])
+def test_claude_terminal_env_keeps_a_user_api_timeout(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """A user's own API_TIMEOUT_MS wins over the default request timeout."""
+    config = None
+    if source == "ambient":
+        monkeypatch.setenv("API_TIMEOUT_MS", "600000")
+    else:
+        monkeypatch.delenv("API_TIMEOUT_MS", raising=False)
+        config = ClaudeNativeUcodeConfig(env={"API_TIMEOUT_MS": "600000"})
+
+    terminal_env = build_native_claude_terminal_env(config)
+
+    if source == "provider":
+        assert terminal_env["API_TIMEOUT_MS"] == "600000"
+    else:
+        assert "API_TIMEOUT_MS" not in terminal_env

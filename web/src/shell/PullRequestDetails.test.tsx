@@ -3,6 +3,10 @@
 // a draft outlives the Summary tab unmounting, and pasted media upload into the draft.
 
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
+import { PullRequestReviewThread } from "./PullRequestReviewThread";
+import { PullRequestReviewBody } from "./PullRequestReviewBody";
+import { parsePatchFiles } from "@pierre/diffs";
+import type { ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
@@ -43,7 +47,11 @@ function stubFetch() {
     vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const { pathname } = new URL(String(input), "http://localhost");
       return new Promise<Response>((respond, reject) => {
-        if (pathname === DETAILS_PATH || pathname.endsWith("/github/comments"))
+        if (
+          pathname === DETAILS_PATH ||
+          pathname.endsWith("/github/comments") ||
+          pathname.endsWith("/replies")
+        )
           edits.push({ body: JSON.parse(String(init?.body)), respond, reject });
         else if (pathname === ATTACHMENTS_PATH)
           uploads.push({ body: init?.body as FormData, respond, reject });
@@ -546,6 +554,160 @@ function mountCommentComposer(client: QueryClient, prUrl = PR_URL) {
     </QueryClientProvider>,
   );
 }
+
+function inlineReviewThread(): ReviewThread {
+  return {
+    id: "thread-1",
+    path: "app.py",
+    side: "RIGHT",
+    line: 2,
+    start_line: 2,
+    subject_type: "LINE",
+    resolved: false,
+    outdated: false,
+    can_reply: true,
+    diff_hunk: "",
+    comments: {
+      data: [{ id: "root", author: "reviewer", body: "Why?", created_at: null, url: null }],
+      has_more: false,
+      next_cursor: null,
+    },
+  };
+}
+
+it("renders suggestions as replacement diffs while keeping ordinary Markdown and code", async () => {
+  const thread = inlineReviewThread();
+  const fileDiff = parsePatchFiles(
+    "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,2 @@\n context\n-old\n+current\n",
+  )[0].files[0];
+  const body = [
+    "**Explanation** with `suggestion` as inline code.",
+    "```suggestion\nfirst\n<script>literal()</script>\n```",
+    "```suggestion\n```",
+    "````text\n```suggestion\nthis is ordinary code\n```\n````",
+  ].join("\n\n");
+  const view = render(<PullRequestReviewBody body={body} thread={thread} fileDiff={fileDiff} />);
+  const suggestions = await screen.findAllByRole("region", { name: "Suggested change" });
+  expect(suggestions).toHaveLength(2);
+  const diffRoot = suggestions[0].querySelector("diffs-container")!.shadowRoot!;
+  await waitFor(() => expect(diffRoot.querySelectorAll("[data-line]")).toHaveLength(3));
+  expect(
+    [...diffRoot.querySelectorAll("[data-line]")].map((row) => [
+      row.getAttribute("data-line"),
+      row.getAttribute("data-line-type"),
+      row.textContent,
+    ]),
+  ).toEqual([
+    ["2", "change-deletion", "current"],
+    ["2", "change-addition", "first"],
+    ["3", "change-addition", "<script>literal()</script>"],
+  ]);
+  const emptyRoot = suggestions[1].querySelector("diffs-container")!.shadowRoot!;
+  expect(emptyRoot.querySelectorAll("[data-line]")).toHaveLength(1);
+  expect(emptyRoot.querySelector('[data-line-type="change-addition"]')).toBeNull();
+  expect(diffRoot.querySelector("script")).toBeNull();
+  expect(screen.getByText("Explanation")).toHaveAttribute("data-streamdown", "strong");
+  expect(screen.getAllByRole("button", { name: "Copy Code" })).toHaveLength(1);
+  expect(view.container.querySelector(".chat-code-block")).toHaveTextContent(
+    "this is ordinary code",
+  );
+
+  view.rerender(<PullRequestReviewBody body={body} thread={thread} />);
+  expect(screen.getAllByText("Original lines are unavailable for comparison.")).toHaveLength(2);
+  expect(view.container.querySelectorAll("diffs-container")).toHaveLength(0);
+  expect(
+    screen.getByText("first\n<script>literal()</script>", { normalizer: (text) => text }),
+  ).toBeVisible();
+});
+
+it.each(["unmount", "rerender"])(
+  "keeps an inline reply with its thread across %s",
+  async (switchMode) => {
+    const { edits } = stubFetch();
+    const client = new QueryClient();
+    const thread = inlineReviewThread();
+    const page = {
+      data: [thread, { ...thread, id: "untouched" }],
+      has_more: false,
+      next_cursor: null,
+      head_sha: "head",
+      base_sha: "base",
+    };
+    client.setQueryData(INFO_KEY, {
+      selected_pr_url: PR_URL,
+      pr: { comments: [] },
+    });
+    const threadKey = ["github-review-threads", "conv_1", PR_URL, "octocat", "base:head"];
+    client.setQueryData(threadKey, page);
+    const tree = (prUrl: string, current: ReviewThread) => (
+      <QueryClientProvider client={client}>
+        <PullRequestReviewThread
+          thread={current}
+          context={{
+            conversationId: "conv_1",
+            prUrl,
+            account: "octocat",
+            canReply: true,
+            loadComments: vi.fn(),
+            loadingComments: null,
+          }}
+        />
+      </QueryClientProvider>
+    );
+    const mount = (prUrl: string, current: ReviewThread) => render(tree(prUrl, current));
+    const first = mount(PR_URL, thread);
+    expect(screen.getByRole("button", { expanded: true })).toHaveTextContent("New line 2");
+    expect(screen.getByRole("button", { expanded: true })).not.toHaveTextContent("2–2");
+    expect(screen.queryByRole("button", { name: "Reply…" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Write" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reply" })).not.toBeInTheDocument();
+    fireEvent.focus(screen.getByRole("textbox"));
+    expect(screen.getByRole("textbox")).toHaveFocus();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "**Because**" } });
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("**Because**"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("tab", { name: "Write" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toHaveValue("**Because**");
+    expect(screen.getByRole("textbox").closest("form")).toHaveFocus();
+    fireEvent.focus(screen.getByRole("textbox"));
+    expect(screen.getByRole("textbox")).toHaveFocus();
+    expect(screen.getByRole("textbox")).toHaveValue("**Because**");
+    fireEvent.click(screen.getByRole("button", { expanded: true }));
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    expect(screen.getByRole("textbox")).toHaveValue("**Because**");
+    first.unmount();
+    const restored = mount(PR_URL, thread);
+    expect(screen.getByRole("textbox")).toHaveValue("**Because**");
+    fireEvent.submit(screen.getByRole("textbox").closest("form")!);
+    fireEvent.submit(screen.getByRole("textbox").closest("form")!);
+    await waitFor(() => expect(edits).toHaveLength(1));
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+    expect(edits[0].body).toEqual({ pr_url: PR_URL, body: "**Because**" });
+    if (switchMode === "unmount") {
+      restored.unmount();
+      mount("other-pr", { ...thread, id: "thread-2" });
+    } else {
+      restored.rerender(tree("other-pr", { ...thread, id: "thread-2" }));
+    }
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Other draft" } });
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("Other draft"));
+    const comment = {
+      id: "reply",
+      author: "octocat",
+      body: "**Because**",
+      created_at: "2026-10-28",
+      url: PR_URL + "#discussion_r99",
+    };
+    await act(async () => edits[0].respond(json({ thread_id: thread.id, comment })));
+    expect(screen.getByRole("textbox")).toHaveValue("Other draft");
+    const info = client.getQueryData<PullRequestInfo>(INFO_KEY)!;
+    const updated = client.getQueryData<typeof page>(threadKey)!;
+    expect(updated.data[0].comments.data.map(({ id }) => id)).toEqual(["root", "reply"]);
+    expect(info.pr!.comments).toEqual([]);
+    expect(updated.data[1].comments.data.map(({ id }) => id)).toEqual(["root"]);
+  },
+);
 
 it("posts a comment once, keeps the draft through unmount, and updates only its PR", async () => {
   const { edits } = stubFetch();

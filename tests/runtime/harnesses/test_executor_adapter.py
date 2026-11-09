@@ -1333,6 +1333,113 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
     assert [m["role"] for m in messages] == ["user", "user"]
 
 
+@pytest.mark.parametrize("content", ["", [], [{"type": "input_text", "text": ""}]])
+@pytest.mark.parametrize("preserve_content_blocks", [False, True])
+@pytest.mark.parametrize("include_tool_history", [False, True])
+@pytest.mark.parametrize("preserve_empty_initiating_message", [False, True])
+def test_translate_input_to_messages_empty_initiating_item_requires_opt_in(
+    content, preserve_content_blocks, include_tool_history, preserve_empty_initiating_message
+) -> None:
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "user", "id": "msg_old_empty", "content": []},
+            {"type": "message", "role": "assistant", "content": []},
+            {"type": "message", "role": "user", "id": "msg_empty", "content": content},
+        ],
+        preserve_content_blocks=preserve_content_blocks,
+        include_tool_history=include_tool_history,
+        preserve_empty_initiating_message=preserve_empty_initiating_message,
+    )
+
+    normalized_content = content if preserve_content_blocks else ""
+    if not normalized_content and not preserve_empty_initiating_message:
+        assert messages == [{"role": "user", "content": "old"}]
+        return
+    assert len(messages) == 2
+    assert "input_item_id" not in messages[0]
+    assert messages[-1] == {
+        "role": "user",
+        "content": normalized_content,
+        "input_item_id": "msg_empty",
+    }
+
+
+@pytest.mark.parametrize("executor_name", ["acp", "goose", "qwen", "default"])
+@pytest.mark.parametrize("content", ["", [], [{"type": "input_text", "text": ""}]])
+async def test_adapter_only_preserves_empty_input_for_opted_in_executors(
+    executor_name, content, monkeypatch
+) -> None:
+    import asyncio
+
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+    from omnigent.inner.executor import MockExecutor, TurnComplete
+    from omnigent.inner.goose_executor import GooseExecutor
+    from omnigent.inner.qwen_executor import QwenExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    factories = {
+        "acp": lambda: AcpExecutor(AcpAgentConfig(command="unused", omnigent_mcp=False)),
+        "goose": GooseExecutor,
+        "qwen": QwenExecutor,
+        "default": MockExecutor,
+    }
+    executor = factories[executor_name]()
+    captured = []
+
+    async def capture(messages, tools, system_prompt, config=None):
+        captured.extend(messages)
+        yield TurnComplete(response=None)
+
+    monkeypatch.setattr(executor, "run_turn", capture)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    request = CreateResponseRequest(
+        model="test-agent",
+        input=[
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "user", "id": "msg_empty", "content": content},
+        ],
+    )
+    ctx = TurnContext(
+        response_id=f"resp_{uuid.uuid4().hex}",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+
+    await adapter.run_turn(request, ctx)
+
+    if executor_name == "default":
+        assert len(captured) == 1
+        assert captured[-1]["content"] == "old"
+        assert "input_item_id" not in captured[-1]
+    else:
+        assert len(captured) == 2
+        assert captured[-1]["content"] == ""
+        assert captured[-1]["input_item_id"] == "msg_empty"
+
+
+@pytest.mark.parametrize("has_output", [False, True], ids=["tool-call", "tool-call-and-output"])
+def test_translate_input_to_messages_tool_resume_has_no_input_item_id(has_output) -> None:
+    """A tool tail must not reuse the user ID when the agent produced no text."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    history = [
+        {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+        {"type": "function_call", "name": "read", "call_id": "call_1", "arguments": "{}"},
+    ]
+    if has_output:
+        history.append({"type": "function_call_output", "call_id": "call_1", "output": "done"})
+
+    messages = _translate_input_to_messages(history)
+
+    assert messages == [{"role": "user", "content": "old"}]
+    assert "input_item_id" not in messages[-1]
+
+
 def test_translate_input_to_messages_carries_tool_history() -> None:
     """
     Tool items are dropped unless the executor opts in. Opted in, each call appears
@@ -3341,6 +3448,104 @@ async def test_subprocess_tracking_uses_validated_session_without_telemetry(
     assert [pr.url for pr in SessionPrRegistry(conv_id).list()] == [
         "https://github.com/example/sdk/pull/42"
     ]
+
+
+def test_stringify_tool_payload_unwraps_acp_content_union() -> None:
+    """ACP ``content``-variant results render as the nested block's text,
+    for both an inner dict and an inner block array."""
+    from omnigent.runtime.harnesses._executor_adapter import _stringify_tool_payload
+
+    wrapped = [{"type": "content", "content": {"type": "text", "text": "keys: ['token']"}}]
+    assert _stringify_tool_payload(wrapped) == "keys: ['token']"
+
+    inner_array = [
+        {
+            "type": "content",
+            "content": [
+                {"type": "text", "text": "first "},
+                {"type": "text", "text": "second"},
+            ],
+        }
+    ]
+    assert _stringify_tool_payload(inner_array) == "first second"
+
+    mixed_inner = [
+        {
+            "type": "content",
+            "content": [{"type": "text", "text": "ok"}, {"type": "image", "data": "..."}],
+        }
+    ]
+    assert _stringify_tool_payload(mixed_inner) == "ok\n[content: image]"
+
+
+def test_stringify_tool_payload_renders_diff_and_terminal_variants() -> None:
+    """ACP ``diff`` / ``terminal`` results render as readable summaries,
+    never as a raw JSON dump of the union."""
+    from omnigent.runtime.harnesses._executor_adapter import _stringify_tool_payload
+
+    diff_result = _stringify_tool_payload(
+        [
+            {
+                "type": "diff",
+                "path": "/work/config.py",
+                "oldText": "timeout = 30\n",
+                "newText": "timeout = 60\n",
+            }
+        ]
+    )
+    assert diff_result == "diff /work/config.py (1 line)\ntimeout = 60\n"
+    assert _stringify_tool_payload([{"type": "diff", "newText": "a\nb\n"}]) == (
+        "diff (2 lines)\na\nb\n"
+    )
+    assert _stringify_tool_payload([{"type": "diff", "path": "/f"}]) == "diff /f (0 lines)"
+
+    assert _stringify_tool_payload([{"type": "terminal", "terminalId": "term-1"}]) == (
+        "[terminal term-1]"
+    )
+    assert _stringify_tool_payload([{"type": "terminal"}]) == "[terminal]"
+
+    mixed = [
+        {"type": "content", "content": {"type": "text", "text": "ok"}},
+        {"type": "terminal", "terminalId": "t"},
+    ]
+    assert _stringify_tool_payload(mixed) == "ok\n[terminal t]"
+
+
+def test_stringify_tool_payload_preserves_flat_blocks_and_fallbacks() -> None:
+    """Anthropic-style flat blocks, plain strings, and the JSON fallback
+    for non-text payloads keep their existing rendering."""
+    import json
+
+    from omnigent.runtime.harnesses._executor_adapter import _stringify_tool_payload
+
+    flat = [{"type": "text", "text": "alpha"}, {"type": "text", "text": "beta"}]
+    assert _stringify_tool_payload(flat) == "alphabeta"
+
+    assert _stringify_tool_payload("plain string") == "plain string"
+
+    non_text = [{"type": "image", "source": {"data": "..."}}]
+    assert _stringify_tool_payload(non_text) == json.dumps(non_text)
+
+    foreign_block = {"type": "tool_result", "content": [{"type": "text", "text": "inner"}]}
+    assert _stringify_tool_payload([foreign_block]) == json.dumps([foreign_block])
+
+    assert _stringify_tool_payload([]) == "[]"
+
+    # Unrenderable entries stay visible: non-text content by kind, unknown blocks as JSON.
+    terminal = {"type": "terminal", "terminalId": "term-1"}
+    image_content = {"type": "content", "content": {"type": "image", "data": "..."}}
+    assert _stringify_tool_payload([{"type": "content"}]) == json.dumps({"type": "content"})
+    assert (
+        _stringify_tool_payload([image_content, terminal]) == "[content: image]\n[terminal term-1]"
+    )
+    assert _stringify_tool_payload([foreign_block, terminal]) == (
+        f"{json.dumps(foreign_block)}\n[terminal term-1]"
+    )
+    assert _stringify_tool_payload([{"type": "text", "text": "ok"}, terminal]) == (
+        "ok\n[terminal term-1]"
+    )
+    unhashable_type = [{"type": ["content"]}]
+    assert _stringify_tool_payload(unhashable_type) == json.dumps(unhashable_type)
 
 
 @pytest.mark.asyncio

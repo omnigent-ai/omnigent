@@ -428,6 +428,44 @@ request enforces this, so unsigned commits will block merging.
   section. The complete changelog still credits the PR using its title. This
   records your recommendation; maintainers curate the release notes.
 
+### CI freshness
+
+Passing CI is valid for 24 hours from each workflow's original creation time.
+`Merge Ready` shows the earliest expiry across the required CI checks. Changes
+to `main` during that window do not invalidate a passing result.
+
+After expiry, update your PR branch from `main` and let fresh CI finish. If the
+branch is already current, push a new commit to trigger fresh PR workflows.
+Re-running an existing workflow, including with `/rerun`, keeps its original
+age and does not renew the window. DCO and intentionally skipped checks do not
+expire.
+
+A sweep scheduled every 15 minutes rechecks expired green statuses on open
+PRs, including those without the `automerge` label. GitHub can delay scheduled
+runs, so idle PRs become blocked when the sweep and gate evaluation complete.
+Each sweep reevaluates at most 50 PRs, prioritizing known expiries over older
+statuses that have no expiry recorded yet. Large backlogs take multiple sweeps.
+Known expiries use a lightweight job that rereads the current status under the
+same per-head lock as full gate evaluations, then marks it red only if it is
+still expired. This skips check enumeration and dependency-report evaluation;
+legacy statuses without a valid expiry still need a full evaluation. Status
+writers queue without replacing pending evaluations (up to 100 pending jobs
+per head; GitHub cancels additional arrivals). Normal gate evaluations also
+enforce expiry, and only a full evaluation can restore green.
+
+GitHub's normal merge button, native auto-merge, and the separate Dependabot
+auto-merge workflow rely on the published `Merge Ready` status. They can merge
+after the recorded deadline until reevaluation revokes green; they do not
+independently enforce the timestamp. Before asking GitHub to merge a green
+gate, the `Merge Ready` workflow itself checks the timestamp again.
+
+A `/merge` command from a user with write access records the request with the
+`automerge` label and posts an acknowledgement. Every subsequent gate evaluation
+can act on that request after checking CI freshness, so overlapping CI events
+cannot discard it. Adding the label directly uses the same path.
+To cancel the request, remove the `automerge` label and disable GitHub auto-merge
+if it is already enabled.
+
 ### Database migration reviews
 
 Follow the [database best practices](docs/DATABASE_BEST_PRACTICES.md) when

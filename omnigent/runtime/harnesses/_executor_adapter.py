@@ -86,7 +86,6 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 # starving the reap (subprocess-backed executors terminate only in close/close_session).
 # _INTERRUPT_SLICE_S must exceed _PiRpcSession.close()'s inner 2.0s process.wait() so the
 # slice never fires first and inject a CancelledError that bypasses the SIGKILL fallback.
-INTERRUPT_TIMEOUT_S = 3.0
 _INTERRUPT_SLICE_S = 3.0
 
 # Interrupting an executor abandoned by an abnormal exit usually fails because the
@@ -248,6 +247,7 @@ class ExecutorAdapter(HarnessApp):
             request.input,
             include_tool_history=executor.replays_tool_history(),
             preserve_content_blocks=executor.preserves_message_content_blocks(),
+            preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
         )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
@@ -670,7 +670,7 @@ class ExecutorAdapter(HarnessApp):
             return closed
 
         try:
-            return await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+            return await asyncio.wait_for(_reap(), timeout=executor.close_timeout())
         except Exception:
             _logger.exception("abandoned executor teardown failed or timed out")
             return False
@@ -716,7 +716,7 @@ class ExecutorAdapter(HarnessApp):
                         await exc.close()
 
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(_close(), timeout=INTERRUPT_TIMEOUT_S)
+                    await asyncio.wait_for(_close(), timeout=executor.close_timeout())
         finally:
             self._resyncing = False
 
@@ -1572,6 +1572,7 @@ def _translate_input_to_messages(
     *,
     include_tool_history: bool = False,
     preserve_content_blocks: bool = False,
+    preserve_empty_initiating_message: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
@@ -1586,6 +1587,7 @@ def _translate_input_to_messages(
         input_value,
         include_tool_history=include_tool_history,
         preserve_content_blocks=preserve_content_blocks,
+        preserve_empty_initiating_message=preserve_empty_initiating_message,
     )
     if history_messages:
         return history_messages
@@ -1601,6 +1603,7 @@ def _extract_role_keyed_messages(
     *,
     include_tool_history: bool,
     preserve_content_blocks: bool,
+    preserve_empty_initiating_message: bool,
 ) -> list[Message]:
     """Extract role-keyed messages from an Omnigent input list.
 
@@ -1635,9 +1638,16 @@ def _extract_role_keyed_messages(
         content = _normalize_message_content(
             item.get("content"), preserve_content_blocks=preserve_content_blocks
         )
-        if not content:
+        is_initiating_user = role == "user" and item is input_value[-1]
+        # Opted-in executors need the empty item's identity and position.
+        if not content and not (is_initiating_user and preserve_empty_initiating_message):
             continue
-        messages.append({"role": role, "content": content})
+        message: Message = {"role": role, "content": content}
+        # Only the final input item can identify this turn. Filtered tool history
+        # must not make an older user message look like the initiating item.
+        if is_initiating_user:
+            message["input_item_id"] = item.get("id")
+        messages.append(message)
     return messages
 
 
@@ -1741,23 +1751,84 @@ def _serialize_tool_result(event: ToolCallComplete) -> str:
     return ""
 
 
-def _stringify_tool_payload(value: Any) -> str:
-    """Coerce a result payload to string (str pass-through, content-block join, JSON fallback)."""
-    import json
+_ACP_TOOL_CALL_CONTENT_TYPES = frozenset({"content", "diff", "terminal"})
 
+
+def _stringify_tool_payload(value: Any) -> str:
+    """Coerce a result payload to string (str pass-through, content-block join, JSON fallback).
+
+    Handles Anthropic-style flat text blocks and the ACP ``ToolCallContent`` union
+    (``content`` wrapper, ``diff``, ``terminal``; agentclientprotocol.com/protocol/tool-calls).
+    """
     if isinstance(value, str):
         return value
     if isinstance(value, list):
+        if any(
+            isinstance(block, dict)
+            and isinstance(block.get("type"), str)
+            and block["type"] in _ACP_TOOL_CALL_CONTENT_TYPES
+            for block in value
+        ):
+            # ACP entries are self-contained summaries; keep each on its own line.
+            return "\n".join(_render_acp_tool_call_content(block) for block in value)
         # Anthropic-style content blocks: join text fields; skip non-text (image, tool_use, etc.).
-        text_parts: list[str] = []
-        for block in value:
-            if not isinstance(block, dict):
-                continue
-            block_text = block.get("text")
-            if isinstance(block_text, str):
-                text_parts.append(block_text)
+        text_parts = [
+            block["text"]
+            for block in value
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
         if text_parts:
             return "".join(text_parts)
+    return _json_or_repr(value)
+
+
+def _render_acp_tool_call_content(block: Any) -> str:
+    """Render one ACP ``ToolCallContent`` entry.
+
+    Non-text ``content`` blocks are named rather than dumped; unknown shapes keep a JSON fallback.
+    """
+    if isinstance(block, dict):
+        block_type = block.get("type")
+        if block_type == "content":
+            inner = block.get("content")
+            inner_blocks = [
+                b for b in (inner if isinstance(inner, list) else [inner]) if isinstance(b, dict)
+            ]
+            texts = [b["text"] for b in inner_blocks if isinstance(b.get("text"), str)]
+            # Image, audio and resource blocks can carry large base64 payloads; name them instead.
+            kinds = sorted(
+                {
+                    str(b.get("type", "unknown"))
+                    for b in inner_blocks
+                    if not isinstance(b.get("text"), str)
+                }
+            )
+            parts = ["".join(texts)] if texts else []
+            if kinds:
+                parts.append(f"[content: {', '.join(kinds)}]")
+            if parts:
+                return "\n".join(parts)
+        elif block_type == "diff":
+            path = block.get("path")
+            new_text = block.get("newText")
+            line_count = len(new_text.splitlines()) if isinstance(new_text, str) else 0
+            count = f"{line_count} line" + ("" if line_count == 1 else "s")
+            label = f"diff {path} ({count})" if path else f"diff ({count})"
+            return f"{label}\n{new_text}" if isinstance(new_text, str) and new_text else label
+        elif block_type == "terminal":
+            terminal_id = block.get("terminalId")
+            return f"[terminal {terminal_id}]" if terminal_id else "[terminal]"
+        # Preserve the text of flat text blocks mixed into an ACP list.
+        block_text = block.get("text")
+        if isinstance(block_text, str):
+            return block_text
+    return _json_or_repr(block)
+
+
+def _json_or_repr(value: Any) -> str:
+    """JSON-encode ``value``, falling back to ``repr`` for non-serializable payloads."""
+    import json
+
     try:
         return json.dumps(value)
     except (TypeError, ValueError):

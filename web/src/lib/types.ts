@@ -1,3 +1,4 @@
+import type { SandboxProfile } from "./sandboxProfilesApi";
 // Mirrors the response/error/usage types in
 // sdks/python-client/omnigent_client/_types.py.
 //
@@ -30,6 +31,12 @@ export interface ConversationRef {
 export interface RememberScope {
   tool: string;
   host?: string;
+}
+
+/** The untruncated file-edit tool call an approval gates, for rendering as a diff. */
+export interface FileEditRequest {
+  toolName: string;
+  toolInput: Record<string, unknown>;
 }
 
 /** Persistence scopes advertised by Codex for MCP tool approvals. */
@@ -273,8 +280,27 @@ export interface BackgroundTaskInfo {
   command?: string;
 }
 
+export interface SessionFamily {
+  id: string;
+  representative_id: string | null;
+  pinned: boolean;
+  pinned_at?: string | null;
+}
+
 export interface Session {
+  family?: SessionFamily | null;
+  sandboxProfile?: SandboxProfile | null;
   projectId?: string | null;
+  /**
+   * The session whose Workspace rail lists this one as a side chat; `null` for
+   * anything else, including side chats from before the rail was server-listed.
+   */
+  sideChatParentId?: string | null;
+  /**
+   * Whether the viewer may start side chats here (only the owner of the
+   * session's root can); `null` when the server didn't say.
+   */
+  sideChatAllowed?: boolean | null;
   id: string;
   agentId: string;
   /**
@@ -457,6 +483,12 @@ export interface Session {
    * for non-native sessions (their message is already in `items`).
    */
   pendingInputs?: PendingInput[];
+  /**
+   * Saved startup messages that were never delivered, e.g. because the
+   * managed sandbox host didn't come online. Their file blocks still resolve
+   * under this session. Empty when nothing failed or on older servers.
+   */
+  failedInputs?: PendingInput[];
   /**
    * Requesting user's numeric permission level on this session
    * (1=read, 2=edit, 3=manage, 4=owner). ``null`` when permissions

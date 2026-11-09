@@ -58,12 +58,15 @@ class SandboxProviderMetadata:
         provider-specific ``sandbox.<name>`` config block.
     :param managed_token_ttl_s: Optional default managed launch-token
         lifetime in seconds.
+    :param manages_profiles: Advertise profile support without importing or
+        constructing the launcher. Must match its ``manages_profiles`` capability.
     """
 
     name: str
     launcher_class: str
     config_model: type[object] | None = None
     managed_token_ttl_s: int | None = None
+    manages_profiles: bool = False
 
 
 @dataclass(frozen=True)

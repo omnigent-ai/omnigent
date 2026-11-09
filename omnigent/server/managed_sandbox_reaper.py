@@ -49,11 +49,13 @@ class ManagedSandboxReaper:
         sandbox_config: ManagedSandboxDeployment,
         clock: Callable[[], int] = now_epoch,
         scan_batch_size: int = _DEFAULT_SCAN_BATCH_SIZE,
+        reap_offline: bool = True,
     ) -> None:
         if scan_batch_size <= 0:
             raise ValueError("scan_batch_size must be positive")
         self._host_store = host_store
         self._sandbox_config = sandbox_config
+        self._reap_offline = reap_offline
         self._clock = clock
         self._scan_batch_size = scan_batch_size
         self._task: asyncio.Task[None] | None = None
@@ -267,8 +269,7 @@ class ManagedSandboxReaper:
                         )
             return reaped
 
-    @staticmethod
-    def _is_reap_candidate(host: Host, *, cutoff: int, now: int) -> bool:
+    def _is_reap_candidate(self, host: Host, *, cutoff: int, now: int) -> bool:
         return host.sandbox_provider is not None and (
             (
                 host.deleted_at is not None
@@ -276,7 +277,8 @@ class ManagedSandboxReaper:
             )
             or host.terminating_sandbox_id is not None
             or (
-                host.sandbox_id is not None
+                self._reap_offline
+                and host.sandbox_id is not None
                 and not host_is_live(host, now=now)
                 and host.updated_at <= cutoff
             )

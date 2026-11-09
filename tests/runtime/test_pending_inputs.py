@@ -1112,31 +1112,47 @@ def test_interrupted_entries_expire_with_the_ttl(monkeypatch: pytest.MonkeyPatch
     assert pending_inputs.pending_ids("conv_a") == []
 
 
-def test_queued_slash_prompt_recorded_after_a_plain_follow_up_is_not_lost() -> None:
+@pytest.mark.parametrize("command", ["/probe-cmd", "!git status", "exit", "QUIT", ":wq"])
+def test_queued_command_recorded_after_a_plain_follow_up_is_not_lost(command: str) -> None:
     """
-    A "/"-led prompt queued before a plain one can be recorded after it.
+    A command queued before a plain prompt can be recorded after it, or never.
 
-    Claude folds the plain prompt in at the next tool call but holds the
-    "/"-led one until the turn ends, so the older entry is not known lost.
+    Claude folds the plain prompt in at the next tool call but holds a "/" or
+    "!" command until the turn ends; an exit word quits without a record. So
+    the older entry is not known lost.
     """
-    pending_inputs.record("conv", [_text_block("/probe-cmd")], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block(command)], stable_id="a" * 32)
     pending_inputs.record("conv", [_text_block("plain follow-up")], stable_id="b" * 32)
 
-    match = pending_inputs.resolve_matching_text("conv", "plain follow-up")
+    match = pending_inputs.resolve_matching_text("conv", "plain follow-up", claude_commands=True)
 
     assert match.matched is not None
     assert match.skipped == []
     [uncertain] = match.uncertain
-    assert uncertain.content == [_text_block("/probe-cmd")]
+    assert uncertain.content == [_text_block(command)]
 
 
-def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost() -> None:
+@pytest.mark.parametrize(
+    ("older", "claude_commands"),
+    [
+        ("first plain", True),
+        ("exit the loop early", True),
+        # Only Claude Code runs these itself; another harness records them in order.
+        ("!git status", False),
+        ("exit", False),
+    ],
+)
+def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost(
+    older: str, claude_commands: bool
+) -> None:
     """A plain older entry jumped over is still reported as lost."""
-    pending_inputs.record("conv", [_text_block("first plain")], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block(older)], stable_id="a" * 32)
     pending_inputs.record("conv", [_text_block("second plain")], stable_id="b" * 32)
 
-    match = pending_inputs.resolve_matching_text("conv", "second plain")
+    match = pending_inputs.resolve_matching_text(
+        "conv", "second plain", claude_commands=claude_commands
+    )
 
     [skipped] = match.skipped
-    assert skipped.content == [_text_block("first plain")]
+    assert skipped.content == [_text_block(older)]
     assert match.uncertain == []

@@ -331,7 +331,7 @@ async def plan_codex_launch(
         servers = await (probe or SubprocessCodexProbe()).effective_servers(
             argv, env=env, cwd=cwd, timeout_s=timeout_s
         )
-    except Exception:  # noqa: BLE001 - every probe failure must leave launch unchanged
+    except Exception:
         _logger.warning("mcp_disabled_preflight_failed executor=%s", executor, exc_info=True)
         return CodexLaunchPlan(original, original, "probe_failed", ())
     overrides = []

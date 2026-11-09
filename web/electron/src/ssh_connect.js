@@ -25,6 +25,7 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { lastLine, SAFE_URL_RE } = require("./arca");
+const { isDatabricksOAuthServerUrl } = require("./url");
 const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
 const { UV_INSTALLER } = require("./cli_install");
 const { createAskpass } = require("./ssh_askpass");
@@ -169,9 +170,9 @@ function describeCommands(serverUrl, destination) {
  * Find the sign-in link in one line of `omnigent login` output.
  *
  * @param {string} line
- * @returns {{ url: string, port: number | null } | null} `port` is the
- *   loopback port the CLI waits on, for a Databricks sign-in; null for a
- *   server's own browser sign-in, which needs no forward.
+ * @returns {{ url: string, port: number | null, kind: "databricks" | "server" } | null}
+ *   `port` is the loopback port the CLI waits on, for a Databricks sign-in; null
+ *   for a server's own browser sign-in, which needs no forward.
  */
 function parseSignInLink(line) {
   const clean = line.replace(ANSI_RE, "").trim();
@@ -182,15 +183,49 @@ function parseSignInLink(line) {
       const redirect = new URL(new URL(url).searchParams.get("redirect_uri") ?? "");
       const port = Number(redirect.port);
       if (["localhost", "127.0.0.1"].includes(redirect.hostname) && port > 0) {
-        return { url, port };
+        return { url, port, kind: "databricks" };
       }
     } catch {
-      // No usable redirect_uri; open the link without a forward.
+      // No usable redirect_uri; signInLinkRefusal stops it.
     }
-    return { url, port: null };
+    return { url, port: null, kind: "databricks" };
   }
   const own = /^Opening browser for login:\s+(https?:\/\/\S+)/.exec(clean);
-  return own ? { url: own[1], port: null } : null;
+  return own ? { url: own[1], port: null, kind: "server" } : null;
+}
+
+/**
+ * Why not to open a sign-in link the remote machine printed, or null to open it.
+ * The machine could be compromised, so its links are held to what the CLI prints:
+ * the server's own page, or a workspace sign-in calling back to loopback on 8020 to 8040.
+ *
+ * @param {{ url: string, port: number | null, kind: "databricks" | "server" }} link
+ * @param {string} serverUrl
+ * @returns {string | null}
+ */
+function signInLinkRefusal(link, serverUrl) {
+  let origin;
+  try {
+    origin = new URL(link.url).origin;
+  } catch {
+    return "The sign-in link isn't a web address.";
+  }
+  const serverOrigin = new URL(serverUrl).origin;
+  if (link.kind === "server" && origin !== serverOrigin) {
+    return `The sign-in link goes to ${origin}, not this server (${serverOrigin}).`;
+  }
+  if (link.kind === "server") return null;
+  // Workspace and account sign-in hosts only: Databricks Apps hosts serve app content.
+  if (origin !== serverOrigin && !isDatabricksOAuthServerUrl(link.url)) {
+    return `The sign-in link goes to ${origin}, which isn't this server or a Databricks workspace.`;
+  }
+  if (link.port === null) {
+    return "The sign-in link doesn't call back to this computer, so sign-in can't finish here.";
+  }
+  if (link.port < SIGN_IN_FIRST_PORT || link.port > SIGN_IN_LAST_PORT) {
+    return `The sign-in link waits on port ${link.port}, outside ${SIGN_IN_FIRST_PORT} to ${SIGN_IN_LAST_PORT}.`;
+  }
+  return null;
 }
 
 /**
@@ -597,6 +632,12 @@ async function signIn(ctx) {
       if (clean) notes.push(clean);
       return;
     }
+    const refusal = signInLinkRefusal(link, serverUrl);
+    if (refusal) {
+      problem = refusal;
+      run.cancel();
+      return;
+    }
     if (link.port !== null && link.port !== forwarded) {
       if (expected === null) {
         problem = `No free sign-in port on this computer: ${SIGN_IN_FIRST_PORT} to ${SIGN_IN_LAST_PORT} are all in use.`;
@@ -728,7 +769,9 @@ async function runSshConnect(ctx) {
         const detail = failureDetail(install.stderr || install.stdout);
         return {
           ok: false,
-          error: `Installing Omnigent on ${destination} failed: ${detail || `exit code ${install.code}`}`,
+          error: install.timedOut
+            ? `Installing Omnigent on ${destination} timed out.`
+            : `Installing Omnigent on ${destination} failed: ${detail || `exit code ${install.code}`}`,
         };
       }
       login = await signIn({ ...full, openExternal: openSafely });
@@ -863,6 +906,7 @@ module.exports = {
   isPortFree,
   loginScript,
   parseSignInLink,
+  signInLinkRefusal,
   remoteCommand,
   runSshConnect,
   safeServerUrl,

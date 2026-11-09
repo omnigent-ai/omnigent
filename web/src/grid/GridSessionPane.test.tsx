@@ -6,7 +6,7 @@ import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testi
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
-import { FileViewerContext } from "@/shell/FileViewerContext";
+import { type FileNavigationGuard, FileViewerContext } from "@/shell/FileViewerContext";
 import type { WorkspacePanel } from "@/shell/WorkspacePanel";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { RearrangeableGrid } from "./GridWorkspace";
@@ -23,15 +23,29 @@ const fixture = vi.hoisted(() => ({
   terminalPending: false,
   composerDisabled: false,
   hostOnline: undefined as boolean | undefined,
+  failedChat: "",
+  failedTerminal: "",
+  renderError: new Error("Grid surface render failed"),
+  // Set while a cell's viewer holds unsaved edits and is asking to discard them.
+  discardEdits: null as (() => void) | null,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
   retrySession: vi.fn(async () => ({ recovered: true })),
 }));
 vi.mock("@/components/blocks/TerminalView", () => ({
-  TerminalView: ({ active, readOnly }: { active: boolean; readOnly: boolean }) => (
-    <textarea aria-label="Terminal input" data-active={active} readOnly={readOnly} />
-  ),
+  TerminalView: ({
+    sessionId,
+    active,
+    readOnly,
+  }: {
+    sessionId: string;
+    active: boolean;
+    readOnly: boolean;
+  }) => {
+    if (sessionId === fixture.failedTerminal) throw fixture.renderError;
+    return <textarea aria-label="Terminal input" data-active={active} readOnly={readOnly} />;
+  },
 }));
 
 vi.mock("@/canvas/CanvasWorkspace", () => ({ CanvasWorkspace: () => null }));
@@ -84,9 +98,10 @@ vi.mock("./GridSessionsContext", () => ({
   gridTitle: () => "Test grid",
 }));
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: () => {
+  SideChatPane: ({ childId }: { childId: string }) => {
     const context = useContext(FileViewerContext)!;
     const terminal = useTerminalFirst();
+    if (childId === fixture.failedChat) throw fixture.renderError;
     return (
       <>
         <textarea aria-label="Message" disabled={fixture.composerDisabled} />
@@ -98,6 +113,16 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         </button>
         <button type="button" onClick={() => context.registerNavigationGuard?.(() => {})}>
           Block navigation
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            context.registerNavigationGuard?.((_path, _options, navigate) => {
+              fixture.discardEdits = navigate;
+            })
+          }
+        >
+          Edit file
         </button>
         <button type="button" onClick={() => context.openFolder?.("/workspace/experimental")}>
           Open folder
@@ -153,6 +178,9 @@ afterEach(() => {
   fixture.terminalPending = false;
   fixture.composerDisabled = false;
   fixture.hostOnline = undefined;
+  fixture.failedChat = "";
+  fixture.failedTerminal = "";
+  fixture.discardEdits = null;
   vi.restoreAllMocks();
 });
 
@@ -176,6 +204,60 @@ it("opens agent-requested files only in the active workspace and respects naviga
   act(() => emitUiOpenFile({ type: "ui_open_file", path: "blocked.md" }, "first"));
   expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
   expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
+});
+
+/** The shell's file-viewer context, collecting the guards registered with it. */
+function shellFileViewerContext(guards: Set<FileNavigationGuard>) {
+  return {
+    openFile: vi.fn(),
+    registerNavigationGuard: (guard: FileNavigationGuard) => {
+      guards.add(guard);
+      return () => void guards.delete(guard);
+    },
+    openGithubTab: vi.fn(),
+    isChangedPath: () => false,
+    conversationId: undefined,
+    workspaceRoot: null,
+    workspaceHome: null,
+  };
+}
+
+it("asks each cell's viewer before the shell's Close leaves the grid", () => {
+  // Stands in for AppShell: its Close runs every registered guard, then leaves.
+  const shellGuards = new Set<FileNavigationGuard>();
+  const shellContext = shellFileViewerContext(shellGuards);
+  const leave = vi.fn();
+  const closeFromShell = () => {
+    const guards = [...shellGuards];
+    const next = (index: number): void => {
+      const guard = guards[index];
+      if (guard) guard(null, undefined, () => next(index + 1));
+      else leave();
+    };
+    next(0);
+  };
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <FileViewerContext.Provider value={shellContext}>
+          <RearrangeableGrid
+            grid={{ id: "dirty-close", layout: splitGrid("first", "first", "second", "right")! }}
+          />
+        </FileViewerContext.Provider>
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const second = screen.getByRole("region", { name: "second" });
+  fireEvent.click(within(second).getByText("Edit file"));
+
+  // Keep editing: the viewer never calls back, so the grid stays.
+  act(() => closeFromShell());
+  expect(fixture.discardEdits).not.toBeNull();
+  expect(leave).not.toHaveBeenCalled();
+
+  // Discard changes: leaving goes ahead.
+  act(() => fixture.discardEdits?.());
+  expect(leave).toHaveBeenCalledOnce();
 });
 
 it("browses a chat-linked folder in the Files tab of that pane's workspace", () => {
@@ -254,6 +336,81 @@ it("keeps cell views, input, permissions and shortcut targets independent", asyn
     within(screen.getByRole("region", { name: "second" })).getByLabelText("Message"),
   ).toBeVisible();
 });
+
+it.each(["chat", "terminal"])(
+  "contains a grid %s render failure without losing healthy drafts or cell controls",
+  async (surface) => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const suppressExpectedError = (event: ErrorEvent) => {
+      if (event.error === fixture.renderError) event.preventDefault();
+    };
+    window.addEventListener("error", suppressExpectedError);
+    onTestFinished(() => window.removeEventListener("error", suppressExpectedError));
+    fixture.labels = { "omnigent.ui": "terminal" };
+    fixture.terminals = [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }];
+    const tree = () => (
+      <MemoryRouter>
+        <TooltipProvider>
+          <RearrangeableGrid
+            grid={{ id: "render-failure", layout: splitGrid("first", "first", "second", "right")! }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>
+    );
+    const view = render(tree());
+    const first = screen.getByRole("region", { name: "first (active)" });
+    const second = screen.getByRole("region", { name: "second" });
+    const chat = within(first).getByLabelText("Message");
+    const neighborChat = within(second).getByLabelText("Message");
+    fireEvent.change(chat, { target: { value: "Chat draft" } });
+    fireEvent.change(neighborChat, { target: { value: "Neighbor draft" } });
+    fireEvent.click(within(first).getByText("Open citation"));
+    const workspaceDraft = within(screen.getByTestId("workspace-first")).getByLabelText(
+      "File draft",
+    );
+    fireEvent.change(workspaceDraft, { target: { value: "Unsaved file" } });
+    fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+    const terminal = await within(first).findByLabelText("Terminal input");
+    fireEvent.change(terminal, { target: { value: "Terminal draft" } });
+    if (surface === "chat") {
+      fireEvent.click(within(first).getByRole("button", { name: "Chat view" }));
+      fixture.failedChat = "first";
+    } else {
+      fixture.failedTerminal = "first";
+    }
+
+    view.rerender(tree());
+
+    const failure = within(first).getByRole("alert");
+    expect(failure).toHaveTextContent(`Unable to display ${surface}.`);
+    expect(within(first).getByRole("button", { name: "Move first" })).toBeEnabled();
+    expect(within(first).getByRole("link", { name: "Open first full screen" })).toHaveAttribute(
+      "href",
+      "/c/first",
+    );
+    expect(within(first).getByRole("button", { name: "Remove first from grid" })).toBeEnabled();
+    const survivor = surface === "chat" ? terminal : chat;
+    expect(within(first).getByLabelText(surface === "chat" ? "Terminal input" : "Message")).toBe(
+      survivor,
+    );
+    expect(survivor).toHaveValue(surface === "chat" ? "Terminal draft" : "Chat draft");
+    expect(within(second).getByLabelText("Message")).toBe(neighborChat);
+    expect(neighborChat).toHaveValue("Neighbor draft");
+    expect(within(screen.getByTestId("workspace-first")).getByLabelText("File draft")).toBe(
+      workspaceDraft,
+    );
+    expect(workspaceDraft).toHaveValue("Unsaved file");
+
+    fixture.failedChat = "";
+    fixture.failedTerminal = "";
+    fireEvent.click(within(failure).getByRole("button", { name: "Try again" }));
+    expect(within(first).queryByRole("alert")).toBeNull();
+    expect(
+      await within(first).findByLabelText(surface === "chat" ? "Message" : "Terminal input"),
+    ).toBeInTheDocument();
+    expect(survivor).toHaveValue(surface === "chat" ? "Terminal draft" : "Chat draft");
+  },
+);
 
 it("cycles keyboard focus through cells and toggles the grid workspace from the keyboard", () => {
   fixture.labels = { "omnigent.ui": "terminal" };

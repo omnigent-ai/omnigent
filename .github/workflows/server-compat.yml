@@ -56,6 +56,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  OMNIGENT_CI_PIPELINE: server-compat
+
 jobs:
   # ── Fast smoke: both compat configs against the latest stable release ──────
   # Runs on every PR that touches the server↔runner contract surface (paths
