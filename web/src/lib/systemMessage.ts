@@ -274,9 +274,17 @@ export function taskNotificationMarkerContent(
 export const AUTOMATION_CONTEXT_NOTE =
   "<omnigent-automation-context>\nNote: an Omnigent automation sent this message, and no one is watching this run. No one can answer questions, approve requests or give input, so work toward the goal above on your own. Don't ask questions, wait for confirmation or stop to request permission. When something is unclear, make a reasonable assumption only if it is easy to reverse and within the user's authorization. Record each assumption, its basis and how easily it can be changed. For decisions that are hard to reverse, involve significant trade-offs or would likely surprise the user, record the options and your recommendation, and defer the affected work. Continue independent work that does not depend on those decisions. If an action is denied or requires unavailable approval, skip that action and explain the blocker. Continue independent work and permitted alternatives. Do not change permission settings to get past the restriction. If you have the sys_journal tools, start by reading your journal with sys_journal_read; if the session has no plan, write one with sys_journal_write_plan (one step is fine); and before your final reply, write a status for each step you worked on with sys_journal_write_status. Lead your final reply with unresolved decisions and assumptions, prioritizing those the user is most likely to want to change, then summarize what you did and anything you couldn't do.\n</omnigent-automation-context>";
 
-/** Hide only the canonical suffix; arbitrary text inside matching tags stays visible. */
+// Notes earlier servers sent, still at the end of the messages that carried them.
+export const EARLIER_AUTOMATION_CONTEXT_NOTES: readonly string[] = [
+  "<omnigent-automation-context>\nNote: an Omnigent automation sent this message, and no one is watching this run. No one can answer questions, approve requests or give input, so work toward the goal above on your own. Don't ask questions, wait for confirmation or stop to request permission. When something is unclear, make a reasonable assumption only if it is easy to reverse and within the user's authorization. Record each assumption, its basis and how easily it can be changed. For decisions that are hard to reverse, involve significant trade-offs or would likely surprise the user, record the options and your recommendation, and defer the affected work. Continue independent work that does not depend on those decisions. If an action is denied or requires unavailable approval, skip that action and explain the blocker. Continue independent work and permitted alternatives. Do not change permission settings to get past the restriction. Lead your final reply with unresolved decisions and assumptions, prioritizing those the user is most likely to want to change, then summarize what you did and anything you couldn't do.\n</omnigent-automation-context>",
+];
+
+/** Hide only a canonical suffix; arbitrary text inside matching tags stays visible. */
 export function stripAutomationContext(text: string): string {
-  const suffix = `\n\n${AUTOMATION_CONTEXT_NOTE}`;
   const trimmed = text.trimEnd();
-  return trimmed.endsWith(suffix) ? trimmed.slice(0, -suffix.length) : text;
+  for (const note of [AUTOMATION_CONTEXT_NOTE, ...EARLIER_AUTOMATION_CONTEXT_NOTES]) {
+    const suffix = `\n\n${note}`;
+    if (trimmed.endsWith(suffix)) return trimmed.slice(0, -suffix.length);
+  }
+  return text;
 }
