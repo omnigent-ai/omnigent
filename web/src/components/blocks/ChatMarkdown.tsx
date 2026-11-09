@@ -637,6 +637,7 @@ export function FilePathAwareMessageResponse({
   children,
   breaks = false,
   literalHtml = false,
+  isStreaming = false,
   ...props
 }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
   const components = FILE_PATH_AWARE_COMPONENTS;
@@ -682,7 +683,14 @@ export function FilePathAwareMessageResponse({
   }
 
   return (
-    <MessageResponse {...props} components={components} remarkPlugins={remarkPlugins} markFileLinks>
+    <MessageResponse
+      {...props}
+      components={components}
+      remarkPlugins={remarkPlugins}
+      markFileLinks
+      // The shown text can trail the latest by one interval after the stream ends.
+      isStreaming={isStreaming || throttledText !== normalizedText}
+    >
       {isString ? throttledText : children}
     </MessageResponse>
   );

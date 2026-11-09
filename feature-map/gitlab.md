@@ -8,7 +8,7 @@ reads the MR; agent CLI and MCP writes associate it with the session.
 
 - `summary`: MR identity, nested project, description, and checks.
 - `comments`: MR comments on their own tab, whose label shows the count.
-- `changes`: changed files and diff, with exact-revision expanded context. Find searches the fetched patch from the toolbar search button, or Cmd/Ctrl+F while focus is in the Changes tab.
+- `changes`: changed files and diff, with exact-revision expanded context, a path filter, and copy-path and open actions. Find searches the fetched patch from the toolbar search button, or Cmd/Ctrl+F while focus is in the Changes tab.
 - `associations`: link, select, and unlink MRs across projects.
 - `partial`: incomplete comments, checks, files, and omitted diff explanations.
 - `auth`: missing CLI or denied access retains checkout context and a useful hint.

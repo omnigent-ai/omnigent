@@ -225,6 +225,10 @@ class Conversation:
     :param project_id: The first-class project this session is filed
         under, or ``None`` if unfiled. Owner-private membership; see
         ``designs/PROJECTS_PRD.md``.
+    :param side_chat_parent_id: The session whose Workspace rail lists this
+        one as a side chat, or ``None`` when it is not a listed side chat.
+    :param family_id: Stable sibling-family identity, or ``None`` for a standalone
+        session. Membership does not confer execution parentage or access.
     :param search_snippet: Transient, list-only excerpt of the chat
         content that matched a ``search_query`` — set by
         ``list_conversations`` whenever the query hit an item's body (even
@@ -269,11 +273,18 @@ class Conversation:
     # outstanding approval-prompt count (None = never written);
     # ``runner_last_seen`` is the runner tunnel's last heartbeat (epoch
     # seconds, None = no live stamp) — carried on the row so a session list
-    # can judge runner liveness without a second connectivity query.
+    # can judge runner liveness without a second connectivity query;
+    # ``background_work_running`` is whether a background shell outlives the
+    # ended turn (None = never written); ``blocked_on`` is why a running
+    # session's agent is parked on a terminal prompt (None = not parked).
     live_status: str | None = None
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
+    background_work_running: bool | None = None
+    blocked_on: str | None = None
     project_id: str | None = None
+    side_chat_parent_id: str | None = None
+    family_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None
@@ -316,8 +327,10 @@ class MessageData(BaseModel):
     :param stream_message_id: Native live-preview stream finalized by
         this assistant message. Persisted so reconnect snapshots can
         suppress delayed preview chunks after the authoritative item.
-    :param user_authored: Confirmed or conservatively preserved user input;
-        prevents legacy content cleanup from hiding literal agent markup.
+    :param user_authored: Originated from an explicit user action; may be
+        server-expanded, e.g. skill instructions. Independent of ``is_meta``;
+        client-settable by convention, not a trust signal. Also exempts the
+        message from legacy markup cleanup on import.
     :param subagent_return_id: Native task id of an explicitly completed child.
     :param phase: Assistant-only harness label for the message, e.g. Codex
         ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.

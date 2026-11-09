@@ -3871,7 +3871,14 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
         lambda server: "https://example.databricks.com",
     )
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
-    fresh_auth = SimpleNamespace(current_token=lambda: "fresh-token", profile_name=None)
+    from omnigent.inner.databricks_executor import _databrickscfg_fingerprint
+
+    # Resolved from the config file as it is now, like _resolve_databricks_auth stamps it.
+    fresh_auth = SimpleNamespace(
+        current_token=lambda: "fresh-token",
+        profile_name=None,
+        resolved_config_file=_databrickscfg_fingerprint(),
+    )
     monkeypatch.setattr(
         cli,
         "_databricks_workspace_auth_info",

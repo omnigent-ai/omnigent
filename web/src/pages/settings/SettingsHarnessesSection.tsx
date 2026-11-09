@@ -65,24 +65,18 @@ interface HarnessEntry {
 // (/v1/harnesses) carries no descriptions, so these live here; the rest of each
 // entry (name, icon, order) comes from NATIVE_CODING_AGENTS.
 const HARNESS_DESCRIPTIONS: Record<string, string> = {
-  "claude-native":
-    "Anthropic’s coding agent for understanding codebases, editing files, and running development workflows.",
-  "codex-native":
-    "OpenAI’s coding agent for building features, fixing bugs, and working across repositories.",
-  "opencode-native": "An open-source coding agent for the terminal, IDE, and desktop.",
-  "cursor-native":
-    "An AI code editor with agent workflows for navigating, editing, and shipping code.",
-  "pi-native": "A minimal, extensible coding agent harness built for terminal workflows.",
-  "devin-native": "Cognition’s autonomous coding agent for end-to-end software tasks.",
-  "antigravity-native":
-    "Google’s agent-first development platform for planning and executing software tasks.",
-  "kiro-native":
-    "An agentic IDE for spec-driven development, hooks, and production-ready software.",
-  "qwen-native": "An open-source terminal coding agent powered by Qwen models.",
-  "goose-native": "An open-source local AI agent for coding, automation, and extensible workflows.",
-  "kimi-native":
-    "A terminal coding agent for editing code, running commands, and completing development tasks.",
-  "hermes-native": "A self-improving AI agent that learns reusable skills from experience.",
+  "claude-native": "Anthropic’s agent for coding and development workflows.",
+  "codex-native": "OpenAI’s coding agent for building features and fixing bugs.",
+  "opencode-native": "An open-source coding agent for terminal, IDE, and desktop.",
+  "cursor-native": "An AI editor with agents for navigating and editing code.",
+  "pi-native": "A minimal, extensible terminal coding agent.",
+  "devin-native": "Cognition’s autonomous coding agent.",
+  "antigravity-native": "Google’s agent platform for software development.",
+  "kiro-native": "An agentic IDE for spec-driven development.",
+  "qwen-native": "An open-source terminal coding agent powered by Qwen.",
+  "goose-native": "An open-source local agent for coding and automation.",
+  "kimi-native": "A terminal coding agent for editing code and running commands.",
+  "hermes-native": "An agent that learns reusable skills from experience.",
 };
 
 // The harness catalog, derived from the shared native-agent registry so this
@@ -475,6 +469,14 @@ function HarnessStatusText({
       </span>
     );
   }
+  if (status.reason === "cli-unresponsive") {
+    return (
+      <span className="flex w-fit items-center gap-1 text-xs text-amber-600 dark:text-amber-500">
+        <TriangleAlertIcon className="size-3.5" aria-hidden />
+        CLI did not respond
+      </span>
+    );
+  }
   if (status.needsSetup && !enhanced) {
     const text = harnessWarningBadgeText(status.reason);
     return (
@@ -559,7 +561,8 @@ function HarnessCard({
   const status = harnessStatus(entry.harness, host);
   const mode = harnessFixMode(status.reason);
   const canFix = canSetup && !!host && !host.sandbox_provider;
-  const opensDetail = status.ready || (status.needsSetup && canFix);
+  const needsAttention = status.needsSetup || status.reason === "cli-unresponsive";
+  const opensDetail = status.ready || (needsAttention && canFix);
   const navigate = useNavigate();
   const body = (
     <>
@@ -580,8 +583,7 @@ function HarnessCard({
             />
           </div>
         </div>
-        {(status.ready ||
-          (status.needsSetup && canFix && (mode !== "install" || !installable))) && (
+        {(status.ready || (needsAttention && canFix && (mode !== "install" || !installable))) && (
           <Button
             size="icon-sm"
             variant="ghost"
@@ -601,7 +603,7 @@ function HarnessCard({
           <SetupButton entry={entry} onSetup={() => onFix("install")} />
         )}
       </div>
-      <p className="line-clamp-2 text-ui text-muted-foreground">{entry.description}</p>
+      <p className="line-clamp-2 text-sm text-muted-foreground">{entry.description}</p>
     </>
   );
   const className =
@@ -713,9 +715,11 @@ function HarnessDetail({
       warning={credentialProblem}
       showStatus={canSetup}
       statusLabel={
-        status.reason === "binary-missing" || status.reason === "unconfigured"
-          ? reconfigurationReason(status.reason)
-          : "Needs reconfiguration"
+        status.reason === "cli-unresponsive"
+          ? "Not checked"
+          : status.reason === "binary-missing" || status.reason === "unconfigured"
+            ? reconfigurationReason(status.reason)
+            : "Needs reconfiguration"
       }
       action={
         status.ready && canFix && canSwitchHarnessAccount(host, entry.harness)
@@ -738,7 +742,7 @@ function HarnessDetail({
           account={readyNotice.account}
         />
       )}
-      {status.needsSetup && !credentialProblem && (
+      {(status.needsSetup || status.reason === "cli-unresponsive") && !credentialProblem && (
         <HarnessWarning
           entry={entry}
           host={host}
@@ -842,13 +846,15 @@ function HarnessWarning({
   onFix: (mode: HarnessFixMode) => void;
 }) {
   const copy =
-    reason === "readiness-error"
-      ? `${entry.name} isn’t working on ${host.name}. Run setup again to fix it.`
-      : mode === "tmux"
-        ? `${entry.name} needs tmux ${MIN_TMUX_VERSION} or newer on ${host.name}. Install or upgrade tmux so new sessions can use ${entry.name}.`
-        : mode === "update"
-          ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
-          : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
+    reason === "cli-unresponsive"
+      ? `${entry.name}’s CLI on ${host.name} didn’t respond to a version check. New sessions still try to start it; run it on that machine and finish any setup prompt it shows.`
+      : reason === "readiness-error"
+        ? `${entry.name} isn’t working on ${host.name}. Run setup again to fix it.`
+        : mode === "tmux"
+          ? `${entry.name} needs tmux ${MIN_TMUX_VERSION} or newer on ${host.name}. Install or upgrade tmux so new sessions can use ${entry.name}.`
+          : mode === "update"
+            ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
+            : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
   const action =
     mode === "tmux"
       ? "Set up tmux"
@@ -865,7 +871,7 @@ function HarnessWarning({
         <TriangleAlertIcon className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" />
         <p>{copy}</p>
       </div>
-      {!host.sandbox_provider && (
+      {!host.sandbox_provider && reason !== "cli-unresponsive" && (
         <Button size="sm" onClick={() => onFix(mode)}>
           {action}
         </Button>
