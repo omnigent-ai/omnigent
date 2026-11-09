@@ -200,6 +200,7 @@ class ScheduledTaskStore(ABC):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        expected_schedule: ScheduledTask | None = None,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.
@@ -220,6 +221,10 @@ class ScheduledTaskStore(ABC):
         switches the harness its future firings run. The fire path reads
         ``agent_id`` fresh on every firing and each firing owns its own
         conversation, so past runs keep the agent they actually ran.
+
+        ``expected_schedule`` guards the recurrence, session mode and execution
+        target read before validation. A mismatch raises a conflict before any
+        changes are saved; callers must reload and revalidate before retrying.
 
         Returns ``None`` if the task does not exist.
 
@@ -252,6 +257,23 @@ class ScheduledTaskStore(ABC):
             that has none: the session cannot move, so every later run routes
             to that host.
         :returns: How the adoption resolved.
+        """
+        ...
+
+    @abstractmethod
+    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+        """
+        Forget the session a ``"continue"`` task continues, if it is still *session_id*.
+
+        Used when that session was deleted, so the next firing starts a new one
+        and records it with :meth:`adopt_session`. Does not touch ``updated_at``:
+        this is housekeeping, and a firing compares that field with its own read
+        of the task before it records the session it created.
+
+        :param scheduled_task_id: Opaque task identifier.
+        :param session_id: The session the caller found missing.
+        :returns: ``True`` if the task held *session_id* and no longer does;
+            ``False`` if the task is gone or already holds another session.
         """
         ...
 

@@ -55,6 +55,9 @@ async def _expect_pending(
         await expect(picker).to_be_enabled()
         await expect(picker).to_have_attribute("aria-busy", "true")
         await expect(loading).to_have_count(0)
+    composer = page.get_by_test_id("new-chat-landing-composer")
+    if await composer.get_attribute("data-mobile-composer") == "collapsed":
+        await page.get_by_test_id("new-chat-landing-input").focus()
     permissions_loading = page.get_by_role("status", name="Loading permissions")
     permissions = page.get_by_test_id("new-chat-landing-permission-chip")
     if cached_label is None:
@@ -72,7 +75,7 @@ async def _expect_pending(
         await expect(workspace).to_have_count(0)
     else:
         await expect(workspace).to_have_text(workspace_path.rsplit("/", 1)[-1])
-        await expect(workspace).to_have_attribute("title", workspace_path)
+        await expect(workspace).to_have_accessible_name(f"Working directory: {workspace_path}")
         await expect(workspace_loading).to_have_count(0)
         await expect(workspace).to_be_enabled()
 
@@ -251,7 +254,9 @@ async def _drive(
                     )
                     await page.get_by_role("button", name=expected_workspace, exact=True).click()
                     await expect(workspace).to_be_enabled()
-                    await expect(workspace).to_have_attribute("title", expected_workspace)
+                    await expect(workspace).to_have_accessible_name(
+                        f"Working directory: {expected_workspace}"
+                    )
                     await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_disabled()
                     await page.get_by_test_id("new-chat-landing-composer").dispatch_event("submit")
                     assert not creates
@@ -350,7 +355,7 @@ async def _drive(
                 await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
                 await expect(
                     page.get_by_test_id("new-chat-landing-workspace-chip")
-                ).to_have_attribute("title", expected_workspace)
+                ).to_have_accessible_name(f"Working directory: {expected_workspace}")
                 await expect(
                     page.get_by_test_id("new-chat-landing-permission-chip")
                 ).to_be_enabled()

@@ -31,7 +31,8 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 const fetchMock = vi.fn();
 
 const BUILTINS_URL = "/v1/agents";
-const MINE_URL = "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine";
+const MINE_URL =
+  "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine&expand_families=true";
 const HARNESSES_URL = "/v1/harnesses";
 
 /**
@@ -51,9 +52,10 @@ function routeFetch(routes: Record<string, Response>) {
 
 function wrapper({ children }: { children: ReactNode }) {
   // retry off so the no-network/error case resolves on the first
-  // attempt instead of stalling the test on TanStack's backoff.
+  // attempt instead of stalling the test on TanStack's backoff. Queries
+  // that set their own retry policy still retry, so make that immediate.
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
   });
   return (
     <QueryClientProvider client={client}>
@@ -158,10 +160,11 @@ describe("useAvailableAgents", () => {
     client.setQueryData(mineKey, cache(rows));
     routeFetch({
       [BUILTINS_URL]: mockResponse({ data: [], has_more: false }),
-      "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=shared": mockResponse({
-        data: [{ ...rows[0], id: "shared", agent_id: "ag_shared", permission_level: 1 }],
-        has_more: false,
-      }),
+      "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=shared&expand_families=true":
+        mockResponse({
+          data: [{ ...rows[0], id: "shared", agent_id: "ag_shared", permission_level: 1 }],
+          has_more: false,
+        }),
     });
     const { result } = renderHook(
       () => ({

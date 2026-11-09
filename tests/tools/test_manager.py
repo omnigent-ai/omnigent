@@ -66,8 +66,8 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_list",
         "sys_session_get_info",
         "sys_session_rename",
-        # Peer messaging is advertised for every agent; the server
-        # enforces the orchestration flag and source authorization.
+        # Peer messaging is advertised unless the runner disables
+        # peer_session_messaging; the server enforces its own flags.
         "sys_session_message",
         "ui_open_file",
         # Read-only agent discovery tools are likewise always available
@@ -126,11 +126,25 @@ def _non_lifecycle_schemas(
     ]
 
 
-@pytest.mark.parametrize("tool_name", ["sys_session_rename", "sys_session_message"])
-def test_session_tools_are_registered_for_every_agent(tool_name: str) -> None:
-    names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
+@pytest.mark.parametrize("peer_messaging", [True, False])
+@pytest.mark.parametrize("spawn", [True, False])
+def test_session_tools_are_registered_for_every_agent(
+    monkeypatch: pytest.MonkeyPatch, peer_messaging: bool, spawn: bool
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", "" if peer_messaging else "-peer_session_messaging")
+    spec = _make_spec()
+    spec.spawn = spawn
+    names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
 
-    assert tool_name in names
+    assert ("sys_session_message" in names) is peer_messaging
+    assert {
+        "sys_session_rename",
+        "sys_session_list",
+        "sys_session_get_info",
+        "sys_session_get_history",
+    } <= names
+    assert ("sys_session_send" in names) is spawn
+    assert ("sys_session_close" in names) is spawn
 
 
 @pytest.fixture()

@@ -40,6 +40,7 @@ IDLE = "idle"
 TOOL_RUNNING = "tool_running"
 TOOL_ENDS_DURING_OUTAGE = "tool_ends_during_outage"
 APPROVAL_PENDING = "approval_pending"
+MODEL_CALL_UNANSWERED = "model_call_unanswered"
 #: Native harnesses every scenario runs against.
 HARNESSES: tuple[Harness, ...] = ("claude", "codex")
 
@@ -124,8 +125,16 @@ def enter(driver: SessionDriver, phase: str, *, outage_s: float) -> Phase:
     if phase == APPROVAL_PENDING:
         turn, approval_id = driver.start_approval_turn()
         return Phase(phase, turn, approval_id)
+    if phase == MODEL_CALL_UNANSWERED:
+        return Phase(phase, driver.start_unanswered_turn())
     if phase != IDLE:
         raise ValueError(f"unknown phase {phase!r}")
+    # The final reply can be committed before the native turn's idle edge.
+    wait_for(
+        lambda: driver.lab.snapshot(driver.session_id).get("status") == "idle" or None,
+        timeout=SETTLE_S,
+        what="idle before injecting the fault",
+    )
     return Phase(phase)
 
 
