@@ -432,10 +432,12 @@ async def test_wait_for_runner_client_never_connected_makes_no_lookup(
     assert event.attributes["attempts"] == 0
 
 
+@pytest.mark.parametrize("wait_kind", ["client", "managed"])
 @pytest.mark.parametrize(
     "outcome",
     [
         "connected",
+        "late_credential",
         "deadline_tie",
         "late_pending",
         "stopped",
@@ -443,17 +445,23 @@ async def test_wait_for_runner_client_never_connected_makes_no_lookup(
         "cancelled",
         "dead",
         "expired",
+        "host_reconnected",
+        "host_changed",
     ],
 )
-async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) -> None:
+async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome, wait_kind) -> None:
     from omnigent.errors import OmnigentError
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
     from omnigent.server.routes._sessions import orchestration
 
     # Only the orchestration deadline uses this clock; asyncio keeps its real clock.
     clock = _VirtualTime()
     monkeypatch.setattr(orchestration, "time", SimpleNamespace(monotonic=clock.monotonic))
     monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0)
-    monkeypatch.setattr("omnigent.runner.identity.RUNNER_SIGN_IN_PENDING_WAIT_S", 150.0)
+    from omnigent.runner.identity import RUNNER_SIGN_IN_PENDING_WAIT_S
+
+    wait_budget = RUNNER_SIGN_IN_PENDING_WAIT_S if outcome == "late_credential" else 150.0
+    monkeypatch.setattr("omnigent.runner.identity.RUNNER_SIGN_IN_PENDING_WAIT_S", wait_budget)
     ordinary_expired = asyncio.Event()
     pending_wait_started = asyncio.Event()
     status_poll_started = asyncio.Event()
@@ -462,7 +470,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
     clock_tick = object()
     connection_results: asyncio.Queue[object] = asyncio.Queue()
     next_status: asyncio.Queue[str] = asyncio.Queue()
-    current = SimpleNamespace(runner_id="runner-owned")
+    current = SimpleNamespace(runner_id="runner-owned", host_id="host-owned")
     connection = SimpleNamespace(host_id="host-owned")
     registry = SimpleNamespace(get=lambda _host_id: connection)
     store = SimpleNamespace(get_conversation=lambda _session_id: current)
@@ -470,6 +478,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
     waits: list[float] = []
     active: list[asyncio.Task] = []
     status_calls = 0
+    queried_connections: list[object] = []
 
     async def wait(*_args, timeout_s, **_kwargs):
         waits.append(timeout_s)
@@ -497,6 +506,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
     async def status(*_args):
         nonlocal status_calls
         status_calls += 1
+        queried_connections.append(_args[0])
         if outcome == "late_pending" and status_calls == 1:
             return "alive"
         # Late pending follows alive, a cancelled poll, then a fresh deadline query.
@@ -509,8 +519,20 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
 
     monkeypatch.setattr(orchestration, "_wait_for_runner_client", wait)
     monkeypatch.setattr(orchestration, "_query_host_runner_status", status)
-    task = asyncio.create_task(
-        orchestration._wait_for_host_bound_runner_client(
+    if wait_kind == "managed":
+        tracker = ManagedLaunchTracker()
+        tracker.begin("session-owned")
+        pending = helpers._wait_for_managed_runner_tunnel(
+            "session-owned",
+            "runner-owned",
+            SimpleNamespace(wait_for_runner=wait),
+            tracker,
+            host_conn=connection,
+            host_registry=registry,
+            conversation_store=store,
+        )
+    else:
+        pending = orchestration._wait_for_host_bound_runner_client(
             "session-owned",
             None,
             None,
@@ -521,7 +543,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
             host_registry=registry,
             conversation_store=store,
         )
-    )
+    task = asyncio.create_task(pending)
     try:
         async with asyncio.timeout(budget(5)):
             if outcome == "late_pending":
@@ -529,16 +551,36 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
                 clock.now = 30.0
                 ordinary_expired.set()
             await pending_wait_started.wait()
-            assert waits == [30.0, 150.0]
-            if outcome in {"connected", "deadline_tie", "late_pending", "expired"}:
-                clock.now += 31.0
+            assert waits == [30.0, wait_budget]
+            if outcome == "host_reconnected":
+                await status_poll_started.wait()
+                connection = SimpleNamespace(host_id="host-owned")
+                next_status.put_nowait("dead")
+                await pending_rechecked.wait()
+                assert queried_connections[-1] is connection
+                next_status.put_nowait("sign_in_pending")
+                assert waits == [30.0, wait_budget], "a host reconnect renewed the credential wait"
+            if outcome in {
+                "connected",
+                "late_credential",
+                "deadline_tie",
+                "late_pending",
+                "expired",
+            }:
+                clock.now = 236.0 if outcome == "late_credential" else clock.now + 31.0
                 next_status.put_nowait("sign_in_pending")
                 await pending_rechecked.wait()
-                assert waits == [30.0, 150.0], "a repeated status renewed the sign-in wait"
-            if outcome in {"connected", "deadline_tie", "late_pending"}:
+                assert waits == [30.0, wait_budget], "a repeated status renewed the sign-in wait"
+            if outcome in {
+                "connected",
+                "late_credential",
+                "deadline_tie",
+                "late_pending",
+                "host_reconnected",
+            }:
                 assert not task.done(), "ordinary startup grace discarded pending sign-in"
                 connection_results.put_nowait(client)
-                assert await task is client
+                assert await task is (True if wait_kind == "managed" else client)
             elif outcome == "stopped":
                 monkeypatch.setitem(
                     orchestration._intentional_stop_sessions, "session-owned", "runner-owned"
@@ -551,13 +593,18 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
                 next_status.put_nowait("sign_in_pending")
                 with pytest.raises(OmnigentError, match="binding changed"):
                     await task
+            elif outcome == "host_changed":
+                current.host_id = "host-other"
+                next_status.put_nowait("sign_in_pending")
+                with pytest.raises(OmnigentError, match="binding changed"):
+                    await task
             elif outcome == "cancelled":
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
             elif outcome == "dead":
                 next_status.put_nowait("dead")
-                assert await task is None
+                assert await task is (False if wait_kind == "managed" else None)
             else:
                 clock.now = 149.0
                 connection_results.put_nowait(clock_tick)
@@ -565,7 +612,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
                 assert not task.done(), "sign-in wait expired before its deadline"
                 clock.now = 150.0
                 connection_results.put_nowait(clock_tick)
-                assert await task is None
+                assert await task is (False if wait_kind == "managed" else None)
             assert not active
             assert len(waits) == 2
     finally:
@@ -621,6 +668,7 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
     from omnigent.server.routes._sessions import orchestration
     from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
 
+    monkeypatch.setattr("omnigent.runner.identity.RUNNER_SIGN_IN_PENDING_WAIT_S", 150.0)
     clock = _VirtualTime()
     monkeypatch.setattr(
         orchestration, "time", SimpleNamespace(monotonic=clock.monotonic, time=clock.monotonic)
