@@ -9,12 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-POLICY_FILES = frozenset(
-    {
-        "dev/lint/lint_reference_policy.py",
-        "tests/dev/lint/test_lint_reference_policy.py",
-    }
-)
+POLICY_FILES = frozenset({"dev/lint/lint_reference_policy.py"})
 PROHIBITED_NAMES = frozenset(
     {
         "arca",
@@ -38,30 +33,7 @@ PHRASES = re.compile(
     r"|\be2[-_]dogfood\b",
     re.IGNORECASE,
 )
-HOST = re.compile(
-    r"(?<![\w.-])(?:[a-z0-9-]+\.)+(?:databricks\.com|databricksapps\.com|azuredatabricks\.net)(?![\w.-])",
-    re.IGNORECASE,
-)
-SYNTHETIC_PREFIXES = frozenset(
-    {
-        "example",
-        "test",
-        "workspace",
-        "ws",
-        "acme",
-        "account",
-        "app.example",
-        "dbc-test",
-        "dbc-x",
-        "dbc-123",
-        "dbc-1234",
-        "dbc-12345678-abcd",
-        "dbc-87654321-dcba",
-        "123",
-        "1234567890123456",
-        "4242424242424242",
-    }
-)
+HOST_SUFFIXES = ("databricks.com", "databricksapps.com", "azuredatabricks.net")
 PUBLIC_HOSTS = frozenset(
     {
         "www.databricks.com",
@@ -72,6 +44,17 @@ PUBLIC_HOSTS = frozenset(
 )
 
 
+def host_pattern(suffixes: tuple[str, ...]) -> re.Pattern[str]:
+    alternatives = "|".join(re.escape(suffix) for suffix in suffixes)
+    return re.compile(
+        r"(?<![\w.-])(?:[a-z0-9-]+\.)+(?:" + alternatives + r")(?![\w.-])",
+        re.IGNORECASE,
+    )
+
+
+HOST = host_pattern(HOST_SUFFIXES)
+
+
 def violates(text: str) -> bool:
     """Match names in prose, snake_case, camelCase, and filenames."""
     words = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
@@ -80,18 +63,7 @@ def violates(text: str) -> bool:
         return True
     if PHRASES.search(words):
         return True
-    for match in HOST.finditer(text):
-        host = match.group().lower()
-        if host in PUBLIC_HOSTS:
-            continue
-        prefix = re.sub(
-            r"\.(?:(?:ai-gateway|staging|gcp)\.)?(?:cloud\.)?(?:databricks\.com|databricksapps\.com|azuredatabricks\.net)$",
-            "",
-            host,
-        )
-        if prefix not in SYNTHETIC_PREFIXES:
-            return True
-    return False
+    return any(match.group().lower() not in PUBLIC_HOSTS for match in HOST.finditer(text))
 
 
 def git(root: Path, *args: str) -> bytes:

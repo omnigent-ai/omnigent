@@ -122,6 +122,9 @@ def test_prompt_references_readable_guidance_from_checkout(
     assert "**Reference policy** — treat new violations as blocking contract violations." in prompt
     assert "dev/lint/lint_reference_policy.py" in prompt
     assert "Do not explain prohibited names" in prompt
+    assert "Test fixtures and parametrized values" in prompt
+    assert "are not exempt: use reserved example domains" in prompt
+    assert "tests must not duplicate prohibited literals" in prompt
     references = _prompt_references(prompt_workspace)
     assert references == {guidance.resolve()}
     reference = references.pop()

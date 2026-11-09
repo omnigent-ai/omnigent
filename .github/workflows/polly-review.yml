@@ -685,15 +685,18 @@ jobs:
 
           **Reference policy** — treat new violations as blocking contract violations.
           Read `dev/lint/lint_reference_policy.py` in the trusted checkout for the
-          prohibited patterns and permitted synthetic examples. Check added code,
+          prohibited patterns and public-host exceptions. Check added code,
           filenames, tests, comments, docs, and generated text. Also flag clearly
           evidenced non-public deployment details, real workspace addresses or IDs,
           and organization-specific access instructions that the patterns miss.
           Existing unchanged references are not new findings; public API integration
-          and synthetic examples are allowed. Do not explain prohibited names or
-          repeat matched values in feedback: cite the location and request generic
-          wording. Review changes to the checker, its exemptions, and its tests for
-          bypasses; those files may contain test patterns, not deployment details.
+          and generic examples are allowed. Test fixtures and parametrized values
+          are not exempt: use reserved example domains, not plausible deployment
+          addresses. Do not explain prohibited names or repeat matched values in
+          feedback: cite the location and request generic wording. Review the checker,
+          its exemptions, and its tests for bypasses. Only the policy definition may
+          list prohibited patterns; tests must not duplicate prohibited literals or
+          describe deployment details.
 
           **Database best practices** — apply every relevant section of the reference
           document to the changed schema, queries, transactions, and storage code.

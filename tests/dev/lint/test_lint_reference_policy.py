@@ -1,44 +1,49 @@
 """Reference-policy matching and staged/branch diff coverage."""
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from dev.lint.lint_reference_policy import POLICY_FILES, check, git, violates
+from dev.lint import lint_reference_policy as policy
+from dev.lint.lint_reference_policy import check, git, violates
+
+
+@pytest.fixture
+def sample_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        policy, "PROHIBITED_NAMES", frozenset({"sampletool", "sampletools", "demotool"})
+    )
+    monkeypatch.setattr(policy, "PHRASES", re.compile(r"example[\s_-]*restricted", re.IGNORECASE))
+    monkeypatch.setattr(
+        policy, "HOST", policy.host_pattern(("service.example.test", "apps.example.test"))
+    )
+    monkeypatch.setattr(policy, "PUBLIC_HOSTS", frozenset({"docs.service.example.test"}))
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        "Arca",
-        "arclets",
-        "ISAAC",
-        "refreshDbcert",
-        "ARCA_HOST",
-        "useArcaHost",
-        "lakebox",
-        "ucode",
-        "dbexec",
-        "SPOG",
-        "databricksInternalFeaturesEnabled",
-        "Databricks-internal",
-        "--internal-beta",
-        "internal Databricks",
-        "Databricks corporate network",
-        "https://github.com/databricks-eng/project",
-        "e2-dogfood",
-        "https://dbc-deadbeef-abcd.cloud.databricks.com/path",
-        "123987.ai-gateway.cloud.databricks.com",
-        "adb-987654.12.azuredatabricks.net",
-        "private.gcp.databricks.com",
-        "private.databricksapps.com",
-        "package-mirror.cloud.databricks.com",
-        "example.evil.cloud.databricks.com",
+        "Sampletool",
+        "sampletools",
+        "DEMOTOOL",
+        "refreshSampletool",
+        "SAMPLETOOL_HOST",
+        "useSampletoolHost",
+        "exampleRestricted",
+        "Example-restricted",
+        "example restricted",
+        "https://tenant.service.example.test/path",
+        "https://tenant.apps.example.test/path",
+        "EXAMPLE.SERVICE.EXAMPLE.TEST",
+        "123.service.example.test",
+        "docs.extra.service.example.test",
     ],
 )
+@pytest.mark.usefixtures("sample_policy")
 def test_prohibited(text: str) -> None:
     assert violates(text)
 
@@ -46,62 +51,95 @@ def test_prohibited(text: str) -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        "Databricks OAuth",
         "varchar",
-        "arcade",
+        "sampletoolbox",
+        "xsampletool",
         "internal server error",
-        "https://docs.databricks.com/en/",
-        "https://accounts.cloud.databricks.com/",
-        "https://example.cloud.databricks.com/omnigent",
-        "https://example.staging.cloud.databricks.com",
-        "https://dbc-12345678-abcd.cloud.databricks.com",
-        "https://4242424242424242.ai-gateway.cloud.databricks.com",
-        "https://example.azuredatabricks.net",
-        "https://app.example.databricksapps.com",
+        "https://docs.service.example.test/en/",
+        "https://DOCS.SERVICE.EXAMPLE.TEST/en/",
+        "https://tenant.example.test/path",
+        "https://service.example.test/",
+        "https://tenant.service.example.test.other.example/",
     ],
 )
+@pytest.mark.usefixtures("sample_policy")
 def test_allowed(text: str) -> None:
     assert not violates(text)
 
 
+def test_configured_names_are_prohibited() -> None:
+    assert policy.PROHIBITED_NAMES
+    for name in policy.PROHIBITED_NAMES:
+        assert violates(name)
+        assert violates(name.upper())
+        assert violates(f"before_{name}_after")
+        assert violates(f"use{name.title()}Value")
+
+
+@pytest.mark.parametrize("label", ["example", "test", "workspace", "123", "12345678"])
+def test_sample_labels_do_not_exempt_policy_hosts(label: str) -> None:
+    for suffix in policy.HOST_SUFFIXES:
+        assert violates(f"https://{label}.{suffix}/path")
+
+
+def test_public_hosts_and_reserved_examples_are_allowed() -> None:
+    for host in policy.PUBLIC_HOSTS:
+        assert not violates(f"https://{host}/path")
+        assert violates(f"extra.{host}")
+    for text in ["Databricks OAuth", "https://workspace.example.test/", "https://example.com/"]:
+        assert not violates(text)
+
+
+def test_fixture_source_follows_policy() -> None:
+    assert not violates(Path(__file__).read_text(encoding="utf-8"))
+
+
 @pytest.fixture
-def repository(tmp_path: Path) -> Path:
+def prohibited_name() -> str:
+    return min(policy.PROHIBITED_NAMES)
+
+
+@pytest.fixture
+def repository(tmp_path: Path, prohibited_name: str) -> Path:
     git(tmp_path, "init", "-q")
     git(tmp_path, "config", "user.name", "Test")
     git(tmp_path, "config", "user.email", "test@example.com")
-    (tmp_path / "existing.txt").write_text("arca\nkeep\n", encoding="utf-8")
+    (tmp_path / "existing.txt").write_text(f"{prohibited_name}\nkeep\n", encoding="utf-8")
     git(tmp_path, "add", ".")
     git(tmp_path, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "initial")
     return tmp_path
 
 
-def test_staged_only_and_existing_lines(repository: Path) -> None:
+def test_staged_only_and_existing_lines(repository: Path, prohibited_name: str) -> None:
     path = repository / "existing.txt"
-    path.write_text("arca\nkeep\nsafe\n", encoding="utf-8")
+    path.write_text(f"{prohibited_name}\nkeep\nsafe\n", encoding="utf-8")
     git(repository, "add", ".")
-    path.write_text("arca\nkeep\nisaac\n", encoding="utf-8")
+    path.write_text(f"{prohibited_name}\nkeep\n{prohibited_name}\n", encoding="utf-8")
     assert check(repository) == []
     git(repository, "add", ".")
     assert check(repository) == ["existing.txt:3: prohibited reference in added text"]
 
 
-def test_branch_range_checks_committed_changes(repository: Path) -> None:
+def test_branch_range_checks_committed_changes(repository: Path, prohibited_name: str) -> None:
     base = git(repository, "rev-parse", "HEAD").decode().strip()
-    (repository / "notes.md").write_text("# Note\narclets\n", encoding="utf-8")
+    (repository / "notes.md").write_text(f"# Note\n{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
     git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
     assert check(repository) == []
     assert check(repository, base, "HEAD") == ["notes.md:2: prohibited reference in added text"]
 
 
-def test_paths_renames_and_line_numbers(repository: Path) -> None:
-    (repository / "isaac notes.txt").write_text("safe\n", encoding="utf-8")
+def test_paths_renames_and_line_numbers(repository: Path, prohibited_name: str) -> None:
+    name = f"{prohibited_name} notes.txt"
+    (repository / name).write_text("safe\n", encoding="utf-8")
     git(repository, "mv", "existing.txt", "renamed.txt")
     git(repository, "add", ".")
-    assert check(repository) == [
-        "isaac notes.txt:1: prohibited reference in new path",
-        "renamed.txt:1: prohibited reference in added text",
-    ]
+    assert sorted(check(repository)) == sorted(
+        [
+            f"{name}:1: prohibited reference in new path",
+            "renamed.txt:1: prohibited reference in added text",
+        ]
+    )
 
 
 def test_deletion_and_binary_content(repository: Path) -> None:
@@ -111,14 +149,21 @@ def test_deletion_and_binary_content(repository: Path) -> None:
     assert check(repository) == []
 
 
-def test_only_policy_and_its_tests_are_exempt(repository: Path) -> None:
-    for name in [*POLICY_FILES, "docs/policy.md", "tests/other.py"]:
+def test_only_policy_definition_is_exempt(repository: Path, prohibited_name: str) -> None:
+    assert {"dev/lint/lint_reference_policy.py"} == policy.POLICY_FILES
+    for name in [
+        *policy.POLICY_FILES,
+        "docs/policy.md",
+        "tests/dev/lint/test_lint_reference_policy.py",
+        "tests/other.py",
+    ]:
         path = repository / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("arca\n", encoding="utf-8")
+        path.write_text(f"{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
     assert check(repository) == [
         "docs/policy.md:1: prohibited reference in added text",
+        "tests/dev/lint/test_lint_reference_policy.py:1: prohibited reference in added text",
         "tests/other.py:1: prohibited reference in added text",
     ]
 
@@ -128,10 +173,12 @@ def test_missing_base_fails_closed(repository: Path) -> None:
         check(repository, "missing-ref", "HEAD")
 
 
-def test_cli_uses_push_range_and_does_not_echo_values(repository: Path) -> None:
+def test_cli_uses_push_range_and_does_not_echo_values(
+    repository: Path, prohibited_name: str
+) -> None:
     script = Path(__file__).resolve().parents[3] / "dev/lint/lint_reference_policy.py"
     base = git(repository, "rev-parse", "HEAD").decode().strip()
-    (repository / "notes.txt").write_text("isaac\n", encoding="utf-8")
+    (repository / "notes.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
     git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
     result = subprocess.run(
@@ -144,7 +191,7 @@ def test_cli_uses_push_range_and_does_not_echo_values(repository: Path) -> None:
     )
     assert result.returncode == 1
     assert "notes.txt:1: prohibited reference" in result.stdout
-    assert "isaac" not in result.stdout
+    assert prohibited_name not in result.stdout
     failed = subprocess.run(
         [sys.executable, str(script), "--base", "missing-ref", "--head", "HEAD"],
         cwd=repository,
