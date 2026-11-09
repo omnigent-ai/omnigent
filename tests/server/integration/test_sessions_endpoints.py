@@ -122,6 +122,12 @@ async def test_authored_framework_notice_is_rejected(
     assert snapshot["pending_inputs"] == []
 
 
+@pytest.fixture(autouse=True)
+def _show_cost_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep cost-display assertions independent of a host ``OMNIGENT_HIDE_COST``."""
+    monkeypatch.delenv("OMNIGENT_HIDE_COST", raising=False)
+
+
 def _capture_published(
     monkeypatch: pytest.MonkeyPatch, published: list[tuple[str, dict[str, Any]]]
 ) -> None:

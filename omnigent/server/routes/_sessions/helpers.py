@@ -2208,8 +2208,9 @@ def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
     unaffected — it reads the value with a ``0.0`` default.
 
     Operators whose catalog and harness costs are both non-authoritative set
-    ``OMNIGENT_HIDE_COST=1`` to report every session as unpriced; token counts
-    and the stored cost that budget policies read are kept.
+    ``OMNIGENT_HIDE_COST=1`` to report sessions as unpriced in the session view
+    (snapshot, ``session.usage`` events, per-model breakdown). Token counts, the
+    stored cost budget policies read, and the ``/v1/usage`` report are kept.
 
     :param usage: A conversation's ``session_usage`` dict, e.g.
         ``{"input_tokens": 1200, "total_cost_usd": 0.42}`` (priced) or

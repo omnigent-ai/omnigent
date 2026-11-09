@@ -69,6 +69,8 @@ services:
       # Deliberately value-less: an unset .env entry stays unset in the
       # container (keep all), while an explicit empty value keeps none.
       OMNIGENT_SEEDED_AGENTS:
+      # "1" hides USD cost in the session view; token counts stay. See README.
+      OMNIGENT_HIDE_COST: "${OMNIGENT_HIDE_COST:-}"
       # Anchor the server's data dir on the persistent volume so
       # file-backed operator config survives container restarts:
       # the admin roster (/data/admins) and allowed-domains file

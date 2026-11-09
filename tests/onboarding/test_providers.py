@@ -375,6 +375,36 @@ def test_find_catalog_models_family_fallback_does_not_cross_versions(model_id: s
     assert find_catalog_models(model_id) == []
 
 
+@pytest.mark.parametrize(
+    ("model_id", "expected_names"),
+    [
+        ("gpt-4o-2024-08-07", ["gpt-4o-2024-08-06"]),
+        ("gemini-2.5-pro-preview-05-07", ["gemini-2.5-pro-preview-05-06"]),
+        ("claude-sonnet-4-20990101", []),
+        ("anthropic/claude-sonnet-4-20990101", []),
+        ("gpt-4-20990101", []),
+    ],
+)
+def test_find_catalog_models_family_fallback_handles_dates_and_dotted_versions(
+    monkeypatch: pytest.MonkeyPatch,
+    model_id: str,
+    expected_names: list[str],
+) -> None:
+    """Hyphenated dates keep the fallback; dotted or concatenated siblings never match."""
+
+    def _catalog(*names: str) -> dict[str, Any]:
+        return {"schema_version": "1.0", "models": {name: {"mode": "chat"} for name in names}}
+
+    monkeypatch.setitem(_FAKE_CATALOG, "openai", _catalog("gpt-4o", "gpt-4o-2024-08-06"))
+    monkeypatch.setitem(_FAKE_CATALOG, "gemini", _catalog("gemini-2.5-pro-preview-05-06"))
+    monkeypatch.setitem(_FAKE_CATALOG, "anthropic", _catalog())
+    monkeypatch.setitem(
+        _FAKE_CATALOG, "openrouter", _catalog("anthropic/claude-sonnet-4.5", "openai/gpt-4o")
+    )
+
+    assert [match.name for match in find_catalog_models(model_id)] == expected_names
+
+
 def test_fetch_model_pricing_prices_1m_marker_as_base_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
