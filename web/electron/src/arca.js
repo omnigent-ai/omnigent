@@ -3,21 +3,16 @@
 /**
  * Arca host connection.
  *
- * Arca is Databricks' internal sandbox CLI: each user has one EC2 dev
- * instance, `arca ssh <args...>` passes the args through to ssh against it
- * (starting the instance first when needed). Connecting that instance as an
- * Omnigent host means running, over `arca ssh`:
+ * Connecting an Arca instance as an Omnigent host means running, over
+ * `arca ssh`:
  *
  *   isaac omni host --server <url> --background --non-interactive
  *
- * (`isaac` is the launcher that provides the `omni` CLI
- * on Arca instances.)
- *
  * The remote daemon then opens the ordinary outbound host tunnel using the
- * Arca box's own Omnigent OAuth grant; generic Arca sign-in is not sufficient.
- * `--background` exits 0 only once the daemon registered with the server,
- * and `--non-interactive` fails loud instead of dangling on a browser
- * login — both are what make the exit code a trustworthy signal here.
+ * instance's own Omnigent OAuth grant; generic Arca sign-in is not sufficient.
+ * `--background` exits 0 only once the daemon registered with the server, and
+ * `--non-interactive` fails instead of waiting on a browser login, so the exit
+ * code is a reliable signal.
  *
  * This module is main-process-free: the binary probe and process spawn are
  * injected so everything is unit-testable without Electron or a real arca.
@@ -164,10 +159,9 @@ function buildArcaArgs(serverUrl, login = false) {
   }
   return [
     "ssh",
-    // Ordinary arca ssh inherits -R 19222 from ~/.ssh/config. Arca Companion
-    // concurrently reclaims that reserved listener with `fuser -k`, which can
-    // kill this session during cold start even after the remote command
-    // succeeded. This headless launch needs no forwards, so opt out entirely.
+    // A headless launch needs no port forwards. Clear the reserved -R 19222
+    // from ~/.ssh/config so a listener reclaimed during cold start can't kill
+    // the session after the remote command succeeds.
     "-o",
     "ClearAllForwardings=yes",
     "isaac",
@@ -242,8 +236,8 @@ function describeConnectFailure(run) {
       errorAction: "Check `arca status` and try again.",
     };
   }
-  // `omni host --non-interactive` fails loud with a sign-in hint when the
-  // Arca box's Databricks credentials can't mint a server token.
+  // `omni host --non-interactive` fails with a sign-in hint when the instance's
+  // credentials can't mint a server token.
   if (/OMNIGENT_AUTH_REQUIRED|not signed in|authentication failed \(HTTP 401\)/i.test(output)) {
     return {
       ok: false,
@@ -846,7 +840,7 @@ function connectArcaHost(serverUrl, deps = {}) {
 }
 
 /**
- * Well-known install locations for dbcert, the corp certificate CLI.
+ * Well-known install locations for dbcert.
  *
  * @returns {string[]}
  */
@@ -877,10 +871,8 @@ function resolveDbcertPathAsync(deps = {}) {
 
 /**
  * Renew this machine's dbcert with `dbcert --force`, which signs in through
- * the browser. Unless skipped, dbcert syncs the primary Arca itself. Arca Companion
- * watches `~/.dbcert` and copies the certificate to the user's Arcas and Arclets.
- * `--force` mints a new certificate even while this
- * machine's is valid, so a box that missed the last copy gets one too.
+ * the browser. Unless skipped, dbcert also syncs the primary Arca instance.
+ * `--force` mints a new certificate even while the current one is valid.
  *
  * @param {{ resolveDbcertPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number, skipArcaSync?: boolean }} [deps]
  * @returns {Promise<{ ok: true } | { ok: false, error: string }>}

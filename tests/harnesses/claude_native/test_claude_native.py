@@ -9362,7 +9362,7 @@ def test_bedrock_config_for_native_claude_keeps_betas_under_use_gateway(
 ) -> None:
     """A bedrock-style gateway with CLAUDE_CODE_USE_GATEWAY=1 keeps betas on.
 
-    Bedrock-compatible corporate gateways can run in gateway-aware mode; when
+    Bedrock-compatible enterprise gateways can run in gateway-aware mode; when
     CLAUDE_CODE_USE_GATEWAY=1 the beta-disable flag is skipped so MCP tool
     search stays enabled, matching the generic gateway provider path.
     """

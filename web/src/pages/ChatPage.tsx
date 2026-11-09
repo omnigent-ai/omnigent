@@ -923,7 +923,7 @@ export function ChatPage() {
   // Also prefer the snapshot's `permissionLevel` over the sidebar row's when
   // it's resolved: the hook derives `host_offline`'s `isOwner` from this
   // level, and a deployment whose session list is owner-only (the caller's
-  // effective level omitted, e.g. the Databricks-managed server) leaves the
+  // effective level omitted, e.g. a managed server) leaves the
   // row's `permission_level` null — which would read permissively as "owner"
   // and offer a non-owner the host-reconnect path. The single-session
   // snapshot always carries the authoritative level.

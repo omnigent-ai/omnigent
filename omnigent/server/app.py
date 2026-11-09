@@ -1853,7 +1853,7 @@ def create_app(
     # auth_provider wired in, and (c) account_store passed in.
     #
     # account_store is an EXPLICIT parameter (not constructed in
-    # here) so the internal hosted product can opt out of accounts
+    # here) so a hosted deployment can opt out of accounts
     # persistence entirely by passing None — even when it happens
     # to deploy with the accounts code on disk. Without this gate
     # the create_app factory would force every consumer to carry
@@ -3512,9 +3512,8 @@ def create_app(
         — when ``accounts_enabled`` is false, the SPA never
         registers ``/login``, ``/register``, ``/members`` and
         never renders the AccountMenu, so the bundle behaves
-        identically to a pre-PR-2008 build for header / OIDC
-        deploys (in particular, the internal hosted product that
-        syncs from this repo).
+        identically to a build without accounts for header / OIDC
+        deploys (in particular, hosted deployments).
 
         Authentication: this endpoint is intentionally UNAUTHED
         so the SPA can probe it before holding a session cookie.
@@ -3550,11 +3549,10 @@ def create_app(
         needs_setup = False
         if accounts_enabled and account_store is not None:
             needs_setup = not any(u.has_password for u in account_store.list_users())
-        # databricks_features gates the Databricks-deployment-only UI hints
-        # (the "Databricks Lakebox" connect tab). True only when the internal
-        # lakebox launcher module is present — it is excluded from the OSS
-        # export, so an OSS build reports False and the SPA shows the clean,
-        # provider-agnostic hints. find_spec is side-effect-free (no import).
+        # databricks_features gates the Databricks-only UI hints (the
+        # "Databricks Lakebox" connect tab). True only when the lakebox launcher
+        # module is present; otherwise the SPA shows the provider-agnostic hints.
+        # find_spec is side-effect-free (no import).
         import importlib.util
 
         databricks_features = (

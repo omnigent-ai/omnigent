@@ -84,7 +84,7 @@
 
   /**
    * Normalize persisted recent-server targets for the setup-page picker. The
-   * stored target may include an internal mount such as `/omnigent`; the picker
+   * stored target may include a mount path such as `/omnigent`; the picker
    * shows and reconnects through the user-facing root URL instead. Invalid and
    * duplicate entries are omitted.
    *
@@ -253,11 +253,10 @@
   }
 
   /**
-   * True when a server URL is hosted by Databricks — a workspace domain
+   * True when a server URL is hosted by Databricks: a workspace domain
    * (workspace-mounted Omnigent) or a Databricks App. Https-only: a local or
-   * self-hosted server is never "Databricks-managed", whatever its hostname
-   * claims. Used to scope managed desktop features (e.g. the Arca
-   * host option) to Databricks-managed servers.
+   * self-hosted server is never "managed", whatever its hostname claims. Used
+   * to scope managed desktop features (e.g. the Arca host option) to managed servers.
    *
    * @param {string | null | undefined} rawUrl
    * @returns {boolean}
