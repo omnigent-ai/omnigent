@@ -457,7 +457,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
       )}
 
       {/* Saved configuration for launching sessions. */}
-      <Collapsible defaultOpen className="mt-6">
+      <Collapsible className="mt-6">
         <h2 className="mb-2 text-sm font-medium text-muted-foreground">
           <CollapsibleTrigger className="group flex cursor-pointer items-center gap-1 rounded-sm text-left transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
             <ChevronDownIcon

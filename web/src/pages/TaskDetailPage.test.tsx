@@ -228,6 +228,11 @@ function renderPage() {
   return render(pageTree());
 }
 
+/** Configuration starts collapsed; expand it to assert on saved launch settings. */
+function openConfiguration() {
+  fireEvent.click(screen.getByRole("button", { name: "Configuration" }));
+}
+
 describe("header, prompt, configuration", () => {
   it("shows the user prompt first and keeps generated instructions collapsed and read-only", () => {
     const prompt = renderTriggerPrompt(
@@ -253,15 +258,11 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-prompt")).toBeVisible();
   });
 
-  it("collapses and reopens configuration while keeping run history visible", () => {
+  it("starts with configuration collapsed and toggles it while keeping run history visible", () => {
     setTask(task({ modelOverride: "opus" }));
     setRuns([run({ sessionCostUsd: 1.23 })]);
     renderPage();
     const toggle = screen.getByRole("button", { name: "Configuration" });
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByTestId("task-detail-model")).toBeVisible();
-
-    fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByTestId("task-detail-model")).not.toBeInTheDocument();
     expect(screen.getByTestId("run-cost")).toBeVisible();
@@ -269,11 +270,17 @@ describe("header, prompt, configuration", () => {
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByTestId("task-detail-model")).toHaveTextContent("Opus");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("task-detail-model")).not.toBeInTheDocument();
+    expect(screen.getByTestId("run-cost")).toBeVisible();
   });
 
   it("renders the title, prompt, schedule, and agent/host config", () => {
     setTask(task());
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-title")).toHaveTextContent("Nightly triage");
     expect(screen.getByTestId("task-detail-prompt")).toHaveTextContent(
       "Triage the inbox and summarize.",
@@ -311,6 +318,7 @@ describe("header, prompt, configuration", () => {
       }),
     );
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-model")).toHaveTextContent("Opus");
     expect(screen.getByTestId("task-detail-effort")).toHaveTextContent("High");
     expect(screen.getByTestId("task-detail-permission")).toHaveTextContent("Accept edits");
@@ -336,6 +344,7 @@ describe("header, prompt, configuration", () => {
       }),
     );
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-model")).toHaveTextContent("custom-model");
     expect(screen.getByTestId("task-detail-effort")).toHaveTextContent("xHigh");
     expect(screen.getByTestId("task-detail-permission")).toHaveTextContent("Manual");
@@ -372,6 +381,7 @@ describe("header, prompt, configuration", () => {
     });
     setTask(task({ permissionMode }));
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-permission").textContent).toBe(label);
   });
 
@@ -392,12 +402,14 @@ describe("header, prompt, configuration", () => {
     }));
     setTask(task({ agentId: "ag_1" }));
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-agent")).toHaveTextContent(/^Polly$/);
   });
 
   it("names the sandbox for a task that runs in a new sandbox each time", () => {
     setTask(task({ executionTarget: "managed_sandbox" }));
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-host")).toHaveTextContent("New Sandbox");
     expect(screen.getByTestId("task-detail-workspace")).toHaveTextContent("Sandbox default");
   });
@@ -405,6 +417,7 @@ describe("header, prompt, configuration", () => {
   it("resolves a pinned host id to its name", () => {
     setTask(task({ hostId: "h_1" }));
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-host")).toHaveTextContent("My Laptop");
   });
 
