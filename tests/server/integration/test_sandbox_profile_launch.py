@@ -201,13 +201,23 @@ async def test_daemon_clear_then_launch_recovers_offline_runner(
     current = env.conversations.get_conversation(session_id)
     if launch_fails:
         assert current.runner_id == ("offline-runner" if mode == "profile" else None)
-        assert current.host_id == (host_id if mode == "profile" else None)
+        assert current.host_id == (host_id if mode in {"profile", "legacy-managed"} else None)
     else:
         assert current.runner_id == response.json()["runner_id"] != "offline-runner"
         assert current.host_id == host_id
     assert env.app.state.sandbox_profiles is None or env.catalog.get_session_snapshot(
         session_id
     ) == (env.profile if mode == "profile" else None)
+    if launch_fails and mode == "legacy-managed":
+        launch_fails = False
+        retry = await env.client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": session_id, "workspace": "/workspace"},
+        )
+        assert retry.status_code == 200, retry.text
+        current = env.conversations.get_conversation(session_id)
+        assert current.host_id == host_id and current.runner_id == retry.json()["runner_id"]
+        assert env.catalog.get_session_snapshot(session_id) is None
 
 
 @pytest.mark.parametrize("race", ["local-live", "fresh-heartbeat", "new-binding"])
