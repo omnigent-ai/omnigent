@@ -232,6 +232,37 @@ describe("ComposerAddMenu", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: /Plan/ }));
     expect(onPlan).toHaveBeenCalledOnce();
   });
+
+  it.each(["goal", "side-chat"] as const)(
+    "lets the %s action keep focus after the menu closes",
+    async (action) => {
+      const user = userEvent.setup();
+      const openAction = vi.fn(() => screen.getByTestId("action-input").focus());
+      render(
+        <>
+          <ComposerAddMenu
+            disabled={false}
+            onAttach={vi.fn()}
+            onGoal={action === "goal" ? openAction : undefined}
+            onSideChat={action === "side-chat" ? openAction : undefined}
+            planActive={false}
+          />
+          <textarea data-testid="action-input" />
+        </>,
+      );
+      const trigger = screen.getByRole("button", { name: "Add" });
+      await user.click(trigger);
+      const restoredTriggerFocus = vi.fn();
+      trigger.addEventListener("focus", restoredTriggerFocus);
+      onTestFinished(() => trigger.removeEventListener("focus", restoredTriggerFocus));
+
+      await user.click(screen.getByTestId(`composer-${action}-action`));
+
+      await waitFor(() => expect(restoredTriggerFocus).toHaveBeenCalled());
+      await waitFor(() => expect(screen.getByTestId("action-input")).toHaveFocus());
+      expect(openAction).toHaveBeenCalledOnce();
+    },
+  );
 });
 
 // Keep transport helpers real; each test controls the resolved user and create POST.
