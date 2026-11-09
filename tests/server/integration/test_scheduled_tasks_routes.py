@@ -97,6 +97,7 @@ def _build_app(
     local_single_user: bool = False,
     projects: bool = True,
     automations: bool | Callable[[], bool] | None = None,
+    session_mcp_selection: object | None = None,
 ) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.stores.host_store import HostStore
@@ -126,6 +127,7 @@ def _build_app(
             if persistent
             else None
         ),
+        session_mcp_selection=session_mcp_selection,
     )
 
 
@@ -819,6 +821,133 @@ async def test_create_persists_permission_mode(
             assert changed.json()["permission_mode"] == patched_mode
             reread = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
             assert reread.json()["permission_mode"] == patched_mode
+
+
+def _mcp_registry(app: FastAPI) -> None:
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
+
+    app.state.mcp_registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id=name,
+                    title=name,
+                    url="https://example.test/mcp",
+                    auth="none",
+                    tools=["read_ticket"],
+                    allowed_users=[] if name == "restricted" else None,
+                )
+                for name in ("github", "linear", "restricted")
+            ]
+        ),
+        None,
+    )
+
+
+async def test_mcp_services_round_trip_on_create_and_update(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient
+) -> None:
+    _mcp_registry(auth_app)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(mcp_services=["github", "github", "linear"]),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["mcp_services"] == ["github", "linear"]
+    task_url = f"/v1/scheduled-tasks/{created.json()['id']}"
+
+    renamed = await auth_client.patch(task_url, json={"name": "renamed"}, headers=_headers())
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["mcp_services"] == ["github", "linear"]
+    replaced = await auth_client.patch(
+        task_url, json={"mcp_services": ["linear"]}, headers=_headers()
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert replaced.json()["mcp_services"] == ["linear"]
+    cleared = await auth_client.patch(task_url, json={"mcp_services": []}, headers=_headers())
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["mcp_services"] == []
+
+
+@pytest.mark.parametrize(
+    ("service", "status"), [("missing", 403), ("restricted", 403), ("../bad", 400)]
+)
+async def test_mcp_services_the_owner_cannot_use_are_rejected(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, service: str, status: int
+) -> None:
+    _mcp_registry(auth_app)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(mcp_services=[service]), headers=_headers()
+    )
+    assert created.status_code == status, created.text
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert listed.json()["scheduled_tasks"] == []
+
+    saved = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(mcp_services=["github"]), headers=_headers()
+    )
+    task_url = f"/v1/scheduled-tasks/{saved.json()['id']}"
+    patched = await auth_client.patch(
+        task_url, json={"mcp_services": [service]}, headers=_headers()
+    )
+    assert patched.status_code == status, patched.text
+    kept = await auth_client.get(task_url, headers=_headers())
+    assert kept.json()["mcp_services"] == ["github"]
+
+
+async def test_mcp_services_use_the_deployment_selection(
+    runtime_init: None, db_uri: str, tmp_path: Path, mock_llm: ControllableMockClient
+) -> None:
+    checked: list[tuple[tuple[str, ...], str | None]] = []
+
+    class _Selection:
+        def validate(self, request, services, *, spec, user_id):
+            checked.append((tuple(services), user_id))
+            return tuple(services)
+
+        def session_labels(self, services):
+            return {}
+
+        def selected_services(self, labels):
+            return ()
+
+    app = _build_app(db_uri, tmp_path, session_mcp_selection=_Selection())
+    _make_user(db_uri)
+    _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
+    async with _serve(app, mock_llm, tmp_path) as client:
+        created = await client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(mcp_services=["system.ai.github"]),
+            headers=_headers(),
+        )
+        info = await client.get("/v1/info")
+    assert created.status_code == 200, created.text
+    assert created.json()["mcp_services"] == ["system.ai.github"]
+    assert checked == [(("system.ai.github",), "alice@example.com")]
+    assert info.json()["scheduled_task_mcp_services"] is True
+
+
+async def test_mcp_services_that_do_not_fit_the_column_are_rejected(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient
+) -> None:
+    class _AcceptAll:
+        def validate(self, request, services, *, spec, user_id):
+            return tuple(services)
+
+        def session_labels(self, services):
+            return {}
+
+        def selected_services(self, labels):
+            return ()
+
+    auth_app.state.session_mcp_selection = _AcceptAll()
+    long_names = [f"system.ai.{'x' * 100}{i:02d}" for i in range(40)]
+    rejected = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(mcp_services=long_names), headers=_headers()
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "Too many MCP services" in rejected.text
 
 
 @pytest.mark.parametrize("operation", ["create", "update"])
@@ -3657,10 +3786,15 @@ async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
     assert copies == []
 
 
+@pytest.mark.parametrize(
+    "edit", [{"workspace": "/other"}, {"mcp_services": ["github"]}], ids=["pin", "mcp"]
+)
 async def test_changing_where_a_task_runs_starts_a_new_session(
-    auth_client: httpx.AsyncClient, db_uri: str
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, edit: dict[str, object]
 ) -> None:
-    """A continued session cannot follow a new pin, so the next run starts a new one."""
+    """A continued session cannot follow a new pin or MCP selection, so the next run starts
+    a new one."""
+    _mcp_registry(auth_app)
     session_id = _owned_session(db_uri)
     created = (
         await auth_client.post(
@@ -3678,7 +3812,7 @@ async def test_changing_where_a_task_runs_starts_a_new_session(
     assert resent.json()["session_id"] == session_id
 
     moved = await auth_client.patch(
-        f"/v1/scheduled-tasks/{created['id']}", json={"workspace": "/other"}, headers=_headers()
+        f"/v1/scheduled-tasks/{created['id']}", json=edit, headers=_headers()
     )
 
     assert moved.status_code == 200, moved.text

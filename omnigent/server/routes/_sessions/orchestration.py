@@ -76,7 +76,7 @@ from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
-from omnigent.mcp_selection import mcp_selection_revision
+from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -410,6 +410,7 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
+from omnigent.server.session_mcp_selection import session_mcp_selection
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
     StartupInputContext,
@@ -11846,6 +11847,48 @@ async def _resolve_native_smart_routing(
     return native_agent.agent_name, model, verdict, None
 
 
+async def _inherited_mcp_labels(
+    request: Request,
+    source_labels: Mapping[str, str],
+    labels: Mapping[str, str],
+    *,
+    spec: AgentSpec | None,
+    user_id: str | None,
+    host_id: str | None,
+    runner_id: str | None,
+) -> dict[str, str]:
+    """The source session's MCP selection labels for a worker it starts.
+
+    Empty when the worker already carries a selection, the source has none, or
+    the worker's agent could not be loaded to check for name collisions. A
+    selection the worker cannot use (a disconnected account, a name its agent
+    uses for a custom server, or a runtime without registry support) is dropped
+    whole, so the worker still starts.
+    """
+    from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
+
+    selection = session_mcp_selection(request.app.state)
+    services = selection.selected_services(source_labels)
+    if not services or selection.selected_services(labels) or spec is None:
+        return {}
+    inherited = selection.session_labels(services)
+    try:
+        await asyncio.to_thread(selection.validate, request, services, spec=spec, user_id=user_id)
+        require_registry_mcp_runtime(
+            registry_services(selected_mcp_spec(spec, inherited)),
+            host_id=host_id,
+            runner_id=runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+        )
+    except OmnigentError as exc:
+        if exc.code == ErrorCode.WRONG_REPLICA:
+            raise
+        _logger.warning("worker session does not inherit MCP services: %s", exc)
+        return {}
+    return inherited
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -11863,6 +11906,7 @@ async def _create_session_from_existing_agent(
     created_by_session_id: str | None = None,
     created_by_project_id: str | None = None,
     created_by_scheduled_task_id: str | None = None,
+    created_by_labels: Mapping[str, str] | None = None,
 ) -> tuple[SessionResponse, Conversation]:
     """
     Create a session bound to an already-registered agent.
@@ -11897,6 +11941,8 @@ async def _create_session_from_existing_agent(
         no project is filed there, so it sits beside the session that started it.
     :param created_by_scheduled_task_id: The automation whose run is that source, if
         any. A worker whose request carries no launch args runs in its permission mode.
+    :param created_by_labels: That source's labels. A worker that picks no MCP
+        services of its own starts with the source's.
     :returns: The newly created session snapshot and its conversation row.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -12314,6 +12360,17 @@ async def _create_session_from_existing_agent(
         host_registry=getattr(request.app.state, "host_registry", None),
         tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
     )
+    inherited_mcp_labels: dict[str, str] = {}
+    if created_by_labels and not body.mcp_registry_services and not body.sub_agent_name:
+        inherited_mcp_labels = await _inherited_mcp_labels(
+            request,
+            created_by_labels,
+            body.labels or {},
+            spec=selection_spec,
+            user_id=user_id,
+            host_id=body.host_id,
+            runner_id=inherited_runner_id,
+        )
 
     selected_harness = (
         harness_override or _spec_harness(selection_spec)
@@ -12523,6 +12580,7 @@ async def _create_session_from_existing_agent(
         initial_labels[CREATED_BY_SESSION_LABEL_KEY] = created_by_session_id
     initial_labels.update(registry_labels)
     initial_labels.update(automation_permission_labels)
+    initial_labels.update(inherited_mcp_labels)
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,
