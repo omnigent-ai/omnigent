@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -47,6 +48,7 @@ from omnigent.runtime.harnesses.process_manager import (
     HarnessProcessManager,
     NoLiveHarnessError,
     _default_tmp_parent,
+    _HarnessHttpClient,
     _kill_orphan_runners,
     _model_env_key,
     _pid_alive,
@@ -145,6 +147,46 @@ async def test_get_client_before_start_raises(
     """
     with pytest.raises(RuntimeError, match="before start"):
         await manager.get_client("conv_x", _TEST_HARNESS_NAME)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Привет 🐍", "Привет 🐍 recording-\udcff.txt \ud800", r"literal \udcff"],
+    ids=["unicode", "surrogates", "literal-escape"],
+)
+async def test_harness_client_preserves_json_text(text: str) -> None:
+    """Escaping surrogate code points preserves text, header overrides and strict JSON."""
+    async with _HarnessHttpClient(
+        headers={"Content-Type": "application/vnd.harness+json"}
+    ) as client:
+        event = {"content": [{"text": text}], text: "nested key"}
+        request = client.build_request("POST", "http://harness/events", json=event)
+        assert json.loads(request.content) == event
+        assert request.headers["content-type"] == "application/vnd.harness+json"
+        assert text.split()[0] in request.content.decode("utf-8")
+        with pytest.raises(ValueError, match="Out of range float"):
+            client.build_request(
+                "POST", "http://harness/events", json={"text": text, "n": float("nan")}
+            )
+
+
+async def test_harness_client_delivers_json_with_surrogate_text(
+    manager: HarnessProcessManager,
+) -> None:
+    """Surrogates in retained content cannot crash HTTPX before harness delivery."""
+    event = {"type": "interrupt", "content": "Привет 🐍 recording-\udcff.txt \ud800"}
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_unicode", _TEST_HARNESS_NAME)
+        async with client.stream(
+            "POST", "/v1/sessions/conv_unicode/events", json=event
+        ) as response:
+            assert response.status_code == 204
+        assert response.request.headers["content-type"] == "application/json"
+        assert json.loads(response.request.content) == event
+        assert "Привет 🐍" in response.request.content.decode("utf-8")
+    finally:
+        await manager.shutdown()
 
 
 async def test_start_creates_instance_dir_with_sentinel(
@@ -301,8 +343,10 @@ async def _ping_health(client) -> None:  # type: ignore[no-untyped-def]
     assert response.json() == {"status": "ok"}
 
 
+@pytest.mark.parametrize("removed_directory", [None, "instance", "root"])
 async def test_get_client_spawns_and_serves(
     manager: HarnessProcessManager,
+    removed_directory: str | None,
 ) -> None:
     """First get_client spawns the runner; /health round-trips.
 
@@ -314,8 +358,19 @@ async def test_get_client_spawns_and_serves(
     """
     await manager.start()
     try:
+        if removed_directory is not None:
+            shutil.rmtree(
+                manager.instance_dir
+                if removed_directory == "instance"
+                else manager.instance_dir.parent
+            )
         client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
         await _ping_health(client)
+        claim = read_owner_claim(manager.instance_dir, filename=_AP_PID_FILE)
+        assert claim is not None and claim.pid == os.getpid()
+        if removed_directory is not None and os.name == "posix":
+            assert manager.instance_dir.stat().st_mode & 0o777 == 0o700
+            assert manager.socket_path("conv_a").stat().st_mode & 0o777 == 0o600
         # The runner stashed the conversation id on app.state per
         # the contract; verify the round-trip works.
         cid_resp = await client.get("/conversation-id")
@@ -718,10 +773,12 @@ async def test_get_client_respawns_after_crash(
 
 @pytest.mark.posix_only
 @pytest.mark.parametrize("response_id", [None, "resp_socket_lost"])
+@pytest.mark.parametrize("removed_path", ["socket", "instance", "root"])
 async def test_get_client_respawns_when_socket_pathname_vanishes(
     manager: HarnessProcessManager,
     caplog: pytest.LogCaptureFixture,
     response_id: str | None,
+    removed_path: str,
 ) -> None:
     """A live harness whose socket file was removed is replaced on the next turn.
 
@@ -746,7 +803,12 @@ async def test_get_client_respawns_when_socket_pathname_vanishes(
             manager.mark_in_flight("conv_a", response_id)
         socket_path = manager.socket_path("conv_a")
         assert socket_path.exists()
-        socket_path.unlink()
+        if removed_path == "socket":
+            socket_path.unlink()
+        else:
+            shutil.rmtree(
+                manager.instance_dir if removed_path == "instance" else manager.instance_dir.parent
+            )
         assert _pid_alive(original_pid)
 
         await asyncio.sleep(httpx.Limits().keepalive_expiry + 1.0)
@@ -761,6 +823,8 @@ async def test_get_client_respawns_when_socket_pathname_vanishes(
         assert new_pid != original_pid
         assert _pid_alive(new_pid)
         assert socket_path.exists()
+        claim = read_owner_claim(manager.instance_dir, filename=_AP_PID_FILE)
+        assert claim is not None and claim.pid == os.getpid()
         assert not _pid_alive(original_pid)
         assert not manager.has_active_turn("conv_a")
         if response_id is None:

@@ -52,7 +52,7 @@ the upstream action's default of disabled thinking is rejected by our model.
 
 The upstream action is pinned to a commit, the CLI to `1.12.0`, and automatic
 CLI updates are disabled. It uses medium effort, concurrency two, a 15-minute
-per-task timeout, and a 600,000-token stopping threshold. Final requests can
+per-task timeout, and a 1,200,000-token stopping threshold. Final requests can
 exceed that threshold. The job has a 30-minute timeout.
 
 `rules.json` includes GitHub automation (including prompts and documentation)
@@ -125,8 +125,13 @@ review; local workflow tests do not establish its detection accuracy.
    the Actions summary. There must be no completion receipt for that run,
    and plain `/ocr` must retry it. Validate any retained findings manually.
    Incomplete results must fail the completeness step; publication failures
-   must also prevent a receipt. If these failures do not occur during the
-   smoke test, record those live scenarios as unverified; local fixture tests
+   must also prevent a receipt. The one exception is a `partial` result whose
+   summary sets `budget_exceeded` and whose failed coverage items were all
+   skipped for token budget: the step passes with a warning and lists the
+   unreviewed files in the Actions summary. That run records no completion
+   receipt either, so plain `/ocr` reviews the commit again. If these failures
+   do not occur during the smoke test, record those live scenarios as
+   unverified; local fixture tests
    cover them without deliberately disrupting the shared gateway.
 
 Adding this workflow in a branch does not activate the default-branch triggers.

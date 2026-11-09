@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import AsyncIterator, Generator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 
 import httpx
 
 from omnigent.util.threaded_auth import ThreadedAuth
+from tests.budgets import budget
 
 
 async def test_async_streaming_bodies_remain_available_to_auth() -> None:
@@ -71,3 +73,33 @@ async def test_cancellation_waits_for_provider_cleanup_without_blocking_loop() -
     with suppress(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=3)
     assert closed.is_set()
+
+
+async def test_credential_steps_run_while_the_default_executor_is_full() -> None:
+    """Authenticated requests don't queue behind blocking jobs on the default pool."""
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    release = threading.Event()
+    default_job = asyncio.ensure_future(asyncio.to_thread(release.wait, budget(10)))
+
+    class TokenAuth(ThreadedAuth):
+        def auth_flow(
+            self, request: httpx.Request
+        ) -> Generator[httpx.Request, httpx.Response, None]:
+            request.headers["Authorization"] = "Bearer token"
+            yield request
+
+    try:
+        async with httpx.AsyncClient(
+            auth=TokenAuth(),
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, text=request.headers["Authorization"])
+            ),
+        ) as client:
+            response = await asyncio.wait_for(
+                client.get("https://example.invalid"), timeout=budget(2)
+            )
+        assert response.text == "Bearer token"
+    finally:
+        release.set()
+        await default_job

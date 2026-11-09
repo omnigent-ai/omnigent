@@ -5,6 +5,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo, SharingMode } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { PermissionsModal } from "./PermissionsModal";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 vi.mock("@/hooks/useSharing", () => ({
   usePublicSharingMaxLevel: () => ({ data: undefined }),
@@ -23,7 +24,8 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
 }));
-vi.mock("@/lib/sessionsApi", () => ({
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
   updateSession: vi.fn(),
 }));
 
@@ -443,6 +445,50 @@ describe("PermissionsModal", () => {
     return waitFor(() => {
       expect(writeText).toHaveBeenCalledWith("https://host.example.com/embed#/c/conv_xyz");
     });
+  });
+
+  it.each([
+    [
+      "denies clipboard write",
+      {
+        writeText: vi
+          .fn()
+          .mockRejectedValue(new DOMException("Write permission denied.", "NotAllowedError")),
+      },
+    ],
+    ["is unavailable on an insecure origin", undefined],
+  ])("copies the link and confirms when the async clipboard %s", async (_case, clipboard) => {
+    listMock.mockResolvedValue([]);
+    const copiedText = vi.fn();
+    Object.assign(navigator, { clipboard });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn((command: string) => {
+        if (command !== "copy") return false;
+        const event = new Event("copy", { bubbles: true, cancelable: true }) as ClipboardEvent;
+        Object.defineProperty(event, "clipboardData", {
+          value: { setData: (_type: string, text: string) => copiedText(text) },
+        });
+        document.dispatchEvent(event);
+        if (!event.defaultPrevented && document.activeElement instanceof HTMLTextAreaElement) {
+          copiedText(document.activeElement.value);
+        }
+        return true;
+      }),
+    });
+
+    try {
+      render(<PermissionsModal sessionId="conv_xyz" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: /copy link/i }));
+
+      expect(await screen.findByRole("button", { name: /copied!/i })).toBeInTheDocument();
+      expect(copiedText).toHaveBeenCalledWith(`${window.location.origin}/c/conv_xyz`);
+    } finally {
+      delete (document as { execCommand?: unknown }).execCommand;
+    }
   });
 
   it("surfaces a server error from a failed revoke", async () => {

@@ -6,6 +6,7 @@
 // the harness config controls, and the store can all depend on one source of
 // truth without a circular import.
 
+import { findNativeModelOption } from "@/lib/codexNativeModels";
 import { fusionModelLabel, isFusionModelUid } from "@/lib/devinFusion";
 import type { NativeModelOption } from "@/lib/types";
 
@@ -55,6 +56,26 @@ export function compactModelTriggerLabel(value: string): string {
   return withoutDefault.replace(/\s*\((\d+(?:\.\d+)?[KMG]) context\)/gi, " $1");
 }
 
+/** Resolve display names across catalog spellings without losing context variants. */
+export function findModelLabelOption(
+  options: readonly NativeModelOption[],
+  model: string | null,
+): NativeModelOption | null {
+  const raw = model?.trim();
+  if (!raw) return null;
+  const exact =
+    options.find((option) => option.id === raw) ?? options.find((option) => option.model === raw);
+  if (exact) return exact;
+  const extendedContext = raw.toLowerCase().endsWith("[1m]");
+  return findNativeModelOption(
+    options.filter(
+      (option) =>
+        (option.model ?? option.id ?? "").toLowerCase().endsWith("[1m]") === extendedContext,
+    ),
+    raw,
+  );
+}
+
 export function formatStatusModelLabel(
   model: string | null,
   codexModelOptions: readonly NativeModelOption[] = [],
@@ -65,9 +86,7 @@ export function formatStatusModelLabel(
     const descriptor = codexModelOptions.find((candidate) => candidate.fusion)?.fusion;
     if (descriptor) return fusionModelLabel(descriptor, raw);
   }
-  const option =
-    codexModelOptions.find((candidate) => candidate.id === raw) ??
-    codexModelOptions.find((candidate) => candidate.model === raw);
+  const option = findModelLabelOption(codexModelOptions, raw);
   return option ? nativeModelLabel(option) : raw;
 }
 

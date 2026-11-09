@@ -2,10 +2,21 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bubble } from "@/lib/renderItems";
+import type { Bubble, RenderItem } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
-import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
+import { type ReactNode, useLayoutEffect } from "react";
+import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
+import {
+  BubbleView,
+  buildUndeliveredBubbles,
+  ConversationScrollRefBridge,
+  containsMermaidDiagram,
+  keyboardActiveQuestionId,
+  placeUndeliveredBubbles,
+} from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
 const initialStoreState = useChatStore.getState();
@@ -482,6 +493,85 @@ describe("AssistantBubble error retry", () => {
   });
 });
 
+describe("AssistantBubble error-only role", () => {
+  // The reconnect journey counts [data-role="assistant"] bubbles as Claude
+  // replies. An undelivered-message notice is a standalone error item with no
+  // prose, so it must not carry the assistant role and inflate that count.
+  it("tags an undelivered-message notice as an error bubble, not an assistant reply", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "assistant",
+            responseId: "resp_undelivered",
+            stableId: "undelivered_notice",
+            lifecycle: "failed",
+            error: null,
+            items: [
+              {
+                kind: "error",
+                itemId: "undelivered_notice",
+                message: "Message not delivered. Try sending it again.",
+                source: "runtime",
+                code: "native_prompt_not_recorded",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveAttribute("data-role", "error");
+    expect(bubble).toHaveTextContent("Message not delivered. Try sending it again.");
+  });
+
+  it.each<{ name: string; nonError: Extract<Bubble, { kind: "assistant" }>["items"][number] }>([
+    {
+      name: "a prose reply carrying a trailing error",
+      nonError: { kind: "text", itemId: "reply_text", text: "the answer is 42", final: true },
+    },
+    {
+      name: "a failed turn with reasoning but no prose",
+      nonError: {
+        kind: "reasoning",
+        itemId: "thinking",
+        text: "Weighing the options.",
+        duration: 1,
+      },
+    },
+  ])("keeps $name on the assistant role", ({ nonError }) => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "assistant",
+            responseId: "resp_mixed_failure",
+            stableId: "mixed_failure",
+            lifecycle: "failed",
+            error: null,
+            items: [
+              nonError,
+              {
+                kind: "error",
+                itemId: "mixed_error",
+                message: "API Error: Request rejected (429): rate limit",
+                source: "execution",
+                code: "rate_limit_exceeded",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveAttribute("data-role", "assistant");
+  });
+});
+
 describe("AssistantBubble sealed side-chat recovery", () => {
   it("removes recovery actions when the side chat is sealed but keeps the error", () => {
     const view = render(
@@ -598,6 +688,20 @@ describe("UserBubble long-prompt collapse", () => {
     expect(bubble).not.toHaveTextContent(TAIL);
   });
 
+  it("keeps message typography when expanding a prompt over 50K characters", () => {
+    const text = "Long user prose. ".repeat(3_000) + TAIL;
+    render(<BubbleView bubble={userBubble(text)} isLastAssistant={false} />);
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble.querySelector(".break-all")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+
+    const fallback = bubble.querySelector(".break-all");
+    expect(fallback).toHaveClass("text-message", "font-mono", "whitespace-pre-wrap");
+    expect(fallback).not.toHaveClass("text-sm");
+    expect(fallback!.textContent).toBe(text);
+  });
+
   it("Copy always writes the full text to the clipboard regardless of collapse state", async () => {
     const writtenTexts: string[] = [];
     vi.stubGlobal("navigator", {
@@ -675,5 +779,140 @@ describe("AssistantBubble copy", () => {
     expect(await item.items["text/html"].text()).toBe(
       "<h2>Findings</h2>\n<p>A <strong>bold</strong> claim and <code>code</code>.</p>",
     );
+  });
+});
+
+describe("undelivered startup messages", () => {
+  const lost = {
+    pendingId: "pending_first",
+    content: [
+      { type: "input_file" as const, file_id: "file_notes", filename: "notes.txt" },
+      { type: "input_image" as const, file_id: "file_chart", filename: "chart.png" },
+      { type: "input_text" as const, text: "Summarize these" },
+    ],
+  };
+
+  it("sit above the startup failure notice, or last when it isn't loaded", () => {
+    const user: Bubble = { kind: "user", itemId: "user_1", content: [] };
+    const notice = errorBubble("startup_input_failed");
+    const [undelivered] = buildUndeliveredBubbles([lost], "alice@example.com");
+    expect(undelivered).toMatchObject({ undelivered: true, createdBy: "alice@example.com" });
+    expect(placeUndeliveredBubbles([user, notice], [undelivered!])).toEqual([
+      user,
+      undelivered,
+      notice,
+    ]);
+    expect(placeUndeliveredBubbles([user], [undelivered!])).toEqual([user, undelivered]);
+  });
+
+  it("start a new session carrying the text and the attachments that download", async () => {
+    function LocationProbe() {
+      const location = useLocation();
+      return <output data-testid="location">{location.pathname + location.search}</output>;
+    }
+    fetchMock.mockImplementation(async (url: string) =>
+      url.endsWith("/files/file_notes/content")
+        ? new Response("meeting notes", { headers: { "Content-Type": "text/plain" } })
+        : jsonResponse({ detail: "gone" }, 404),
+    );
+    const toasts: unknown[] = [];
+    const recordToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", recordToast);
+    const [bubble] = buildUndeliveredBubbles([lost], null);
+    render(
+      <MemoryRouter initialEntries={["/c/conv_failed"]}>
+        <ConversationScopeContext.Provider value="conv_failed">
+          <BubbleView bubble={bubble!} isLastAssistant={false} />
+        </ConversationScopeContext.Provider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("message-undelivered")).toHaveTextContent("Not delivered");
+    fireEvent.click(screen.getByRole("button", { name: "Copy message to new session" }));
+
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toMatch(/^\/\?/));
+    window.removeEventListener("omnigent:toast", recordToast);
+    const search = new URLSearchParams(screen.getByTestId("location").textContent!.slice(1));
+    const handoff = peekNewSessionHandoff(search.get(NEW_SESSION_HANDOFF_PARAM));
+    expect(handoff?.text).toBe("Summarize these");
+    const [notes] = handoff?.files ?? [];
+    expect(handoff?.files).toHaveLength(1);
+    expect(notes?.name).toBe("notes.txt");
+    expect(await notes?.text()).toBe("meeting notes");
+    expect(toasts).toEqual(["Couldn't copy chart.png. Attach again before you send."]);
+  });
+});
+
+describe("keyboardActiveQuestionId", () => {
+  type Elicitation = Extract<RenderItem, { kind: "elicitation" }>;
+  const question = (elicitationId: string, extra: Partial<Elicitation> = {}): Elicitation => ({
+    kind: "elicitation",
+    itemId: null,
+    elicitationId,
+    message: "Claude has questions",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: "",
+    requestedSchema: {},
+    status: "pending",
+    response: null,
+    askUserQuestion: {
+      questions: [
+        { question: "Which framework?", options: [{ label: "React" }], multiSelect: false },
+      ],
+    },
+    ...extra,
+  });
+  const approval = (elicitationId: string): Elicitation => ({
+    ...question(elicitationId),
+    askUserQuestion: null,
+    contentPreview: "Bash({})",
+  });
+
+  it("picks the newest pending question", () => {
+    expect(keyboardActiveQuestionId([question("q_old"), question("q_new")])).toBe("q_new");
+  });
+
+  it("looks past newer approvals to the newest question", () => {
+    expect(keyboardActiveQuestionId([question("q_1"), approval("bash_2")])).toBe("q_1");
+  });
+
+  it("returns null when no question is pending", () => {
+    expect(keyboardActiveQuestionId([])).toBeNull();
+    expect(keyboardActiveQuestionId([approval("bash_1")])).toBeNull();
+  });
+
+  it("holds the keys while the newest question awaits delivery", () => {
+    const awaiting = question("q_new", {
+      nativeDelivery: { state: "sending", attempt: "attempt_1", action: "accept" },
+    });
+    expect(keyboardActiveQuestionId([question("q_old"), awaiting])).toBeNull();
+  });
+});
+
+describe("ConversationScrollRefBridge", () => {
+  it("hands over the scroll element before paint when rendered after the content", () => {
+    const onScroller = vi.fn();
+    let seenBeforePaint: unknown = "not run";
+    // A parent's layout effect runs after its children's and before paint.
+    function BeforePaint({ children }: { children: ReactNode }) {
+      useLayoutEffect(() => {
+        seenBeforePaint = onScroller.mock.lastCall?.[0]?.el;
+      }, []);
+      return <div>{children}</div>;
+    }
+    render(
+      <BeforePaint>
+        <Conversation>
+          <ConversationContent>
+            <p>row</p>
+          </ConversationContent>
+          <ConversationScrollRefBridge onScroller={onScroller} />
+        </Conversation>
+      </BeforePaint>,
+    );
+    expect(seenBeforePaint).toBeInstanceOf(HTMLElement);
+    expect(seenBeforePaint).toBe(screen.getByText("row").parentElement?.parentElement);
   });
 });

@@ -117,6 +117,20 @@ export async function logout(): Promise<void> {
 }
 
 /**
+ * End the browser session and leave the app. Accounts mode clears the cookie and
+ * opens the login form; OIDC follows the server's /auth/logout redirect. Both
+ * navigate with a full page load so client caches reset.
+ */
+export async function signOutOfBrowserSession(accountsEnabled: boolean): Promise<void> {
+  if (accountsEnabled) {
+    await logout();
+    window.location.href = withBasePath("/login");
+    return;
+  }
+  window.location.href = withBasePath("/auth/logout");
+}
+
+/**
  * GET /auth/me — fetch the current user.
  *
  * Note: there's also a generic ``GET /v1/me`` used by ``identity.ts``

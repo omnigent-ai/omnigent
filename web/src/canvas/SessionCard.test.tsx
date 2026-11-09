@@ -112,6 +112,24 @@ describe("SessionCard", () => {
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noopener noreferrer");
     expect(link).toHaveTextContent("#7 Ship it");
+    expect(link).toHaveAttribute("title", "Ship it (open)");
+  });
+
+  it("says how old a stale pull request state is", () => {
+    renderCard({
+      conversation: conversation(),
+      pullRequest: {
+        number: 7,
+        title: "Ship it",
+        state: "OPEN",
+        url: "https://github.com/acme/repo/pull/7",
+        state_checked_at: Date.now() / 1000 - 2 * 3600,
+      },
+    });
+    expect(screen.getByRole("link", { name: "Open pull request #7" })).toHaveAttribute(
+      "title",
+      "Ship it (open, as of 2h ago)",
+    );
   });
 
   it.each([

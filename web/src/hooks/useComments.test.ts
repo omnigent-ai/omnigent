@@ -7,6 +7,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { useChatStore } from "@/store/chatStore";
 import {
   commentsQueryKey,
@@ -50,9 +52,15 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function wrapperWith(queryClient: QueryClient) {
+function wrapperWith(queryClient: QueryClient, gridEnabled = false) {
   return ({ children }: { children: ReactNode }) =>
-    createElement(QueryClientProvider, { client: queryClient }, children);
+    createElement(
+      CapabilitiesContext.Provider,
+      {
+        value: { ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: gridEnabled } },
+      },
+      createElement(QueryClientProvider, { client: queryClient }, children),
+    );
 }
 
 function makeComment(overrides: Partial<Comment> & { id: string; path: string }): Comment {
@@ -250,9 +258,9 @@ describe("useUpdateComment", () => {
 });
 
 describe("useSendCommentsToAgent", () => {
-  function renderSend(queryClient: QueryClient) {
+  function renderSend(queryClient: QueryClient, gridEnabled = false) {
     return renderHook(() => useSendCommentsToAgent("conv_1", "ag_1"), {
-      wrapper: wrapperWith(queryClient),
+      wrapper: wrapperWith(queryClient, gridEnabled),
     });
   }
 
@@ -271,7 +279,7 @@ describe("useSendCommentsToAgent", () => {
     expect(JSON.parse(init.body as string)).toEqual({ comment_ids: ["c1"], instruction: "fix" });
   });
 
-  it("dispatches the formatted message to the agent via the chat store on success", async () => {
+  it.each([false, true])("dispatches comments with grid flag %s", async (gridEnabled) => {
     // The whole point of this hook: the server-formatted message is sent
     // to the agent immediately, no manual send. Regressing this leaves
     // comments queued but never delivered.
@@ -280,11 +288,15 @@ describe("useSendCommentsToAgent", () => {
     );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
-    const { result } = renderSend(queryClient);
+    const { result } = renderSend(queryClient, gridEnabled);
     result.current.mutate({ comment_ids: ["c1"] });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    expect(sendMock).toHaveBeenCalledWith("please address these", "ag_1");
+    if (gridEnabled)
+      expect(sendMock).toHaveBeenCalledWith("please address these", "ag_1", undefined, {
+        pinnedConversationId: "conv_1",
+      });
+    else expect(sendMock).toHaveBeenCalledWith("please address these", "ag_1");
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["comments", "conv_1"] });
   });
 

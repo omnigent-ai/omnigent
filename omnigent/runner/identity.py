@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
+ORCHESTRATION_SOURCE_HEADER = "X-Omnigent-Orchestration-Source"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 # Host-launched runners delegate machine-global stale-process cleanup to the
 # host daemon. CLI-local runners leave this unset and retain standalone cleanup.
@@ -24,6 +25,9 @@ RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR = "OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEA
 # Some platforms (notably native Windows) do not define SIGUSR1; keep
 # imports working there and let callers skip adopt signaling.
 RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
+# Signal the host sends its runners when its terminal hangs up: finish
+# in-flight work before exiting on orphaning. ``None`` where undefined.
+RUNNER_FINISH_WORK_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR2", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
 # Exit code of a runner whose tunnel the server refused on credentials before

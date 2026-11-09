@@ -13,6 +13,8 @@ e2e suite when available.
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -142,6 +144,61 @@ def test_executor_factory_reads_env_vars(
     assert os_env_value.type == "caller_process"
     assert os_env_value.sandbox is not None
     assert os_env_value.sandbox.type == "none"
+
+
+_GATEWAY_ROUTE = {
+    "HARNESS_CODEX_GATEWAY": "true",
+    "HARNESS_CODEX_GATEWAY_HOST": "https://gateway.example",
+    "HARNESS_CODEX_GATEWAY_BASE_URL": "https://gateway.example/v1",
+    "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "printf token",
+    "HARNESS_CODEX_MODEL": "gpt-gateway",
+}
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        pytest.param({}, id="config-toml"),
+        pytest.param(
+            {"HARNESS_CODEX_GATEWAY": "0", "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "printf token"},
+            id="gateway-off-auth-command",
+        ),
+        pytest.param(
+            {
+                "HARNESS_CODEX_GATEWAY": "0",
+                "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "printf token",
+                "HARNESS_CODEX_MODEL_PROVIDER": "openai",
+            },
+            id="gateway-off-openai-pin",
+        ),
+        pytest.param(
+            {"HARNESS_CODEX_MODEL_PROVIDER": "custom", "HARNESS_CODEX_GATEWAY_HOST": "https://x"},
+            id="custom-pin",
+        ),
+        pytest.param(_GATEWAY_ROUTE, id="gateway"),
+    ],
+)
+def test_child_model_provider_matches_the_executor_route(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The catalog's reading of a child's route agrees with the executor the wrap builds."""
+    for name in {*_GATEWAY_ROUTE, "HARNESS_CODEX_MODEL_PROVIDER", "HARNESS_CODEX_SIGNER_PROVIDER"}:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    codex = tmp_path / "codex"
+    codex.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", str(codex))
+
+    executor = codex_harness._build_codex_executor()
+    provider = codex_harness.codex_child_model_provider(os.environ)
+
+    pins = [
+        json.loads(override.removeprefix("model_provider="))
+        for override in executor._codex_config_overrides
+        if override.startswith("model_provider=")
+    ]
+    assert provider == ("" if executor._gateway else (pins[0] if pins else None))
 
 
 @pytest.mark.parametrize("configured", [True, False])
