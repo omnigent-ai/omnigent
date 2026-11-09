@@ -108,10 +108,16 @@ describe("sandbox session catalog hooks", () => {
 
   function renderCheck(
     harness = "codex-native",
-    { launched = true, enabled = true, modelLabel = null as string | null } = {},
+    {
+      launched = true,
+      enabled = true,
+      modelLabel = null as string | null,
+      // Defaults match the store's current choices set in beforeEach.
+      model = "gpt-5" as string | null,
+      effort = "minimal" as string | null,
+    } = {},
   ) {
-    // The launch picks match the store's current choices set in beforeEach.
-    if (launched) markSandboxLaunch(sessionId, { model: "gpt-5", effort: "minimal", modelLabel });
+    if (launched) markSandboxLaunch(sessionId, { model, effort, modelLabel });
     return renderHook(
       ({ models }: { models: NativeModelOption[] }) =>
         useSandboxLaunchSelectionCheck(sessionId, harness, models, enabled),
@@ -149,7 +155,7 @@ describe("sandbox session catalog hooks", () => {
 
   it("leaves later choices alone after a launch the sandbox supports", async () => {
     useChatStore.setState({ sessionModelOverride: "opus", sessionReasoningEffort: null });
-    const { rerender } = renderCheck("claude-native");
+    const { rerender } = renderCheck("claude-native", { model: "opus", effort: null });
     rerender({ models: claudeModels });
     await act(async () => {});
     act(() => useChatStore.setState({ sessionModelOverride: "gpt-5" }));
