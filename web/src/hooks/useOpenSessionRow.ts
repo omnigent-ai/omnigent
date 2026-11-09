@@ -34,6 +34,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     updated_at: wire.updated_at ?? wire.created_at,
     labels: wire.labels ?? {},
     permission_level: wire.permission_level ?? null,
+    family: wire.family,
     owner: wire.owner ?? null,
     runner_id: wire.runner_id ?? null,
     host_id: wire.host_id ?? null,

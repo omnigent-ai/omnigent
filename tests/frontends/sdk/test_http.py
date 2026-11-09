@@ -7,13 +7,17 @@ resolves ``127.0.0.1`` against itself. httpx trusts the environment by
 default, so a client built without ``trust_env=False`` fails with
 ``httpx.ConnectError: All connection attempts failed`` even though the
 server is listening and healthy.
+
+``session_url`` builds every SDK path that embeds a caller-supplied
+session, file or elicitation id; it must keep each id inside its own
+segment so an id can never select a different route.
 """
 
 from __future__ import annotations
 
 import pytest
 from omnigent_client import OmnigentClient
-from omnigent_client._http import is_loopback_url
+from omnigent_client._http import is_loopback_url, session_url
 
 
 @pytest.mark.parametrize(
@@ -83,3 +87,44 @@ def test_client_bypasses_env_proxies_only_for_loopback(
     client = OmnigentClient(base_url=server_url)
 
     assert client._http.trust_env is expected_trust_env
+
+
+@pytest.mark.parametrize(
+    ("segments", "expected"),
+    [
+        (("conv_abc",), "http://srv/v1/sessions/conv_abc"),
+        (("conv_abc", "items"), "http://srv/v1/sessions/conv_abc/items"),
+        # Reserved characters stay inside the segment instead of starting a query.
+        (
+            ("conv_x?delete_branch=true",),
+            "http://srv/v1/sessions/conv_x%3Fdelete_branch%3Dtrue",
+        ),
+        (
+            ("conv_abc", "elicitations", "elicit a#1", "resolve"),
+            "http://srv/v1/sessions/conv_abc/elicitations/elicit%20a%231/resolve",
+        ),
+    ],
+)
+def test_session_url_keeps_each_segment_in_place(segments: tuple[str, ...], expected: str) -> None:
+    assert session_url("http://srv", *segments) == expected
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        ("",),
+        (".",),
+        ("..",),
+        ("../projects/proj_1",),
+        # The server decodes %2F before routing, so a slash must be rejected,
+        # not encoded: this id would otherwise select the permissions route.
+        ("conv_abc/permissions/alice",),
+        ("conv_abc", ""),
+        ("conv_abc", "elicitations", "../../projects", "resolve"),
+    ],
+)
+def test_session_url_rejects_segments_that_escape_the_session_path(
+    segments: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError, match="invalid session URL segment"):
+        session_url("http://srv", *segments)

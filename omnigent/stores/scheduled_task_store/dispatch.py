@@ -22,6 +22,10 @@ class ScheduledTaskDispatchStore(Protocol):
         """Select persisted cursor maintenance before serving requests."""
         ...
 
+    def configure_trigger_polling(self, seconds: int | None) -> None:
+        """Set how soon a saved trigger automation first polls; ``None`` keeps its schedule."""
+        ...
+
     def check_dispatch_support(self) -> None:
         """Raise if the backend cannot provide atomic multi-statement claims."""
         ...
@@ -71,6 +75,15 @@ class ScheduledTaskDispatchStore(Protocol):
 
         An already-recorded occurrence advances the cursor but returns None,
         as does a changed task. Neither case starts another run.
+        """
+        ...
+
+    def skip_scheduled_occurrence(
+        self, task: ScheduledTask, *, now: int, next_run_at: int
+    ) -> bool:
+        """Advance an unchanged task past its due occurrence without recording a run.
+
+        Returns False, changing nothing, if the task changed since it was listed.
         """
         ...
 
