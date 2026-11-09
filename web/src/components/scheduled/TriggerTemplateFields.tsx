@@ -19,19 +19,23 @@ import {
   MAX_INSTRUCTIONS_CHARS,
   MAX_SESSIONS_PER_RUN,
   OMNIGENT_ATTRIBUTION,
+  singleValueScope,
   stripScopePrefix,
+  TRIGGER_SCOPE_OPERATOR_LABELS,
   TRIGGER_TEMPLATES,
   triggerConditionFields,
   triggerEvent,
   triggerOperatorLabel,
   triggerScope,
   triggerScopeEntries,
+  triggerScopeOperators,
   triggerServiceName,
   VALUELESS_OPERATORS,
   withTriggerEvent,
   type TriggerCondition,
   type TriggerFields,
   type TriggerOperator,
+  type TriggerScopeOperator,
   type TriggerSource,
 } from "@/components/scheduled/triggerTemplates";
 import { cn } from "@/lib/utils";
@@ -133,7 +137,7 @@ export function TriggerTemplateFields({
               <Select
                 value={fields.scopeOperator ?? "in"}
                 onValueChange={(operator) =>
-                  onChange({ ...fields, scopeOperator: operator as "is" | "in" })
+                  onChange({ ...fields, scopeOperator: operator as TriggerScopeOperator })
                 }
                 onOpenChange={onSelectOpenChange}
               >
@@ -146,8 +150,11 @@ export function TriggerTemplateFields({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
-                  <SelectItem value="is">equals</SelectItem>
-                  <SelectItem value="in">in</SelectItem>
+                  {triggerScopeOperators(source).map((operator) => (
+                    <SelectItem key={operator} value={operator}>
+                      {TRIGGER_SCOPE_OPERATOR_LABELS[operator]}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             )}
@@ -165,7 +172,7 @@ export function TriggerTemplateFields({
               <Input
                 value={fields.scope}
                 placeholder={
-                  fields.scopeOperator === "is" && !scope.isGroup
+                  singleValueScope(fields) && !scope.isGroup
                     ? scope.placeholder.split(",")[0]
                     : scope.placeholder
                 }
@@ -185,9 +192,12 @@ export function TriggerTemplateFields({
             </p>
           )}
 
-          {!scope.isGroup && fields.scopeOperator === "is" && fields.scope.includes(",") && (
+          {!scope.isGroup && singleValueScope(fields) && fields.scope.includes(",") && (
             <p className="pl-6 text-sm text-destructive" role="alert">
-              Equals matches one value. Choose in to match a comma-separated list.
+              {fields.scopeOperator === "contains"
+                ? "Contains matches one piece of text."
+                : "Equals matches one value."}{" "}
+              Choose in to match a comma-separated list.
             </p>
           )}
 
