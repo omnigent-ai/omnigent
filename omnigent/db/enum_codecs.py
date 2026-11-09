@@ -5,7 +5,7 @@ Several low-cardinality closed-set columns (``conversations.kind``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
 ``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
 ``scheduled_tasks.execution_target``,
-``scheduled_task_runs.status``, ``inbox_items.kind``/``state``/``feedback``)
+``scheduled_task_runs.status``, ``inbox_items.kind``/``state``/``resolution``)
 are stored as integer codes rather than their string names — smaller rows
 and a tighter ``CHECK`` than a free ``VARCHAR``. The string names remain the
 contract for entities, the HTTP API, the web client, and the SDKs; the
@@ -147,10 +147,15 @@ INBOX_ITEM_STATE: dict[str, int] = {
     "dismissed": 4,
 }
 
-INBOX_ITEM_FEEDBACK: dict[str, int] = {
+# How the owner closed an item: through one of its actions, or a Dismiss reason.
+INBOX_ITEM_RESOLUTION: dict[str, int] = {
     "none": 0,
-    "useful": 1,
-    "not_useful": 2,
+    "action_taken": 1,
+    "already_done": 2,
+    "useful": 3,
+    "not_relevant": 4,
+    "incorrect": 5,
+    "not_now": 6,
 }
 
 
@@ -396,11 +401,11 @@ def decode_inbox_item_state(code: int) -> str:
     return _decode(INBOX_ITEM_STATE, code, field="inbox_items.state")
 
 
-def encode_inbox_item_feedback(name: str) -> int:
-    """Encode an ``inbox_items.feedback`` name to its int code."""
-    return _encode(INBOX_ITEM_FEEDBACK, name, field="inbox_items.feedback")
+def encode_inbox_item_resolution(name: str) -> int:
+    """Encode an ``inbox_items.resolution`` name to its int code."""
+    return _encode(INBOX_ITEM_RESOLUTION, name, field="inbox_items.resolution")
 
 
-def decode_inbox_item_feedback(code: int) -> str:
-    """Decode an ``inbox_items.feedback`` int code to its name."""
-    return _decode(INBOX_ITEM_FEEDBACK, code, field="inbox_items.feedback")
+def decode_inbox_item_resolution(code: int) -> str:
+    """Decode an ``inbox_items.resolution`` int code to its name."""
+    return _decode(INBOX_ITEM_RESOLUTION, code, field="inbox_items.resolution")

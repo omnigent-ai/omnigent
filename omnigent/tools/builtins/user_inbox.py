@@ -91,10 +91,40 @@ class SysUserInboxPostTool(Tool):
                                 "identifies the item, so reuse it for the same subject."
                             ),
                         },
-                        "suggested_prompt": {
-                            "type": "string",
+                        "actions": {
+                            "type": "array",
                             "description": (
-                                "Optional prompt for a new session that acts on the item."
+                                "Up to three buttons. Each opens a new session prefilled "
+                                "with its prompt for the user to edit and send, e.g. a "
+                                "reply to draft or a change to make."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {
+                                        "type": "string",
+                                        "description": "Button text, under 60 characters.",
+                                    },
+                                    "prompt": {
+                                        "type": "string",
+                                        "description": "Prompt the new session starts with.",
+                                    },
+                                },
+                                "required": ["label", "prompt"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "chart": {
+                            "type": "object",
+                            "description": (
+                                "Optional chart drawn on the card, only when it shows the "
+                                "point of the item. Use only numbers from queries you ran, "
+                                "and state the key numbers in body_md too. Shape: {version: "
+                                "1, type: 'line' | 'bar', title, unit?, x: [labels, at most "
+                                "60], series: [{name, values: [number or null, one per x "
+                                "label], emphasis?}] (at most 4), highlight?: {from, to} "
+                                "(x labels), markers?: [{x, label}] (at most 3), source?: "
+                                "{label, href?}}."
                             ),
                         },
                         "expires_at": {
@@ -125,8 +155,9 @@ class SysUserInboxListTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             f"List the user's Inbox items from the last {USER_INBOX_LIST_WINDOW_DAYS} days in "
-            "every state, with each item's topic and the user's response (read, done, "
-            "dismissed, useful or not useful). Use it before posting to avoid repeats."
+            "every state, with each item's topic and how the user responded: read, an action "
+            "taken, or a Dismiss reason (already done, useful, not relevant, incorrect, not "
+            "now). Use it before posting to avoid repeats and to learn what the user wants."
         )
 
     def get_schema(self) -> dict[str, Any]:

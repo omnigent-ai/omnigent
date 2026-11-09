@@ -1772,63 +1772,67 @@ class SqlScheduledTaskRun(OmnigentBase):
     )
 
 
+# Largest stored (compressed) value for a new column, per the database guide.
+_INBOX_MAX_STORED_BYTES = 16_383
+# Items one session may post; each takes one ``session_slot``.
+INBOX_ITEMS_PER_SESSION = 10
+
+
 class SqlInboxItem(OmnigentBase):
-    """SQLAlchemy model for the ``inbox_items`` table.
+    """Agent-posted Inbox suggestions, scoped to a workspace and owner.
 
-    One suggestion an agent posted to its owner's Inbox. Relationships to
-    ``conversations.id`` and ``agents.id`` are application-owned (no DB
-    foreign key, Rule R032).
-
-    :param id: UUID primary key.
-    :param user_id: Owner of the item; the reserved ``"local"`` user in
-        single-user mode, so the duplicate-detection unique index applies
-        there too (NULLs never collide in a unique index).
-    :param source_session_id: Session whose agent posted the item.
-    :param agent_id: Agent of that session.
-    :param prompt_version: Content hash of the agent bundle the session ran.
-    :param kind: Stable int code (see omnigent.db.enum_codecs INBOX_ITEM_KIND).
-    :param title: One-line summary.
-    :param body_md: Markdown body, stored compressed.
-    :param links: JSON list of evidence links, stored compressed.
-    :param suggested_prompt: Prompt for the card's Start session action.
-    :param primary_link: Canonical form of the first link; a duplicate-key input.
-    :param topic: The agent's slug for what the item is about; a duplicate-key input.
-    :param dedupe_key: Versioned duplicate-detection key, unique per owner.
-    :param state: Stable int code (see INBOX_ITEM_STATE).
-    :param feedback: Stable int code (see INBOX_ITEM_FEEDBACK).
-    :param feedback_text: The user's comment.
-    :param created_at: Unix epoch seconds when the item was posted.
-    :param read_at: Unix epoch seconds when the user first read it.
-    :param acted_at: Unix epoch seconds of the user's last action on it.
-    :param expires_at: Unix epoch seconds after which the key may be reused.
+    Agent and session relationships are maintained by application code (no DB
+    foreign key, Rule R032). ``session_slot`` numbers a session's items from 0
+    so a unique index enforces the per-session cap under concurrent posts.
     """
 
     __tablename__ = "inbox_items"
 
-    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    # Tenant partition key: workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
         nullable=False,
-        server_default="0",
         default=current_workspace_id,
     )
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # The reserved "local" user in single-user mode, so the unique indexes apply there too.
     user_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    source_session_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    agent_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    session_slot: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    agent_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     prompt_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # INBOX_ITEM_KIND code.
     kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     title: Mapped[str] = mapped_column(String(256), nullable=False)
-    body_md: Mapped[str] = mapped_column(CompressedText, nullable=False)
-    links: Mapped[str] = mapped_column(CompressedText, nullable=False)
-    suggested_prompt: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    body_md: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
+    )
+    # JSON list of evidence links (at most ten), stored compressed.
+    links: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
+    )
+    # JSON list of agent-defined actions ({label, prompt}, at most three), stored compressed.
+    actions: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
+    )
+    # JSON chart drawn on the card (see omnigent.server.inbox_chart), stored compressed.
+    chart: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=True
+    )
+    # Duplicate-key inputs and the versioned key built from them.
     primary_link: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     topic: Mapped[str] = mapped_column(String(128), nullable=False)
     dedupe_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
-    feedback: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="0")
-    feedback_text: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # INBOX_ITEM_STATE and INBOX_ITEM_RESOLUTION codes.
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    resolution: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    # Index into ``actions`` of the action the owner took; NULL otherwise.
+    resolution_action: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    feedback_text: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=True
+    )
+    # Unix epoch seconds.
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     read_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     acted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -1837,13 +1841,35 @@ class SqlInboxItem(OmnigentBase):
     __table_args__ = (
         CheckConstraint("kind IN (1, 2, 3)", name="ck_inbox_items_kind"),
         CheckConstraint("state IN (1, 2, 3, 4)", name="ck_inbox_items_state"),
-        CheckConstraint("feedback IN (0, 1, 2)", name="ck_inbox_items_feedback"),
+        CheckConstraint("resolution IN (0, 1, 2, 3, 4, 5, 6)", name="ck_inbox_items_resolution"),
+        CheckConstraint(
+            f"session_slot >= 0 AND session_slot < {INBOX_ITEMS_PER_SESSION}",
+            name="ck_inbox_items_session_slot",
+        ),
+        # Newest-first list of all of an owner's items.
         Index("ix_inbox_items_user_created", "workspace_id", "user_id", "created_at", "id"),
+        # Newest-first list and bounded count of an owner's items in one state.
+        Index(
+            "ix_inbox_items_user_state_created",
+            "workspace_id",
+            "user_id",
+            "state",
+            "created_at",
+            "id",
+        ),
         Index(
             "uq_inbox_items_user_dedupe_key",
             "workspace_id",
             "user_id",
             "dedupe_key",
+            unique=True,
+        ),
+        Index(
+            "uq_inbox_items_session_slot",
+            "workspace_id",
+            "user_id",
+            "source_session_id",
+            "session_slot",
             unique=True,
         ),
     )

@@ -78,18 +78,24 @@ async def test_post_forwards_the_body_with_the_source_session() -> None:
     assert call["headers"] == {ORCHESTRATION_SOURCE_HEADER: "conv_source"}
 
 
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [(403, "server returned 403"), (404, "does not support Inbox items")],
+    ids=["rejected", "unsupported-server"],
+)
 @pytest.mark.asyncio
-async def test_post_reports_server_errors() -> None:
-    client = _RecordingClient(_Resp({"detail": "no"}, status_code=403))
+async def test_server_errors_become_tool_errors(status: int, message: str) -> None:
+    for tool_name in ("sys_user_inbox_post", "sys_user_inbox_list"):
+        client = _RecordingClient(_Resp({"detail": "no"}, status_code=status))
 
-    out = await execute_tool(
-        tool_name="sys_user_inbox_post",
-        arguments="{}",
-        server_client=client,
-        conversation_id="conv_source",
-    )
+        out = await execute_tool(
+            tool_name=tool_name,
+            arguments="{}",
+            server_client=client,
+            conversation_id="conv_source",
+        )
 
-    assert json.loads(out)["error"] == "server returned 403"
+        assert message in json.loads(out)["error"]
 
 
 @pytest.mark.asyncio
@@ -102,6 +108,8 @@ async def test_list_pages_and_trims_items() -> None:
         "body_md": "b" * 1000,
         "dedupe_key": "v1:secret-detail",
         "state": "dismissed",
+        "resolution": "already_done",
+        "actions": [{"label": "Reply", "prompt": "long prompt"}],
     }
     client = _RecordingClient(
         _Resp({"data": [item], "next_cursor": "10:" + "a" * 32}),
@@ -120,6 +128,29 @@ async def test_list_pages_and_trims_items() -> None:
     assert [entry["id"] for entry in out["items"]] == ["i1", "i2"]
     assert len(out["items"][0]["body_preview"]) == 300
     assert "dedupe_key" not in out["items"][0]
-    assert out["items"][0]["state"] == "dismissed"
+    assert (out["items"][0]["state"], out["items"][0]["resolution"]) == (
+        "dismissed",
+        "already_done",
+    )
+    assert out["items"][0]["action_labels"] == ["Reply"]
+    assert out["truncated"] is False
     assert client.calls[1]["params"]["after"] == "10:" + "a" * 32
     assert client.calls[0]["params"]["created_after"] > 0
+
+
+@pytest.mark.asyncio
+async def test_list_reports_truncation() -> None:
+    page = _Resp({"data": [{"id": "i"}], "next_cursor": "10:" + "a" * 32})
+    client = _RecordingClient(page, page, page)
+
+    out = json.loads(
+        await execute_tool(
+            tool_name="sys_user_inbox_list",
+            arguments="{}",
+            server_client=client,
+            conversation_id="conv_source",
+        )
+    )
+
+    assert out["truncated"] is True
+    assert len(client.calls) == 3

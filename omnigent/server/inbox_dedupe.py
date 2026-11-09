@@ -7,12 +7,14 @@ the only place that decides whether a post repeats an existing item. Routes,
 tools, and the UI never inspect keys themselves, so the formula can change:
 add a new version to ``_KEY_FORMULAS``, backfill stored keys from the stored
 inputs, then move ``CURRENT_KEY_VERSION``. During the backfill,
-``LEGACY_KEY_VERSIONS`` keeps older keys matching.
+``LEGACY_KEY_VERSIONS`` keeps older keys matching. Each decision is logged with
+its key, so a candidate formula can be checked against past posts.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from collections.abc import Callable, Mapping
@@ -28,6 +30,9 @@ _logger = logging.getLogger(__name__)
 CURRENT_KEY_VERSION = "v1"
 # Older versions still checked while their stored keys are being backfilled.
 LEGACY_KEY_VERSIONS: tuple[str, ...] = ()
+
+# Longest canonical link the ``primary_link`` column stores.
+MAX_CANONICAL_LINK_CHARS = 2048
 
 _GITHUB_PULL_PATH = re.compile(r"^/([^/]+)/([^/]+)/pull/(\d+)(?:/.*)?$")
 _TOPIC_SEPARATORS = re.compile(r"[\s_]+")
@@ -65,6 +70,10 @@ def normalize_topic(topic: str) -> str:
     return _TOPIC_SEPARATORS.sub("-", topic.strip().lower()).strip("-")
 
 
+class InvalidLinkError(ValueError):
+    """Raised when a link cannot be reduced to a canonical form the server stores."""
+
+
 def canonical_link(link: Mapping[str, Any]) -> str | None:
     """Return one stable string for a link, so spellings of the same target match.
 
@@ -75,28 +84,38 @@ def canonical_link(link: Mapping[str, Any]) -> str | None:
 
     :param link: A link with ``type`` and ``ref``.
     :returns: The canonical form, or ``None`` when ``ref`` is empty.
+    :raises InvalidLinkError: If ``ref`` is not a parseable URL, or its
+        canonical form is longer than :data:`MAX_CANONICAL_LINK_CHARS`.
     """
     ref = str(link.get("ref") or "").strip()
     if not ref:
         return None
     if link.get("type") == "session":
-        return f"session:{ref}"
-    parts = urlsplit(ref if "://" in ref else f"https://{ref}")
-    host = (parts.hostname or "").lower()
-    if host == "www.github.com":
-        host = "github.com"
-    path = parts.path.rstrip("/")
-    if host == "github.com":
-        match = _GITHUB_PULL_PATH.match(path)
+        canonical = f"session:{ref}"
+    else:
+        try:
+            parts = urlsplit(ref if "://" in ref else f"https://{ref}")
+            host = (parts.hostname or "").lower()
+        except ValueError as exc:
+            raise InvalidLinkError(f"invalid link: {exc}") from exc
+        if host == "www.github.com":
+            host = "github.com"
+        path = parts.path.rstrip("/")
+        match = _GITHUB_PULL_PATH.match(path) if host == "github.com" else None
         if match is not None:
             owner, repo, number = match.groups()
-            return f"github.com/{owner.lower()}/{repo.lower()}/pull/{number}"
-    query = f"?{parts.query}" if parts.query else ""
-    return f"{host}{path}{query}"
+            canonical = f"github.com/{owner.lower()}/{repo.lower()}/pull/{number}"
+        else:
+            query = f"?{parts.query}" if parts.query else ""
+            canonical = f"{host}{path}{query}"
+    if len(canonical) > MAX_CANONICAL_LINK_CHARS:
+        raise InvalidLinkError("link is too long")
+    return canonical
 
 
 def _key_v1(inputs: DedupeInputs) -> str:
-    material = "|".join((inputs.kind, inputs.primary_link or "", inputs.topic))
+    # A JSON array keeps component boundaries unambiguous.
+    material = json.dumps([inputs.kind, inputs.primary_link, inputs.topic])
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -137,13 +156,18 @@ def find_duplicate(
 
 
 def log_post_decision(inputs: DedupeInputs, match: DuplicateMatch) -> None:
-    """Log a post's key inputs and outcome so a new formula can be replayed against them."""
+    """Log a post's key and outcome so a new formula can be evaluated against them.
+
+    The primary link itself is not logged, since an agent may post a link
+    whose query string carries credentials; its host is enough to group posts.
+    """
+    link_host = (inputs.primary_link or "").split("/", 1)[0].split("?", 1)[0] or None
     _logger.info(
         "inbox item duplicate check",
         extra={
-            "inbox_dedupe_version": CURRENT_KEY_VERSION,
+            "inbox_dedupe_key": dedupe_key(inputs),
             "inbox_dedupe_kind": inputs.kind,
-            "inbox_dedupe_primary_link": inputs.primary_link,
+            "inbox_dedupe_link_host": link_host,
             "inbox_dedupe_topic": inputs.topic,
             "inbox_dedupe_matched_item": match.existing.id if match.existing else None,
             "inbox_dedupe_replaced_expired": match.expired.id if match.expired else None,

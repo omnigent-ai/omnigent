@@ -6159,6 +6159,11 @@
               "restrict_to_agent_names": []
             }
           },
+          "proactive_agent_enabled": {
+            "default": false,
+            "title": "Proactive Agent Enabled",
+            "type": "boolean"
+          },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"
