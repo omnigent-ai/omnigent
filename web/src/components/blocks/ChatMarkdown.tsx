@@ -12,7 +12,7 @@
 
 import type React from "react";
 import { useInRouterContext } from "react-router-dom";
-import { useNavigate } from "@/lib/routing";
+import { Link } from "@/lib/routing";
 import { useMemo } from "react";
 import {
   BotIcon,
@@ -533,10 +533,12 @@ const MENTION_PILL_CLASS =
 function FileMentionPill({
   path,
   isDir,
+  lineSpan,
   children,
 }: {
   path: string;
   isDir: boolean;
+  lineSpan?: string;
   children: React.ReactNode;
 }) {
   const { open } = useWorkspaceFileOpener(path, true);
@@ -548,7 +550,8 @@ function FileMentionPill({
       className={MENTION_PILL_CLASS}
       // Disabled until the existence check says how to open the path.
       aria-disabled={open ? undefined : true}
-      title={path}
+      // The label can truncate; the hover title keeps the full path and line span.
+      title={lineSpan ? `${path}:${lineSpan}` : path}
       onClick={(event) => {
         event.stopPropagation();
         open?.();
@@ -566,7 +569,7 @@ function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) 
   if (!target) return <WorkspaceFileLink {...props} />;
   if (target.kind === "file") {
     return (
-      <FileMentionPill path={target.path} isDir={target.isDir}>
+      <FileMentionPill path={target.path} isDir={target.isDir} lineSpan={target.lineSpan}>
         {props.children}
       </FileMentionPill>
     );
@@ -594,43 +597,49 @@ export function SessionMentionPill(props: SessionMentionPillProps) {
   );
 }
 
-function RoutedSessionMentionPill(props: SessionMentionPillProps) {
-  const navigate = useNavigate();
+// The routing seam's Link rebases the href under an embed's mount, routes plain
+// clicks in-app and leaves modified clicks (new tab) to the browser.
+function RoutedSessionMentionPill({ id, isSubagent, children }: SessionMentionPillProps) {
   return (
-    <SessionPillLink
-      {...props}
-      onNavigate={(event) => {
-        // Modified clicks keep the browser's new-tab / new-window behaviour.
-        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)
-          return;
-        event.preventDefault();
-        navigate(`/c/${encodeURIComponent(props.id)}`);
-      }}
-    />
+    <Link
+      to={`/c/${encodeURIComponent(id)}`}
+      data-testid="mention-pill"
+      className={MENTION_PILL_CLASS}
+      title={isSubagent ? "Subagent" : "Session"}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <SessionPillContent isSubagent={isSubagent}>{children}</SessionPillContent>
+    </Link>
   );
 }
 
-function SessionPillLink({
-  id,
-  isSubagent,
-  children,
-  onNavigate,
-}: SessionMentionPillProps & { onNavigate?: (event: React.MouseEvent) => void }) {
-  const Icon = isSubagent ? BotIcon : MessageSquareIcon;
+function SessionPillLink({ id, isSubagent, children }: SessionMentionPillProps) {
   return (
     <a
       data-testid="mention-pill"
       href={withBasePath(`/c/${encodeURIComponent(id)}`)}
       className={MENTION_PILL_CLASS}
       title={isSubagent ? "Subagent" : "Session"}
-      onClick={(event) => {
-        event.stopPropagation();
-        onNavigate?.(event);
-      }}
+      onClick={(event) => event.stopPropagation()}
     >
+      <SessionPillContent isSubagent={isSubagent}>{children}</SessionPillContent>
+    </a>
+  );
+}
+
+function SessionPillContent({
+  isSubagent,
+  children,
+}: {
+  isSubagent: boolean;
+  children: React.ReactNode;
+}) {
+  const Icon = isSubagent ? BotIcon : MessageSquareIcon;
+  return (
+    <>
       <Icon className="size-3 shrink-0" />
       <span className="truncate">{children}</span>
-    </a>
+    </>
   );
 }
 

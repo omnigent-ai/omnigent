@@ -3162,6 +3162,7 @@ function ComposerImpl(
     },
     textareaRef,
     isMobile,
+    segments: [draft.text, ...draft.quotes.map((quote) => quote.before)],
   });
 
   // Depends on mentionedItems (from the hook above), so it's computed here.

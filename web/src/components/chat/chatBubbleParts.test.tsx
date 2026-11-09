@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
+import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { MemoryRouter, useLocation } from "react-router-dom";
@@ -287,14 +288,21 @@ describe("UserBubble messages from another session", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("opens the sender in-app on a plain click instead of reloading the page", () => {
-    const client = new QueryClient();
-    client.setQueryData(["session", "s_src"], { title: "Casual greeting", parentSessionId: null });
-    function LocationProbe() {
-      return <div data-testid="location">{useLocation().pathname}</div>;
-    }
-    render(
-      <MemoryRouter initialEntries={["/c/s_here"]}>
+  it.each([
+    ["standalone", null, "/c/s_src"],
+    ["an embed mount", "/mount", "/mount/c/s_src"],
+  ])(
+    "opens the sender in-app on a plain click instead of reloading the page (%s)",
+    (_case, mount, target) => {
+      const client = new QueryClient();
+      client.setQueryData(["session", "s_src"], {
+        title: "Casual greeting",
+        parentSessionId: null,
+      });
+      function LocationProbe() {
+        return <div data-testid="location">{useLocation().pathname}</div>;
+      }
+      const bubble = (
         <QueryClientProvider client={client}>
           <BubbleView
             bubble={{
@@ -306,15 +314,26 @@ describe("UserBubble messages from another session", () => {
           />
           <LocationProbe />
         </QueryClientProvider>
-      </MemoryRouter>,
-    );
-    const pill = screen.getByTestId("mention-pill");
-    // A plain click routes in-app; the click event is cancelled, so no document load.
-    expect(fireEvent.click(pill)).toBe(false);
-    expect(screen.getByTestId("location").textContent).toBe("/c/s_src");
-    // A modified click is left to the browser (new tab).
-    expect(fireEvent.click(pill, { metaKey: true })).toBe(true);
-  });
+      );
+      render(
+        <MemoryRouter initialEntries={[`${mount ?? ""}/c/s_here`]}>
+          {mount ? (
+            <RoutingProvider value={basenamedRouting(mount)}>{bubble}</RoutingProvider>
+          ) : (
+            bubble
+          )}
+        </MemoryRouter>,
+      );
+      const pill = screen.getByTestId("mention-pill");
+      // The href a new tab or a copied link uses keeps the mount.
+      expect(pill).toHaveAttribute("href", target);
+      // A plain click routes in-app; the click event is cancelled, so no document load.
+      expect(fireEvent.click(pill)).toBe(false);
+      expect(screen.getByTestId("location").textContent).toBe(target);
+      // A modified click is left to the browser (new tab).
+      expect(fireEvent.click(pill, { metaKey: true })).toBe(true);
+    },
+  );
 
   it("names a subagent of the viewed session from its cached child list", () => {
     const client = new QueryClient();

@@ -20,7 +20,7 @@ export function mentionPillMarkdown(mention: SentMention): string {
 /** What a mention link's title encodes, or ``null`` for an ordinary link. */
 export type MentionPillTarget =
   | { kind: "session"; id: string; isSubagent: boolean }
-  | { kind: "file"; path: string; isDir: boolean };
+  | { kind: "file"; path: string; isDir: boolean; lineSpan?: string };
 
 export function parseMentionPillTitle(title: unknown): MentionPillTarget | null {
   if (typeof title !== "string" || !title.startsWith(MENTION_TITLE_PREFIX)) return null;
@@ -35,6 +35,12 @@ export function parseMentionPillTitle(title: unknown): MentionPillTarget | null 
     return null;
   }
   // "path:3-9" tags a line span; the opener wants the file itself.
-  const path = raw.replace(/:\d+-\d+$/, "");
-  return { kind: "file", path: path.replace(/\/$/, ""), isDir: path.endsWith("/") };
+  const span = /:(\d+-\d+)$/.exec(raw);
+  const path = span ? raw.slice(0, span.index) : raw;
+  return {
+    kind: "file",
+    path: path.replace(/\/$/, ""),
+    isDir: path.endsWith("/"),
+    ...(span ? { lineSpan: span[1] } : {}),
+  };
 }

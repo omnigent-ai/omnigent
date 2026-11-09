@@ -10701,6 +10701,9 @@ describe("NewChatLandingScreen @-file-mention", () => {
     fireEvent.keyDown(input(), { key: "Enter" });
     expect((input() as HTMLTextAreaElement).value).toBe("");
     expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
+    // Retyping the same text without picking it is literal, not the deleted tag.
+    fireEvent.change(input(), { target: { value: "read @README.md now", selectionStart: 19 } });
+    expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
   });
 });
 

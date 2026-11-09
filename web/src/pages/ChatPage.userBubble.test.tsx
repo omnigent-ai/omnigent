@@ -648,6 +648,11 @@ describe("UserBubble @-mention pills", () => {
   it("keeps the line span of a partial-file attach in its pill", () => {
     renderBubble(userBubble("review [Attached: bob-max-gain/docker-compose.yml:2-9]"));
     expect(pills()).toEqual(["@bob-max-gain/docker-compose.yml:2-9"]);
+    // A long path can truncate the label; the hover title keeps the full span.
+    const longPath = `${"deeply/nested/".repeat(8)}service/docker-compose.yml`;
+    cleanup();
+    renderBubble(userBubble(`review [Attached: ${longPath}:120-188]`));
+    expect(screen.getByTestId("mention-pill")).toHaveAttribute("title", `${longPath}:120-188`);
   });
 
   // An explicit upload is materialized to disk by the native executor, which

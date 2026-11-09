@@ -586,6 +586,36 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(onSend).toHaveBeenCalledWith("see", undefined);
   });
 
+  it("treats a deleted tag's retyped text as literal text", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("see @");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    type("see @readme.md");
+    fireEvent.keyDown(textarea(), { key: "Backspace" });
+    expect(tokens()).toEqual([]);
+    // Typing the same text again, without picking a suggestion, is not a tag.
+    type("Explain the literal text @readme.md here");
+    expect(tokens()).toEqual([]);
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("Explain the literal text @readme.md here", undefined);
+  });
+
+  it("keeps a tag while another of its tokens remains", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("see @");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    append("and @readme");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    expect(tokens()).toEqual(["@readme.md", "@readme.md"]);
+    // Deleting one occurrence leaves the other tagged.
+    type("see and @readme.md ");
+    expect(tokens()).toEqual(["@readme.md"]);
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("see and [Attached: readme.md]", undefined);
+  });
+
   it("dedups re-attaching the same file via '@' to one tag", () => {
     const onSend = vi.fn();
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);

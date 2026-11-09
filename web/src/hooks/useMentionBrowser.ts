@@ -1,8 +1,9 @@
-import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
+import { type KeyboardEvent, type RefObject, useEffect, useRef, useState } from "react";
 
 import {
   detectMentionAt,
   fileMentionToken,
+  findMentionTokens,
   mentionTokenAtCaret,
   newFileMentionToken,
   NO_SESSION_MENTIONS,
@@ -42,6 +43,12 @@ export interface MentionBrowserParams {
   isMobile?: boolean;
   /** Tags restored with a saved draft, used for the first render only. */
   initialMentions?: TaggedMentions;
+  /**
+   * Every editable text segment of the draft (defaults to ``[text]``). A tag
+   * whose token is in none of them is dropped, so retyping its text later is
+   * a literal, not the deleted tag.
+   */
+  segments?: readonly string[];
 }
 
 /** An open level of the ``@`` session menu; ``null`` is the top level. */
@@ -102,6 +109,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     textareaRef,
     isMobile = false,
     initialMentions,
+    segments,
   } = params;
   const [mentionIndex, setMentionIndex] = useState(-1);
   const [mentionedItems, setMentionedItems] = useState<MentionItem[]>(
@@ -163,6 +171,30 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     ...mentionedItems.map(fileMentionToken),
     ...mentionedSessions.map((it) => it.token ?? `@${it.title}`),
   ];
+
+  // Release tags whose last token was deleted (Backspace, cut, select-and-type).
+  // Scanning with every token at once keeps a token that is only the start of a
+  // longer one from counting as present.
+  const draftSegments = segments ?? [text];
+  const segmentsKey = draftSegments.join("\u0000");
+  useEffect(() => {
+    const tokens = [
+      ...mentionedItems.map(fileMentionToken),
+      ...mentionedSessions.map((it) => it.token ?? `@${it.title}`),
+    ];
+    if (tokens.length === 0) return;
+    const present = new Set(
+      draftSegments.flatMap((segment) => findMentionTokens(segment, tokens).map((r) => r.token)),
+    );
+    if (!mentionedItems.every((it) => present.has(fileMentionToken(it)))) {
+      setMentionedItems((prev) => prev.filter((it) => present.has(fileMentionToken(it))));
+    }
+    if (!mentionedSessions.every((it) => present.has(it.token ?? `@${it.title}`))) {
+      setMentionedSessions((prev) => prev.filter((it) => present.has(it.token ?? `@${it.title}`)));
+    }
+    // draftSegments is captured through segmentsKey, which changes with its content.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segmentsKey, mentionedItems, mentionedSessions]);
 
   const placeCaret = (caret: number) =>
     queueMicrotask(() => {
