@@ -48,7 +48,7 @@ from omnigent.host.frames import HostSkillsFrame
 from omnigent.host.skills import HostSkillDiscovery
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
-from omnigent.spec.types import SkillSpec
+from omnigent.spec.types import SkillSpec, ToolGroupsConfig
 
 _MARKETPLACE = "testmarket"
 _PLUGIN = "myplugin"
@@ -134,13 +134,15 @@ class _ExecutorStub:
 
 
 class _SpecStub:
-    """Minimal ``AgentSpec`` stand-in for runner skill discovery."""
+    """Minimal ``AgentSpec`` stand-in for runner skill discovery, journal group off."""
 
     def __init__(self, harness: str) -> None:
         """:param harness: Harness id driving per-harness skill discovery."""
         self.skills: list[SkillSpec] = []
         self.skills_filter: str = "all"
         self.executor = _ExecutorStub(harness)
+        # Keeps Omnigent's own skills out of the lists these tests compare.
+        self.tool_groups = ToolGroupsConfig(journal=False)
 
 
 class _ServerClient:

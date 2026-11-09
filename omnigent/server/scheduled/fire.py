@@ -399,7 +399,8 @@ def _scheduled_session_title(task: ScheduledTask) -> str:
 # Follows the prompt in every message a fire sends. No one watches a run, so a
 # question or a permission request stalls it instead of reaching a person. Only
 # the sent message carries it: the task keeps the prompt its owner wrote, so the
-# automation pages never show it.
+# automation pages never show it. The chat hides it by exact text, so a change
+# here also goes in AUTOMATION_CONTEXT_NOTE in web/src/lib/systemMessage.ts.
 UNATTENDED_RUN_NOTE = (
     "<omnigent-automation-context>\n"
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
