@@ -61,21 +61,23 @@ test("resolver keys default npm caches by committed lock digest", async () => {
   );
 });
 
-test("archive harness rejects versions without a pinned checksum", async () => {
-  const manifest = await loadManifest();
-  assert.throws(
-    () =>
-      resolveHarness({
-        cacheNamespace: "v1",
-        harness: "agy",
-        manifest,
-        platform: "Linux-X64",
-        requestedVersion: "1.2.5",
-        runnerTemp: "/runner/temp",
-      }),
-    /has no pinned checksum/,
-  );
-});
+for (const [harness, requestedVersion] of [["agy", "1.2.5"], ["jcode", "0.84.1"]]) {
+  test(`${harness} rejects versions without a pinned checksum`, async () => {
+    const manifest = await loadManifest();
+    assert.throws(
+      () =>
+        resolveHarness({
+          cacheNamespace: "v1",
+          harness,
+          manifest,
+          platform: "Linux-X64",
+          requestedVersion,
+          runnerTemp: "/runner/temp",
+        }),
+      /has no pinned checksum/,
+    );
+  });
+}
 
 test("retry helper uses bounded 2-second and 5-second backoffs", async () => {
   const attempts = [];

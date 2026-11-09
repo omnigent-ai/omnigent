@@ -32,5 +32,17 @@
         "member": "antigravity"
       }
     }
+  },
+  "jcode": {
+    "kind": "archive",
+    "version": "0.84.0",
+    "binary": "jcode",
+    "platforms": {
+      "Linux-X64": {
+        "url": "https://github.com/1jehuang/jcode/releases/download/v0.84.0/jcode-linux-x86_64.tar.gz",
+        "sha512": "ed36f82f7bfee13366289216a00a229a5b425fbde1a51ccab0abcc3cda78977da29f9335d02f8d1afeae0d4a052c2961816c977e1bfa6cc3cba438854f6ebb5a",
+        "member": "jcode-linux-x86_64.bin"
+      }
+    }
   }
 }
