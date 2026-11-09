@@ -19,7 +19,10 @@ to customize.
   draft until the dialog closes, including the schedule and any custom prompt edits.
 - `scope`: **equals** matches one project, channel, repository, or team.
   Choose **in** for a comma-separated list. Equals rejects lists without losing
-  the entered values; Slack placeholders omit the optional leading `#`.
+  the entered values. Slack can watch a channel, direct messages from listed
+  senders, or the one group DM with exactly the listed people (two or more; no
+  operator). A pink `#` or `@` precedes the input, and pasted prefixes are stripped.
+  Switching between channel and people events clears the scope; DMs hide Author.
 - `link-posting`: a checkbox below the trigger controls posting the session link
   back to Jira, Slack, GitHub, or Linear. Sessions start whether it is checked or not.
 - `prompt-editing`: the detail page and edit dialog show Your prompt first. System
