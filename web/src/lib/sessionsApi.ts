@@ -1522,6 +1522,21 @@ export const HOST_OFFLINE_CODE = "host_offline";
 /** A request answered by a sign-in page instead of the API. */
 export const SIGN_IN_EXPIRED_CODE = "sign_in_expired";
 
+/** The server's ErrorCode.RUNNER_STARTING: a held send whose new runner is still connecting. */
+export const RUNNER_STARTING_CODE = "runner_starting";
+
+/** The server's ErrorCode.HOST_SIGN_IN_REQUIRED: a held send whose host must sign in again. */
+export const HOST_SIGN_IN_REQUIRED_CODE = "host_sign_in_required";
+
+/** Whether a refused send asks this client to hold the message and send it again later. */
+export function isHeldSendCode(code: string | null): boolean {
+  return (
+    code === HOST_OFFLINE_CODE ||
+    code === RUNNER_STARTING_CODE ||
+    code === HOST_SIGN_IN_REQUIRED_CODE
+  );
+}
+
 /** Tells the server this client resends a message once its offline host reconnects. */
 const HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline";
 
