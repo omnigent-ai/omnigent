@@ -3262,6 +3262,63 @@ async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(
     assert copy.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
 
 
+async def test_runs_need_an_agent_that_can_open_the_sessions_file_attachments(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.native.native_coding_agents import PI_NATIVE_AGENT_NAME
+
+    source_id = _owned_session(db_uri)
+    stored = SqlAlchemyFileStore(db_uri).create(
+        filename="sample.zip", bytes=4, session_id=source_id
+    )
+    SqlAlchemyConversationStore(db_uri).append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(
+                    role="user",
+                    content=[
+                        {"type": "input_text", "text": "summarize this"},
+                        {"type": "input_file", "file_id": stored.id, "filename": "sample.zip"},
+                    ],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "done"}],
+                    agent="claude-native",
+                ),
+            ),
+        ],
+    )
+    pi = builtin_agent_id(PI_NATIVE_AGENT_NAME)
+
+    # Pi can't open the zip the copied history refers to, as with a fork.
+    rejected = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=source_id, agent_id=pi),
+        headers=_headers(),
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "sample.zip" in rejected.json()["error"]["message"]
+
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    switched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created.json()['id']}", json={"agent_id": pi}, headers=_headers()
+    )
+    assert switched.status_code == 400, switched.text
+    assert "sample.zip" in switched.json()["error"]["message"]
+
+
 async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
     auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

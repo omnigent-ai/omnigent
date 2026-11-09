@@ -610,8 +610,11 @@ def create_scheduled_tasks_router(
             f"cannot continue this session: {reason}", code=ErrorCode.INVALID_INPUT
         )
 
-    async def _require_source_session(source_id: str, owner: str) -> Conversation:
-        """Return a session *owner* can start an automation from, hiding one they can't see."""
+    async def _require_source_session(source_id: str, owner: str) -> tuple[Conversation, str]:
+        """A session *owner* can start an automation from, hiding one they can't see.
+
+        :returns: The session and its last finished response, which its copy stops at.
+        """
         from omnigent.stores.conversation_store import (
             SCHEDULED_TASK_SOURCE_LABEL_KEY,
             SIDE_CHAT_LABEL_KEY,
@@ -639,12 +642,30 @@ def create_scheduled_tasks_router(
         from omnigent.server.scheduled.source_session import last_finished_response_id
 
         # Runs start from the history through the last finished reply, so there must be one.
-        if await asyncio.to_thread(last_finished_response_id, conversation_store, conv.id) is None:
+        up_to = await asyncio.to_thread(last_finished_response_id, conversation_store, conv.id)
+        if up_to is None:
             raise OmnigentError(
                 "The session has no finished reply to start an automation from yet",
                 code=ErrorCode.INVALID_INPUT,
             )
-        return conv
+        return conv, up_to
+
+    async def _require_openable_attachments(
+        session_id: str, agent: Agent, up_to_response_id: str | None = None
+    ) -> None:
+        """Reject an agent that can't open the files the copied history refers to."""
+        from omnigent.server.routes.sessions.routes_core import (
+            _require_attachment_compatible_history,
+        )
+
+        await asyncio.to_thread(
+            _require_attachment_compatible_history,
+            session_id,
+            agent,
+            conversation_store,
+            file_store,
+            up_to_response_id=up_to_response_id,
+        )
 
     async def _source_history_carry(agent: Agent) -> bool:
         from omnigent.server.scheduled.source_session import (
@@ -676,6 +697,7 @@ def create_scheduled_tasks_router(
     async def _copy_source_session(
         source: Conversation,
         *,
+        up_to: str,
         task_id: str,
         name: str,
         owner: str,
@@ -683,16 +705,11 @@ def create_scheduled_tasks_router(
         carry: bool,
     ) -> Conversation:
         """Copy *source*, through its last finished reply, for the task's runs to start from."""
-        from omnigent.server.scheduled.source_session import (
-            copy_session,
-            last_finished_response_id,
-            source_copy_title,
-        )
+        from omnigent.server.scheduled.source_session import copy_session, source_copy_title
         from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
 
         # _require_source_session rejects a session without an agent.
         assert source.agent_id is not None
-        up_to = await asyncio.to_thread(last_finished_response_id, conversation_store, source.id)
         copy = await asyncio.to_thread(
             copy_session,
             conversation_store=conversation_store,
@@ -764,6 +781,7 @@ def create_scheduled_tasks_router(
         task_id = uuid.uuid4().hex
         host_id = body.host_id
         source: Conversation | None = None
+        source_up_to = ""
         carry = False
         if body.session_id is not None:
             # A picked session keeps the agent it runs, so the task takes no copy.
@@ -792,9 +810,11 @@ def create_scheduled_tasks_router(
                 host_id = picked.host_id
         else:
             if body.source_session_id is not None:
-                source = await _require_source_session(body.source_session_id, owner)
-                # Runs rebuild the copied history in the task's agent, so it must carry one.
+                source, source_up_to = await _require_source_session(body.source_session_id, owner)
+                # Runs rebuild the copied history in the task's agent, so it must carry one,
+                # and open the files it refers to.
                 await _source_history_carry(agent)
+                await _require_openable_attachments(source.id, agent, source_up_to)
                 carry = await _copy_history_carry(source)
             bound = await _bind_agent(agent, owner_id)
         project_id: str | None = None
@@ -805,6 +825,7 @@ def create_scheduled_tasks_router(
             if source is not None:
                 source_copy = await _copy_source_session(
                     source,
+                    up_to=source_up_to,
                     task_id=task_id,
                     name=body.name,
                     owner=owner,
@@ -1223,8 +1244,10 @@ def create_scheduled_tasks_router(
                 execution_target=target_execution,
             )
             if agent_changed and existing.source_session_id is not None:
-                # Runs rebuild the copied history in the new agent, so it must carry one.
+                # Runs rebuild the copied history in the new agent, so it must carry one
+                # and open the files it refers to.
                 await _source_history_carry(agent)
+                await _require_openable_attachments(existing.source_session_id, agent)
             if switching_to_managed:
                 # A sandbox has no pinned host; its workspace is a repository URL.
                 fields["host_id"] = None
