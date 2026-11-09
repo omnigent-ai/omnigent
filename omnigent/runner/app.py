@@ -180,6 +180,7 @@ from omnigent.runner.subagent_work import (
     _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX,
     _SUBAGENT_TERMINAL_STATUSES,
     _WAKE_POST_MAX_ATTEMPTS,
+    SUBAGENT_DISPATCH_ID_LABEL_KEY,
     _child_session_parents,
     _ChildParentMeta,
     _deliver_subagent_completion,
@@ -196,12 +197,14 @@ from omnigent.runner.subagent_work import (
     _SubagentDeliveryAck,
     _SubagentWorkEntry,
     _truncate_child_preview,
+    answered_subagent_response_id,
     get_subagent_work,
     is_codex_native_subagent_wrapper,
     latest_wake_eligible_subagent_work,
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
+    start_subagent_follow_up_work,
     unregister_child_session,
     unregister_subagent_work_for_session,
     wrapper_label_from_labels,
@@ -5230,6 +5233,32 @@ def create_runner_app(
             _schedule_subagent_wake(ack.entry)
         return ack
 
+    async def _track_subagent_follow_up(child_session_id: str) -> None:
+        """
+        Track a new turn of an already answered child as work for its parent.
+
+        Stamps the new dispatch id as ``sys_session_send`` does, so the parent's
+        drain receipt matches it and a runner restart cannot replay the result.
+
+        :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+        :returns: None.
+        """
+        entry = start_subagent_follow_up_work(child_session_id)
+        if entry is None:
+            return
+        from omnigent.runner.tool_dispatch import _patch_subagent_label
+
+        error = await _patch_subagent_label(
+            server_client, child_session_id, SUBAGENT_DISPATCH_ID_LABEL_KEY, entry.work_id
+        )
+        if error is not None:
+            _logger.warning(
+                "Failed to stamp a follow-up dispatch id on child=%s: %s",
+                child_session_id,
+                error,
+                extra={"session_id": child_session_id},
+            )
+
     # Seam for the entrypoint's launch reaper (and tests): terminal delivery
     # that also schedules the parent wake POST, not just the inbox insert.
     app.state.mark_subagent_terminal_and_wake = _mark_subagent_terminal_and_wake
@@ -7366,6 +7395,10 @@ def create_runner_app(
                         session_id=conversation_id,
                         server_client=server_client,
                     )
+                if not message_body.get("peer_message"):
+                    # sys_session_message never forwards replies; any other input to an
+                    # answered sub-agent starts work its parent must hear about.
+                    await _track_subagent_follow_up(conversation_id)
 
                 if conversation_id in _active_turns:
                     _native = _is_native_harness(conversation_id)
@@ -7539,6 +7572,17 @@ def create_runner_app(
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             terminal_status = None
+            edge_response_id = data.get("response_id") if isinstance(data, dict) else None
+            if (
+                status == "idle"
+                and isinstance(data, dict)
+                and data.get("turn_completed") is True
+                and isinstance(edge_response_id, str)
+                and edge_response_id != answered_subagent_response_id(conversation_id)
+            ):
+                # A confirmed end of a turn other than the delivered one: the child
+                # continued on its own, e.g. Claude Code after a background task.
+                await _track_subagent_follow_up(conversation_id)
             if status in ("idle", "failed"):
                 recovered_entry = get_subagent_work(conversation_id)
                 turn_outcome = data.get("turn_outcome") if isinstance(data, dict) else None
@@ -7659,6 +7703,14 @@ def create_runner_app(
                         status="failed",
                         output=output or "Error: native sub-agent turn failed",
                     )
+            if (
+                delivery_ack is not None
+                and delivery_ack.entry is not None
+                and delivery_ack.delivered_now
+                and isinstance(edge_response_id, str)
+            ):
+                # Remember which turn was delivered so a re-sent report stays deduped.
+                delivery_ack.entry.response_id = edge_response_id
             if delivery_ack is not None:
                 if (
                     delivery_ack.entry is not None
