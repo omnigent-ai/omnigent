@@ -3681,6 +3681,9 @@ def _log_unmirrored_human_prompt(
     if entry.get("type") == "attachment":
         if not isinstance(attachment, dict) or attachment.get("type") != "queued_command":
             return
+        # A queued shell command or notification is dropped on purpose, not lost.
+        if attachment.get("commandMode") != "prompt":
+            return
         origin = attachment.get("origin")
         content: object = attachment.get("prompt")
     else:
@@ -10774,14 +10777,9 @@ def _user_transcript_items_from_entry(
             # assistant text must inherit this id so it clusters with
             # the indicator, not the prior bubble.
             return fallback_response_id, [item]
-        # ``!cmd`` terminal commands may arrive here in older Claude
-        # builds; newer builds use top-level ``local_command`` records.
-        # In both shapes, surface the command and result as their own
-        # transcript group instead of inheriting the previous assistant
-        # response id. Such a record starts with its ``<bash-*>`` markup; a
-        # prompt that merely quotes the markup (a pasted log) is the person's
-        # message, and parsing it as a command would leave the web message it
-        # answers unsettled, reported as never recorded.
+        # Legacy ``!cmd`` records start with ``<bash-*>`` (newer builds use top-level
+        # ``local_command``) and get their own transcript group, not the prior response id.
+        # A prompt that merely quotes the markup (a pasted log) stays the person's message.
         if stripped.startswith("<bash-"):
             terminal_response_id = (
                 fallback_response_id

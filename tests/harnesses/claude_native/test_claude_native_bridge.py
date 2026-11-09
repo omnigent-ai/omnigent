@@ -2049,8 +2049,8 @@ def test_read_transcript_items_from_offset_warns_on_unmirrored_human_prompt(
 
     A human prompt the forwarder drops as CLI scaffolding leaves the web
     message it answers unsettled, so the server later reports it as never
-    recorded. Plain prompts and real command echoes stay quiet, and the
-    warning never carries the prompt text.
+    recorded. Plain prompts, real command echoes and a queued shell command
+    (dropped on purpose) stay quiet, and the warning never carries the text.
     """
     records = [
         {
@@ -2073,6 +2073,16 @@ def test_read_transcript_items_from_offset_warns_on_unmirrored_human_prompt(
             "uuid": "command",
             "origin": {"kind": "human"},
             "message": {"role": "user", "content": "<command-name>/model</command-name>"},
+        },
+        {
+            "type": "attachment",
+            "uuid": "queued-shell",
+            "attachment": {
+                "type": "queued_command",
+                "origin": {"kind": "human"},
+                "prompt": "pwd",
+                "commandMode": "bash",
+            },
         },
     ]
     transcript_path = tmp_path / "session.jsonl"
