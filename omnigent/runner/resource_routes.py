@@ -29,6 +29,7 @@ from omnigent.entities.session_resources import (
     resolve_terminal_entry_by_resource_id,
     session_resource_view_to_dict,
     terminal_resource_id,
+    wait_for_terminal_entry_by_resource_id,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
@@ -964,6 +965,7 @@ def register_resource_routes(
         session_id: str,
         terminal_id: str,
         read_only: bool = Query(default=False),
+        await_launch: bool = Query(default=False),
     ) -> None:
         await websocket.accept()
         entry = resolve_terminal_entry_by_resource_id(
@@ -971,6 +973,12 @@ def register_resource_routes(
             terminal_id,
             terminal_registry,
         )
+        if entry is None and await_launch:
+            entry = await wait_for_terminal_entry_by_resource_id(
+                session_id,
+                terminal_id,
+                terminal_registry,
+            )
         terminal_role = (
             resource_registry.terminal_resource_role(session_id, terminal_id)
             if resource_registry is not None
@@ -1458,6 +1466,23 @@ def register_resource_routes(
             default_pr_url=default_pr_url,
         )
 
+    @app.get("/v1/sessions/{session_id}/resources/github/commits")
+    async def read_github_commits(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+        head_sha: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_commits",
+            head_sha=head_sha,
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
     @app.get("/v1/sessions/{session_id}/resources/github/diff")
     async def read_github_pr_diff(
         session_id: str,
@@ -1472,6 +1497,23 @@ def register_resource_routes(
             "pr_diff",
             head_sha=head_sha,
             base_sha=base_sha,
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
+    @app.get("/v1/sessions/{session_id}/resources/github/commit-diff")
+    async def read_github_commit_diff(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+        commit_sha: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_commit_diff",
+            commit_sha=commit_sha,
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,

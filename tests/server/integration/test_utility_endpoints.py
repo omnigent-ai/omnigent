@@ -95,12 +95,13 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "arca_shutdown_warnings": False,
         "import_review": False,
         "custom_agents_settings_ui": True,
-        "sidebar_grouping_ui": False,
+        "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
         "automations_v2": False,
         "splittable_terminal_view_ui": False,
         "session_orchestration": True,
+        "sibling_sessions": False,
         "codex_plan_at_launch": True,
     }
     # Compatibility field for frontend builds predating the nested map.
@@ -119,6 +120,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_subhour"] is True
     assert data["automation_trigger_poll_minutes"] == 10
     assert data["scheduled_task_harness_settings"] is True
+    # Gates the automation picker's approval-skipping modes; older servers reject them.
+    assert data["scheduled_task_approval_skipping_modes"] is True
     assert data["agent_detail"] is True
     assert data["agent_config_edit"] is True
     # Gates the web's /clear for native sessions; older servers reject it.
