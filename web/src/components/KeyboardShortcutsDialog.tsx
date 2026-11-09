@@ -1,7 +1,7 @@
 // A read-only "Keyboard shortcuts" overlay listing the shortcuts that already
 // exist in the chat surface. It is intentionally a mirror of the live
 // behavior — every row here corresponds to a handler that ships today
-// (composer `handleKeyDown`, the global session-switch / message-nav hotkeys,
+// (composer `handleKeyDown`, the global history / message-nav hotkeys,
 // and the approve hotkey). Nothing here binds new behavior except the dialog's
 // own opener (⌘/Ctrl + /), which this component registers.
 //
@@ -216,6 +216,7 @@ function shortcutGroupsFor(
   grids: boolean,
   splitTerminal: boolean,
   desktopCommands: boolean,
+  siblingSessions: boolean,
 ): ShortcutGroup[] {
   const groups = SHORTCUT_GROUPS.map((group) => {
     if (group.title === "General") {
@@ -223,6 +224,9 @@ function shortcutGroupsFor(
         ...group,
         items: [
           { label: "Start a new session", keys: newSessionShortcutKeys(native) },
+          ...(siblingSessions
+            ? [{ label: "Add nested agent", keys: [MOD_KEY, ALT_KEY, "A"] }]
+            : []),
           // The desktop menu's Settings item owns ⌘, there.
           ...group.items.map((item) =>
             item.label === "Open Settings"
@@ -342,6 +346,7 @@ export function KeyboardShortcutsList({
     !isMobileViewport && isFeatureEnabled(serverInfo, "grid_sessions_display_ui"),
     !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
     supportsDesktopCommands(),
+    serverInfo !== "loading" && serverInfo.sibling_sessions === true,
   );
   const settings = variant === "settings";
   return (
