@@ -61,7 +61,7 @@ jobs:
       # The uv.lock *format* is a third flag. `uv lock --check` passes on an
       # older lock revision, but Dependabot's current uv rewrites the header in
       # every Python bump and the auto-merge policy refuses the header change.
-      # The script compares the committed revision with the one this (pinned)
+      # The script flags a committed revision older than the one this (pinned)
       # uv writes, so the lock follows the uv pin in .github/actions/setup-uv.
       - name: Check lockfile consistency
         id: check

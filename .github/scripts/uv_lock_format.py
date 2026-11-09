@@ -6,11 +6,12 @@ on an older revision, so nothing notices until Dependabot, which runs a current
 uv, rewrites the header in every Python bump and the auto-merge policy refuses
 each one as a resolution-settings change.
 
-``check`` compares the committed revision with the one this uv writes for an
-empty project. ``migrate`` rewrites the lock in the current format with every
-pin unchanged: a refresh moves the revision, and one same-version relock lands
-on the marker ordering uv keeps stable across later bumps (a bare refresh does
-not, so the next Dependabot bump would reorder it again).
+``check`` fails when the committed revision is older than the one this uv
+writes for an empty project. ``migrate`` rewrites such a lock in the current
+format with every pin unchanged: a refresh moves the revision, and one
+same-version relock lands on the marker ordering uv keeps stable across later
+bumps (a bare refresh does not, so the next Dependabot bump would reorder it
+again).
 """
 
 from __future__ import annotations
@@ -47,7 +48,10 @@ def pins(text: str) -> dict[tuple[str, str], tuple[str | None, tuple[str, ...]]]
 
 
 def run_uv(uv: str, *args: str, cwd: Path) -> None:
-    subprocess.run([uv, *args], cwd=cwd, check=True, capture_output=True, text=True)
+    result = subprocess.run([uv, *args], cwd=cwd, capture_output=True, text=True, check=False)
+    if result.returncode:
+        command = " ".join(["uv", *args])
+        raise SystemExit(f"`{command}` exited {result.returncode}:\n{result.stderr.strip()}")
 
 
 def probe_revision(uv: str) -> int:
@@ -72,15 +76,19 @@ def anchor_package(text: str) -> str:
 
 
 def migrate(uv: str, lock_path: Path) -> tuple[int, int]:
-    """Rewrite the lock in this uv's format; fail and restore it if any pin moved."""
+    """Rewrite the lock in this uv's format; on any failure, or if a pin moved, restore it."""
     before = lock_path.read_text()
+    anchor = anchor_package(before)
     project = lock_path.parent
-    run_uv(uv, "lock", "--refresh", cwd=project)
-    run_uv(uv, "lock", "--upgrade-package", anchor_package(before), cwd=project)
-    after = lock_path.read_text()
-    if pins(after) != pins(before):
+    try:
+        run_uv(uv, "lock", "--refresh", cwd=project)
+        run_uv(uv, "lock", "--upgrade-package", anchor, cwd=project)
+        after = lock_path.read_text()
+        if pins(after) != pins(before):
+            raise SystemExit("migration changed a pin; uv.lock restored, inspect by hand")
+    except BaseException:
         lock_path.write_text(before)
-        raise SystemExit("migration changed a pin; uv.lock restored, inspect by hand")
+        raise
     return lock_revision(before), lock_revision(after)
 
 
@@ -94,9 +102,16 @@ def main(argv: list[str] | None = None) -> int:
     committed = lock_revision(args.lock.read_text())
     current = probe_revision(args.uv)
     print(f"uv.lock revision={committed}; uv writes revision={current}")
+    # A lock newer than the pinned uv means the pin fell behind; rewriting the
+    # lock with the older uv would undo the newer format, so leave it alone.
+    if committed > current:
+        print(
+            "::warning::uv.lock is newer than the pinned uv writes; "
+            "move the uv pin in .github/actions/setup-uv"
+        )
     if args.command == "check":
-        return 0 if committed == current else 1
-    if committed == current:
+        return 1 if committed < current else 0
+    if committed >= current:
         print("uv.lock is already in the current format")
         return 0
     old, new = migrate(args.uv, args.lock)
