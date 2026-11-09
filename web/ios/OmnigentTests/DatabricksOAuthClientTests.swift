@@ -82,7 +82,14 @@ final class DatabricksOAuthClientTests: XCTestCase {
   }
 
   func testNetworkErrorsAreSanitized() async throws {
-    let server = OAuthTestServer { _ in throw URLError(.notConnectedToInternet) }
+    let server = OAuthTestServer { _ in
+      throw URLError(
+        .notConnectedToInternet,
+        userInfo: [
+          NSURLErrorFailingURLErrorKey: URL(string: "https://secret.example/token?code=private")!,
+          NSLocalizedDescriptionKey: "sensitive details",
+        ])
+    }
     do {
       _ = try await DatabricksOAuthClient(session: server.session).exchange(
         code: "code", for: server.attempt())
@@ -95,6 +102,8 @@ final class DatabricksOAuthClientTests: XCTestCase {
       XCTAssertEqual(
         error.localizedDescription,
         "Could not reach Databricks. Please try again. (NSURLErrorDomain -1009)")
+      XCTAssertFalse(error.localizedDescription.contains("secret.example"))
+      XCTAssertFalse(error.localizedDescription.contains("sensitive details"))
     }
   }
 
