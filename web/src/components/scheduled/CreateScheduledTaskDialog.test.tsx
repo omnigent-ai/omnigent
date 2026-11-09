@@ -5192,15 +5192,15 @@ describe("creating an automation from a session", () => {
     ["its joined repository label", { "omnigent.sandbox.repo": RUNTIME_REPO }],
     // A long repository list carries only the indexed labels.
     ["only indexed repository labels", { "omnigent.sandbox.repo.0": RUNTIME_REPO }],
-  ])("defaults to an Arclet sandbox when one is offered (session with %s)", async (_, labels) => {
+  ])("defaults to a sandbox whose provider lists repos (session with %s)", async (_, labels) => {
     renderFromSession({
       source: { ...SOURCE, labels },
       info: {
         managed_sandboxes_enabled: true,
-        sandbox_provider: "arclet",
+        sandbox_provider: "repo_sandbox",
         scheduled_task_sandbox_workspaces: true,
         sandbox_provider_capabilities: {
-          arclet: { repo_catalog: [{ name: "runtime", url: RUNTIME_REPO }] },
+          repo_sandbox: { repo_catalog: [{ name: "runtime", url: RUNTIME_REPO }] },
         },
       },
     });
@@ -5214,9 +5214,13 @@ describe("creating an automation from a session", () => {
     expect(input.workspace ?? "").toBe(Object.keys(labels).length > 0 ? RUNTIME_REPO : "");
   });
 
-  it("does not default to another sandbox provider", async () => {
+  it("does not default to a sandbox whose provider lists no repositories", async () => {
     renderFromSession({
-      info: { managed_sandboxes_enabled: true, sandbox_provider: "databricks-lakebox" },
+      info: {
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "plain_sandbox",
+        sandbox_provider_capabilities: { plain_sandbox: { multi_repo: true } },
+      },
     });
 
     const input = await submit();

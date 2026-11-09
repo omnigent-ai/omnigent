@@ -515,10 +515,13 @@ export function CreateScheduledTaskDialog({
   }, [open]);
   const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
   const targetInputsLoaded = !curationPending && !hostsPending;
-  // From a session: an Arclet sandbox when offered (with the session's sandbox
-  // repository), else the session's own connected host and directory, else the
-  // first online host. Other sandbox providers are never the default.
-  const arcletOffered = managedSandboxesEnabled && info.sandbox_provider === "arclet";
+  // From a session: a sandbox when the offered provider lists repositories (with the
+  // session's repository), else the session's own connected host and directory, else
+  // the first online host. Providers without a repository list are never the default.
+  const catalogSandboxOffered =
+    managedSandboxesEnabled &&
+    !!info.sandbox_provider &&
+    (info.sandbox_provider_capabilities?.[info.sandbox_provider]?.repo_catalog ?? []).length > 0;
   const sourceHostId = hosts?.some((h) => h.host_id === fromSession?.hostId)
     ? (fromSession?.hostId ?? undefined)
     : undefined;
@@ -533,7 +536,7 @@ export function CreateScheduledTaskDialog({
   useEffect(() => {
     if (!open || isEdit || !targetInputsLoaded || targetChosenRef.current) return;
     if (fromSession) {
-      if (arcletOffered) {
+      if (catalogSandboxOffered) {
         targetChosenRef.current = true;
         setSandboxMode(true);
         setHostId("");
@@ -564,7 +567,7 @@ export function CreateScheduledTaskDialog({
     managedSandboxesEnabled,
     defaultHostId,
     fromSession,
-    arcletOffered,
+    catalogSandboxOffered,
     sourceHostId,
     sourceWorkspace,
     sourceRepoInCatalog,
