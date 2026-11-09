@@ -25,6 +25,7 @@ from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CO
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server import session_live_state
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
@@ -43,6 +44,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle, create_test_agent
@@ -777,14 +779,44 @@ async def test_pending_input_retains_request_options_on_service_restart(startup_
     assert "startup_options" not in dispatched[0].data
 
 
+@pytest.mark.parametrize("scheduled", [False, True])
 @pytest.mark.parametrize("detail", [None, "harness is not configured on this host"])
 async def test_host_refusal_keeps_startup_input_without_failing_session(
-    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, detail: str | None
+    startup_env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    detail: str | None,
+    scheduled: bool,
+    scheduled_run_context: ScheduledRunLogContext,
+    db_uri: str,
+    request: pytest.FixtureRequest,
 ) -> None:
     env = startup_env
-    session_id = await _create(env)
+    with scheduled_run_scope(scheduled_run_context if scheduled else None):
+        session_id = await _create(env)
     saved = _bind(env, session_id)
     conv = env.conv_store.get_conversation(session_id)
+    scheduled_store = None
+    if scheduled:
+        scheduled_store = SqlAlchemyScheduledTaskStore(db_uri)
+        scheduled_store.create(
+            scheduled_run_context.task_id,
+            "startup-refusal",
+            _TEXT,
+            "FREQ=DAILY",
+            None,
+            conv.agent_id,
+            "UTC",
+            execution_target="managed_sandbox",
+        )
+        scheduled_store.create_run(
+            scheduled_run_context.run_id,
+            scheduled_run_context.task_id,
+            "running",
+            scheduled_run_context.scheduled_at,
+            conversation_id=session_id,
+        )
+        session_live_state.configure(env.conv_store, scheduled_store)
+        request.addfinalizer(lambda: session_live_state.configure(env.conv_store))
     env.app.state.host_registry.register(
         conv.host_id,
         AsyncMock(),
@@ -804,6 +836,13 @@ async def test_host_refusal_keeps_startup_input_without_failing_session(
     startup = env.app.state.startup_inputs
     await startup._deliver(env.app, session_id, saved)
     await startup._deliver(env.app, session_id, saved)
+    if scheduled_store is not None:
+        await asyncio.wrap_future(
+            session_live_state.submit("test_refusal_completion", lambda: None)
+        )
+        [run], _ = scheduled_store.list_runs(scheduled_run_context.task_id)
+        assert run.status == "failed"
+        assert run.error_code == "harness_not_configured"
     assert launch.await_count == 1
     [pending] = env.conv_store.list_pending_inputs(session_id)
     assert pending.id == saved.id and pending.status == "failed"

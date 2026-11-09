@@ -459,18 +459,20 @@ def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
     assert error is None and error_code is None
 
 
-def test_scheduled_run_completion_failed_carries_error_code() -> None:
+@pytest.mark.parametrize("run_id", [None, "owned_run"])
+def test_scheduled_run_completion_failed_carries_error_code(run_id: str | None) -> None:
     """A terminal ``failed`` edge flips the run to failed with the error detail."""
     sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
     session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
     try:
         session_live_state.persist_scheduled_run_completion(
-            "conv_1", "failed", error_code="runner_disconnected", error="dropped"
+            "conv_1", "failed", error_code="runner_disconnected", error="dropped", run_id=run_id
         )
         _wait_until(lambda: bool(sched.update_calls))
     finally:
         session_live_state.configure(None)
-    assert sched.update_calls == [("run_1", "failed", "dropped", "runner_disconnected")]
+    assert sched.update_calls == [(run_id or "run_1", "failed", "dropped", "runner_disconnected")]
+    assert sched.lookup_calls == (["conv_1"] if run_id is None else [])
 
 
 def test_scheduled_run_completion_noop_for_non_scheduled_conversation() -> None:
