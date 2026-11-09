@@ -160,9 +160,9 @@ executor:
             composer = page.locator(_COMPOSER)
             expect(composer).to_be_visible(timeout=30_000)
 
-            # The session's runner goes away, so the next send relaunches one.
+            # Stop the idle runner cleanly so only the interrupted send produces a failure card.
             hold = _LaunchHold(host.log_path, skip=len(_launches(host.log_path)))
-            os.kill(first_pid, signal.SIGKILL)
+            os.kill(first_pid, signal.SIGTERM)
             poll_until(lambda: not _runner_online(client, first_runner), timeout_s=30)
 
             composer.tap()
