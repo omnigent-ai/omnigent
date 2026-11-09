@@ -3113,18 +3113,10 @@ describe("automation trigger type", () => {
     },
   );
 
-  it("restores schedule and source drafts without carrying conditions between integrations", async () => {
-    async function chooseTimezone(zone: string) {
-      await userEvent.click(screen.getByLabelText("Timezone", { exact: true }));
-      fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: zone } });
-      await userEvent.click(await screen.findByRole("option", { name: zone.replaceAll("_", " ") }));
-    }
-
+  it("keeps each integration's trigger draft without carrying conditions to another", async () => {
     render(dialog());
     type("task-name-input", "Team work");
     type("task-prompt-input", "Prepare the weekly report.");
-    await choose("Every week", "schedule-preset-trigger");
-    await chooseTimezone("America/New_York");
     await choose("Jira");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Team work");
     expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(
@@ -3144,6 +3136,24 @@ describe("automation trigger type", () => {
     expect(screen.getByTestId("task-trigger-scope")).toHaveValue("ES");
     expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Triage the ticket.");
     expect(screen.getByTestId("task-trigger-condition-0-value")).toHaveValue("bug");
+  });
+
+  // Opens the full timezone list twice, which can exceed 5s under CI coverage.
+  it("restores the schedule draft after an integration changes its own schedule", async () => {
+    async function chooseTimezone(zone: string) {
+      await userEvent.click(screen.getByLabelText("Timezone", { exact: true }));
+      fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: zone } });
+      await userEvent.click(await screen.findByRole("option", { name: zone.replaceAll("_", " ") }));
+    }
+
+    render(dialog());
+    type("task-name-input", "Team work");
+    type("task-prompt-input", "Prepare the weekly report.");
+    await choose("Every week", "schedule-preset-trigger");
+    await chooseTimezone("America/New_York");
+    await choose("Jira");
+    type("task-trigger-scope", "ES");
+    type("task-trigger-instructions", "Triage the ticket.");
     fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
     fireEvent.click(screen.getByTestId("task-session-mode-trigger"));
     await choose("Every day", "schedule-preset-trigger");
@@ -3165,7 +3175,7 @@ describe("automation trigger type", () => {
     expect(mutateAsync.mock.calls[0][0].timezone).toBe("America/New_York");
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("templateId");
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
-  });
+  }, 15_000);
 
   it("keeps custom prompt edits and attributes a switched gallery template to the selected source", async () => {
     render(dialog({ initialTrigger: "jira", initialTemplateId: "jira" }));
