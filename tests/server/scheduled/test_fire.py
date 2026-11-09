@@ -4198,6 +4198,56 @@ async def test_a_run_copies_no_attachment_the_deployment_now_refuses(
 
 
 @pytest.mark.asyncio
+async def test_a_run_needs_an_agent_that_opens_the_files_its_source_gained(tmp_path: Path) -> None:
+    from omnigent.entities import MessageData
+
+    class _ZipFileStore:
+        def list(self, session_id: str, **kwargs: Any) -> SimpleNamespace:
+            stored = StoredFile(
+                id="f" * 32, created_at=1, filename="bundle.zip", bytes=5, session_id=session_id
+            )
+            return SimpleNamespace(data=[stored], has_more=False, last_id=stored.id)
+
+    def _message(role: str, content: list[dict[str, str]]) -> SimpleNamespace:
+        data = MessageData(role=role, content=content, agent=None if role == "user" else "pi")
+        return SimpleNamespace(
+            type="message", status="completed", response_id="resp_zip", data=data
+        )
+
+    conv_store = FakeConversationStore()
+    # Attached in the source after the automation was created, and answered there.
+    page = SimpleNamespace(
+        data=[
+            _message("assistant", [{"type": "output_text", "text": "Read it"}]),
+            _message("user", [{"type": "input_file", "file_id": "f" * 32}]),
+        ],
+        has_more=False,
+        last_id=None,
+    )
+    conv_store.list_items = lambda conversation_id, **kwargs: page  # type: ignore[method-assign]
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        file_store=_ZipFileStore(),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    # The task's agent can't open files, so the run stops before copying anything.
+    assert conv_store.forked == [] and launched == []
+    (run,) = store.runs
+    assert (run["status"], run.get("error_code")) == ("failed", "source_session_incompatible")
+    assert "bundle.zip" in run["error"]
+
+
+@pytest.mark.asyncio
 async def test_a_deleted_source_session_fails_the_run_and_pauses_the_task() -> None:
     conv_store = FakeConversationStore()
     conv_store.get_conversation = lambda conversation_id: None  # type: ignore[method-assign]

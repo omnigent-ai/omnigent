@@ -105,12 +105,11 @@ export function automationDeletedWith(
 }
 
 /**
- * Delete the automations that run from sessions about to be deleted. An
- * automation that is already gone (404) counts as deleted. Resolves `false`
- * when any other delete fails, so the caller can keep the sessions; deleting a
- * session first would leave its automation failing every run. Once the deletes
- * finish, it leaves the page the user is on then when that page is one of
- * *sessionIds* (and every delete succeeded) or a deleted automation's.
+ * Delete the automations that run from sessions about to be deleted, first.
+ * Only a `not_found` error counts as already deleted; any other failure
+ * resolves `false` so the caller keeps the sessions. Once the deletes finish,
+ * it leaves the page the user is on then if that is one of *sessionIds* (all
+ * deleted) or a deleted automation's.
  */
 export function useDeleteSourceAutomations(): (
   taskIds: string[],

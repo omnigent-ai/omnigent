@@ -1796,6 +1796,22 @@ async def _copy_source_session_for_run(
         task.source_session_id,
         running=running,
     )
+    from omnigent.server.routes.sessions.routes_core import _require_attachment_compatible_history
+
+    try:
+        # The source can gain attachments after Create; the run's agent must open them.
+        await asyncio.to_thread(
+            _require_attachment_compatible_history,
+            task.source_session_id,
+            agent,
+            deps.conversation_store,
+            deps.file_store,
+            up_to_response_id=up_to,
+        )
+    except OmnigentError as exc:
+        raise _CannotLaunchScheduledFire(
+            exc.message, error_code="source_session_incompatible"
+        ) from exc
     agent_changed = source is not None and source.agent_id != task.agent_id
     dropped = run_copy_dropped_label_keys(
         source.labels if source is not None else {}, agent_changed=agent_changed
