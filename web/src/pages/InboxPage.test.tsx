@@ -1144,6 +1144,23 @@ describe("InboxPage replies", () => {
     await waitFor(() => expect(sessionsApi.postEvent).toHaveBeenCalledTimes(1));
   });
 
+  it("inserts a newline on Alt+Enter instead of sending", async () => {
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const box = within(expandUnread()).getByRole<HTMLTextAreaElement>("textbox", {
+      name: /Reply to/,
+    });
+    fireEvent.change(box, { target: { value: "firstsecond" } });
+    box.setSelectionRange(5, 5);
+
+    expect(fireEvent.keyDown(box, { key: "Enter", altKey: true })).toBe(false);
+    expect(box).toHaveValue("first\nsecond");
+    expect(sessionsApi.postEvent).not.toHaveBeenCalled();
+  });
+
   it("never sends the Enter that confirms an IME candidate", async () => {
     // WHY: Safari confirms a candidate with an Enter that isn't flagged as
     // composing (keyCode 229), which would send a half-typed reply.
@@ -1189,7 +1206,7 @@ describe("InboxPage replies", () => {
     );
     fireEvent.keyDown(box, { key: "Enter" });
     fireEvent.click(send);
-    // Enter with a modifier is held while the reply sends, too.
+    // Alt+Enter's fallback edits even a read-only box; it must not unlock it.
     expect(fireEvent.keyDown(box, { key: "Enter", altKey: true })).toBe(false);
     fireEvent.change(box, { target: { value: "Ship it twice" } });
     expect(box).toHaveValue("Ship it");

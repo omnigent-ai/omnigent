@@ -400,7 +400,6 @@ function TranscriptImpl({
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
             <KeepBottomOnResize />
-            <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader
               scrollElement={scroller?.el ?? null}
               rowCount={display.streamBubbles.length}
@@ -481,6 +480,8 @@ function TranscriptImpl({
               remeasureNonce={spacerMeasureNonce}
             />
           </ConversationContent>
+          {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
+          <ConversationScrollRefBridge onScroller={setScroller} />
           <ConversationScrollButton
             className={
               isMobileViewport
