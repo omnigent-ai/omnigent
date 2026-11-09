@@ -310,6 +310,13 @@ export interface SlashCommandBlock {
   output: string | null;
 }
 
+/** Hide the internal native-wrapper namespace added to bundled skills. */
+export function slashCommandDisplayName(name: string): string {
+  const separator = name.indexOf(":");
+  if (separator < 0 || !nativeCodingAgentForAgentName(name.slice(0, separator))) return name;
+  return name.slice(separator + 1) || name;
+}
+
 /**
  * Reconstruct the literal composer text a skill invocation came from,
  * e.g. `/review-pr 123 focus on auth`. A skill's `slash_command`
@@ -319,7 +326,8 @@ export interface SlashCommandBlock {
  * Skill indicator.
  */
 export function slashCommandEchoText(name: string, args: string): string {
-  return args ? `/${name} ${args}` : `/${name}`;
+  const displayName = slashCommandDisplayName(name);
+  return args ? `/${displayName} ${args}` : `/${displayName}`;
 }
 
 /**

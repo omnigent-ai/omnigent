@@ -617,9 +617,10 @@ class SandboxLifecycle(ABC):
         ``True`` otherwise.
 
         Called BOTH once after a CLI bootstrap provision AND periodically
-        by the managed path for as long as the sandbox has a live runner
-        (:mod:`omnigent.server.managed_host_keepalive`), so an implementation
-        must be idempotent and cheap enough to repeat. Either shape
+        by the managed path while the sandbox's runner does work, and for the
+        runner idle timeout after (:mod:`omnigent.server.managed_host_keepalive`),
+        so an implementation must be idempotent and cheap enough to repeat.
+        Either shape
         satisfies it: "configure once to maximize lifetime" (disable idle
         autostop, restate a cap) or "push a deadline forward" (refresh an
         absolute expiry). Managed-only launchers that cannot extend a
