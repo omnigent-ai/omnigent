@@ -3230,6 +3230,32 @@ async def test_a_task_that_starts_from_a_session_can_switch_agents_but_not_conti
     assert cleared.json()["source_session_id"] == created["source_session_id"]
 
 
+async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.scheduled import source_session
+    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+
+    claude = builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+    # Only the session's agent rebuilds a copied transcript; the task's doesn't.
+    monkeypatch.setattr(source_session, "carries_native_history", lambda agent: agent.id == claude)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            source_session_id=_owned_session(db_uri),
+            agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME),
+        ),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+
+    copy = SqlAlchemyConversationStore(db_uri).get_conversation(
+        created.json()["source_session_id"]
+    )
+    assert copy is not None and copy.agent_id == claude
+    assert copy.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+
+
 async def test_deleting_the_automation_keeps_its_copy_as_an_ordinary_session(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

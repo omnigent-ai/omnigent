@@ -649,6 +649,22 @@ def create_scheduled_tasks_router(
         except SourceHistoryUnsupportedError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
+    async def _copy_history_carry(source: Conversation) -> bool:
+        """Whether the copy, which keeps the session's own agent, rebuilds a native transcript."""
+        from omnigent.server.scheduled.source_session import (
+            SourceHistoryUnsupportedError,
+            carries_native_history,
+        )
+
+        assert source.agent_id is not None  # _require_source_session rejects agentless sessions
+        source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
+        if source_agent is None:
+            return False
+        try:
+            return await asyncio.to_thread(carries_native_history, source_agent)
+        except SourceHistoryUnsupportedError:
+            return False
+
     async def _copy_source_session(
         source: Conversation,
         *,
@@ -763,7 +779,9 @@ def create_scheduled_tasks_router(
         else:
             if body.source_session_id is not None:
                 source = await _require_source_session(body.source_session_id, owner)
-                carry = await _source_history_carry(agent)
+                # Runs rebuild the copied history in the task's agent, so it must carry one.
+                await _source_history_carry(agent)
+                carry = await _copy_history_carry(source)
             bound = await _bind_agent(agent, owner_id)
         project_id: str | None = None
         source_copy: Conversation | None = None

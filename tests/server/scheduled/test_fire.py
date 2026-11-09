@@ -4007,6 +4007,31 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_run_copy_that_cannot_bind_its_host_is_deleted() -> None:
+    conv_store = FakeConversationStore()
+
+    def _no_host(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("host binding failed")
+
+    conv_store.set_host_id = _no_host  # type: ignore[method-assign]
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # The copy was made before the bind failed, so the run deletes it rather than orphan it.
+    assert [fork["source_id"] for fork in conv_store.forked] == ["conv_source"]
+    assert conv_store.deleted == ["conv_1"]
+    assert launched == []
+    assert [run["status"] for run in store.runs] == ["failed"]
+
+
+@pytest.mark.asyncio
 async def test_a_deleted_source_session_fails_the_run_and_pauses_the_task() -> None:
     conv_store = FakeConversationStore()
     conv_store.get_conversation = lambda conversation_id: None  # type: ignore[method-assign]

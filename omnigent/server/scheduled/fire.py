@@ -1801,9 +1801,14 @@ async def _copy_source_session_for_run(
         override_terminal_launch_args=True,
     )
     if task.host_id is not None:
-        conv = await asyncio.to_thread(
-            deps.conversation_store.set_host_id, conv.id, task.host_id, workspace, git_branch
-        )
+        try:
+            conv = await asyncio.to_thread(
+                deps.conversation_store.set_host_id, conv.id, task.host_id, workspace, git_branch
+            )
+        except Exception:
+            # The caller never receives this session, so its cleanup can't delete it.
+            await _discard_session(deps, conv)
+            raise
     return conv
 
 
