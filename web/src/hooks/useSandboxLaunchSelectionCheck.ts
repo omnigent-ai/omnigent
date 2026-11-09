@@ -53,9 +53,17 @@ export function launchSelectionNotice(
 // Sessions this tab created from New Chat, with the launched model's picker label.
 // Waking or reopening a session never adds one, so in-session choices stay untouched.
 const pendingLaunchChecks = new Map<string, string | null>();
+let retiresOnLeave = false;
 
 export function markSandboxLaunch(sessionId: string, modelLabel: string | null): void {
   pendingLaunchChecks.set(sessionId, modelLabel);
+  if (retiresOnLeave) return;
+  retiresOnLeave = true;
+  // Leaving a launch before its catalog arrives retires the check, so a later reopen never resets.
+  useChatStore.subscribe((state, previous) => {
+    if (previous.conversationId !== null && previous.conversationId !== state.conversationId)
+      pendingLaunchChecks.delete(previous.conversationId);
+  });
 }
 
 /** Once a sandbox this tab launched reports its catalog, reset a model or effort it lacks. */
@@ -66,13 +74,6 @@ export function useSandboxLaunchSelectionCheck(
   enabled: boolean,
 ) {
   const conversationId = useChatStore((state) => state.conversationId);
-  // Leaving before the catalog arrives retires the check, so a later reopen never resets.
-  useEffect(
-    () => () => {
-      if (sessionId !== null) pendingLaunchChecks.delete(sessionId);
-    },
-    [sessionId],
-  );
   useEffect(() => {
     if (!enabled || sessionId === null || conversationId !== sessionId) return;
     if (harness === null || models.length === 0 || !pendingLaunchChecks.has(sessionId)) return;
@@ -80,15 +81,24 @@ export function useSandboxLaunchSelectionCheck(
     pendingLaunchChecks.delete(sessionId);
     const { sessionModelOverride: model, sessionReasoningEffort: effort } = useChatStore.getState();
     const resets = launchSelectionResets(harness, models, model, effort);
-    const notice = launchSelectionNotice(resets, model, effort, modelLabel);
-    if (notice === null) return;
+    if (!resets.model && !resets.effort) return;
     void (async () => {
       try {
         if (resets.model) await useChatStore.getState().setModel(null);
-        // The setters act on the shown session, so stop if the user switched away.
-        if (resets.effort && useChatStore.getState().conversationId === sessionId)
-          await useChatStore.getState().setEffort(null);
-        toast.info(notice);
+        // Skip the effort if the user switched away or picked a new effort meanwhile.
+        const after = useChatStore.getState();
+        const resetEffort =
+          resets.effort &&
+          after.conversationId === sessionId &&
+          after.sessionReasoningEffort === effort;
+        if (resetEffort) await after.setEffort(null);
+        const notice = launchSelectionNotice(
+          { model: resets.model, effort: resetEffort },
+          model,
+          effort,
+          modelLabel,
+        );
+        if (notice !== null) toast.info(notice);
       } catch {
         toast.error("Couldn't switch to the sandbox's default model settings.");
       }

@@ -170,21 +170,42 @@ describe("sandbox session catalog hooks", () => {
     expect(toast.info).not.toHaveBeenCalled();
   });
 
-  it("retires the check when the user leaves before the catalog arrives", async () => {
+  it("retires the check when the user leaves before the session or catalog loads", async () => {
     markSandboxLaunch(sessionId, null);
+    // The session snapshot hasn't loaded, so the page has no session id to pass yet.
     const hook = renderHook(
-      ({ id, models }: { id: string; models: NativeModelOption[] }) =>
+      ({ id, models }: { id: string | null; models: NativeModelOption[] }) =>
         useSandboxLaunchSelectionCheck(id, "codex-native", models, true),
-      { initialProps: { id: sessionId, models: [] as NativeModelOption[] } },
+      { initialProps: { id: null as string | null, models: [] as NativeModelOption[] } },
     );
     act(() => useChatStore.setState({ conversationId: "conv_elsewhere" }));
-    hook.rerender({ id: "conv_elsewhere", models: [] });
     // Reopening later and receiving the catalog must not reset anything.
     act(() => useChatStore.setState({ conversationId: sessionId }));
     hook.rerender({ id: sessionId, models: codexModels });
     await act(async () => {});
     expect(setModel).not.toHaveBeenCalled();
     expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  it("keeps an effort the user picked while the model reset was pending", async () => {
+    let finishModelReset = () => {};
+    setModel.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishModelReset = resolve;
+        }),
+    );
+    const { rerender } = renderCheck("claude-native");
+    rerender({ models: claudeModels });
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith(null));
+    act(() => useChatStore.setState({ sessionReasoningEffort: "high" }));
+    await act(async () => finishModelReset());
+    await waitFor(() =>
+      expect(toast.info).toHaveBeenCalledWith(
+        "gpt-5 isn't available in this sandbox. Using the default model.",
+      ),
+    );
+    expect(setEffort).not.toHaveBeenCalled();
   });
 
   it.each([
