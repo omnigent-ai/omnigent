@@ -12,6 +12,12 @@ MCP independent creation.
 
 - `message`: sender without edit-level sharing, same owner and workspace; shared destinations are
   allowed and their readers see the message. Normal queue/steering applies.
+- `sender-attribution`: a delivered message starts with `[Message from session <id>]`.
+  The destination's Chat drops that line from the user bubble and shows "From
+  @<sender>" as a session pill that opens the sender; the agent still receives
+  the prefix. The title comes from sessions the sidebar, the viewed session's
+  subagents or the session cache already hold, else one lookup; an unreadable
+  sender reads "From another session". The prefix is a label, not proof of origin.
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
 - `created-by`: independent workers record their creating session. The worker's
@@ -68,7 +74,8 @@ MCP independent creation.
 - As an admin on desktop or mobile web, open Settings → Sharing → Agent
   messaging, or `/settings/sharing`, and toggle **Message other sessions**.
 - In an SDK session's Chat, ask the agent to send a task using
-  `sys_session_message`, then inspect the destination's history.
+  `sys_session_message`, then inspect the destination's history. Its new user
+  bubble shows "From @<sender>"; click the pill to open the sender.
 - In a native session's Chat or agent terminal, ask for the same operation;
   the native MCP relay supplies the tools.
 - In a session with creation tools enabled, ask for a worker with
