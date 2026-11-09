@@ -867,12 +867,17 @@ async def test_list_sessions_pinned_filter(
 
 @pytest.mark.parametrize(
     "label_key",
-    ["omnigent.git.worktree_root_sha256", "omnigent.scheduled_task_worktree_source_sha256"],
+    [
+        "omnigent.git.worktree_root_sha256",
+        "omnigent.scheduled_task_worktree_source_sha256",
+        # Deleting a session with this label deletes the automation it names.
+        "omnigent.scheduled_task_source",
+    ],
 )
-async def test_patch_rejects_forged_worktree_identity(
+async def test_patch_rejects_forged_server_owned_labels(
     client: httpx.AsyncClient, session_id: str, db_uri: str, label_key: str
 ) -> None:
-    """The cleanup identity must remain server-owned after creation."""
+    """The cleanup identity and automation source must remain server-owned after creation."""
 
     response = await client.patch(
         f"/v1/sessions/{session_id}", json={"labels": {label_key: "forged"}}
@@ -881,18 +886,3 @@ async def test_patch_rejects_forged_worktree_identity(
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert label_key not in conv.labels
-
-
-async def test_patch_rejects_a_forged_automation_source(
-    client: httpx.AsyncClient, session_id: str, db_uri: str
-) -> None:
-    """Only the server sets the source label; deleting the session deletes its automation."""
-    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
-
-    response = await client.patch(
-        f"/v1/sessions/{session_id}", json={"labels": {SCHEDULED_TASK_SOURCE_LABEL_KEY: "st_1"}}
-    )
-    assert response.status_code == 400, response.text
-    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
-    assert conv is not None
-    assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in conv.labels

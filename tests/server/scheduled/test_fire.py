@@ -31,7 +31,7 @@ from starlette.datastructures import Headers
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
-from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.entities import ScheduledTask, ScheduledTaskRun, StoredFile
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
 from omnigent.server.routes._host_worktree import (
@@ -95,6 +95,8 @@ class _FakeAgent:
 
 
 class FakeAgentStore:
+    supports_user_agents = False
+
     def __init__(self, agents: dict[str, _FakeAgent] | None = None) -> None:
         self.agents = agents or {"ag_1": _FakeAgent("ag_1")}
 
@@ -4052,6 +4054,45 @@ async def test_a_run_copy_that_cannot_bind_its_host_is_deleted() -> None:
     assert conv_store.deleted == ["conv_1"]
     assert launched == []
     assert [run["status"] for run in store.runs] == ["failed"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_copies_no_attachment_the_deployment_now_refuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class _OneZipFileStore:
+        def list(self, session_id: str, **kwargs: Any) -> SimpleNamespace:
+            stored = StoredFile(
+                id="f" * 32, created_at=1, filename="bundle.zip", bytes=5, session_id=session_id
+            )
+            return SimpleNamespace(data=[stored], has_more=False, last_id=stored.id)
+
+    # The policy tightened after the automation was created.
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_denied_extensions": ["zip"]},
+    )
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        file_store=_OneZipFileStore(),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    # Refused before the run's session exists.
+    assert conv_store.forked == [] and launched == []
+    (run,) = store.runs
+    assert (run["status"], run.get("error_code")) == ("failed", "source_session_incompatible")
+    assert "not accepted" in run["error"]
 
 
 @pytest.mark.asyncio

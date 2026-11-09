@@ -3406,6 +3406,27 @@ async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
     assert [stored.filename for stored in files.list(source_id).data] == ["notes.txt"]
 
 
+async def test_a_copy_takes_only_attachments_the_deployment_accepts(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_id = _session_with_history(db_uri)
+    SqlAlchemyFileStore(db_uri).create(filename="bundle.zip", bytes=5, session_id=source_id)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    before = {conv.id for conv in conversations.list_conversations(limit=100).data}
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_denied_extensions": ["zip"]},
+    )
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+
+    assert resp.status_code == 415, resp.text
+    # Refused before anything is copied.
+    assert {conv.id for conv in conversations.list_conversations(limit=100).data} == before
+
+
 async def test_deleting_the_automation_keeps_its_copy_as_an_ordinary_session(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

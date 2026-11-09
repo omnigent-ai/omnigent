@@ -70,6 +70,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
@@ -1788,26 +1789,33 @@ async def _copy_source_session_for_run(
     dropped = run_copy_dropped_label_keys(
         source.labels if source is not None else {}, agent_changed=agent_changed
     )
-    conv = await asyncio.to_thread(
-        copy_session,
-        conversation_store=deps.conversation_store,
-        file_store=deps.file_store,
-        artifact_store=deps.artifact_store,
-        source_id=task.source_session_id,
-        title=_scheduled_session_title(task),
-        agent_id=task.agent_id,
-        created_by=task.user_id or RESERVED_USER_LOCAL,
-        project_id=await _fire_project_id(deps, task),
-        carry_history_into_native=carry,
-        labels=labels,
-        dropped_label_keys=dropped,
-        up_to_response_id=up_to,
-        copy_model_settings=False,
-        # The copy's provider binding belongs to its agent; another agent resolves its own.
-        copy_inference_snapshot=not agent_changed,
-        terminal_launch_args=launch_args,
-        override_terminal_launch_args=True,
-    )
+    project_id = await _fire_project_id(deps, task)
+    try:
+        conv = await asyncio.to_thread(
+            copy_session,
+            conversation_store=deps.conversation_store,
+            file_store=deps.file_store,
+            artifact_store=deps.artifact_store,
+            source_id=task.source_session_id,
+            title=_scheduled_session_title(task),
+            agent_id=task.agent_id,
+            created_by=task.user_id or RESERVED_USER_LOCAL,
+            project_id=project_id,
+            carry_history_into_native=carry,
+            labels=labels,
+            dropped_label_keys=dropped,
+            up_to_response_id=up_to,
+            copy_model_settings=False,
+            # The copy's provider binding belongs to its agent; another agent resolves its own.
+            copy_inference_snapshot=not agent_changed,
+            terminal_launch_args=launch_args,
+            override_terminal_launch_args=True,
+        )
+    except HTTPException as exc:
+        # The deployment's attachment policy refuses a file the session holds.
+        raise _CannotLaunchScheduledFire(
+            str(exc.detail), error_code="source_session_incompatible"
+        ) from exc
     if task.host_id is not None:
         try:
             conv = await asyncio.to_thread(

@@ -59,12 +59,7 @@ def run_prompt_text(task: ScheduledTask) -> str:
 
 
 def source_copy_title(source_title: str | None, name: str) -> str:
-    """Title of the copy an automation's runs start from.
-
-    :param source_title: The copied session's title, e.g. ``"Rubric"``.
-    :param name: The automation's name, used when the session has no title.
-    :returns: The session's title, e.g. ``"Rubric"``, else the automation's name.
-    """
+    """Use the source title, falling back to the automation name."""
     return source_title or name
 
 
@@ -182,6 +177,8 @@ def copy_session(
     :param override_terminal_launch_args: Use *terminal_launch_args* instead
         of the source's launch args.
     :returns: The new session.
+    :raises HTTPException: 415 or 413, before anything is copied, when the
+        deployment's attachment policy refuses a file the session holds.
     """
     from omnigent.db.utils import generate_file_id
 
@@ -197,6 +194,7 @@ def copy_session(
             if not files_page.has_more or not files_page.data:
                 break
             files_after = files_page.last_id
+        _admit_copied_files(source_files, file_store)
 
     conv = conversation_store.fork_conversation(
         source_id,
@@ -239,6 +237,25 @@ def copy_session(
                     exc_info=True,
                 )
     return conv
+
+
+def _admit_copied_files(source_files: list[Any], file_store: Any) -> None:
+    """Apply the deployment's attachment policy to the files a copy takes, as a fork does."""
+    from omnigent.inner.native_attachments import uses_filesystem_delivery
+    from omnigent.server.routes._sessions.helpers import _enforce_filesystem_attachment_policy
+
+    delivered_as_files = [
+        stored
+        for stored in source_files
+        if uses_filesystem_delivery(stored.filename, stored.source_metadata)
+    ]
+    if delivered_as_files:
+        _enforce_filesystem_attachment_policy(
+            [stored.filename or "" for stored in delivered_as_files],
+            session_id=None,
+            file_store=file_store,
+            sizes=[stored.bytes for stored in delivered_as_files],
+        )
 
 
 def run_copy_dropped_label_keys(
