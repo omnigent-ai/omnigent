@@ -740,6 +740,7 @@ class _CodexForwarderState:
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_ids: dict[str, set[UserMessageId]] = field(default_factory=dict)
+    skill_expansion_position: tuple[str, frozenset[UserMessageId]] | None = None
     turns_with_skill_order_gap: set[str] = field(default_factory=set)
     skill_rollout: CodexSkillRollout | None = None
     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
@@ -1144,9 +1145,9 @@ class _CodexForwarderState:
         self.subscribed_child_threads.add(thread_id)
 
     def note_user_message_posted(self, turn_id: str, item: _JsonObject) -> None:
-        self.posted_user_ids.setdefault(turn_id, set()).update(
-            user_message_ids(item.get("id"), item.get("clientId"))
-        )
+        identities = user_message_ids(item.get("id"), item.get("clientId"))
+        self.posted_user_ids.setdefault(turn_id, set()).update(identities)
+        self.skill_expansion_position = (turn_id, identities)
 
     def has_posted_user_message(self, turn_id: str) -> bool:
         return turn_id in self.posted_user_ids
@@ -3795,9 +3796,15 @@ async def _handle_event(
                     client, route_session_id, params, event_bridge_dir, event_state
                 )
         elif isinstance(item, dict) and _user_shell_command(item) is not None:
-            if await _post_user_shell_input(client, route_session_id, params, item):
-                if event_state is not None and isinstance(item_id := item.get("id"), str):
-                    event_state.started_user_shell_items.add(item_id)
+            async with _conversation_item_delivery_scope(route_session_id):
+                await _persist_skill_expansions(
+                    client, route_session_id, params, event_bridge_dir, event_state
+                )
+                if await _post_user_shell_input(client, route_session_id, params, item):
+                    if event_state is not None:
+                        event_state.skill_expansion_position = None
+                        if isinstance(item_id := item.get("id"), str):
+                            event_state.started_user_shell_items.add(item_id)
         elif isinstance(item, dict) and item.get("type") == "commandExecution":
             async with _conversation_item_delivery_scope(route_session_id):
                 await _persist_skill_expansions(
@@ -3806,6 +3813,7 @@ async def _handle_event(
                 call_id = await _post_tool_call_item(client, route_session_id, params, item)
                 if call_id is not None and event_state is not None:
                     event_state.note_tool_call_posted(call_id)
+                    event_state.skill_expansion_position = None
         return
     if method == _CODEX_SERVER_REQUEST_RESOLVED_METHOD:
         # Resolve on the session the elicitation was published on (a child
@@ -5028,6 +5036,7 @@ async def _maybe_handle_turn_event(
                 else:
                     if forwarder_state is not None:
                         forwarder_state.compaction_item_persisted = True
+                        forwarder_state.skill_expansion_position = None
         return True
     if method == "turn/diff/updated":
         _handle_turn_diff_updated(params, forwarder_state)
@@ -6597,6 +6606,7 @@ async def _handle_completed_item_inner(
             else:
                 if forwarder_state is not None:
                     forwarder_state.compaction_item_persisted = True
+                    forwarder_state.skill_expansion_position = None
         return
     if item_type == "userMessage":
         await _mirror_user_message(client, session_id, params, item, forwarder_state)
@@ -6615,13 +6625,15 @@ async def _handle_completed_item_inner(
         # bubbles. Recover and post the turn's user message first so it
         # always takes the earlier position.
         await _ensure_user_message_posted(client, session_id, params, forwarder_state)
-        await _post_agent_message(client, session_id, params, item, source_id=source_id)
-        return
-    if item_type == "plan":
-        await _post_plan_item(client, session_id, params, item, source_id=source_id)
-        return
-    if _user_shell_command(item) is not None:
-        await _post_user_shell_item(
+        history_advanced = await _post_agent_message(
+            client, session_id, params, item, source_id=source_id
+        )
+    elif item_type == "plan":
+        history_advanced = await _post_plan_item(
+            client, session_id, params, item, source_id=source_id
+        )
+    elif _user_shell_command(item) is not None:
+        history_advanced = await _post_user_shell_item(
             client,
             session_id,
             params,
@@ -6629,17 +6641,17 @@ async def _handle_completed_item_inner(
             forwarder_state=forwarder_state,
             source_id=source_id,
         )
-        return
-    if item_type in _REVIEW_MODE_ITEM_TYPES:
-        await _post_review_mode_marker(client, session_id, params, item, source_id=source_id)
-        return
-    if item_type in _TOOL_ITEM_TYPES:
+    elif item_type in _REVIEW_MODE_ITEM_TYPES:
+        history_advanced = await _post_review_mode_marker(
+            client, session_id, params, item, source_id=source_id
+        )
+    elif item_type in _TOOL_ITEM_TYPES:
         if item_type == "fileChange":
             await _observe_file_change(
                 file_observer_bridge_dir if file_observer_bridge_dir is not None else bridge_dir,
                 item,
             )
-        await _post_tool_item(
+        history_advanced = await _post_tool_item(
             client,
             session_id,
             params,
@@ -6647,6 +6659,10 @@ async def _handle_completed_item_inner(
             forwarder_state=forwarder_state,
             source_id=source_id,
         )
+    else:
+        return
+    if history_advanced and forwarder_state is not None:
+        forwarder_state.skill_expansion_position = None
 
 
 async def _maybe_persist_interrupted_partial_text(
@@ -6696,7 +6712,8 @@ async def _maybe_persist_interrupted_partial_text(
         return
     scoped_params = _params_with_turn_id(params, turn_id)
     await _ensure_user_message_posted(client, session_id, scoped_params, forwarder_state)
-    await _post_interrupted_partial_agent_message(client, session_id, scoped_params, text)
+    if await _post_interrupted_partial_agent_message(client, session_id, scoped_params, text):
+        forwarder_state.skill_expansion_position = None
 
 
 def _claim_partial_text_buffer(
@@ -6725,7 +6742,7 @@ async def _post_interrupted_partial_agent_message(
     session_id: str,
     params: _JsonObject,
     text: str,
-) -> None:
+) -> bool:
     """
     Persist an interrupted Codex turn's visible partial assistant text.
 
@@ -6733,11 +6750,10 @@ async def _post_interrupted_partial_agent_message(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param params: Codex turn params including ``turnId``.
     :param text: Partial assistant text, e.g. ``"The answer is"``.
-    :returns: None.
     """
     thread_id = _thread_id_from_params(params) or "thread"
     turn_id = _turn_id_from_payload(params) or "turn"
-    await _post_external_item(
+    return await _post_external_item(
         client,
         session_id,
         item_type="message",
@@ -6794,7 +6810,7 @@ async def _flush_turn_diff(
     thread_id = _thread_id_from_params(params) or "thread"
     source_id = f"{thread_id}:{turn_id}:turn-diff"
     async with _conversation_item_delivery_scope(session_id):
-        await _post_external_item(
+        call_posted = await _post_external_item(
             client,
             session_id,
             item_type="function_call",
@@ -6807,7 +6823,7 @@ async def _flush_turn_diff(
             response_id=response_id,
             source_id=f"{source_id}:call",
         )
-        await _post_external_item(
+        output_posted = await _post_external_item(
             client,
             session_id,
             item_type="function_call_output",
@@ -6815,6 +6831,8 @@ async def _flush_turn_diff(
             response_id=response_id,
             source_id=f"{source_id}:output",
         )
+        if call_posted or output_posted:
+            forwarder_state.skill_expansion_position = None
 
 
 async def _handle_collab_item(
@@ -7819,6 +7837,9 @@ async def _persist_skill_expansions(
                 if user_item is not None:
                     state.turns_with_skill_order_gap.add(turn_id)
                 return
+        position = state.skill_expansion_position
+        if position is None or position[0] != turn_id or not user.ids & position[1]:
+            continue
         for expansion in user.expansions:
             source_id = _source_id(scoped_params, {"id": expansion.item_id})
             if source_id in state.synced_item_keys:
@@ -8108,7 +8129,7 @@ async def _post_user_shell_item(
     *,
     forwarder_state: _CodexForwarderState | None,
     source_id: str,
-) -> None:
+) -> bool:
     """
     Mirror one completed user shell command as ``terminal_command`` items.
 
@@ -8122,7 +8143,6 @@ async def _post_user_shell_item(
     :param item: Codex user-shell ``commandExecution`` item.
     :param forwarder_state: Optional state tracking inputs posted at item start.
     :param source_id: Stable native item id used for server-side deduplication.
-    :returns: None.
     """
     item_id = item.get("id")
     started = forwarder_state is not None and item_id in forwarder_state.started_user_shell_items
@@ -8130,7 +8150,7 @@ async def _post_user_shell_item(
         assert forwarder_state is not None
         forwarder_state.started_user_shell_items.discard(item_id)
     elif not await _post_user_shell_input(client, session_id, params, item, source_id=source_id):
-        return
+        return False
     tool_call = _codex_tool_call_from_item(item)
     await _post_external_item(
         client,
@@ -8144,6 +8164,7 @@ async def _post_user_shell_item(
         response_id=_response_id(params),
         source_id=f"{source_id}:output",
     )
+    return True
 
 
 async def _post_tool_item(
@@ -8154,7 +8175,7 @@ async def _post_tool_item(
     *,
     forwarder_state: _CodexForwarderState | None,
     source_id: str,
-) -> None:
+) -> bool:
     """
     Mirror one completed Codex built-in tool call into Omnigent history.
 
@@ -8172,11 +8193,10 @@ async def _post_tool_item(
         "command": "/bin/zsh -lc 'pwd'", "aggregatedOutput": "/repo\n",
         "exitCode": 0}``.
     :param forwarder_state: Optional state tracking calls posted at item start.
-    :returns: None.
     """
     tool_call = _codex_tool_call_from_item(item)
     if tool_call is None:
-        return
+        return False
     if forwarder_state is None or not forwarder_state.take_posted_tool_call(tool_call.call_id):
         if (
             await _post_tool_call_item(
@@ -8188,7 +8208,7 @@ async def _post_tool_item(
             )
             is None
         ):
-            return
+            return False
     await _post_external_item(
         client,
         session_id,
@@ -8197,6 +8217,7 @@ async def _post_tool_item(
         response_id=_response_id(params),
         source_id=f"{source_id}:output",
     )
+    return True
 
 
 async def _post_plan_item(

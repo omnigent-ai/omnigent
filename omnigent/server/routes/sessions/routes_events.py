@@ -113,7 +113,7 @@ from omnigent.server.failed_status_diagnostics import (
     bound_runner_connection,
     failed_status_intake_attributes,
 )
-from omnigent.server.feature_flags import Feature
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -3808,6 +3808,8 @@ def register_events_routes(
                     agent_id=conv.agent_id,
                     sub_agent_name=conv.sub_agent_name,
                 )
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        native_skill_routing = flags.enabled(Feature.NATIVE_SKILL_ROUTING)
         if body.type == _SLASH_COMMAND_TYPE:
             if _agent is None:
                 raise OmnigentError(
@@ -3820,7 +3822,7 @@ def register_events_routes(
             native_harness = None
             if (
                 startup_context is None
-                and request.app.state.feature_flags.enabled(Feature.NATIVE_SKILL_ROUTING)
+                and native_skill_routing
                 and not _codex_side_chat_thread_id(conv)
             ):
                 native_harness = await asyncio.to_thread(_native_skill_harness_for_session, conv)
@@ -3924,9 +3926,7 @@ def register_events_routes(
             # one; absent, the dispatch forwards as before.
             host_registry=getattr(request.app.state, "host_registry", None),
             startup_input=request if isinstance(request, StartupInputContext) else None,
-            native_skill_routing=request.app.state.feature_flags.enabled(
-                Feature.NATIVE_SKILL_ROUTING
-            ),
+            native_skill_routing=native_skill_routing,
         )
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)

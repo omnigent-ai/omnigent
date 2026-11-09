@@ -272,6 +272,61 @@ async def test_skill_echoes_and_native_expansions_keep_same_turn_input_order(
     }
 
 
+@pytest.mark.parametrize("later_item", ["assistant", "steer"])
+@pytest.mark.asyncio
+async def test_codex_skips_late_skill_expansion_and_keeps_later_steer_expansion(
+    tmp_path: Path, later_item: str
+) -> None:
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_1")
+    rollout = tmp_path / "codex-home" / "sessions" / "rollout-thread_123.jsonl"
+    rollout.parent.mkdir(parents=True)
+    first = _skill_user("live-1", "omnigent-skill:first")
+    steer = _skill_user("live-2", "omnigent-skill:steer")
+    late = json.dumps(_rollout_skill("late-expansion", "<skill>Late body</skill>")) + "\n"
+    split = len(late) // 2
+    rollout.write_text(json.dumps(_rollout_user(first)) + "\n" + late[:split])
+
+    async def complete(item: dict) -> None:
+        await fwd._handle_completed_item(
+            client,
+            "conv_x",
+            {"threadId": "thread_123", "turnId": "turn_1", "item": item},
+            bridge_dir=tmp_path,
+            forwarder_state=state,
+        )
+
+    def sources() -> list[str]:
+        return [
+            body["data"]["source_id"].removeprefix("thread_123:turn_1:")
+            for _, body in client.posts
+            if body["type"] == "external_conversation_item"
+        ]
+
+    await complete(first)
+    if later_item == "assistant":
+        await complete({"type": "agentMessage", "id": "model-1", "text": "First response."})
+        assert sources() == ["omnigent-skill:first", "model-1"]
+    else:
+        await complete(steer)
+        assert sources() == ["omnigent-skill:first", "omnigent-skill:steer"]
+    with rollout.open("a") as stream:
+        stream.write(late[split:])
+        stream.write(json.dumps(_rollout_user(steer)) + "\n")
+        stream.write(
+            json.dumps(_rollout_skill("steer-expansion", "<skill>Steer body</skill>")) + "\n"
+        )
+    if later_item == "assistant":
+        await complete(steer)
+    await complete({"type": "agentMessage", "id": "model-2", "text": "Later response."})
+
+    expected = ["omnigent-skill:first"]
+    if later_item == "assistant":
+        expected.append("model-1")
+    assert sources() == [*expected, "omnigent-skill:steer", "steer-expansion", "model-2"]
+
+
 @pytest.mark.parametrize(
     ("legacy", "recoverable"),
     [(False, True), (True, True), (False, False)],

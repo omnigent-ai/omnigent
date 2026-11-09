@@ -6157,12 +6157,13 @@ def _claude_transcript_record_from_session_item(
             message = {"role": "user", "content": user_content}
             if item.get("is_meta") is True:
                 extra["isMeta"] = True
-                if (
-                    user_content
-                    and isinstance(first_block := user_content[0], dict)
-                    and isinstance(text := first_block.get("text"), str)
-                    and text.startswith("Base directory for this skill: ")
-                ):
+                first_block = (
+                    user_content[0]
+                    if isinstance(user_content, list) and user_content
+                    else user_content
+                )
+                text = first_block.get("text") if isinstance(first_block, dict) else first_block
+                if isinstance(text, str) and text.startswith("Base directory for this skill: "):
                     extra["turnCompanion"] = True
         elif role == "assistant":
             assistant_content = _claude_assistant_content_from_api_blocks(item.get("content"))
