@@ -2108,12 +2108,7 @@ def test_missing_harness_cli_flags_outdated_version(
 def test_missing_harness_cli_lets_a_slow_kimi_through_sub_agent_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A present ``kimi`` whose ``--version`` outlasts the dispatch budget isn't "missing".
-
-    Sub-agent dispatch calls ``missing_harness_cli(child_harness)`` with the
-    default 30s budget. On a CPU-starved sandbox the probe can time out for a
-    current kimi, which was reported as missing or outdated (#12299).
-    """
+    """A resolved CLI whose version probe times out must still pass the dispatch preflight."""
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
     probe_timeouts: list[object] = []
 

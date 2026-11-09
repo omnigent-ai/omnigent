@@ -1450,7 +1450,7 @@ async def test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_
     bindir = tmp_path / "bin"
     bindir.mkdir()
     launcher = bindir / "pi"
-    launcher.write_text("#!/bin/sh\nprintf 'Workspace URL > '\nexec sleep 600\n")
+    launcher.write_text("#!/bin/sh\nexit 0\n")
     launcher.chmod(0o755)
     config_home = tmp_path / "config"
     config_home.mkdir()
@@ -1472,31 +1472,30 @@ async def test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_
     monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
     monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setattr("omnigent.onboarding.harness_readiness.READINESS_CLI_PROBE_TIMEOUT_S", 2.0)
+    original_run = subprocess.run
+
+    def _unanswered_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:] != ["--version"]:
+            return original_run(argv, **kwargs)
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    monkeypatch.setattr(subprocess, "run", _unanswered_version)
     host = _make_host_process()
+    proc = Mock(spec=subprocess.Popen, pid=1234)
+    proc.poll.return_value = None
+    monkeypatch.setattr(
+        host, "_spawn_runner_proc", Mock(return_value=(proc, tmp_path / "runner.log"))
+    )
+    monkeypatch.setattr(host, "_watch_runner", AsyncMock())
     workspace = tmp_path / "project"
     workspace.mkdir()
-    original_popen = subprocess.Popen
-
-    def _fake_runner_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
-        # The patch is process-wide, so let the readiness probe run the real launcher.
-        if "omnigent.runner._entry" not in args:
-            return original_popen(args, **kwargs)
-        return original_popen(
-            ["sleep", "10"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-
     frame = HostLaunchRunnerFrame(
         request_id="req_unanswered_pi",
         binding_token="token_def",
         workspace=str(workspace),
         harness="pi-native",
     )
-    try:
-        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_runner_popen):
-            result = await asyncio.wait_for(host._handle_launch(frame), timeout=30.0)
-    finally:
-        _cleanup_host(host)
+    result = await host._handle_launch(frame)
 
     assert "install the CLI" not in (result.error or ""), result.error
     assert result.status == "launched", result.error
