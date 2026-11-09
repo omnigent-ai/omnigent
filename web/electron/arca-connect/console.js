@@ -9,6 +9,11 @@ const introEl = document.getElementById("intro");
 const commandEl = document.getElementById("command");
 const terminalEl = document.getElementById("terminal");
 const statusEl = document.getElementById("status");
+const statusMessageEl = document.getElementById("status-message");
+const statusActionEl = document.getElementById("status-action");
+const diagnosticsEl = document.getElementById("diagnostics");
+const copyDiagnosticsBtn = document.getElementById("copy-diagnostics");
+const copyStateEl = document.getElementById("copy-state");
 const confirmBtn = document.getElementById("confirm");
 const cancelBtn = document.getElementById("cancel");
 
@@ -62,7 +67,9 @@ window.arcaConnect.onStarted(({ login, command }) => {
   confirmBtn.classList.add("loading");
   confirmBtn.textContent = login ? "Signing in…" : "Connecting…";
   statusEl.dataset.kind = "";
-  statusEl.textContent = login
+  statusActionEl.textContent = "";
+  diagnosticsEl.hidden = true;
+  statusMessageEl.textContent = login
     ? "Complete sign-in in your browser. If no browser opened, check that Arca Companion is running. Credentials stay on the Arca instance."
     : "A cold instance can take a few minutes to start.";
 });
@@ -96,11 +103,35 @@ window.arcaConnect.onOutput((text) => {
   ensureTerminal().write(text);
 });
 
-window.arcaConnect.onDone(({ ok, error }) => {
+window.arcaConnect.onDone(({ ok, error, errorMessage, errorAction, canCopyDiagnostics }) => {
   statusEl.dataset.kind = ok ? "ok" : "error";
-  statusEl.textContent = ok ? "Connected. The Arca host should appear online shortly." : error;
+  // A structured failure puts the problem and the next step on separate lines;
+  // a legacy combined `error` stays on one line.
+  statusMessageEl.textContent = ok
+    ? "Connected. The Arca host should appear online shortly."
+    : (errorMessage ?? error);
+  statusActionEl.textContent = !ok && errorMessage && errorAction ? errorAction : "";
+  diagnosticsEl.hidden = ok || canCopyDiagnostics !== true;
+  copyStateEl.textContent = "";
   confirmBtn.classList.remove("loading");
   confirmBtn.hidden = true;
   cancelBtn.textContent = "Close";
   resizeToContent();
+  // The result rows shrink the terminal pane; refit so it doesn't overlap them.
+  requestAnimationFrame(() => fitAddon?.fit());
+});
+
+// The shell builds the text from its own record of the failure and reports
+// whether the clipboard write actually succeeded.
+copyDiagnosticsBtn.addEventListener("click", async () => {
+  copyDiagnosticsBtn.disabled = true;
+  copyStateEl.textContent = "";
+  const copied = await Promise.resolve()
+    .then(() => window.arcaConnect.copyDiagnostics())
+    .then(
+      (result) => result?.ok === true,
+      () => false,
+    );
+  copyStateEl.textContent = copied ? "Copied" : "Couldn't copy. Try again.";
+  copyDiagnosticsBtn.disabled = false;
 });

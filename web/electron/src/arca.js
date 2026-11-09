@@ -31,10 +31,13 @@ const { StringDecoder } = require("node:string_decoder");
 const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
 
 /**
- * Connecting may cold-start the EC2 instance, which takes minutes — give the
- * whole ssh + remote daemon startup a generous ceiling.
+ * Outlasts a cold start plus Isaac's wait for a browser sign-in nobody can
+ * finish, so the sign-in error arrives first. Can drop once Isaac skips that
+ * wait for `--background --non-interactive`.
  */
-const CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
+const CONNECT_TIMEOUT_MS = 10 * 60 * 1000;
+/** `isaac omni login` gives up on its browser sign-in after 5 minutes. */
+const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const STATUS_TIMEOUT_MS = 60_000;
 const EXTEND_TIMEOUT_MS = 120_000;
 /** A dbcert refresh waits for the user to finish its browser sign-in. */
@@ -231,19 +234,9 @@ function buildLoginArgs(serverUrl) {
  */
 function describeConnectFailure(run) {
   const output = `${run.stderr}\n${run.stdout}`;
-  if (run.timedOut) {
-    return {
-      ok: false,
-      errorKind: "timeout",
-      error:
-        "Connecting to Arca timed out. The instance may still be starting — " +
-        "check `arca status` and try again.",
-      errorMessage: "Connecting to Arca timed out. The instance may still be starting.",
-      errorAction: "Check `arca status` and try again.",
-    };
-  }
   // `omni host --non-interactive` fails loud with a sign-in hint when the
-  // Arca box's Databricks credentials can't mint a server token.
+  // Arca box's Databricks credentials can't mint a server token. It wins over a
+  // timeout: a run that printed it needs sign-in, not a retry.
   if (/OMNIGENT_AUTH_REQUIRED|not signed in|authentication failed \(HTTP 401\)/i.test(output)) {
     return {
       ok: false,
@@ -255,6 +248,17 @@ function describeConnectFailure(run) {
       errorMessage: "The Arca instance isn't signed in to this server.",
       errorAction:
         "Run `arca ssh` and sign in with `isaac omni login <server-url>`, then try again.",
+    };
+  }
+  if (run.timedOut) {
+    return {
+      ok: false,
+      errorKind: "timeout",
+      error:
+        "Connecting to Arca timed out. The instance may still be starting — " +
+        "check `arca status` and try again.",
+      errorMessage: "Connecting to Arca timed out. The instance may still be starting.",
+      errorAction: "Check `arca status` and try again.",
     };
   }
   // The remote shell couldn't find isaac (or isaac couldn't find omni) on the
@@ -732,8 +736,10 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
               errorKind: "timeout",
               error:
                 "Arca sign-in timed out. Check Arca Companion, finish browser sign-in, and try again.",
+              errorMessage: "Arca sign-in timed out.",
+              errorAction: "Check Arca Companion, finish browser sign-in, and try again.",
             }
-          : describeConnectFailure({ code: null, stdout: "", stderr: "", timedOut: true }),
+          : describeConnectFailure({ code: null, stdout, stderr, timedOut: true }),
       );
       try {
         child.kill();
@@ -830,7 +836,11 @@ function startArcaConnect(serverUrl, deps = {}) {
 }
 
 function startArcaLogin(serverUrl, deps = {}) {
-  return startArcaCommand(serverUrl, deps, true);
+  return startArcaCommand(
+    serverUrl,
+    { ...deps, timeoutMs: deps.timeoutMs ?? LOGIN_TIMEOUT_MS },
+    true,
+  );
 }
 
 /**
