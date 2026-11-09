@@ -559,6 +559,50 @@ async def test_info_harness_install_gate_overrides_feature_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_info_mcp_sign_in_gate_overrides_feature_snapshot(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", "mcp_sign_in")
+    env_app = _build_branding_app(db_uri, tmp_path, "mcp-sign-in-env")
+    static_off_app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "mcp-sign-in-off",
+        mcp_sign_in=False,
+    )
+    values = iter([True, False])
+    callable_app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "mcp-sign-in-callable",
+        mcp_sign_in=lambda: next(values),
+    )
+
+    async def info(app: FastAPI) -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            return (await client.get("/v1/info")).json()
+
+    env_info = await info(env_app)
+    assert env_info["features"]["mcp_sign_in"] is True
+
+    off_info = await info(static_off_app)
+    assert off_info["features"]["mcp_sign_in"] is False
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=callable_app), base_url="http://test"
+    ) as client:
+        first = (await client.get("/v1/info")).json()
+        second = (await client.get("/v1/info")).json()
+    assert first["features"]["mcp_sign_in"] is True
+    assert second["features"]["mcp_sign_in"] is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("server_config", "create_app_kwargs", "expected"),
     [

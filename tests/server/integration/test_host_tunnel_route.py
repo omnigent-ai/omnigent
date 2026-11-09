@@ -31,6 +31,7 @@ from omnigent.host.frames import (
     HostImportLocalDoneFrame,
     HostImportLocalSessionChunkFrame,
     HostLaunchRunnerResultFrame,
+    HostMcpLoginResultFrame,
     HostMcpToolsFrame,
     HostMcpToolsResultFrame,
     HostPluginsResultFrame,
@@ -2304,7 +2305,7 @@ async def test_malformed_skill_content_reply_returns_502(
 async def test_host_tunnel_routes_mcp_tools_result_to_future(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
 ) -> None:
-    """A mcp_tools_result resolves only its own pending request, and drops it."""
+    """MCP tools and sign-in results resolve only their own pending request, and drop it."""
     app, registry, _store = host_app
     comm = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry)
@@ -2329,6 +2330,19 @@ async def test_host_tunnel_routes_mcp_tools_result_to_future(
     assert not other.done()
     assert list(conn.pending_mcp_tools) == ["req_other"]
 
+    login: asyncio.Future[HostMcpLoginResultFrame] = loop.create_future()
+    conn.pending_mcp_logins["req_login"] = login
+    login_other: asyncio.Future[HostMcpLoginResultFrame] = loop.create_future()
+    conn.pending_mcp_logins["req_login_other"] = login_other
+    login_result = HostMcpLoginResultFrame(
+        request_id="req_login", status="ok", login_id="l1", state="succeeded"
+    )
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(login_result)})
+    signed_in = await asyncio.wait_for(login, timeout=budget(2.0))
+    assert (signed_in.login_id, signed_in.state) == ("l1", "succeeded")
+    assert list(conn.pending_mcp_logins) == ["req_login_other"]
+    assert not login_other.done()
+
 
 @pytest.mark.parametrize(
     "invalid", [{"tools": "private"}, {"truncated": "no"}, {"connection": None}]
@@ -2341,7 +2355,7 @@ async def test_malformed_mcp_tools_reply_returns_502(
     import httpx
 
     app, registry, store = host_app
-    app.include_router(create_mcp_tools_router(registry, store), prefix="/v1")
+    app.include_router(create_mcp_tools_router(registry, store, mcp_sign_in=True), prefix="/v1")
     comm = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry)
     conn = registry.get(_HOST_ID)

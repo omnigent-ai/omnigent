@@ -11,6 +11,7 @@ import pytest
 from omnigent.host import mcp_inventory
 from omnigent.host.mcp_inventory import (
     HostMcpInventory,
+    configured_mcp_servers,
     discover_mcp_servers,
     read_auth_status_overlay,
 )
@@ -143,6 +144,30 @@ def test_reads_each_harness_and_drops_secrets(home: Path) -> None:
     ]
     assert _SECRET not in json.dumps(servers)
     assert "/usr/bin/tool" not in json.dumps(servers)
+
+
+def test_one_plugin_from_two_marketplaces_shares_its_names(home: Path) -> None:
+    plugins = home / ".claude" / "plugins"
+    installs: dict[str, object] = {}
+    for key in ("toolkit@first", "toolkit@second", "solo@first"):
+        plugin, marketplace = key.split("@")
+        path = plugins / "cache" / marketplace / plugin / "1.0"
+        _write_json(path / ".mcp.json", {"mcpServers": {"docs": {"url": "https://d.io/mcp"}}})
+        installs[key] = [{"scope": "user", "installPath": str(path)}]
+    _write_json(plugins / "installed_plugins.json", {"version": 2, "plugins": installs})
+    _write_json(
+        home / ".claude" / "settings.json", {"enabledPlugins": dict.fromkeys(installs, True)}
+    )
+    _write_json(home / ".claude.json", {"mcpServers": {"docs": {"url": "https://d.io/mcp"}}})
+
+    servers = configured_mcp_servers()
+
+    assert [(s.summary.get("source_id"), s.shared_name) for s in servers] == [
+        (None, False),
+        (_plugin_asset_id("toolkit@first", "mcp", "docs"), True),
+        (_plugin_asset_id("toolkit@second", "mcp", "docs"), True),
+        (_plugin_asset_id("solo@first", "mcp", "docs"), False),
+    ]
 
 
 def test_honors_claude_and_codex_config_homes(

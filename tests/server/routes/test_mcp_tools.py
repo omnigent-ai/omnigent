@@ -1,8 +1,9 @@
-"""The MCP tools route is owner-only and fails fast for older hosts."""
+"""The MCP tools and sign-in routes are owner-only and fail fast for older hosts."""
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from unittest.mock import AsyncMock
 
 import httpx
@@ -12,13 +13,21 @@ from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
+    CAP_MCP_LOGIN,
     CAP_MCP_TOOLS,
+    MCP_LOGIN_MAX_CALLBACK,
     HostHelloFrame,
+    HostMcpLoginFrame,
+    HostMcpLoginResultFrame,
     HostMcpToolsFrame,
     HostMcpToolsResultFrame,
     decode_host_frame,
 )
+from omnigent.host.mcp_login import CALLBACK_TIMEOUT_SECONDS, START_TIMEOUT_SECONDS
+from omnigent.server.feature_flags import McpSignInGate
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.routes import _host_launch
+from omnigent.server.routes import mcp_tools as mcp_tools_routes
 from omnigent.server.routes.mcp_tools import (
     create_mcp_tools_router,
     request_host_mcp_tools,
@@ -54,31 +63,56 @@ def _register(registry: HostRegistry, *capabilities: str) -> HostConnection:
     )
 
 
-@pytest.fixture
-def tools_app(db_uri: str) -> tuple[FastAPI, HostRegistry, HostStore]:
+def _make_tools_app(
+    db_uri: str, mcp_sign_in: McpSignInGate
+) -> tuple[FastAPI, HostRegistry, HostStore]:
     registry = HostRegistry()
     hosts = HostStore(db_uri)
     hosts.upsert_on_connect(_HOST_ID, "laptop", "owner")
     app = FastAPI()
     app.include_router(
-        create_mcp_tools_router(registry, hosts, auth_provider=_Auth()), prefix="/v1"
+        create_mcp_tools_router(
+            registry,
+            hosts,
+            auth_provider=_Auth(),
+            mcp_sign_in=mcp_sign_in,
+        ),
+        prefix="/v1",
     )
 
     @app.exception_handler(OmnigentError)
     async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
-        return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
 
     return app, registry, hosts
+
+
+@pytest.fixture
+def tools_app(db_uri: str) -> tuple[FastAPI, HostRegistry, HostStore]:
+    return _make_tools_app(db_uri, True)
 
 
 def _client(app: FastAPI) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
+def _broken_gate() -> bool:
+    raise RuntimeError("gate unavailable")
+
+
 @pytest.mark.parametrize(
     "result,status",
     [
         (HostMcpToolsResultFrame("", "ok", **_TOOLS), 200),
+        (
+            HostMcpToolsResultFrame(
+                "", "ok", tools=[], connection="needs_auth", harness_sign_in="available"
+            ),
+            200,
+        ),
         (HostMcpToolsResultFrame("", "failed", error="lookup failed"), 502),
         (HostMcpToolsResultFrame("", "busy"), 503),
         # A malformed connection enum is a host failure.
@@ -108,8 +142,40 @@ async def test_owner_gets_mcp_tools(
         response = await task
     assert response.status_code == status
     if status == 200:
-        assert response.json() == _TOOLS
+        assert response.json() == {
+            "tools": result.tools,
+            "connection": result.connection,
+            "truncated": False,
+            "harness_sign_in": result.harness_sign_in,
+        }
     assert not conn.pending_mcp_tools
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [False, pytest.param(lambda: False, id="callable-false")],
+)
+async def test_disabled_management_omits_harness_sign_in(
+    db_uri: str, gate: bool | Callable[[], bool]
+) -> None:
+    app, registry, _ = _make_tools_app(db_uri, gate)
+    conn = _register(registry, CAP_MCP_TOOLS)
+    async with _client(app) as client:
+        task = asyncio.create_task(client.post(_URL, json=_REQUEST, headers=_OWNER))
+        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
+        assert isinstance(frame, HostMcpToolsFrame)
+        conn.pending_mcp_tools[frame.request_id].set_result(
+            HostMcpToolsResultFrame(
+                frame.request_id,
+                "ok",
+                tools=[],
+                connection="needs_auth",
+                harness_sign_in="available",
+            )
+        )
+        response = await task
+    assert response.status_code == 200
+    assert "harness_sign_in" not in response.json()
 
 
 @pytest.mark.parametrize("user,status", [("stranger", 403), (None, 401)])
@@ -204,3 +270,230 @@ async def test_disconnect_after_sending_fails_fast() -> None:
         await asyncio.wait_for(task, 2)  # well under the 15s timeout
     assert exc_info.value.status_code == 502
     assert conn.pending_mcp_tools == {}
+
+
+_LOGIN_URL = f"/v1/hosts/{_HOST_ID}/mcp-servers/login"
+_OWNER = {"x-test-user": "owner"}
+_PENDING = {
+    "login_id": "abc_DEF-123",
+    "state": "pending",
+    "authorization_url": "https://auth.example.test/authorize?redirect_uri=x",
+    "error": None,
+}
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("POST", "", {"harness": "claude", "server": "linear"}),
+        ("GET", "/abc", None),
+        ("POST", "/abc/callback", {"callback_url": "http://localhost:1/callback?code=c"}),
+        ("DELETE", "/abc", None),
+    ],
+)
+@pytest.mark.parametrize(
+    "gate",
+    [
+        False,
+        pytest.param(lambda: False, id="callable-false"),
+        pytest.param(_broken_gate, id="raises"),
+    ],
+)
+async def test_disabled_management_hides_login_routes(
+    db_uri: str,
+    gate: bool | Callable[[], bool],
+    method: str,
+    path: str,
+    body: dict | None,
+) -> None:
+    app, registry, _ = _make_tools_app(db_uri, gate)
+    conn = _register(registry, CAP_MCP_LOGIN)
+    async with _client(app) as client:
+        response = await client.request(method, _LOGIN_URL + path, json=body, headers=_OWNER)
+    assert response.status_code == 404
+    assert conn.outbound_queue.empty()
+
+
+async def _answer_login(
+    conn: HostConnection, result: HostMcpLoginResultFrame
+) -> HostMcpLoginFrame:
+    frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
+    assert isinstance(frame, HostMcpLoginFrame)
+    result.request_id = frame.request_id
+    conn.pending_mcp_logins[frame.request_id].set_result(result)
+    return frame
+
+
+@pytest.mark.parametrize(
+    "method,path,body,expected",
+    [
+        (
+            "POST",
+            "",
+            {"harness": "claude", "server": "linear", "plugin": "tools", "source_id": "b" * 64},
+            {
+                "action": "start",
+                "harness": "claude",
+                "server": "linear",
+                "plugin": "tools",
+                "source_id": "b" * 64,
+            },
+        ),
+        ("GET", "/abc_DEF-123", None, {"action": "status", "login_id": "abc_DEF-123"}),
+        (
+            "POST",
+            "/abc_DEF-123/callback",
+            {"callback_url": "http://localhost:1/callback?code=c"},
+            {
+                "action": "submit",
+                "login_id": "abc_DEF-123",
+                "callback_url": "http://localhost:1/callback?code=c",
+            },
+        ),
+        ("DELETE", "/abc_DEF-123", None, {"action": "cancel", "login_id": "abc_DEF-123"}),
+    ],
+)
+async def test_owner_drives_mcp_login(
+    tools_app, method: str, path: str, body: dict | None, expected: dict
+) -> None:
+    app, registry, _ = tools_app
+    conn = _register(registry, CAP_MCP_LOGIN)
+    async with _client(app) as client:
+        task = asyncio.create_task(
+            client.request(method, _LOGIN_URL + path, json=body, headers=_OWNER)
+        )
+        frame = await _answer_login(conn, HostMcpLoginResultFrame("", "ok", **_PENDING))
+        response = await task
+    assert response.status_code == 200
+    assert response.json() == _PENDING
+    assert {key: getattr(frame, key) for key in expected} == expected
+    assert not conn.pending_mcp_logins
+
+
+@pytest.mark.parametrize(
+    "result,status,detail",
+    [
+        (
+            HostMcpLoginResultFrame("", "not_found", error="Sign-in not found"),
+            404,
+            "Sign-in not found",
+        ),
+        (
+            HostMcpLoginResultFrame("", "invalid", error="That isn't the address"),
+            400,
+            "That isn't the address",
+        ),
+        (HostMcpLoginResultFrame("", "busy", error="Too many sign-ins"), 503, "Too many sign-ins"),
+        # Host failure text stays on the host.
+        (
+            HostMcpLoginResultFrame("", "failed", error="private detail"),
+            502,
+            "host MCP sign-in failed",
+        ),
+        (
+            HostMcpLoginResultFrame("", "ok", login_id="x", state="bogus", error="private detail"),
+            502,
+            "host sent a malformed MCP sign-in reply",
+        ),
+    ],
+)
+async def test_mcp_login_host_errors(
+    tools_app, result: HostMcpLoginResultFrame, status: int, detail: str
+) -> None:
+    app, registry, _ = tools_app
+    conn = _register(registry, CAP_MCP_LOGIN)
+    async with _client(app) as client:
+        task = asyncio.create_task(client.get(f"{_LOGIN_URL}/abc", headers=_OWNER))
+        await _answer_login(conn, result)
+        response = await task
+    assert (response.status_code, response.json()["detail"]) == (status, detail)
+
+
+@pytest.mark.parametrize(
+    "user,capabilities,method,path,body,status",
+    [
+        ("stranger", (CAP_MCP_LOGIN,), "GET", "/abc", None, 403),
+        ("stranger", (CAP_MCP_LOGIN,), "POST", "", {"harness": "claude", "server": "x"}, 403),
+        (
+            "stranger",
+            (CAP_MCP_LOGIN,),
+            "POST",
+            "/abc/callback",
+            {"callback_url": "http://localhost:1/callback?code=c"},
+            403,
+        ),
+        (None, (CAP_MCP_LOGIN,), "DELETE", "/abc", None, 401),
+        ("owner", (CAP_MCP_TOOLS,), "GET", "/abc", None, 501),
+        ("owner", (CAP_MCP_LOGIN,), "GET", "/a.b", None, 422),
+        ("owner", (CAP_MCP_LOGIN,), "POST", "", {"harness": "cursor", "server": "x"}, 422),
+        (
+            "owner",
+            (CAP_MCP_LOGIN,),
+            "POST",
+            "/abc/callback",
+            {"callback_url": "x" * (MCP_LOGIN_MAX_CALLBACK + 1)},
+            422,
+        ),
+    ],
+)
+async def test_mcp_login_requests_rejected_before_the_host(
+    tools_app,
+    user: str | None,
+    capabilities: tuple[str, ...],
+    method: str,
+    path: str,
+    body: dict | None,
+    status: int,
+) -> None:
+    app, registry, _ = tools_app
+    conn = _register(registry, *capabilities)
+    async with _client(app) as client:
+        response = await client.request(
+            method,
+            _LOGIN_URL + path,
+            json=body,
+            headers={"x-test-user": user} if user else {},
+        )
+    assert response.status_code == status
+    assert conn.outbound_queue.empty()
+
+
+# A live host absent from this replica's registry is re-addressed only when sharded.
+@pytest.mark.parametrize(
+    ("sharded", "status", "code"), [(True, 400, "wrong_replica"), (False, 409, "conflict")]
+)
+async def test_mcp_login_for_a_host_on_another_replica(
+    tools_app, monkeypatch: pytest.MonkeyPatch, sharded: bool, status: int, code: str
+) -> None:
+    app, _, _ = tools_app
+    monkeypatch.setattr(_host_launch, "_deployment_is_sharded", lambda: sharded)
+    async with _client(app) as client:
+        response = await client.post(
+            _LOGIN_URL, json={"harness": "claude", "server": "docs"}, headers=_OWNER
+        )
+    assert (response.status_code, response.json()["error"]["code"]) == (status, code)
+
+
+@pytest.mark.parametrize("outcome,status", [("timeout", 504), ("disconnect", 502)])
+async def test_unanswered_mcp_login_requests_are_cleaned_up(
+    tools_app, monkeypatch: pytest.MonkeyPatch, outcome: str, status: int
+) -> None:
+    app, registry, _ = tools_app
+    conn = _register(registry, CAP_MCP_LOGIN)
+    if outcome == "timeout":
+        monkeypatch.setattr(mcp_tools_routes, "_MCP_LOGIN_TIMEOUT_S", 0.01)
+    async with _client(app) as client:
+        task = asyncio.create_task(client.get(f"{_LOGIN_URL}/abc", headers=_OWNER))
+        await asyncio.wait_for(conn.outbound_queue.get(), 2)
+        if outcome == "disconnect":
+            registry.deregister(conn.host_id)
+        response = await asyncio.wait_for(task, 2)
+    assert response.status_code == status
+    assert conn.pending_mcp_logins == {}
+
+
+def test_server_outwaits_host_sign_in_steps() -> None:
+    # A host that gives up on a start still stops its CLI (up to 2s) before replying.
+    assert mcp_tools_routes._MCP_LOGIN_START_TIMEOUT_S >= START_TIMEOUT_SECONDS + 5
+    # A submit's listener exchange and its terminal fallback each end within the callback timeout.
+    assert mcp_tools_routes._MCP_LOGIN_SUBMIT_TIMEOUT_S >= 2 * CALLBACK_TIMEOUT_SECONDS + 5

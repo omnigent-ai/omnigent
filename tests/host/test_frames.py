@@ -12,6 +12,7 @@ from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
+    MCP_LOGIN_MAX_URL,
     SERVER_CAP_TMUX_READINESS,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
@@ -48,6 +49,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostMcpLoginFrame,
+    HostMcpLoginResultFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
     HostMcpToolsFrame,
@@ -2921,6 +2924,15 @@ def test_skill_content_allow_list_and_correlated_malformed_result():
             "m", "ok", tools=[{"name": "read", "description": None}], connection="connected"
         ),
         HostMcpToolsResultFrame("m", "failed"),
+        HostMcpToolsResultFrame("m", "ok", connection="needs_auth", harness_sign_in="signed_in"),
+        HostMcpLoginFrame("m", "start", "claude", "linear", "tools", "a" * 64),
+        HostMcpLoginFrame(
+            "m", "submit", login_id="l1", callback_url="http://localhost:1/cb?code=x"
+        ),
+        HostMcpLoginResultFrame(
+            "m", "ok", "l1", "pending", "https://auth.example.test/authorize?x=1"
+        ),
+        HostMcpLoginResultFrame("m", "invalid", error="This sign-in is no longer waiting"),
     ],
 )
 def test_mcp_tools_round_trip(frame):
@@ -2946,6 +2958,45 @@ def test_mcp_tools_allow_list_and_correlated_malformed_result():
     frame = decode_host_frame(json.dumps(payload))
     assert isinstance(frame, HostMcpToolsResultFrame)
     assert (frame.request_id, frame.status, frame.tools) == ("m", "failed", [])
+
+
+def test_mcp_tools_result_drops_unknown_sign_in_state():
+    payload = {
+        "kind": "host.mcp_tools_result",
+        "request_id": "m",
+        "status": "ok",
+        "tools": [],
+        "connection": "needs_auth",
+        "truncated": False,
+        "harness_sign_in": "something_newer",
+    }
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostMcpToolsResultFrame)
+    assert (frame.status, frame.harness_sign_in) == ("ok", None)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"state": "bogus"},
+        # test_mcp_servers_result_validates_reported_account_state covers the URL predicate.
+        {"authorization_url": "javascript:alert(1)"},
+        {"authorization_url": "https://auth.example.test/?" + "a" * MCP_LOGIN_MAX_URL},
+    ],
+)
+def test_mcp_login_result_rejects_unsafe_replies(fields):
+    payload = {
+        "kind": "host.mcp_login_result",
+        "request_id": "m",
+        "status": "ok",
+        "login_id": "l1",
+        "state": "pending",
+        "authorization_url": "https://auth.example.test/authorize",
+        **fields,
+    }
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostMcpLoginResultFrame)
+    assert (frame.request_id, frame.status, frame.authorization_url) == ("m", "failed", None)
 
 
 def test_import_local_session_archived_flag_defaults_and_must_be_a_bool() -> None:

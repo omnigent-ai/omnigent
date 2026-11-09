@@ -91,6 +91,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "sandbox_profiles": False,
         "usage_page": False,
         "harness_install": False,
+        "mcp_sign_in": False,
         "canvas": False,
         "arca_shutdown_warnings": False,
         "import_review": False,

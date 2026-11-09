@@ -13,6 +13,7 @@ from omnigent.server.feature_flags import (
     Feature,
     FeatureFlags,
     harness_install_enabled,
+    mcp_sign_in_enabled,
     resolve_feature_flags,
 )
 
@@ -35,6 +36,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "sandbox_profiles": False,
         "usage_page": False,
         "harness_install": False,
+        "mcp_sign_in": False,
         "canvas": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
@@ -203,6 +205,18 @@ def test_harness_install_callable_failure_fails_closed(caplog: pytest.LogCapture
         assert harness_install_enabled(broken_gate) is False
 
     assert "harness_install gate failed" in caplog.text
+
+
+def test_mcp_sign_in_callable_failure_fails_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def broken_gate() -> bool:
+        raise RuntimeError("gate unavailable")
+
+    with caplog.at_level(logging.WARNING):
+        assert mcp_sign_in_enabled(broken_gate) is False
+
+    assert "mcp_sign_in gate failed" in caplog.text
 
 
 def test_release_flags_have_lifecycle_metadata_and_expected_defaults() -> None:
