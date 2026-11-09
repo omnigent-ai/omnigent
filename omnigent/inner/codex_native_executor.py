@@ -915,33 +915,31 @@ async def _inject_codex_turn(
     settings_overrides: Mapping[str, object],
 ) -> None:
     """Retain input while a standalone shell or explicitly refused compaction settles."""
-    state = await _wait_for_shell_completion(client, bridge_dir, state)
-    try:
-        await _inject_codex_turn_once(
-            client,
-            bridge_dir=bridge_dir,
-            state=state,
-            input_items=input_items,
-            settings_overrides=settings_overrides,
-        )
-        return
-    except CodexAppServerResponseError as error:
-        if state.active_turn_id is None or not is_compaction_steer_refusal(error):
+    resubmitting = False
+    while True:
+        state = await _wait_for_shell_completion(client, bridge_dir, state)
+        try:
+            await _inject_codex_turn_once(
+                client,
+                bridge_dir=bridge_dir,
+                state=state,
+                input_items=input_items,
+                settings_overrides=settings_overrides,
+            )
+            return
+        except CodexAppServerResponseError as error:
+            if state.active_turn_id is None or not is_compaction_steer_refusal(error):
+                raise
+        except _CodexNativeInputUndelivered:
             raise
-    recovered_state = await _wait_for_compaction_turn(bridge_dir, state)
-    try:
-        await _inject_codex_turn_once(
-            client,
-            bridge_dir=bridge_dir,
-            state=recovered_state,
-            input_items=input_items,
-            settings_overrides=settings_overrides,
-        )
-    except (CodexAppServerResponseError, _CodexNativeInputUndelivered):
-        raise
-    except Exception as exc:
-        # Codex may have accepted the resubmitted input before its reply was lost.
-        raise InjectionDeliveryAmbiguous(str(exc)) from exc
+        except Exception as exc:
+            if not resubmitting:
+                raise
+            # Codex may have accepted the resubmitted input before its reply was lost.
+            raise InjectionDeliveryAmbiguous(str(exc)) from exc
+        # Every retry follows an explicit refusal and waits for that turn to settle.
+        state = await _wait_for_compaction_turn(bridge_dir, state)
+        resubmitting = True
 
 
 async def _wait_for_compaction_turn(

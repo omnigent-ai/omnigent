@@ -302,12 +302,14 @@ def _compact_steer_refusal() -> CodexAppServerResponseError:
     )
 
 
+@pytest.mark.parametrize("compaction_count", [1, 2])
 @pytest.mark.parametrize("next_turn_id", [None, "turn_new"], ids=["completed", "superseded"])
 @pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
 async def test_compact_steer_waits_for_settlement_before_delivering_once(
     draining_client,
     next_turn_id: str | None,
     live_injection: bool,
+    compaction_count: int,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -315,7 +317,7 @@ async def test_compact_steer_waits_for_settlement_before_delivering_once(
     state = read_bridge_state(tmp_path)
     assert state is not None
     refused = asyncio.Event()
-    draining_client.delivery_errors = [_compact_steer_refusal()]
+    draining_client.delivery_errors = [_compact_steer_refusal() for _ in range(compaction_count)]
     draining_client.on_refusal = refused.set
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
@@ -333,11 +335,16 @@ async def test_compact_steer_waits_for_settlement_before_delivering_once(
     with input_delivery_scope({"input_stable_id": "a" * 32}, response_id="resp_delivery"):
         delivery = asyncio.create_task(send())
     try:
-        await asyncio.wait_for(refused.wait(), 2)
-        await asyncio.sleep(0)
-        assert not delivery.done(), "a temporary compaction refusal must keep the input pending"
-        assert len(draining_client.requests) == 1
-        write_bridge_state(tmp_path, replace(state, active_turn_id=next_turn_id))
+        for index in range(compaction_count):
+            await asyncio.wait_for(refused.wait(), 2)
+            await asyncio.sleep(0)
+            assert not delivery.done(), (
+                "a temporary compaction refusal must keep the input pending"
+            )
+            assert len(draining_client.requests) == index + 1
+            refused.clear()
+            next_state = next_turn_id if index + 1 == compaction_count else "turn_compact_next"
+            write_bridge_state(tmp_path, replace(state, active_turn_id=next_state))
         result = await asyncio.wait_for(delivery, 2)
         if live_injection:
             assert result is True
@@ -349,7 +356,7 @@ async def test_compact_steer_waits_for_settlement_before_delivering_once(
 
     assert draining_client.accepted_inputs == [[{"type": "text", "text": "queued input"}]]
     assert [method for method, _params in draining_client.requests] == [
-        "turn/steer",
+        *(["turn/steer"] * compaction_count),
         "turn/start" if next_turn_id is None else "turn/steer",
     ]
     if next_turn_id is not None:
@@ -362,9 +369,7 @@ async def test_compact_steer_waits_for_settlement_before_delivering_once(
         in {"codex_native_compaction_wait", "codex_native_delivery_finished"}
     ]
     assert [record.attributes["outcome"] for record in records] == [
-        "rpc_rejected_compacting",
-        "waiting",
-        "settled",
+        *(["rpc_rejected_compacting", "waiting", "settled"] * compaction_count),
         "rpc_accepted",
     ]
     assert all(record.attributes["input_stable_id"] == "a" * 32 for record in records)
@@ -523,7 +528,7 @@ async def test_compact_steer_wait_cancellation_propagates_without_resubmission(
     assert draining_client.closes == 1
 
 
-@pytest.mark.parametrize("reply_lost", [True, False], ids=["reply-lost", "refused-again"])
+@pytest.mark.parametrize("reply_lost", [True, False], ids=["reply-lost", "input-too-large"])
 @pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
 async def test_compact_steer_second_submission_failure_is_bounded(
     draining_client, reply_lost: bool, live_injection: bool, tmp_path: Path
@@ -531,7 +536,11 @@ async def test_compact_steer_second_submission_failure_is_bounded(
     _seed_bridge(tmp_path, active_turn_id="turn_compact")
     state = read_bridge_state(tmp_path)
     assert state is not None
-    second = _ReplyLost("reply lost") if reply_lost else _compact_steer_refusal()
+    second = (
+        _ReplyLost("reply lost")
+        if reply_lost
+        else CodexAppServerResponseError(_INPUT_TOO_LARGE_ERROR)
+    )
     draining_client.delivery_errors = [_compact_steer_refusal(), second]
     draining_client.on_refusal = lambda: write_bridge_state(
         tmp_path, replace(state, active_turn_id="turn_new")
@@ -5348,11 +5357,13 @@ async def test_owned_native_wait_past_sixty_seconds(
     ("rebind", "clear_relaunch", "pause_clear"),
     [(False, False, False), (True, False, False), (False, True, False), (False, True, True)],
 )
+@pytest.mark.parametrize("compaction_count", [1, 2])
 async def test_compaction_wait_cannot_revive_input_after_executor_interrupt(
     draining_client,
     tmp_path: Path,
     queued_count: int,
     entry_point: str,
+    compaction_count: int,
     rebind: bool,
     clear_relaunch: bool,
     pause_clear: bool,
@@ -5369,7 +5380,7 @@ async def test_compaction_wait_cannot_revive_input_after_executor_interrupt(
     observed = read_bridge_state(tmp_path)
     assert observed is not None
     refused = asyncio.Event()
-    draining_client.delivery_errors = [_compact_steer_refusal()]
+    draining_client.delivery_errors = [_compact_steer_refusal() for _ in range(compaction_count)]
     draining_client.on_refusal = refused.set
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
     executor.interrupt_session = AsyncMock(wraps=executor.interrupt_session)
@@ -5395,7 +5406,11 @@ async def test_compaction_wait_cannot_revive_input_after_executor_interrupt(
 
     deliveries = [asyncio.create_task(send())]
     try:
-        await asyncio.wait_for(refused.wait(), 2)
+        for index in range(compaction_count):
+            await asyncio.wait_for(refused.wait(), 2)
+            refused.clear()
+            if index + 1 < compaction_count:
+                write_bridge_state(tmp_path, replace(observed, active_turn_id="turn_compact_next"))
         if queued_count == 2:
             deliveries.append(asyncio.create_task(send()))
             await asyncio.sleep(0)
@@ -5439,7 +5454,13 @@ async def test_compaction_wait_cannot_revive_input_after_executor_interrupt(
             delivery.cancel()
         await asyncio.gather(*deliveries, return_exceptions=True)
     assert draining_client.accepted_inputs == []
-    assert [method for method, _ in draining_client.requests] == ["turn/steer", "turn/interrupt"]
+    assert [method for method, _ in draining_client.requests] == [
+        *(["turn/steer"] * compaction_count),
+        "turn/interrupt",
+    ]
+    assert draining_client.requests[-1][1]["turnId"] == (
+        "turn_compact" if compaction_count == 1 else "turn_compact_next"
+    )
     current = read_bridge_state(tmp_path)
     assert current is not None and current.interrupt_generation == 1
     if rebind:
