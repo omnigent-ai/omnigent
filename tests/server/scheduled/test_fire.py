@@ -4316,8 +4316,14 @@ def test_a_run_on_another_agent_leaves_off_the_copys_mcp_picks() -> None:
     same_agent = run_copy_dropped_label_keys(labels, agent_changed=False)
     other_agent = run_copy_dropped_label_keys(labels, agent_changed=True)
 
-    # Presentation is always re-stamped for the run's agent.
-    assert {"omnigent.ui", "omnigent.wrapper"} <= same_agent
+    # Presentation is always re-stamped for the run's agent, and the copy's permission
+    # labels never describe the run, which launches with the task's mode.
+    assert {
+        "omnigent.ui",
+        "omnigent.wrapper",
+        "omnigent.claude_native.permission_mode",
+        "omnigent.codex_native.approval_mode",
+    } <= same_agent
     assert "omnigent.mcp_service.jira" not in same_agent
     assert "omnigent.mcp_service.jira" in other_agent
 

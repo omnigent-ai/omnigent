@@ -272,11 +272,16 @@ def run_copy_dropped_label_keys(
     """
     from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
     from omnigent.mcp_selection import MCP_SELECTION_PREFIX
-    from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
+    from omnigent.server.routes._sessions.common import (
+        _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
+        _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
+    )
 
     dropped = {
         FORK_SOURCE_LABEL_KEY,
+        # A run launches with the task's permission mode; its runtime reports the mode.
         _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
+        _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
         UI_MODE_LABEL_KEY,
         WRAPPER_LABEL_KEY,
     }
