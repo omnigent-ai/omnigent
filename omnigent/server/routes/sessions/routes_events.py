@@ -821,7 +821,7 @@ def _hold_send_for_host_sign_in(session_id: str) -> bool:
     """
     first_held = _host_sign_in_holds.get(session_id)
     if first_held is not None and time.monotonic() - first_held > HOST_SIGN_IN_HOLD_S:
-        _host_sign_in_holds.pop(session_id, None)
+        # Keep expiry visible to both the prelaunch and postlaunch checks.
         return False
     if first_held is None:
         _host_sign_in_holds[session_id] = time.monotonic()

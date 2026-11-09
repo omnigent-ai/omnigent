@@ -2626,7 +2626,11 @@ _SIGN_IN_EXIT_REPORT = (
 )
 
 
-@pytest.mark.parametrize("holds", [True, False], ids=["holding_client", "other_client"])
+@pytest.mark.parametrize(
+    "holds, expired",
+    [(True, False), (False, False), (True, True)],
+    ids=["holding_client", "other_client", "expired_hold"],
+)
 async def test_native_message_relaunch_holds_send_until_the_host_signs_in(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -2634,6 +2638,7 @@ async def test_native_message_relaunch_holds_send_until_the_host_signs_in(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     holds: bool,
+    expired: bool,
 ) -> None:
     """A runner refused on its host's expired sign-in holds a holding client's send.
 
@@ -2691,6 +2696,20 @@ async def test_native_message_relaunch_holds_send_until_the_host_signs_in(
     assert after is not None and after.runner_id == held_runner.runner_id
     outcomes = [event.attributes["outcome"] for event in _runner_client_wait_events(caplog)]
     assert outcomes[-1] == "host_sign_in_held"
+
+    if expired:
+        routes_events._host_sign_in_holds[session_id] = (
+            time.monotonic() - routes_events.HOST_SIGN_IN_HOLD_S - 1
+        )
+        expired_response = await _relaunch_then_report_exit(
+            client, comm, session_id, _SIGN_IN_EXIT_REPORT, headers=_HOLD_SEND_HEADERS
+        )
+        assert expired_response.status_code == 202, expired_response.text
+        expired_items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+        assert [item["code"] for item in expired_items if item["type"] == "error"] == [
+            "runner_failed_to_start"
+        ]
+        return
 
     # A reconnecting host may have signed in again, so its next send relaunches.
     await comm.send_input({"type": "websocket.disconnect", "code": 1001})

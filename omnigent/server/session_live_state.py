@@ -254,6 +254,7 @@ def persist_scheduled_run_completion(
     *,
     error_code: str | None = None,
     error: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Transition a scheduled-task run to terminal when its turn ends.
 
@@ -287,19 +288,21 @@ def persist_scheduled_run_completion(
     :param error_code: Short failure classification when ``run_status`` is
         ``"failed"`` (e.g. the conversation's ``last_task_error_code``).
     :param error: Optional human-readable failure detail for ``"failed"``.
+    :param run_id: Owned occurrence to finish instead of looking up a possibly newer run.
     """
     store = _scheduled_task_store
     if store is None:
         return
 
     def _transition() -> None:
-        run = store.get_running_run_by_conversation(conversation_id)
-        if run is None:
-            # Not a scheduled fire, or its run is already terminal — nothing to
-            # do. This is the common case (interactive sessions).
-            return
+        target_run_id = run_id
+        if target_run_id is None:
+            run = store.get_running_run_by_conversation(conversation_id)
+            if run is None:
+                return
+            target_run_id = run.id
         store.update_run(
-            run.id,
+            target_run_id,
             status=run_status,
             finished_at=int(time.time()),
             error=error,
