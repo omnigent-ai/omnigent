@@ -27,3 +27,15 @@ def enable_grouping_ui(page: Page, enabled: bool = True) -> None:
         route.fulfill(response=response, json=info)
 
     page.route("**/v1/info", serve_info)
+
+
+def open_session_filters(page: Page) -> None:
+    """Open the sidebar funnel's Display submenu, which lists the session filters."""
+    page.get_by_test_id("session-filter").click()
+    page.get_by_test_id("session-display-menu").click()
+
+
+def choose_session_filter(page: Page, value: str) -> None:
+    """Pick the ``all``/``mine``/``shared``/``archived`` filter from the sidebar funnel."""
+    open_session_filters(page)
+    page.get_by_test_id(f"session-filter-{value}").click()

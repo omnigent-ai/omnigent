@@ -1297,12 +1297,10 @@ describe("index.css shared UI font smoothing", () => {
 });
 
 /* On the macOS desktop shell the window's top strip carries the OS traffic
- * lights plus the Search/Settings/toggle cluster, and the cluster is owned by
- * AppShell rather than the sidebar so it holds that spot whether the sidebar is
- * open, collapsed, or peeking. Asserted at the CSS level because the whole
- * change is CSS — and because the lights are painted by macOS OUTSIDE the page,
- * so no DOM test (and no page screenshot) can see them. These values ARE the
- * alignment.
+ * lights plus persistent sidebar actions. The wordmark and Search occupy the
+ * row below while the sidebar is open; Search joins the title-bar actions when
+ * collapsed. Asserted at the CSS level because the lights are painted by macOS
+ * OUTSIDE the page, so no DOM test (and no page screenshot) can see them.
  */
 describe("index.css electron-mac sidebar header", () => {
   const sidebarRule = cssSource.match(
@@ -1311,7 +1309,6 @@ describe("index.css electron-mac sidebar header", () => {
   const headerRowRule = cssSource.match(
     /\[data-electron-mac\] \.sidebar-header-row \{[^}]*\}/,
   )?.[0];
-  const brandRule = cssSource.match(/\[data-electron-mac\] \.sidebar-brand \{[^}]*\}/)?.[0];
   const inSidebarActionsRule = cssSource.match(
     /\[data-electron-mac\] \.conversations-sidebar \[data-testid="sidebar-header-actions"\] \{[^}]*\}/,
   )?.[0];
@@ -1336,12 +1333,13 @@ describe("index.css electron-mac sidebar header", () => {
     expect(sidebarRule).toContain("margin-top: 0");
   });
 
-  it("drops the brand mark, which has nowhere to sit beside the lights", () => {
-    expect(brandRule).toContain("display: none");
+  it("keeps the brand mark visible below the title bar", () => {
+    expect(cssSource).not.toMatch(/\[data-electron-mac\] \.sidebar-brand \{[^}]*display:\s*none/);
   });
 
-  it("reserves the entire drag band before the sidebar content", () => {
-    expect(headerRowRule).toContain("height: var(--mac-titlebar-height)");
+  it("reserves the drag band above a normal-height brand row", () => {
+    expect(headerRowRule).toContain("height: calc(var(--mac-titlebar-height) + 3rem)");
+    expect(headerRowRule).toContain("padding: var(--mac-titlebar-height) 1rem 0");
   });
 
   it("hides the sidebar's own cluster in favour of the title-bar copy", () => {
@@ -1390,7 +1388,7 @@ describe("index.css electron-mac sidebar header", () => {
     expect(peekHeaderRowRule).toContain("display: none");
   });
 
-  it("orders the cluster Collapse, Search, Settings left-to-right", () => {
+  it("orders the cluster Toggle, Search, Settings left-to-right", () => {
     // The DOM order is Search → Settings → toggle (tab order follows
     // importance), so the toggle is reordered visually rather than moved.
     expect(stripActionsRule).toMatch(/&\s*>\s*\*\s*>\s*\*:last-child\s*\{[^}]*order:\s*-1/);
@@ -1425,7 +1423,6 @@ describe("index.css electron-mac sidebar header", () => {
     const selectorsInSource = [...cssSource.matchAll(/(^|\})\s*([^{}]+?)\s*\{/g)].map((m) => m[2]);
     for (const cls of [
       ".sidebar-header-row",
-      ".sidebar-brand",
       ".settings-sidebar-header",
       ".electron-sidebar-header-actions",
       ".chat-header-sidebar-toggle",

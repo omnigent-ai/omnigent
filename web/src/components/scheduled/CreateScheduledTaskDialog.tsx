@@ -647,7 +647,7 @@ export function CreateScheduledTaskDialog({
     validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
       null;
   const renderedTriggerPrompt =
-    trigger !== null && triggerFieldsComplete(triggerFields)
+    trigger !== null && triggerFieldsComplete(triggerFields, trigger)
       ? renderTriggerPrompt(trigger, triggerFields, {
           // Workers run where the manager runs: beside it on a connected host,
           // or each in its own sandbox.

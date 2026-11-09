@@ -11160,6 +11160,62 @@ def test_github_label_ops_are_served_on_host(
     assert calls[1][-3:] == ["repos/example/one/issues/42/labels", "-f", "labels[]=bug"]
 
 
+def test_github_commit_ops_are_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host lists a tracked PR's commits and reads one commit when the runner is offline."""
+    from omnigent.host.frames import HostFsRequestFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    head, commit = "a" * 40, "c" * 40
+    url = "https://github.com/example/one/pull/42"
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if argv[-1] == "repos/example/one/pulls/42":
+            pr = {"head": {"sha": head}, "base": {"sha": "b" * 40}, "commits": 1}
+            return 0, json.dumps(pr), ""
+        if "--paginate" in argv:
+            author = {"name": "Ada", "date": "2026-11-01T10:00:00Z"}
+            entries = [{"sha": commit, "commit": {"message": "Fix", "author": author}}]
+            return 0, json.dumps([entries]), ""
+        return 0, "commit-patch", ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+    try:
+        listed = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="commits",
+                op="github_commits",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "head_sha": head},
+            )
+        )
+        patch = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="commit-diff",
+                op="github_commit_diff",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "commit_sha": commit},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert listed.status == "ok", listed
+    assert [entry["sha"] for entry in listed.payload["data"]] == [commit]
+    assert patch.status == "ok", patch
+    assert patch.payload == {"object": "session.github.pr_diff", "patch": "commit-patch"}
+
+
 def test_github_merge_ops_are_served_on_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
