@@ -255,6 +255,7 @@ describe("resolveServerInfo session_search_scope", () => {
 describe.each([
   "scheduled_task_projects",
   "scheduled_task_harness_settings",
+  "scheduled_task_approval_skipping_modes",
   "scheduled_task_subhour",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
@@ -317,6 +318,32 @@ describe("resolveServerInfo request_managed_sandbox_host_id", () => {
   ])("parses %s strictly as %s", async (advertised, expected) => {
     const parsed = await probe({ request_managed_sandbox_host_id: advertised });
     expect(parsed.request_managed_sandbox_host_id).toBe(expected);
+  });
+});
+
+describe("resolveServerInfo session_bundle_workspaces", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("requires explicit support for %s", async (value, expected) => {
+    expect((await probe({ session_bundle_workspaces: value })).session_bundle_workspaces).toBe(
+      expected,
+    );
+  });
+});
+
+describe("resolveServerInfo sibling_session_destinations", () => {
+  it.each([
+    ["current_host", "current_host"],
+    ["current_host_or_new_sandbox", "current_host_or_new_sandbox"],
+    ["any_host", "any_host"],
+    [undefined, "any_host"],
+    ["connected_hosts", "current_host"],
+  ])("parses %s as %s", async (advertised, expected) => {
+    const parsed = await probe({ sibling_session_destinations: advertised });
+    expect(parsed.sibling_session_destinations).toBe(expected);
   });
 });
 
