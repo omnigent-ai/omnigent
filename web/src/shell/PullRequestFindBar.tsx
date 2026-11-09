@@ -19,6 +19,8 @@ export interface PullRequestFindBarProps {
   invalid: boolean;
   /** The regular expression ran past its time budget. */
   tooSlow: boolean;
+  /** The regular expression could not be searched because its worker failed. */
+  failed: boolean;
   /** The regular expression is still running. */
   searching: boolean;
   /** Matches in files the filters hide. */
@@ -64,6 +66,7 @@ function findStatus({
   query,
   invalid,
   tooSlow,
+  failed,
   searching,
   total,
   position,
@@ -72,6 +75,7 @@ function findStatus({
   query: string;
   invalid: boolean;
   tooSlow: boolean;
+  failed: boolean;
   searching: boolean;
   total: number;
   position: number;
@@ -80,7 +84,9 @@ function findStatus({
   if (!query.trim()) return "";
   if (invalid) return "Invalid";
   if (tooSlow) return "Pattern too slow";
-  if (searching) return "Searching…";
+  if (failed) return "Search failed";
+  // A refresh keeps the last matches while it reruns, so the position stays visible.
+  if (searching && total === 0) return "Searching…";
   if (total === 0) return "No results";
   const count = `${total}${truncated ? "+" : ""}`;
   // Position is 0 for the moment between a query change and the viewport seeding its match.
@@ -95,6 +101,7 @@ export function PullRequestFindBar({
   truncated,
   invalid,
   tooSlow,
+  failed,
   searching,
   hiddenCount,
   hiddenTruncated,
@@ -141,7 +148,16 @@ export function PullRequestFindBar({
     );
   }
 
-  const status = findStatus({ query, invalid, tooSlow, searching, total, position, truncated });
+  const status = findStatus({
+    query,
+    invalid,
+    tooSlow,
+    failed,
+    searching,
+    total,
+    position,
+    truncated,
+  });
 
   return (
     <div className="flex min-w-0 flex-1 items-center gap-1.5 text-ui">

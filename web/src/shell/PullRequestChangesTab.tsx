@@ -1234,6 +1234,7 @@ export function PullRequestChangesTab({
                 truncated={search.truncated}
                 invalid={search.invalid}
                 tooSlow={search.tooSlow}
+                failed={search.failed}
                 searching={search.searching}
                 hiddenCount={hiddenSearch.matches.length}
                 hiddenTruncated={hiddenSearch.truncated}

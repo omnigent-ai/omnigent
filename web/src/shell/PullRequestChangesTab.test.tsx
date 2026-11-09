@@ -41,9 +41,11 @@ const mocks = vi.hoisted(() => ({
   commitsUnavailable: false,
   /** The PR's server lacks the commit routes. */
   commitsUnsupported: false,
-  /** A saved review draft, anchored to one file's line, as the composer hook reports it. */
   /** Makes the regex search report the time budget as spent, as a backtracking pattern would. */
   patternTooSlow: false,
+  /** Makes the regex search report that its worker could not run. */
+  patternFailed: false,
+  /** A saved review draft, anchored to one file's line, as the composer hook reports it. */
   draftAnchor: null as null | {
     path: string;
     side: "LEFT" | "RIGHT";
@@ -68,8 +70,10 @@ vi.mock("./pullRequestPatternSearch", async (importOriginal) => {
       options: Parameters<typeof findMatches>[2],
     ) =>
       mocks.patternTooSlow
-        ? { matches: [], truncated: false, invalid: false, tooSlow: true }
-        : { ...findMatches(corpus, query, options), tooSlow: false },
+        ? { matches: [], truncated: false, invalid: false, tooSlow: true, failed: false }
+        : mocks.patternFailed
+          ? { matches: [], truncated: false, invalid: false, tooSlow: false, failed: true }
+          : { ...findMatches(corpus, query, options), tooSlow: false, failed: false },
   };
 });
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
@@ -245,6 +249,7 @@ const sectionHeader = (path: string, expanded: boolean) =>
 describe("PullRequestChangesTab", () => {
   afterEach(() => {
     mocks.patternTooSlow = false;
+    mocks.patternFailed = false;
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -460,6 +465,35 @@ describe("PullRequestChangesTab", () => {
     fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
     fireEvent.change(findInput(), { target: { value: "needle" } });
     expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+  });
+
+  it("reports a search whose worker could not run", async () => {
+    mocks.patternFailed = true;
+    renderTab({ conversationId: "find-failed" });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    fireEvent.change(findInput(), { target: { value: "needle" } });
+
+    expect(await screen.findByText("Search failed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Next match" })).toBeDisabled();
+  });
+
+  it("follows the shown match across regex refreshes while the search reruns", async () => {
+    const { rerender } = renderTab({ conversationId: "find-regex-refresh" });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    fireEvent.change(findInput(), { target: { value: "needle" } });
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+
+    // The worker is still running here, so the shown match must survive the pending search.
+    rerender(A + addedFile("b.ts", ["x1", "x2", "x3", "x4", "gamma", "needle here"]) + C);
+    expect(screen.getByText("1 of 2")).toBeInTheDocument();
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+
+    rerender(
+      A + addedFile("b.ts", ["needle top", "x2", "x3", "x4", "x5", "gamma", "needle here"]) + C,
+    );
+    expect(await screen.findByText("2 of 3")).toBeInTheDocument();
   });
 
   it("closes on Escape, returns focus to the trigger, and reopens on the shortcut", () => {

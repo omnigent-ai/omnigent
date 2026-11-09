@@ -161,8 +161,8 @@ Component coverage for these helpers and views lives in
 - **Cmd+F is scoped to the Changes tab.** It opens the in-tab bar with focus anywhere
   in the tab, including review comment boxes. On macOS only Cmd+F counts; Ctrl+F still
   moves the caret there. Outside the tab, the browser's own find runs.
-- **Regex find runs on the page's main thread.** A pathological pattern can freeze
-  the Changes tab until it finishes. Known follow-up, not yet fixed.
+- **Regex find runs in a worker with a one-second budget.** It shows "Searching…" while
+  it runs and "Pattern too slow" when the budget is spent; plain find stays synchronous.
 - **Highlights need the browser's CSS highlight API.** Without it, the match's row
   still centres but is not painted. Highlight painting was checked only in Chromium.
 - **Find's reveal ends with a collapse.** Collapsing a file that find opened keeps it

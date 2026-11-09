@@ -15,6 +15,7 @@ const SEARCHING: FindSearch = {
   truncated: false,
   invalid: false,
   tooSlow: false,
+  failed: false,
   searching: true,
 };
 
@@ -31,8 +32,8 @@ export function useFindSearch(
   options: { matchCase: boolean; regex: boolean },
 ): FindSearch {
   const { matchCase, regex } = options;
-  // Blank queries and plain substrings are cheap and stay synchronous.
-  const onWorker = regex && query.trim() !== "";
+  // Blank queries, an empty corpus and plain substrings are cheap and stay synchronous.
+  const onWorker = regex && query.trim() !== "" && corpus.length > 0;
   const local = useMemo<FindSearch | null>(
     () =>
       onWorker
@@ -40,6 +41,7 @@ export function useFindSearch(
         : {
             ...findMatches(corpus, query, { matchCase, regex, limit: MATCH_LIMIT }),
             tooSlow: false,
+            failed: false,
             searching: false,
           },
     [corpus, query, matchCase, regex, onWorker],
@@ -61,10 +63,17 @@ export function useFindSearch(
     // Typing a new pattern stops the previous worker, so a runaway pattern can't keep running.
     return () => controller.abort();
   }, [corpus, query, matchCase, onWorker]);
+  // A refreshed corpus under the same query keeps the last matches while the worker reruns,
+  // so the occurrence the reader is on survives the wait. A new query drops them.
+  const refreshing = useMemo<FindSearch | null>(
+    () => (settled ? { ...settled.search, searching: true } : null),
+    [settled],
+  );
 
   if (local) return local;
-  if (settled?.corpus === corpus && settled.query === query && settled.matchCase === matchCase) {
-    return settled.search;
+  if (settled?.query === query && settled.matchCase === matchCase) {
+    if (settled.corpus === corpus) return settled.search;
+    if (refreshing) return refreshing;
   }
   return SEARCHING;
 }

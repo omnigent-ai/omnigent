@@ -1284,7 +1284,7 @@ _BACKTRACKING_FIND_PATCH = (
     "@@ -1,2 +1,3 @@\n"
     " line1\n"
     "+added line\n"
-    f"+{'a' * 28}!\n"
+    f"+{'a' * 40}!\n"
 )
 
 
@@ -1316,6 +1316,9 @@ def test_changes_find_regex_over_budget_reports_too_slow(
     panel.get_by_role("button", name="Find in changes", exact=True).click()
     find = panel.get_by_role("textbox", name="Find in changes", exact=True)
     panel.get_by_role("button", name="Regular expression", exact=True).click()
+    # A benign pattern first, so a worker that never runs can't pass for a timeout.
+    find.fill("added\\s+line")
+    expect(panel.get_by_text("1 of 1", exact=True)).to_be_visible()
     find.fill("(a+)+$")
     expect(panel.get_by_text("Pattern too slow", exact=True)).to_be_visible(timeout=10_000)
 
