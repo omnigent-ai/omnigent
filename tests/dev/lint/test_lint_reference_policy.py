@@ -188,18 +188,21 @@ def test_branch_range_checks_committed_changes(
 ) -> None:
     base = git(repository, "rev-parse", "HEAD").decode().strip()
     git(repository, "mv", "existing.txt", "renamed.txt")
+    (repository / "existing.txt").mkdir()
+    (repository / "existing.txt" / "safe.txt").write_text("safe\n", encoding="utf-8")
     if edit_renamed:
         (repository / "renamed.txt").write_text(
             f"{prohibited_name}\nkeep\n{prohibited_name}\n", encoding="utf-8"
         )
     (repository / "notes.md").write_text(f"# Note\n{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
-    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
-    (repository / "notes.md").write_bytes(b"\x00")
-    assert check(repository) == []
     expected = ["notes.md:2: prohibited reference in added text"]
     if edit_renamed:
         expected.append("renamed.txt:3: prohibited reference in added text")
+    assert check(repository) == expected
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
+    (repository / "notes.md").write_bytes(b"\x00")
+    assert check(repository) == []
     assert check(repository, base, "HEAD") == expected
 
 
@@ -262,6 +265,10 @@ def test_deletion_and_binary_content(repository: Path, prohibited_name: str) -> 
             "notes.txt:2: prohibited reference in added text",
         ]
     )
+    blob = git(repository, "rev-parse", ":notes.txt").decode().strip()
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "module")
+    git(repository, "update-index", "--cacheinfo", f"100644,{blob},{prohibited_name}-module")
+    assert check(repository) == [f"{prohibited_name}-module:2: prohibited reference in added text"]
 
 
 def test_only_policy_definition_is_exempt(repository: Path, prohibited_name: str) -> None:

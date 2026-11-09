@@ -97,17 +97,26 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
         target = head or "HEAD"
         ancestor = git(root, "merge-base", base, target).decode().strip()
         revisions = [ancestor, target]
-    options = ["--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", *revisions]
+    options = ["--no-ext-diff", "--no-textconv", "--no-color"]
     entries = iter(
         git(
-            root, "diff", *options, "--raw", "--no-abbrev", "-z", "--diff-filter=AMRT", "--"
+            root,
+            "diff",
+            *options,
+            "--find-renames",
+            *revisions,
+            "--raw",
+            "--no-abbrev",
+            "-z",
+            "--diff-filter=AMRT",
+            "--",
         ).split(b"\0")
     )
     findings = []
     for metadata in entries:
         if not metadata:
             break
-        _, mode, _, object_id, status = metadata.split()
+        old_mode, mode, old_object_id, object_id, status = metadata[1:].split()
         old_path = os.fsdecode(next(entries))
         renamed = status.startswith(b"R")
         path = os.fsdecode(next(entries)) if renamed else old_path
@@ -123,20 +132,19 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
         violation_lines = _violation_lines(contents.decode("utf-8", errors="replace"))
         if not violation_lines:
             continue
-        if old_path in POLICY_FILES:
+        if status == b"A" or old_mode == b"160000" or old_path in POLICY_FILES:
             added_lines = violation_lines
         else:
-            paths = [old_path, path] if renamed else [path]
             patch = git(
                 root,
-                "--literal-pathspecs",
                 "diff",
                 *options,
                 "--text",
                 "--unified=0",
                 "--inter-hunk-context=0",
+                old_object_id.decode(),
+                object_id.decode(),
                 "--",
-                *paths,
             ).decode("utf-8", errors="replace")
             added_lines = set()
             line_number = None
