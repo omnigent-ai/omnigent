@@ -32,7 +32,8 @@ export interface MessageItem extends BaseItem {
   model?: string;
   /** Human author email; omitted for agent/tool/system items. */
   created_by?: string;
-  /** Human submission confirmed by the server, including anonymous input. */
+  /** Explicit user action, possibly server-expanded skill instructions.
+   * Independent of is_meta; client-settable by convention, not a trust signal. */
   user_authored?: boolean;
   /** Hidden durable context such as injected skill instructions. */
   is_meta?: boolean;
