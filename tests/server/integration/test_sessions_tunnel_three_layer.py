@@ -2578,7 +2578,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     store.set_host_id(session_id, host_id, workspace="/tmp/host-offline")
     snapshot_ids = {session_id}
     if batched_snapshot:
-        monkeypatch.setattr(server_app, "_HOST_HOLD_SNAPSHOT_BATCH_SIZE", 2, raising=False)
+        monkeypatch.setattr(server_app, "_HOST_HOLD_SNAPSHOT_BATCH_SIZE", 2)
         for _ in range(4):
             extra = store.create_conversation(runner_id=runner_id)
             store.set_host_id(extra.id, host_id, workspace="/tmp/host-offline")
