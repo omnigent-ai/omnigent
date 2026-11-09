@@ -41,7 +41,7 @@ export async function recoverMessageAttachments(
   const missing: string[] = [];
   results.forEach((result, index) => {
     if (result.status === "fulfilled") files.push(result.value);
-    else missing.push(attachmentLabel(attachments[index]!));
+    else missing.push(withoutPendingPrefix(attachmentLabel(attachments[index]!)));
   });
   return { files, missing };
 }
@@ -60,9 +60,25 @@ function decodeDataUri(uri: string, filename: string | undefined): File {
   const mimeType = match[1] || "application/octet-stream";
   const isBase64 = match[2]!.toLowerCase().split(";").includes("base64");
   const payload = match[3]!;
+  // RFC 2397 payloads may be percent-encoded; non-base64 ones can carry raw bytes.
   const bytes = isBase64
-    ? Uint8Array.from(atob(payload), (character) => character.charCodeAt(0))
-    : new TextEncoder().encode(decodeURIComponent(payload));
+    ? Uint8Array.from(atob(decodeURIComponent(payload)), (character) => character.charCodeAt(0))
+    : percentDecodeBytes(payload);
   const extension = mimeType.split("/")[1]?.split("+")[0] ?? "bin";
   return new File([bytes], filename ?? `image.${extension}`, { type: mimeType });
+}
+
+/** Decode `%XX` escapes byte for byte, encoding other characters as UTF-8. */
+function percentDecodeBytes(payload: string): Uint8Array<ArrayBuffer> {
+  const encoder = new TextEncoder();
+  const bytes: number[] = [];
+  for (const part of payload.split(/(%[0-9a-f]{2})/i)) {
+    if (/^%[0-9a-f]{2}$/i.test(part)) bytes.push(Number.parseInt(part.slice(1), 16));
+    else bytes.push(...encoder.encode(part));
+  }
+  return Uint8Array.from(bytes);
+}
+
+function withoutPendingPrefix(label: string): string {
+  return label.startsWith(PENDING_FILE_PREFIX) ? label.slice(PENDING_FILE_PREFIX.length) : label;
 }

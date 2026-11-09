@@ -44,10 +44,25 @@ describe("recoverMessageAttachments", () => {
       { type: "input_image", image_url: "data:image/png;base64,%%%", filename: "broken.png" },
       // A non-string filename from an imported transcript is labelled by its file id.
       { type: "input_file", file_id: "file_odd", filename: 42 as unknown as string },
+      { type: "input_file", file_id: "pending:draft.csv" },
     ]);
 
     expect(files.map((file) => file.name)).toEqual(["ok.txt"]);
-    expect(missing).toEqual(["gone.txt", "broken.png", "file_odd"]);
+    expect(missing).toEqual(["gone.txt", "broken.png", "file_odd", "draft.csv"]);
+  });
+
+  it("decodes percent-encoded data URIs byte for byte", async () => {
+    const { files, missing } = await recoverMessageAttachments(null, [
+      // "iVBORw==" with its "=" padding percent-encoded.
+      { type: "input_image", image_url: "data:image/png;base64,iVBORw%3D%3D", filename: "a.png" },
+      { type: "input_image", image_url: "data:image/png,%89PNG%0D", filename: "b.png" },
+    ]);
+
+    expect(missing).toEqual([]);
+    expect([...new Uint8Array(await files[0]!.arrayBuffer())]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+    expect([...new Uint8Array(await files[1]!.arrayBuffer())]).toEqual([
+      0x89, 0x50, 0x4e, 0x47, 0x0d,
+    ]);
   });
 
   it("can't download without the session it was sent in", async () => {

@@ -7150,6 +7150,30 @@ describe("Composer — editing a sent message", () => {
     expect(screen.getByText("notes.txt")).toBeInTheDocument();
   });
 
+  it("cancels a confirmed replacement when the user keeps the draft mid-download", async () => {
+    let finishDownload: () => void = () => {};
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishDownload = () => resolve(new Response("meeting notes"));
+        }),
+    );
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+
+    act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Keep draft" }));
+    await act(async () => finishDownload());
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("half-written thought");
+    expect(screen.queryByText("notes.txt")).toBeNull();
+    expect(toasts).toEqual([]);
+  });
+
   it("dismisses a pending confirmation when the conversation changes", async () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
@@ -7211,6 +7235,27 @@ describe("Composer — editing a sent message", () => {
     expect(textarea()).toHaveValue("");
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.queryByText("notes.txt")).toBeNull();
+  });
+
+  it("drops a load that finishes after the composer unmounts", async () => {
+    // A failed download would toast if the stale load still applied.
+    let finishDownload: () => void = () => {};
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishDownload = () => resolve(new Response("gone", { status: 404 }));
+        }),
+    );
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { unmount } = renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    const editSentMessage = ref.current!.editSentMessage;
+
+    act(() => editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
+    unmount();
+    await act(async () => finishDownload());
+
+    expect(toasts).toEqual([]);
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("lets the newer Edit win when an older download finishes last", async () => {

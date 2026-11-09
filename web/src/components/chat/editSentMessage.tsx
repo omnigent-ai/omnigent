@@ -58,21 +58,9 @@ interface PendingReplacement {
 }
 
 /**
- * Load a sent message into a composer, confirming first when a draft would be replaced.
- *
- * A draft present at click is confirmed before anything downloads; the dialog
- * stays open while a confirmed download runs. A draft typed during an
- * unconfirmed download gets the dialog once it finishes. A newer Edit, Keep
- * draft, a change of `target`, or unmounting drops a download still in flight.
- *
- * @param target - Identifies the draft the composer is showing (its conversation).
- * @param canAccept - Whether the composer can take a message now; read at click
- *   and again before anything is applied.
- * @param hasDraft - Whether the composer holds unsent input.
- * @param applyDraft - Replaces the composer's draft and focuses it.
- * @param focusComposer - Focuses the composer again once the dialog has closed.
- * @returns `editMessage` for {@link EditSentMessageContext}, and the confirmation
- *   dialog to render.
+ * Load a sent message into a composer, confirming before a draft is replaced
+ * and dropping loads a newer Edit, Keep draft, or a change of `target` supersedes.
+ * `focusComposer` refocuses the composer after the dialog's focus trap releases.
  */
 export function useEditSentMessage({
   target,

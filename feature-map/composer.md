@@ -822,8 +822,8 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/pages/ChatPage.composer.test.tsx`,
   `web/src/components/chat/SideChatPane.test.tsx`, and
   `web/src/lib/recoverMessageAttachments.test.ts`. Grid session panes and
-  sub-agent Workspace tabs render the same `SideChatPane`, so its component
-  tests cover them; to check one by hand, open
+  sub-agent Workspace tabs render the same `SideChatPane`, whose Edit logic has
+  component coverage; their own wiring is checked by hand: open
   a grid pane or a writable Workspace tab, click Edit on a message you sent
   there, and confirm that pane's composer fills while the main one stays empty.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
