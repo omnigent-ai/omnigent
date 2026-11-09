@@ -8,6 +8,10 @@ from typing import Final, Literal, TypeGuard
 from omnigent_client import harness_readiness as _client_readiness
 
 HARNESS_BINARY_MISSING: Final[Literal["binary-missing"]] = "binary-missing"
+# The CLI resolves but its ``--version`` probe timed out, so its version is unknown.
+HARNESS_CLI_UNRESPONSIVE: Final[Literal["cli-unresponsive"]] = (
+    _client_readiness.HARNESS_CLI_UNRESPONSIVE
+)
 HARNESS_NEEDS_AUTH: Final[Literal["needs-auth"]] = _client_readiness.HARNESS_NEEDS_AUTH
 HARNESS_VERSION_TOO_LOW: Final[Literal["version-too-low"]] = "version-too-low"
 # A native (tmux-backed) harness whose CLI is usable but the host's tmux is
@@ -16,12 +20,17 @@ HARNESS_VERSION_TOO_LOW: Final[Literal["version-too-low"]] = "version-too-low"
 HARNESS_TMUX_UNAVAILABLE: Final[Literal["tmux-unavailable"]] = "tmux-unavailable"
 
 HarnessUnavailableReason = Literal[
-    "binary-missing", "needs-auth", "version-too-low", "tmux-unavailable"
+    "binary-missing",
+    "cli-unresponsive",
+    "needs-auth",
+    "version-too-low",
+    "tmux-unavailable",
 ]
 HarnessAvailability = Literal[
     True,
     False,
     "binary-missing",
+    "cli-unresponsive",
     "needs-auth",
     "version-too-low",
     "tmux-unavailable",
@@ -37,6 +46,7 @@ def is_harness_availability(value: object) -> TypeGuard[HarnessAvailability]:
     """Return whether a decoded value is a supported readiness state."""
     return isinstance(value, bool) or value in (
         HARNESS_BINARY_MISSING,
+        HARNESS_CLI_UNRESPONSIVE,
         HARNESS_NEEDS_AUTH,
         HARNESS_VERSION_TOO_LOW,
         HARNESS_TMUX_UNAVAILABLE,
@@ -59,7 +69,7 @@ def harness_launch_availability(
     harness: str | None,
     readiness: Mapping[str, object] | None,
 ) -> tuple[bool | None, str | None]:
-    """Treat host auth reports as advisory; sessions can supply credentials."""
+    """Treat auth and unresponsive-CLI reports as advisory; the host launch can still work."""
     from omnigent.harness_aliases import canonicalize_harness
 
     return _client_readiness.harness_launch_availability(harness, readiness, canonicalize_harness)

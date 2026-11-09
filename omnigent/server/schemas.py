@@ -27,6 +27,7 @@ from omnigent_client.wire import (  # noqa: F401 -- re-exported wire schemas
     CompletedEvent,
     ConversationRef,
     CreatedEvent,
+    DailyCost,
     ElicitationRequestEvent,
     ElicitationRequestParams,
     ElicitationResolvedEvent,
@@ -82,6 +83,7 @@ from omnigent_client.wire import (  # noqa: F401 -- re-exported wire schemas
     SessionTerminalPendingEvent,
     SessionTitleEvent,
     SessionTodosEvent,
+    SessionUsage,
     SessionUsageEvent,
     SupersessionReason,
     ToolOutputDeltaEvent,
@@ -92,12 +94,14 @@ from omnigent_client.wire import (  # noqa: F401 -- re-exported wire schemas
     UiOpenFileEvent,
     Usage,
     UsageDetails,
+    UsageReport,
     _SSEEventBase,
 )
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    RootModel,
     SerializerFunctionWrapHandler,
     Strict,
     field_validator,
@@ -109,8 +113,18 @@ from pydantic.json_schema import SkipJsonSchema
 from omnigent.entities import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
+    CompactionData,
     ConversationItem,
+    ErrorData,
+    FunctionCallData,
+    FunctionCallOutputData,
+    NativeToolData,
+    ResourceEventData,
+    RoutingDecisionData,
+    SlashCommandData,
+    TerminalCommandData,
 )
+from omnigent.entities.conversation import StartupInputOptions
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
@@ -145,20 +159,7 @@ class PaginatedList(BaseModel):
     has_more: bool = False
 
 
-class AgentList(PaginatedList):
-    """
-    The built-in agent list, plus the packaged names this deployment hides.
-
-    :param suppressed_agent_names: Packaged built-ins ``OMNIGENT_SEEDED_AGENTS``
-        trimmed from ``data``. The web picker also discovers agents from a
-        user's recent sessions, so it needs these names to keep a hidden
-        built-in with prior sessions from resurfacing as a custom agent.
-    """
-
-    suppressed_agent_names: list[str] = Field(default_factory=list)
-
-
-# ── Agents ──────────────────────────────────────────────────────
+# ── Agents ──────────────────────────────────────────────────
 
 
 class MCPServerSummary(BaseModel):
@@ -493,6 +494,24 @@ class AgentDetailObject(AgentObject):
     """Agent summary with caller ownership for management actions."""
 
     user_owned: bool
+
+
+class AgentList(BaseModel):
+    """
+    Paginated list of agents; ``data`` is a page of ``AgentObject``.
+
+    :param suppressed_agent_names: Packaged built-ins ``OMNIGENT_SEEDED_AGENTS``
+        trimmed from ``data``. The web picker also discovers agents from a
+        user's recent sessions, so it needs these names to keep a hidden
+        built-in with prior sessions from resurfacing as a custom agent.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[AgentObject] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+    suppressed_agent_names: list[str] = Field(default_factory=list)
 
 
 # ── Session Policies ───────────────────────────────────────────
@@ -3103,6 +3122,186 @@ class ChildSessionList(BaseModel):
     has_more: bool = False
 
 
+class _SessionItemCommon(BaseModel):
+    """Store-assigned fields shared by every flattened session item."""
+
+    id: str = Field(description='Store-assigned item ID, e.g. ``"msg_abc123"``.')
+    response_id: str = Field(description="ID of the task/response that produced this item.")
+    status: str = Field(description='Item status, e.g. ``"completed"``.')
+    created_at: int = Field(description="Unix epoch seconds of creation.")
+    created_by: str | None = Field(
+        default=None,
+        description="Identity of the human author; omitted for agent, tool, and system items.",
+    )
+
+
+class SessionContentBlock(BaseModel):
+    """
+    One ``content`` or ``summary`` block of a message or reasoning item.
+
+    Blocks are heterogeneous (``input_text``, ``output_text``,
+    ``input_image``, ``summary_text``, ...), so kinds other than text
+    carry extra keys.
+
+    :param type: Block kind, e.g. ``"input_text"`` or ``"output_text"``.
+    :param text: Text body of a text block; absent for other kinds.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+    text: str | None = None
+
+
+class SessionMessageItem(_SessionItemCommon):
+    """
+    ``message`` item as returned by ``GET /v1/sessions/{id}/items``.
+
+    Mirrors ``MessageData`` field for field. The entity keeps the blocks
+    as free-form dicts, so this variant spells out the typed block shape
+    instead of inheriting it.
+
+    :param type: Always ``"message"``.
+    :param role: ``"user"`` or ``"assistant"``.
+    :param content: Content blocks in order.
+    :param model: Agent name; present on assistant messages, absent on
+        user messages.
+    :param is_meta: ``True`` for durable context hidden from user-facing
+        transcripts; omitted when ``False``.
+    :param user_authored: ``True`` for confirmed or conservatively
+        preserved user input; omitted when ``False``.
+    :param subagent_return_id: Native task id of an explicitly completed
+        child; omitted when unset.
+    :param interrupted: ``True`` for a partial assistant response from an
+        interrupted turn; omitted when ``False``.
+    :param stream_message_id: Native live-preview stream finalized by this
+        assistant message.
+    :param phase: Assistant-only harness label, e.g. ``"commentary"``;
+        omitted when unset.
+    :param startup_options: Request options kept while a startup input
+        awaits delivery; omitted when unset.
+    """
+
+    type: Literal["message"]
+    role: Literal["user", "assistant"]
+    content: list[SessionContentBlock]
+    model: str | None = None
+    is_meta: bool = False
+    user_authored: bool = False
+    subagent_return_id: str | None = None
+    interrupted: bool = False
+    stream_message_id: str | None = None
+    phase: str | None = None
+    startup_options: StartupInputOptions | None = None
+
+
+class SessionFunctionCallItem(_SessionItemCommon, FunctionCallData):
+    """``function_call`` item: common fields plus ``FunctionCallData``."""
+
+    type: Literal["function_call"]
+
+
+class SessionFunctionCallOutputItem(_SessionItemCommon, FunctionCallOutputData):
+    """``function_call_output`` item: common fields plus ``FunctionCallOutputData``."""
+
+    type: Literal["function_call_output"]
+
+
+class SessionErrorItem(_SessionItemCommon, ErrorData):
+    """``error`` item: common fields plus ``ErrorData``."""
+
+    type: Literal["error"]
+
+
+class SessionReasoningItem(_SessionItemCommon):
+    """
+    ``reasoning`` item as returned by ``GET /v1/sessions/{id}/items``.
+
+    Mirrors ``ReasoningData`` field for field, with its text blocks typed
+    as ``SessionContentBlock`` like message content.
+
+    :param type: Always ``"reasoning"``.
+    :param model: Agent name.
+    :param summary: Summary text blocks,
+        e.g. ``[{"type": "summary_text", "text": "..."}]``.
+    :param content: Raw reasoning text blocks; absent when redacted.
+    :param encrypted_content: Encrypted reasoning content; absent when none.
+    """
+
+    type: Literal["reasoning"]
+    model: str
+    summary: list[SessionContentBlock]
+    content: list[SessionContentBlock] | None = None
+    encrypted_content: str | None = None
+
+
+class SessionCompactionItem(_SessionItemCommon, CompactionData):
+    """``compaction`` item: common fields plus ``CompactionData``."""
+
+    type: Literal["compaction"]
+
+
+class SessionNativeToolItem(_SessionItemCommon, NativeToolData):
+    """``native_tool`` item: common fields plus ``NativeToolData``."""
+
+    type: Literal["native_tool"]
+
+
+class SessionResourceEventItem(_SessionItemCommon, ResourceEventData):
+    """``resource_event`` item: common fields plus ``ResourceEventData``."""
+
+    type: Literal["resource_event"]
+
+
+class SessionRoutingDecisionItem(_SessionItemCommon, RoutingDecisionData):
+    """``routing_decision`` item: common fields plus ``RoutingDecisionData``."""
+
+    type: Literal["routing_decision"]
+
+
+class SessionSlashCommandItem(_SessionItemCommon, SlashCommandData):
+    """``slash_command`` item: common fields plus ``SlashCommandData``."""
+
+    type: Literal["slash_command"]
+
+
+class SessionTerminalCommandItem(_SessionItemCommon, TerminalCommandData):
+    """``terminal_command`` item: common fields plus ``TerminalCommandData``."""
+
+    type: Literal["terminal_command"]
+
+
+class SessionItem(
+    RootModel[
+        Annotated[
+            SessionMessageItem
+            | SessionFunctionCallItem
+            | SessionFunctionCallOutputItem
+            | SessionErrorItem
+            | SessionReasoningItem
+            | SessionCompactionItem
+            | SessionNativeToolItem
+            | SessionResourceEventItem
+            | SessionRoutingDecisionItem
+            | SessionSlashCommandItem
+            | SessionTerminalCommandItem,
+            Field(discriminator="type"),
+        ]
+    ]
+):
+    """One record of ``GET /v1/sessions/{id}/items``; ``type`` selects the variant."""
+
+
+class SessionItemList(BaseModel):
+    """Paginated list of session items; ``data`` is a page of ``SessionItem``."""
+
+    object: Literal["list"] = "list"
+    data: list[SessionItem] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
 class SideChatSummary(BaseModel):
     """
     A side chat listed in its parent session's Workspace rail.
@@ -3127,89 +3326,6 @@ class SideChatList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
-
-
-class SessionUsage(BaseModel):
-    """
-    One session's rolled-up LLM spend for the ``GET /v1/usage`` report.
-
-    ``cost_usd`` is the subtree total — the session plus every sub-agent it
-    spawned — read from ``session_usage`` via
-    :func:`omnigent.runtime.policies.builder.load_session_usage`. It is the
-    authoritative session figure (the same value the web session sidebar
-    shows as "Session cost" and the daily rollup records).
-
-    ``models`` is the per-model cost breakdown, mirroring the web session
-    sidebar's per-model list. Deliberately **not guaranteed to sum to
-    ``cost_usd``**: native harnesses report a single cumulative session
-    total and the server attributes it to the currently-active model, so on
-    a session that switched models mid-run each model's bucket is a snapshot
-    of the running total rather than that model's own spend. The header
-    ``cost_usd`` stays authoritative; the per-model values are shown
-    faithfully as recorded (same convention as the web UI).
-
-    :param id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :param created_at: Unix epoch seconds of creation.
-    :param updated_at: Unix epoch seconds of last activity.
-    :param title: Optional human-readable title.
-    :param cost_usd: Authoritative cumulative USD spend for this session's
-        subtree.
-    :param models: Per-model recorded cost, keyed by the raw harness model
-        id (e.g. ``{"claude-opus-4-8": 14.03}``). Empty when no per-model
-        cost was recorded. May not sum to ``cost_usd`` (see above).
-    """
-
-    id: str
-    created_at: int
-    updated_at: int
-    title: str | None = None
-    cost_usd: float = 0.0
-    models: dict[str, float] = Field(default_factory=dict)
-    harness: str | None = None
-    other_harnesses: list[str] | None = None
-    llm_model: str | None = None
-    agent_name: str | None = None
-
-
-class DailyCost(BaseModel):
-    """One day's LLM spend for the daily timeline chart."""
-
-    day: str
-    cost_usd: float = 0.0
-
-
-class UsageReport(BaseModel):
-    """
-    Aggregated LLM usage for the calling user, powering ``omni usage``.
-
-    The cost summary is sourced from the per-user daily-cost rollup
-    (``user_daily_cost``), which attributes spend to the UTC calendar day it
-    occurred on. Windows are therefore calendar-day buckets summed back from
-    today — ``cost_today`` / ``cost_last_7d`` / ``cost_last_30d`` — not
-    rolling wall-clock hours, so a weeks-old session touched today is not
-    counted wholly in "today".
-
-    The ``sessions`` list is a separate detail view built from each session's
-    cumulative ``session_usage`` (newest activity first), so the summary and
-    the per-session list come from different sources and are not guaranteed
-    to tie out to the cent (the summary counts every priced turn ever
-    recorded for the user; the list only covers the user's currently-listed
-    top-level sessions).
-
-    :param cost_today: Total spend on the current UTC day.
-    :param cost_last_7d: Total spend over the last 7 UTC days (incl. today).
-    :param cost_last_30d: Total spend over the last 30 UTC days (incl. today).
-    :param total_cost_usd: All-time total spend from the daily rollup.
-    :param sessions: Per-session detail, newest activity first.
-    """
-
-    object: Literal["usage_report"] = "usage_report"
-    cost_today: float = 0.0
-    cost_last_7d: float = 0.0
-    cost_last_30d: float = 0.0
-    total_cost_usd: float = 0.0
-    daily_costs: list[DailyCost] = Field(default_factory=list)
-    sessions: list[SessionUsage] = Field(default_factory=list)
 
 
 # ── Permissions ────────────────────────────────────────────────────

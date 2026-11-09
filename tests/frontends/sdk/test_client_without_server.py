@@ -138,5 +138,8 @@ def test_server_reuses_client_wire_schemas() -> None:
     """One definition: the server's event union and closed-session check are the client's."""
     assert server_schemas.ServerStreamEvent is client_wire.ServerStreamEvent
     assert server_schemas.CompletedEvent is client_wire.CompletedEvent
+    assert server_schemas.UsageReport is client_wire.UsageReport
+    assert server_schemas.SessionUsage is client_wire.SessionUsage
+    assert server_schemas.DailyCost is client_wire.DailyCost
     assert server_session_lifecycle.is_session_closed is client_session_lifecycle.is_session_closed
     assert runner_identity.OMNIGENT_INTERNAL_WS_ORIGIN == client_wire.OMNIGENT_INTERNAL_WS_ORIGIN

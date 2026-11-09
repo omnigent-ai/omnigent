@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Final, Literal
 
+# The CLI resolves but its ``--version`` probe timed out, so its version is unknown.
+HARNESS_CLI_UNRESPONSIVE: Final[Literal["cli-unresponsive"]] = "cli-unresponsive"
 HARNESS_NEEDS_AUTH: Final[Literal["needs-auth"]] = "needs-auth"
 
 
@@ -48,14 +50,16 @@ def harness_launch_availability(
     canonicalize: Callable[[str], str | None] | None = None,
 ) -> tuple[bool | None, str | None]:
     """
-    Treat host auth reports as advisory; sessions can supply credentials.
+    Treat auth and unresponsive-CLI reports as advisory; the host launch can still work.
 
     :param harness: Harness the session needs, e.g. ``"claude-sdk"``.
     :param readiness: The host's ``configured_harnesses`` map, or ``None``.
     :param canonicalize: Optional alias normalizer; see
         :func:`reported_harness_availability`.
     :returns: ``(available, reason)``; ``available`` is ``None`` when
-        unknown or when the host only reports missing credentials.
+        unknown or when the host only reports missing credentials or an
+        unresponsive CLI.
     """
     available, reason = reported_harness_availability(harness, readiness, canonicalize)
-    return (None if reason == HARNESS_NEEDS_AUTH else available), reason
+    advisory = reason in (HARNESS_NEEDS_AUTH, HARNESS_CLI_UNRESPONSIVE)
+    return (None if advisory else available), reason

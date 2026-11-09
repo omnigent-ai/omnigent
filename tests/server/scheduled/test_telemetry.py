@@ -32,6 +32,7 @@ def task() -> ScheduledTask:
         ("ui", "slack", "ui", "slack"),
         ("ui", "github", "ui", "github"),
         ("ui", "linear", "ui", "linear"),
+        ("ui", "pagerduty", "ui", "pagerduty"),
         ("ui", "follow-up-monitor", "ui", "follow-up-monitor"),
         ("ui", "pr-sweep", "ui", "pr-sweep"),
         ("ui", "news-digest", "ui", "news-digest"),

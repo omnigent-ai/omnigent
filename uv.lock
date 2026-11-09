@@ -42,7 +42,6 @@ exclude-newer-span = "P7D"
 cwsandbox = "2026-06-12T00:00:00Z"
 google-antigravity = "2026-06-12T00:00:00Z"
 nimble-python = "2026-07-29T00:00:00Z"
-oauthlib = "2026-11-01T00:00:00Z"
 
 [manifest]
 members = [
