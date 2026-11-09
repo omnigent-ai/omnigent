@@ -642,7 +642,7 @@ async def test_native_startup_registration_preserves_the_accepted_actor(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, user_id: str
 ) -> None:
     from omnigent.server.routes._auth_helpers import attribution_user
-    from omnigent.server.routes._sessions.orchestration import _record_codex_native_input
+    from omnigent.server.routes._sessions.orchestration import _record_native_terminal_input
 
     if user_id != "local":
         auth_client.headers["X-Forwarded-Email"] = user_id
@@ -659,10 +659,10 @@ async def test_native_startup_registration_preserves_the_accepted_actor(
         {**_INPUT, "data": {**_INPUT["data"], "stable_id": entry.id}}
     )
     try:
-        first = await _record_codex_native_input(
+        first = await _record_native_terminal_input(
             session_id, event, startup.conversations, attribution_user(user_id), entry.id, True
         )
-        retry = await _record_codex_native_input(
+        retry = await _record_native_terminal_input(
             session_id, event, startup.conversations, attribution_user(user_id), entry.id, True
         )
         assert first[0] is not None and first[1:] == (None, entry.id, True)
