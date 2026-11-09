@@ -179,7 +179,7 @@ def load(
         is a tarball or bytes, ignored when *source* is a directory
         or omnigent YAML.
     :param expand_env: Whether to expand ``${VAR}`` references in
-        connection blocks, MCP headers, and MCP ``env`` against the
+        executor auth, connection blocks, MCP headers, and MCP ``env`` against the
         current process environment. ``True`` (the default) is for
         operator-authored specs whose author is the process owner
         (local ``omnigent run``, ``--agent`` preregistration). It
@@ -245,6 +245,7 @@ def load(
         if is_omnigent_yaml(source):
             return load_omnigent_yaml(
                 source,
+                expand_env=expand_env,
                 enforce_handler_allowlist=enforce_handler_allowlist,
                 prune_invalid_sub_agents=prune_invalid_sub_agents,
             )
@@ -278,14 +279,13 @@ def load(
     # YAML into a single-file tarball for the agent store. See
     # omnigent/spec/_omnigent_compat.py for the tech-debt
     # ownership; remove when omnigent compat ends.
-    # The omnigent single-file path (load_omnigent_yaml) copies
-    # headers / connection verbatim and never expands ``${VAR}``
-    # against the process env, so it is safe regardless of
-    # *expand_env* and the flag does not apply.
+    # The single-file path must honor *expand_env* for executor auth as
+    # well as the native config.yaml parser does.
     candidate = _find_omnigent_yaml_in_dir(root)
     if candidate is not None:
         return load_omnigent_yaml(
             candidate,
+            expand_env=expand_env,
             enforce_handler_allowlist=enforce_handler_allowlist,
             prune_invalid_sub_agents=prune_invalid_sub_agents,
         )

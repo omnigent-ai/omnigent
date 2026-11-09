@@ -26,6 +26,7 @@ _CREATE_ARGS = {
     "prompt": "Triage new issues.",
     "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
     "agent_id": "ag_1",
+    "permission_mode": None,
 }
 
 
@@ -45,7 +46,12 @@ def _no_guardrails_spec(
         ("sys_scheduled_task_create", _CREATE_ARGS, PolicyAction.ASK),
         (
             "sys_scheduled_task_update",
-            {"scheduled_task_id": _TASK_ID, "state": "paused"},
+            {
+                "scheduled_task_id": _TASK_ID,
+                "state": "paused",
+                "prompt": "Triage new issues.",
+                "permission_mode": "bypassPermissions",
+            },
             PolicyAction.ASK,
         ),
     ],

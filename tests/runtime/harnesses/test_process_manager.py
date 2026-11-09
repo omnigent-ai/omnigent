@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -47,6 +48,7 @@ from omnigent.runtime.harnesses.process_manager import (
     HarnessProcessManager,
     NoLiveHarnessError,
     _default_tmp_parent,
+    _HarnessHttpClient,
     _kill_orphan_runners,
     _model_env_key,
     _pid_alive,
@@ -145,6 +147,46 @@ async def test_get_client_before_start_raises(
     """
     with pytest.raises(RuntimeError, match="before start"):
         await manager.get_client("conv_x", _TEST_HARNESS_NAME)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Привет 🐍", "Привет 🐍 recording-\udcff.txt \ud800", r"literal \udcff"],
+    ids=["unicode", "surrogates", "literal-escape"],
+)
+async def test_harness_client_preserves_json_text(text: str) -> None:
+    """Escaping surrogate code points preserves text, header overrides and strict JSON."""
+    async with _HarnessHttpClient(
+        headers={"Content-Type": "application/vnd.harness+json"}
+    ) as client:
+        event = {"content": [{"text": text}], text: "nested key"}
+        request = client.build_request("POST", "http://harness/events", json=event)
+        assert json.loads(request.content) == event
+        assert request.headers["content-type"] == "application/vnd.harness+json"
+        assert text.split()[0] in request.content.decode("utf-8")
+        with pytest.raises(ValueError, match="Out of range float"):
+            client.build_request(
+                "POST", "http://harness/events", json={"text": text, "n": float("nan")}
+            )
+
+
+async def test_harness_client_delivers_json_with_surrogate_text(
+    manager: HarnessProcessManager,
+) -> None:
+    """Surrogates in retained content cannot crash HTTPX before harness delivery."""
+    event = {"type": "interrupt", "content": "Привет 🐍 recording-\udcff.txt \ud800"}
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_unicode", _TEST_HARNESS_NAME)
+        async with client.stream(
+            "POST", "/v1/sessions/conv_unicode/events", json=event
+        ) as response:
+            assert response.status_code == 204
+        assert response.request.headers["content-type"] == "application/json"
+        assert json.loads(response.request.content) == event
+        assert "Привет 🐍" in response.request.content.decode("utf-8")
+    finally:
+        await manager.shutdown()
 
 
 async def test_start_creates_instance_dir_with_sentinel(

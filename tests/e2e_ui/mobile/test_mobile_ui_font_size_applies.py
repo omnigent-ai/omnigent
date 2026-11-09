@@ -75,9 +75,9 @@ def test_mobile_ui_font_size_applies_not_just_saves(page: Page, live_server: str
     value = page.get_by_test_id("ui-font-size-input")
     increase = page.get_by_test_id("ui-font-size-inc")
 
-    # Fresh context: mobile defaults to 14px. Capture that rendered baseline
+    # Fresh context: mobile defaults to 15px. Capture that rendered baseline
     # before touching anything.
-    expect(value).to_have_value("14")
+    expect(value).to_have_value("15")
     baseline_px = _rendered_ui_text_px(page)
 
     # Step to the 18px maximum — a "significant" increase per the report.

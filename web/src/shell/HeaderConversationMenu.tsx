@@ -20,13 +20,20 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  PlusIcon,
   ShareIcon,
   Trash2Icon,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import {
+  ARIA_MOD_KEY,
+  ARCHIVE_SESSION_KEYS,
+  FORK_SESSION_KEYS,
+  CompactShortcutKeys,
+  PIN_SESSION_KEYS,
+} from "@/components/KeyboardShortcut";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
-import { PresenceAvatars } from "@/components/PresenceAvatars";
 import {
   Dialog,
   DialogContent,
@@ -39,7 +46,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
@@ -47,6 +53,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isIndentedSibling } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
@@ -63,6 +71,11 @@ import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useDesktopCommand } from "@/lib/desktopCommands";
+import { supportsDesktopCommands } from "@/lib/nativeBridge";
+import { useIsEmbedded } from "@/lib/embedded";
+import { getEmbedRoot } from "@/lib/host";
+import { hasCommandModifier, isFocusInDialogOrMenu } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
@@ -71,9 +84,12 @@ import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
+import { MobileHeaderButton } from "./MobileHeaderButton";
+import { SessionMenuHeader } from "./SessionMenuHeader";
 
 interface HeaderConversationMenuProps {
   conversation: Conversation;
+  workingDirectory?: string | null;
   currentProject: string | null;
   canShare: boolean;
   canFork: boolean;
@@ -96,6 +112,7 @@ interface HeaderConversationMenuProps {
 
 export function HeaderConversationMenu({
   conversation,
+  workingDirectory = conversation.workspace,
   currentProject,
   canShare,
   canFork,
@@ -110,8 +127,10 @@ export function HeaderConversationMenu({
   workspaceItems = null,
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
+  const info = useServerInfo();
   const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
+  const isEmbedded = useIsEmbedded();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
   // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
@@ -130,9 +149,11 @@ export function HeaderConversationMenu({
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
   const isArchived = conversation.archived === true;
+  const canAddAgent = !isArchived && info !== "loading" && info.sibling_sessions;
+  const addAgentPath = `/?sibling=${encodeURIComponent(conversation.id)}`;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
-  const itemClass = isMobile ? "gap-2.5 px-2.5 py-2" : undefined;
+  const itemClass = cn("mobile-touch-target", isMobile && "gap-2.5 px-2.5 py-2");
   // Share and Agent info reach this menu on mobile from the header's legacy
   // Share · Agent info menu, which reported them under these ids. Keep
   // emitting the same ones so the metric series stays continuous, and only on
@@ -156,6 +177,33 @@ export function HeaderConversationMenu({
     setDeleteOpen(false);
     setDeleteBranch(false);
   }, [conversation.id, conversation.title]);
+
+  useEffect(() => {
+    if (!canAddAgent) return;
+    const handleAddAgent = (event: globalThis.KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.repeat ||
+        event.isComposing ||
+        !hasCommandModifier(event) ||
+        !event.altKey ||
+        event.shiftKey ||
+        event.getModifierState("AltGraph") ||
+        event.code !== "KeyA"
+      ) {
+        return;
+      }
+      const embedRoot = getEmbedRoot();
+      if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
+      if (isFocusInDialogOrMenu() || document.activeElement?.closest(".xterm, .monaco-editor"))
+        return;
+      event.preventDefault();
+      event.stopPropagation();
+      navigate(addAgentPath);
+    };
+    window.addEventListener("keydown", handleAddAgent);
+    return () => window.removeEventListener("keydown", handleAddAgent);
+  }, [addAgentPath, canAddAgent, isEmbedded, navigate]);
 
   const closeMenu = () => {
     setMenuOpen(false);
@@ -226,23 +274,46 @@ export function HeaderConversationMenu({
     showArchiveUndoToast(queryClient, [conversation], navigate);
   };
 
+  const togglePin = () =>
+    isPinned
+      ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
+      : togglePinned.mutate({ id: conversation.id, pinned: true });
+  // Desktop Session → Pin (⌥⌘P), Archive (⇧⌘A) and Fork (⌥⌘F) act on the session shown here.
+  // Like the menu item, Pin waits out a pending pin write (from any row).
+  useDesktopCommand("toggle-pin-session", pinSaving ? null : togglePin, { active: isPinned });
+  useDesktopCommand("archive-session", archiveConversation, { active: isArchived });
+  useDesktopCommand("fork-session", canFork && !forkDisabledReason ? onFork : null);
+  const desktopShortcuts = supportsDesktopCommands();
+
   const mainItems = (
     <>
-      {/* Chat/Terminal switch leads the menu on terminal-first sessions; it
-          renders its own trailing separator (null on other sessions). */}
+      {canAddAgent && (
+        <>
+          <DropdownMenuItem
+            data-testid="add-sibling-session"
+            className={itemClass}
+            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+A`}
+            onSelect={() => navigate(addAgentPath)}
+          >
+            <PlusIcon className="size-3.5" />
+            Add nested agent
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+        </>
+      )}
+      {/* Chat/Terminal renders its own trailing separator (null on other sessions). */}
       {viewItems}
       <DropdownMenuItem
         data-testid="header-pin-conversation"
         className={itemClass}
         disabled={pinSaving}
-        onSelect={() =>
-          isPinned
-            ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
-            : togglePinned.mutate({ id: conversation.id, pinned: true })
-        }
+        onSelect={togglePin}
       >
         {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
         {isPinned ? "Unpin" : "Pin"}
+        {desktopShortcuts && (
+          <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
+        )}
       </DropdownMenuItem>
       {canShare && (
         <DropdownMenuItem
@@ -272,6 +343,9 @@ export function HeaderConversationMenu({
         >
           <GitForkIcon className="size-3.5" />
           Fork
+          {desktopShortcuts && (
+            <CompactShortcutKeys keys={FORK_SESSION_KEYS} className="ml-auto pl-4" />
+          )}
         </SessionActionMenuItem>
       )}
       <DropdownMenuItem
@@ -317,36 +391,37 @@ export function HeaderConversationMenu({
       {/* Move to project is also reachable on desktop via the breadcrumb's
           folder tag (HeaderProjectTag); on mobile the native shells hide the
           breadcrumb, so this menu is the sole entry point. */}
-      {isMobile ? (
-        // Mobile has no room for a side flyout, so this item swaps the menu body
-        // to the project picker in place (see the `projectPickerOpen` branch).
-        <DropdownMenuItem
-          data-testid="header-move-to-project"
-          className={cn("whitespace-nowrap", itemClass)}
-          onSelect={(event) => {
-            event.preventDefault();
-            setProjectPickerOpen(true);
-          }}
-        >
-          <FolderInputIcon className="size-3.5" />
-          {currentProject ? "Move session" : "Add to project"}
-        </DropdownMenuItem>
-      ) : (
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger
+      {!isIndentedSibling(conversation) &&
+        (isMobile ? (
+          // Mobile has no room for a side flyout, so this item swaps the menu body
+          // to the project picker in place (see the `projectPickerOpen` branch).
+          <DropdownMenuItem
             data-testid="header-move-to-project"
-            className="whitespace-nowrap"
+            className={cn("whitespace-nowrap", itemClass)}
+            onSelect={(event) => {
+              event.preventDefault();
+              setProjectPickerOpen(true);
+            }}
           >
             <FolderInputIcon className="size-3.5" />
             {currentProject ? "Move session" : "Add to project"}
-          </DropdownMenuSubTrigger>
-          {/* A native submenu flyout — no separate popover layer, so no
+          </DropdownMenuItem>
+        ) : (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger
+              data-testid="header-move-to-project"
+              className="whitespace-nowrap"
+            >
+              <FolderInputIcon className="size-3.5" />
+              {currentProject ? "Move session" : "Add to project"}
+            </DropdownMenuSubTrigger>
+            {/* A native submenu flyout — no separate popover layer, so no
               open/dismiss race with the parent menu. */}
-          <DropdownMenuSubContent className="min-w-56">
-            <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-      )}
+            <DropdownMenuSubContent className="min-w-56">
+              <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        ))}
       {workspaceItems && (
         <>
           <DropdownMenuSeparator />
@@ -365,6 +440,9 @@ export function HeaderConversationMenu({
           <ArchiveIcon className="size-3.5" />
         )}
         {isArchived ? "Unarchive" : "Archive"}
+        {desktopShortcuts && (
+          <CompactShortcutKeys keys={ARCHIVE_SESSION_KEYS} className="ml-auto pl-4" />
+        )}
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"
@@ -395,33 +473,28 @@ export function HeaderConversationMenu({
         }}
       >
         <DropdownMenuTrigger asChild>
-          <Button
+          <MobileHeaderButton
             type="button"
             variant="ghost"
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
+            className="mobile-touch-target shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
           >
             <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
-          </Button>
+          </MobileHeaderButton>
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align={isMobile ? "end" : "start"}
+          collisionPadding={isMobile ? 16 : undefined}
           className={cn(
             "min-w-56",
             MOBILE_GLASS_SURFACE,
-            isMobile && "max-w-[min(20rem,calc(100vw-1rem))]",
+            isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
           )}
         >
           {isMobile && !projectPickerOpen && (
-            <>
-              <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
-                <span className="min-w-0 flex-1 truncate">{label}</span>
-                <PresenceAvatars />
-              </DropdownMenuLabel>
-              <DropdownMenuSeparator />
-            </>
+            <SessionMenuHeader title={label} workingDirectory={workingDirectory} />
           )}
           {projectPickerOpen ? (
             <>
@@ -465,11 +538,20 @@ export function HeaderConversationMenu({
               }}
               className="mt-4 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
             />
-            <DialogFooter className="mt-4 border-t-0 bg-transparent">
-              <Button type="button" variant="ghost" onClick={() => setRenameOpen(false)}>
+            <DialogFooter className="mt-4 border-t-0 bg-transparent mobile-app:flex-col-reverse mobile-app:gap-1">
+              <Button
+                type="button"
+                variant="ghost"
+                className="mobile-touch-target mobile-app:w-full"
+                onClick={() => setRenameOpen(false)}
+              >
                 Cancel
               </Button>
-              <Button type="submit" disabled={!renameTitle.trim() || rename.isPending}>
+              <Button
+                type="submit"
+                className="mobile-touch-target mobile-app:w-full"
+                disabled={!renameTitle.trim() || rename.isPending}
+              >
                 Rename
               </Button>
             </DialogFooter>

@@ -28,6 +28,27 @@ def test_mock_config_respects_workflow_ownership(monkeypatch, tmp_path, harness,
     assert config.read_text() == "original config\n"
 
 
+@pytest.mark.parametrize("config_home", [None, ""], ids=["unset", "empty"])
+def test_mock_config_refuses_the_real_config_home(monkeypatch, tmp_path, config_home):
+    real_config = tmp_path / "home" / ".omnigent" / "config.yaml"
+    real_config.parent.mkdir(parents=True)
+    real_config.write_text("real user config\n")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr("omnigent.config._GLOBAL_CONFIG_PATH", real_config)
+    if config_home is None:
+        monkeypatch.delenv("OMNIGENT_CONFIG_HOME", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_CONFIG_HOME", config_home)
+    with pytest.raises(RuntimeError, match="OMNIGENT_CONFIG_HOME is unset"):
+        with configuration.temp_omnigent_mock_config("http://model", "codex"):
+            pytest.fail("must not write the real config")
+    # Workflow-owned runs never touch the config, so the guard does not apply.
+    with configuration.temp_omnigent_mock_config("http://model", "codex", workflow_owned=True):
+        pass
+    assert real_config.read_text() == "real user config\n"
+    assert sorted(path.name for path in real_config.parent.iterdir()) == ["config.yaml"]
+
+
 def test_native_claude_mock_rejects_conflicting_managed_route(monkeypatch, tmp_path):
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     config = tmp_path / "config.yaml"

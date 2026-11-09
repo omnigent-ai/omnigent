@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -22,32 +23,13 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
 )
 from tests.harnesses.codex_native.forwarder._support import (
+    _deliver_to_parent,
     _RecordingClient,
+    _seed_active_turn,
+    _status_post,
+    _turn_completed,
+    _turn_started,
 )
-
-
-def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
-    """
-    Seed bridge state so a terminal turn edge clears the active turn.
-
-    ``_terminal_turn_status_edge`` only produces an edge when the terminal
-    event clears the recorded active turn id; without this seed it returns
-    ``None`` as "stale".
-
-    :param bridge_dir: Native Codex bridge directory (the test ``tmp_path``).
-    :param turn_id: Active Codex turn id to record, e.g. ``"turn_123"``.
-    :returns: None.
-    """
-    write_bridge_state(
-        bridge_dir,
-        CodexNativeBridgeState(
-            session_id="conv_x",
-            socket_path=str(bridge_dir / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(bridge_dir / "codex-home"),
-            active_turn_id=turn_id,
-        ),
-    )
 
 
 def test_classify_codex_error_auth_vs_generic() -> None:
@@ -118,6 +100,24 @@ def test_classify_codex_error_budget_exhausted_not_auth() -> None:
         fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 403}}, "access denied")
         == auth
     )
+
+
+def test_classify_codex_error_ip_access_list_refusal_not_auth() -> None:
+    """A workspace IP access list refusal (HTTP 403) is not a sign-in failure.
+
+    Signing in again cannot clear a network policy, so the re-auth status and
+    hint would point the user at the wrong fix.
+    """
+    generic = fwd._CODEX_ERROR_KIND_GENERIC
+    # Synthetic address, workspace and request id; the wording is the gateway's.
+    acl_message = (
+        "unexpected status 403 Forbidden: Source IP address: 203.0.113.7 is blocked by "
+        "Databricks IP ACL for workspace: 1234567890123456 "
+        "[ReqId: 00000000-0000-4000-8000-000000000000]"
+    )
+    structured_403 = {"codexErrorInfo": {"httpStatusCode": 403}}
+    assert fwd._classify_codex_error(structured_403, acl_message) == generic
+    assert fwd._classify_codex_error({}, acl_message) == generic
 
 
 @pytest.mark.parametrize(
@@ -974,7 +974,33 @@ def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
+@pytest.mark.parametrize(
+    ("message", "expected_output"),
+    [
+        ("model stream broke", "model stream broke"),
+        (
+            "Incomplete response returned, reason: max_output_tokens",
+            "Incomplete response returned, reason: max_output_tokens\n\n"
+            "The model reached its response length limit. Ask it to continue or split "
+            "the request into smaller parts.",
+        ),
+        (
+            "Incomplete response returned, reason: content_filter",
+            "Incomplete response returned, reason: content_filter",
+        ),
+        (
+            "Invalid max_output_tokens configuration",
+            "Invalid max_output_tokens configuration",
+        ),
+        (
+            "Failed to shutdown thread persistence",
+            "Failed to shutdown thread persistence",
+        ),
+    ],
+)
+async def test_post_turn_status_edge_surfaces_generic_error_output(
+    message: str, expected_output: str
+) -> None:
     """A failed edge with a generic error surfaces the message as output.
 
     The reason must reach the server (as ``output``) rather than being dropped;
@@ -986,7 +1012,7 @@ async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
         turn_id="turn_123",
         source="turn/completed:turn-error",
         error=fwd._CodexTerminalError(
-            message="model stream broke",
+            message=message,
             kind=fwd._CODEX_ERROR_KIND_GENERIC,
         ),
     )
@@ -998,7 +1024,9 @@ async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
     assert body["type"] == "external_session_status"
     data = body["data"]
     assert data["status"] == "failed"
-    assert data["output"] == "model stream broke"
+    assert data["output"] == expected_output
+    assert edge.error is not None
+    assert edge.error.message == message
     # Generic errors do not demand re-auth.
     assert "reauth_required" not in data
 
@@ -1381,3 +1409,150 @@ async def test_interrupted_turn_keeps_launcher_certificate_record(tmp_path: Path
     )
 
     assert read_certificate_failure(tmp_path) is not None
+
+
+_SYSTEM_ERROR_OUTPUT = (
+    "Codex reported a system error on this thread. Open the terminal for details."
+)
+
+
+def _system_error_event(thread_id: str = "thread_123") -> dict[str, Any]:
+    """
+    Build a Codex ``thread/status/changed`` envelope reporting a system error.
+
+    :param thread_id: Thread whose status changed, e.g. ``"thread_123"``.
+    :returns: Notification envelope dict.
+    """
+    return {
+        "method": "thread/status/changed",
+        "params": {"threadId": thread_id, "status": {"type": "systemError"}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_system_error_fails_a_thread_no_turn_is_running(tmp_path: Path) -> None:
+    """A system error on an idle thread fails the session, since no turn reports it."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+
+    assert client.posts == [
+        _status_post({"status": "failed", "output": _SYSTEM_ERROR_OUTPUT}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_system_error_during_a_turn_waits_for_the_turn_outcome(tmp_path: Path) -> None:
+    """
+    A system error mid-turn can leave the turn running, so the turn's end decides.
+
+    Codex reports some non-fatal errors this way; posting failed here would
+    misreport a turn that goes on to complete.
+    """
+    _seed_active_turn(tmp_path, "turn_1")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+    assert client.posts == []
+
+    await _deliver_to_parent(client, tmp_path, state, _turn_completed("turn_1", "completed"))
+
+    assert client.posts == [_status_post({"status": "idle", "response_id": "codex_turn_1"})]
+
+
+@pytest.mark.asyncio
+async def test_system_error_after_a_reported_error_is_not_repeated(tmp_path: Path) -> None:
+    """A standalone error that already failed the turn is not failed again by the thread state."""
+    _seed_active_turn(tmp_path, "turn_1")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(
+        client,
+        tmp_path,
+        state,
+        {
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": "turn_1",
+                "willRetry": False,
+                "error": {
+                    "message": "You've hit your usage limit.",
+                    "codexErrorInfo": "usageLimitExceeded",
+                },
+            },
+        },
+    )
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+
+    assert client.posts == [
+        _status_post(
+            {
+                "status": "failed",
+                "response_id": "codex_turn_1",
+                "output": "You've hit your usage limit.",
+            }
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_system_error_after_a_failed_turn_boundary_is_not_repeated(tmp_path: Path) -> None:
+    """A turn that already ended as failed is not failed again by the thread state."""
+    _seed_active_turn(tmp_path, "turn_1")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(client, tmp_path, state, _turn_completed("turn_1", "failed"))
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+
+    assert client.posts == [_status_post({"status": "failed", "response_id": "codex_turn_1"})]
+
+
+@pytest.mark.asyncio
+async def test_system_error_after_a_new_turn_is_reported_again(tmp_path: Path) -> None:
+    """A turn that starts clears the earlier turn's failure, so a later system error reports."""
+    _seed_active_turn(tmp_path, "turn_1")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(client, tmp_path, state, _turn_completed("turn_1", "failed"))
+    await _deliver_to_parent(client, tmp_path, state, _turn_started("turn_2"))
+    await _deliver_to_parent(client, tmp_path, state, _turn_completed("turn_2", "completed"))
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+
+    assert client.posts == [
+        _status_post({"status": "failed", "response_id": "codex_turn_1"}),
+        _status_post({"status": "running", "response_id": "codex_turn_2"}),
+        _status_post({"status": "idle", "response_id": "codex_turn_2"}),
+        _status_post({"status": "failed", "output": _SYSTEM_ERROR_OUTPUT}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repeated_system_error_is_reported_once(tmp_path: Path) -> None:
+    """Repeated system-error reports for an idle thread post one failure."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event())
+
+    assert client.posts == [
+        _status_post({"status": "failed", "output": _SYSTEM_ERROR_OUTPUT}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_system_error_on_a_child_thread_is_not_the_sessions_status(tmp_path: Path) -> None:
+    """A child thread's system error is not the parent session's failure."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    state.note_child_thread("thread_child", "conv_child")
+
+    await _deliver_to_parent(client, tmp_path, state, _system_error_event("thread_child"))
+
+    assert client.posts == []

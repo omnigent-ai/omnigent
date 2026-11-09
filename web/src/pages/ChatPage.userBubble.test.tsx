@@ -1,7 +1,9 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
+import { AUTOMATION_CONTEXT_NOTE } from "@/lib/systemMessage";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { BubbleView, buildPendingBubbles } from "./ChatPage";
 
@@ -10,7 +12,10 @@ import { BubbleView, buildPendingBubbles } from "./ChatPage";
 // pin that wiring: if the text path reverts to a raw `{text}` string, the
 // markdown syntax would render literally and these assertions would fail.
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 const FILE_VIEWER_NOOP = {
   openFile: () => {},
@@ -45,14 +50,44 @@ function assistantBubble(
 }
 
 function renderBubble(bubble: Bubble) {
+  // File mention pills check the workspace through a query.
   return render(
-    <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
-      <BubbleView bubble={bubble} />
-    </FileViewerContext.Provider>,
+    <QueryClientProvider client={new QueryClient()}>
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BubbleView bubble={bubble} />
+      </FileViewerContext.Provider>
+    </QueryClientProvider>,
   );
 }
 
 describe("UserBubble markdown rendering", () => {
+  it.each([false, true])(
+    "preserves visible and copied text for modified note=%s",
+    async (modified) => {
+      const note = modified
+        ? AUTOMATION_CONTEXT_NOTE.replace("no one is watching this run.", "include a table.")
+        : AUTOMATION_CONTEXT_NOTE;
+      const text = `Summarize **today**.\n\n${note}`;
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("navigator", { clipboard: { writeText } });
+      try {
+        renderBubble(userBubble(text));
+        expect(screen.getByText("today")).toBeInTheDocument();
+        if (modified) {
+          expect(screen.getByText(/include a table/)).toBeInTheDocument();
+        } else {
+          expect(screen.queryByText(/no one is watching/)).not.toBeInTheDocument();
+        }
+        fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+        await waitFor(() =>
+          expect(writeText).toHaveBeenCalledWith(modified ? text : "Summarize **today**."),
+        );
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
   it("renders **bold** markdown as a strong node, not literal asterisks", () => {
     renderBubble(userBubble("hello **world**"));
     // Streamdown emits bold as an element tagged data-streamdown="strong"
@@ -156,11 +191,11 @@ describe("UserBubble system messages", () => {
         ],
       }),
     );
-    // A real bubble with both screenshots — not the blank pill the stolen
-    // file blocks used to leave behind.
+    // The attachment slots stay in a real bubble while their file URLs load.
     expect(screen.getByTestId("message-bubble")).toBeInTheDocument();
-    expect(screen.getByAltText("shot1.png")).toBeInTheDocument();
-    expect(screen.getByAltText("shot2.png")).toBeInTheDocument();
+    expect(screen.getByTestId("user-image-attachments").children).toHaveLength(2);
+    expect(screen.getByRole("status", { name: "Loading image: shot1.png" })).toHaveClass("size-20");
+    expect(screen.getByRole("status", { name: "Loading image: shot2.png" })).toHaveClass("size-20");
     // Upload markers are stripped from the text, and an empty text renders
     // nothing rather than an empty markdown block.
     expect(screen.queryByText(/\[Attached:/)).toBeNull();
@@ -188,6 +223,60 @@ describe("UserBubble image attachments", () => {
     expect(screen.getByText("look at this")).toBeInTheDocument();
   });
 
+  it("keeps multiple images above the text bubble in one wrapping row", () => {
+    renderBubble(
+      userBubble("compare these", {
+        content: [
+          { type: "input_text", text: "compare these" },
+          ...Array.from({ length: 4 }, (_, index) => ({
+            type: "input_image" as const,
+            image_url: INLINE_PNG,
+            filename: `shot-${index + 1}.png`,
+          })),
+        ],
+      }),
+    );
+
+    const row = screen.getByTestId("user-image-attachments");
+    const content = screen.getByTestId("user-message-content");
+    expect(row).toHaveClass("flex-wrap", "justify-end");
+    expect(row.querySelectorAll("img")).toHaveLength(4);
+    expect(content).toHaveTextContent("compare these");
+    expect(content).not.toContainElement(row);
+    expect(row.parentElement).toBe(content.parentElement);
+  });
+
+  it("shows images without an empty gray bubble when the message has no text", () => {
+    renderBubble(
+      userBubble("", {
+        content: [{ type: "input_image", image_url: INLINE_PNG, filename: "only-shot.png" }],
+      }),
+    );
+
+    expect(screen.getByRole("button", { name: "Zoom image: only-shot.png" })).toBeInTheDocument();
+    expect(screen.getByTestId("user-image-attachments")).toBeInTheDocument();
+    expect(screen.queryByTestId("user-message-content")).toBeNull();
+  });
+
+  it("keeps file chips and text in the bubble below image attachments", () => {
+    renderBubble(
+      userBubble("read these", {
+        content: [
+          { type: "input_image", image_url: INLINE_PNG, filename: "shot.png" },
+          { type: "input_file", file_id: "file_1", filename: "notes.pdf" },
+          { type: "input_text", text: "read these" },
+        ],
+      }),
+    );
+
+    const row = screen.getByTestId("user-image-attachments");
+    const content = screen.getByTestId("user-message-content");
+    expect(row).toContainElement(screen.getByRole("img", { name: "shot.png" }));
+    expect(content).toHaveTextContent("notes.pdf");
+    expect(content).toHaveTextContent("read these");
+    expect(content).not.toContainElement(row);
+  });
+
   it("keeps the rest of the message readable when an image block is malformed", () => {
     // The non-fatal fallback: one unusable attachment costs its own preview,
     // never the surrounding transcript.
@@ -198,10 +287,10 @@ describe("UserBubble image attachments", () => {
     );
 
     expect(screen.getByText("still readable")).toBeInTheDocument();
-    expect(screen.getByText("Unavailable image")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Unavailable image" })).toHaveClass("size-20");
   });
 
-  it("still shows a chip while an upload is in flight", () => {
+  it("reserves a thumbnail slot while an upload is in flight", () => {
     renderBubble(
       userBubble("uploading", {
         content: [
@@ -212,6 +301,9 @@ describe("UserBubble image attachments", () => {
     );
 
     expect(screen.getByText("shot.png")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Uploading image: shot.png" })).toHaveClass(
+      "size-20",
+    );
     expect(screen.queryByAltText("shot.png")).toBeNull();
   });
 });
@@ -300,12 +392,61 @@ describe("UserBubble entrance motion", () => {
 describe("UserBubble awaiting-agent marker", () => {
   const content: MessageContentBlock[] = [{ type: "input_text", text: "steer" }];
 
-  it("tells the user a mid-turn message waits for the agent's current step", () => {
-    const [pending] = buildPendingBubbles([{ tempId: "pend_1", content, sentMidTurn: true }], null);
-    renderBubble(pending!);
-    expect(screen.getByTestId("message-awaiting-agent")).toHaveTextContent(
-      "The agent will read this after its current step",
+  it.each([false, true])(
+    "shares the timestamp row while keeping mobile pending status visible (mobile=%s)",
+    (mobile) => {
+      vi.stubGlobal("matchMedia", () => ({
+        matches: mobile,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      }));
+      const [pending] = buildPendingBubbles(
+        [{ tempId: "pend_1", content, sentMidTurn: true }],
+        null,
+      );
+      if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
+      renderBubble({ ...pending, createdAtS: 1_762_000_000 });
+      const explanation = screen.getByTestId("message-awaiting-agent");
+      expect(explanation).toHaveTextContent("The agent will read this after its current step");
+      const footer = screen.getByTestId("message-timestamp").parentElement;
+      expect(explanation.parentElement).toBe(footer);
+      expect(explanation.nextElementSibling).toBe(screen.getByTestId("message-timestamp"));
+      expect(footer).toContainElement(screen.getByRole("button", { name: "Copy" }));
+      expect(footer).toHaveClass("pt-1");
+      if (mobile) {
+        expect(footer).toHaveClass("opacity-100");
+        expect(footer).not.toHaveClass("invisible");
+      } else {
+        expect(footer).toHaveClass(
+          "md:opacity-0",
+          "md:group-hover:opacity-100",
+          "md:group-focus-within:opacity-100",
+        );
+      }
+      expect(explanation).toHaveClass("truncate");
+      expect(explanation.querySelector("svg")).toBeNull();
+    },
+  );
+
+  it("keeps an attachment-only explanation visible without a focusable footer control", () => {
+    const [pending] = buildPendingBubbles(
+      [
+        {
+          tempId: "pend_attachment",
+          content: [{ type: "input_file", file_id: "file_1", filename: "notes.txt" }],
+          sentMidTurn: true,
+        },
+      ],
+      null,
     );
+    if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
+    renderBubble({ ...pending, createdAtS: 1_762_000_000 });
+    const explanation = screen.getByTestId("message-awaiting-agent");
+    const footer = explanation.parentElement;
+    expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+    expect(screen.getByTestId("copy-message-link")).toBeDisabled();
+    expect(footer).toHaveClass("opacity-100");
+    expect(footer).not.toHaveClass("md:opacity-0");
   });
 
   it("stays hidden for a send that started a turn and for committed history", () => {
@@ -327,11 +468,13 @@ describe("UserBubble copy button", () => {
     vi.unstubAllGlobals();
   });
 
-  it("uses a compact action button with an 8px content gap", () => {
+  it("uses a compact action button", () => {
     renderBubble(userBubble("copy me please"));
 
-    expect(screen.getByTestId("message-bubble")).toHaveClass("gap-2");
     expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveClass(
+      "[@media(pointer:coarse)]:size-8",
+    );
   });
 
   it("copies the message text to the clipboard when clicked", async () => {
@@ -479,28 +622,37 @@ describe("AssistantBubble copy-link button", () => {
   });
 });
 
-describe("UserBubble @-mention attachment chips", () => {
-  it("shows file and folder chips from [Attached: …] markers and hides the markers", () => {
-    renderBubble(userBubble("[Attached: src/server.ts]\n[Attached: docs/]\n\nsummarize these"));
+function pills() {
+  return screen.queryAllByTestId("mention-pill").map((pill) => pill.textContent);
+}
 
-    // The marker paths surface as chips (folder keeps its trailing slash)...
-    expect(screen.getByText("@src/server.ts")).toBeInTheDocument();
-    expect(screen.getByText("@docs/")).toBeInTheDocument();
-    // ...while the raw "[Attached: …]" marker text is stripped from the body.
+describe("UserBubble @-mention pills", () => {
+  it("renders file and folder markers as pills where they sit in the sentence", () => {
+    renderBubble(userBubble("summarize [Attached: src/server.ts] and [Attached: docs/] please"));
+
+    // The marker paths render as pills (folder keeps its trailing slash) inline...
+    expect(pills()).toEqual(["@src/server.ts", "@docs/"]);
+    expect(screen.getAllByTestId("mention-pill")[0].closest("p")?.textContent).toBe(
+      "summarize @src/server.ts and @docs/ please",
+    );
+    // ...while the raw "[Attached: …]" marker text never shows.
     expect(screen.queryByText(/\[Attached:/)).toBeNull();
-    expect(screen.getByText("summarize these")).toBeInTheDocument();
   });
 
-  it("renders chips for the codex 'Attached file:' wording too", () => {
+  it("renders pills for the codex 'Attached file:' wording too", () => {
     renderBubble(userBubble("[Attached file: src/a.ts]\n\ncheck this"));
-    expect(screen.getByText("@src/a.ts")).toBeInTheDocument();
+    expect(pills()).toEqual(["@src/a.ts"]);
     expect(screen.queryByText(/\[Attached/)).toBeNull();
   });
 
-  it("shows the line span of a partial-file attach in its own (non-truncating) node", () => {
-    renderBubble(userBubble("[Attached: bob-max-gain/docker-compose.yml:2-9]\n\nreview"));
-    expect(screen.getByText("@bob-max-gain/docker-compose.yml")).toBeInTheDocument();
-    expect(screen.getByText(":2-9")).toBeInTheDocument();
+  it("keeps the line span of a partial-file attach in its pill", () => {
+    renderBubble(userBubble("review [Attached: bob-max-gain/docker-compose.yml:2-9]"));
+    expect(pills()).toEqual(["@bob-max-gain/docker-compose.yml:2-9"]);
+    // A long path can truncate the label; the hover title keeps the full span.
+    const longPath = `${"deeply/nested/".repeat(8)}service/docker-compose.yml`;
+    cleanup();
+    renderBubble(userBubble(`review [Attached: ${longPath}:120-188]`));
+    expect(screen.getByTestId("mention-pill")).toHaveAttribute("title", `${longPath}:120-188`);
   });
 
   // An explicit upload is materialized to disk by the native executor, which
@@ -508,13 +660,13 @@ describe("UserBubble @-mention attachment chips", () => {
   // The upload already rides in as an input_image / input_file block, so the
   // marker must NOT also surface as a path chip (it would double-render, and
   // the path is an internal temp dir).
-  it("does not chip an absolute upload marker (already shown via its file block)", () => {
+  it("does not pill an absolute upload marker (already shown via its file block)", () => {
     renderBubble(
       userBubble(
         "[Attached: /var/folders/x/omnigent-1/claude-native/abc/uploads/image.png]\n\nwhat is this",
       ),
     );
-    // No "@…" chip for the absolute upload path.
+    // No "@…" pill for the absolute upload path.
     expect(screen.queryByText(/^@\//)).toBeNull();
     expect(screen.queryByText(/uploads\/image\.png/)).toBeNull();
     // The marker is still stripped from the body and the prose survives.
@@ -529,22 +681,46 @@ describe("UserBubble @-mention attachment chips", () => {
     ["C:\\Users\\me\\AppData\\Local\\Temp\\omnigent\\uploads\\image.png", "drive (backslash)"],
     ["C:/Users/me/AppData/Local/Temp/omnigent/uploads/image.png", "drive (forward slash)"],
     ["\\\\host\\share\\omnigent\\uploads\\image.png", "UNC"],
-  ])("does not chip a Windows-style absolute upload marker (%s)", (path) => {
+  ])("does not pill a Windows-style absolute upload marker (%s)", (path) => {
     renderBubble(userBubble(`[Attached: ${path}]\n\nwhat is this`));
     expect(screen.queryByText(/uploads/)).toBeNull();
     expect(screen.getByText("what is this")).toBeInTheDocument();
   });
 
-  it("chips a relative @-mention but not an absolute upload in the same message", () => {
+  it("pills a relative @-mention but not an absolute upload in the same message", () => {
     renderBubble(
       userBubble(
         "[Attached: /tmp/omnigent/claude-native/abc/uploads/image.png]\n" +
           "[Attached: src/server.ts]\n\ncompare",
       ),
     );
-    // Workspace @-mention still chips...
-    expect(screen.getByText("@src/server.ts")).toBeInTheDocument();
+    // Workspace @-mention still renders as a pill...
+    expect(pills()).toEqual(["@src/server.ts"]);
     // ...the materialized upload does not.
     expect(screen.queryByText(/uploads\/image\.png/)).toBeNull();
+  });
+});
+
+describe("UserBubble still-sending note", () => {
+  const content: MessageContentBlock[] = [{ type: "input_text", text: "ship it" }];
+
+  it("shows on a send whose POST is unanswered and clears once it is posted", () => {
+    const [unanswered] = buildPendingBubbles(
+      [{ tempId: "pend_slow", content, stillSending: true }],
+      null,
+    );
+    const { rerender } = renderBubble(unanswered!);
+    expect(screen.getByTestId("message-still-sending")).toHaveTextContent("Still sending…");
+
+    const [posted] = buildPendingBubbles(
+      [{ tempId: "pend_slow", content, stillSending: true, posted: true }],
+      null,
+    );
+    rerender(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BubbleView bubble={posted!} />
+      </FileViewerContext.Provider>,
+    );
+    expect(screen.queryByTestId("message-still-sending")).toBeNull();
   });
 });

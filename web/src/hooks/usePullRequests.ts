@@ -101,6 +101,18 @@ export interface PullRequestComment {
   url: string | null;
 }
 
+export interface PullRequestTimelineEvent {
+  id: string;
+  kind: "commit" | "force_push";
+  author: string | null;
+  /** Commit time for commits; event time for force pushes. */
+  created_at: string | null;
+  url: string | null;
+  sha: string | null;
+  previous_sha?: string | null;
+  message?: string | null;
+}
+
 export type PullRequestReviewerState =
   "PENDING" | "APPROVED" | "COMMENTED" | "CHANGES_REQUESTED" | "DISMISSED";
 
@@ -147,12 +159,17 @@ export interface PullRequest {
   checks_supported?: boolean;
   head_sha?: string;
   base_sha?: string;
+  /** HTTPS web URL of the source (possibly fork) repository; null when unknown or deleted. */
+  head_repository_url?: string | null;
   /** PR description (GitHub-flavored markdown); null when empty. Optional: a
    *  host predating the Summary tab omits it, so treat undefined as none. */
   body?: string | null;
   /** Top-level PR comments GitHub shows by default; absent from an older host. */
   comments?: PullRequestComment[];
   comments_partial?: boolean;
+  /** Commit and force-push activity; absent from older hosts and other providers. */
+  timeline_events?: PullRequestTimelineEvent[];
+  timeline_partial?: boolean;
   /** Assigned reviewers and their current review state; absent from older hosts. */
   reviewers?: PullRequestReviewer[];
   /** The PR's labels; absent from older hosts and providers that don't report them. */
@@ -339,13 +356,21 @@ function legacyPullRequestAuth(raw: PullRequestInfo): PullRequestAuth {
  *  workspace changed-files list, plus a "renamed" status. */
 export type PullRequestChangedFile = Omit<WorkspaceChangedFile, "status"> & {
   status: WorkspaceChangedFile["status"] | "renamed";
+  /** The old path of a renamed file. */
+  previous_path?: string | null;
 };
 
 export interface PullRequestChangedFilesResult {
   available: boolean;
   data: PullRequestChangedFile[];
+  /** True when the provider truncated the list. */
   has_more?: boolean;
   warning?: string;
+  /** The provider's total changed-file count, when known. */
+  total_count?: number | null;
+  /** The revision the list describes, when pinned. */
+  head_sha?: string | null;
+  base_sha?: string | null;
 }
 
 export interface PullRequestFileDiffResponse {
@@ -516,6 +541,7 @@ function pullRequestInfoQueryOptions(
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
     refetchInterval: options?.poll
       ? (query) => {
           const info = query.state.data;
@@ -615,12 +641,24 @@ export function useSetPullRequestPreference(conversationId: string | undefined) 
   });
 }
 
+/** `pr_url` plus the `base:head` revision the diff and file list are pinned to. */
+function pinnedPrQuery(prUrl?: string, revision?: string): string {
+  const query = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
+  const [baseSha, headSha] = revision?.split(":") ?? [];
+  if (prUrl && baseSha && headSha) {
+    query.set("base_sha", baseSha);
+    query.set("head_sha", headSha);
+  }
+  return query.size ? `?${query}` : "";
+}
+
 async function fetchPullRequestChangedFiles(
   conversationId: string,
   prUrl?: string,
+  revision?: string,
 ): Promise<PullRequestChangedFilesResult> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${prQuery(prUrl)}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${pinnedPrQuery(prUrl, revision)}`,
   );
   if (res.status === 404) return { available: false, data: [] };
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
@@ -646,13 +684,14 @@ export function usePullRequestChangedFiles(
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
     queryKey: ["github-changed-files", conversationId, ...(prUrl ? [prUrl, revision] : [])],
-    queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl),
+    queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl, revision),
     // Only a PR has files to show — skip the call in every no-PR / unavailable
     // / unauthenticated state (the panel shows an empty state instead).
     enabled: !!conversationId && hasPr && serveable !== false,
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
   });
 }
 
@@ -703,14 +742,8 @@ async function fetchPullRequestDiff(
   prUrl?: string,
   revision?: string,
 ): Promise<PullRequestDiffResponse> {
-  const query = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
-  const [baseSha, headSha] = revision?.split(":") ?? [];
-  if (prUrl && baseSha && headSha) {
-    query.set("base_sha", baseSha);
-    query.set("head_sha", headSha);
-  }
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${query.size ? `?${query}` : ""}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${pinnedPrQuery(prUrl, revision)}`,
   );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
@@ -740,6 +773,7 @@ export function usePullRequestDiff(
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
   });
 }
 

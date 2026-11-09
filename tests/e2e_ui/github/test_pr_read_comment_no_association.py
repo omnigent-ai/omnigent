@@ -25,7 +25,6 @@ from __future__ import annotations
 import gzip
 import io
 import json
-import re
 import shutil
 import subprocess
 import tarfile
@@ -302,7 +301,7 @@ def test_created_pr_remains_tracked(
     )
 
     rail = _open_github_panel(page)
-    expect(
-        rail.get_by_role("button", name=re.compile(r"^example\/one #42(?: —|$)"))
-    ).to_be_visible(timeout=30_000)
+    expect(rail.get_by_role("link", name="Open the PR on GitHub")).to_have_attribute(
+        "href", _PR_URL, timeout=30_000
+    )
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("#42")
