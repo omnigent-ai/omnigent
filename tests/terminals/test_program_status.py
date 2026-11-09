@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import pytest
 
 from omnigent.terminals.program_status import (
     _REPLY,
+    _UNSENT_INPUT_LIMIT,
     ProgramStatus,
     ProgramStatusParser,
     parse_report,
@@ -341,6 +343,58 @@ def test_backed_up_input_reaches_the_child_intact(tmp_path: Path) -> None:
         data = received.read_bytes()
         assert data.count(_REPLY) == 1
         assert data.replace(_REPLY, b"") == payload
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_query_replies_stop_queueing_at_the_limit_and_resume(tmp_path: Path) -> None:
+    """Replies to a child that is not reading stop queueing at the limit, then resume."""
+    resume = tmp_path / "resume"
+    backlog = tmp_path / "backlog"
+    after = tmp_path / "after"
+    queries = 2 * _UNSENT_INPUT_LIMIT // len(_REPLY)
+    child_script = (
+        "import os, select, time, tty\n"
+        "from pathlib import Path\n"
+        "tty.setraw(0)\n"
+        f"flood = b'\\x1b]7501;?\\x1b\\\\' * {queries} + b'flooded'\n"
+        "while flood:\n"
+        "    flood = flood[os.write(1, flood) :]\n"
+        f"while not Path({str(resume)!r}).exists():\n"
+        "    time.sleep(0.01)\n"
+        "data = b''\n"
+        "while select.select([0], [], [], 1)[0]:\n"
+        "    data += os.read(0, 65536)\n"
+        f"Path({str(backlog)!r}).write_bytes(data)\n"
+        "os.write(1, b'\\x1b]7501;?\\x1b\\\\')\n"
+        "data = b''\n"
+        f"while len(data) < {len(_REPLY)}:\n"
+        f"    data += os.read(0, {len(_REPLY)} - len(data))\n"
+        f"Path({str(after)!r}).write_bytes(data)\n"
+    )
+    master, slave = os.openpty()
+    tty.setraw(slave)
+    try:
+        with _start_relay(
+            tmp_path / "status.json", [sys.executable, "-c", child_script], slave
+        ) as process:
+            assert process.stdout is not None
+            # The relay forwards this marker only after handling every earlier query.
+            output = b""
+            deadline = time.monotonic() + 10
+            while b"flooded" not in output:
+                assert time.monotonic() < deadline, output
+                if select.select([process.stdout], [], [], 0.1)[0]:
+                    output += os.read(process.stdout.fileno(), 65536)
+            resume.touch()
+            rest, _ = process.communicate(timeout=15)
+            assert process.returncode == 0, output + rest
+        drained = backlog.read_bytes()
+        replies = len(drained) // len(_REPLY)
+        assert drained == _REPLY * replies
+        assert _UNSENT_INPUT_LIMIT // len(_REPLY) <= replies < queries
+        assert after.read_bytes() == _REPLY
     finally:
         os.close(master)
         os.close(slave)
