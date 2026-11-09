@@ -195,6 +195,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _RECONNECT_BINDING_BATCH_SIZE = 128
+_HOST_HOLD_SNAPSHOT_BATCH_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -4080,6 +4081,16 @@ def create_app(
             _session_active_response_cache.get(session_id),
         )
 
+    def _held_session_owner_changed(
+        session_id: str, owner: tuple[object, int, str | None, str | None]
+    ) -> bool:
+        """Preserve newer local work; ordinary relay teardown does not establish it."""
+        old_relay, old_count, old_status, old_response = owner
+        relay, count, status, response = _held_session_owner(session_id)
+        return (status, response) != (old_status, old_response) or (
+            relay is not None and (relay is not old_relay or count != old_count)
+        )
+
     async def _mark_disconnected_runner_failed(
         runner_id: str,
         reference_stamp: int | None,
@@ -4219,7 +4230,7 @@ def create_app(
             unsettled = []
             for conv in affected:
                 owner = held.session_owners.get(conv.id)
-                if owner is not None and _held_session_owner(conv.id) != owner:
+                if owner is not None and _held_session_owner_changed(conv.id, owner):
                     continue
                 if (
                     conv.id in held.mid_turn_sessions
@@ -4389,20 +4400,23 @@ def create_app(
         owners = {conv.id: _held_session_owner(conv.id) for conv in held}
         # Order the snapshot after local status writes so a later terminal row
         # cannot merely be persistence lag behind this replica's running edge.
-        saved = await asyncio.wrap_future(
-            session_live_state.submit(
-                "runner_host_hold_snapshot",
-                conversation_store.list_conversations_by_runner_id,
-                runner_id,
+        saved: dict[str, Conversation] = {}
+        for batch in batched(owners, _HOST_HOLD_SNAPSHOT_BATCH_SIZE):
+            snapshot = await asyncio.wrap_future(
+                session_live_state.submit(
+                    "runner_host_hold_snapshot",
+                    conversation_store.get_conversations,
+                    list(batch),
+                )
             )
-        )
+            saved.update(snapshot or {})
         mid_turn_sessions = frozenset(
             conv.id
-            for conv in saved or []
+            for conv in saved.values()
             if conv.runner_id == runner_id
             and conv.live_status in _MID_TURN_STATUSES
             and conv.id in owners
-            and _held_session_owner(conv.id) == owners[conv.id]
+            and not _held_session_owner_changed(conv.id, owners[conv.id])
         )
         host_back_deadline: float | None = None
         outcome = "cancelled"
