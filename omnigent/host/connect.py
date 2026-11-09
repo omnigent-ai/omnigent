@@ -718,7 +718,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # launcher registered in the ``omnigent.claude_launcher`` group (e.g.
         # ``isaac``). Read by omnigent.claude_launcher.resolve_claude_launch in
         # the managed-host runner (``_auto_create_claude_terminal``) to wrap the
-        # Claude launch through a downstream binary (e.g. Databricks' isaac).
+        # Claude launch through a downstream binary.
         # The daemon→runner env strip would otherwise drop it, leaving the
         # runner on the default launch. Safe to propagate: not a secret, just a
         # plugin name.
@@ -2070,10 +2070,16 @@ class HostProcess:
             and (binding_for_harness(frame.inference_config, frame.harness) is not None)
         )
         if has_binding:
-            from omnigent.onboarding.harness_install import missing_harness_cli
+            from omnigent.onboarding.harness_install import (
+                READINESS_CLI_PROBE_TIMEOUT_S,
+                missing_harness_cli,
+            )
 
             assert frame.harness is not None
-            harness_ready = (await asyncio.to_thread(missing_harness_cli, frame.harness)) is None
+            missing = await asyncio.to_thread(
+                missing_harness_cli, frame.harness, READINESS_CLI_PROBE_TIMEOUT_S
+            )
+            harness_ready = missing is None
         else:
             harness_ready = frame.harness is None or await asyncio.to_thread(
                 harness_is_configured, frame.harness

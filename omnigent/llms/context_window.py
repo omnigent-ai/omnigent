@@ -16,7 +16,7 @@ from typing import Any, Protocol, cast
 
 from omnigent.onboarding.providers import ModelInfo, find_catalog_models
 
-_DEFAULT_CONTEXT_WINDOW: int = 128_000
+DEFAULT_CONTEXT_WINDOW: int = 128_000
 
 _ANTHROPIC_1M_BETA_SUFFIX = "[1m]"
 _ANTHROPIC_1M_BETA_WINDOW = 1_000_000
@@ -120,7 +120,7 @@ def get_model_context_window(model: str) -> int:
        source and reuses the onboarding/model-resolver cache.
     4. ``litellm.get_model_info()`` — optional local metadata. Also
        tried with the ``databricks/`` prefix for Databricks models.
-    5. ``_DEFAULT_CONTEXT_WINDOW`` (128 K) — conservative fallback.
+    5. ``DEFAULT_CONTEXT_WINDOW`` (128 K) — conservative fallback.
 
     :param model: The model identifier, e.g. ``"openai/gpt-4o"`` or
         ``"databricks-gpt-5-5"``.
@@ -129,7 +129,7 @@ def get_model_context_window(model: str) -> int:
     window = find_model_context_window(model)
     if window is not None:
         return window
-    return _DEFAULT_CONTEXT_WINDOW
+    return DEFAULT_CONTEXT_WINDOW
 
 
 def resolve_effective_context_window(

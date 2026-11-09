@@ -18,7 +18,11 @@ from omnigent.server.provider_sandbox_profiles import (
     provider_call,
     select_provider_profile,
 )
-from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
+    ConversationNotFoundError,
+)
 from omnigent.stores.sandbox_profile_store import (
     SandboxProfileStore,
     encode_snapshot,
@@ -87,7 +91,7 @@ class SandboxProfileCatalog:
                 ) from None
         rows = []
         for provider in managed:
-            rows.extend(self._provider_profiles(provider, user_id))
+            rows.extend(self._provider_profiles(provider, user_id) or [])
         if profile_id is not None:
             rows = [row for row in rows if row["id"] == profile_id]
         if search.strip():
@@ -126,28 +130,32 @@ class SandboxProfileCatalog:
 
     def _provider_profiles(
         self, provider: str, user_id: str | None, *, sandbox_id: str | None = None
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any]] | None:
         context = profile_context(user_id, sandbox_id)
         assert self._deployment is not None
         entry = self._deployment.for_provider(provider)
         assert entry is not None
 
-        def read() -> list[ProviderSandboxProfile]:
-            profiles = TypeAdapter(list[ProviderSandboxProfile]).validate_python(
-                build_owner_launcher(entry, self._deployment, context.user_id).list_profiles(
-                    context
-                )
+        def read() -> list[ProviderSandboxProfile] | None:
+            result = build_owner_launcher(entry, self._deployment, context.user_id).list_profiles(
+                context
             )
+            if result is None and sandbox_id is not None:
+                return None
+            profiles = TypeAdapter(list[ProviderSandboxProfile]).validate_python(result)
             if len(profiles) > 1000 or len({p.id for p in profiles}) != len(profiles):
                 raise ValueError("Provider catalog must have at most 1000 unique profiles")
             return profiles
 
+        profiles = provider_call(read, allow_gone=sandbox_id is not None)
+        if profiles is None:
+            return None
         return [
             {
                 **profile.model_dump(),
                 "provider": provider,
             }
-            for profile in provider_call(read, allow_gone=sandbox_id is not None)
+            for profile in profiles
         ]
 
     def require_selection(self, provider: str | None, *, user_id: str | None = None) -> None:
@@ -174,7 +182,7 @@ class SandboxProfileCatalog:
         if selected_provider in self.managed_providers(selected_provider):
             assert selected_provider is not None
             context = profile_context(user_id)
-            profiles = self._provider_profiles(selected_provider, user_id)
+            profiles = self._provider_profiles(selected_provider, user_id) or []
             selected = next((p for p in profiles if p["id"] == profile_id), None)
             if selected is None:
                 raise HTTPException(status_code=403, detail="Sandbox profile access denied")
@@ -272,14 +280,10 @@ class SandboxProfileCatalog:
             return False
         current_host_id = conversation.host_id
         if conversation.runner_id and current_host_id:
-            current_host = host_store.get_host(current_host_id) if host_store else None
-            protected = self.get_host_snapshot(
-                current_host_id, reference_session_id=conversation.id
-            ) is not None or (
-                current_host is not None
-                and current_host.sandbox_provider is not None
-                and current_host.sandbox_provider
-                in self.managed_providers(current_host.sandbox_provider)
+            protected = (
+                self.get_session_snapshot(conversation.id) is not None
+                or self.get_host_snapshot(current_host_id, reference_session_id=conversation.id)
+                is not None
             )
             if protected:
                 if runner_id is not None:
@@ -339,11 +343,15 @@ class SandboxProfileCatalog:
             bind=False,
             sandbox_provider=host.sandbox_provider,
             user_id=host.user_id,
+            allow_unprofiled_runner=True,
         )
         host_profile = self.get_host_snapshot(host_id)
-        if host_profile is None:
+        if host_profile is None and (
+            host.sandbox_provider is None
+            or host.sandbox_provider not in self.managed_providers(host.sandbox_provider)
+        ):
             return False
-        if profile is None and conversation.runner_id is not None:
+        if profile is None and host_profile is not None and conversation.runner_id is not None:
             raise OmnigentError(
                 "Detach this session's runner before adopting a sandbox profile",
                 code=ErrorCode.INVALID_INPUT,
@@ -359,6 +367,13 @@ class SandboxProfileCatalog:
             profile_snapshot=profile if profile is not None else host_profile,
         )
         return True
+
+    def _has_unprofiled_binding(self, session_id: str, host_id: str) -> bool:
+        try:
+            binding = self._store.conversations.get_profile_host_binding(session_id)
+        except ConversationNotFoundError:
+            return False
+        return binding.host_id == host_id and binding.profile_snapshot is None
 
     @staticmethod
     def _rotate_runner(
@@ -422,29 +437,43 @@ class SandboxProfileCatalog:
                         saved = self._saved_host_snapshot(host_id, reference_session_id)
                         if saved is not None:
                             return self.validate_snapshot(saved, user_id=host.user_id)
+                        if reference_session_id is not None and self._has_unprofiled_binding(
+                            reference_session_id, host.host_id
+                        ):
+                            return None
                         raise HTTPException(
                             status_code=409, detail="Sandbox no longer exists"
                         ) from None
-                    if len(rows) != 1:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="The controller did not identify this sandbox's exact profile",
-                        )
-                    snapshot = ProviderProfileSnapshot.model_validate(
-                        {
-                            **rows[0],
-                            "user_id": host.user_id,
-                            "workspace_id": profile_context(host.user_id).workspace_id,
-                        }
-                    ).model_dump()
-                    try:
-                        self.validate_snapshot(
-                            snapshot, user_id=host.user_id, sandbox_id=host.sandbox_id
-                        )
-                    except SandboxGoneError:
-                        raise HTTPException(
-                            status_code=409, detail="Sandbox disappeared; retry the request"
-                        ) from None
+                    if rows is None:
+                        if self._saved_host_snapshot(host.host_id) is not None:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="The controller lost this sandbox's profile",
+                            )
+                        snapshot = None
+                    else:
+                        if len(rows) != 1:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "The controller did not identify this sandbox's exact profile"
+                                ),
+                            )
+                        snapshot = ProviderProfileSnapshot.model_validate(
+                            {
+                                **rows[0],
+                                "user_id": host.user_id,
+                                "workspace_id": profile_context(host.user_id).workspace_id,
+                            }
+                        ).model_dump()
+                        try:
+                            self.validate_snapshot(
+                                snapshot, user_id=host.user_id, sandbox_id=host.sandbox_id
+                            )
+                        except SandboxGoneError:
+                            raise HTTPException(
+                                status_code=409, detail="Sandbox disappeared; retry the request"
+                            ) from None
                     assert self._host_store is not None
                     current = self._host_store.get_host(host_id)
                     if (
@@ -472,6 +501,7 @@ class SandboxProfileCatalog:
         bind: bool = True,
         sandbox_provider: str | None = None,
         user_id: str | None = None,
+        allow_unprofiled_runner: bool = False,
     ) -> None:
         """After host ownership checks, inherit or match the host's accepted profile."""
         host = self._host_store.get_host(host_id) if self._host_store else None
@@ -487,8 +517,13 @@ class SandboxProfileCatalog:
         host_snapshot = self.get_host_snapshot(host_id, reference_session_id=session_id)
         if host_snapshot is not None:
             self.validate_snapshot(host_snapshot, user_id=user_id)
-        elif sandbox_provider is not None:
-            self.require_selection(sandbox_provider, user_id=user_id)
+        elif session_snapshot is None:
+            legacy = host is not None and (
+                self._has_unprofiled_binding(session_id, host.host_id) or allow_unprofiled_runner
+            )
+            provider = host.sandbox_provider if host is not None else sandbox_provider
+            if not legacy and provider is not None:
+                self.require_selection(provider, user_id=user_id)
         if (
             session_snapshot is not None or host_snapshot is not None
         ) and not self._store.can_bind_host(session_id, host_id):

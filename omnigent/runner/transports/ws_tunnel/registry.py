@@ -256,6 +256,7 @@ class TunnelRegistry:
         max_connect_waiters_per_runner: int = 1024,
         max_connect_waiters_total: int = 8192,
         on_retire: Callable[[str], None] | None = None,
+        on_work_dispatched: Callable[[str], None] | None = None,
     ) -> None:
         """
         Create an empty runner tunnel registry.
@@ -273,6 +274,9 @@ class TunnelRegistry:
         :param on_retire: Called with the runner id whenever this server
             retires a live tunnel on purpose (:meth:`deregister` with
             ``retire=True``), before the close reaches the runner.
+        :param on_work_dispatched: Called with the runner id after a session
+            event (``POST /v1/sessions/{id}/events``) is sent to it, so the
+            managed-sandbox keepalive learns about new work before the next pong.
         :raises ValueError: If either waiter limit is less than one.
         """
         if max_connect_waiters_per_runner < 1:
@@ -288,7 +292,20 @@ class TunnelRegistry:
         self._max_connect_waiters_total = max_connect_waiters_total
         self._connect_waiter_total = 0
         self._on_retire = on_retire
+        self._on_work_dispatched = on_work_dispatched
         self._lock = threading.RLock()
+
+    def note_work_dispatched(self, runner_id: str) -> None:
+        """Report that a session event was just sent to *runner_id*; never raises.
+
+        :param runner_id: Runner that received the event.
+        """
+        if self._on_work_dispatched is None:
+            return
+        try:
+            self._on_work_dispatched(runner_id)
+        except Exception:
+            _logger.exception("work-dispatched hook failed for runner %s", runner_id)
 
     # ── Session lifecycle ────────────────────────────────
 

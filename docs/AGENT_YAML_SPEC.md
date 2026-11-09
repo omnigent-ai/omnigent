@@ -414,6 +414,12 @@ missing executor values.
 Register commands in `~/.omnigent/config.yaml` under `acp.agents`; the slug is
 derived from the agent name.
 
+Every ACP `session/prompt`, including Goose and Qwen prompts, carries
+`params._meta["ai.omnigent/inputItemId"]`. Its value is the persisted user item
+ID, already readable via `GET /v1/sessions/{id}/items` when the prompt arrives.
+A `null` value means a synthetic or tool-recovery prompt without an initiating
+persisted user item. A missing key indicates an older Omnigent version.
+
 OpenClaw's Gateway ACP bridge is one such server. It rejects per-session
 `mcpServers`, so disable Omnigent's MCP relay for that entry and let OpenClaw
 use its own tools, routing, memory, and channels:
@@ -653,14 +659,14 @@ os_env:
     type: linux_bwrap
     egress_rules:
       - "* pypi.org/**"                              # your other egress needs
-      - "* dbc-adb7b1a3-9097.cloud.databricks.com/**"  # the proxied workspace
+      - "* dbc-87654321-dcba.cloud.databricks.com/**"  # the proxied workspace
     credential_proxy:
       - type: databricks_cli
-        profiles: [dbc-adb7b1a3-9097, oss]
-        default: dbc-adb7b1a3-9097   # optional; sets DATABRICKS_CONFIG_PROFILE
+        profiles: [dbc-87654321-dcba, oss]
+        default: dbc-87654321-dcba   # optional; sets DATABRICKS_CONFIG_PROFILE
 ```
 
-Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
+Inside the sandbox, `databricks --profile dbc-87654321-dcba current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
 ### Git over SSH from a sandbox

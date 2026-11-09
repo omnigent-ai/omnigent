@@ -230,9 +230,7 @@ def test_agent_scheduled_task_create_requires_approval(
         expect(card).to_contain_text(f"rrule={_RRULE}")
         expect(card).to_contain_text("timezone=UTC")
         expect(card).to_contain_text(_PROMPT)
-        expect(card).to_contain_text(
-            "Effective task permission mode: agent default (no task override)"
-        )
+        expect(card).to_contain_text("Task permission setting: agent default (no task override)")
         assert not _tasks_named(base_url, task_name), "task was created before approval"
 
     outcome = _drive_gated_turn(
@@ -285,7 +283,7 @@ def test_agent_scheduled_task_update_requires_approval(
     def still_active() -> None:
         card = page.locator(_APPROVAL_CARD).first
         expect(card).to_contain_text(_PROMPT)
-        expect(card).to_contain_text("Effective task permission mode: auto")
+        expect(card).to_contain_text("Task permission setting: auto")
         tasks = _tasks_named(base_url, task_name)
         assert tasks, f"seeded task {task_name!r} disappeared"
         assert tasks[0]["state"] == "active", "task was paused before approval"
