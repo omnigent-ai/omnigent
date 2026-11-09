@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests._helpers.pull_request_ui import open_session_pull_requests
 from tests.e2e_ui.conftest import stub_session_pull_requests
 from tests.e2e_ui.github.test_github_tab import _INFO
 
@@ -228,7 +229,7 @@ def test_session_pr_list_long_title(
     stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
-    page.get_by_test_id("composer-pr-link").click()
+    open_session_pull_requests(page, mobile=viewport_width < 768)
     panel = (
         page.get_by_test_id("github-panel-drawer")
         if viewport_width < 768

@@ -318,16 +318,24 @@ async function disconnectHost(cliCommand, serverUrl) {
  *
  * Returns ok for an already-authed unmanaged CLI, when the server is unreachable (so the connect
  * attempt can raise its own, clearer error), or after a successful login. On
- * login failure returns `{ ok:false, authError:true, error }` so the UI can
- * offer a sign-in/retry affordance instead of a generic failure.
+ * login failure returns `{ ok:false, authError:true, error, errorMessage, errorAction, failure? }`
+ * so the UI can offer a sign-in/retry affordance instead of a generic failure;
+ * `failure` is the process-level {@link import("./omnigent_cli").CliFailure} behind the copy.
  *
  * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
  * @param {string} serverUrl
- * @param {{ onLogin?: () => void }} [opts] `onLogin` fires just before the login
- *   (which may open the browser) runs.
- * @returns {Promise<{ ok: boolean, authError?: boolean, error?: string }>}
+ * @param {{ onLogin?: () => void, loginTimeoutMs?: number }} [opts] `onLogin`
+ *   fires just before the login (which may open the browser) runs.
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   authError?: boolean,
+ *   error?: string,
+ *   errorMessage?: string,
+ *   errorAction?: string,
+ *   failure?: import("./omnigent_cli").CliFailure,
+ * }>}
  */
-async function ensureServerAuth(cliCommand, serverUrl, { onLogin } = {}) {
+async function ensureServerAuth(cliCommand, serverUrl, { onLogin, loginTimeoutMs } = {}) {
   if (cli.isLoopbackServer(serverUrl)) return { ok: true };
   const probe = await cli.probeServerAuth(serverUrl);
   const managedOmni = cli.cliCommandParts(cliCommand).prefixArgs[0] === "omni";
@@ -335,23 +343,91 @@ async function ensureServerAuth(cliCommand, serverUrl, { onLogin } = {}) {
   // Skip unreachable servers so the connect attempt reports the connectivity error.
   if ((!managedOmni && probe.authed) || !probe.reachable) return { ok: true };
   onLogin?.();
-  const res = await cli.loginServer(cliCommand, serverUrl);
+  const loginOptions = loginTimeoutMs === undefined ? [] : [{ timeoutMs: loginTimeoutMs }];
+  const res = await cli.loginServer(cliCommand, serverUrl, ...loginOptions);
   if (res.ok) return { ok: true };
-  // Deliberately a fixed, generic message — NOT `res.output`. `omnigent login`
-  // stdout on the OIDC path contains the login-ticket URL
-  // (`…/auth/login?ticket=…`), which is auth material; threading it to the
-  // renderer would leak it. The server URL alone is safe (the renderer already
-  // knows it).
-  const displayName = cli.cliCommandParts(cliCommand).displayName;
-  const errorMessage = `Sign-in to ${serverUrl} didn't complete. A browser window should have opened.`;
-  const errorAction = `Finish signing in and try again (or run \`${displayName} login ${serverUrl}\` in a terminal).`;
+  const { errorMessage, errorAction } = loginFailureCopy(
+    cliCommand,
+    serverUrl,
+    res.failure,
+    loginTimeoutMs ?? cli.LOGIN_TIMEOUT_MS,
+  );
   return {
     ok: false,
     authError: true,
     error: `${errorMessage} ${errorAction}`,
     errorMessage,
     errorAction,
+    ...(res.failure ? { failure: res.failure } : {}),
   };
+}
+
+/** @param {number} ms */
+function formatDuration(ms) {
+  if (ms >= 60000) {
+    const minutes = Math.round(ms / 60000);
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  const seconds = Math.round(ms / 100) / 10;
+  return `${seconds} second${seconds === 1 ? "" : "s"}`;
+}
+
+/**
+ * Diagnosis and recovery copy for a failed login, built only from the server
+ * URL, the command's display name, and process-level facts. Never from `login`
+ * output: on the OIDC path it carries the login-ticket URL (`…/auth/login?ticket=…`),
+ * which is auth material. The executable path is left out because it can reveal
+ * the user's home directory to the server-loaded renderer.
+ *
+ * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
+ * @param {string} serverUrl
+ * @param {import("./omnigent_cli").CliFailure | undefined} failure
+ * @param {number} timeoutMs
+ * @returns {{ errorMessage: string, errorAction: string }}
+ */
+function loginFailureCopy(cliCommand, serverUrl, failure, timeoutMs) {
+  const { displayName } = cli.cliCommandParts(cliCommand);
+  const rerun = `\`${displayName} login ${serverUrl}\``;
+  switch (failure?.kind) {
+    case undefined:
+      // No process-level facts to classify: keep the generic browser-flow copy.
+      return {
+        errorMessage: `Sign-in to ${serverUrl} didn't complete. A browser window should have opened.`,
+        errorAction: `Finish signing in and try again (or run ${rerun} in a terminal).`,
+      };
+    case "cli-not-found":
+      return {
+        errorMessage: `Couldn't start sign-in to ${serverUrl}: \`${displayName}\` or the interpreter it runs with wasn't found.`,
+        errorAction:
+          "Check that it's installed and on your PATH (or at the configured CLI path). If it is, reinstall it to repair it, then try again.",
+      };
+    case "spawn-failed":
+      return {
+        errorMessage: `Couldn't start sign-in to ${serverUrl}: \`${displayName}\` couldn't be run (${failure.errorCode}).`,
+        errorAction:
+          "Check that it's installed and executable, on your PATH or at the configured CLI path, then try again.",
+      };
+    case "timed-out":
+      return {
+        errorMessage: `Sign-in to ${serverUrl} wasn't finished within ${formatDuration(timeoutMs)}, so it was stopped.`,
+        errorAction: `Try again and finish any browser sign-in promptly, or run ${rerun} in a terminal.`,
+      };
+    case "signal":
+      return {
+        errorMessage: `Sign-in to ${serverUrl} stopped unexpectedly: \`${displayName} login\` was terminated by ${failure.signal}.`,
+        errorAction: `Try again, or run ${rerun} in a terminal.`,
+      };
+    case "exited":
+      return {
+        errorMessage: `Sign-in to ${serverUrl} failed: \`${displayName} login\` exited with code ${failure.exitCode}.`,
+        errorAction: `Try again and complete any browser sign-in that appears; if it still fails, run ${rerun} in a terminal to see the details.`,
+      };
+    default:
+      return {
+        errorMessage: `Sign-in to ${serverUrl} didn't complete.`,
+        errorAction: `Run ${rerun} in a terminal to see the details, then try again.`,
+      };
+  }
 }
 
 /**
@@ -479,6 +555,20 @@ async function shutdown(cliPath) {
   if (cliPath) await stopOwnedLocalServer(cliPath);
 }
 
+/**
+ * What `shutdown` would stop right now: connected host processes and a local
+ * server this app started. Read-only; the quit prompt uses it for its wording.
+ *
+ * @returns {{ hosts: number, localServer: boolean }}
+ */
+function runningWork() {
+  let hosts = 0;
+  for (const key of hostChildren.keys()) {
+    if (ownsLiveHost(key)) hosts += 1;
+  }
+  return { hosts, localServer: ownedLocalServer !== null };
+}
+
 module.exports = {
   ensureHostConnected,
   ensureServerAuth,
@@ -487,6 +577,7 @@ module.exports = {
   startLocalServer,
   stopOwnedLocalServer,
   shutdown,
+  runningWork,
   onChange,
   // Exposed for tests / introspection.
   _hostChildren: hostChildren,

@@ -299,7 +299,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
                 (host) => host.host_id === sourceHostId && isArcaHost(host, rememberedArcaHostId),
               )
           : false;
-      const result = cancelled
+      let result = cancelled
         ? { ok: false, error: "browser relay context changed" }
         : await dispatch(
             sourceConversationId,
@@ -311,6 +311,28 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
             sourceIsArcaHost,
             readHostOptions,
           );
+      if (
+        !cancelled &&
+        needsHostRevalidation &&
+        !readHostOptions &&
+        !result.ok &&
+        result.error === "Current session host is required to read this browser view"
+      ) {
+        // A view can become host-local after the probe; retry once with fresh provenance.
+        const currentHostId = await fetchSessionHostId(sourceConversationId, { queryClient });
+        result = cancelled
+          ? { ok: false, error: "browser relay context changed" }
+          : await dispatch(
+              sourceConversationId,
+              evt.action,
+              evt.args,
+              desktop,
+              currentHostId,
+              rememberedArcaHostId,
+              sourceIsArcaHost,
+              { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId: currentHostId },
+            );
+      }
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 

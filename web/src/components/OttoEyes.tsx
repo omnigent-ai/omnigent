@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { OttoIcon } from "@/components/icons/OttoIcon";
+import { createTextFieldMirror } from "@/lib/textFieldMirror";
 
 // Eye geometry in the SVG's own viewBox coordinate system (0 0 1024 1024).
 // Each of Otto's eyes is a fixed near-circular white with a concentric pupil
@@ -53,17 +54,9 @@ function isTrackedTextField(node: EventTarget | null): node is HTMLElement {
 
 // Screen-space point of the caret inside a <textarea>/<input>. There is no
 // native caret-rect API, so a hidden <div> mirrors the field's text layout and
-// a DOM Range measures the real character before the caret. Two details make
-// the mirror wrap *identically* to the field (earlier bugs made it wrap a word
-// early, so Otto glanced a line too low):
-//   - the font is copied via the `font` SHORTHAND; copying individual longhand
-//     properties lets an inherited font-stretch/variation widen the mirror's
-//     text and wrap it early;
-//   - getComputedStyle().width is the content-box width, so the mirror uses
-//     box-sizing:content-box with width = clientWidth - horizontal padding and
-//     zero padding/border, rather than copying width onto a border-box element.
-// Only the direction to the caret matters (the pupil is normalized onto the eye
-// rim), so sub-pixel differences are invisible.
+// a DOM Range measures the real character before the caret. Only the direction
+// to the caret matters (the pupil is normalized onto the eye rim), so sub-pixel
+// differences are invisible.
 function textFieldCaretPoint(el: TextField): ScreenPoint | null {
   const doc = el.ownerDocument;
   const win = doc.defaultView;
@@ -71,34 +64,11 @@ function textFieldCaretPoint(el: TextField): ScreenPoint | null {
 
   const cs = win.getComputedStyle(el);
   const padLeft = parseFloat(cs.paddingLeft) || 0;
-  const padRight = parseFloat(cs.paddingRight) || 0;
   const padTop = parseFloat(cs.paddingTop) || 0;
   const borderLeft = parseFloat(cs.borderLeftWidth) || 0;
   const borderTop = parseFloat(cs.borderTopWidth) || 0;
-  const contentWidth = el.clientWidth - padLeft - padRight;
 
-  const mirror = doc.createElement("div");
-  // The `font` shorthand carries family/size/weight/style/line-height together
-  // and resets the rest, so the mirror's glyph metrics match the field exactly.
-  mirror.style.font = cs.font;
-  mirror.style.letterSpacing = cs.letterSpacing;
-  mirror.style.wordSpacing = cs.wordSpacing;
-  mirror.style.textTransform = cs.textTransform;
-  mirror.style.textIndent = cs.textIndent;
-  mirror.style.tabSize = cs.tabSize;
-  mirror.style.direction = cs.direction;
-  mirror.style.position = "absolute";
-  mirror.style.top = "0";
-  mirror.style.left = "0";
-  mirror.style.boxSizing = "content-box";
-  mirror.style.width = `${contentWidth}px`;
-  mirror.style.height = "auto";
-  mirror.style.padding = "0";
-  mirror.style.border = "0";
-  mirror.style.visibility = "hidden";
-  mirror.style.whiteSpace = el instanceof HTMLInputElement ? "pre" : "pre-wrap";
-  mirror.style.wordWrap = "break-word";
-  mirror.style.overflowWrap = "break-word";
+  const mirror = createTextFieldMirror(el, cs);
   mirror.textContent = el.value;
 
   // Default to the content box's top-left (caret at the very start, empty
