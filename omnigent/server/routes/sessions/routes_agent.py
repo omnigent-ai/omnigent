@@ -364,8 +364,7 @@ def register_agent_routes(
         # Owner-only: a session-scoped agent's bundle runs with runner
         # authority, so a LEVEL_EDIT grant on the session (shared editors,
         # reused-agent sessions) is not enough — only the creating user or an
-        # admin may replace it. Check this before the reverse-session lookup,
-        # which is ambiguous for legacy agents reused across unrelated roots.
+        # admin may replace it.
         await asyncio.to_thread(_require_agent_owner, user_id, agent, permission_store)
 
         # A session-scoped agent row can be bound into several sessions, so

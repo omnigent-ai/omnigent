@@ -186,7 +186,9 @@ def test_redaction_retains_non_omnigent_executor_type() -> None:
     assert validate_agent_bundle(redacted).executor.harness_kind == "claude_sdk"
 
 
-def test_read_only_fork_gets_redacted_agent_copy(tmp_path: Path) -> None:
+@pytest.mark.parametrize("level", [LEVEL_READ, LEVEL_EDIT])
+def test_fork_agent_copy_is_redacted_only_for_read(tmp_path: Path, level: int) -> None:
+    """A READ fork gets a redacted agent copy; an EDIT fork keeps the full bundle."""
     uri = f"sqlite:///{tmp_path / 'fork-bundle.db'}"
     conversations = SqlAlchemyConversationStore(uri)
     permissions = SqlAlchemyPermissionStore(uri)
@@ -194,9 +196,10 @@ def test_read_only_fork_gets_redacted_agent_copy(tmp_path: Path) -> None:
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
     agent = agents.create("b" * 32, "shared-agent", "agents/shared.tar.gz")
     secret = "SOURCE_PRIVATE_CREDENTIAL_FORK"
-    artifacts.put(agent.bundle_location, _source_bundle(agent.name, secret))
+    original = _source_bundle(agent.name, secret)
+    artifacts.put(agent.bundle_location, original)
     source = conversations.create_conversation(agent_id=agent.id)
-    permissions.grant("collaborator@example.com", source.id, LEVEL_READ)
+    permissions.grant("collaborator@example.com", source.id, level)
 
     router = APIRouter()
     register_core_routes(
@@ -221,6 +224,11 @@ def test_read_only_fork_gets_redacted_agent_copy(tmp_path: Path) -> None:
         fork = conversations.get_conversation(response.json()["id"])
         assert fork is not None
         assert fork.agent_id is not None
+        if level == LEVEL_EDIT:
+            # An editor's fork shares the source agent and its original bundle.
+            assert fork.agent_id == source.agent_id
+            assert artifacts.get(agent.bundle_location) == original
+            return
         assert fork.agent_id != source.agent_id
         fork_agent = agents.get(fork.agent_id)
         assert fork_agent is not None

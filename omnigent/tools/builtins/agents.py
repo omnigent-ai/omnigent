@@ -61,7 +61,9 @@ class SysAgentGetTool(Tool):
             "guardrail policies. Global read — any session you can "
             "access. Requires session_id (an agent is only inspectable "
             "while running in some session). The returned agent_id "
-            "launches the same agent directly via sys_session_create. "
+            "launches the same agent via sys_session_create when you have "
+            "EDIT on a session using it (READ is not enough for another "
+            "user's session-scoped agent). "
             "Use sys_agent_download to fetch a bundle for inspection; "
             "READ access returns a redacted bundle, while EDIT returns the full bundle."
         )
