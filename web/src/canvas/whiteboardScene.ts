@@ -225,31 +225,37 @@ export function withText(
 }
 
 /**
- * Remove an element. Arrows bound to a removed shape keep that end where it
- * was drawn last, so deleting a frame never deletes the arrows pointing at it.
+ * Remove an element. An arrow bound to a removed shape keeps that end where
+ * it touched the shape, so deleting a frame never deletes the arrows pointing
+ * at it. The other end stays bound even while its card is not loaded yet.
  */
 export function removeElement(
   elements: readonly WhiteboardElement[],
   id: string,
   resolveBox: BoxResolver,
 ): WhiteboardElement[] {
-  return elements
-    .filter((element) => element.id !== id)
-    .flatMap((element): WhiteboardElement[] => {
-      if (element.kind !== "arrow") return [element];
-      const fromRemoved = isBoundEnd(element.from) && element.from.bind === id;
-      const toRemoved = isBoundEnd(element.to) && element.to.bind === id;
-      if (!fromRemoved && !toRemoved) return [element];
-      const drawn = resolveArrow(element, resolveBox);
-      if (!drawn) return [];
-      return [
-        {
-          ...element,
-          from: fromRemoved ? movePoint(drawn.start, 0, 0) : element.from,
-          to: toRemoved ? movePoint(drawn.end, 0, 0) : element.to,
-        },
-      ];
-    });
+  const removed = elements.find((element) => element.id === id);
+  const remaining = elements.filter((element) => element.id !== id);
+  if (!removed || !isBoxed(removed)) return remaining;
+  return remaining.flatMap((element): WhiteboardElement[] => {
+    if (element.kind !== "arrow") return [element];
+    const fromRemoved = isBoundEnd(element.from) && element.from.bind === id;
+    const toRemoved = isBoundEnd(element.to) && element.to.bind === id;
+    if (!fromRemoved && !toRemoved) return [element];
+    // Both ends on the removed shape would leave a zero-length arrow.
+    if (fromRemoved && toRemoved) return [];
+    const other = fromRemoved ? element.to : element.from;
+    const otherBox = isBoundEnd(other) ? resolveBox(other.bind) : null;
+    const otherAnchor = isBoundEnd(other) ? otherBox && center(otherBox) : other;
+    const loose = movePoint(otherAnchor ? edgePoint(removed, otherAnchor) : center(removed), 0, 0);
+    return [
+      {
+        ...element,
+        from: fromRemoved ? loose : element.from,
+        to: toRemoved ? loose : element.to,
+      },
+    ];
+  });
 }
 
 /** Append a new element, dropping the oldest ones beyond the cap. */

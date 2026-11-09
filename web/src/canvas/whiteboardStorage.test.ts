@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MAX_ELEMENTS, type WhiteboardElement } from "./whiteboardScene";
+import {
+  MAX_ELEMENTS,
+  MAX_STROKE_POINTS,
+  MAX_TEXT_LENGTH,
+  type WhiteboardElement,
+} from "./whiteboardScene";
 import {
   readWhiteboard,
   WHITEBOARD_VERSION,
@@ -52,6 +57,10 @@ describe("whiteboard storage", () => {
       JSON.stringify({ version: WHITEBOARD_VERSION + 1, elements: [] }),
     );
     expect(readWhiteboard("u", "main")).toEqual([]);
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new DOMException("denied", "SecurityError");
+    });
+    expect(readWhiteboard("u", "main")).toEqual([]);
   });
 
   it("drops malformed and duplicate elements and bounds the rest", () => {
@@ -67,12 +76,28 @@ describe("whiteboard storage", () => {
           { kind: "stroke", points: [0, 0, 1, 1] },
           { id: "wb-e", kind: "rectangle", box: [5_000_000, 0, 10, 10], text: 7 },
           { id: "wb-e", kind: "note", box: [0, 0, 10, 10], text: "duplicate" },
+          { id: "wb-f", kind: "note", box: [0, 0, 10, 10], text: "x".repeat(MAX_TEXT_LENGTH + 9) },
+          {
+            id: "wb-g",
+            kind: "stroke",
+            points: Array.from({ length: (MAX_STROKE_POINTS + 5) * 2 }, (_, index) => index),
+          },
         ],
       }),
     );
-    expect(readWhiteboard("u", "main")).toEqual([
-      { id: "wb-e", kind: "rectangle", x: 1_000_000, y: 0, width: 10, height: 10, text: "" },
-    ]);
+    const [frame, note, stroke] = readWhiteboard("u", "main");
+    expect(frame).toEqual({
+      id: "wb-e",
+      kind: "rectangle",
+      x: 1_000_000,
+      y: 0,
+      width: 10,
+      height: 10,
+      text: "",
+    });
+    expect(note).toMatchObject({ id: "wb-f", text: "x".repeat(MAX_TEXT_LENGTH) });
+    expect(stroke).toMatchObject({ id: "wb-g", kind: "stroke" });
+    expect((stroke as { points: unknown[] }).points).toHaveLength(MAX_STROKE_POINTS);
   });
 
   it("keeps only the newest elements beyond the cap", () => {

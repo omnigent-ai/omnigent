@@ -2,24 +2,28 @@
 // viewport portal renders in place, screen and flow coordinates are the same,
 // and the session cards come from `nodesRef`. Scene and storage run for real.
 
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 import { CanvasWhiteboard } from "./CanvasWhiteboard";
 import { readWhiteboard, writeWhiteboard } from "./whiteboardStorage";
 
-const { nodesRef, zoomRef } = vi.hoisted(() => ({
+const { nodesRef, zoomRef, snapRequests } = vi.hoisted(() => ({
   nodesRef: {
     current: [] as { id: string; position: { x: number; y: number }; measured?: object }[],
   },
   zoomRef: { current: 1 },
+  snapRequests: [] as boolean[],
 }));
 
 vi.mock("@xyflow/react", () => ({
   ViewportPortal: ({ children }: { children: ReactNode }) => children,
   useNodes: () => nodesRef.current,
   useReactFlow: () => ({
-    screenToFlowPosition: (point: { x: number; y: number }) => point,
+    screenToFlowPosition: (point: { x: number; y: number }, options?: { snapToGrid?: boolean }) => {
+      snapRequests.push(options?.snapToGrid ?? true);
+      return point;
+    },
     getZoom: () => zoomRef.current,
   }),
 }));
@@ -45,6 +49,7 @@ function chooseTool(label: string) {
 beforeEach(() => {
   nodesRef.current = [];
   zoomRef.current = 1;
+  snapRequests.length = 0;
 });
 
 afterEach(() => {
@@ -68,6 +73,9 @@ describe("CanvasWhiteboard", () => {
     expect(readWhiteboard("u", "main")).toEqual([
       expect.objectContaining({ kind: "rectangle", x: 10, y: 20, width: 200, height: 100 }),
     ]);
+    // React Flow snaps by default; frames ask for it explicitly.
+    expect(snapRequests.length).toBeGreaterThan(0);
+    expect(snapRequests.every(Boolean)).toBe(true);
   });
 
   it("keeps the pen active and saves one stroke per gesture", () => {
@@ -82,6 +90,9 @@ describe("CanvasWhiteboard", () => {
       "stroke",
       "stroke",
     ]);
+    // Snapping pen samples to the grid turns strokes into staircases.
+    expect(snapRequests.length).toBeGreaterThan(0);
+    expect(snapRequests.some(Boolean)).toBe(false);
   });
 
   it("places a note, edits its text, and shows it again after a reload", () => {
@@ -98,6 +109,43 @@ describe("CanvasWhiteboard", () => {
 
     render(<CanvasWhiteboard canvasId="main" viewerId="u" />);
     expect(screen.getByRole("note", { name: "Ask the reviewer" })).toBeInTheDocument();
+  });
+
+  it("keeps note text typed just before a reload, without leaving the editor", () => {
+    const { unmount } = render(<CanvasWhiteboard canvasId="main" viewerId="u" />);
+    chooseTool("Note");
+    fireEvent.pointerDown(surface(), { pointerId: 1, button: 0, clientX: 200, clientY: 200 });
+    fireEvent.pointerUp(surface(), { pointerId: 1, clientX: 200, clientY: 200 });
+    fireEvent.change(screen.getByRole("textbox", { name: "Note text" }), {
+      target: { value: "Half-written" },
+    });
+
+    act(() => {
+      window.dispatchEvent(new Event("pagehide"));
+    });
+    expect(readWhiteboard("u", "main")).toEqual([
+      expect.objectContaining({ kind: "note", text: "Half-written" }),
+    ]);
+    unmount();
+    render(<CanvasWhiteboard canvasId="main" viewerId="u" />);
+    expect(screen.getByRole("note", { name: "Half-written" })).toBeInTheDocument();
+  });
+
+  it("saves a frame name typed before the board unmounts", () => {
+    writeWhiteboard(
+      [{ id: "wb-frame", kind: "rectangle", x: 0, y: 0, width: 320, height: 192, text: "" }],
+      "u",
+      "main",
+    );
+    const { unmount } = render(<CanvasWhiteboard canvasId="main" viewerId="u" />);
+    fireEvent.doubleClick(within(screen.getByTestId("whiteboard-frame")).getByLabelText("Frame"));
+    fireEvent.change(screen.getByRole("textbox", { name: "Frame name" }), {
+      target: { value: "Review" },
+    });
+    unmount();
+    expect(readWhiteboard("u", "main")).toEqual([
+      expect.objectContaining({ kind: "rectangle", text: "Review" }),
+    ]);
   });
 
   it("binds an arrow to the session cards under its ends, so it follows them", () => {

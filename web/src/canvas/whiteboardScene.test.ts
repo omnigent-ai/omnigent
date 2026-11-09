@@ -20,6 +20,7 @@ import {
   strokePath,
   withText,
   type ArrowElement,
+  type RectangleElement,
   type WhiteboardBox,
   type WhiteboardElement,
 } from "./whiteboardScene";
@@ -140,9 +141,26 @@ describe("whiteboard arrows", () => {
     ]);
   });
 
-  it("drops an arrow it can no longer place", () => {
-    const orphan: ArrowElement = { ...bound, from: { bind: "gone" } };
-    expect(removeElement([frame, orphan], "wb-frame", resolveBox)).toEqual([]);
+  it.each([
+    ["frame", "rectangle"],
+    ["note", "note"],
+  ] as const)("keeps an arrow from a deleted %s to a card that has not loaded yet", (_, kind) => {
+    const shape: WhiteboardElement = { ...(frame as RectangleElement), kind };
+    const loaded = (id: string) => (id === "later" ? card : resolveBox(id));
+    const toCard: ArrowElement = { ...bound, from: { bind: "wb-frame" }, to: { bind: "later" } };
+    const fromCard: ArrowElement = { ...bound, from: { bind: "later" }, to: { bind: "wb-frame" } };
+    const [keptTo, keptFrom] = removeElement([shape, toCard, fromCard], "wb-frame", resolveBox);
+    // The deleted end stays where the shape was; the card end stays bound.
+    expect(keptTo).toEqual({ ...toCard, from: { x: 350, y: 25 } });
+    expect(keptFrom).toEqual({ ...fromCard, to: { x: 350, y: 25 } });
+    expect(resolveArrow(keptTo as ArrowElement, loaded)).toEqual({
+      start: { x: 350, y: 25 },
+      end: { x: 100, y: 25 },
+    });
+    expect(resolveArrow(keptFrom as ArrowElement, loaded)).toEqual({
+      start: { x: 100, y: 25 },
+      end: { x: 350, y: 25 },
+    });
   });
 });
 

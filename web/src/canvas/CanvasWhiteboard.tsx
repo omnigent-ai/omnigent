@@ -24,9 +24,10 @@ import {
   Trash2Icon,
 } from "lucide-react";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { isTextEntry } from "@/lib/hotkeys";
+import { isEscapeOwnerOpen, isTextEntry } from "@/lib/hotkeys";
 import { cn } from "@/lib/utils";
 import { CARD_HEIGHT, CARD_WIDTH } from "./canvasLayout";
+import { useCanvasWorkspace } from "./CanvasWorkspace";
 import {
   addElement,
   appendStrokePoint,
@@ -71,6 +72,7 @@ const TOOL_CLASS =
 const NO_FLOW_GESTURES = "nopan nodrag nowheel";
 const INTERACTIVE_CLASS = `${NO_FLOW_GESTURES} pointer-events-auto`;
 const MOVE_THRESHOLD = 3;
+const TEXT_SAVE_DELAY_MS = 400;
 const STROKE_WIDTH = 3;
 const HIT_WIDTH = 14;
 const INK = "var(--foreground)";
@@ -144,17 +146,47 @@ export function CanvasWhiteboard({
     [storageKey],
   );
 
-  const save = useCallback(
-    (next: WhiteboardElement[]) => {
-      show(next);
+  const persist = useCallback(
+    (next: readonly WhiteboardElement[], viewer: string | null, canvas: string) => {
       try {
-        writeWhiteboard(next, viewerId, canvasId);
+        writeWhiteboard(next, viewer, canvas);
         setSaveFailed(false);
       } catch {
         setSaveFailed(true);
       }
     },
-    [canvasId, show, viewerId],
+    [],
+  );
+
+  // Typing saves after a short pause; blur, unmount and page hide write any
+  // pending edit at once, so a reload mid-edit keeps the text. A pending edit
+  // carries its own canvas, so switching tabs can't write it to the new one.
+  const pendingTextRef = useRef<{ timer: number; write: () => void } | null>(null);
+  const cancelPendingText = useCallback(() => {
+    const pending = pendingTextRef.current;
+    if (pending) window.clearTimeout(pending.timer);
+    pendingTextRef.current = null;
+    return pending;
+  }, []);
+  const flushPendingText = useCallback(() => {
+    cancelPendingText()?.write();
+  }, [cancelPendingText]);
+  useEffect(() => {
+    window.addEventListener("pagehide", flushPendingText);
+    return () => {
+      window.removeEventListener("pagehide", flushPendingText);
+      flushPendingText();
+    };
+  }, [flushPendingText]);
+
+  const save = useCallback(
+    (next: WhiteboardElement[]) => {
+      // ``next`` already includes any text still waiting to be written.
+      cancelPendingText();
+      show(next);
+      persist(next, viewerId, canvasId);
+    },
+    [canvasId, cancelPendingText, persist, show, viewerId],
   );
 
   // Bind targets in drawing order (frames, cards, notes) so the topmost one wins.
@@ -204,16 +236,24 @@ export function CanvasWhiteboard({
   selectedRef.current = selectedId;
   const toolRef = useRef(tool);
   toolRef.current = tool;
+  // A focused conversation hides the board without unmounting it.
+  const visible = useCanvasWorkspace()?.canvasVisible ?? true;
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
   // Capture phase, so Delete never also reaches React Flow's own delete key.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented) return;
+      if (event.defaultPrevented || !visibleRef.current) return;
       if (event.target instanceof HTMLElement && isTextEntry(event.target)) return;
       if ((event.key === "Delete" || event.key === "Backspace") && selectedRef.current) {
         event.preventDefault();
         event.stopPropagation();
         deleteSelected();
-      } else if (event.key === "Escape" && (toolRef.current !== "select" || selectedRef.current)) {
+      } else if (
+        event.key === "Escape" &&
+        !isEscapeOwnerOpen() &&
+        (toolRef.current !== "select" || selectedRef.current)
+      ) {
         event.preventDefault();
         event.stopPropagation();
         drawRef.current = null;
@@ -361,8 +401,20 @@ export function CanvasWhiteboard({
     onPointerCancel: finishMove,
   });
 
+  const editText = (id: string, text: string) => {
+    const next = withText(elementsRef.current, id, text);
+    show(next);
+    cancelPendingText();
+    const write = () => persist(next, viewerId, canvasId);
+    pendingTextRef.current = {
+      timer: window.setTimeout(flushPendingText, TEXT_SAVE_DELAY_MS),
+      write,
+    };
+  };
+
   const commitText = (id: string, text: string) => {
     setEditingId(null);
+    flushPendingText();
     const current = elementsRef.current.find((element) => element.id === id);
     if (!current || !("text" in current) || current.text === text) return;
     save(withText(elementsRef.current, id, text));
@@ -499,6 +551,7 @@ export function CanvasWhiteboard({
               INTERACTIVE_CLASS,
               "h-6 w-56 rounded border bg-background px-1.5 text-ui text-foreground outline-none",
             )}
+            onChange={(event) => editText(frame.id, event.currentTarget.value)}
             onBlur={(event) => commitText(frame.id, event.currentTarget.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter" || event.key === "Escape") event.currentTarget.blur();
@@ -537,6 +590,7 @@ export function CanvasWhiteboard({
             defaultValue={note.text}
             maxLength={MAX_TEXT_LENGTH}
             className="size-full resize-none bg-transparent outline-none"
+            onChange={(event) => editText(note.id, event.currentTarget.value)}
             onBlur={(event) => commitText(note.id, event.currentTarget.value)}
             onKeyDown={(event) => {
               if (event.key === "Escape") event.currentTarget.blur();

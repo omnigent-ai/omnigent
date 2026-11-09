@@ -178,6 +178,10 @@ the header menu), and each place is a separate entry point.
   composer; sending returns to that board with the new session selected.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
+- `canvas-whiteboard`: with the `canvas_whiteboard` feature on, each board has a
+  toolbar to draw, add frames and notes, connect arrows to cards, frames or
+  notes, and delete. Drawings pan and zoom with the cards and are saved only in
+  this browser, per server, viewer and board.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared with me / Archived), Ordering
   (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
@@ -1117,6 +1121,14 @@ plain `uv run pytest`, which starts a private server for the test.
   outside the loaded sidebar pages enters health polling and the live watch
   set; changing cards updates the watched session and encoded temporary ids
   are excluded.
+- **`canvas-whiteboard` (draw, frame, note, arrow, delete, reload):**
+  `tests/e2e_ui/sessions/test_canvas_page.py::test_canvas_whiteboard_draws_on_the_board_and_keeps_the_drawing`.
+  Component tests in `web/src/canvas/CanvasWhiteboard.test.tsx` cover each
+  tool, snapping, arrow binding, text kept through a reload mid-edit, and save
+  failures. `web/src/canvas/CanvasWorkspace.test.tsx` checks that a hidden
+  board leaves Escape to the focused conversation. Scene and storage rules run
+  in `web/src/canvas/whiteboardScene.test.ts` and
+  `web/src/canvas/whiteboardStorage.test.ts`.
 - **`canvas-mobile` (deep link, back button, and reload):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_deep_link_and_mobile_return_keep_the_project`.
   At phone width and just below the desktop breakpoint, the journey compares the
