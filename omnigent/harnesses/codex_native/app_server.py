@@ -1186,6 +1186,19 @@ def codex_resume_unconfigured_model_provider(exc: BaseException) -> str | None:
     return missing if isinstance(missing, str) and missing else None
 
 
+def is_project_hooks_config_refusal(exc: BaseException) -> bool:
+    """Identify a project hooks path failure from Codex's pre-input config check."""
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == _CODEX_INVALID_REQUEST_CODE
+        and exc.message is not None
+        and exc.message.startswith(
+            "failed to load configuration: Failed to read project hooks config file "
+        )
+        and exc.message.endswith("/.codex/config.toml: Not a directory (os error 20)")
+    )
+
+
 async def _codex_effective_model_provider(client: CodexAppServerClient, cwd: Path) -> str | None:
     """
     Read the provider Codex runs for *cwd*, or ``None`` when it cannot be read.
