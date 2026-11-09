@@ -249,10 +249,10 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 "setup",
                 "--no-internal-beta",
                 stdin="\n".join(
-                    ["7", "3", "1", "3", "gateway-test", "q", "q", "q"]
+                    ["8", "3", "1", "3", "gateway-test", "q", "q", "q"]
                     if databricks
                     else [
-                        "7",
+                        "8",
                         "3",
                         "1",
                         "2",

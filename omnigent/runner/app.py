@@ -9172,6 +9172,7 @@ def _build_spawn_env_from_spec(
             _build_codex_spawn_env,
             _build_copilot_spawn_env,
             _build_cursor_spawn_env,
+            _build_genie_spawn_env,
             _build_goose_spawn_env,
             _build_hermes_spawn_env,
             _build_kimi_spawn_env,
@@ -9185,6 +9186,13 @@ def _build_spawn_env_from_spec(
         elif harness == "codex":
             env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
             env["HARNESS_CODEX_SKILLS_DIR"] = (
+                str(resource_registry.codex_skills_dir(session_id))
+                if resource_registry is not None and session_id is not None
+                else ""
+            )
+        elif harness == "genie":
+            env = _build_genie_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            env["HARNESS_GENIE_SKILLS_DIR"] = (
                 str(resource_registry.codex_skills_dir(session_id))
                 if resource_registry is not None and session_id is not None
                 else ""
@@ -9273,11 +9281,12 @@ def _build_spawn_env_from_spec(
         from omnigent.runner.subagent_routing import session_router_env
 
         env.update(session_router_env(session_id, harness))
-        if harness in CODEX_CANONICAL_HARNESSES:
+        if harness in CODEX_CANONICAL_HARNESSES and harness != "genie":
             # A Smart Routing turn or spawn can land on a gateway arm codex's
             # bundled catalog has no entry for, so the session replaces that
             # catalog. Plain sessions get nothing here and never pay the
-            # ``codex debug models`` probe.
+            # ``codex debug models`` probe. Genie is never routed, and the
+            # probe would run the codex binary, not genie.
             from omnigent.inner.codex_executor import codex_extended_catalog_env
 
             env.update(

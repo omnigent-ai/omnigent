@@ -18,6 +18,7 @@ function stub(name: string) {
 vi.mock("@/components/icons/ClaudeIcon", () => ({ ClaudeIcon: stub("claude") }));
 vi.mock("@/components/icons/CodexIcon", () => ({ CodexIcon: stub("codex") }));
 vi.mock("@/components/icons/CursorIcon", () => ({ CursorIcon: stub("cursor") }));
+vi.mock("@/components/icons/GenieIcon", () => ({ GenieIcon: stub("genie") }));
 vi.mock("@/components/icons/GooseIcon", () => ({ GooseIcon: stub("goose") }));
 vi.mock("@/components/icons/KiroIcon", () => ({ KiroIcon: stub("kiro") }));
 vi.mock("@/components/icons/NessieIcon", () => ({ NessieIcon: stub("nessie") }));
@@ -71,6 +72,8 @@ describe("AgentCard icon selection", () => {
     // The in-process Antigravity SDK harness shares the same glyph.
     { name: "x", harness: "antigravity", expected: "antigravity" },
     { name: "x", harness: "claude-sdk", expected: "claude" },
+    // Genie is a Codex fork but has its own lamp mark, not Codex's.
+    { name: "genie", harness: "genie", expected: "genie" },
     { name: "pi", harness: "pi", expected: "pi" },
     // The pi match is exact: a harness merely containing "pi" stays generic.
     { name: "spec-gen", harness: "openapi", expected: "bot" },

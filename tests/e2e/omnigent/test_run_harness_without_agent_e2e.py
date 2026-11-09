@@ -261,6 +261,11 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     this matrix to drive. Its coverage is the dedicated devin-native
     bridge/forwarder/executor unit tests plus the Devin picker e2e_ui suite.
 
+    ``genie`` (Databricks' codex fork) is excluded because it wraps the separately
+    distributed ``genie`` binary, which CI does not install, and several
+    ``HARNESS_PROBES`` consumers do not skip on a missing CLI. Its coverage is
+    ``tests/inner/test_genie_executor.py`` plus the genie spawn-env, readiness,
+    and background-title unit tests.
     Builtin ACP CLI harnesses (every row of ``ACP_CLI_HARNESSES``) are excluded
     for the same reason as ``goose``: each wraps an own-auth vendor CLI, so its
     spawn env carries no gateway/profile probe vars for this matrix to drive.
@@ -288,6 +293,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "hermes",
         "hermes-native",
         "devin-native",
+        "genie",
         *ACP_CLI_HARNESSES,
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

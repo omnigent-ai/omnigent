@@ -124,6 +124,15 @@ describe("partitionPickerEntries", () => {
     expect(agents.map((a) => a.name)).toEqual(["polly"]);
   });
 
+  it("puts the headless genie harness with the native CLIs", () => {
+    const { harnesses, agents } = partitionPickerEntries([
+      agent({ name: "genie", harness: "genie" }),
+      agent({ name: "polly", harness: "claude-sdk" }),
+    ]);
+    expect(harnesses.map((a) => a.name)).toEqual(["genie"]);
+    expect(agents.map((a) => a.name)).toEqual(["polly"]);
+  });
+
   it("keeps the user's own agents under Agents even on a native harness", () => {
     // One of these would otherwise pass for a harness row.
     const { harnesses, agents } = partitionPickerEntries([
