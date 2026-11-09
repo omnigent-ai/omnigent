@@ -1296,29 +1296,70 @@ export function ChatPage() {
     }
   }, [newSessionProjectId, newSessionProjectLabel, navigate]);
 
-  // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
-  // early return can't change the hook order between renders.
+  const terminalFirst = useTerminalFirst();
+  const showTerminal = shouldShowTerminalSurface(urlConvId ?? null, terminalFirst, runnerOnline);
+  // The shown terminal surface's element; MainAgentSurface's frontmost check reads it.
+  const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
+  const handleTerminalResume = useCallback(async () => {
+    if (!urlConvId) throw new Error("Session is not available");
+    if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {
+      onShowReconnectHelp();
+      return;
+    }
+    // An asleep sandbox joins any wake already on its way, so Resume never races it.
+    if (liveness.kind === "host_asleep") {
+      await wakeSandboxSession(urlConvId);
+      return;
+    }
+    const result = await retrySession(urlConvId);
+    if (!result.recovered) {
+      throw new Error("The session is already connected; no recovery was performed");
+    }
+  }, [urlConvId, liveness.kind, onShowReconnectHelp]);
+
+  // Loading + error gates for `/c/:id` hydration. The gate stands in for the
+  // chat surface only: the warm terminal surfaces render beside it in
+  // SessionLayout, so a switch through the gate keeps their live attaches.
+  let hydrationGate: React.ReactNode = null;
   if (urlConvId) {
     const promotingTempConversation =
       isTempConvId(urlConvId) &&
       activeConversationId !== null &&
       !isTempConvId(activeConversationId);
-    if (loadingConversation || (activeConversationId !== urlConvId && !promotingTempConversation))
-      return <HydratingPlaceholder />;
-    if (conversationLoadError) {
-      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
+    if (loadingConversation || (activeConversationId !== urlConvId && !promotingTempConversation)) {
+      hydrationGate = <HydratingPlaceholder />;
+    } else if (conversationLoadError) {
+      hydrationGate = (
+        <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />
+      );
     }
   }
+  const hydrated = hydrationGate === null;
 
-  const mainAgent = (
+  const terminalSurfaces = (
+    <WarmTerminalSurfaces
+      conversationId={urlConvId ?? null}
+      hydrated={hydrated}
+      showTerminal={showTerminal}
+      liveness={liveness}
+      runnerOnline={runnerOnline}
+      lastTaskError={failedSessionLastError(activeSession)}
+      permissionLevel={permissionLevel}
+      onShowReconnectHelp={onShowReconnectHelp}
+      onResume={handleTerminalResume}
+      onSurfaceElement={setTerminalSurfaceEl}
+    />
+  );
+
+  const mainAgent = hydrationGate ?? (
     <MainAgentSurface
+      terminalSurfaceEl={terminalSurfaceEl}
       conversationId={urlConvId ?? null}
       hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
       runnerOnline={runnerOnline}
-      lastTaskError={failedSessionLastError(activeSession)}
       liveness={liveness}
       agentsError={agentsError}
       disabled={!agentId || agentsError !== null}
@@ -1377,68 +1418,76 @@ export function ChatPage() {
 
   return (
     <SessionSharedContext.Provider value={isSessionShared}>
-      <SessionLayout mainAgent={mainAgent} />
-      <ReconnectSessionDialog
-        open={dialogOpen}
-        onOpenChange={setDialogOpen}
-        localReconnect={localReconnect}
-        arcaReconnect={arcaReconnect}
-        conversationId={urlConvId}
-        serverUrl={getCliServerUrl()}
-        wrapper={activeConv?.labels?.["omnigent.wrapper"]}
-        harness={activeSession?.harness}
-        state={reconnectState}
-        isOwner={reconnectIsOwner}
-        // Source prefill for the Clone tab's fork form. Mirrors AppShell's
-        // ForkSessionDialog wiring; the title additionally falls back to the
-        // sidebar row, which ChatPage has at hand.
-        sourceTitle={activeConv?.title ?? activeSession?.title}
-        sourceWorkspace={activeSession?.workspace}
-        sourceHostId={activeSession?.hostId}
-        sourceGitBranch={activeSession?.gitBranch}
-      />
-      {((isUnboundFork && forkSourceId) || canResumeOnLocalHost) && (
-        <ResumeWithDirectoryDialog
-          open={resumeDirDialogOpen}
-          onOpenChange={setResumeDirDialogOpen}
-          sessionId={urlConvId}
-          // Fork clone prefills from its source; a host-less session has none
-          // and prefills from its own recorded host/workspace/branch instead.
-          sourceSessionId={isUnboundFork ? forkSourceId : null}
-          prefill={{
-            hostId: activeSession?.hostId ?? null,
-            workspace: activeSession?.workspace ?? null,
-            gitBranch: activeSession?.gitBranch ?? null,
-          }}
-          serverUrl={getCliServerUrl()}
-          wrapper={activeConv?.labels?.["omnigent.wrapper"]}
-          harness={activeSession?.harness}
-        />
+      <SessionLayout mainAgent={mainAgent} terminalSurfaces={terminalSurfaces} />
+      {hydrated && (
+        <>
+          <ReconnectSessionDialog
+            open={dialogOpen}
+            onOpenChange={setDialogOpen}
+            localReconnect={localReconnect}
+            arcaReconnect={arcaReconnect}
+            conversationId={urlConvId}
+            serverUrl={getCliServerUrl()}
+            wrapper={activeConv?.labels?.["omnigent.wrapper"]}
+            harness={activeSession?.harness}
+            state={reconnectState}
+            isOwner={reconnectIsOwner}
+            // Source prefill for the Clone tab's fork form. Mirrors AppShell's
+            // ForkSessionDialog wiring; the title additionally falls back to the
+            // sidebar row, which ChatPage has at hand.
+            sourceTitle={activeConv?.title ?? activeSession?.title}
+            sourceWorkspace={activeSession?.workspace}
+            sourceHostId={activeSession?.hostId}
+            sourceGitBranch={activeSession?.gitBranch}
+          />
+          {((isUnboundFork && forkSourceId) || canResumeOnLocalHost) && (
+            <ResumeWithDirectoryDialog
+              open={resumeDirDialogOpen}
+              onOpenChange={setResumeDirDialogOpen}
+              sessionId={urlConvId}
+              // Fork clone prefills from its source; a host-less session has none
+              // and prefills from its own recorded host/workspace/branch instead.
+              sourceSessionId={isUnboundFork ? forkSourceId : null}
+              prefill={{
+                hostId: activeSession?.hostId ?? null,
+                workspace: activeSession?.workspace ?? null,
+                gitBranch: activeSession?.gitBranch ?? null,
+              }}
+              serverUrl={getCliServerUrl()}
+              wrapper={activeConv?.labels?.["omnigent.wrapper"]}
+              harness={activeSession?.harness}
+            />
+          )}
+        </>
       )}
     </SessionSharedContext.Provider>
   );
 }
 
 interface SessionLayoutProps {
+  /** The chat surface, or the hydration gate standing in for it. */
   mainAgent: React.ReactNode;
+  /** The warm terminal overlays; outlive the chat surface across switches. */
+  terminalSurfaces: React.ReactNode;
 }
 
 /**
- * Inside a conversation: wraps the chat surface. The terminals panel
- * and right rail are managed by AppShell and rendered outside this
- * component as flex siblings.
+ * Inside a conversation: wraps the chat surface and the terminal surfaces
+ * kept warm beside it. The terminals panel and right rail are managed by
+ * AppShell and rendered outside this component as flex siblings.
  *
  * The embedded browser pane is NOT here — it lives as the "Browser"
  * tab inside the right Workspace rail (WorkspacePanel), so it never floats as a
  * mid-page column.
  */
-function SessionLayout({ mainAgent }: SessionLayoutProps) {
+function SessionLayout({ mainAgent, terminalSurfaces }: SessionLayoutProps) {
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
-      {/* `relative`: positions MainAgentSurface's persistent terminal overlay
-          and the composer's file-drop overlay (both absolute inset-0) against
-          the main column. */}
+      {/* `relative`: positions the persistent terminal overlays and the
+          composer's file-drop overlay (both absolute inset-0) against the
+          main column. */}
       <div data-chat-surface className="relative flex min-w-0 flex-1 flex-col">
+        {terminalSurfaces}
         {mainAgent}
       </div>
     </div>
@@ -1466,8 +1515,8 @@ interface MainAgentSurfaceProps {
    * this is false and uses it to show the stopped-harness resume state.
    */
   runnerOnline: boolean | undefined;
-  /** Active session's last task error when it has failed; forwarded to MainTerminalView so the stopped-terminal state shows why. */
-  lastTaskError?: Session["lastTaskError"];
+  /** The shown terminal surface's element (WarmTerminalSurfaces), for the frontmost check. */
+  terminalSurfaceEl: HTMLElement | null;
   /** Derived open-session liveness — drives the reconnect hint/banner. */
   liveness: SessionLiveness;
   agentsError: unknown;
@@ -1636,14 +1685,108 @@ export function updateWarmTerminalSurfaces(
   return [...rest, { conversationId, readOnly }].slice(-MAX_WARM_TERMINAL_SURFACES);
 }
 
+interface WarmTerminalSurfacesProps {
+  /** Session the URL names, or null on the landing page. */
+  conversationId: string | null;
+  /**
+   * False while the hydration gate stands in for `conversationId`'s chat
+   * surface. Warm surfaces stay mounted (hidden) through the gate; the
+   * incoming session is warmed only once its snapshot is in, so the surface
+   * takes that session's own permission level and terminal-first state.
+   */
+  hydrated: boolean;
+  /** Whether the active session's terminal surface is the one on screen. */
+  showTerminal: boolean;
+  liveness: SessionLiveness;
+  runnerOnline: boolean | undefined;
+  /** Active session's last task error when it has failed, so the stopped-terminal state shows why. */
+  lastTaskError: Session["lastTaskError"] | null;
+  permissionLevel: number | null;
+  onShowReconnectHelp: () => void;
+  onResume: () => Promise<void>;
+  /** Receives the shown surface's element, for the frontmost check. */
+  onSurfaceElement: (element: HTMLElement | null) => void;
+}
+
+/**
+ * Terminal-first sessions' terminal surfaces, kept mounted (hidden) for the
+ * last {@link MAX_WARM_TERMINAL_SURFACES} sessions viewed so a switch back
+ * re-reveals a live attach instead of re-dialing. SessionLayout renders this
+ * beside the chat surface, outside the `/c/:id` hydration gate: the gate
+ * replaces the chat surface on every switch, and a cache kept inside it was
+ * torn down — with every attach — each time.
+ */
+function WarmTerminalSurfaces({
+  conversationId,
+  hydrated,
+  showTerminal,
+  liveness,
+  runnerOnline,
+  lastTaskError,
+  permissionLevel,
+  onShowReconnectHelp,
+  onResume,
+  onSurfaceElement,
+}: WarmTerminalSurfacesProps) {
+  const terminalFirst = useTerminalFirst();
+  // Hidden overlays retain layout so FitAddon geometry stays stable.
+  const mountTerminal = hydrated && shouldMountTerminalSurface(conversationId, terminalFirst);
+  // Non-owners attach read-only: a shared PTY can't attribute input
+  // per-user, so only the owner may type. They drive the agent via the
+  // composer instead. Server enforces this too.
+  const terminalReadOnly = !isOwnerLevel(permissionLevel);
+  const [warmTerminals, setWarmTerminals] = useState<WarmTerminalEntry[]>([]);
+  useEffect(() => {
+    if (!mountTerminal || !conversationId) return;
+    setWarmTerminals((prev) => updateWarmTerminalSurfaces(prev, conversationId, terminalReadOnly));
+  }, [mountTerminal, conversationId, terminalReadOnly]);
+  // Render from warmTerminals only: the effect adds the active session after
+  // the first paint, so xterm (a lazy chunk) never loads on the initial render.
+  // Returning to an already-warm session is still same-commit.
+  return (
+    <>
+      {warmTerminals.map((entry) => {
+        const isActive = mountTerminal && entry.conversationId === conversationId;
+        const isShown = isActive && showTerminal;
+        return (
+          <div
+            key={entry.conversationId}
+            // xterm's .visible scrollbar overrides inherited visibility. Opacity
+            // hides the entire subtree without disturbing its layout or connection.
+            className={cn("absolute inset-0 flex flex-col", !isShown && "invisible opacity-0")}
+            aria-hidden={!isShown}
+          >
+            <MainTerminalView
+              conversationId={entry.conversationId}
+              initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
+              visible={isShown}
+              runnerOnline={isActive ? runnerOnline : undefined}
+              lastTaskError={isActive ? lastTaskError : undefined}
+              onResume={isActive ? onResume : undefined}
+              sandboxOffline={isActive && liveness.kind === "host_asleep"}
+              onSurfaceElement={isActive ? onSurfaceElement : undefined}
+              readOnly={entry.readOnly}
+              splittable
+            />
+            {isShown && (
+              <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+            )}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
 /**
  * The conversation scroll surface + composer — the content of the
  * "Main Agent" tab (and also the standalone view on `/`).
  *
  * In terminal-first sessions, when the header switcher is set to
- * Terminal, the conversation + composer are replaced by an inline
- * `MainTerminalView`. The switcher itself stays visible (in the header,
- * see ViewModeToggle) so the user can flip back to Chat.
+ * Terminal, the conversation + composer give way to the session's terminal
+ * surface (WarmTerminalSurfaces, a sibling in SessionLayout). The switcher
+ * itself stays visible (in the header, see ViewModeToggle) so the user can
+ * flip back to Chat.
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
@@ -1652,7 +1795,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   isWorking,
   showsWorking,
   runnerOnline,
-  lastTaskError,
+  terminalSurfaceEl,
   liveness,
   agentsError,
   disabled,
@@ -1740,7 +1883,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   }, []);
   // Typing in the conversation starts a message in the composer.
   useTypeToComposer(() => composerRef.current?.focus(), conversationRef, !showTerminal);
-  const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
   // True only while the chat/terminal surface is the frontmost thing on screen.
   // Drives both native overlays so neither floats over an opened drawer.
   const surfaceFrontmost = useSurfaceFrontmost(
@@ -1871,171 +2013,99 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);
   }, [scroller]);
 
-  // Pre-warm terminal attaches across Chat/Terminal flips and session switches.
-  // Hidden overlays retain layout so FitAddon geometry stays stable; the chat
-  // surface unmounts while Terminal is shown.
-  const mountTerminal = shouldMountTerminalSurface(conversationId, terminalFirst);
-  // Non-owners attach read-only: a shared PTY can't attribute input
-  // per-user, so only the owner may type. They drive the agent via the
-  // composer instead. Server enforces this too.
-  const terminalReadOnly = !isOwnerLevel(permissionLevel);
-  const [warmTerminals, setWarmTerminals] = useState<WarmTerminalEntry[]>([]);
-  useEffect(() => {
-    if (!mountTerminal || !conversationId) return;
-    setWarmTerminals((prev) => updateWarmTerminalSurfaces(prev, conversationId, terminalReadOnly));
-  }, [mountTerminal, conversationId, terminalReadOnly]);
-  // Derive from warmTerminals only — the effect above adds the active session
-  // after the first paint, so xterm (a lazy chunk) never loads on the initial
-  // render. Previously the active session was included here same-commit to
-  // avoid the one-frame delay; that optimization is removed so the terminal
-  // chunk defers until after first paint. Returning to an already-warm
-  // background session is still same-commit (it's already in warmTerminals).
-  const renderedTerminals = warmTerminals;
-  const handleTerminalResume = useCallback(async () => {
-    if (!conversationId) throw new Error("Session is not available");
-    if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {
-      onShowReconnectHelp();
-      return;
-    }
-    // An asleep sandbox joins any wake already on its way, so Resume never races it.
-    if (liveness.kind === "host_asleep") {
-      await wakeSandboxSession(conversationId);
-      return;
-    }
-    const result = await retrySession(conversationId);
-    if (!result.recovered) {
-      throw new Error("The session is already connected; no recovery was performed");
-    }
-  }, [conversationId, liveness.kind, onShowReconnectHelp]);
-  const terminalSurfaces = renderedTerminals.map((entry) => {
-    const isActive = mountTerminal && entry.conversationId === conversationId;
-    const isShown = isActive && showTerminal;
-    return (
-      <div
-        key={entry.conversationId}
-        // xterm's .visible scrollbar overrides inherited visibility. Opacity
-        // hides the entire subtree without disturbing its layout or connection.
-        className={cn("absolute inset-0 flex flex-col", !isShown && "invisible opacity-0")}
-        aria-hidden={!isShown}
-      >
-        <MainTerminalView
-          conversationId={entry.conversationId}
-          initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
-          visible={isShown}
-          runnerOnline={isActive ? runnerOnline : undefined}
-          lastTaskError={isActive ? lastTaskError : undefined}
-          onResume={isActive ? handleTerminalResume : undefined}
-          sandboxOffline={isActive && liveness.kind === "host_asleep"}
-          onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
-          readOnly={entry.readOnly}
-          splittable
-        />
-        {isShown && (
-          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
-        )}
-      </div>
-    );
-  });
-
-  // Single return so both surfaces keep stable fragment positions across
-  // view flips — an early return would change the tree shape and remount
-  // the terminal overlays, disposing the live attaches they exist to
-  // preserve. The chat surface still unmounts entirely while the
-  // terminal is shown (a heavy transcript shouldn't render behind it).
+  // The chat surface unmounts entirely while the terminal is shown (a heavy
+  // transcript shouldn't render behind it). The terminal surfaces themselves
+  // are siblings in SessionLayout (WarmTerminalSurfaces), so this early-out
+  // can't disturb their live attaches.
+  if (showTerminal) return null;
   return (
     <>
-      {terminalSurfaces}
-      {!showTerminal && (
-        <>
-          {/* The scrolling transcript column owns every streaming-hot store
-          subscription and the bubble pipeline, so an SSE frame re-renders it
-          alone — this surface's composer and chrome below bail out. */}
-          <Transcript
-            hostId={hostId}
-            setConversationEl={setConversationEl}
-            containerEl={containerEl}
-            scroller={scroller}
-            setScroller={setScroller}
-            sendScrollNonce={sendScrollNonce}
-            hasMoreHistory={hasMoreHistory}
-            loadingMoreHistory={loadingMoreHistory}
-            isMobileViewport={isMobileViewport}
-            showsWorking={showsWorking}
-            agentsError={agentsError}
-            sandboxLaunching={sandboxLaunching}
-            spacerMeasureRef={spacerMeasureRef}
-          />
-          {/* Floating reply button — scoped to the conversation container.
-          Withheld when the composer refuses quotes (read-only grant or a
-          structurally non-interactive session), as SideChatPane does. */}
-          {!isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason) && (
-            <SelectionPopup
-              containerRef={conversationRef}
-              onReply={(text) => composerRef.current?.appendReplyQuote(text)}
-              onAskInSideChat={
-                supportsSideChat(selectionSessionHarness, canStartSideChat)
-                  ? (text) => composerRef.current?.startSideChat(text)
-                  : undefined
-              }
-            />
-          )}
-
-          <Composer
-            ref={composerRef}
-            disabled={disabled}
-            status={status}
-            isWorking={isWorking}
-            onSend={handleSend}
-            onNewSession={onNewSession}
-            onSendSlashCommand={handleSendSlashCommand}
-            onStop={onStop}
-            agents={agents}
-            selectedAgentId={selectedAgentId}
-            permissionLevel={permissionLevel}
-            readOnlyReason={readOnlyReason}
-            sendDisabledReason={sendDisabledReason}
-            effortLevels={effortLevels}
-            showEffort={showEffort}
-            showModels={showModels}
-            modelPickerKind={modelPickerKind}
-            codexModelOptions={codexModelOptions}
-            inferenceConfigured={inferenceConfigured}
-            inferenceError={inferenceError}
-            modelsFromLaunchPreview={modelsFromLaunchPreview}
-            modelLabelOptions={modelLabelOptions}
-            showCodexPlanMode={showCodexPlanMode}
-            showClaudePermissionMode={showClaudePermissionMode}
-            showCodexApprovalMode={showCodexApprovalMode}
-            showGoalControl={showGoalControl}
-            runnerOnline={runnerOnline}
-            runnerStarting={
-              sandboxStatus?.stage !== "failed" &&
-              (sandboxLaunching || liveness.kind === "starting")
-            }
-            showClaudeGoalControl={showClaudeGoalControl}
-            showPollyCodexGoalControl={showPollyCodexGoalControl}
-            isTerminalFirst={isTerminalFirst}
-            isNativeWrapper={isNativeWrapper}
-            unreachable={
-              !sandboxLaunching &&
-              (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
-            }
-            sendReconnectsArca={sendReconnectsArca}
-            sandboxStarting={sandboxStarting}
-            onShowReconnectHelp={onShowReconnectHelp}
-            costRoutingEligible={costRoutingEligible}
-            subagentRoutingEligible={subagentRoutingEligible}
-            subAgentLabel={subAgentLabel}
-            wrapperLabel={wrapperLabel}
-            onViewportShrinkPinScroll={pinScrollOnComposerGrowth}
-          />
-
-          {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
-          Sits below the composer so its position is consistent with the
-          terminal view. */}
-          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
-        </>
+      {/* The scrolling transcript column owns every streaming-hot store
+      subscription and the bubble pipeline, so an SSE frame re-renders it
+      alone — this surface's composer and chrome below bail out. */}
+      <Transcript
+        hostId={hostId}
+        setConversationEl={setConversationEl}
+        containerEl={containerEl}
+        scroller={scroller}
+        setScroller={setScroller}
+        sendScrollNonce={sendScrollNonce}
+        hasMoreHistory={hasMoreHistory}
+        loadingMoreHistory={loadingMoreHistory}
+        isMobileViewport={isMobileViewport}
+        showsWorking={showsWorking}
+        agentsError={agentsError}
+        sandboxLaunching={sandboxLaunching}
+        spacerMeasureRef={spacerMeasureRef}
+      />
+      {/* Floating reply button — scoped to the conversation container.
+      Withheld when the composer refuses quotes (read-only grant or a
+      structurally non-interactive session), as SideChatPane does. */}
+      {!isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason) && (
+        <SelectionPopup
+          containerRef={conversationRef}
+          onReply={(text) => composerRef.current?.appendReplyQuote(text)}
+          onAskInSideChat={
+            supportsSideChat(selectionSessionHarness, canStartSideChat)
+              ? (text) => composerRef.current?.startSideChat(text)
+              : undefined
+          }
+        />
       )}
+
+      <Composer
+        ref={composerRef}
+        disabled={disabled}
+        status={status}
+        isWorking={isWorking}
+        onSend={handleSend}
+        onNewSession={onNewSession}
+        onSendSlashCommand={handleSendSlashCommand}
+        onStop={onStop}
+        agents={agents}
+        selectedAgentId={selectedAgentId}
+        permissionLevel={permissionLevel}
+        readOnlyReason={readOnlyReason}
+        sendDisabledReason={sendDisabledReason}
+        effortLevels={effortLevels}
+        showEffort={showEffort}
+        showModels={showModels}
+        modelPickerKind={modelPickerKind}
+        codexModelOptions={codexModelOptions}
+        inferenceConfigured={inferenceConfigured}
+        inferenceError={inferenceError}
+        modelsFromLaunchPreview={modelsFromLaunchPreview}
+        modelLabelOptions={modelLabelOptions}
+        showCodexPlanMode={showCodexPlanMode}
+        showClaudePermissionMode={showClaudePermissionMode}
+        showCodexApprovalMode={showCodexApprovalMode}
+        showGoalControl={showGoalControl}
+        runnerOnline={runnerOnline}
+        runnerStarting={
+          sandboxStatus?.stage !== "failed" && (sandboxLaunching || liveness.kind === "starting")
+        }
+        showClaudeGoalControl={showClaudeGoalControl}
+        showPollyCodexGoalControl={showPollyCodexGoalControl}
+        isTerminalFirst={isTerminalFirst}
+        isNativeWrapper={isNativeWrapper}
+        unreachable={
+          !sandboxLaunching &&
+          (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
+        }
+        sendReconnectsArca={sendReconnectsArca}
+        sandboxStarting={sandboxStarting}
+        onShowReconnectHelp={onShowReconnectHelp}
+        costRoutingEligible={costRoutingEligible}
+        subagentRoutingEligible={subagentRoutingEligible}
+        subAgentLabel={subAgentLabel}
+        wrapperLabel={wrapperLabel}
+        onViewportShrinkPinScroll={pinScrollOnComposerGrowth}
+      />
+
+      {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
+      Sits below the composer so its position is consistent with the
+      terminal view. */}
+      <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
     </>
   );
 });
