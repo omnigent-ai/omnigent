@@ -60,8 +60,15 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
     useWorkspaceDirectory: () => ({ data: undefined }),
+    useWorkspaceFileSearch: () => ({ data: undefined }),
   };
 });
+// The "@" menu's session rows read the sidebar cache and a search query; these
+// tests don't open it, so stub the source like the workspace hooks above.
+vi.mock("@/hooks/useSessionMentionEntries", () => ({
+  MENTION_SEARCH_DEBOUNCE_MS: 300,
+  useSessionMentionEntries: () => [],
+}));
 
 // The /mcp panel's registry read and popup sign-in; the MCP cases script both.
 vi.mock("@/lib/mcpRegistry", () => ({
@@ -784,6 +791,8 @@ describe("Composer send shortcut", () => {
     [false, "{Shift>}{Enter}{/Shift}"],
     [true, "{Enter}"],
     [true, "{Shift>}{Enter}{/Shift}"],
+    [false, "{Alt>}{Enter}{/Alt}"],
+    [true, "{Alt>}{Enter}{/Alt}"],
   ] as const)("preserves newline input (alternate send: %s, keys: %s)", async (alternate, keys) => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
     const onSend = vi.fn();
@@ -855,16 +864,6 @@ describe("Composer send shortcut", () => {
     } finally {
       restorePointer();
     }
-  });
-
-  it("leaves an open slash menu's highlighted command alone on Alt+Enter", () => {
-    const onSend = vi.fn();
-    render(<Composer {...composerProps({ onSend })} />);
-    fireEvent.change(textarea(), { target: { value: "/des" } });
-
-    fireEvent.keyDown(textarea(), { key: "Enter", altKey: true });
-    expect(textarea().value).toBe("/des");
-    expect(onSend).not.toHaveBeenCalled();
   });
 
   it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {
@@ -6062,7 +6061,8 @@ describe("Composer reply quotes", () => {
     fireEvent.change(textarea(), { target: { value: "My answer" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     const [text, , replyDraft] = vi.mocked(props.onSend).mock.calls[0]!;
-    expect(text).toBe("[Attached file: src/example.ts]\n\n> Actual card\n\nMy answer");
+    // The drained file is an inline token, so its marker keeps the token's trailing space.
+    expect(text).toBe("[Attached file: src/example.ts] \n\n> Actual card\n\nMy answer");
     expect(serializeReplyDraft(replyDraft!)).toBe(text);
     act(() =>
       useChatStore.setState({
@@ -6071,7 +6071,7 @@ describe("Composer reply quotes", () => {
     );
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Actual card");
     expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue(
-      "[Attached file: src/example.ts]\n\n",
+      "[Attached file: src/example.ts] ",
     );
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toBe(text);
@@ -6936,7 +6936,8 @@ describe("Composer — editing queued messages", () => {
       }),
     );
     if (quoted) act(() => ref.current?.appendReplyQuote("Quoted answer"));
-    fireEvent.change(textarea(), { target: { value: QUEUED_TEXT } });
+    // Keep the drained inline token: deleting it would untag the file.
+    fireEvent.change(textarea(), { target: { value: textarea().value + QUEUED_TEXT } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     const original = useChatStore.getState().queuedMessages[0]!;
     expect(original.text).toContain("[Attached file: src/example.ts]");
