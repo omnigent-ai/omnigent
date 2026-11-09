@@ -971,12 +971,14 @@ class SandboxHostLauncher(SandboxLifecycle):
     supports_sandbox_profile_lookup: ClassVar[bool] = False
     """Whether sandbox-scoped discovery returns the durable assigned revision."""
 
-    def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile]:
+    def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile] | None:
         """Return only profiles currently authorized for the trusted caller context.
 
         Use bounded provider I/O, including explicit network timeouts. This
         synchronous hook must not provision resources or perform launch preflight.
         Return public metadata only; keep configuration and access rules private.
+        For sandbox-scoped lookup only, None confirms an authorized legacy sandbox
+        has no profile. Denied access must raise SandboxProfileAccessDenied.
         """
         raise self._capability_error("list provider-managed sandbox profiles")
 
