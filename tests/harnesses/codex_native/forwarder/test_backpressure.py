@@ -6,11 +6,15 @@ import asyncio
 import contextlib
 import functools
 import json
+import logging
+import time
+import uuid
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native.bridge import (
@@ -21,6 +25,7 @@ from omnigent.harnesses.codex_native.bridge import (
 from tests._helpers.polling import poll_until_async
 from tests.harnesses.codex_native.forwarder._support import (
     _posted_cumulative_tokens,
+    _RecordingClient,
     _usage_event,
 )
 
@@ -543,3 +548,74 @@ async def test_child_lane_drain_timeout_stops_a_stuck_worker() -> None:
     finally:
         await state.close_child_streams()
         await client.aclose()
+
+
+def _codex_turn_id(created_at: float) -> str:
+    """Build a Codex-style UUIDv7 turn id created at ``created_at`` (Unix seconds)."""
+    version_and_variant = (0x7 << 76) | (0x2 << 62)
+    return str(uuid.UUID(int=(int(created_at * 1000) << 80) | version_and_variant))
+
+
+def _records_named(caplog: pytest.LogCaptureFixture, event_name: str) -> list[Any]:
+    """Return the captured log records carrying debug event ``event_name``."""
+    return [
+        record for record in caplog.records if getattr(record, "event_name", None) == event_name
+    ]
+
+
+async def test_turn_start_reports_how_far_chat_trails_codex(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A live turn start records its lag behind Codex, and a late one warns."""
+    caplog.set_level(logging.INFO, logger=fwd._logger.name)
+    late_turn = _codex_turn_id(time.time() - 45)
+    prompt_turn = _codex_turn_id(time.time() - 1)
+    reconciled_turn = _codex_turn_id(time.time() - 600)
+    for turn_id, source in (
+        (late_turn, "turn/started"),
+        (prompt_turn, "turn/started"),
+        # A resume reconciliation of an old turn is not a delivery delay.
+        (reconciled_turn, "thread/resume"),
+        ("turn_without_timestamp", "turn/started"),
+    ):
+        await fwd._post_turn_status_edge(
+            _RecordingClient(),  # type: ignore[arg-type]
+            _SESSION_ID,
+            fwd._CodexTurnStatusEdge(status="running", turn_id=turn_id, source=source),
+        )
+
+    [warning] = _records_named(caplog, "codex_turn_start_delivery_lag")
+    assert warning.levelno == logging.WARNING
+    assert (warning.session_id, warning.turn_id) == (_SESSION_ID, late_turn)
+    assert 45_000 <= warning.attributes["start_lag_ms"] < 60_000
+    start_lags = {
+        record.turn_id: record.attributes["start_lag_ms"]
+        for record in _records_named(caplog, "codex_turn_status")
+    }
+    assert start_lags[late_turn] == warning.attributes["start_lag_ms"]
+    assert 1_000 <= start_lags[prompt_turn] < fwd._TURN_START_LAG_WARNING_SECONDS * 1000
+    assert start_lags[reconciled_turn] is None
+    assert start_lags["turn_without_timestamp"] is None
+
+
+def test_dropped_events_from_another_thread_are_logged_at_powers_of_ten(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Drops are counted per thread, and a thread losing many events warns."""
+    caplog.set_level(logging.INFO, logger=fwd._logger.name)
+    state = fwd._CodexForwarderState(parent_session_id=_SESSION_ID)
+    params = {"threadId": "thread_other", "turnId": "turn_other"}
+
+    for _ in range(150):
+        assert fwd._resolve_event_session(
+            params, "hook/started", _PARENT_THREAD, state, fallback_session_id=_SESSION_ID
+        ) == (None, False)
+
+    assert [
+        (record.levelno, record.attributes["dropped_events"], record.attributes["thread_id"])
+        for record in _records_named(caplog, "codex_thread_events_dropped")
+    ] == [
+        (logging.INFO, 1, "thread_other"),
+        (logging.INFO, 10, "thread_other"),
+        (logging.WARNING, 100, "thread_other"),
+    ]
