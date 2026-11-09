@@ -199,6 +199,23 @@ describe("validateSchedule — 1-hour floor + required selections", () => {
 });
 
 describe("describeSchedule", () => {
+  it.each([
+    [1, "Every minute"],
+    [10, "Every 10 minutes"],
+  ])("renders unrestricted minute intervals of %i", (interval, summary) => {
+    expect(describeSchedule(`FREQ=MINUTELY;INTERVAL=${interval}`)).toBe(summary);
+  });
+
+  it.each([
+    "FREQ=MINUTELY;INTERVAL=10;BYDAY=MO",
+    "FREQ=MINUTELY;INTERVAL=10;BYMONTH=3",
+    "FREQ=MINUTELY;INTERVAL=60;BYDAY=MO",
+    "FREQ=MINUTELY;INTERVAL=60;BYMONTH=3",
+    "FREQ=MINUTELY;INTERVAL=10;BYSECOND=30",
+  ])("preserves filters the library omits from minute summaries: %s", (rule) => {
+    expect(describeSchedule(rule)).toBe(rule);
+  });
+
   it("collapses the Mon–Fri set to Weekdays", () => {
     expect(describeSchedule("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0")).toBe(
       "Weekdays at 8:00 AM",

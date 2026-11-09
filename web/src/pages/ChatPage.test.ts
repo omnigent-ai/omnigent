@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
-import type { ServerInfo } from "@/lib/capabilities";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -14,6 +14,7 @@ import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
   buildSlashCommandMap,
+  composerOffersClear,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
   collectPendingElicitations,
@@ -46,6 +47,7 @@ import {
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
@@ -1177,6 +1179,20 @@ describe("workingIndicatorLabel — parked on a dialog", () => {
     expect(workingIndicatorLabel(2, "dialog open")).toMatch(/terminal/i);
   });
 
+  it("tentatively points at the terminal when a hidden prompt replaced its input box", () => {
+    expect(workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON)).toBe(
+      "Something in the agent's terminal may need your input.",
+    );
+    expect(
+      workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON, {
+        terminalView: true,
+        answerableInChat: true,
+      }),
+    ).toBe(
+      "Something in the agent's terminal may need your input. Open the Terminal view to check.",
+    );
+  });
+
   it("falls back to the normal label when not parked", () => {
     expect(workingIndicatorLabel(0, null)).toBe("Working…");
   });
@@ -1446,6 +1462,33 @@ describe("collectBubbleMarkdown", () => {
 });
 
 // ── Slash command map (skills + built-ins) ────────────────────────────
+
+describe("composer /clear gating", () => {
+  const info = (overrides: Partial<ServerInfo>) => ({ ...FALLBACK_SERVER_INFO, ...overrides });
+
+  it.each([
+    ["claude-native", true],
+    ["codex-native", true],
+    ["claude-sdk", false],
+    ["openai-agents", false],
+    [null, false],
+  ] as const)(
+    "offers native /clear for %s when the server lists the control",
+    (harness, offered) => {
+      expect(composerOffersClear(harness, info({ session_event_types: ["clear"] }))).toBe(offered);
+      expect(composerOffersClear(harness, info({ session_event_types: ["message"] }))).toBe(false);
+      expect(composerOffersClear(harness, "loading")).toBe(false);
+    },
+  );
+
+  it("offers claude-sdk /clear only when the server continues it in a new session", () => {
+    const sdkClear = info({ session_event_types: ["clear"], session_claude_sdk_clear: true });
+    expect(composerOffersClear("claude-sdk", sdkClear)).toBe(true);
+    expect(composerOffersClear("openai-agents", sdkClear)).toBe(false);
+    // An older server lists "clear" for native sessions only.
+    expect(composerOffersClear("claude-sdk", info({ session_event_types: ["clear"] }))).toBe(false);
+  });
+});
 
 describe("buildSlashCommandMap", () => {
   const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions"];

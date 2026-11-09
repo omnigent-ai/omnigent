@@ -57,6 +57,17 @@ struct DatabricksWebSession {
   }
 }
 
+/// What a workspace said about a saved web session when probed with its cookie.
+enum DatabricksSessionVerdict: Equatable {
+  case accepted
+  /// The session ended: a 401, or a redirect to the sign-in page.
+  case expired
+  /// The workspace denied this user.
+  case forbidden
+  /// No verdict: network failure, timeout, server error, or any other answer.
+  case unknown
+}
+
 @MainActor
 struct DatabricksSessionClient: DatabricksSessionCreating {
   private static let transport = DatabricksOAuthClient.makeSession()
@@ -190,6 +201,48 @@ struct DatabricksSessionClient: DatabricksSessionCreating {
         configuration: context.configuration, workspaceID: workspaceID)
     }
     throw DatabricksSessionError.unsafeRedirect
+  }
+
+  /// Asks the workspace's identity endpoint whether it still accepts `cookie`. The shared
+  /// transport does not follow redirects, so a sign-in redirect is visible as-is.
+  func verify(pageURL: URL, cookie: HTTPCookie) async -> DatabricksSessionVerdict {
+    guard var components = URLComponents(url: pageURL, resolvingAgainstBaseURL: false) else {
+      return .unknown
+    }
+    // Shared hosts route by the `o` selector, so it must survive; the rest of the page does not.
+    components.percentEncodedPath = WorkspaceURLExpander.workspaceUIPath + "/v1/me"
+    let workspaceSelector = components.queryItems?.first { $0.name == "o" }
+    components.queryItems = workspaceSelector.map { [$0] }
+    components.fragment = nil
+    guard let url = components.url else { return .unknown }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 15
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue(
+      HTTPCookie.requestHeaderFields(with: [cookie])["Cookie"], forHTTPHeaderField: "Cookie")
+    let result: (Data, URLResponse)
+    do {
+      result = try await session.data(for: request)
+    } catch {
+      return .unknown
+    }
+    guard let http = result.1 as? HTTPURLResponse else { return .unknown }
+    switch http.statusCode {
+    case 200...299:
+      return .accepted
+    case 401:
+      return .expired
+    case 403:
+      return .forbidden
+    case 301, 302, 303, 307, 308:
+      guard let location = http.value(forHTTPHeaderField: "Location"),
+        let target = URL(string: location, relativeTo: url)?.absoluteURL,
+        DatabricksWebSession.isLoginPath(target.path)
+      else { return .unknown }
+      return .expired
+    default:
+      return .unknown
+    }
   }
 
   private static func exchangeOrigin(context: DatabricksWebContext, tokens: DatabricksOAuthTokens)

@@ -3,6 +3,7 @@ import {
   HIDDEN_RECONNECT_JITTER_MS,
   HIDDEN_RECONNECT_MS,
   RECONNECT_BASE_MS,
+  RECONNECT_MAX_MS,
 } from "./reconnectBackoff";
 import {
   HEALTHY_CONNECTION_MS,
@@ -288,6 +289,44 @@ describe("sessionUpdatesSocket visibility-aware reconnect", () => {
     fireVisibilityChange(true);
     fireVisibilityChange(false);
     expect(FakeWebSocket.instances.length).toBe(1);
+  });
+
+  it("keeps backing off when every socket is dropped right after it opens", () => {
+    // An overloaded or crash-looping server can accept each socket and drop it
+    // at once. Opening alone must not reset the ramp, or the client redials
+    // every 250 ms and each reopen costs the server a full snapshot.
+    sessionUpdatesSocket.start();
+    for (let i = 0; i < 5; i += 1) {
+      latestWs().open();
+      latestWs().close();
+      vi.advanceTimersByTime(RECONNECT_MAX_MS);
+    }
+    const dials = FakeWebSocket.instances.length;
+
+    latestWs().open();
+    latestWs().close();
+    // The sixth failure's delay is the cap, jittered to no less than half.
+    vi.advanceTimersByTime(RECONNECT_MAX_MS / 2 - 1);
+    expect(FakeWebSocket.instances.length).toBe(dials);
+    vi.advanceTimersByTime(RECONNECT_MAX_MS / 2 + 1);
+    expect(FakeWebSocket.instances.length).toBe(dials + 1);
+  });
+
+  it("restarts the ramp from the base once a connection stays up", () => {
+    sessionUpdatesSocket.start();
+    for (let i = 0; i < 5; i += 1) {
+      latestWs().open();
+      latestWs().close();
+      vi.advanceTimersByTime(RECONNECT_MAX_MS);
+    }
+    latestWs().open();
+    vi.advanceTimersByTime(HEALTHY_CONNECTION_MS);
+    const dials = FakeWebSocket.instances.length;
+
+    latestWs().close();
+    // A healthy connection's drop retries within the first base delay again.
+    vi.advanceTimersByTime(RECONNECT_BASE_MS);
+    expect(FakeWebSocket.instances.length).toBe(dials + 1);
   });
 
   it("drops a pending hidden retry on stop() and ramps from the base after start()", () => {

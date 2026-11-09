@@ -12,8 +12,9 @@
 //
 // The pure helpers (matchesServer, parseDaemonRecord, normalizeServerUrl,
 // candidatePaths, resolveCliPath with injected probes) are unit-tested in
-// test/omnigent_cli.test.js; the functions that actually spawn a binary are
-// exercised in the manual verification flow.
+// test/omnigent_cli.test.js, as is runCli's failure classification against real
+// subprocesses; the other spawning functions are exercised in the manual
+// verification flow.
 
 "use strict";
 
@@ -27,6 +28,9 @@ const url = require("./url");
 
 /** Default timeout for the short status commands. */
 const DEFAULT_TIMEOUT_MS = 10000;
+
+/** Ceiling for `login`, just past the CLI's own 300s OIDC ticket deadline. */
+const LOGIN_TIMEOUT_MS = 305000;
 
 /**
  * One-liner shown on the setup page when the CLI is missing. Mirrors the
@@ -421,14 +425,57 @@ function cliCommandParts(command) {
 }
 
 /**
+ * Why a CLI subprocess failed, built only from process-level facts so it is
+ * safe to show or log: CLI output can carry auth material and is never read.
+ *
+ * @typedef {{
+ *   kind: "cli-not-found" | "spawn-failed" | "timed-out" | "signal" | "exited" | "failed",
+ *   exitCode?: number,
+ *   signal?: string,
+ *   errorCode?: string,
+ * }} CliFailure
+ */
+
+/**
+ * Classify an `execFile` error. execFile sets `err.code` to the numeric exit
+ * code on a normal non-zero exit, or a string errno (e.g. "ENOENT") with a
+ * `spawn …` syscall when the spawn itself failed; `killed` marks its own
+ * timeout kill, which a child that handles the signal can still answer with an
+ * exit code instead of dying by the signal.
+ *
+ * @param {Error & { code?: unknown, syscall?: unknown, killed?: boolean, signal?: string | null }} err
+ * @returns {CliFailure}
+ */
+function cliFailureOf(err) {
+  if (err.killed) {
+    return {
+      kind: "timed-out",
+      ...(typeof err.code === "number" ? { exitCode: err.code } : {}),
+      ...(typeof err.signal === "string" ? { signal: err.signal } : {}),
+    };
+  }
+  if (typeof err.code === "number") return { kind: "exited", exitCode: err.code };
+  if (
+    typeof err.code === "string" &&
+    typeof err.syscall === "string" &&
+    err.syscall.startsWith("spawn")
+  ) {
+    return { kind: err.code === "ENOENT" ? "cli-not-found" : "spawn-failed", errorCode: err.code };
+  }
+  if (typeof err.signal === "string") return { kind: "signal", signal: err.signal };
+  return { kind: "failed" };
+}
+
+/**
  * Run an Omnigent CLI subcommand and resolve with its captured output. Never
- * rejects — a failure surfaces as a non-zero `code` plus stderr so callers can
- * decide. `execFile` (no shell) avoids quoting pitfalls.
+ * rejects — a failure surfaces as a non-zero `code` (1 when there's no exit
+ * code) plus stderr and a {@link CliFailure} so callers can decide. `execFile`
+ * (no shell) avoids quoting pitfalls.
  *
  * @param {Parameters<typeof cliCommandParts>[0]} command
  * @param {string[]} args
  * @param {{ timeoutMs?: number }} [opts]
- * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
+ * @returns {Promise<{ code: number, stdout: string, stderr: string, failure?: CliFailure }>}
  */
 function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   const { executable, prefixArgs } = cliCommandParts(command);
@@ -438,10 +485,13 @@ function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
       [...prefixArgs, ...args],
       { timeout: timeoutMs, encoding: "utf8" },
       (err, stdout, stderr) => {
-        // execFile sets err.code to the numeric exit code on a normal non-zero
-        // exit, or a string errno (e.g. "ENOENT") when the spawn itself failed.
         const code = err ? (typeof err.code === "number" ? err.code : 1) : 0;
-        resolve({ code, stdout: stdout || "", stderr: stderr || "" });
+        resolve({
+          code,
+          stdout: stdout || "",
+          stderr: stderr || "",
+          ...(err ? { failure: cliFailureOf(err) } : {}),
+        });
       },
     );
   });
@@ -491,11 +541,15 @@ function serverAuthed(serverUrl) {
  * @param {string} cliPath
  * @param {string} serverUrl
  * @param {{ timeoutMs?: number }} [opts]
- * @returns {Promise<{ ok: boolean, output: string }>}
+ * @returns {Promise<{ ok: boolean, output: string, failure?: CliFailure }>}
  */
-async function loginServer(cliPath, serverUrl, { timeoutMs = 305000 } = {}) {
+async function loginServer(cliPath, serverUrl, { timeoutMs = LOGIN_TIMEOUT_MS } = {}) {
   const res = await runCli(cliPath, ["login", serverUrl], { timeoutMs });
-  return { ok: res.code === 0, output: (res.stdout || res.stderr).trim() };
+  return {
+    ok: res.code === 0,
+    output: (res.stdout || res.stderr).trim(),
+    ...(res.failure ? { failure: res.failure } : {}),
+  };
 }
 
 /**
@@ -965,6 +1019,29 @@ function bearerTokenFor(serverUrl) {
   return null;
 }
 
+const OMNIGENT_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
+const WORKSPACE_API_PATH = "/api/2.0/omnigent";
+
+/**
+ * Whether requests to `serverUrl` should carry a host's routing key, by the same
+ * rule as `databricks_request_headers()` (omnigent/cli_auth.py): on by default
+ * for the host-sharded workspace mount, opt-in on other servers with
+ * `OMNIGENT_HOST_SLICE_KEY_ENABLED=1`, and off for either when it is "0".
+ *
+ * @param {string} serverUrl
+ * @returns {boolean}
+ */
+function hostRoutingEnabled(serverUrl) {
+  const setting = process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+  if (setting === "0") return false;
+  if (setting === "1") return true;
+  try {
+    return new URL(serverUrl).pathname.replace(/\/+$/, "") === WORKSPACE_API_PATH;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The "basic request" that detects whether a host's tunnel is up: a single
  * `GET {serverUrl}/v1/hosts/{host_id}`, reading `body.status` — the same probe
@@ -994,6 +1071,8 @@ async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
   if (token) headers.Authorization = `Bearer ${token}`;
   else if (!isLoopbackServer(serverUrl))
     return { status: null, reachable: false, authMissing: true };
+  // Route to the replica holding this host's tunnel, the one whose status we want.
+  if (hostRoutingEnabled(serverUrl)) headers[OMNIGENT_SLICE_KEY_HEADER] = hostId;
   const base = serverUrl.replace(/\/+$/, "");
   const target = `${base}/v1/hosts/${encodeURIComponent(hostId)}`;
   try {
@@ -1154,6 +1233,7 @@ function liveDaemonRecordFor(serverUrl) {
 module.exports = {
   INSTALL_COMMAND,
   DEFAULT_TIMEOUT_MS,
+  LOGIN_TIMEOUT_MS,
   normalizeServerUrl,
   isLoopbackServer,
   sameLoopbackServer,
@@ -1190,6 +1270,7 @@ module.exports = {
   readDaemonRecords,
   daemonServerUrl,
   bearerTokenFor,
+  hostRoutingEnabled,
   probeHostTunnel,
   getHostConnectionFast,
 };

@@ -521,3 +521,14 @@ export function nativeAgentHasCapability(
 ): boolean {
   return nativeCodingAgentForAvailableAgent(agent)?.capabilities?.includes(capability) ?? false;
 }
+
+/** Whether the create-time UI offers native model settings. */
+export function nativeAgentHasModelSettings(
+  agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
+): boolean {
+  return (
+    nativeAgentHasCapability(agent, "modelPicker") ||
+    nativeAgentHasCapability(agent, "devinMode") ||
+    nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native"
+  );
+}

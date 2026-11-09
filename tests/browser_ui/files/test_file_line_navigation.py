@@ -133,6 +133,7 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
         },
     )
     browser_contract.json(f"{api}/child_sessions", empty)
+    browser_contract.json(f"{api}/side_chats", empty)
     browser_contract.json(f"{api}/policies", empty)
     browser_contract.json("/v1/policy-registry", empty)
     browser_contract.json(f"{api}/owner", {"owner": None})
@@ -500,23 +501,27 @@ def test_content_search_opens_line_and_preserves_results(
     """The tab, picker and hotkey preserve search and line navigation."""
     seeded_session.features["workspace_content_search"] = True
     _seed_citation_file(page, seeded_session)
-    seeded_session.contract.json(
-        f"/v1/sessions/{seeded_session.session_id}/resources/environments/default/content-search",
-        {
-            "matches": [
-                {
-                    "path": _FILE_PATH,
-                    "line": 351,
-                    "column": 3,
-                    "text": _AFTER_LINES[350],
-                    "match_start": 2,
-                    "match_end": 9,
-                }
-            ],
-            "truncated": False,
-            "warning": None,
-        },
-    )
+
+    def serve_match(line: int) -> None:
+        seeded_session.contract.json(
+            f"/v1/sessions/{seeded_session.session_id}/resources/environments/default/content-search",
+            {
+                "matches": [
+                    {
+                        "path": _FILE_PATH,
+                        "line": line,
+                        "column": 3,
+                        "text": _AFTER_LINES[line - 1],
+                        "match_start": 2,
+                        "match_end": 9,
+                    }
+                ],
+                "truncated": False,
+                "warning": None,
+            },
+        )
+
+    serve_match(351)
     _open_monaco(page, seeded_session)
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="Content search", exact=True).click()
@@ -571,6 +576,44 @@ def test_content_search_opens_line_and_preserves_results(
         "aria-selected", "true"
     )
     expect(search).to_have_value("")
+
+    # Phones reach the same search from the session menu as a full-screen drawer.
+    # A different line proves the tap navigates rather than inheriting line=351.
+    serve_match(200)
+    page.set_viewport_size({"width": 390, "height": 1000})
+    page.get_by_role("button", name="Conversation actions", exact=True).click()
+    page.get_by_role("menuitem", name="Content search", exact=True).click()
+    drawer = page.get_by_test_id("content-search-panel-drawer")
+    drawer_search = drawer.get_by_role("searchbox", name="Search file contents")
+    drawer_search.fill("changed")
+    drawer_search.press("Enter")
+    drawer.get_by_role("button", name=f"Open {_FILE_PATH} at line 200").click()
+    expect(drawer).to_have_attribute("data-state", "closed")
+    expect(page).to_have_url(re.compile(r"[?&]line=200(?:&|$)"))
+    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[199], "diff": False})
+
+    # Back from a result returns to the preserved search, not the Files drawer.
+    page.get_by_role("button", name="Close file viewer", exact=True).click()
+    expect(drawer).to_have_attribute("data-state", "open")
+    expect(drawer_search).to_have_value("changed")
+    expect(drawer.get_by_role("button", name=f"Open {_FILE_PATH} at line 200")).to_be_visible()
+
+    # The same file opened from Changes goes back to Files instead.
+    drawer.get_by_role("button", name="Close", exact=True).click()
+    page.get_by_role("button", name="Conversation actions", exact=True).click()
+    page.get_by_role("menuitem", name=re.compile(r"^Changes")).click()
+    files_drawer = page.get_by_test_id("files-panel-drawer")
+    files_drawer.get_by_role("button", name=_FILE_PATH, exact=True).click()
+    page.get_by_role("button", name="Close file viewer", exact=True).click()
+    expect(files_drawer).to_have_attribute("data-state", "open")
+    expect(drawer).to_have_attribute("data-state", "closed")
+    files_drawer.get_by_role("button", name="Close files", exact=True).click()
+
+    # Widening hands the same query and results to the desktop rail.
+    page.set_viewport_size({"width": 1600, "height": 1000})
+    rail.get_by_role("tab", name="Content search", exact=True).click()
+    expect(search).to_have_value("changed")
+    expect(rail.get_by_role("button", name=f"Open {_FILE_PATH} at line 200")).to_be_visible()
 
 
 def test_source_citation_centers_last_loaded_line(
@@ -1000,19 +1043,21 @@ def test_markdown_diff_url_stays_stable_across_responsive_layouts(
 def test_large_markdown_citation_and_unsaved_resize(
     page: Page, seeded_session: BrowserSession
 ) -> None:
-    """Large Markdown uses source for citations and preserves drafts on mobile."""
+    """Large Markdown opens in Preview, uses source for citations, and keeps drafts on mobile."""
     path = "src/large.md"
-    content = "# Large file\n" + "A paragraph for source viewing.\n" * 35_000
+    content = "# Large file\n" + "A paragraph for source viewing.\n" * 20_000
     content += "Final large Markdown line."
     _mock_markdown_files(page, seeded_session, {path: content})
     _post_message(seeded_session, f"[End of document]({path}:{len(content.splitlines())})")
     viewer = _open_viewer(
         page, seeded_session, path, {"diffActive": False, "previewableViewMode": "preview"}
     )
+    expect(viewer.get_by_role("heading", name="Large file")).to_be_visible(timeout=30_000)
+    expect(viewer.locator(".monaco-editor")).to_have_count(0)
+    page.get_by_role("button", name="End of document", exact=True).click()
     editor = viewer.locator(".monaco-editor")
     expect(editor).to_be_visible(timeout=30_000)
-    expect(viewer.get_by_text("Large Markdown file opened as source", exact=False)).to_be_visible()
-    page.get_by_role("button", name="End of document", exact=True).click()
+    expect(viewer.get_by_text("Large Markdown file edited as source", exact=False)).to_be_visible()
     page.wait_for_function(
         _CENTERED_LINE, arg={"text": "Final large Markdown line.", "diff": False}
     )
