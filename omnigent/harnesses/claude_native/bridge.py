@@ -3661,6 +3661,79 @@ def read_transcript_items_since_with_position(
     )
 
 
+def _log_unmirrored_human_prompt(
+    entry: _JsonObject,
+    parsed: list[ClaudeTranscriptItem],
+    *,
+    line_number: int,
+) -> None:
+    """
+    Warn when a prompt Claude marks as human-typed yields no user message.
+
+    The server settles a queued web message only when its mirrored user
+    message arrives, so a dropped record later surfaces as "never recorded".
+    Command echoes are expected to become other item types and are skipped.
+    Only the record's shape is logged, never its text.
+
+    :param entry: Decoded Claude transcript record.
+    :param parsed: Items the forwarder produced for *entry*.
+    :param line_number: One-based transcript line number, for correlation.
+    """
+    attachment = entry.get("attachment")
+    if entry.get("type") == "attachment":
+        if not isinstance(attachment, dict) or attachment.get("type") != "queued_command":
+            return
+        # A queued shell command or notification is dropped on purpose, not lost.
+        if attachment.get("commandMode") != "prompt":
+            return
+        origin = attachment.get("origin")
+        content: object = attachment.get("prompt")
+    else:
+        origin = entry.get("origin")
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(origin, dict) or origin.get("kind") != "human":
+        return
+    if any(
+        item.item_type == "message"
+        and item.data.get("role") == "user"
+        and item.data.get("is_meta") is not True
+        for item in parsed
+    ):
+        return
+    texts = (
+        [content]
+        if isinstance(content, str)
+        else [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        if isinstance(content, list)
+        else []
+    )
+    if any(
+        _is_slash_command_echo(text) or text.lstrip().startswith(("<bash-", "<local-command"))
+        for text in texts
+    ):
+        return
+    joined = "\n".join(texts)
+    _logger.warning(
+        "claude-native: human prompt record produced no user message; record_type=%s "
+        "line=%d content_shape=%s content_chars=%d is_meta=%s command_mode=%s "
+        "item_types=%s has_command_markup=%s has_shell_markup=%s",
+        entry.get("type"),
+        line_number,
+        type(content).__name__,
+        len(joined),
+        entry.get("isMeta") is True,
+        attachment.get("commandMode") if isinstance(attachment, dict) else None,
+        sorted({item.item_type for item in parsed}),
+        "<command-name>" in joined or "<command-message>" in joined,
+        any(marker in joined for marker in ("<bash-input>", "<bash-stdout>", "<bash-stderr>")),
+    )
+
+
 def read_transcript_items_from_offset(
     transcript_path: Path,
     byte_offset: int,
@@ -3752,6 +3825,7 @@ def read_transcript_items_from_offset(
             pending_settled_at=pending_settled_at,
             include_sidechains=include_sidechains,
         )
+        _log_unmirrored_human_prompt(entry, parsed, line_number=record.line_number)
         if legacy_agent_messages and any(item.agent_message_candidate for item in parsed):
             active_response_id = previous_response_id
         items.extend(parsed)
@@ -10748,23 +10822,22 @@ def _user_transcript_items_from_entry(
             # assistant text must inherit this id so it clusters with
             # the indicator, not the prior bubble.
             return fallback_response_id, [item]
-        # ``!cmd`` terminal commands may arrive here in older Claude
-        # builds; newer builds use top-level ``local_command`` records.
-        # In both shapes, surface the command and result as their own
-        # transcript group instead of inheriting the previous assistant
-        # response id.
-        terminal_response_id = (
-            fallback_response_id
-            if _BASH_INPUT_RE.search(content) is not None
-            else current_response_id or fallback_response_id
-        )
-        terminal_items = _terminal_command_items_from_content(
-            content,
-            source_key=source_key,
-            response_id=terminal_response_id,
-        )
-        if terminal_items:
-            return terminal_response_id, terminal_items
+        # Legacy ``!cmd`` records start with ``<bash-*>`` (newer builds use top-level
+        # ``local_command``) and get their own transcript group, not the prior response id.
+        # A prompt that merely quotes the markup (a pasted log) stays the person's message.
+        if stripped.startswith("<bash-"):
+            terminal_response_id = (
+                fallback_response_id
+                if _BASH_INPUT_RE.search(content) is not None
+                else current_response_id or fallback_response_id
+            )
+            terminal_items = _terminal_command_items_from_content(
+                content,
+                source_key=source_key,
+                response_id=terminal_response_id,
+            )
+            if terminal_items:
+                return terminal_response_id, terminal_items
         # Other CLI-scaffolding records (stdout/stderr from /effort, etc.)
         # arrive as standalone ``role=user`` records and must drop instead
         # of leaking as user bubbles.

@@ -631,8 +631,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
         # Forge CLI config selectors must agree across CLI, daemon, and runner.
-        # Forward paths only; bearer-token environment variables remain excluded.
+        # Forward paths and hosts; bearer-token environment variables remain excluded.
         "GLAB_CONFIG_DIR",
+        "GITLAB_HOST",
+        "GLAB_HOST",
         "GH_CONFIG_DIR",
         "XDG_CONFIG_HOME",
         "XDG_CONFIG_DIRS",

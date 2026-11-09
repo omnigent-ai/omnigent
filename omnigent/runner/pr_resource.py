@@ -269,15 +269,10 @@ def _default_pr(session_id: str | None, pr_url: str | None) -> SessionPullReques
 def _cannot_serve(info: dict[str, Any], capabilities: ProviderCapabilities) -> bool:
     """Whether a provider's workspace info shows that it cannot serve the workspace.
 
-    True when its CLI, if it has one, is present and signed in, yet no
-    repository resolved and the panel offers no other account to try.
+    True when no repository resolved and the panel offers no other account to try.
     """
     auth = info.get("auth")
     if info.get("available") is not True or not isinstance(auth, dict):
-        return False
-    cli = auth.get("cli")
-    if not auth.get("authenticated") or (isinstance(cli, dict) and not cli.get("available")):
-        # The panel shows the provider's install or sign-in guidance instead.
         return False
     repo = info.get("repo")
     if info.get("pr") is not None or (isinstance(repo, dict) and repo.get("name_with_owner")):
