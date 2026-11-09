@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        harness: [claude, codex, pi, agy]
+        harness: [claude, codex, pi, agy, jcode]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install without cache
@@ -65,4 +65,5 @@ jobs:
             codex) codex --version ;;
             pi) pi --version ;;
             agy) agy --version ;;
+            jcode) jcode --version ;;
           esac

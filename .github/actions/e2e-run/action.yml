@@ -99,7 +99,7 @@ runs:
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
     - name: Install Claude Code CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@4c1ff1ccd9a2e8bfa637a42dbddeffd0dd3c3c32
       with:
         harness: claude
 
@@ -118,24 +118,20 @@ runs:
         echo "OMNIGENT_E2E_CLAUDE_BILLING_NOTICE_BIN=$billing_cli_dir/node_modules/.bin/claude" >> "$GITHUB_ENV"
 
     - name: Install Codex CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@4c1ff1ccd9a2e8bfa637a42dbddeffd0dd3c3c32
       with:
         harness: codex
 
     - name: Install Pi CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@4c1ff1ccd9a2e8bfa637a42dbddeffd0dd3c3c32
       with:
         harness: pi
 
     - name: Install jcode harness CLI
-      # The builtin jcode catalog row launches via `jcode acp`. Host-daemon
-      # e2e tests bind sessions to the FIRST registered agent row, so a host
-      # without the jcode binary refuses the launch ("harness 'jcode' is not
-      # configured") and the runner never appears. Pin the version so CI is
-      # deterministic; bump to match the image bake's default when it moves.
-      shell: bash
-      run: |
-        sudo bash "${GITHUB_WORKSPACE}/deploy/docker/install-harness-cli.sh" jcode@v0.84.0
+      # Host-daemon E2E can select the builtin jcode ACP harness.
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@4c1ff1ccd9a2e8bfa637a42dbddeffd0dd3c3c32
+      with:
+        harness: jcode
 
     - name: Build pinned old server (backwards-compat only)
       # Only runs when server_version is set. Builds the released tag into an
