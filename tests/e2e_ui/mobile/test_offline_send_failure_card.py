@@ -27,7 +27,7 @@ from tests._helpers.host import isolated_host
 from tests._helpers.polling import poll_until
 from tests.e2e.resilience.lab.events import EventLog
 from tests.e2e.resilience.lab.proxy import FaultProxy, LoopThread, client_link
-from tests.e2e_ui.conftest import _register_agent_yaml, configure_mock_llm
+from tests.e2e_ui.conftest import _register_extra_agent, configure_mock_llm
 
 _PHONE = pytest.mark.browser_context_args(
     viewport={"width": 390, "height": 844},
@@ -129,15 +129,8 @@ def test_failure_card_clears_once_reconnect_recovers_the_delivered_send(
             ) as host,
         ):
             host.wait_online(client, timeout=45)
-            agent_id = _register_agent_yaml(
-                live_server,
-                "spec_version: 1\n"
-                "name: offline-send-agent\n"
-                "prompt: You are a terse smoke-test assistant.\n"
-                "executor:\n"
-                "  model: gpt-4o-mini\n"
-                "  config:\n"
-                "    harness: openai-agents\n",
+            agent_id = _register_extra_agent(
+                live_server, "offline-send-agent", "You are a terse smoke-test assistant."
             )
             assert agent_id is not None
             workspace = tmp_path / "project"
