@@ -132,16 +132,24 @@ function AutomationLinks({
   tasks: ScheduledTask[];
   onNavigate: () => void;
 }) {
-  const byId = new Map(tasks.map((task) => [task.id, task]));
+  // The separator before each name, e.g. ", " or " and ".
+  const separatorBefore = new Map<string, string>();
+  let separator = "";
   const parts = new Intl.ListFormat("en", { type: "conjunction" }).formatToParts(
     tasks.map((task) => task.id),
   );
-  return parts.map((part, index) => {
-    const task = part.type === "element" ? byId.get(part.value) : undefined;
-    return task ? (
-      <AutomationLink key={task.id} task={task} onNavigate={onNavigate} />
-    ) : (
-      <Fragment key={index}>{part.value}</Fragment>
-    );
-  });
+  for (const part of parts) {
+    if (part.type === "literal") {
+      separator += part.value;
+    } else {
+      separatorBefore.set(part.value, separator);
+      separator = "";
+    }
+  }
+  return tasks.map((task) => (
+    <Fragment key={task.id}>
+      {separatorBefore.get(task.id)}
+      <AutomationLink task={task} onNavigate={onNavigate} />
+    </Fragment>
+  ));
 }
