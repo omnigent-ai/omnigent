@@ -64,14 +64,14 @@ async def _drive_slow_worktree_discovery(base_url: str, session_id: str) -> None
             workspace = page.get_by_test_id("new-chat-landing-workspace-chip")
             await expect(workspace).to_be_visible()
             await expect(workspace).to_be_enabled()
-            await expect(workspace).to_have_attribute("title", "/work/repo")
+            await expect(workspace).to_have_accessible_name("Working directory: /work/repo")
             await expect(page.get_by_test_id("new-chat-landing-workspace-loading")).to_have_count(
                 0
             )
             await workspace.click()
             await page.get_by_test_id("recent-workspace-select-0").click()
             await expect(workspace).to_be_enabled()
-            await expect(workspace).to_have_attribute("title", "/work/repo")
+            await expect(workspace).to_have_accessible_name("Working directory: /work/repo")
             await expect(page.get_by_test_id("new-chat-landing-workspace-loading")).to_have_count(
                 0
             )

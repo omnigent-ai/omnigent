@@ -137,13 +137,14 @@ interface HostWorktreesResponse {
   data: HostWorktree[];
 }
 
-class HostWorktreesFetchError extends ApiError {
-  readonly retryable: boolean;
+// A plain ApiError with a flag: a subclass would evaluate ApiError at module load,
+// which breaks tests that mock @/lib/sessionsApi without it.
+type HostWorktreesApiError = ApiError & { retryable: boolean };
 
-  constructor(status: number, retryable: boolean) {
-    super(`host worktrees fetch failed: HTTP ${status}`, status, null);
-    this.retryable = retryable;
-  }
+function hostWorktreesFetchError(status: number, retryable: boolean): HostWorktreesApiError {
+  return Object.assign(new ApiError(`host worktrees fetch failed: HTTP ${status}`, status, null), {
+    retryable,
+  });
 }
 
 /**
@@ -177,7 +178,7 @@ export async function fetchHostWorktrees(
     const exhaustedHostBudget =
       res.status === 504 ||
       (res.status === 409 && /did not respond to worktree listing within \d+s/i.test(errorText));
-    throw new HostWorktreesFetchError(res.status, res.status !== 400 && !exhaustedHostBudget);
+    throw hostWorktreesFetchError(res.status, res.status !== 400 && !exhaustedHostBudget);
   }
   const body = (await res.json()) as HostWorktreesResponse;
   return body.data;
@@ -186,7 +187,7 @@ export async function fetchHostWorktrees(
 // A 400 is the host's answer for this path. A host timeout may already have
 // consumed its 150-second budget, so immediate retries only multiply that wait.
 function shouldRetryHostWorktrees(failureCount: number, error: Error): boolean {
-  if (error instanceof HostWorktreesFetchError && !error.retryable) return false;
+  if (error instanceof ApiError && "retryable" in error && error.retryable === false) return false;
   return failureCount < 3;
 }
 

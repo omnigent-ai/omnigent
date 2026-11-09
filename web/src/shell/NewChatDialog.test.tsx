@@ -5776,7 +5776,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByRole("status", { name: "Loading working directory" })).toBeNull();
     expect(pendingWorkspace).toBeEnabled();
     expect(pendingWorkspace).not.toHaveAttribute("aria-busy");
-    expect(pendingWorkspace).toHaveAttribute("title", "/Users/corey/repo");
+    expect(pendingWorkspace).toHaveAccessibleName("Working directory: /Users/corey/repo");
     expect(screen.getByTestId("new-chat-landing-workspace-icon-folder")).toBeInTheDocument();
     expect(screen.queryByText("legacy")).toBeNull();
 
@@ -6253,7 +6253,7 @@ describe("NewChatLandingScreen", () => {
     } as ReturnType<typeof useHostWorktrees>);
     renderLanding();
     const workspace = await screen.findByTestId("new-chat-landing-workspace-chip");
-    expect(workspace).toHaveAttribute("title", "/Users/corey/repo");
+    expect(workspace).toHaveAccessibleName("Working directory: /Users/corey/repo");
     expect(workspace).toBeEnabled();
     expect(workspace).not.toHaveAttribute("aria-busy");
     expect(screen.queryByRole("status", { name: "Loading working directory" })).toBeNull();
