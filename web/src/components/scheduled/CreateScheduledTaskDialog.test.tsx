@@ -3683,6 +3683,38 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
   });
 
+  it("matches PagerDuty services by name with contains, which other sources don't offer", async () => {
+    function scopeOperatorOptions() {
+      const scopeOperator = screen.getByTestId("task-trigger-scope-operator");
+      fireEvent.pointerDown(
+        scopeOperator,
+        new MouseEvent("pointerdown", { bubbles: true, button: 0 }),
+      );
+      fireEvent.click(scopeOperator);
+      return screen.getAllByRole("option").map((option) => option.textContent);
+    }
+
+    const { unmount } = renderTrigger("jira");
+    expect(scopeOperatorOptions()).toEqual(["equals", "in"]);
+    unmount();
+
+    renderTrigger("pagerduty");
+    expect(scopeOperatorOptions()).toEqual(["equals", "in", "contains"]);
+    fireEvent.click(screen.getByRole("option", { name: "contains" }));
+    expect(screen.getByTestId("task-trigger-scope-operator")).toHaveTextContent("contains");
+    type("task-trigger-scope", "payments, checkout");
+    type("task-trigger-instructions", "Find the likely cause.");
+    expect(screen.getByRole("alert")).toHaveTextContent("Contains matches one piece of text.");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    type("task-trigger-scope", "payments");
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    const prompt = await submittedPrompt();
+    expect(prompt).toContain(
+      'Watch: new PagerDuty incidents on services whose name contains "payments"',
+    );
+  });
+
   it("separates the rendered system and user prompts on Edit as prompt", async () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");

@@ -190,6 +190,29 @@ A task that continues a session replaces steps 2 to 4 once it has a
 `session_id`: it checks the session, wakes its runner the way a user message
 would, and sends the prompt, also while the session is busy with an earlier turn.
 It records `succeeded` once the prompt is delivered, without waiting for the turn.
+Trigger automations are the exception. A trigger automation is such a task whose
+prompt starts with the opening sentence of a Jira, Slack, GitHub, Linear or
+PagerDuty trigger template, the same check the web form uses. The database scheduler
+checks a trigger again two minutes after each poll (`TRIGGER_POLL_SECONDS`)
+instead of on its saved schedule, though never past the schedule's next
+occurrence: a schedule that ends (`COUNT` or `UNTIL`) still ends the trigger,
+and its last occurrence is sent even while the session is busy. It also
+configures the store so that a trigger
+that is created or resumed, or edited into a trigger, is first checked two
+minutes later; after an upgrade, an existing trigger switches over at its next
+saved poll. Before claiming a poll, the scheduler asks the check built by
+`build_busy_until` when the session can be polled. A session that shows as
+running (a turn in progress, or waiting on an approval or question) is checked
+again two minutes later. An idle one is polled once it has been quiet for two
+minutes after its last change (`updated_at`), since an agent can pause between
+steps. Either way, a poll goes out once the latest run went out (`fired_at`) ten
+minutes ago, so a stale status cannot stall the trigger. A skip only moves
+`next_run_at` to the next check: it writes no run row and logs
+`scheduled_run_skipped_busy`. The
+status is read from session activity, which needs no caller access check, so the
+poll does not act as the owner. A failed check sends the prompt. Other continued
+tasks, legacy timers and a scheduler with a custom `on_fire` hook (it has no busy
+check) follow the saved schedule and never skip, and neither does Run now.
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run

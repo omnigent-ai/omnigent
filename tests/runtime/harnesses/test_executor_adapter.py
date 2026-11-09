@@ -416,8 +416,10 @@ async def test_executor_error_terminates_with_response_failed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preserve_session", [False, True])
+@pytest.mark.parametrize("retryable", [False, True])
 async def test_executor_error_preserves_only_explicitly_reusable_sessions(
     preserve_session: bool,
+    retryable: bool,
 ) -> None:
     """Ordinary errors still tear down; explicitly reusable executors can be retained."""
     import asyncio
@@ -429,7 +431,7 @@ async def test_executor_error_preserves_only_explicitly_reusable_sessions(
     from omnigent.server.schemas import CreateResponseRequest
 
     executor = MockExecutor()
-    error = ExecutorError(message="model unavailable", retryable=True)
+    error = ExecutorError(message="model unavailable", retryable=retryable, undelivered=True)
     if preserve_session:
         error.preserve_session = True
         executor.enqueue_events([error])
@@ -445,9 +447,10 @@ async def test_executor_error_preserves_only_explicitly_reusable_sessions(
         response_id="resp_failed", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
     )
 
-    with pytest.raises(RuntimeError, match="model unavailable"):
+    with pytest.raises(RuntimeError, match="model unavailable") as raised:
         await adapter.run_turn(request, ctx)
 
+    assert adapter._build_error_detail(raised.value).undelivered is True
     if preserve_session:
         assert adapter._executor is executor
         assert adapter._abandoned_executor_cleanup is None
