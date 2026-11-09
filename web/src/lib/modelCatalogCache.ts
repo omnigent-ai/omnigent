@@ -5,7 +5,7 @@ import type { NativeModelOption } from "./types";
 
 // Runner-reported catalogs send null for unset fields; read them as absent.
 function unset<T extends z.ZodType>(schema: T) {
-  return schema.nullish().transform((value) => value ?? undefined);
+  return z.preprocess((value) => value ?? undefined, schema.optional());
 }
 
 export const modelOptionSchema = z.object({
