@@ -25,6 +25,8 @@ import uuid
 import httpx
 from playwright.sync_api import Locator, Page, expect
 
+from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
+
 # Longer than the tooltip's 600 ms hover delay (TooltipProvider in
 # web/src/components/ui/tooltip.tsx) and the 600 ms menu-close guard
 # (web/src/hooks/useMenuGuardedTooltip.ts), so a late tooltip cannot slip past.
@@ -65,6 +67,8 @@ def test_session_header_action_visibility(
     """Filter stays visible while Select reveals on hover or keyboard focus."""
     base_url, session_id = seeded_session
     title = f"e2e-header-actions-{uuid.uuid4().hex[:8]}"
+    # The Sessions-header filter button exists only with sidebar_grouping_ui off.
+    enable_grouping_ui(page, enabled=False)
     _set_title(base_url, session_id, title)
 
     page.set_viewport_size({"width": 1280, "height": 800})
@@ -112,6 +116,8 @@ def test_filter_tooltip_stays_hidden_after_choosing_an_option(
     """Choosing a filter option closes the menu without the icon's tooltip appearing."""
     base_url, session_id = seeded_session
     title = f"e2e-filter-tooltip-{uuid.uuid4().hex[:8]}"
+    # The Sessions-header filter button exists only with sidebar_grouping_ui off.
+    enable_grouping_ui(page, enabled=False)
     _set_title(base_url, session_id, title)
 
     page.set_viewport_size({"width": 1280, "height": 800})

@@ -98,7 +98,11 @@ from omnigent.harnesses.antigravity_native.steps import (
 )
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.native._native_post_delivery import post_session_event_with_retry
-from omnigent.native._native_supersession import post_clear_supersession
+from omnigent.native._native_supersession import (
+    clear_replacement_create_body,
+    post_clear_supersession,
+    unfiled_clear_replacement_body,
+)
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _logger = logging.getLogger(__name__)
@@ -3077,7 +3081,7 @@ async def _rotate_session_for_cascade(
     new cascade on the SAME process:
 
     1. GET the old session snapshot (``agent_id`` / ``runner_id`` / ``labels``).
-    2. POST ``/v1/sessions`` with the old ``agent_id`` + inherited ``labels`` — the
+    2. POST ``/v1/sessions`` with the old ``agent_id``, title, project + inherited ``labels`` — the
        labels carry agy's bridge-id (:data:`ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY`),
        so the NEW session resolves to the SAME ``bridge_dir`` the reader uses (agy's
        bridge_dir is keyed off the launcher's bridge-id, NOT the session id — so we
@@ -3133,10 +3137,10 @@ async def _rotate_session_for_cascade(
         if ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY not in labels:
             labels[ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
 
-        create_resp = await client.post(
-            "/v1/sessions",
-            json={"agent_id": agent_id, "labels": labels},
-        )
+        create_body = clear_replacement_create_body(old, agent_id=agent_id, labels=labels)
+        create_resp = await client.post("/v1/sessions", json=create_body)
+        if (unfiled_body := unfiled_clear_replacement_body(create_body, create_resp)) is not None:
+            create_resp = await client.post("/v1/sessions", json=unfiled_body)
         create_resp.raise_for_status()
         created = create_resp.json()
         new_session_id = created.get("id") if isinstance(created, dict) else None

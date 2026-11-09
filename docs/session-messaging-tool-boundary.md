@@ -14,7 +14,9 @@ This records the existing behavior on `main`; it changes no runtime permissions.
 
 Creating C from A with `sys_session_create(placement="same_host")` or
 `placement="managed"` does not make C a child. Its `created_by_session_id`
-records origin; `parent_session_id` determines the child relationship.
+records origin; `parent_session_id` determines the child relationship. C is
+filed in A's project, so a trigger automation's per-item sessions sit beside
+the session that started them.
 Named child dispatch through `sys_session_send(agent=..., args=...)` remains
 available too. The table describes the intended choice, not a new restriction
 on which owned destinations the peer-message tool can address.

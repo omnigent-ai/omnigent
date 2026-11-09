@@ -14,7 +14,13 @@ import { capitalizeAgentName } from "./agentLabels";
 import { agentRootName } from "./forkHarness";
 import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
 import type { RoutingDecisionExtras } from "./routingDecision";
-import type { AgyPermission, CodexPersistMode, RememberScope, Response } from "./types";
+import type {
+  AgyPermission,
+  CodexPersistMode,
+  FileEditRequest,
+  RememberScope,
+  Response,
+} from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -304,6 +310,13 @@ export interface SlashCommandBlock {
   output: string | null;
 }
 
+/** Hide the internal native-wrapper namespace added to bundled skills. */
+export function slashCommandDisplayName(name: string): string {
+  const separator = name.indexOf(":");
+  if (separator < 0 || !nativeCodingAgentForAgentName(name.slice(0, separator))) return name;
+  return name.slice(separator + 1) || name;
+}
+
 /**
  * Reconstruct the literal composer text a skill invocation came from,
  * e.g. `/review-pr 123 focus on auth`. A skill's `slash_command`
@@ -313,7 +326,8 @@ export interface SlashCommandBlock {
  * Skill indicator.
  */
 export function slashCommandEchoText(name: string, args: string): string {
-  return args ? `/${name} ${args}` : `/${name}`;
+  const displayName = slashCommandDisplayName(name);
+  return args ? `/${displayName} ${args}` : `/${displayName}`;
 }
 
 /**
@@ -687,6 +701,8 @@ export interface ElicitationBlock {
    * Optional/null for every other elicitation.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** Claude-native file-edit prompts only: the full tool call, so the card can show a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Structured Codex command-approval payload. Present for
    * codex-native command approvals so the card can show command,

@@ -656,6 +656,11 @@ def _pr_payload(
         "head_ref": _short_ref(pr.get("sourceRefName")),
         "head_sha": _commit(pr, "lastMergeSourceCommit"),
         "base_sha": _commit(pr, "lastMergeTargetCommit"),
+        "head_repository_url": (
+            _text(_nested(pr, "forkSource", "repository", "webUrl"))
+            if pr.get("forkSource")
+            else url.rsplit("/pullrequest/", 1)[0]
+        ),
         "checks": checks,
         "body": description if isinstance(description, str) and description.strip() else None,
         "comments": comments[:_MAX_COMMENTS],
