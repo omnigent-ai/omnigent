@@ -2377,6 +2377,7 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
     # Keep the resolved server config off the real ~/.omnigent/config.yaml.
     monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "data" / "anchor"))
+    monkeypatch.delenv("OMNIGENT_CONFIG", raising=False)
 
     db_path = tmp_path / "chat.db"
     artifact_dir = tmp_path / "artifacts"

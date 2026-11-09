@@ -4871,14 +4871,15 @@ def server(
             ) from None
     server_config: dict[str, Any] | None = cfg
     if config_path is None:
-        # Without -c, the resolved server config (OMNIGENT_CONFIG or
-        # <data_dir>/config.yaml) owns every key; the user config only fills in
+        # Without -c, create_app gets the resolved server config (OMNIGENT_CONFIG
+        # or <data_dir>/config.yaml); the user config only fills in
         # session_title_instructions when the server config leaves it unset.
-        server_config = dict(load_server_config())
+        resolved_server_config = dict(load_server_config())
         title_instructions = _load_global_config().get(SESSION_TITLE_INSTRUCTIONS_KEY)
         if title_instructions is not None:
-            server_config.setdefault(SESSION_TITLE_INSTRUCTIONS_KEY, title_instructions)
-        server_config = server_config or None
+            resolved_server_config.setdefault(SESSION_TITLE_INSTRUCTIONS_KEY, title_instructions)
+        # Pass the dict even when empty so create_app doesn't re-read the file.
+        server_config = resolved_server_config
 
     # Let the server-config reader (branding) see the same ``-c`` file.
     if config_path:
