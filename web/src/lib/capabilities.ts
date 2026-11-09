@@ -7,12 +7,9 @@
  * ``/login`` / ``/register`` / ``/members`` routes and whether to
  * render the ``AccountMenu``.
  *
- * This is the single gate for accounts UI in the SPA. When the
- * internal hosted product (header / OIDC) syncs from this repo
- * and serves this bundle, ``/v1/info`` returns
- * ``accounts_enabled: false`` and none of the accounts routes
- * are reachable — the bundle behaves identically to a pre-PR-2008
- * build for those deploys.
+ * This is the single gate for accounts UI in the SPA. Deployments that use
+ * header or OIDC auth get ``accounts_enabled: false`` from ``/v1/info``, so
+ * none of the accounts routes are reachable.
  *
  * Mirrors the ``identity.ts`` resolve-once-then-cache pattern.
  * Unauthed by design — must work before any cookie is present.
@@ -76,8 +73,19 @@ export type FeatureKey =
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
 
+export type SiblingSessionDestinations =
+  "current_host" | "current_host_or_new_sandbox" | "any_host";
+
+export function parseSiblingSessionDestinations(value: unknown): SiblingSessionDestinations {
+  if (value === undefined || value === "any_host") return "any_host";
+  return value === "current_host_or_new_sandbox" ? value : "current_host";
+}
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  sibling_sessions?: boolean;
+  session_bundle_workspaces?: boolean;
+  sibling_session_destinations?: SiblingSessionDestinations;
   accounts_enabled: boolean;
   /**
    * True only on an explicit single-user local runtime
@@ -98,11 +106,9 @@ export interface ServerInfo {
    */
   needs_setup: boolean;
   /**
-   * True on Databricks/internal deployments (the server's internal lakebox
-   * CLI is present). Gates Databricks-only UI hints — the "Databricks Lakebox"
-   * connect tab in the CLI command snippets. False
-   * on the OSS build, where those modules are excluded from the export, so the
-   * SPA shows the clean, provider-agnostic hints.
+   * True when the server has the lakebox CLI. Gates the Lakebox-specific UI
+   * hints, such as the connect tab in the CLI command snippets. False in
+   * builds that exclude those modules, which show provider-agnostic hints.
    */
   databricks_features: boolean;
   /**
@@ -225,6 +231,14 @@ export interface ServerInfo {
    * hidden there. Fails to ``false``.
    */
   archive_worktree_cleanup?: boolean;
+  /**
+   * True when the automations feature (recurring scheduled tasks) is enabled
+   * for the caller. When false the SPA hides the sidebar Automations tab and
+   * every automation entry point (the ``/v1/scheduled-tasks`` API 404s, so
+   * linking to it would be a dead page). Absent ⇒ true: servers from before
+   * the gate always offered automations.
+   */
+  automations_enabled?: boolean;
   /** True when scheduled tasks accept the optional random-worktree base ref. */
   scheduled_task_worktrees?: boolean;
   /**
@@ -239,6 +253,12 @@ export interface ServerInfo {
    * Session control there. Fails to ``false``.
    */
   scheduled_task_session_modes?: boolean;
+  /**
+   * True when a scheduled task can start every run from a copy of an existing
+   * session (``source_session_id``). Gates the session menu's "Create
+   * automation…" item. Fails to ``false``.
+   */
+  scheduled_task_source_sessions?: boolean;
   /** Connected hosts and continued sandboxes accept ten-minute schedules. */
   scheduled_task_subhour?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
@@ -286,6 +306,8 @@ export interface ServerInfo {
   scheduled_task_inbox?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
+  /** Automations accept modes that skip approval; older servers may reject them. */
+  scheduled_task_approval_skipping_modes?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
   /**
@@ -395,6 +417,8 @@ function parseBranding(raw: unknown): Branding | null {
 
 /** Sentinel used when the probe fails — accounts and release features are off. */
 export const FALLBACK_SERVER_INFO: ServerInfo = {
+  sibling_session_destinations: "any_host",
+  session_bundle_workspaces: false,
   accounts_enabled: false,
   // Fail to multi-user: a failed probe must not hide account/sharing chrome.
   single_user: false,
@@ -420,8 +444,10 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   dictation_available: false,
   scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
+  automations_enabled: true,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
@@ -543,6 +569,11 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const smartRoutingEnabled = data.smart_routing_enabled === true;
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
+          sibling_sessions: data.sibling_sessions === true,
+          sibling_session_destinations: parseSiblingSessionDestinations(
+            data.sibling_session_destinations,
+          ),
+          session_bundle_workspaces: data.session_bundle_workspaces === true,
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,
@@ -581,8 +612,10 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           scheduled_task_worktrees: data.scheduled_task_worktrees === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           automation_trigger_poll_minutes:
             typeof data.automation_trigger_poll_minutes === "number" &&
@@ -606,6 +639,8 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
+          scheduled_task_approval_skipping_modes:
+            data.scheduled_task_approval_skipping_modes === true,
           branding: parseBranding(data.branding),
           picker: parsePicker(data.picker),
         };

@@ -4341,8 +4341,8 @@ def test_parse_credential_proxy_databricks_cli(tmp_path: Path) -> None:
         [
             {
                 "type": "databricks_cli",
-                "profiles": ["dbc-adb7b1a3-9097", "oss"],
-                "default": "dbc-adb7b1a3-9097",
+                "profiles": ["dbc-87654321-dcba", "oss"],
+                "default": "dbc-87654321-dcba",
             }
         ]
     )
@@ -4352,8 +4352,8 @@ def test_parse_credential_proxy_databricks_cli(tmp_path: Path) -> None:
     assert proxy is not None
     assert proxy.entries == []
     assert proxy.databricks is not None
-    assert [b.profile for b in proxy.databricks.profiles] == ["dbc-adb7b1a3-9097", "oss"]
-    assert proxy.databricks.default == "dbc-adb7b1a3-9097"
+    assert [b.profile for b in proxy.databricks.profiles] == ["dbc-87654321-dcba", "oss"]
+    assert proxy.databricks.default == "dbc-87654321-dcba"
 
 
 @pytest.mark.parametrize(

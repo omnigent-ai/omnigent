@@ -110,5 +110,11 @@ integration evidence separately; the browser test does not exercise them.
   changes or new indexes are involved.
   Before first opt-in, complete the [legacy-label audit](../docs/extending/provider_profiles.md#rollout-rollback-and-verification)
   after upgrading every writer. Enable the flag before configuring a provider that requires profiles.
+- Existing unprofiled sessions retain wake, relaunch, missing-sandbox replacement
+  and runner rotation after opt-in. The provider must retain its unselected
+  lifecycle path; scoped lookup returns `None` only for an authorized legacy
+  resource. Fresh sandbox creation still requires selection, and saved profiles
+  never fall back to defaults. The rollout regression lives in
+  `tests/server/integration/test_sandbox_profile_launch.py::test_unprofiled_session_survives_provider_opt_in`.
 
 Controller recovery is covered in `tests/server/integration/test_sandbox_profile_controller.py`: last-session deletion, restart, historical revision, revocation and missing-sandbox replacement. The [controller walkthrough](../examples/sandbox-profile-provider/README.md#controller-recovery-demo) is runnable without a cluster.

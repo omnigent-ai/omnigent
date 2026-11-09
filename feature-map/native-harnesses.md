@@ -39,6 +39,14 @@ implements them separately, so a fix for one harness does not reach the others.
   host has not configured can be hidden from the picker. When harness repair is
   enabled, Settings → Harnesses shows the missing credential as an actionable
   card; its Reconfigure control and full-card click replace a separate banner action.
+- `cli-unresponsive`: a host CLI that resolves but does not answer its
+  `--version` check (for example, a wrapper waiting at a setup prompt) reads as
+  "did not respond", not outdated. New Chat keeps the harness selectable with a
+  notice and no **Set up** action, and launches and resumes still start the CLI,
+  so its own prompt shows in the terminal. Settings → Harnesses labels the card
+  **CLI did not respond**. With `harness_install` enabled on a non-sandbox host,
+  the card and its gear open the harness settings, whose warning offers no
+  Install, Update or Reconfigure action and marks the credential **Not checked**.
 - `new-chat-setup`: with `harness_install` enabled, New Chat’s **Set up**
   action opens the shared Reconfigure flow in place for native agents on
   connected user hosts when a fix is available. Missing binaries install before
@@ -204,10 +212,11 @@ once both end. While the server runs, the composer shows "1 background task"
 with its command, the same list Codex shows for `/ps` in its terminal.
 Answer an approval in Chat and another from the Inbox: "Needs response" clears
 at once. Block the answer request in the browser's developer tools and answer
-again: the prompt comes back. A prompt shown only in Claude's terminal has no
-reliable manual trigger: Claude's own prompts also get a Chat card within about
-a second, and a dialog the user opens, such as `/model`, leaves Claude
-reporting working during a turn and done after it, so the row does not change.
+again: the prompt comes back. Claude's own terminal prompts also get a Chat
+card within about a second. A dialog the user opens during a turn, such as
+`/model`, leaves Claude reporting working, so after about 15 seconds the row
+shows "May need input" in Needs attention until the dialog closes. Claude
+reports done after the turn, so a dialog opened then leaves the row unchanged.
 
 **Pi Smart Routing:** enable Smart Routing for the session, then send a task
 from Chat or type it into the native Pi terminal. Follow a completed tool call
@@ -274,6 +283,21 @@ select its namespaced suggestion. See the
 then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
 Probes run only on expansion.
 
+**MCP enablement:** the switch on configured Claude/Codex servers and plugin MCP
+rows applies only to Omnigent launches, including new sessions and cold resumes.
+It does not stop a running harness or edit the harness's configuration. Off rows
+cannot expand or probe; turning a server off collapses it, and re-enabling leaves
+it collapsed. Managed server names are locked across matching rows in that
+harness, including plugin rows. A failed save rolls the switch back and shows the
+error. Refreshing inventory updates switches on an already-open plugin page.
+
+The server's `mcp_disabled_servers` master gate and each harness's
+`mcp_disabled_servers_claude` / `mcp_disabled_servers_codex` flag must be enabled.
+Older hosts without the enablement capability have no switches. For rollback,
+disable the master gate or a harness flag: switches disappear for that scope,
+future launches ignore its saved preferences, and running sessions remain
+unchanged. Saved preferences remain available when the flags are re-enabled.
+
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
 shown once for the host desktop onboarding just connected → See more. It opens
@@ -293,6 +317,11 @@ picks tmux up on its next periodic readiness refresh, about a minute later.
 The desktop app keeps the PATH it started with, so if tmux went into a new PATH
 directory, quit and reopen the app. Signing in or saving a credential on a host
 without tmux continues to the same tmux step.
+
+**Unresponsive harness CLI:** put a harness wrapper that never answers
+`--version` first on the host's PATH and restart the host. Open New Chat with
+that agent, then Settings → Harnesses → the **CLI did not respond** card or its
+gear, then send a message in an existing session for that harness.
 
 **Harness account sign-in and switching:** Settings → Harnesses → Codex or
 Claude. Use **Sign in again** on an expired Codex card, or open the configured
@@ -598,6 +627,13 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
+- **`cli-unresponsive`:**
+  `tests/onboarding/test_harness_readiness.py::test_unanswered_pi_version_probe_is_not_reported_as_outdated`,
+  `tests/host/test_connect.py::test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_answers`,
+  `tests/onboarding/test_harness_install.py::test_missing_harness_cli_lets_a_slow_kimi_through_sub_agent_dispatch`,
+  and the "did not respond" cases in
+  `web/src/pages/settings/SettingsHarnessesSection.test.tsx` and
+  `web/src/shell/NewChatDialog.test.tsx`.
 - **`model-and-effort`, Claude runtime selection (own environment):**
   `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
   uses real Claude catalog discovery, tmux, statusLine and the runner event
@@ -1035,6 +1071,10 @@ Cross-harness journeys:
   `tests/server/routes/test_mcp_tools.py`, and the real-host test
   `tests/e2e/test_host_mcp_tools_e2e.py::test_host_mcp_tools` with plain pytest.
   Web coverage is in `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  For enablement, also run `tests/host/test_mcp_inventory.py` and
+  `tests/server/routes/test_mcp_servers.py`. The non-browser journey
+  `tests/e2e/test_mcp_disabled_servers.py` checks both native CLIs, a disabled
+  fixture, an enabled control, and the Omnigent relay without building the SPA.
   Disabled plugin MCP rows stay visible without expansion or probes. Check
   same-name plugins from different marketplaces return their respective tools.
   HTTP probes honor the host's proxy and certificate environment settings.
@@ -1114,6 +1154,11 @@ Cross-harness journeys:
   failing-operation evidence when tmux exits after readiness. These tests
   exercise the injection used by existing-session and first-message composers;
   CLI typing bypasses the web injection gate. They do not run a vendor model.
+  `tests/harnesses/claude_native/test_claude_native_overdrawn_prompt.py` checks
+  redraw recovery in single and split tmux windows, the requested pane's exit
+  while its neighbor stays alive, a missing target, and a suspended background
+  job staying paused during redraw. It uses a scripted TUI
+  and real tmux; it does not establish browser or vendor-model compatibility.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
   `tests/e2e/test_codex_native_event_stream_disconnect_e2e.py` covers waiting
   consumers, buffered events, explicit close, and startup discovery without a

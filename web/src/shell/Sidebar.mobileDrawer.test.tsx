@@ -1,9 +1,7 @@
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
-// Behaviour tests for the mobile sidebar drawer shape: it stops short of the
-// right edge so a strip of the chat stays visible, tapping that strip dismisses
-// it (replacing the collapse toggle, which is now desktop-only), and Search /
-// Settings float at the top and bottom of the drawer.
+// Mobile drawer: a strip of chat stays visible and dismisses it on tap, Search
+// floats at the top, and Settings sits in the profile footer.
 
 import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -103,44 +101,38 @@ describe("mobile sidebar drawer", () => {
     );
   });
 
-  it("floats Settings at the bottom and hides the desktop collapse toggle on mobile", () => {
+  it("keeps Settings in the profile footer and hides the desktop collapse toggle on mobile", async () => {
     renderSidebar();
 
-    // Search stays in the header row (top); Settings gets its own float at the
-    // bottom of the session list.
+    // Search stays in the header row (top); Settings sits in the footer below
+    // the session list, so the list needs no gutter for a floating button.
     const headerActions = screen.getByTestId("sidebar-header-actions");
     expect(within(headerActions).getByTestId("sidebar-search-button")).toBeInTheDocument();
+    expect(within(headerActions).queryByLabelText("Settings")).toBeNull();
 
-    const float = screen.getByTestId("sidebar-settings-float");
-    expect(float).toHaveAttribute("href", "/settings");
-    expect(float.closest("a, button")).toHaveClass("absolute", "bottom-4", "right-4", "md:hidden");
+    const footer = await screen.findByTestId("sidebar-server-picker-row");
+    expect(within(footer).getByTestId("sidebar-profile-settings")).toHaveAttribute(
+      "href",
+      "/settings",
+    );
+    expect(screen.getByRole("navigation")).not.toHaveClass("max-md:pb-16");
 
-    // The header-row Settings copy and the collapse toggle are desktop-only.
-    expect(screen.getByTestId("settings-button")).toHaveClass("max-md:hidden");
     expect(within(headerActions).getByRole("button", { name: "Close sidebar" })).toHaveClass(
       "max-md:hidden",
     );
   });
 
-  it("keeps both floating actions icon-only on mobile", () => {
+  it("keeps Search and Settings icon-only on mobile", async () => {
     renderSidebar();
 
     const search = screen.getByTestId("sidebar-search-button");
-    const settings = screen.getByTestId("sidebar-settings-float").closest("a, button")!;
+    const settings = await screen.findByTestId("sidebar-profile-settings");
 
     for (const button of [search, settings]) {
       expect(button).toHaveClass("max-md:size-11", "max-md:text-foreground");
       expect(button.className).toMatch(/(?:^| )(?:max-md:)?rounded-full(?: |$)/);
       expect(button).not.toHaveClass("sidebar-glass-chip");
     }
-  });
-
-  it("gives the session list a gutter so the last row clears the floating action", () => {
-    // The action doesn't scroll, so without this it would cover the last row,
-    // hiding its title and state badge and blocking the tap target.
-    renderSidebar();
-
-    expect(screen.getByRole("navigation")).toHaveClass("max-md:pb-16");
   });
 });
 
@@ -258,7 +250,7 @@ function touch(target: Element, type: string, x: number, time: number, fingers =
 
 function stubMobileLayout(mobile: boolean): void {
   vi.stubGlobal("matchMedia", (query: string) => ({
-    matches: mobile && query.includes("max-width"),
+    matches: mobile && query.includes("max-width") && !query.includes("min-width"),
     media: query,
     addEventListener: () => {},
     removeEventListener: () => {},
