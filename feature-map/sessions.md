@@ -288,8 +288,10 @@ Open the imported session and choose a host and working directory to resume it,
 then continue from Chat or Terminal.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
-offer pin, fork, rename, mark as unread or read, add to project (or move
-session), archive or unarchive, and delete.
+offer pin, fork, rename, mark as unread or read, create automation (when
+automations are on), add to project (or move session), archive or unarchive,
+and delete. Deleting a session an automation runs from warns that the
+automation is deleted with it.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens.
@@ -314,8 +316,8 @@ drawer, then drag it. Ordering → Custom in the filter menu keeps the order sho
 actions (mark as read or unread, archive, unarchive, delete).
 
 **Session header menu:** open a session and use the menu next to its title for
-pin, fork, export, rename, mark as unread, add to project, archive or
-unarchive, and delete. Clicking the title also renames, and the title's folder
+pin, fork, export, rename, mark as unread, create automation, add to project,
+archive or unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
 actions. On phones, the sidebar toggle has a circular glass surface; host,
 harness/model, background tasks, and session actions share the top-right glass
