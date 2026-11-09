@@ -1405,3 +1405,84 @@ def test_rollout_records_never_replay_tool_output_without_preceding_call(
     )
 
     _assert_tool_outputs_follow_their_calls(records)
+
+
+def test_rebuilt_skill_history_keeps_only_the_post_compaction_expansion(tmp_path: Path) -> None:
+    expansion = "<skill>exact native body including trailing space </skill>\n"
+    items = [
+        {
+            "type": "message",
+            "role": "user",
+            "is_meta": True,
+            "content": [{"type": "input_text", "text": "obsolete skill body"}],
+        },
+        {
+            "type": "compaction",
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "summary"}],
+                }
+            ],
+        },
+        {
+            "id": "slash-id",
+            "response_id": "codex_native-turn",
+            "type": "slash_command",
+            "kind": "skill",
+            "model": "codex-native-ui",
+            "name": "example",
+            "arguments": "  raw\nargs",
+            "native_invocation": "$example   raw\nargs",
+        },
+        {
+            "id": "meta-id",
+            "response_id": "codex_native-turn",
+            "type": "message",
+            "role": "user",
+            "is_meta": True,
+            "content": [{"type": "input_text", "text": expansion}],
+        },
+        {
+            "type": "slash_command",
+            "kind": "skill",
+            "model": "claude-native-ui",
+            "name": "elsewhere",
+            "arguments": "",
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_new",
+        external_session_id="new-thread",
+        cwd=tmp_path,
+        model_provider="local",
+        cli_version="0.167.0",
+    )
+
+    assert [row["type"] for row in records] == [
+        "session_meta",
+        "compacted",
+        "turn_context",
+        "response_item",
+        "event_msg",
+        "response_item",
+    ]
+    assert records[2]["payload"]["turn_id"] == "native-turn"
+    assert [records[i]["payload"]["content"][0]["text"] for i in (3, 5)] == [
+        "$example   raw\nargs",
+        expansion,
+    ]
+    assert records[4]["payload"] == {
+        "type": "user_message",
+        "message": "$example   raw\nargs",
+        "images": [],
+        "local_images": [],
+        "text_elements": [
+            {
+                "byte_range": {"start": 0, "end": 0},
+                "placeholder": "omnigent-skill-history:slash-id",
+            }
+        ],
+    }

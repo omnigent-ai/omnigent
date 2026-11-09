@@ -1324,11 +1324,11 @@ class CodexAppServerClient:
         self._next_id = 1
         self._subscribed_thread_ids: set[str] = set()
 
-    async def connect(self) -> None:
+    async def connect(self) -> CodexMessage:
         """
         Connect to the app-server and run the initialize handshake.
 
-        :returns: None.
+        :returns: The initialize response from this app-server.
         """
         if self._ws_url is not None:
             self._ws = await websockets.connect(
@@ -1351,7 +1351,7 @@ class CodexAppServerClient:
             self._reader_loop(),
             name="codex-native-app-server-reader",
         )
-        await self.request(
+        response = await self.request(
             "initialize",
             {
                 "clientInfo": {
@@ -1364,6 +1364,7 @@ class CodexAppServerClient:
             },
         )
         await self.notify("initialized")
+        return response
 
     async def close(self) -> None:
         """

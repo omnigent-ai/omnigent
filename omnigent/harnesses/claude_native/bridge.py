@@ -4528,6 +4528,7 @@ def inject_user_message(
     *,
     content: str,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    expected_skill_socket: str | None = None,
 ) -> None:
     r"""
     Deliver a user message into the Claude terminal via tmux send-keys.
@@ -4570,9 +4571,8 @@ def inject_user_message(
     rejects that guess ("Unknown command: /<name>") it drops the whole
     message without calling the model, so after such a submit the pane
     is watched briefly for the rejection and the message is re-delivered
-    escaped (space prefix) as plain user text — the message is never
-    silently swallowed. A recognized skill prints no rejection and runs
-    exactly as before.
+    escaped as plain user text. A verified skill reports the rejection
+    without another submission.
 
     :param bridge_dir: Bridge directory path.
     :param content: User text from the Omnigent web UI. Must be non-empty.
@@ -4592,6 +4592,8 @@ def inject_user_message(
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    if expected_skill_socket is not None and str(info["socket_path"]) != expected_skill_socket:
+        raise ClaudeMessageNotAccepted("Claude's terminal changed before the skill could be sent.")
     delivery_diagnostics.set_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
@@ -4653,6 +4655,8 @@ def inject_user_message(
         # No rejection: Claude Code accepted the command (a real skill or
         # custom command) and the turn is underway.
         return
+    if expected_skill_socket is not None:
+        raise ClaudeMessageNotAccepted(f"Claude Code did not recognize the skill /{unknown_name}.")
     # Claude Code dropped the message. Re-deliver it escaped so the text
     # reaches the model as a regular user message instead of vanishing.
     _logger.info(
@@ -10748,6 +10752,27 @@ def _user_transcript_items_from_entry(
         if isinstance(content, list)
         else []
     )
+    if (
+        entry.get("isMeta") is True
+        and entry.get("turnCompanion") is True
+        and notification_texts
+        and notification_texts[0].startswith("Base directory for this skill: ")
+    ):
+        source_key = _transcript_source_key(entry, line_number, record_offset)
+        return current_response_id, [
+            ClaudeTranscriptItem(
+                source_id=_source_id(source_key, 0, "skill_expansion"),
+                item_type="message",
+                data={
+                    "role": "user",
+                    "is_meta": True,
+                    "content": [
+                        {"type": "input_text", "text": text} for text in notification_texts
+                    ],
+                },
+                response_id=current_response_id or _response_id_from_source(source_key),
+            )
+        ]
     # Keep hidden completion provenance so the parent can link the returned child.
     if (
         entry.get("isMeta") is True

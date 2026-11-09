@@ -77,6 +77,7 @@ from omnigent.harnesses.codex_native.forwarder import (
     codex_rollout_last_turn_model,
     supervise_forwarder,
 )
+from omnigent.harnesses.codex_native.skill_rollout import HISTORICAL_SKILL_MARKER_PREFIX
 from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
 from omnigent.host.daemon_launch import (
     error_text,
@@ -2404,7 +2405,14 @@ def _codex_rollout_records_from_session_items(
                 "payload": payload,
             }
         )
-        event_msg = _codex_event_msg_record_for_message(payload, timestamp=timestamp)
+        if item.get("is_meta") is True:
+            continue
+        historical_skill_id = None
+        if _codex_native_skill_invocation(item) is not None:
+            historical_skill_id = str(payload.get("id") or f"skill-{index}")
+        event_msg = _codex_event_msg_record_for_message(
+            payload, timestamp=timestamp, historical_skill_id=historical_skill_id
+        )
         if event_msg is not None:
             records.append(event_msg)
     return records
@@ -2564,6 +2572,7 @@ def _codex_event_msg_record_for_message(
     payload: _JsonObject,
     *,
     timestamp: str,
+    historical_skill_id: str | None = None,
 ) -> _JsonObject | None:
     """
     Build the ``event_msg`` mirror record for a message ``response_item``.
@@ -2579,6 +2588,7 @@ def _codex_event_msg_record_for_message(
         rollout, e.g. ``{"type": "message", "role": "user", "content": [...]}``.
     :param timestamp: Rollout record timestamp, e.g.
         ``"2026-06-12T08:00:00.000Z"``.
+    :param historical_skill_id: Persisted command card id for replay deduplication.
     :returns: An ``event_msg`` record for user/assistant messages, or
         ``None`` for tool-call payloads (codex shows those via dedicated
         event types that are not needed for turn reconstruction).
@@ -2596,7 +2606,9 @@ def _codex_event_msg_record_for_message(
         if not isinstance(block_text, str):
             raise click.ClickException("Codex message content text must be a string.")
         text_parts.append(block_text)
-    text = " ".join(text_parts).strip()
+    text = " ".join(text_parts)
+    if historical_skill_id is None:
+        text = text.strip()
     if not text:
         return None
     role = payload.get("role")
@@ -2608,6 +2620,14 @@ def _codex_event_msg_record_for_message(
             "local_images": [],
             "text_elements": [],
         }
+        if historical_skill_id is not None:
+            # Legacy user events have no client id. Codex hides zero-width text elements.
+            event_payload["text_elements"] = [
+                {
+                    "byte_range": {"start": 0, "end": 0},
+                    "placeholder": f"{HISTORICAL_SKILL_MARKER_PREFIX}{historical_skill_id}",
+                }
+            ]
     elif role == "assistant":
         event_payload = {
             "type": "agent_message",
@@ -2694,6 +2714,19 @@ def _is_interrupted_assistant_session_item(item: _JsonObject) -> bool:
     )
 
 
+def _codex_native_skill_invocation(item: _JsonObject) -> str | None:
+    invocation = item.get("native_invocation")
+    if (
+        item.get("type") == "slash_command"
+        and item.get("kind") == "skill"
+        and item.get("model") == _AGENT_NAME
+        and isinstance(invocation, str)
+        and invocation
+    ):
+        return invocation
+    return None
+
+
 def _codex_response_item_payload(item: _JsonObject) -> _JsonObject | None:
     """
     Convert one supported Omnigent item into a Codex response payload body.
@@ -2709,6 +2742,12 @@ def _codex_response_item_payload(item: _JsonObject) -> _JsonObject | None:
         return _codex_function_call_payload_from_session_item(item)
     if item_type == "function_call_output":
         return _codex_function_call_output_payload_from_session_item(item)
+    if (invocation := _codex_native_skill_invocation(item)) is not None:
+        return {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": invocation}],
+        }
     return None
 
 

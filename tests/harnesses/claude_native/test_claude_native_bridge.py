@@ -3038,6 +3038,49 @@ def test_read_hook_events_from_offset_preserves_partial_trailing_line(tmp_path: 
     assert [record.event_name for record in second.records] == ["Stop"]
 
 
+def test_claude_native_skill_expansion_stays_hidden_and_in_its_command_turn(
+    tmp_path: Path,
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    expansion = "Base directory for this skill: /bundle/skills/review\n\nCheck arg 42."
+    command_echo = "<command-name>/team:review</command-name>"
+    _write_transcript_jsonl(
+        transcript_path,
+        [
+            {
+                "type": "user",
+                "uuid": "skill-command",
+                "message": {
+                    "role": "user",
+                    "content": f"{command_echo}\n<command-args>42</command-args>",
+                },
+            },
+            {
+                "type": "user",
+                "uuid": "skill-expansion",
+                "isMeta": True,
+                "turnCompanion": True,
+                "message": {"role": "user", "content": [{"type": "text", "text": expansion}]},
+            },
+            {
+                "type": "user",
+                "uuid": "unrelated-cli-meta",
+                "isMeta": True,
+                "message": {"role": "user", "content": "An unrelated CLI note."},
+            },
+        ],
+    )
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+    command, context = items
+    assert command.item_type == "slash_command"
+    assert context.response_id == command.response_id
+    assert context.data == {
+        "role": "user",
+        "is_meta": True,
+        "content": [{"type": "input_text", "text": expansion}],
+    }
+
+
 def test_read_transcript_items_since_surfaces_skill_as_slash_command(
     tmp_path: Path,
 ) -> None:

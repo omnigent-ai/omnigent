@@ -6155,6 +6155,15 @@ def _claude_transcript_record_from_session_item(
                 return None
             record_type = "user"
             message = {"role": "user", "content": user_content}
+            if item.get("is_meta") is True:
+                extra["isMeta"] = True
+                if (
+                    user_content
+                    and isinstance(first_block := user_content[0], dict)
+                    and isinstance(text := first_block.get("text"), str)
+                    and text.startswith("Base directory for this skill: ")
+                ):
+                    extra["turnCompanion"] = True
         elif role == "assistant":
             assistant_content = _claude_assistant_content_from_api_blocks(item.get("content"))
             if assistant_content is None and allow_native_message_content:
@@ -6171,6 +6180,26 @@ def _claude_transcript_record_from_session_item(
         if isinstance(message_id, str) and message_id:
             # Claude Code rejoins records sharing message.id into one API message.
             message["id"] = message_id
+    elif item_type == "slash_command" and item.get("kind") == "skill":
+        response_id = item.get("response_id")
+        name = item.get("name")
+        arguments = item.get("arguments")
+        if not (
+            isinstance(response_id, str)
+            and response_id.startswith("resp_claude_")
+            and isinstance(name, str)
+            and isinstance(arguments, str)
+        ):
+            return None
+        record_type = "user"
+        message = {
+            "role": "user",
+            "content": (
+                f"<command-message>{name}</command-message>\n"
+                f"<command-name>/{name}</command-name>\n"
+                f"<command-args>{arguments}</command-args>"
+            ),
+        }
     elif item_type == "function_call":
         name = item.get("name")
         call_id = item.get("call_id")

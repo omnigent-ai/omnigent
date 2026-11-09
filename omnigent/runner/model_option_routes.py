@@ -16,6 +16,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from omnigent.native.skill_invocation import NativeSkillInvocation
 from omnigent.runner.app_support import (
     _client_safe_error_detail,
     _SpecEntry,
@@ -58,6 +59,9 @@ def register_model_option_routes(
         [str], Coroutine[Any, Any, ClaudeNativeUcodeConfig | None]
     ],
     _resolve_session_skills: Callable[[str], Coroutine[Any, Any, list[SkillSpec]]],
+    _select_native_skill: Callable[
+        [str, SkillSpec, str], Coroutine[Any, Any, NativeSkillInvocation | None]
+    ],
     _session_cursor_model_names: dict[str, dict[str, str]],
     _session_harness_name: Callable[[str], str | None],
     _session_spec_cache: dict[str, _SpecEntry | None],
@@ -425,6 +429,12 @@ def register_model_option_routes(
                     "available": sorted(s.name for s in skills),
                 },
             )
+        if body.get("allow_native") is True:
+            invocation = await _select_native_skill(session_id, skill, arguments)
+            if invocation is not None:
+                return JSONResponse(
+                    status_code=200, content={"native_invocation": invocation.model_dump()}
+                )
         return JSONResponse(
             status_code=200,
             content={"meta_text": format_skill_meta_text(skill, arguments)},

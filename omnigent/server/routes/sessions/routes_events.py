@@ -113,6 +113,7 @@ from omnigent.server.failed_status_diagnostics import (
     bound_runner_connection,
     failed_status_intake_attributes,
 )
+from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -198,6 +199,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _check_native_skill_submission_claim,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _extract_user_text_from_event,
@@ -211,8 +213,11 @@ from omnigent.server.routes._sessions.helpers import (
     _is_devin_native_subagent,
     _launch_runner_on_host,
     _native_coding_agent_for_session,
+    _native_skill_harness_for_session,
+    _native_skill_submission_claim,
     _owns_host_runner,
     _parse_background_tasks,
+    _parse_skill_slash_command,
     _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
     _persist_external_codex_approval_mode_change,
@@ -243,10 +248,12 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_session_superseded,
     _publish_status,
     _query_host_runner_status,
+    _record_native_skill_claim,
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
     _require_filesystem_attachment_harness,
     _resolve_harness,
+    _resolve_skill_invocation_via_runner,
     _response_agent_name_from_store,
     _session_status_from_cache,
     _set_background_tasks,
@@ -3809,6 +3816,74 @@ def register_events_routes(
                 )
             if runner_router is not None:
                 await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
+            startup_context = request if isinstance(request, StartupInputContext) else None
+            native_harness = None
+            if (
+                startup_context is None
+                and request.app.state.feature_flags.enabled(Feature.NATIVE_SKILL_ROUTING)
+                and not _codex_side_chat_thread_id(conv)
+            ):
+                native_harness = await asyncio.to_thread(_native_skill_harness_for_session, conv)
+            claim = _native_skill_submission_claim(session_id, body, created_by)
+            if claim is not None and claim.stable_id is not None:
+                existing = await asyncio.to_thread(
+                    conversation_store.get_item, session_id, claim.stable_id
+                )
+                if existing is not None:
+                    _check_native_skill_submission_claim(existing, claim)
+                    return {"queued": False, "delivery_unconfirmed": True}
+
+            skill_name, arguments = _parse_skill_slash_command(body)
+            invocation = await _resolve_skill_invocation_via_runner(
+                session_id,
+                skill_name,
+                arguments,
+                runner_client,
+                legacy_name=_legacy_skill_names.get(skill_name),
+                native_harness=native_harness,
+            )
+            if (
+                native_harness is not None
+                and claim is not None
+                and not await _record_native_skill_claim(
+                    conversation_store, session_id, body.data["stable_id"], claim
+                )
+            ):
+                return {"queued": False, "delivery_unconfirmed": True}
+            if not isinstance(invocation, str):
+                message = SessionEventInput(
+                    type="message",
+                    data={
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": invocation.command}],
+                        "stable_id": body.data.get("stable_id"),
+                    },
+                    model_override=body.model_override,
+                )
+                dispatch = await _dispatch_session_event_to_runner(
+                    session_id,
+                    conv,
+                    message,
+                    conversation_store,
+                    runner_client,
+                    agent_name=_agent.name,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                    has_mcp_servers=_has_mcp_servers,
+                    created_by=created_by,
+                    runner_router=runner_router,
+                    native_terminal_ready=True,
+                    background_titles_enabled=background_session_titles_enabled(request.headers),
+                    agent_revision=mcp_selection_revision(_agent.bundle_location, conv.labels),
+                    startup_input=startup_context,
+                    native_skill_invocation=invocation,
+                )
+                if pending_background_title is not None:
+                    pending_background_title.schedule(expected_seed_title=conv.title)
+                native_response: dict[str, bool | str] = {"queued": dispatch.accepted}
+                if dispatch.pending_id is not None:
+                    native_response["pending_id"] = dispatch.pending_id
+                return native_response
             item_id = await _dispatch_skill_slash_command_to_runner(
                 session_id,
                 conv,
@@ -3816,10 +3891,10 @@ def register_events_routes(
                 conversation_store,
                 runner_client,
                 agent=_agent,
+                meta_text=invocation,
                 has_mcp_servers=_has_mcp_servers,
                 created_by=created_by,
-                legacy_skill_names=_legacy_skill_names,
-                startup_input=request if isinstance(request, StartupInputContext) else None,
+                startup_input=startup_context,
             )
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
@@ -3849,6 +3924,9 @@ def register_events_routes(
             # one; absent, the dispatch forwards as before.
             host_registry=getattr(request.app.state, "host_registry", None),
             startup_input=request if isinstance(request, StartupInputContext) else None,
+            native_skill_routing=request.app.state.feature_flags.enabled(
+                Feature.NATIVE_SKILL_ROUTING
+            ),
         )
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)

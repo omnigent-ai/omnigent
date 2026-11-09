@@ -23,6 +23,7 @@ import httpx
 
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.debug_logging import debug_event
+from omnigent.entities.conversation import SlashCommandData
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.codex_egress import (
@@ -70,6 +71,12 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.harnesses.codex_native.skill_rollout import (
+    HISTORICAL_SKILL_MARKER_PREFIX,
+    CodexSkillRollout,
+    UserMessageId,
+    user_message_ids,
+)
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
@@ -88,6 +95,7 @@ from omnigent.native._native_supersession import (
     post_clear_supersession,
     unfiled_clear_replacement_body,
 )
+from omnigent.native.skill_invocation import SKILL_CLIENT_ID_PREFIX
 from omnigent.process_logging import log_info_once
 from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.tool_output import cap_tool_output
@@ -620,12 +628,6 @@ class _CodexForwarderState:
     :param surfaced_terminal_error_turns: Turn ids whose standalone terminal
         ``error`` notification was already surfaced. Used to suppress a later
         terminal boundary for the same turn.
-    :param posted_user_turns: Turn ids whose ``userMessage`` has been
-        posted to Omnigent this connection, e.g. ``{"turn_123"}``. Used to
-        enforce user-before-assistant ordering: before posting a turn's
-        assistant reply, the forwarder recovers and posts the turn's user
-        message if the live stream missed it (see
-        :func:`_ensure_user_message_posted`).
     :param user_message_copy_balance: Unmatched user-message copies of
         unfinished turns keyed by (thread, turn, content digest): positive
         counts live copies and negative counts resumed copies with positional
@@ -737,7 +739,9 @@ class _CodexForwarderState:
     )
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
-    posted_user_turns: set[str] = field(default_factory=set)
+    posted_user_ids: dict[str, set[UserMessageId]] = field(default_factory=dict)
+    turns_with_skill_order_gap: set[str] = field(default_factory=set)
+    skill_rollout: CodexSkillRollout | None = None
     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
     resume_echo_thread_ids: set[str] = field(default_factory=set)
     posted_tool_calls: set[str] = field(default_factory=set)
@@ -1139,23 +1143,13 @@ class _CodexForwarderState:
         """
         self.subscribed_child_threads.add(thread_id)
 
-    def note_user_message_posted(self, turn_id: str) -> None:
-        """
-        Record that a turn's user message has been posted to AP.
-
-        :param turn_id: Codex turn id, e.g. ``"turn_123"``.
-        :returns: None.
-        """
-        self.posted_user_turns.add(turn_id)
+    def note_user_message_posted(self, turn_id: str, item: _JsonObject) -> None:
+        self.posted_user_ids.setdefault(turn_id, set()).update(
+            user_message_ids(item.get("id"), item.get("clientId"))
+        )
 
     def has_posted_user_message(self, turn_id: str) -> bool:
-        """
-        Return whether a turn's user message was already posted to AP.
-
-        :param turn_id: Codex turn id, e.g. ``"turn_123"``.
-        :returns: ``True`` when the turn's user message has been posted.
-        """
-        return turn_id in self.posted_user_turns
+        return turn_id in self.posted_user_ids
 
     def pair_user_message_copy(self, key: tuple[str, str, str], *, resumed: bool) -> bool:
         """
@@ -3477,6 +3471,13 @@ async def _replay_resume_response(
                     expected_thread_id=thread_id,
                     forwarder_state=forwarder_state,
                 )
+            await _persist_skill_expansions(
+                client,
+                session_id,
+                {"threadId": thread_id, "turnId": turn_id},
+                bridge_dir,
+                forwarder_state,
+            )
         await _post_resume_turn_status(
             client,
             session_id=session_id,
@@ -3788,15 +3789,23 @@ async def _handle_event(
             # now), so the web UI renders the question above the reply. The
             # ``item/completed`` guard below remains the backstop for the
             # resume-backfill path, which replays only ``item/completed``.
-            await _ensure_user_message_posted(client, route_session_id, params, event_state)
+            async with _conversation_item_delivery_scope(route_session_id):
+                await _ensure_user_message_posted(client, route_session_id, params, event_state)
+                await _persist_skill_expansions(
+                    client, route_session_id, params, event_bridge_dir, event_state
+                )
         elif isinstance(item, dict) and _user_shell_command(item) is not None:
             if await _post_user_shell_input(client, route_session_id, params, item):
                 if event_state is not None and isinstance(item_id := item.get("id"), str):
                     event_state.started_user_shell_items.add(item_id)
         elif isinstance(item, dict) and item.get("type") == "commandExecution":
-            call_id = await _post_tool_call_item(client, route_session_id, params, item)
-            if call_id is not None and event_state is not None:
-                event_state.note_tool_call_posted(call_id)
+            async with _conversation_item_delivery_scope(route_session_id):
+                await _persist_skill_expansions(
+                    client, route_session_id, params, event_bridge_dir, event_state
+                )
+                call_id = await _post_tool_call_item(client, route_session_id, params, item)
+                if call_id is not None and event_state is not None:
+                    event_state.note_tool_call_posted(call_id)
         return
     if method == _CODEX_SERVER_REQUEST_RESOLVED_METHOD:
         # Resolve on the session the elicitation was published on (a child
@@ -4900,6 +4909,9 @@ async def _maybe_handle_turn_event(
                     )
                 except Exception:  # the failure still posts, undiagnosed.
                     _logger.warning("Could not read the Codex rollout's last model", exc_info=True)
+            await _persist_skill_expansions(
+                client, session_id, params, bridge_dir, forwarder_state
+            )
             await _post_turn_status_edge(
                 client,
                 session_id,
@@ -4994,25 +5006,28 @@ async def _maybe_handle_turn_event(
         await _handle_turn_plan_updated(client, session_id, params)
         return True
     if method == _CODEX_THREAD_COMPACTED_METHOD:
-        # Codex finished compacting the thread's context window.
-        await _post_compaction_status(
-            client, session_id, "completed", forwarder_state=forwarder_state
-        )
-        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
-            try:
-                await _persist_codex_compaction_item(
-                    client, session_id=session_id, bridge_dir=bridge_dir
-                )
-            except Exception as exc:
-                _logger.warning(
-                    "Failed to persist codex compaction item for %s: %s",
-                    session_id,
-                    _compaction_persist_failure_reason(exc),
-                    exc_info=True,
-                )
-            else:
-                if forwarder_state is not None:
-                    forwarder_state.compaction_item_persisted = True
+        async with _conversation_item_delivery_scope(session_id):
+            await _persist_skill_expansions(
+                client, session_id, params, bridge_dir, forwarder_state
+            )
+            await _post_compaction_status(
+                client, session_id, "completed", forwarder_state=forwarder_state
+            )
+            if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+                try:
+                    await _persist_codex_compaction_item(
+                        client, session_id=session_id, bridge_dir=bridge_dir
+                    )
+                except Exception as exc:
+                    _logger.warning(
+                        "Failed to persist codex compaction item for %s: %s",
+                        session_id,
+                        _compaction_persist_failure_reason(exc),
+                        exc_info=True,
+                    )
+                else:
+                    if forwarder_state is not None:
+                        forwarder_state.compaction_item_persisted = True
         return True
     if method == "turn/diff/updated":
         _handle_turn_diff_updated(params, forwarder_state)
@@ -5216,6 +5231,10 @@ async def _handle_terminal_turn_boundary_inner(
         forwarder_state=forwarder_state,
     )
     with _turn_status_publication_scope(session_id, terminal.edge, phase="before_status"):
+        if terminal.handled:
+            await _persist_skill_expansions(
+                client, session_id, params, bridge_dir, forwarder_state
+            )
         if delta_coalescer is not None:
             await delta_coalescer.flush()
         # Safety net: if a compaction was reported in progress but Codex never
@@ -6452,6 +6471,16 @@ def _claim_completed_item(
         keys and anonymous-item counters.
     :returns: Stable source id when the item should be posted to AP, otherwise ``None``.
     """
+    client_id = item.get("clientId")
+    if (
+        item.get("type") == "userMessage"
+        and isinstance(client_id, str)
+        and client_id.startswith(SKILL_CLIENT_ID_PREFIX)
+    ):
+        source_id = _source_id(params, {"id": client_id})
+        if forwarder_state is None or forwarder_state.claim_item_key(source_id):
+            return source_id
+        return None
     if forwarder_state is None:
         return _source_id(params, item)
     item_key, is_anon = _completed_item_key(params, item, forwarder_state)
@@ -6521,6 +6550,7 @@ async def _handle_completed_item_inner(
         return
     item_type = item.get("type")
     turn_id = _turn_id_from_payload(params)
+    await _persist_skill_expansions(client, session_id, params, bridge_dir, forwarder_state)
     if item_type in {"agentMessage", "plan"} and forwarder_state is not None and turn_id:
         item_id = item.get("id")
         forwarder_state.discard_partial_text_item(
@@ -6568,15 +6598,11 @@ async def _handle_completed_item_inner(
                 if forwarder_state is not None:
                     forwarder_state.compaction_item_persisted = True
         return
+    if item_type == "userMessage":
+        await _mirror_user_message(client, session_id, params, item, forwarder_state)
+        return
     source_id = _claim_completed_item(params, item, forwarder_state)
     if source_id is None:
-        return
-    if item_type == "userMessage":
-        posted = await _post_user_message(client, session_id, params, item, source_id=source_id)
-        if posted and forwarder_state is not None:
-            turn_id = _turn_id_from_payload(params)
-            if turn_id:
-                forwarder_state.note_user_message_posted(turn_id)
         return
     if item_type == "agentMessage":
         # User-before-assistant ordering guarantee. On a fresh thread the
@@ -7642,72 +7668,230 @@ async def _ensure_user_message_posted(
     turn_id = _turn_id_from_payload(params)
     if not turn_id or forwarder_state.has_posted_user_message(turn_id):
         return
-    codex_client = forwarder_state.codex_client
+    user_items = await _resume_user_messages(params, turn_id, forwarder_state)
+    if user_items:
+        await _mirror_user_message(client, session_id, params, user_items[0], forwarder_state)
+
+
+async def _mirror_user_message(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: _JsonObject,
+    item: _JsonObject,
+    state: _CodexForwarderState | None,
+) -> None:
+    source_id = _claim_completed_item(params, item, state)
+    if source_id is not None and await _post_user_message(
+        client, session_id, params, item, source_id=source_id
+    ):
+        turn_id = _turn_id_from_payload(params)
+        if state is not None and turn_id:
+            state.note_user_message_posted(turn_id, item)
+
+
+async def _resume_user_messages(
+    params: _JsonObject, turn_id: str, state: _CodexForwarderState
+) -> list[_JsonObject]:
+    codex_client = state.codex_client
     thread_id = _thread_id_from_params(params)
     if codex_client is None or thread_id is None:
-        return
+        return []
     try:
         response = await codex_client.request("thread/resume", {"threadId": thread_id})
-    except asyncio.CancelledError:
-        raise
-    except Exception:  # degrade to current behavior on resume failure.
+    except Exception:
         _logger.warning(
-            "Codex forwarder could not resume to recover user message: thread=%s turn=%s",
+            "Codex forwarder could not resume to recover user messages: thread=%s turn=%s",
             thread_id,
             turn_id,
             exc_info=True,
         )
-        return
-    user_item = _find_turn_user_message(response, turn_id)
-    if user_item is None:
-        return
-    recovered_params: _JsonObject = {
-        "threadId": thread_id,
-        "turnId": turn_id,
-        "item": user_item,
-    }
-    source_id = _claim_completed_item(recovered_params, user_item, forwarder_state)
-    if source_id is None:
-        return
-    if await _post_user_message(
-        client,
-        session_id,
-        recovered_params,
-        user_item,
-        source_id=source_id,
-    ):
-        forwarder_state.note_user_message_posted(turn_id)
-
-
-def _find_turn_user_message(response: CodexMessage, turn_id: str) -> _JsonObject | None:
-    """
-    Locate a turn's ``userMessage`` item in a ``thread/resume`` response.
-
-    :param response: Codex ``thread/resume`` response envelope.
-    :param turn_id: Codex turn id whose user message to find, e.g.
-        ``"turn_123"``.
-    :returns: The ``userMessage`` item dict, or ``None`` when the turn or
-        its user message is absent.
-    """
+        return []
     result = response.get("result")
-    if not isinstance(result, dict):
+    thread = result.get("thread") if isinstance(result, dict) else None
+    turns = thread.get("turns") if isinstance(thread, dict) else None
+    if isinstance(turns, list):
+        for turn in turns:
+            if not isinstance(turn, dict) or _turn_id_from_payload(turn) != turn_id:
+                continue
+            items = turn.get("items")
+            if isinstance(items, list):
+                return [
+                    item
+                    for item in items
+                    if isinstance(item, dict) and item.get("type") == "userMessage"
+                ]
+    return []
+
+
+async def _persist_skill_expansions(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: _JsonObject,
+    bridge_dir: Path | None,
+    state: _CodexForwarderState | None,
+) -> None:
+    if bridge_dir is None or state is None:
+        return
+    turn_id = _terminal_turn_id_from_params(params)
+    thread_id = _thread_id_from_params(params)
+    if turn_id is None or thread_id is None or turn_id in state.turns_with_skill_order_gap:
+        return
+    try:
+        reader = state.skill_rollout
+        if reader is None or reader.thread_id != thread_id:
+            bridge = read_bridge_state(bridge_dir)
+            if bridge is None or bridge.thread_id != thread_id:
+                return
+            path = await asyncio.to_thread(_latest_thread_rollout, bridge)
+            if path is None:
+                return
+            reader = state.skill_rollout = CodexSkillRollout(path, thread_id)
+        users = await asyncio.to_thread(reader.read, turn_id)
+    except FileNotFoundError:
+        state.skill_rollout = None
+        return
+    except OSError:
+        _logger.warning(
+            "Could not read Codex skill rollout for thread=%s", thread_id, exc_info=True
+        )
+        return
+    item = params.get("item")
+    user_item = item if isinstance(item, dict) and item.get("type") == "userMessage" else None
+    if not users or (
+        not any(user.expansions for user in users)
+        and (user_item is None or _structured_skill_command(user_item) is None)
+    ):
+        return
+    scoped_params = _params_with_turn_id(params, turn_id)
+    posted_ids = state.posted_user_ids.get(turn_id, set())
+    prefix = next(
+        (index for index, user in enumerate(users) if not user.ids & posted_ids), len(users)
+    )
+    through = prefix
+    resumed: list[_JsonObject] | None = None
+    current_ids = (
+        user_message_ids(user_item.get("id"), user_item.get("clientId"))
+        if user_item is not None
+        else frozenset()
+    )
+    if user_item is not None:
+        before = next((index for index, user in enumerate(users) if user.ids & current_ids), None)
+        if before is not None:
+            through = before
+        elif prefix < len(users) and not current_ids & posted_ids:
+            resumed = await _resume_user_messages(scoped_params, turn_id, state)
+            predecessors: set[UserMessageId] = set()
+            for user in resumed:
+                ids = user_message_ids(user.get("id"), user.get("clientId"))
+                if ids & current_ids:
+                    through = next(
+                        (
+                            index
+                            for index, entry in enumerate(users)
+                            if not entry.ids & predecessors
+                        ),
+                        len(users),
+                    )
+                    break
+                predecessors.update(ids)
+            else:
+                state.turns_with_skill_order_gap.add(turn_id)
+                return
+    elif not posted_ids:
+        through = 1
+
+    for user in users[:through]:
+        if not user.ids & posted_ids:
+            if resumed is None:
+                resumed = await _resume_user_messages(scoped_params, turn_id, state)
+            recovered = next(
+                (
+                    item
+                    for item in resumed
+                    if user.ids & user_message_ids(item.get("id"), item.get("clientId"))
+                ),
+                None,
+            )
+            if recovered is not None:
+                await _mirror_user_message(client, session_id, scoped_params, recovered, state)
+                posted_ids = state.posted_user_ids.get(turn_id, set())
+            if not user.ids & posted_ids:
+                if user_item is not None:
+                    state.turns_with_skill_order_gap.add(turn_id)
+                return
+        for expansion in user.expansions:
+            source_id = _source_id(scoped_params, {"id": expansion.item_id})
+            if source_id in state.synced_item_keys:
+                continue
+            if not await _post_external_item(
+                client,
+                session_id,
+                item_type="message",
+                item_data={"role": "user", "content": expansion.content, "is_meta": True},
+                response_id=_response_id(scoped_params),
+                source_id=source_id,
+            ):
+                return
+            state.synced_item_keys.add(source_id)
+
+
+def _structured_skill_command(item: _JsonObject) -> SlashCommandData | None:
+    content = item.get("content")
+    if not isinstance(content, list) or len(content) not in (1, 2):
         return None
-    thread = result.get("thread")
-    if not isinstance(thread, dict):
+    text = content[0]
+    if (
+        not isinstance(text, dict)
+        or text.get("type") != "text"
+        or not isinstance(invocation := text.get("text"), str)
+    ):
         return None
-    turns = thread.get("turns")
-    if not isinstance(turns, list):
+    trigger, _, arguments = invocation.partition(" ")
+    name = trigger.removeprefix("$")
+    if not name or name == trigger:
         return None
-    for turn in turns:
-        if not isinstance(turn, dict) or _turn_id_from_payload(turn) != turn_id:
-            continue
-        items = turn.get("items")
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if isinstance(item, dict) and item.get("type") == "userMessage":
-                return item
-    return None
+    if len(content) == 2:
+        skill = content[1]
+        if (
+            not isinstance(skill, dict)
+            or skill.get("type") != "skill"
+            or skill.get("name") != name
+            or not isinstance(path := skill.get("path"), str)
+            or not path
+        ):
+            return None
+    elif _CODEX_RESUME_POSITION_ITEM_ID.fullmatch(str(item.get("id"))) is None:
+        return None
+    # Legacy resume snapshots retain the client id and text but omit typed skills.
+    return SlashCommandData(
+        agent=_AGENT_NAME,
+        name=name,
+        arguments=arguments,
+        native_invocation=invocation,
+    )
+
+
+def _is_rebuilt_skill_message(item: _JsonObject) -> bool:
+    content = item.get("content")
+    if (
+        not isinstance(content, list)
+        or len(content) != 1
+        or not isinstance(text := content[0], dict)
+    ):
+        return False
+    elements = text.get("text_elements")
+    if (
+        not isinstance(elements, list)
+        or len(elements) != 1
+        or not isinstance(marker := elements[0], dict)
+    ):
+        return False
+    placeholder = marker.get("placeholder")
+    return (
+        marker.get("byteRange") == {"start": 0, "end": 0}
+        and isinstance(placeholder, str)
+        and placeholder.startswith(HISTORICAL_SKILL_MARKER_PREFIX)
+    )
 
 
 async def _post_user_message(
@@ -7728,6 +7912,22 @@ async def _post_user_message(
     :param source_id: Stable native item id used for server-side deduplication.
     :returns: Whether the item was accepted by the server.
     """
+    if _is_rebuilt_skill_message(item):
+        return True
+    client_id = item.get("clientId")
+    if isinstance(client_id, str) and client_id.startswith(SKILL_CLIENT_ID_PREFIX):
+        command = _structured_skill_command(item)
+        if command is None:
+            _logger.error("Codex echoed malformed structured skill input: %s", client_id)
+            return False
+        return await _post_external_item(
+            client,
+            session_id,
+            item_type="slash_command",
+            item_data=command.model_dump(mode="json", exclude_none=True),
+            response_id=_response_id(params),
+            source_id=source_id or _source_id(params, {"id": client_id}),
+        )
     text = _user_message_text(item)
     # An image/file-only message has no text but must still be posted: the
     # server drains its optimistic pending-input entry (FIFO) and folds the
