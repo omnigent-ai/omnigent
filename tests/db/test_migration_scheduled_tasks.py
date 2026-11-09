@@ -36,6 +36,8 @@ _DISPATCH_REVISION = "c8e4f2a6b901"
 _COMPLETED_STATE_REVISION = "9e82957bd115"
 _SESSION_MODE_PREVIOUS = "b2e4f6a8c013"
 _SESSION_MODE_REVISION = "d0a1f879a01d"
+_MCP_SERVICES_PREVIOUS = "1ad1db53f99d"
+_MCP_SERVICES_REVISION = "f2c6a9d1b3e8"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -88,6 +90,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["session_mode"]["nullable"] is False
     assert columns["session_id"]["nullable"] is True
     assert columns["source_session_id"]["nullable"] is True
+    assert columns["mcp_services"]["nullable"] is True
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -101,6 +104,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "model_override",
         "reasoning_effort",
         "permission_mode",
+        "mcp_services",
         "max_cost_usd",
         "workspace",
         "base_branch",
@@ -927,3 +931,48 @@ def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
             "id",
         ],
     }
+
+
+def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _MCP_SERVICES_PREVIOUS)
+    values = {
+        "name": "nightly",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"a" * 16, **values))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _MCP_SERVICES_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    widest = '["' + "x" * 4092 + '"]'
+    with engine.begin() as conn:
+        # A task saved before the migration starts its runs with no MCP selection.
+        assert conn.execute(sa.select(tasks.c.mcp_services)).scalar_one() is None
+        conn.execute(tasks.insert().values(id=b"b" * 16, mcp_services=widest, **values))
+        stored = conn.execute(
+            sa.select(tasks.c.mcp_services).where(tasks.c.id == b"b" * 16)
+        ).scalar_one()
+    assert stored == widest
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _MCP_SERVICES_PREVIOUS)
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")}
+    assert "mcp_services" not in columns
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 2
+        config.attributes["connection"] = conn
+        command.upgrade(config, _MCP_SERVICES_REVISION)
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.mcp_services)).scalars().all() == [None, None]
