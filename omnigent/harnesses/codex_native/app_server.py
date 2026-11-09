@@ -16,7 +16,15 @@ import sqlite3
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
@@ -85,6 +93,7 @@ from omnigent.harnesses.codex_native.timeouts import (
     APP_SERVER_READY_TIMEOUT_SECONDS as _APP_SERVER_READY_TIMEOUT_SECONDS,
 )
 from omnigent.inner import _proc
+from omnigent.inner._subprocess_lifecycle import subprocess_exited
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
@@ -1177,6 +1186,19 @@ def codex_resume_unconfigured_model_provider(exc: BaseException) -> str | None:
     return missing if isinstance(missing, str) and missing else None
 
 
+def is_project_hooks_config_refusal(exc: BaseException) -> bool:
+    """Identify a project hooks path failure from Codex's pre-input config check."""
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == _CODEX_INVALID_REQUEST_CODE
+        and exc.message is not None
+        and exc.message.startswith(
+            "failed to load configuration: Failed to read project hooks config file "
+        )
+        and exc.message.endswith("/.codex/config.toml: Not a directory (os error 20)")
+    )
+
+
 async def _codex_effective_model_provider(client: CodexAppServerClient, cwd: Path) -> str | None:
     """
     Read the provider Codex runs for *cwd*, or ``None`` when it cannot be read.
@@ -1358,24 +1380,27 @@ class CodexAppServerClient:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CodexMessage] = loop.create_future()
         self._pending_requests[request_id] = future
+        rpc_identity = f"Codex app-server RPC: method={method} request_id={request_id}"
         try:
-            await self._ws.send(
-                json.dumps(
-                    {
-                        "id": request_id,
-                        "method": method,
-                        "params": params,
-                    }
+            try:
+                await self._ws.send(
+                    json.dumps(
+                        {
+                            "id": request_id,
+                            "method": method,
+                            "params": params,
+                        }
+                    )
                 )
-            )
+            except (OSError, ConnectionClosed) as send_error:
+                send_error.add_note(f"{rpc_identity} phase=send")
+                raise
             if self._reader_task is not None:
                 await asyncio.wait(
                     (future, self._reader_task), return_when=asyncio.FIRST_COMPLETED
                 )
                 if not future.done():
-                    raise ConnectionError(
-                        f"Codex app-server disconnected before responding to {method}"
-                    )
+                    raise self._disconnected_before_response(method, rpc_identity)
             response = await future
         finally:
             self._pending_requests.pop(request_id, None)
@@ -1383,7 +1408,7 @@ class CodexAppServerClient:
         error = response.get("error")
         if error:
             exc = CodexAppServerResponseError(error)
-            exc.add_note(f"Codex app-server RPC: method={method} request_id={request_id}")
+            exc.add_note(rpc_identity)
             raise exc
         if method in {"thread/start", "thread/resume"}:
             result = response.get("result")
@@ -1392,6 +1417,28 @@ class CodexAppServerClient:
             if isinstance(thread_id, str) and thread_id:
                 self._subscribed_thread_ids.add(thread_id)
         return response
+
+    def _disconnected_before_response(self, method: str, rpc_identity: str) -> ConnectionError:
+        """
+        Build the error for an RPC whose reader exited before its response.
+
+        The reader's own failure becomes the cause, and the note records the
+        websocket close code without addresses, close reasons or payloads.
+
+        :param method: App-server method, e.g. ``"turn/start"``.
+        :param rpc_identity: Method and request id note, e.g.
+            ``"Codex app-server RPC: method=turn/start request_id=2"``.
+        :returns: Connection error chained to the reader's failure, if any.
+        """
+        reader = self._reader_task
+        reader_error = (
+            reader.exception() if reader is not None and not reader.cancelled() else None
+        )
+        close_code = self._ws.close_code if self._ws is not None else None
+        error = ConnectionError(f"Codex app-server disconnected before responding to {method}")
+        error.__cause__ = reader_error
+        error.add_note(f"{rpc_identity} phase=response close_code={close_code}")
+        return error
 
     def is_subscribed_to_thread(self, thread_id: str) -> bool:
         """
@@ -2514,6 +2561,7 @@ class CodexNativeAppServer:
     session_id: str | None = None
     writable_roots: tuple[str, ...] = ()
     app_server_command: tuple[str, ...] = ()
+    active_harnesses: Collection[str] | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
     # First TLS certificate failure the launcher printed; mirrored into the
     # bridge so the forwarder can fail a stuck turn with the cause.
@@ -2754,6 +2802,19 @@ class CodexNativeAppServer:
         effort_catalog_transport = self.listen_url or str(self.socket_path)
         _effort_catalog_cache.pop(effort_catalog_transport, None)
         _effort_catalog_misses.pop(effort_catalog_transport, None)
+        from omnigent.mcp_disabled_servers import (
+            RELAUNCH_WITHOUT_OVERRIDES_EVENT,
+            plan_codex_launch,
+        )
+
+        mcp_plan = plan_codex_launch(
+            self.config_overrides,
+            executor="codex-native",
+            active_harnesses=self.active_harnesses,
+            codex_home=self.codex_home,
+            cwd=self.cwd,
+        )
+        self.config_overrides = list(mcp_plan.config_overrides)
         await self._spawn_app_server_process(resolved_listen)
         # Ordering invariant: hooks.json is written before the spawn above,
         # and the trust handshake must complete before the first turn — codex
@@ -2770,7 +2831,25 @@ class CodexNativeAppServer:
         # outer guard so a cancellation mid-trust still tears down.
         try:
             try:
-                startup_client = await self._wait_until_ready()
+                try:
+                    startup_client = await self._wait_until_ready()
+                except Exception:
+                    fallback = mcp_plan.overrides_after_early_exit()
+                    if (
+                        fallback is None
+                        or self.proc is None
+                        or not await subprocess_exited(self.proc)
+                    ):
+                        raise
+                    _logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
+                    await self.close()
+                    self.certificate_failure = None
+                    clear_certificate_failure(self.bridge_dir)
+                    self.config_overrides = list(fallback)
+                    if resolved_listen.startswith("unix://"):
+                        self.socket_path.unlink(missing_ok=True)
+                    await self._spawn_app_server_process(resolved_listen)
+                    startup_client = await self._wait_until_ready()
             except CodexAppServerSilentStartTimeout as silent:
                 # A fresh app-server can stall before initialization; a second spawn
                 # can recover. Reuse the transport: callers captured the listen

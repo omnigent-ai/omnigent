@@ -6125,7 +6125,7 @@ describe("Composer side-chat entry points", () => {
     expect(screen.queryByTestId("composer-side-chat-action") !== null).toBe(offered);
   });
 
-  it("opens a focused pending tab immediately from the add menu", () => {
+  it("opens a focused pending tab after the add menu closes", async () => {
     const authenticatedFetch = vi
       .spyOn(identity, "authenticatedFetch")
       .mockImplementation(() => new Promise<Response>(() => {}));
@@ -6135,6 +6135,7 @@ describe("Composer side-chat entry points", () => {
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     fireEvent.click(screen.getByTestId("composer-side-chat-action"));
 
+    await waitFor(() => expect(useChatStore.getState().sideChatToOpen).not.toBeNull());
     const { sideChatToOpen, sideChatComposers, sideChatDrafts } = useChatStore.getState();
     expect(sideChatToOpen).toEqual({
       childId: expect.stringMatching(/^pending:/),
@@ -6144,6 +6145,46 @@ describe("Composer side-chat entry points", () => {
     expect(sideChatDrafts[sideChatToOpen!.childId]).toBeUndefined();
     expect(textarea()).toHaveValue("");
     expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
+  it("does not open a side chat after its parent changes while the menu closes", async () => {
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    const trigger = screen.getByRole("button", { name: "Add" });
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    const restoredTriggerFocus = vi.fn();
+    trigger.addEventListener("focus", restoredTriggerFocus);
+
+    try {
+      fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+      act(() => useChatStore.setState({ conversationId: "conv_other" }));
+      await waitFor(() => expect(restoredTriggerFocus).toHaveBeenCalled());
+      await act(
+        () =>
+          new Promise<void>((resolve) => {
+            requestAnimationFrame(() => resolve());
+          }),
+      );
+
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      expect(useChatStore.getState().sideChatComposers).toEqual({});
+    } finally {
+      trigger.removeEventListener("focus", restoredTriggerFocus);
+    }
+  });
+
+  it("focuses the native side-chat question after the add menu closes", async () => {
+    const user = userEvent.setup();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+
+    await waitFor(() => expect(textarea()).toHaveValue("/side "));
+    expect(textarea()).toHaveFocus();
+    await user.keyboard("question");
+    expect(textarea()).toHaveValue("/side question");
   });
 });
 

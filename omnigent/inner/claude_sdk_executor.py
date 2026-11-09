@@ -36,7 +36,15 @@ import pathlib
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from types import ModuleType
@@ -1392,6 +1400,18 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
     )
 
 
+def _init_mcp_server_names(data: Mapping[str, object]) -> tuple[str, ...]:
+    """Extract valid server names from an SDK init event."""
+    servers = data.get("mcp_servers", [])
+    if not isinstance(servers, list):
+        return ()
+    return tuple(
+        row["name"]
+        for row in servers
+        if isinstance(row, dict) and isinstance(row.get("name"), str)
+    )
+
+
 def _claude_settings_payload(
     api_key_helper: str | None, model_overrides: dict[str, str]
 ) -> str | None:
@@ -1879,6 +1899,7 @@ class ClaudeSDKExecutor(Executor):
         self,
         *,
         cwd: str | None = None,
+        active_harnesses: Collection[str] | None = None,
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
         permission_mode: str = "auto",
@@ -2084,6 +2105,8 @@ class ClaudeSDKExecutor(Executor):
         # :meth:`_apply_gateway_model_vocabulary`). ``None`` until resolved;
         # the resolved value may be empty (discovery found nothing).
         self._gateway_vocabulary: _GatewayModelVocabulary | None = None
+
+        self._mcp_active_harnesses = active_harnesses
 
         # Eagerly resolve the gateway transport env so errors surface at
         # construction time.
@@ -3089,7 +3112,13 @@ class ClaudeSDKExecutor(Executor):
         # for the canonical ids the CLI names itself (the refusal-fallback).
         # No-op off the gateway transport.
         model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
-        settings_payload = _claude_settings_payload(api_key_helper, model_overrides)
+        from omnigent.mcp_disabled_servers import apply_claude_settings
+
+        settings_payload = apply_claude_settings(
+            _claude_settings_payload(api_key_helper, model_overrides),
+            executor="claude-sdk",
+            active_harnesses=self._mcp_active_harnesses,
+        )
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []
@@ -3746,6 +3775,15 @@ class ClaudeSDKExecutor(Executor):
                         system_msg = cast(_SystemMessageObj, message)
                         subtype = system_msg.subtype
                         data = system_msg.data
+
+                        if subtype == "init":
+                            from omnigent.mcp_disabled_servers import claude_loaded_anyway
+
+                            for name in claude_loaded_anyway(
+                                _init_mcp_server_names(data),
+                                active_harnesses=self._mcp_active_harnesses,
+                            ):
+                                logger.warning("mcp_disabled_server_not_applied server=%s", name)
 
                         if subtype == "api_retry":
                             error_status = data.get("error_status")
