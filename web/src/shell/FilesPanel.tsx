@@ -15,6 +15,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
+import { useSandboxStarting } from "@/hooks/useSessionReconnect";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
@@ -81,6 +82,26 @@ interface FilesPanelProps {
    * split layout rather than a drawer.
    */
   frameless?: boolean;
+}
+
+interface QueryStatus {
+  data: unknown;
+  isLoading: boolean;
+  isError: boolean;
+  error: Error | null;
+}
+
+/**
+ * A file list's query waits for the workspace environment, so until either has
+ * data the list reports the environment's load or failure instead of empty.
+ */
+export function fileListStatus(list: QueryStatus, environment: QueryStatus) {
+  const waiting = list.data === undefined && environment.data === undefined;
+  return {
+    isLoading: list.isLoading || (waiting && environment.isLoading),
+    isError: list.isError || (waiting && environment.isError),
+    error: list.error ?? (waiting ? environment.error : null),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +506,7 @@ export function FilesPanel({
   // lists can't load. Say so rather than "No files in workspace"; a list
   // cached before it slept still renders.
   const showAsleepHint = sandboxAsleep && !dataReady;
+  const sandboxWaking = useSandboxStarting(conversationId);
 
   return (
     <div
@@ -675,13 +697,11 @@ export function FilesPanel({
         )}
         onScroll={handleScroll}
       >
-        {showAsleepHint && <RunnerAsleepHint sandboxOffline />}
+        {showAsleepHint && <RunnerAsleepHint sandboxOffline waking={sandboxWaking} />}
         {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}
-            isLoading={changedQuery.isLoading}
-            isError={changedQuery.isError}
-            error={changedQuery.error}
+            {...fileListStatus(changedQuery, envQuery)}
             onFileSelect={onFileSelect}
             showHidden={showHidden}
             onShowHidden={() => onShowHiddenChange(true)}
@@ -694,9 +714,7 @@ export function FilesPanel({
         {!showAsleepHint && !flatView && (
           <FolderTree
             files={allFilesQuery.data?.data}
-            isLoading={allFilesQuery.isLoading}
-            isError={allFilesQuery.isError}
-            error={allFilesQuery.error}
+            {...fileListStatus(allFilesQuery, envQuery)}
             onFileSelect={openTreeFile}
             conversationId={conversationId}
             showHidden={showHidden}

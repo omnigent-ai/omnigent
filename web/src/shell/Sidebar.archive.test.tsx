@@ -3,22 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
-// Tests for the archive flow in the sidebar. Contract: archiving sends ONLY
-// the archive PATCH (`archived: true`) — no client stop. The row leaves the
-// sidebar optimistically (useArchiveConversation flips the cached `archived`
-// flag in onMutate; the list filters archived rows out client-side), so there
-// is no "Archiving…" status row — the row simply unmounts, like delete's. The
-// only synchronous side effect is the Undo pill (which also links to Settings).
-// The runner stop is the server's job once the flag commits — a client stop
-// would race the server's against the same runner, and put the runner's stop
-// timeouts in front of the flag flip. The kebab's user-facing "Stop session"
-// action is a separate affordance covered by Sidebar.stop.test.tsx.
-// The optimistic cache overlay + error reconcile is covered in
-// sessionListCache.test.ts / useConversations.test.ts.
-//
-// Archived sessions are no longer listed in the sidebar (they moved to the
-// Settings page), so unarchiving is covered by SettingsPage.test.tsx; this
-// file exercises the archive path from a row's kebab.
+// Archiving from a row sends only the PATCH (the server stops the runner) and
+// the row leaves optimistically, except the open session's (Sidebar.openSession.test.tsx).
+// Settings unarchive: SettingsPage.test.tsx; cache overlays: useConversations.test.ts.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";

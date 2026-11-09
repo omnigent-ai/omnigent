@@ -115,7 +115,8 @@ function ArchiveWorktreeDialog({
                 ? `${pending.worktreeCount} of the sessions you're archiving have a git worktree.`
                 : "This session has a git worktree."}{" "}
               Deleting removes the worktree directory, including any uncommitted changes. The branch
-              is kept.
+              is kept. Worktrees used by other sessions (including archived sessions), or inside
+              sandboxes, are kept.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-1">
