@@ -9809,7 +9809,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(after.pendingUserMessages).toEqual([]);
     });
 
-    it.each([false, true])(
+    it.each([undefined, false, true])(
       "ignores meta input (user_authored=%s) without consuming pending user messages",
       (userAuthored) => {
         const existingBlocks: AnyBlock[] = [];
@@ -9829,7 +9829,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
             role: "user",
             is_meta: true,
             content: [{ type: "input_text", text: "<skill>hidden</skill>" }],
-            user_authored: userAuthored,
+            ...(userAuthored === undefined ? {} : { user_authored: userAuthored }),
           },
         });
 
