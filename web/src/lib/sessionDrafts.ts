@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { readTaggedMentions, type TaggedMentions } from "./composerMentions";
+import { mergeTaggedDrafts, readTaggedMentions, type TaggedMentions } from "./composerMentions";
 import { readComposerDraft, type ComposerDraft } from "./replyDraft";
 
 export interface SessionDraft extends ComposerDraft {
@@ -110,27 +110,17 @@ export function recoverFailedSessionDraft<
   if (temporaryConversationId === undefined) return originalDraft;
   const temporaryDraft = retireSessionDraft(temporaryConversationId);
   if (temporaryDraft === undefined) return originalDraft;
-  const message = [originalDraft.message, temporaryDraft.text]
+  // The two composers allocate tokens independently; reconcile them so a shared
+  // token can't make one draft's tag expand to the other's target.
+  const merged = mergeTaggedDrafts(originalDraft.mentions, temporaryDraft);
+  const message = [originalDraft.message, merged.text]
     .filter((part) => part.trim() !== "")
     .join("\n\n");
-  const mentions =
-    originalDraft.mentions || temporaryDraft.mentions
-      ? {
-          files: [
-            ...(originalDraft.mentions?.files ?? []),
-            ...(temporaryDraft.mentions?.files ?? []),
-          ],
-          sessions: [
-            ...(originalDraft.mentions?.sessions ?? []),
-            ...(temporaryDraft.mentions?.sessions ?? []),
-          ],
-        }
-      : undefined;
   return {
     ...originalDraft,
     message,
     files: [...originalDraft.files, ...temporaryDraft.files],
-    ...(mentions ? { mentions } : {}),
+    ...(merged.mentions ? { mentions: merged.mentions } : {}),
   };
 }
 

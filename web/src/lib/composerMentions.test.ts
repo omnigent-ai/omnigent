@@ -138,6 +138,12 @@ describe("expanding composer text", () => {
   it("appends the hint once, only when a session is tagged", () => {
     expect(withSessionMentionHint("go ", true)).toBe(`go\n\n${SESSION_MENTION_HINT}`);
     expect(withSessionMentionHint("go", false)).toBe("go");
+    // A restored message that already carries the hint keeps one copy.
+    const restored = withSessionMentionHint("go", true);
+    expect(withSessionMentionHint(`${restored} and more`, true)).toBe(
+      `${restored} and more\n\n${SESSION_MENTION_HINT}`,
+    );
+    expect(withSessionMentionHint(restored, true)).toBe(restored);
   });
 });
 
@@ -154,6 +160,19 @@ describe("reading a sent message", () => {
 
   it("turns markers into @names, drops uploads and the hint", () => {
     expect(readableSentText(sent)).toBe("Ask @auth about @src/a.ts\nthanks");
+  });
+
+  it("stays linear on malformed markers", () => {
+    // Each input took seconds with patterns that rescan after an unclosed "[";
+    // the test's default timeout is the guard, not a timing assertion.
+    const inputs = [
+      `${" ".repeat(200_000)}x`,
+      "[Attached:".repeat(50_000),
+      `[Attached:${" ".repeat(200_000)}`,
+      `${"[Tagged sessions:".repeat(20_000)}x`,
+      `[Session: "${"a".repeat(200_000)}`,
+    ];
+    for (const input of inputs) expect(readableSentText(input)).toBe(input);
   });
 
   it("keeps a session marker the user typed as text when there is no hint", () => {

@@ -810,7 +810,7 @@ describe("Composer @-session mentions", () => {
     expect(screen.queryByTestId("file-mention-menu")).not.toBeInTheDocument();
   });
 
-  it("searches only once typing pauses for the debounce, with the latest text", () => {
+  it("waits for typing to pause before searching, and searches the latest text", () => {
     vi.useFakeTimers();
     onTestFinished(() => {
       vi.useRealTimers();

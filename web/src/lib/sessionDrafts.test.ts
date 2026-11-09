@@ -124,6 +124,36 @@ describe("session drafts", () => {
     expect(sessionStorage.getItem(key)).toBeNull();
   });
 
+  it("keeps each recovered tag on its own target when both drafts used the same token", async () => {
+    const { recoverFailedSessionDraft, setSessionDraft } = await import("./sessionDrafts");
+    const { composerInlineMentions, expandMentionTokens } = await import("./composerMentions");
+    // Two different sessions titled "Plan", tagged in the launcher and in the
+    // temporary session; each composer gave its tag the plain "@Plan" token.
+    const planA = { id: "s_aaaaaaaa", title: "Plan", isSubagent: false, token: "@Plan" };
+    const planB = { id: "s_bbbbbbbb", title: "Plan", isSubagent: false, token: "@Plan" };
+    setSessionDraft("temp:clash", {
+      text: "and also @Plan",
+      files: [],
+      mentions: { files: [], sessions: [planB] },
+    });
+
+    const recovered = recoverFailedSessionDraft(
+      { message: "read @Plan", files: [], mentions: { files: [], sessions: [planA] } },
+      "temp:clash",
+    );
+
+    const inline = composerInlineMentions(
+      recovered.mentions!.files,
+      recovered.mentions!.sessions,
+      "claude-native",
+    );
+    const sent = expandMentionTokens(recovered.message, inline);
+    expect(sent).toBe(
+      'read [Session: "Plan" id=s_aaaaaaaa subagent=no]\n\n' +
+        'and also [Session: "Plan" id=s_bbbbbbbb subagent=no]',
+    );
+  });
+
   it("re-renders useSessionDraftIds only when the set of draft ids changes", async () => {
     const { setSessionDraft, useSessionDraftIds } = await import("./sessionDrafts");
     let renders = 0;

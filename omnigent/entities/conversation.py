@@ -35,11 +35,13 @@ _ATTACHMENT_MARKER_RE = re.compile(
 # sessionMentionMarker, SESSION_MENTION_HINT and readableSentText in
 # web/src/lib/composerMentions.ts.
 # The hint is only ever appended last; anywhere else it is the user's text.
-_SESSION_MENTION_HINT_RE = re.compile(r"\s*\[Tagged sessions:[^\]]*\]\s*$")
+# Patterns stay linear on hostile input: no group can rescan the rest of the
+# message after an unclosed "[", and the hint is found with string search.
+_SESSION_MENTION_HINT_PREFIX = "[Tagged sessions:"
 _SESSION_MENTION_MARKER_RE = re.compile(
     r'\[Session: "([^"\]]*)" id=[A-Za-z0-9_:-]+ subagent=(?:yes|no)\]'
 )
-_INLINE_ATTACHED_RE = re.compile(r"\[Attached(?: file)?:\s*([^\]]*)\]")
+_INLINE_ATTACHED_RE = re.compile(r"\[Attached(?: file)?:([^\]\[]*)\]")
 _ABSOLUTE_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:[\\/]|\\\\)")
 
 
@@ -47,6 +49,20 @@ def _readable_attached(match: re.Match[str]) -> str:
     path = match.group(1).strip()
     # Absolute paths are materialized uploads, already shown as file blocks.
     return "" if not path or _ABSOLUTE_PATH_RE.match(path) else f"@{path}"
+
+
+def _strip_session_mention_hint(text: str) -> str | None:
+    """
+    Return ``text`` without its trailing tool hint, or ``None`` when it has none.
+
+    :param text: Message text, e.g. ``"Ask @x\n\n[Tagged sessions: read …]"``.
+    :returns: The text before the hint, e.g. ``"Ask @x"``.
+    """
+    end = text.rstrip()
+    start = end.rfind(_SESSION_MENTION_HINT_PREFIX)
+    if start < 0 or end.find("]", start) != len(end) - 1:
+        return None
+    return end[:start].rstrip()
 
 
 def humanize_mention_markers(text: str) -> str:
@@ -59,9 +75,9 @@ def humanize_mention_markers(text: str) -> str:
     """
     # The composer ends every session-tagging message with the hint, so session
     # markers in a message without it are the user's own text.
-    if _SESSION_MENTION_HINT_RE.search(text):
-        text = _SESSION_MENTION_HINT_RE.sub("", text)
-        text = _SESSION_MENTION_MARKER_RE.sub(lambda match: f"@{match.group(1)}", text)
+    without_hint = _strip_session_mention_hint(text)
+    if without_hint is not None:
+        text = _SESSION_MENTION_MARKER_RE.sub(lambda match: f"@{match.group(1)}", without_hint)
     return _INLINE_ATTACHED_RE.sub(_readable_attached, text)
 
 

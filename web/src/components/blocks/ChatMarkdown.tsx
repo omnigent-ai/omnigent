@@ -11,7 +11,8 @@
 // without importing the block dispatcher that renders them.
 
 import type React from "react";
-import { useInRouterContext, useNavigate } from "react-router-dom";
+import { useInRouterContext } from "react-router-dom";
+import { useNavigate } from "@/lib/routing";
 import { useMemo } from "react";
 import {
   BotIcon,
@@ -545,6 +546,8 @@ function FileMentionPill({
       type="button"
       data-testid="mention-pill"
       className={MENTION_PILL_CLASS}
+      // Disabled until the existence check says how to open the path.
+      aria-disabled={open ? undefined : true}
       title={path}
       onClick={(event) => {
         event.stopPropagation();

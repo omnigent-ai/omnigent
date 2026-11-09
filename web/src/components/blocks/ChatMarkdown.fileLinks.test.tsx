@@ -705,11 +705,10 @@ describe("links to folders", () => {
     );
     const pill = screen.getByTestId("mention-pill");
     expect(pill.textContent).toBe("@experimental/data/mobile-touch-targets/");
-    // The pill opens once the existence check confirms it is a folder.
-    await waitFor(() => {
-      fireEvent.click(pill);
-      expect(openFolder).toHaveBeenCalledWith(FOLDER);
-    });
+    // The pill is enabled once the existence check confirms it is a folder.
+    await waitFor(() => expect(pill).not.toHaveAttribute("aria-disabled"));
+    fireEvent.click(pill);
+    expect(openFolder).toHaveBeenCalledWith(FOLDER);
     expect(openFile).not.toHaveBeenCalled();
   });
 

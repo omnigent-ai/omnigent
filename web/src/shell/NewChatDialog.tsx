@@ -5270,9 +5270,11 @@ function NewChatLandingContent({
     mentionOpen,
     sessionMenu,
     mentionedItems,
+    setMentionedItems,
     attachMention,
     openMentionDir,
     mentionedSessions,
+    setMentionedSessions,
     attachSession,
     mentionTokens,
     handleTokenBackspace,
@@ -5827,6 +5829,11 @@ function NewChatLandingContent({
       // The draft's files were validated when the user attached them, so
       // they come back verbatim rather than through a re-validating replace.
       restoreFiles(returnedDraft.files);
+      // Merged tags, so recovered tokens still expand to their own targets.
+      if (returnedDraft.mentions) {
+        setMentionedItems(returnedDraft.mentions.files);
+        setMentionedSessions(returnedDraft.mentions.sessions);
+      }
     } else {
       writeLandingDraft(draftState, returnedDraft);
     }

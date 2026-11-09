@@ -50,7 +50,7 @@ const ROW_ICON_CLASS = "size-3.5 shrink-0 text-slate-500 dark:text-slate-400";
 /** ``text`` with the first case-insensitive match of ``query`` tinted like a mention token. */
 export function MatchHighlight({ text, query }: { text: string; query: string }) {
   const at = query ? text.toLowerCase().indexOf(query.toLowerCase()) : -1;
-  if (at < 0) return <>{text}</>;
+  if (at < 0) return text;
   const end = at + query.length;
   return (
     <>

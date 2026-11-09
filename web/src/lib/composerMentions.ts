@@ -307,9 +307,13 @@ export function expandMentionTokens(text: string, mentions: readonly InlineMenti
   return out;
 }
 
-/** Append the tool hint once when the message tags any session. */
+/**
+ * Append the tool hint once when the message tags any session. A restored
+ * message that already ends with the hint keeps a single copy.
+ */
 export function withSessionMentionHint(text: string, tagsSessions: boolean): string {
-  return tagsSessions ? `${text.trimEnd()}\n\n${SESSION_MENTION_HINT}` : text;
+  if (!tagsSessions) return text;
+  return `${stripTrailingHint(text) ?? text.trimEnd()}\n\n${SESSION_MENTION_HINT}`;
 }
 
 /** A mention found in a sent message. */
@@ -324,10 +328,20 @@ export function isAbsolutePath(path: string): boolean {
   return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(path);
 }
 
+// Linear on hostile input: no group rescans the rest of the message after an
+// unclosed "[", and the trailing hint is found with string search.
 const SENT_SESSION_RE = /\[Session: "([^"\]]*)" id=([A-Za-z0-9_:-]+) subagent=(yes|no)\]/g;
-const SENT_ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]([ \t]*(?:\r?\n)*)/g;
-// The hint is only ever appended at the very end; elsewhere it is user text.
-const SENT_HINT_RE = /(?:\r?\n)*[ \t]*\[Tagged sessions:[^\]]*\]\s*$/;
+const SENT_ATTACHED_RE = /\[Attached(?: file)?:([^\][]*)\]([ \t]*(?:\r?\n)*)/g;
+const SENT_HINT_PREFIX = "[Tagged sessions:";
+
+/** ``text`` without its trailing tool hint, or ``null`` when it has none. */
+function stripTrailingHint(text: string): string | null {
+  // The hint is only ever appended at the very end; elsewhere it is user text.
+  const end = text.trimEnd();
+  const start = end.lastIndexOf(SENT_HINT_PREFIX);
+  if (start < 0 || end.indexOf("]", start) !== end.length - 1) return null;
+  return end.slice(0, start).trimEnd();
+}
 
 /**
  * Rewrite the markers in a sent message with ``render``: drops the trailing tool
@@ -340,14 +354,13 @@ export function replaceSentMentions(
 ): string {
   // The composer always ends a message that tags a session with the hint, so a
   // session marker in a message without it is text the user typed, not a tag.
-  const tagsSessions = SENT_HINT_RE.test(text);
-  const withSessions = tagsSessions
-    ? text
-        .replace(SENT_HINT_RE, "")
-        .replace(SENT_SESSION_RE, (_m, title: string, id: string, sub: string) =>
+  const withoutHint = stripTrailingHint(text);
+  const withSessions =
+    withoutHint === null
+      ? text
+      : withoutHint.replace(SENT_SESSION_RE, (_m, title: string, id: string, sub: string) =>
           render({ kind: "session", id, title, isSubagent: sub === "yes" }),
-        )
-    : text;
+        );
   return withSessions.replace(SENT_ATTACHED_RE, (_m, raw: string, trail: string) => {
     const path = raw.trim();
     if (!path || isAbsolutePath(path)) return "";
@@ -364,6 +377,76 @@ export function readableSentText(text: string): string {
 export interface TaggedMentions {
   files: MentionItem[];
   sessions: SessionMention[];
+}
+
+// A tagged file's identity: the same path, kind and line range.
+function mentionItemIdentity(item: MentionItem): string {
+  const range = item.lineRange ? `${item.lineRange.start}-${item.lineRange.end}` : "";
+  return `${item.path}|${item.isDir}|${range}`;
+}
+
+/**
+ * Combine two drafts' text and tags without letting a shared token retarget a
+ * mention. A tag already in ``first`` keeps its token; a ``second`` tag reuses
+ * it for the same target, or gets a new unique token (rewritten in
+ * ``second.text``) when its token names a different target.
+ *
+ * :param first: The draft whose tokens win, e.g. the launcher draft.
+ * :param second: The draft merged in, e.g. a failed temporary session's draft.
+ * :returns: ``second.text`` with renamed tokens, and the combined tags.
+ */
+export function mergeTaggedDrafts(
+  first: TaggedMentions | undefined,
+  second: { text: string; mentions?: TaggedMentions },
+): { text: string; mentions: TaggedMentions | undefined } {
+  if (!second.mentions) return { text: second.text, mentions: first };
+  const files = [...(first?.files ?? [])];
+  const sessions = [...(first?.sessions ?? [])];
+  const taken = [...files.map(fileMentionToken), ...sessions.map(sessionTokenOf)];
+  const secondTokens = [
+    ...second.mentions.files.map(fileMentionToken),
+    ...second.mentions.sessions.map(sessionTokenOf),
+  ];
+  // A new token must not collide with a later tag of ``second`` either.
+  const avoid = (own: string) => [...taken, ...secondTokens.filter((t) => t !== own)];
+  const renamed = new Map<string, string>();
+  const claim = (from: string, to: string) => {
+    if (from !== to) renamed.set(from, to);
+    if (!taken.includes(to)) taken.push(to);
+  };
+  for (const item of second.mentions.files) {
+    const token = fileMentionToken(item);
+    const same = files.find((it) => mentionItemIdentity(it) === mentionItemIdentity(item));
+    if (same) {
+      claim(token, fileMentionToken(same));
+      continue;
+    }
+    const next = taken.includes(token) ? newFileMentionToken(item, avoid(token)) : token;
+    files.push({ ...item, token: next });
+    claim(token, next);
+  }
+  for (const session of second.mentions.sessions) {
+    const token = sessionTokenOf(session);
+    const same = sessions.find((it) => it.id === session.id);
+    if (same) {
+      claim(token, sessionTokenOf(same));
+      continue;
+    }
+    const next = taken.includes(token) ? sessionMentionToken(session, avoid(token)) : token;
+    sessions.push({ ...session, token: next });
+    claim(token, next);
+  }
+  // Scan every token of ``second`` so a longer one is never split by a shorter rename.
+  let text = second.text;
+  for (const range of findMentionTokens(text, secondTokens).reverse()) {
+    const next = renamed.get(range.token);
+    if (next !== undefined) text = text.slice(0, range.start) + next + text.slice(range.end);
+  }
+  return { text, mentions: { files, sessions } };
+}
+
+function sessionTokenOf(session: SessionMention): string {
+  return session.token ?? `@${session.title}`;
 }
 
 function readTaggedFile(value: unknown): MentionItem | null {

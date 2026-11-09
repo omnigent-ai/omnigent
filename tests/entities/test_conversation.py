@@ -202,6 +202,30 @@ def test_humanize_mention_markers_keeps_a_typed_session_marker_without_hint() ->
     assert humanize_mention_markers(text) == text
 
 
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize(
+    "text",
+    [
+        " " * 200_000 + "x",
+        "[Attached:" * 50_000,
+        "[Attached:" + " " * 200_000,
+        "[Tagged sessions:" * 20_000 + "x",
+        '[Session: "' + "a" * 200_000,
+    ],
+    ids=[
+        "spaces",
+        "unclosed-attached",
+        "attached-then-spaces",
+        "unclosed-hint",
+        "unclosed-session",
+    ],
+)
+def test_humanize_mention_markers_stays_linear_on_malformed_markers(text: str) -> None:
+    # Patterns that rescan after an unclosed "[" took seconds on these; the
+    # generous timeout is the guard rather than a tight timing assertion.
+    assert humanize_mention_markers(text) == text
+
+
 def test_humanize_mention_markers_keeps_a_hint_typed_mid_message() -> None:
     text = "why does [Tagged sessions: read] show up here?"
     assert humanize_mention_markers(text) == text
