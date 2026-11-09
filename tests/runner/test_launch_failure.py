@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.errors import ErrorCategory
+from omnigent.llms.errors import REQUEST_SIZE_OVERFLOW_GUIDANCE
 from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_native_turn_error,
@@ -15,6 +16,7 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_model_rejection,
     diagnose_codex_provider_auth_failure,
     diagnose_model_unavailable,
+    turn_error_display_message,
 )
 
 # The tail Claude Code prints when refusing --dangerously-skip-permissions as
@@ -150,6 +152,49 @@ def test_classifies_missing_binary_by_output() -> None:
     )
     assert diagnosis is not None
     assert diagnosis.title == "Agent command not found"
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "output"),
+    [
+        # npm's ENOENT text from a launcher's failed install also says "no such file".
+        (
+            0,
+            "npm error code ENOENT\n"
+            "npm error syscall rename\n"
+            "npm error enoent ENOENT: no such file or directory, rename "
+            "'/home/dev/.local/lib/node_modules/@anthropic-ai/claude-code'\n"
+            "Failed to install Claude Code version 2.1.400.\n"
+            "Claude Code exited with code 127",
+        ),
+        (1, "Error: claude native binary not installed.\nClaude Code exited with code 1"),
+        # Pane wrapping and borders can split the marker mid-word.
+        (
+            0,
+            "│ An error occurred while running Claude Code: [Errno 8] Exec form │\n"
+            "│ at error: '/home/dev/.local/bin/claude'                          │",
+        ),
+    ],
+)
+def test_classifies_broken_claude_install(exit_status: int, output: str) -> None:
+    diagnosis = classify_terminal_failure(command="env", exit_status=exit_status, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude Code's install is broken"
+    assert diagnosis.remediation is not None
+    assert "reinstall Claude Code" in diagnosis.remediation
+
+
+def test_exec_format_error_of_another_program_is_not_a_broken_claude_install() -> None:
+    # The launcher's exit box names Claude Code right after the other program's path.
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=1,
+        output=(
+            "OSError: [Errno 8] Exec format error: '/home/dev/bin/helper'\n"
+            "│ Claude Code exited with code 1 │"
+        ),
+    )
+    assert diagnosis is None
 
 
 def test_classifies_gateway_claude_version_failure() -> None:
@@ -312,6 +357,41 @@ def test_content_length_text_without_sizes_stays_generic() -> None:
 @pytest.mark.parametrize("code", ["codex_reauth_required", "workspace_missing"])
 def test_content_length_text_does_not_override_specific_failure_codes(code: str) -> None:
     assert classify_native_turn_error(code, _CONTENT_LENGTH_REJECTION) == code
+
+
+_REQUEST_SIZE_LIMIT_REJECTION = (
+    '{"error_code":"BAD_REQUEST","message":"The request size exceeds the maximum '
+    'allowed limit of 33554432 bytes. Please reduce the request size and try again."}'
+)
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+def test_classifies_request_size_limit_wording_as_context_overflow(code: str) -> None:
+    assert classify_native_turn_error(code, _REQUEST_SIZE_LIMIT_REJECTION) == (
+        "context_length_exceeded"
+    )
+
+
+def test_request_size_rejection_displays_the_remedy_not_the_raw_body() -> None:
+    assert (
+        turn_error_display_message("context_length_exceeded", _REQUEST_SIZE_LIMIT_REJECTION)
+        == REQUEST_SIZE_OVERFLOW_GUIDANCE
+    )
+    assert "Compact the conversation" in REQUEST_SIZE_OVERFLOW_GUIDANCE
+    assert "start a new session" in REQUEST_SIZE_OVERFLOW_GUIDANCE
+
+
+def test_other_turn_error_text_is_displayed_unchanged() -> None:
+    message = "Codex ran into a model rejection."
+    assert turn_error_display_message("codex_turn_error", message) == message
+
+
+def test_sized_request_size_rejection_keeps_its_text() -> None:
+    sized = (
+        "exceeds maximum allowed content length. RequestSize(bytes): 33967957, "
+        "Limit(bytes): 33554432"
+    )
+    assert turn_error_display_message("context_length_exceeded", sized) == sized
 
 
 @pytest.mark.parametrize(
@@ -849,6 +929,7 @@ def test_compaction_model_failure_code_survives_its_budget_text() -> None:
         ("codex_thread_not_started", "never ran"),
         ("codex_compaction_model_failed", "previous model"),
         ("codex_provider_auth_failed", "model provider's sign-in command"),
+        ("harness_not_configured", "isn't set up on the host"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:

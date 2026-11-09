@@ -38,6 +38,7 @@ from omnigent.git_providers import (
 from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
+    CommitsFacet,
     ProviderCapabilities,
     PullRequestFacet,
     ReviewerRef,
@@ -1129,14 +1130,38 @@ def upload_pr_attachment(
     )
 
 
+def _full_revision(head_sha: str | None, base_sha: str | None) -> tuple[str, str]:
+    """Return both SHAs of a pinned read, rejecting a partial or malformed pair."""
+    if (
+        not head_sha
+        or not base_sha
+        or not _COMMIT_SHA.fullmatch(head_sha)
+        or not _COMMIT_SHA.fullmatch(base_sha)
+    ):
+        raise ValueError("Expected full head and base commit SHAs")
+    return head_sha, base_sha
+
+
 def pr_changed_files(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
 ) -> dict[str, Any]:
-    """List the selected PR's changed files; empty when no provider serves it."""
+    """List the selected PR's changed files; empty when no provider serves it.
+
+    Providers without :class:`ReviewThreadsFacet` (GitLab, Azure DevOps) ignore
+    ``head_sha``/``base_sha`` and list the current revision.
+    """
     reference = _default_pr(session_id, pr_url)
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": "list", "data": [], "has_more": False}
+    if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
+        head, base = _full_revision(head_sha, base_sha)
+        return facet.review_changed_files(root, reference, head_sha=head, base_sha=base)
     return facet.changed_files(root, reference)
 
 
@@ -1154,15 +1179,64 @@ def pr_diff(
     if facet is None:
         return {"object": PR_DIFF_OBJECT, "patch": ""}
     if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
-        if (
-            not head_sha
-            or not base_sha
-            or not _COMMIT_SHA.fullmatch(head_sha)
-            or not _COMMIT_SHA.fullmatch(base_sha)
-        ):
-            raise ValueError("Expected full head and base commit SHAs")
-        return facet.review_diff(root, reference, head_sha=head_sha, base_sha=base_sha)
+        head, base = _full_revision(head_sha, base_sha)
+        return facet.review_diff(root, reference, head_sha=head, base_sha=base)
     return facet.pr_diff(root, reference)
+
+
+def _commits_target(
+    session_id: str | None, pr_url: str | None
+) -> tuple[CommitsFacet, SessionPullRequest]:
+    """Return the selected tracked PR and its facet, which must list commits."""
+    facet, reference = _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.commit_history,
+        unselected="Select a pull request to list its commits",
+        unsupported="Listing commits is not supported for {kind}",
+    )
+    if not isinstance(facet, CommitsFacet):
+        raise ValueError("This provider does not list pull request commits")
+    return facet, reference
+
+
+def _commit_sha(value: object, field: str) -> str:
+    """Return a full commit id, since an abbreviation can later name a different commit."""
+    if not isinstance(value, str) or not _COMMIT_SHA.fullmatch(value):
+        raise ValueError(f"Expected {field} to be a full commit SHA")
+    return value
+
+
+def pr_commits(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: object = None,
+) -> dict[str, Any]:
+    """List the selected PR's commits, oldest first, at the displayed head.
+
+    :raises ValueError: Without a selected tracked PR, when its provider cannot list
+        commits, or when ``head_sha`` is not a full commit id.
+    """
+    facet, reference = _commits_target(session_id, pr_url)
+    return facet.commits(root, reference, head_sha=_commit_sha(head_sha, "head_sha"))
+
+
+def pr_commit_diff(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    commit_sha: object = None,
+) -> dict[str, Any]:
+    """Return one commit of the selected PR as a unified diff.
+
+    :raises ValueError: Without a selected tracked PR, when its provider cannot list
+        commits, or when ``commit_sha`` is not a full commit id.
+    """
+    facet, reference = _commits_target(session_id, pr_url)
+    return facet.commit_diff(root, reference, commit_sha=_commit_sha(commit_sha, "commit_sha"))
 
 
 def pr_file_diff(

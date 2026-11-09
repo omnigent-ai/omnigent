@@ -21,7 +21,11 @@ from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
-from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.llms.errors import (
+    REQUEST_SIZE_OVERFLOW_GUIDANCE,
+    detect_request_size_overflow,
+    is_request_size_rejection,
+)
 
 __all__ = [
     "TERMINAL_CLOSED_OUTSIDE_OMNIGENT",
@@ -113,6 +117,19 @@ _AUTH_MARKERS = (
     "not authenticated",
 )
 
+# --- Claude Code install failed or left broken -------------------------------
+# A launcher that installs Claude Code before starting it reports npm's
+# ENOENT text, which also reads like a missing binary.
+_BROKEN_CLAUDE_INSTALL_MARKERS = (
+    "failedtoinstallclaudecode",
+    "claudenativebinarynotinstalled",
+)
+# The launcher's exec of a half-written binary, "Exec format error: '<path>/claude'";
+# matched on compacted text, so only the quoted path may name claude.
+_EXEC_FORMAT_ERROR = re.compile(r"execformaterror:'[^']*claude'")
+# Pane captures wrap long lines and draw borders, which can split a marker.
+_PANE_WRAP = re.compile(r"[\s│┃]+")
+
 # --- binary missing -----------------------------------------------------------
 _MISSING_MARKERS = (
     "command not found",
@@ -140,7 +157,8 @@ _BACKGROUND_SESSION_REFUSAL = re.compile(
 
 
 # Ordered most-specific first: the root case also reads like a permission /
-# auth problem, so it must win over the broader rules below it.
+# auth problem, and a broken install like a missing binary, so they must win
+# over the broader rules below them.
 _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     _TerminalMatcher(
         "root_permission",
@@ -152,6 +170,21 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "--dangerously-skip-permissions when running as the root user."
             ),
             remediation="Run the host as a non-root user (uid != 0).",
+        ),
+    ),
+    _TerminalMatcher(
+        "claude_install_broken",
+        lambda s: _claude_install_is_broken(s.output),
+        FailureDiagnosis(
+            title="Claude Code's install is broken",
+            cause=(
+                "Claude Code could not start because its install failed or is incomplete. "
+                "Launches that update Claude Code at the same time can leave it this way."
+            ),
+            remediation=(
+                "Send your message again. If it fails again, reinstall Claude Code on the "
+                "host with the installer you used, then retry."
+            ),
         ),
     ),
     _TerminalMatcher(
@@ -231,6 +264,13 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
         ),
     ),
 )
+
+
+def _claude_install_is_broken(output: str) -> bool:
+    compact = _PANE_WRAP.sub("", output)
+    return any(m in compact for m in _BROKEN_CLAUDE_INSTALL_MARKERS) or bool(
+        _EXEC_FORMAT_ERROR.search(compact)
+    )
 
 
 # A tmux kill run inside the pane acts on Omnigent's private server via $TMUX;
@@ -361,7 +401,7 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return code
     if _CLIENT_UPDATE_REQUIRED.search(message):
         return "client_update_required"
-    if detect_request_size_overflow(message) is not None:
+    if is_request_size_rejection(message):
         return "context_length_exceeded"
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None
@@ -378,6 +418,25 @@ def classify_native_turn_error(code: str, message: str) -> str:
     ):
         return "transient_upstream_error"
     return code
+
+
+def turn_error_display_message(code: str, message: str) -> str:
+    """Return the text to show for a classified turn error.
+
+    The limit-only gateway wording is replaced with the context-overflow guidance. The
+    sized rejection keeps its text, which the UI shows with its byte counts.
+
+    :param code: Classified error code, e.g. ``"context_length_exceeded"``.
+    :param message: Raw harness error text.
+    :returns: The guidance for a limit-only request-size rejection, else ``message``.
+    """
+    if (
+        code == "context_length_exceeded"
+        and detect_request_size_overflow(message) is None
+        and is_request_size_rejection(message)
+    ):
+        return REQUEST_SIZE_OVERFLOW_GUIDANCE
+    return message
 
 
 def diagnose_client_update_required(message: str) -> FailureDiagnosis | None:
@@ -665,6 +724,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "host, then start a new session."
     ),
     "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
+    "harness_not_configured": "The harness isn't set up on the host, so this session can't start.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 

@@ -19,6 +19,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     bridge_dir_for_conversation_id,
 )
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
@@ -840,6 +841,108 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
     assert body.get("error") == "codex_native_compact_failed", (
         f"503 body must carry the codex bridge-failure error code; got {body!r}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_turn_id", ["turn_running", None], ids=["busy", "idle"])
+async def test_events_codex_native_approval_mode_change_types_only_when_idle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    active_turn_id: str | None,
+) -> None:
+    """
+    An approval-mode switch while Codex runs a turn is refused, not keyed in.
+
+    Codex disables /permissions during a turn, and the Escape that opens it
+    interrupts the turn and drops the message it carries. The 409 detail tells
+    the person why the mode did not change. Once the session is idle the same
+    request drives the /permissions popup and reports the confirmed mode.
+    """
+    from tests.runner.helpers import make_test_terminal_instance
+
+    popup = (
+        "  Update Model Permissions\n\n"
+        "› 1. Ask for approval  Read and edit workspace files and run commands\n"
+        "  2. Full Access       Use with caution: Codex can edit files outside\n\n"
+        "  enter select · esc back\n"
+    )
+    tmux_calls: list[tuple[str, ...]] = []
+
+    def _recording_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        tmux_calls.append(args)
+
+    def _fake_capture_pane(socket_path: str, target: str, **kwargs: Any) -> str:
+        del socket_path, target, kwargs
+        # The popup stays up until its Full Access row is picked; Codex then
+        # prints the confirmation line.
+        if any(call[-1] == "2" for call in tmux_calls):
+            return "• Permissions updated to Full Access\n"
+        return popup
+
+    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+        # Session creation would otherwise rewrite the bridge state below.
+        del args, kwargs
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _recording_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture_pane)
+    monkeypatch.setattr(native_controls, "_CODEX_POPUP_RENDER_S", 0)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+    )
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    conv_id = "3c1f6be0b1f04e45a8d9e2f7c6b5a4d3"
+    codex_native_bridge.write_bridge_state(
+        codex_native_bridge.bridge_dir_for_bridge_id(conv_id),
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=active_turn_id,
+        ),
+    )
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+
+    app, _ = await _build_app_for_spec(
+        _harness_spec("codex-native"), terminal_registry=terminal_registry
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "codex_approval_mode_change", "approval_mode": "full-access"},
+        )
+
+    if active_turn_id is None:
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"approval_mode": "full-access"}
+        target = instance.tmux_target
+        assert tmux_calls == [
+            ("send-keys", "-t", target, "Escape"),
+            ("send-keys", "-t", target, "C-u"),
+            ("send-keys", "-l", "-t", target, "/permissions"),
+            ("send-keys", "-t", target, "Enter"),
+            ("send-keys", "-l", "-t", target, "2"),
+            ("send-keys", "-l", "-t", target, "1"),
+        ]
+        return
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["error"] == "codex_native_approval_mode_busy"
+    assert body["detail"] == (
+        "Codex is working on a turn. Change the approval mode after it finishes, "
+        "or stop the turn first."
+    )
+    assert tmux_calls == []
 
 
 @pytest.mark.asyncio
@@ -1793,6 +1896,7 @@ async def _post_model_change_with_status_sequence(
     pane_idle_after_polls: int | None = None,
     model_env: dict[str, str] | None = None,
     expected_command: str | None = None,
+    acknowledged_after_polls: int | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -1858,6 +1962,20 @@ async def _post_model_change_with_status_sequence(
         return script.pop(0) if len(script) > 1 else script[0]
 
     monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", _scripted_status)
+    acknowledgement_polls = 0
+
+    def _acknowledged(_bridge_dir: Any, *, command: str) -> bool:
+        nonlocal acknowledgement_polls
+        del command
+        acknowledgement_polls += 1
+        return (
+            acknowledged_after_polls is not None
+            and acknowledgement_polls >= acknowledged_after_polls
+        )
+
+    monkeypatch.setattr(
+        claude_native_bridge, "model_switch_acknowledged", _acknowledged, raising=False
+    )
     # No tmux behind these tests: the in-loop dialog check must not spend a
     # real 1 s tmux-info wait per poll.
     monkeypatch.setattr(
@@ -2096,6 +2214,42 @@ async def test_bound_claude_switch_preserves_private_model_id(
     assert response.status_code == 204, response.text
 
 
+async def test_bound_claude_1m_pick_is_confirmed_by_the_unmarked_status_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound 1M pick is confirmed by the statusLine's unmarked model name.
+
+    Claude Code's statusLine never carries ``[1m]``, so a bound session that
+    already runs the model and picks its 1M variant reads the same name before
+    and after. The unmarked name confirms the pick, as it does for a session
+    whose model is not bound.
+    """
+    from omnigent.inference_config import inference_config_scope
+
+    plain = "system.ai.claude-fable-5-1"
+    selected = f"{plain}[1m]"
+    config = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "claude-native": {
+                    "provider": "gateway",
+                    "default_model": plain,
+                    "model_allowlist": [plain, selected],
+                }
+            }
+        },
+    }
+    with inference_config_scope(config):
+        response = await _post_model_change_with_status_sequence(
+            monkeypatch,
+            [plain],
+            model=selected,
+            expected_command=f"/model {selected}",
+        )
+    assert response.status_code == 204, response.text
+
+
 async def test_bound_claude_switch_does_not_fold_private_model_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2217,6 +2371,24 @@ async def test_events_model_change_unconfirmed_switch_answers_503(
     body = resp.json()
     assert body["error"] == "claude_native_model_unconfirmed"
     assert "did not confirm" in body["detail"]
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_confirmed_by_claudes_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude Code's own "Set model to" line confirms a switch the statusLine never does.
+
+    In production the statusLine snapshot kept its old reading for the whole
+    budget on an idle pane while the pane itself showed the acknowledgement, so
+    an applied switch was reported as "did not confirm the switch".
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        acknowledged_after_polls=2,
+    )
+    assert resp.status_code == 204, resp.text
 
 
 @pytest.mark.asyncio
@@ -3724,6 +3896,321 @@ async def test_events_compact_on_claude_sdk_buffers_behind_active_turn() -> None
     assert hc.posted_bodies == [], (
         f"Buffered compact must not forward to the harness immediately; got {hc.posted_bodies!r}."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", ["active_turn", "buffered_message", "ingesting", None])
+async def test_events_clear_on_claude_sdk_releases_the_idle_client(
+    busy: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A server-coordinated ``clear`` drops an idle claude-sdk session's client and history.
+
+    The server continues the work in a fresh session, so the old session's
+    SDK client must not keep the old context warm. A turn in flight, or a
+    message waiting for one, refuses with 409 and leaves everything intact.
+    A clear that arrives while a message is still being ingested waits for
+    it, then sees the turn it started.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_histories_ref
+
+    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    ingest_held, release_ingest = asyncio.Event(), asyncio.Event()
+    finish_turn = asyncio.Event()
+    if busy == "ingesting":
+        resolve_content = runner_app._resolve_forwarded_message_content
+
+        async def held_ingest(*args: Any, **kwargs: Any) -> Any:
+            ingest_held.set()
+            await release_ingest.wait()
+            return await resolve_content(*args, **kwargs)
+
+        monkeypatch.setattr(runner_app, "_resolve_forwarded_message_content", held_ingest)
+        stream = pm._client.stream
+
+        def held_stream(*args: Any, **kwargs: Any) -> Any:
+            opened = stream(*args, **kwargs)
+
+            class _HeldTurn:
+                status_code = 200
+
+                async def __aenter__(self) -> Any:
+                    await finish_turn.wait()
+                    return await opened.__aenter__()
+
+                async def __aexit__(self, *exc: Any) -> None:
+                    await opened.__aexit__(*exc)
+
+            return _HeldTurn()
+
+        monkeypatch.setattr(pm._client, "stream", held_stream)
+    sid = "d3f2b8c4e5a16b7c9d0e1f2a31425344"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        history = [{"type": "message", "role": "user", "content": "earlier"}]
+        _session_histories_ref[sid] = history
+        if busy == "active_turn":
+            app.state.active_turns[sid] = object()
+        elif busy == "buffered_message":
+            app.state.session_message_buffers[sid] = [{"type": "message"}]
+        message = None
+        if busy == "ingesting":
+            message = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{sid}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "next"}],
+                    },
+                )
+            )
+            await asyncio.wait_for(ingest_held.wait(), timeout=5)
+
+        clear = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "clear", "continue_in_new_session": True},
+            )
+        )
+        if message is not None:
+            # The clear queues behind the ingest instead of releasing under it.
+            await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- non-event
+            assert not clear.done() and pm.released == []
+            release_ingest.set()
+            assert (await asyncio.wait_for(message, timeout=5)).status_code < 300
+        resp = await asyncio.wait_for(clear, timeout=5)
+        finish_turn.set()
+        turn = app.state.active_turns.get(sid) if message is not None else None
+        if turn is not None:
+            await asyncio.wait_for(asyncio.shield(turn), timeout=5)
+
+    try:
+        if busy is None:
+            assert resp.status_code == 200, resp.text
+            assert sid in pm.released
+            assert sid not in _session_histories_ref
+        else:
+            assert resp.status_code == 409, resp.text
+            assert resp.json()["error"] == "claude_sdk_clear_busy"
+            assert sid not in pm.released
+            assert _session_histories_ref.get(sid) is history
+    finally:
+        _session_histories_ref.pop(sid, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("queued_ahead", ["message", "held_ticket"])
+async def test_cancelled_claude_sdk_clear_does_not_block_later_input(
+    monkeypatch: pytest.MonkeyPatch, queued_ahead: str
+) -> None:
+    """A clear cancelled while queued behind an ingest leaves the gate usable.
+
+    Tunnel teardown cancels in-flight requests. The cancelled clear's place in
+    the ingest gate is given up once the message ahead of it finishes, so the
+    next input for the session still runs. With an earlier ticket that is
+    never served still ahead of it, the clear's retirement waits; deleting the
+    session still ends it.
+    """
+    from omnigent.runner import app as runner_app
+
+    gate: dict[str, Any] = {}
+    build = runner_app.build_native_controls
+
+    def keep_gate(**kwargs: Any) -> Any:
+        gate["next_seq"] = kwargs["_ingest_next_seq"]
+        return build(**kwargs)
+
+    monkeypatch.setattr(runner_app, "build_native_controls", keep_gate)
+    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    sid = "f5b4cad6e7f38d9e1f2a3b4c53647566"
+    ingest_held, release_ingest = asyncio.Event(), asyncio.Event()
+    resolve_content = runner_app._resolve_forwarded_message_content
+
+    async def held_ingest(*args: Any, **kwargs: Any) -> Any:
+        if not ingest_held.is_set():
+            ingest_held.set()
+            await release_ingest.wait()
+        return await resolve_content(*args, **kwargs)
+
+    monkeypatch.setattr(runner_app, "_resolve_forwarded_message_content", held_ingest)
+    message = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "next"}],
+    }
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        ahead = asyncio.create_task(client.post(f"/v1/sessions/{sid}/events", json=message))
+        await asyncio.wait_for(ingest_held.wait(), timeout=5)
+        held_ticket = queued_ahead == "held_ticket"
+        if held_ticket:
+            # An input between the message and the clear holds its place unserved.
+            gate["next_seq"][sid] += 1
+        clear = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "clear", "continue_in_new_session": True},
+            )
+        )
+        for _ in range(20):  # Let the clear take its place in line.
+            await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- queue it
+        clear.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await clear
+        release_ingest.set()
+        assert (await asyncio.wait_for(ahead, timeout=5)).status_code < 300
+        if held_ticket:
+            retiring = [
+                task for task in asyncio.all_tasks() if task.get_name() == f"retire-ingest-{sid}"
+            ]
+            assert retiring and not any(task.done() for task in retiring)
+            deleted = await client.delete(f"/v1/sessions/{sid}")
+            assert deleted.status_code == 200, deleted.text
+            await asyncio.wait_for(asyncio.gather(*retiring), timeout=5)
+            return
+        turn = app.state.active_turns.get(sid)
+        if turn is not None:
+            await asyncio.wait_for(asyncio.shield(turn), timeout=5)
+
+        later = await asyncio.wait_for(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "clear", "continue_in_new_session": True},
+            ),
+            timeout=5,
+        )
+        followed = await asyncio.wait_for(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={**message, "content": [{"type": "input_text", "text": "after the clear"}]},
+            ),
+            timeout=5,
+        )
+        turn = app.state.active_turns.get(sid)
+        if turn is not None:
+            await asyncio.wait_for(asyncio.shield(turn), timeout=5)
+
+    assert later.status_code == 200, later.text
+    assert sid in pm.released
+    # A message after it still reaches the harness.
+    assert followed.status_code < 300, followed.text
+    assert any("after the clear" in json.dumps(body) for body in pm._client.posted_bodies)
+
+
+@pytest.mark.asyncio
+async def test_queued_claude_sdk_clear_ends_when_its_session_is_deleted_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clear whose turn comes just as its session is deleted does not strand.
+
+    Ordering: the input ahead finishes and passes the gate to the clear, then
+    the session is deleted (dropping its gate) before the clear resumes. The
+    clear must notice its gate is gone, answer, and not recreate the gate.
+    """
+    from omnigent.runner import app as runner_app
+
+    gate: dict[str, Any] = {}
+    build = runner_app.build_native_controls
+
+    def keep_gate(**kwargs: Any) -> Any:
+        gate.update(
+            cond=kwargs["_ingest_cond"],
+            next_seq=kwargs["_ingest_next_seq"],
+            now_serving=kwargs["_ingest_now_serving"],
+        )
+        return build(**kwargs)
+
+    monkeypatch.setattr(runner_app, "build_native_controls", keep_gate)
+    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    sid = "b7c6dce8f9a05b1c2d3e4f5a67584930"
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        # An input ahead holds ticket 0.
+        gate["next_seq"][sid] = 1
+        cond = gate["cond"].setdefault(sid, asyncio.Condition())
+        clear = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "clear", "continue_in_new_session": True},
+            )
+        )
+        for _ in range(20):  # Let the clear take ticket 1 and wait.
+            await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- queue it
+        assert gate["next_seq"][sid] == 2 and not clear.done()
+
+        # The input ahead finishes and passes the gate to the clear ...
+        async with cond:
+            gate["now_serving"][sid] = 1
+            cond.notify_all()
+        # ... and, before the clear resumes, deletion drops the session's gate.
+        gate["now_serving"].pop(sid, None)
+        gate["next_seq"].pop(sid, None)
+        gate["cond"].pop(sid, None)
+        async with cond:
+            cond.notify_all()
+
+        answered = await asyncio.wait_for(clear, timeout=5)
+
+    assert answered.status_code == 410, answered.text
+    assert sid not in gate["now_serving"] and sid not in gate["next_seq"]
+    assert sid not in gate["cond"]
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_session_the_runner_never_set_up_is_harmless() -> None:
+    """The server's rollback of an unconfirmed continuation can repeat its delete."""
+    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    async with _runner_client(app) as client:
+        responses = [
+            await client.delete("/v1/sessions/a6b5cbd7e8f49a0b1c2d3e4f56473829") for _ in range(2)
+        ]
+    assert [response.status_code for response in responses] == [200, 200]
+
+
+@pytest.mark.asyncio
+async def test_events_legacy_clear_on_claude_sdk_stays_unsupported() -> None:
+    """
+    An unmarked ``clear`` (an older server's) keeps claude-sdk's unsupported 204.
+
+    An older server treats 200 as a completed clear without moving the work
+    to a new session, so the next message would restore the old context.
+    The runner must leave the client and history alone and answer 204.
+    """
+    from omnigent.runner.app import _session_histories_ref
+
+    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    sid = "e4a3c9d5f6b27c8d0e1f2a3b42536455"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        history = [{"type": "message", "role": "user", "content": "earlier"}]
+        _session_histories_ref[sid] = history
+
+        resp = await client.post(f"/v1/sessions/{sid}/events", json={"type": "clear"})
+
+    try:
+        assert resp.status_code == 204, resp.text
+        assert sid not in pm.released
+        assert _session_histories_ref.get(sid) is history
+    finally:
+        _session_histories_ref.pop(sid, None)
 
 
 async def _accumulate_session_events(

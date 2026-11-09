@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -154,6 +155,10 @@ def _disable_codex_startup_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _fake_wait_until_ready)
     monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _fake_trust_policy_hooks)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._start_codex_model_discovery_process",
+        AsyncMock(side_effect=OSError("no installed CLI in app-server unit tests")),
+    )
 
 
 def _test_app_server(
