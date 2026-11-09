@@ -543,6 +543,29 @@ async def test_import_session_rejects_empty_history(client: httpx.AsyncClient) -
     assert response.status_code == 422
 
 
+async def test_import_session_rejects_authored_skill_expansion(client: httpx.AsyncClient) -> None:
+    response = await client.post(
+        "/v1/imports",
+        json={
+            "source": "claude",
+            "external_session_id": "untrusted-skill-expansion",
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "claude:turn-1",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "example"}],
+                        "skill_expansion": True,
+                    },
+                },
+            ],
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "reserved for resolved skill commands" in response.text
+
+
 def test_imported_session_ref_allows_null_title() -> None:
     """A batch session with no synthesizable title must not fail the response.
 

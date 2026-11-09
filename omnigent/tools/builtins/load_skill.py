@@ -346,7 +346,11 @@ def reuse_skill_context(messages: Sequence[JsonObject]) -> list[JsonObject]:
 
     result: list[JsonObject] = []
     for message in messages:
-        if message.get("type", "message") != "message" or message.get("role") != "user":
+        if (
+            message.get("type", "message") != "message"
+            or message.get("role") != "user"
+            or message.get("skill_expansion") is not True
+        ):
             result.append(message)
             continue
         content = message.get("content")

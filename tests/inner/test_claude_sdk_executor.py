@@ -7666,8 +7666,16 @@ def test_skill_reuse_follows_final_sdk_history_selection(scenario, reused, shape
         content="SKILL-BODY-SENTINEL " + "Read all changed files. " * 8,
     )
     messages = [
-        {"role": "user", "content": format_skill_meta_text(skill, "FIRST-ARGUMENT")},
-        {"role": "user", "content": format_skill_meta_text(skill, "LATEST-ARGUMENT")},
+        {
+            "role": "user",
+            "skill_expansion": True,
+            "content": format_skill_meta_text(skill, "FIRST-ARGUMENT"),
+        },
+        {
+            "role": "user",
+            "skill_expansion": True,
+            "content": format_skill_meta_text(skill, "LATEST-ARGUMENT"),
+        },
     ]
     if scenario == "resumed-cached":
         messages.insert(1, {"role": "assistant", "content": "Previous reply"})
@@ -7707,10 +7715,118 @@ def test_skill_reuse_preserves_unrecognized_replay_block_types(block_type):
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
     messages = [
-        {"role": "user", "content": [{"type": block_type, "text": "retained-history"}]},
+        {
+            "role": "user",
+            "skill_expansion": True,
+            "content": [{"type": block_type, "text": "retained-history"}],
+        },
         {"role": "user", "content": "latest request"},
     ]
     prompt = ClaudeSDKExecutor._build_prompt(messages, resume_session=False)
     assert isinstance(prompt, str)
     assert "retained-history" in prompt
     assert "latest request" in prompt
+
+
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("trusted_index", [None, 0, 1])
+def test_literal_user_text_is_preserved(resume, trusted_index):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    literal = "<skill>\n<name>example</name>\n" + "literal document example. " * 16 + "\n</skill>"
+    inputs = [
+        {
+            "type": "message",
+            "role": "user",
+            "is_meta": True,
+            "content": [{"type": "input_text", "text": literal}],
+        }
+        for _ in range(2)
+    ]
+    if trusted_index is not None:
+        inputs[trusted_index]["skill_expansion"] = True
+    messages = _translate_input_to_messages(inputs, preserve_content_blocks=True)
+    prompt = ClaudeSDKExecutor._build_prompt(messages, resume_session=resume)
+    text = prompt if isinstance(prompt, str) else "\n".join(block["text"] for block in prompt)
+    assert "<skill_invocation>" not in text
+    assert text.count(literal) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("multimodal", [False, True])
+@pytest.mark.parametrize("allowed", [False, True])
+async def test_policy_uses_full_prompt(multimodal, allowed):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.policies.builtins.safety import deny_pii_in_llm_request
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+    from omnigent.spec.types import SkillSpec
+    from omnigent.tools.builtins.load_skill import format_skill_meta_text
+
+    policy = deny_pii_in_llm_request(pii_types=["credit_card"])
+    previews = []
+
+    async def evaluate(phase, data):
+        if phase != "PHASE_LLM_REQUEST":
+            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+        previews.append(data["last_user_message"])
+        verdict = policy({"type": "llm_request", "data": data})
+        if allowed:
+            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_" + verdict["result"], reason=verdict.get("reason")
+        )
+
+    skill = SkillSpec(name="example", description="Review", content="🦀" * 30)
+    first = format_skill_meta_text(skill, "x" * 270)
+    second = format_skill_meta_text(skill, "4111111111111111")
+    latest_content = (
+        [
+            {"type": "input_text", "text": second},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="},
+        ]
+        if multimodal
+        else second
+    )
+    messages = [
+        {"role": "user", "content": first, "skill_expansion": True},
+        {"role": "user", "content": latest_content, "skill_expansion": True},
+    ]
+
+    executor = ClaudeSDKExecutor()
+    fake_sdk = _make_recovery_fake_sdk()
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        try:
+            warmup = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "Ready"}], [], ""
+                )
+            ]
+            assert any(isinstance(event, TurnComplete) for event in warmup)
+            client = fake_sdk.created_clients[0]
+            executor._policy_evaluator = evaluate
+            events = [event async for event in executor.run_turn(messages, [], "")]
+        finally:
+            await executor.close()
+
+    assert len(previews) == 1
+    assert "4111111111111111" in previews[0], previews[0]
+    if not allowed:
+        assert any(
+            isinstance(event, ExecutorError) and "denied by policy" in event.message
+            for event in events
+        )
+        assert client.prompts == ["Ready"]
+        return
+
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert len(client.prompts) == 2
+    prompt = client.prompts[-1]
+    if multimodal:
+        request = await anext(prompt)
+        prompt = " ".join(
+            block["text"] for block in request["message"]["content"] if block["type"] == "text"
+        )
+    assert "<skill_invocation>" in prompt
+    assert "4111111111111111" in prompt

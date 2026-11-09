@@ -784,6 +784,7 @@ def _history_message_from_body(body: _JsonObject) -> _JsonObject:
         "role": body.get("role", "user"),
         "content": body.get("content", []),
         "id": body.get("persisted_item_id"),
+        **({"skill_expansion": True} if body.get("skill_expansion") is True else {}),
     }
 
 

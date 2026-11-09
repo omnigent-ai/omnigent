@@ -3390,10 +3390,15 @@ class ClaudeSDKExecutor(Executor):
             return
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
-        prompt = (
-            self._build_prompt(messages, resume_session=True)
-            if resume_session
-            else await self._fresh_session_prompt(messages, cfg)
+        policy_eval = getattr(self, "_policy_evaluator", None)
+        history_token_budget = None
+        if not resume_session:
+            history_token_budget = await self._fresh_session_history_budget(messages, cfg)
+        prompt = self._build_prompt(
+            messages,
+            resume_session=resume_session,
+            history_token_budget=history_token_budget,
+            reuse_skills=policy_eval is None,
         )
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
@@ -3420,7 +3425,13 @@ class ClaudeSDKExecutor(Executor):
             if rebuild:
                 await self._close_live_client(session_key)
                 resume_session = False
-                prompt = await self._fresh_session_prompt(messages, cfg)
+                history_token_budget = await self._fresh_session_history_budget(messages, cfg)
+                prompt = self._build_prompt(
+                    messages,
+                    resume_session=False,
+                    history_token_budget=history_token_budget,
+                    reuse_skills=policy_eval is None,
+                )
 
         from omnigent.harnesses.claude_native.bridge import (
             MANAGED_MCP_RELAY_MISSING_WARNING,
@@ -3845,8 +3856,7 @@ class ClaudeSDKExecutor(Executor):
         # If the executor adapter installed a ``_policy_evaluator``
         # callback, call it with the request data so the Omnigent server
         # can evaluate LLM_REQUEST policies before the LLM call.
-        _policy_eval = getattr(self, "_policy_evaluator", None)
-        if _policy_eval is not None:
+        if policy_eval is not None:
             # Extract the user prompt text for PII scanning.
             _last_user_msg = ""
             if isinstance(prompt, str):
@@ -3865,11 +3875,17 @@ class ClaudeSDKExecutor(Executor):
                 "system_prompt_preview": (system_prompt[:200] if system_prompt else ""),
                 "last_user_message": _last_user_msg,
             }
-            _req_verdict = await _policy_eval("PHASE_LLM_REQUEST", _req_data)
+            _req_verdict = await policy_eval("PHASE_LLM_REQUEST", _req_data)
             if _req_verdict.action == "POLICY_ACTION_DENY":
                 _deny_reason = _req_verdict.reason or "no reason given"
                 yield ExecutorError(message=f"LLM call denied by policy: {_deny_reason}")
                 return
+            if sum(message.get("skill_expansion") is True for message in messages) > 1:
+                prompt = self._build_prompt(
+                    messages,
+                    resume_session=resume_session,
+                    history_token_budget=history_token_budget,
+                )
 
         notice_messages = messages
         if resume_session:
@@ -4342,7 +4358,7 @@ class ClaudeSDKExecutor(Executor):
         # ── LLM_RESPONSE policy evaluation ───────────────────────
         # Evaluate after the stream completes but before TurnComplete
         # so a DENY prevents the response from being persisted.
-        if _policy_eval is not None:
+        if policy_eval is not None:
             _resp_data: _JsonObject = {
                 "model": model,
                 "text_preview": (response_text[:500] if response_text else ""),
@@ -4350,7 +4366,7 @@ class ClaudeSDKExecutor(Executor):
             }
             if turn_usage is not None:
                 _resp_data["usage"] = turn_usage
-            _resp_verdict = await _policy_eval("PHASE_LLM_RESPONSE", _resp_data)
+            _resp_verdict = await policy_eval("PHASE_LLM_RESPONSE", _resp_data)
             if _resp_verdict.action == "POLICY_ACTION_DENY":
                 _deny_reason = _resp_verdict.reason or "no reason given"
                 if compaction_occurred and claude_session_id:
@@ -4385,31 +4401,20 @@ class ClaudeSDKExecutor(Executor):
             return self._resolved_default_model
         return self._model_override
 
-    async def _fresh_session_prompt(
+    async def _fresh_session_history_budget(
         self, messages: list[Message], cfg: ExecutorConfig
-    ) -> str | list[_JsonObject]:
-        """
-        Build the first prompt for a newly launched client.
-
-        Prior history is replayed within a share of the turn model's context
-        window, so a long session still fits after its client restarts.
-
-        :param messages: Conversation history as inner :class:`Message` dicts.
-        :param cfg: The turn's executor config, carrying any model override.
-        :returns: The prompt from :meth:`_build_prompt`.
-        """
-        budget = None
-        if _has_replayable_history(messages):
-            base_model = self._model_override if cfg.model else await self._spec_or_default_model()
-            # Off-loop: the window lookup may fetch the model catalog.
-            window = await run_sync_on_thread(
-                _resolve_replay_context_window,
-                self._context_window,
-                base_model,
-                cfg.model,
-            )
-            budget = int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
-        return self._build_prompt(messages, resume_session=False, history_token_budget=budget)
+    ) -> int | None:
+        if not _has_replayable_history(messages):
+            return None
+        base_model = self._model_override if cfg.model else await self._spec_or_default_model()
+        # Off-loop: the window lookup may fetch the model catalog.
+        window = await run_sync_on_thread(
+            _resolve_replay_context_window,
+            self._context_window,
+            base_model,
+            cfg.model,
+        )
+        return int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
 
     @staticmethod
     def _build_prompt(
@@ -4417,6 +4422,7 @@ class ClaudeSDKExecutor(Executor):
         *,
         resume_session: bool,
         history_token_budget: int | None = None,
+        reuse_skills: bool = True,
     ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
@@ -4447,7 +4453,9 @@ class ClaudeSDKExecutor(Executor):
         """
         if resume_session:
             # The live session already holds its tool items; only a fresh one replays them.
-            return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
+            return ClaudeSDKExecutor._extract_trailing_user_content(
+                without_tool_history(messages), reuse_skills=reuse_skills
+            )
 
         if not _has_replayable_history(messages):
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
@@ -4470,7 +4478,9 @@ class ClaudeSDKExecutor(Executor):
             kept.append((msg, rendered))
 
         kept.reverse()
-        selected = reuse_skill_context([*[message for message, _ in kept], messages[latest_index]])
+        selected = [*[message for message, _ in kept], messages[latest_index]]
+        if reuse_skills:
+            selected = reuse_skill_context(selected)
         latest_content = ClaudeSDKExecutor._extract_latest_user_content(selected)
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
@@ -4540,6 +4550,8 @@ class ClaudeSDKExecutor(Executor):
     @staticmethod
     def _extract_trailing_user_content(
         messages: list[Message],
+        *,
+        reuse_skills: bool,
     ) -> str | list[_JsonObject]:
         """
         Extract the trailing run of consecutive user messages for the SDK.
@@ -4584,7 +4596,8 @@ class ClaudeSDKExecutor(Executor):
             else:
                 break
         trailing.reverse()
-        trailing = reuse_skill_context(trailing)
+        if reuse_skills:
+            trailing = reuse_skill_context(trailing)
         if not trailing:
             return ""
         if len(trailing) == 1:

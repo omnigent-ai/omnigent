@@ -41,7 +41,7 @@ from omnigent.entities import (
     SlashCommandData,
     TerminalCommandData,
 )
-from omnigent.entities.conversation import StartupInputOptions
+from omnigent.entities.conversation import StartupInputOptions, reject_authored_skill_expansion
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
@@ -1489,6 +1489,10 @@ class SessionEventInput(BaseModel):
     @classmethod
     def reject_framework_blocks(cls, data: dict[str, Any]) -> dict[str, Any]:
         reject_authored_framework_notices(data)
+        reject_authored_skill_expansion(data)
+        item_data = data.get("item_data")
+        if isinstance(item_data, dict):
+            reject_authored_skill_expansion(item_data)
         return data
 
 

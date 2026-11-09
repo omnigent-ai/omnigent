@@ -1665,6 +1665,8 @@ def _extract_role_keyed_messages(
         if not content and not (is_initiating_user and preserve_empty_initiating_message):
             continue
         message: Message = {"role": role, "content": content}
+        if item.get("skill_expansion") is True:
+            message["skill_expansion"] = True
         # Only the final input item can identify this turn. Filtered tool history
         # must not make an older user message look like the initiating item.
         if is_initiating_user:

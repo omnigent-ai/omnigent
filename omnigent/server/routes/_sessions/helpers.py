@@ -8275,6 +8275,7 @@ async def _dispatch_skill_slash_command_to_runner(
             content=meta_content,
             is_meta=True,
             user_authored=True,
+            skill_expansion=True,
         ),
         created_by=created_by,
     )
@@ -8301,6 +8302,7 @@ async def _dispatch_skill_slash_command_to_runner(
         "type": "message",
         "role": "user",
         "content": meta_content,
+        "skill_expansion": True,
         "agent_id": conv.agent_id,
         "agent_revision": mcp_selection_revision(agent.bundle_location, conv.labels),
         "model": agent.name,

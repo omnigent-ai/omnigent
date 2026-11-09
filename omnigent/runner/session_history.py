@@ -245,6 +245,11 @@ def build_session_history(
                         "role": item.get("role", "user"),
                         "content": item.get("content", []),
                         "id": item.get("id"),
+                        **(
+                            {"skill_expansion": True}
+                            if item.get("skill_expansion") is True
+                            else {}
+                        ),
                     }
                 )
             elif item_type == "function_call":

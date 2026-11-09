@@ -122,6 +122,37 @@ async def test_authored_framework_notice_is_rejected(
     assert snapshot["pending_inputs"] == []
 
 
+@pytest.mark.parametrize(
+    "event_type,expected_status",
+    [("message", 422), ("external_conversation_item", 422), ("compaction", 400)],
+)
+async def test_client_cannot_mark_skill_expansions(
+    client: httpx.AsyncClient, event_type: str, expected_status: int
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    message = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "example"}],
+        "skill_expansion": True,
+    }
+    data: dict[str, Any] = message
+    if event_type == "external_conversation_item":
+        data = {"item_type": "message", "item_data": message}
+    elif event_type == "compaction":
+        data = {
+            "summary": "summary",
+            "last_item_id": "message",
+            "token_count": 1,
+            "compacted_messages": [message],
+        }
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events", json={"type": event_type, "data": data}
+    )
+    assert response.status_code == expected_status, response.text
+    assert "reserved for resolved skill commands" in response.text
+
+
 def _capture_published(
     monkeypatch: pytest.MonkeyPatch, published: list[tuple[str, dict[str, Any]]]
 ) -> None:
@@ -2793,6 +2824,18 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     the skill context without showing raw instructions to users.
     """
 
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.runner.app import create_runner_app
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from tests.runner.conftest import (
+        _FakeProcessManager,
+        _runner_client,
+        _ScriptedHarnessClient,
+        _sse,
+    )
+
+    instructions = "Ask sharp questions one at a time. " * 8
     forwarded: list[dict[str, Any]] = []
     published: list[tuple[str, dict[str, Any]]] = []
 
@@ -2815,7 +2858,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             skill = SkillSpec(
                 name="grill-me",
                 description="Stress-test a plan.",
-                content="Ask sharp questions one at a time.",
+                content=instructions,
             )
             return httpx.Response(
                 200,
@@ -2838,7 +2881,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
                 {
                     "name": "grill-me",
                     "description": "Stress-test a plan.",
-                    "content": "Ask sharp questions one at a time.",
+                    "content": instructions,
                 }
             ],
         )
@@ -2868,6 +2911,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     meta = next(item for item in items if item["type"] == "message" and item.get("is_meta"))
     # Explicit skill invocation marks even its hidden expansion as user-authored.
     assert meta["user_authored"] is True
+    assert meta["skill_expansion"] is True
     assert visible["name"] == "grill-me"
     assert visible["kind"] == "skill"
     assert visible["arguments"] == "review this rollout"
@@ -2886,6 +2930,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             "type": "message",
             "role": "user",
             "content": meta["content"],
+            "skill_expansion": True,
             "agent_id": agent["id"],
             "model": "skill-agent",
             "has_mcp_servers": False,
@@ -2912,6 +2957,58 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     session_resp = await client.get(f"/v1/sessions/{session['id']}")
     assert session_resp.status_code == 200, session_resp.text
     assert session_resp.json()["title"] == "/grill-me review this rollout"
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        second = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "slash_command",
+                "data": {"kind": "skill", "name": "grill-me", "arguments": "review the update"},
+            },
+        )
+    assert second.status_code == 202, second.text
+
+    stream_finished = asyncio.Event()
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "r1"}}),
+            _sse({"type": "response.completed", "response": {"id": "r1"}}),
+        ],
+        stream_finished=stream_finished,
+    )
+
+    async def resolve(agent_id, session_id=None):
+        return AgentSpec(
+            spec_version=1,
+            name="skill-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),
+        spec_resolver=resolve,
+        server_client=client,
+    )
+    async with _runner_client(app) as runner:
+        delivered = await runner.post(
+            f"/v1/sessions/{session['id']}/events",
+            json=forwarded[1],
+        )
+        assert delivered.status_code == 202, delivered.text
+        await asyncio.wait_for(stream_finished.wait(), timeout=5)
+    assert len(harness_client.posted_bodies) == 1
+    history = harness_client.posted_bodies[0]["content"]
+    messages = _translate_input_to_messages(history, preserve_content_blocks=True)
+    prompt = ClaudeSDKExecutor._build_prompt(messages, resume_session=False)
+    assert isinstance(prompt, list)
+    prompt_text = "\n".join(block["text"] for block in prompt)
+    assert prompt_text.count(instructions.strip()) == 1
+    assert "review this rollout" in prompt_text
+    assert "review the update" in prompt_text
+    assert "<skill_invocation>" in prompt_text
 
 
 @pytest.mark.parametrize("in_sub_agent", [False, True])

@@ -353,6 +353,11 @@ class StartupInputOptions(BaseModel):
     scheduled_run: ScheduledRunLogContext | None = None
 
 
+def reject_authored_skill_expansion(item: dict[str, Any]) -> None:
+    if "skill_expansion" in item:
+        raise ValueError("skill_expansion is reserved for resolved skill commands")
+
+
 # Longest harness message phase kept, e.g. Codex ``"partial_answer"``.
 _MAX_MESSAGE_PHASE_LENGTH = 64
 
@@ -395,6 +400,9 @@ class MessageData(BaseModel):
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
+    skill_expansion: Literal[True] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
@@ -655,6 +663,8 @@ class CompactionData(BaseModel):
             or ``None`` unchanged.
         """
         reject_authored_framework_notices(value)
+        for message in value or []:
+            reject_authored_skill_expansion(message)
         return redact_binary_payloads(value, _binary_payload_omitted)
 
 

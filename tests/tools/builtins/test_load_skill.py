@@ -433,6 +433,7 @@ def test_skill_context_reuse_preserves_arguments_and_history(arguments, shape):
         {
             "type": "message",
             "role": "user",
+            "skill_expansion": True,
             "id": str(index),
             "content": text if shape == "text" else [{"type": "input_text", "text": text}],
         }
@@ -465,7 +466,7 @@ def test_skill_context_requires_matching_instructions_in_outgoing_input(tmp_path
         name="review", description="Review", content="Original body. " * 20, skill_dir=tmp_path
     )
     original = format_skill_meta_text(skill, "first")
-    prior = {"type": "message", "role": "user", "content": original}
+    prior = {"type": "message", "role": "user", "skill_expansion": True, "content": original}
     if change == "body":
         skill.content = "Changed body. " * 20
     elif change == "path":
@@ -481,6 +482,7 @@ def test_skill_context_requires_matching_instructions_in_outgoing_input(tmp_path
     current = {
         "type": "message",
         "role": "user",
+        "skill_expansion": True,
         "content": format_skill_meta_text(skill, "second"),
     }
     assert reuse_skill_context([prior, current]) == [prior, current]
@@ -502,7 +504,8 @@ def test_skill_context_reintroduces_older_version_after_same_name_changes(tmp_pa
         skill.skill_dir = tmp_path / "other"
     second = format_skill_meta_text(skill, "second")
     messages = [
-        {"type": "message", "role": "user", "content": text} for text in (first, second, first)
+        {"type": "message", "role": "user", "skill_expansion": True, "content": text}
+        for text in (first, second, first)
     ]
     assert reuse_skill_context(messages) == messages
 
@@ -518,7 +521,10 @@ def test_skill_context_preserves_ambiguous_wrapper_delimiters(field):
         content=embedded if field == "content" else "Instructions. " * 20,
     )
     text = format_skill_meta_text(skill, embedded if field == "arguments" else "request")
-    messages = [{"type": "message", "role": "user", "content": text} for _ in range(2)]
+    messages = [
+        {"type": "message", "role": "user", "skill_expansion": True, "content": text}
+        for _ in range(2)
+    ]
     assert reuse_skill_context(messages) == messages
 
 
@@ -538,7 +544,8 @@ def test_ambiguous_skill_expansion_invalidates_previous_reuse(middle):
     first = format_skill_meta_text(skill, "first")
     last = format_skill_meta_text(skill, "last")
     messages = [
-        {"type": "message", "role": "user", "content": text} for text in (first, middle, last)
+        {"type": "message", "role": "user", "skill_expansion": True, "content": text}
+        for text in (first, middle, last)
     ]
     assert reuse_skill_context(messages) == messages
 
@@ -552,7 +559,7 @@ def test_skill_reuse_never_increases_utf8_size(body, reused):
 
     skill = SkillSpec(name="review", description="Review", content=body)
     text = format_skill_meta_text(skill, "request")
-    messages = [{"role": "user", "content": text} for _ in range(3)]
+    messages = [{"role": "user", "skill_expansion": True, "content": text} for _ in range(3)]
     result = reuse_skill_context(messages)
     for message in result:
         assert len(message["content"].encode("utf-8")) <= len(text.encode("utf-8"))
@@ -570,8 +577,12 @@ def test_skill_version_in_rendered_text_blocks_invalidates_reuse(block_type):
     skill.content = "Version B. " * 20
     middle = format_skill_meta_text(skill, "middle")
     messages = [
-        {"role": "user", "content": first},
-        {"role": "user", "content": [{"type": block_type, "text": middle}]},
-        {"role": "user", "content": first},
+        {"role": "user", "skill_expansion": True, "content": first},
+        {
+            "role": "user",
+            "skill_expansion": True,
+            "content": [{"type": block_type, "text": middle}],
+        },
+        {"role": "user", "skill_expansion": True, "content": first},
     ]
     assert reuse_skill_context(messages) == messages
