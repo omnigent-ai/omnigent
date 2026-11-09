@@ -172,12 +172,14 @@ function HostLabel({ host }: { host: Host }) {
   const isOnline = host.status === "online";
   return (
     <span className="flex items-center gap-2">
-      {host.name.toLowerCase().includes("cloud") ? (
+      {host.sandbox_provider || host.name.toLowerCase().includes("cloud") ? (
         <MonitorCloudIcon className="size-4 text-muted-foreground" />
       ) : (
         <MonitorIcon className="size-4 text-muted-foreground" />
       )}
-      <span className="font-mono text-sm">{host.name}</span>
+      <span className={host.sandbox_provider ? "text-sm" : "font-mono text-sm"}>
+        {host.sandbox_provider ? "Same sandbox" : host.name}
+      </span>
       <span
         className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
           isOnline ? "text-green-600" : "text-muted-foreground"
@@ -897,9 +899,16 @@ function SupportedForkSessionForm({
   const { data: agents } = useAvailableAgents({ enabled: true });
   const { data: sourceAgent } = useSessionAgent(sourceSessionId);
 
+  const info = useServerInfo();
+  const reusableSourceHostId =
+    info !== "loading" && info.sibling_sessions ? sourceHostId : undefined;
   // Hosts for the picker — only for a coding source (a non-coding fork
-  // never shows the host field).
-  const { data: hosts } = useHosts({ enabled: isCodingSource });
+  // never shows the host field). Reuse the source sandbox only when the server
+  // advertises the shared-sandbox lifecycle that makes it safe.
+  const { data: hosts } = useHosts({
+    enabled: isCodingSource,
+    sourceHostId: reusableSourceHostId,
+  });
   const allHosts = hosts ?? [];
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
@@ -918,7 +927,6 @@ function SupportedForkSessionForm({
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (rows hidden) until the boot probe resolves. Same gate
   // NewChatDialog uses for its own sandbox option.
-  const info = useServerInfo();
   const managedSandboxesEnabled =
     !workspaceRecovery && info !== "loading" && info.managed_sandboxes_enabled;
   // One picker row per configured provider; a single-provider server
