@@ -225,12 +225,12 @@ describe("palette-aware surface composition", () => {
     expect(darkTokens).toContain(
       "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
     );
-    expect(darkTokens).toContain("--overlay-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
     expect(darkTokens).toContain("color-mix(in srgb, var(--card) 95%, white)");
     expect(darkTokens).not.toContain("#5c306c");
     expect(sidebarRule).toContain("background-color: var(--sidebar)");
     expect(composerRule).toContain("background-color: var(--composer-surface-bg)");
-    expect(menuRule).toContain("background-color: var(--overlay-surface-bg)");
+    expect(menuRule).toContain("background-color: var(--menu-surface-bg)");
     expect(cardRule).toContain("background-color: var(--card-surface-bg)");
   });
 
@@ -255,8 +255,8 @@ describe("palette-aware surface composition", () => {
     expect(generatedPaletteCssSource).not.toContain("--primary-cta");
   });
 
-  it("uses the palette popover for menu surfaces in light mode", () => {
-    expect(lightMenuRule).toContain("background-color: var(--popover)");
+  it("keeps menu surfaces white in light mode", () => {
+    expect(lightMenuRule).toContain("background-color: #fff");
     expect(lightMenuRule).toContain("border: 1px solid rgb(0 0 0 / 8%)");
   });
 
@@ -874,7 +874,7 @@ describe("index.css composer and menu surfaces", () => {
     expect(darkTokens).toContain(
       "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
     );
-    expect(darkTokens).toContain("--overlay-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
     expect(darkTokens).not.toContain("--composer-surface-bg: rgb(255 255 255 /");
   });
 
@@ -1297,12 +1297,10 @@ describe("index.css shared UI font smoothing", () => {
 });
 
 /* On the macOS desktop shell the window's top strip carries the OS traffic
- * lights plus the Search/Settings/toggle cluster, and the cluster is owned by
- * AppShell rather than the sidebar so it holds that spot whether the sidebar is
- * open, collapsed, or peeking. Asserted at the CSS level because the whole
- * change is CSS — and because the lights are painted by macOS OUTSIDE the page,
- * so no DOM test (and no page screenshot) can see them. These values ARE the
- * alignment.
+ * lights plus persistent sidebar actions. The wordmark and Search occupy the
+ * row below while the sidebar is open; Search joins the title-bar actions when
+ * collapsed. Asserted at the CSS level because the lights are painted by macOS
+ * OUTSIDE the page, so no DOM test (and no page screenshot) can see them.
  */
 describe("index.css electron-mac sidebar header", () => {
   const sidebarRule = cssSource.match(
@@ -1311,7 +1309,6 @@ describe("index.css electron-mac sidebar header", () => {
   const headerRowRule = cssSource.match(
     /\[data-electron-mac\] \.sidebar-header-row \{[^}]*\}/,
   )?.[0];
-  const brandRule = cssSource.match(/\[data-electron-mac\] \.sidebar-brand \{[^}]*\}/)?.[0];
   const inSidebarActionsRule = cssSource.match(
     /\[data-electron-mac\] \.conversations-sidebar \[data-testid="sidebar-header-actions"\] \{[^}]*\}/,
   )?.[0];
@@ -1336,12 +1333,13 @@ describe("index.css electron-mac sidebar header", () => {
     expect(sidebarRule).toContain("margin-top: 0");
   });
 
-  it("drops the brand mark, which has nowhere to sit beside the lights", () => {
-    expect(brandRule).toContain("display: none");
+  it("keeps the brand mark visible below the title bar", () => {
+    expect(cssSource).not.toMatch(/\[data-electron-mac\] \.sidebar-brand \{[^}]*display:\s*none/);
   });
 
-  it("reserves the entire drag band before the sidebar content", () => {
-    expect(headerRowRule).toContain("height: var(--mac-titlebar-height)");
+  it("reserves the drag band above a normal-height brand row", () => {
+    expect(headerRowRule).toContain("height: calc(var(--mac-titlebar-height) + 3rem)");
+    expect(headerRowRule).toContain("padding: var(--mac-titlebar-height) 1rem 0");
   });
 
   it("hides the sidebar's own cluster in favour of the title-bar copy", () => {
@@ -1390,10 +1388,12 @@ describe("index.css electron-mac sidebar header", () => {
     expect(peekHeaderRowRule).toContain("display: none");
   });
 
-  it("orders the cluster Collapse, Search, Settings left-to-right", () => {
-    // The DOM order is Search → Settings → toggle (tab order follows
-    // importance), so the toggle is reordered visually rather than moved.
-    expect(stripActionsRule).toMatch(/&\s*>\s*\*\s*>\s*\*:last-child\s*\{[^}]*order:\s*-1/);
+  it("keeps Collapse by the lights and docks Back/Forward at the sidebar's edge", () => {
+    // The toggle comes first in the DOM, so nothing reorders the cluster.
+    expect(stripActionsRule).not.toMatch(/order:/);
+    expect(cssSource).toMatch(
+      /\.app-shell\[data-sidebar-open\]\s+\.electron-sidebar-header-actions\s+\[data-testid="history-navigation-buttons"\]\s*\{[^}]*margin-left:\s*auto/,
+    );
   });
 
   it("pushes the settings sidebar's Back row below the lights", () => {
@@ -1425,7 +1425,6 @@ describe("index.css electron-mac sidebar header", () => {
     const selectorsInSource = [...cssSource.matchAll(/(^|\})\s*([^{}]+?)\s*\{/g)].map((m) => m[2]);
     for (const cls of [
       ".sidebar-header-row",
-      ".sidebar-brand",
       ".settings-sidebar-header",
       ".electron-sidebar-header-actions",
       ".chat-header-sidebar-toggle",
@@ -1485,7 +1484,16 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
 
   it("has the clearance rule this test exists to protect", () => {
     expect(rule, "the maximized rail tab-strip padding rule is gone from index.css").toBeDefined();
-    expect(rule).toContain("padding-left: calc(var(--mac-traffic-light-width) + 5rem)");
+    expect(rule).toContain("padding-left: var(--mac-header-actions-clearance)");
+  });
+
+  it("clears the same width as the chat header, which sits under the same cluster", () => {
+    expect(cssSource).toMatch(
+      /\.traffic-light-clearance \{\s*padding-left: var\(--mac-header-actions-clearance\);/,
+    );
+    expect(cssSource).toContain(
+      "--mac-header-actions-clearance: calc(var(--mac-traffic-light-width) + 6.75rem);",
+    );
   });
 
   it("clears the lights on the mac shell while the sidebar is collapsed", () => {
