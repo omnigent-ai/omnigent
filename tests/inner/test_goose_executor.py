@@ -1604,7 +1604,8 @@ async def test_prompt_includes_input_item_metadata(input_item_id, content, fresh
             {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
             {"type": "message", "role": "assistant", "content": "old reply"},
             tail,
-        ]
+        ],
+        preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
     )
     events = [event async for event in executor.run_turn(messages, [], "")]
 

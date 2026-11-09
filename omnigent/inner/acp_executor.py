@@ -1427,6 +1427,10 @@ class AcpExecutor(Executor):
     def supports_streaming(self) -> bool:
         return True
 
+    def preserves_empty_initiating_message(self) -> bool:
+        """Keep the initiating item identity even when its ACP prompt is empty."""
+        return True
+
     def max_context_tokens(self) -> int | None:
         """Return the agent's reported context-window size, if observed yet."""
         return self._context_window

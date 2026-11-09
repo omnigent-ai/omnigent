@@ -1297,6 +1297,10 @@ class QwenExecutor(Executor):
             return True
         return False
 
+    def preserves_empty_initiating_message(self) -> bool:
+        """Keep the initiating item identity even when its ACP prompt is empty."""
+        return True
+
     async def run_turn(
         self,
         messages: list[Message],

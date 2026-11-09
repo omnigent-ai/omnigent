@@ -248,6 +248,7 @@ class ExecutorAdapter(HarnessApp):
             request.input,
             include_tool_history=executor.replays_tool_history(),
             preserve_content_blocks=executor.preserves_message_content_blocks(),
+            preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
         )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
@@ -1572,6 +1573,7 @@ def _translate_input_to_messages(
     *,
     include_tool_history: bool = False,
     preserve_content_blocks: bool = False,
+    preserve_empty_initiating_message: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
@@ -1586,6 +1588,7 @@ def _translate_input_to_messages(
         input_value,
         include_tool_history=include_tool_history,
         preserve_content_blocks=preserve_content_blocks,
+        preserve_empty_initiating_message=preserve_empty_initiating_message,
     )
     if history_messages:
         return history_messages
@@ -1601,6 +1604,7 @@ def _extract_role_keyed_messages(
     *,
     include_tool_history: bool,
     preserve_content_blocks: bool,
+    preserve_empty_initiating_message: bool,
 ) -> list[Message]:
     """Extract role-keyed messages from an Omnigent input list.
 
@@ -1636,8 +1640,8 @@ def _extract_role_keyed_messages(
             item.get("content"), preserve_content_blocks=preserve_content_blocks
         )
         is_initiating_user = role == "user" and item is input_value[-1]
-        # Keep an empty initiating message so its identity and position survive.
-        if not content and not is_initiating_user:
+        # Opted-in executors need the empty item's identity and position.
+        if not content and not (is_initiating_user and preserve_empty_initiating_message):
             continue
         message: Message = {"role": role, "content": content}
         # Only the final input item can identify this turn. Filtered tool history

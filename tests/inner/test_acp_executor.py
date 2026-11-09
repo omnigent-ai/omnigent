@@ -2943,14 +2943,15 @@ async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expe
     """History filtering and replay must never select an older user's identity."""
     from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
 
+    executor = AcpExecutor(AcpAgentConfig(command="unused", omnigent_mcp=False))
     messages = _translate_input_to_messages(
         [
             {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
             {"type": "message", "role": "assistant", "content": "old reply"},
             tail,
-        ]
+        ],
+        preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
     )
-    executor = AcpExecutor(AcpAgentConfig(command="unused", omnigent_mcp=False))
     executor._proc = Mock(returncode=None)
     executor._initialized = True
     executor._session_id = "acp-session"
