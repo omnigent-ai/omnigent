@@ -5,7 +5,11 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import Mock
 
-from omnigent.inner._subprocess_lifecycle import terminate_direct_subprocess, terminate_subprocess
+from omnigent.inner._subprocess_lifecycle import (
+    subprocess_exited,
+    terminate_direct_subprocess,
+    terminate_subprocess,
+)
 
 
 class _NeverReapedProcess:
@@ -15,6 +19,29 @@ class _NeverReapedProcess:
     async def wait(self) -> int:
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
+
+
+async def test_exit_check_does_not_wait_after_exit() -> None:
+    proc = Mock(returncode=1)
+    assert await subprocess_exited(proc)
+    proc.wait.assert_not_called()
+
+
+async def test_exit_check_allows_delayed_child_notification() -> None:
+    proc = Mock(returncode=None)
+
+    async def notify_exit():
+        await asyncio.sleep(0)
+        proc.returncode = 1
+        return 1
+
+    proc.wait = notify_exit
+    assert await subprocess_exited(proc)
+
+
+async def test_exit_check_does_not_hang_on_a_live_child() -> None:
+    proc = _NeverReapedProcess()
+    assert not await asyncio.wait_for(subprocess_exited(proc, timeout=0.01), timeout=1)
 
 
 async def test_final_wait_after_kill_is_bounded() -> None:
