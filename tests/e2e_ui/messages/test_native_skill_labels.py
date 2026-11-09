@@ -16,6 +16,7 @@ from tests._helpers.host import isolated_host
 from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e_ui.conftest import reset_mock_llm, set_fallback_mock_llm
 from tests.e2e_ui.messages.test_message_render_parity import _ensure_chat_view
+from tests.helpers.ui_configuration import validate_native_claude_mock_routing
 
 _SKILL = "build-summary"
 _SKILL_MARKER = "native-skill-label-probe"
@@ -35,6 +36,8 @@ def test_native_skill_labels(
 ) -> None:
     if shutil.which(harness) is None:
         pytest.skip(f"{harness} CLI required")
+    if harness == "claude":
+        validate_native_claude_mock_routing(mock_llm_server_url)
     protocol = "anthropic" if harness == "claude" else "openai"
     model = "claude-sonnet-4-20250514" if harness == "claude" else "gpt-4o"
     provider = {
