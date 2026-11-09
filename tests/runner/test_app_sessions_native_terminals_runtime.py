@@ -5021,6 +5021,11 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
 
     # A bare subscription default shape, with the real store-backed catalog
     # serving the seeded rows; the re-probe is stubbed off the real CLI.
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: sys.executable)
+    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: sys.executable)
     monkeypatch.setattr(
         codex_app_mod,
         "resolve_native_codex_launch",

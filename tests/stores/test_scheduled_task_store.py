@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.server.scheduled.schedule import next_scheduled_time
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
@@ -1427,6 +1428,9 @@ def test_dispatch_rejects_edited_snapshot(store: SqlAlchemyScheduledTaskStore, e
         )
         is None
     )
+    assert not store.skip_scheduled_occurrence(
+        task, now=task.next_run_at, next_run_at=task.next_run_at + 3600
+    )
     assert store.get(task.id) == updated
     assert store.list_runs(task.id)[0] == []
 
@@ -1503,12 +1507,84 @@ def test_dispatch_mutations_require_workspace_scope(store: SqlAlchemyScheduledTa
         )
         is None
     )
+    assert not store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 3600)
     with workspace_scope(task.workspace_id):
         run = store.claim_scheduled_run(
             task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
         )
     assert store.renew_starting_run(run.id, now=lambda: now + 30, lease_seconds=120) is None
     assert store.transition_starting_run(run, now=lambda: now + 30, status="failed") is None
+
+
+def test_skipping_an_occurrence_advances_the_schedule_without_a_run(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from dataclasses import replace
+
+    task = _due_task(store)
+    now = task.next_run_at
+    with pytest.raises(ValueError, match="later than now"):
+        store.skip_scheduled_occurrence(task, now=now, next_run_at=now)
+    # Nothing to skip before the occurrence is due, or once the task isn't active.
+    assert store.skip_scheduled_occurrence(task, now=now - 1, next_run_at=now + 3600) is False
+    paused = replace(task, state="paused")
+    assert store.skip_scheduled_occurrence(paused, now=now, next_run_at=now + 3600) is False
+    assert store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 3600) is True
+    assert store.get(task.id).next_run_at == now + 3600
+    assert store.list_runs(task.id)[0] == []
+    # The listed snapshot is now stale, so neither a second skip nor a claim of it acts.
+    assert store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 7200) is False
+    claimed = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 7200, host_id=task.host_id, lease_seconds=120
+    )
+    assert claimed is None
+    assert store.get(task.id).next_run_at == now + 3600
+    assert store.list_runs(task.id)[0] == []
+
+
+@pytest.mark.parametrize(
+    ("now", "poll_in"),
+    [
+        (1_800_000_000 + 30 * 60, 120),
+        # The hourly schedule's next occurrence is sooner than two minutes out, so it wins.
+        (1_800_000_000 + 3600 - 30, 30),
+    ],
+    ids=["half-past", "just-before-the-hour"],
+)
+def test_an_edit_that_changes_trigger_status_moves_the_next_poll(
+    store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+    now: int,
+    poll_in: int,
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: now)
+    trigger_prompt = "This automation watches Slack and starts one Omnigent session per message."
+    store.configure_dispatch(True)
+    store.configure_trigger_polling(120)
+    task = store.create(
+        _uid("trigger"),
+        "trigger",
+        trigger_prompt,
+        "FREQ=HOURLY",
+        None,
+        _uid("agent"),
+        "UTC",
+        host_id=_uid("host"),
+        session_mode="continue",
+    )
+    assert task.next_run_at == now + poll_in
+    # Without its opening sentence, the task follows its hourly schedule again.
+    plain = store.update(task.id, prompt="Check the channel.")
+    assert plain.next_run_at == next_scheduled_time(plain, now)
+    trigger = store.update(task.id, prompt=trigger_prompt)
+    assert trigger.next_run_at == now + poll_in
+    # Starting a new session each run also makes it an ordinary automation.
+    plain = store.update(task.id, session_mode="new")
+    assert plain.next_run_at == next_scheduled_time(plain, now)
+    trigger = store.update(task.id, session_mode="continue")
+    assert trigger.next_run_at == now + poll_in
 
 
 def test_startup_lease_renewal_expiry_and_conditional_reconciliation(

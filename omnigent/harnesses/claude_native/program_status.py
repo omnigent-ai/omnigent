@@ -18,8 +18,8 @@ from omnigent.terminals.program_status import (
 _logger = logging.getLogger(__name__)
 
 # How long an error report may stand before its turn is failed without the
-# StopFailure hook. The hook normally follows within about a second.
-ERROR_HOOK_GRACE_S = 5.0
+# StopFailure hook. Process startup and forwarding can delay its detailed error.
+ERROR_HOOK_GRACE_S = 10.0
 
 
 def _reports_failed_turn(report: ProgramStatus) -> bool:
