@@ -263,12 +263,8 @@ def run_copy_dropped_label_keys(
 ) -> frozenset[str]:
     """Labels of the automation's copy that a run leaves off.
 
-    The fork source marks an unbound fork that needs a directory picker, and a
-    run binds its own placement. The permission label belongs to the copy; a
-    run takes the task's permission mode instead. (The store never copies the
-    Codex bypass label.) The Chat/Terminal presentation is re-stamped for the
-    run's agent, and MCP service picks belong to the copy's agent, so a run on
-    another agent leaves them off, as an agent-switching fork does.
+    Drops placement, permission and presentation labels, plus MCP picks on an
+    agent switch.
 
     :param source_labels: The copy's labels.
     :param agent_changed: Whether the run binds a different agent than the copy.
