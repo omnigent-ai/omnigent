@@ -162,6 +162,8 @@ def test_landing_and_live_cards_share_the_geometry_contract(
     for surface in ("landing", "live"):
         _surface(page, chat, surface, viewport)
         card_locator = page.locator("[data-composer-card]")
+        if viewport["width"] < 768:
+            expect(card_locator).to_have_attribute("data-mobile-composer", "collapsed")
         card = box(card_locator)
         container = box(card_locator.locator(".."))
         assert_symmetric_insets(card, container)
@@ -170,7 +172,7 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         assert_within_viewport(box(_submit(page, surface)), viewport["width"])
         assert document_width(page) <= viewport["width"]
         submit = box(_submit(page, surface))
-        if touch:
+        if touch or viewport["width"] < 768:
             assert submit["width"] >= 44 and submit["height"] >= 44
         else:
             assert submit["height"] < 44
@@ -280,12 +282,12 @@ def test_label_collapse_preserves_submit_geometry(
     _surface(page, chat, surface, DESKTOP)
     card_locator = page.locator("[data-composer-card]")
     expanded_inset = right_inset(box(card_locator), box(_submit(page, surface)))
-    # Exercise the narrowest common phone width after the mobile composer
-    # adopted 24px outer gutters.
+    assert expanded_inset == pytest.approx(13, abs=TOLERANCE)
+    # Mobile keeps an 8px action inset inside its 16px screen gutters.
     page.set_viewport_size({"width": 320, "height": PHONE["height"]})
     expect(_action_row(page, surface)).to_have_attribute("data-labels", "collapsed")
     collapsed_inset = right_inset(box(card_locator), box(_submit(page, surface)))
-    assert collapsed_inset == pytest.approx(expanded_inset, abs=TOLERANCE)
+    assert collapsed_inset == pytest.approx(8, abs=TOLERANCE)
     leading = (
         page.get_by_test_id("new-chat-landing-attach")
         if surface == "landing"
@@ -1108,7 +1110,8 @@ def test_composer_growth_reflows_without_covering_output(
     baseline = settled_geometry(page)
 
     def assert_clearance(state: dict, label: str) -> None:
-        assert abs(state["overlap"]) <= TOLERANCE, (label, state)
+        expected_overlap = state["overlayHeight"] if state["mobileOverlay"] else 0
+        assert state["overlap"] == pytest.approx(expected_overlap, abs=TOLERANCE), (label, state)
         assert state["lastMessageBottom"] <= state["composerTop"] + TOLERANCE, (label, state)
         assert state["formMarginTop"] == 0, (label, state)
         assert state["distanceFromBottom"] <= TOLERANCE, (label, state)
@@ -1203,7 +1206,7 @@ def test_composer_growth_reflows_without_covering_output(
         composer.press("Shift+Enter")
         touch_grown = settled_geometry(page)
         assert_reader_anchor(touch_settled, touch_grown, "native touch composer growth")
-        assert abs(touch_grown["overlap"]) <= TOLERANCE
+        assert touch_grown["overlap"] == pytest.approx(touch_grown["overlayHeight"], abs=TOLERANCE)
 
     page.set_viewport_size({"width": 1280, "height": 720})
     # Rows measured under touch keep their larger message-font heights after
@@ -1384,6 +1387,7 @@ def test_fully_visible_transcript_paints_no_scrollbar(
     page.wait_for_timeout(1200)
     state = _fully_visible_state(page)
     assert state["first"] >= state["top"] and state["last"] <= state["bottom"] - 32
+    assert state["max"] <= TOLERANCE, state
     assert not state["thumb"], state
 
 

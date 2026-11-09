@@ -29,6 +29,9 @@ from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
+    is_session_owner as _is_session_owner,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
 from omnigent.server.routes._errors import (
@@ -45,6 +48,8 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
+    SideChatList,
+    SideChatSummary,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -309,4 +314,71 @@ def register_items_routes(
             first_id=data[0].id if data else None,
             last_id=data[-1].id if data else None,
             has_more=start + limit < len(ordered),
+        )
+
+    # ── GET /sessions/{session_id}/side_chats ────────────────────
+
+    @router.get(
+        "/sessions/{session_id}/side_chats",
+        response_model=None,
+        responses={200: {"model": SideChatList}},
+    )
+    async def list_side_chats(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=20, ge=1, le=20),
+        after: str | None = Query(default=None),
+    ) -> PaginatedList:
+        """
+        List the side chats available in a session's Workspace rail.
+
+        Only the owner of the session's root starts side chats there, so only
+        that owner gets any, in id order; anyone else, admins included, gets an
+        empty page. Opening and closing tabs is local to each device.
+
+        :param request: Inbound HTTP request; carries the caller identity.
+        :param session_id: Parent session id, e.g. ``"conv_abc123"``.
+        :param limit: Maximum side chats to return (1-20, default 20).
+        :param after: Cursor: the previous page's ``last_id``.
+        :returns: A :class:`PaginatedList` of :class:`SideChatSummary`.
+        :raises OmnigentError: 403 if the caller lacks READ on
+            ``session_id``; 404 if no session exists there.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        parent = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if parent is None:
+            raise _session_not_found()
+        # Only the owner of the parent's root starts its side chats, so they are all theirs.
+        if not await asyncio.to_thread(
+            _is_session_owner,
+            user_id,
+            parent,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ):
+            return PaginatedList(data=[], has_more=False)
+        ids = await asyncio.to_thread(
+            conversation_store.list_side_chat_ids, parent.id, after=after, limit=limit + 1
+        )
+        has_more = len(ids) > limit
+        ids = ids[:limit]
+        rows = await asyncio.to_thread(conversation_store.get_conversations, ids)
+        return PaginatedList(
+            data=[
+                SideChatSummary(
+                    id=side_id,
+                    created_at=rows[side_id].created_at,
+                    title=rows[side_id].title,
+                )
+                for side_id in ids
+                if side_id in rows
+            ],
+            first_id=ids[0] if ids else None,
+            last_id=ids[-1] if ids else None,
+            has_more=has_more,
         )

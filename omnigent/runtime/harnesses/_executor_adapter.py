@@ -247,6 +247,7 @@ class ExecutorAdapter(HarnessApp):
             request.input,
             include_tool_history=executor.replays_tool_history(),
             preserve_content_blocks=executor.preserves_message_content_blocks(),
+            preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
         )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
@@ -1571,6 +1572,7 @@ def _translate_input_to_messages(
     *,
     include_tool_history: bool = False,
     preserve_content_blocks: bool = False,
+    preserve_empty_initiating_message: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
@@ -1585,6 +1587,7 @@ def _translate_input_to_messages(
         input_value,
         include_tool_history=include_tool_history,
         preserve_content_blocks=preserve_content_blocks,
+        preserve_empty_initiating_message=preserve_empty_initiating_message,
     )
     if history_messages:
         return history_messages
@@ -1600,6 +1603,7 @@ def _extract_role_keyed_messages(
     *,
     include_tool_history: bool,
     preserve_content_blocks: bool,
+    preserve_empty_initiating_message: bool,
 ) -> list[Message]:
     """Extract role-keyed messages from an Omnigent input list.
 
@@ -1634,9 +1638,16 @@ def _extract_role_keyed_messages(
         content = _normalize_message_content(
             item.get("content"), preserve_content_blocks=preserve_content_blocks
         )
-        if not content:
+        is_initiating_user = role == "user" and item is input_value[-1]
+        # Opted-in executors need the empty item's identity and position.
+        if not content and not (is_initiating_user and preserve_empty_initiating_message):
             continue
-        messages.append({"role": role, "content": content})
+        message: Message = {"role": role, "content": content}
+        # Only the final input item can identify this turn. Filtered tool history
+        # must not make an older user message look like the initiating item.
+        if is_initiating_user:
+            message["input_item_id"] = item.get("id")
+        messages.append(message)
     return messages
 
 

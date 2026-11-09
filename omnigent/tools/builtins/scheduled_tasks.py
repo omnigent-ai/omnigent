@@ -103,7 +103,7 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Optional permission mode for native coding agents that "
                                 "support one. Use the selected harness's vocabulary: "
                                 "Claude Code (e.g. 'acceptEdits'), Codex ('default', "
-                                "'read-only', 'full-access', 'bypass'), "
+                                "'ask-for-approval', 'approve-for-me', 'read-only'), "
                                 "Cursor (e.g. 'auto-review'), "
                                 "Antigravity ('default', 'skip'), or Devin (e.g. 'smart'). "
                                 "Runs are unattended, so a prompting mode ('default'/'plan') "

@@ -21,6 +21,13 @@ from omnigent.terminals.program_status import ProgramStatusReader
 # The production grace period, from ERROR_HOOK_GRACE_S.
 _GRACE_S = 5.0
 _ERROR_REPORT = {"state": "error", "app": "claude-code", "message": "API Error: 499"}
+# What Claude reports after a turn fails authentication, until the user signs in.
+_AUTH_BLOCKED_REPORT = {
+    "state": "blocked",
+    "app": "claude-code",
+    "kind": "auth",
+    "message": "Invalid API key · Please run /login",
+}
 
 
 class _FakeClock:
@@ -66,10 +73,13 @@ def _poller(
     )
 
 
-def test_error_report_without_a_hook_edge_fails_the_turn_once(tmp_path: Path) -> None:
+@pytest.mark.parametrize("report", [_ERROR_REPORT, _AUTH_BLOCKED_REPORT])
+def test_error_report_without_a_hook_edge_fails_the_turn_once(
+    tmp_path: Path, report: dict[str, object]
+) -> None:
     """A turn the runner still counts in flight fails once when its hook never lands."""
     path = tmp_path / "program-status.json"
-    _write_report(path, _ERROR_REPORT)
+    _write_report(path, report)
     clock = _FakeClock()
     published: list[str] = []
     poller = _poller(tmp_path, path, published, turn_is_active=lambda: True, clock=clock)
@@ -103,6 +113,99 @@ def test_error_fallback_preserves_available_detail(tmp_path: Path, message: str 
     poller.tick()
     assert failures == ([message] if message and message.strip() else [])
     assert published == ([] if failures else ["failed"])
+
+
+def test_auth_block_is_a_failed_turn_while_a_prompt_block_is_work(tmp_path: Path) -> None:
+    """Only a dialog block keeps the turn running; an auth block, even resynced, publishes none."""
+    path = tmp_path / "program-status.json"
+    reasons: list[tuple[str, str | None]] = []
+
+    def on_status(status: str, reason: str | None) -> None:
+        reasons.append((status, reason))
+
+    poller = ClaudeProgramStatusPoller(
+        ProgramStatusReader(path),
+        SessionStatusPoller(
+            on_status=on_status,
+            pane_pid_getter=lambda: None,
+            session_id_getter=lambda: None,
+            config_dir=tmp_path,
+        ),
+        on_status,
+    )
+    _write_report(path, {"state": "blocked", "app": "claude-code", "kind": "permission"})
+    poller.tick()
+    _write_report(path, _AUTH_BLOCKED_REPORT)
+    poller.tick()
+    poller.resync()
+    poller.tick()
+    assert reasons == [("running", "permission prompt")]
+    _write_report(path, {"state": "idle", "app": "claude-code"})
+    poller.tick()
+    assert reasons == [("running", "permission prompt"), ("idle", None)]
+
+
+def test_osc_owns_status_while_the_file_reports_background_shells(tmp_path: Path) -> None:
+    """OSC says ``done`` once a turn ends with a shell still running; only the file says so."""
+    path = tmp_path / "program-status.json"
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    status_file = sessions / "4242.json"
+    statuses: list[str] = []
+    background: list[bool] = []
+    # Each replay with the observation version current when it was issued.
+    replays: list[tuple[str, int]] = []
+
+    def on_status(status: str, _reason: str | None) -> None:
+        statuses.append(status)
+
+    def write_file(status: str) -> None:
+        previous = status_file.stat().st_mtime if status_file.exists() else None
+        status_file.write_text(
+            json.dumps({"pid": 4242, "sessionId": "s", "kind": "interactive", "status": status})
+        )
+        if previous is not None:
+            # Consecutive writes must stay observable on coarse-mtime filesystems.
+            mtime = max(status_file.stat().st_mtime, previous + 1)
+            os.utime(status_file, (mtime, mtime))
+
+    poller = ClaudeProgramStatusPoller(
+        ProgramStatusReader(path),
+        SessionStatusPoller(
+            on_status=on_status,
+            pane_pid_getter=lambda: 4242,
+            session_id_getter=lambda: "s",
+            config_dir=tmp_path,
+            on_background=background.append,
+        ),
+        on_status,
+        on_replay=lambda status, _reason: replays.append((status, poller.observation_version)),
+    )
+    _write_report(path, {"state": "working", "app": "claude-code"})
+    write_file("busy")
+    poller.tick()
+    _write_report(path, {"state": "done", "app": "claude-code"})
+    write_file("shell")
+    poller.tick()
+    assert statuses == ["running", "idle"]
+    assert background == [True]
+
+    # The shell's completion starts a follow-up turn; the file's busy and idle
+    # publish no status edge of their own while OSC is live.
+    write_file("busy")
+    poller.tick()
+    write_file("idle")
+    poller.tick()
+    assert statuses == ["running", "idle"]
+    assert background == [True, False]
+
+    # A resync replays OSC's status. The file vanishing in the same tick is not a
+    # status observation, so it cannot make that replay look stale.
+    poller.resync()
+    status_file.unlink()
+    poller.tick()
+    assert replays == [("idle", poller.observation_version)]
+    assert background == [True, False, False]
 
 
 def test_forwarded_hook_edge_cancels_the_grace_period(tmp_path: Path) -> None:

@@ -79,7 +79,10 @@ from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
-from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.native.permission_modes import (
+    PERMISSION_LAUNCH_ARGS,
+    UNATTENDED_DISALLOWED_PERMISSION_MODES,
+)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
@@ -94,6 +97,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_agent,
     validate_session_model_metadata,
 )
+from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
 from omnigent.server.routes._sessions.helpers import _announce_session_added
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentity,
@@ -101,7 +105,10 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     StartupLease,
 )
 from omnigent.server.scheduled.harness_settings import (
+    UNATTENDED_PERMISSION_MODE_MESSAGE,
+    scheduled_agent_default_permission_mode,
     scheduled_agent_harness,
+    unattended_permission_mode_allowed,
     validate_scheduled_permission_mode,
 )
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
@@ -121,6 +128,7 @@ from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+    ConversationNotFoundError,
 )
 
 if TYPE_CHECKING:
@@ -180,6 +188,7 @@ _STAGED_LAUNCH_ERRORS = _LaunchErrorCodes("sandbox_create_failed", "runner_start
 SANDBOX_REGISTRATION_TIMEOUT_S = 12 * 60
 # How long an abandoned launch gets to stop before its sandbox is torn down.
 _ABANDONED_LAUNCH_SETTLE_S = 30.0
+_REGISTRATION_HINT_TIMEOUT_S = 1.0
 
 # ``launch_start(conv, task, host_id, error_codes)`` — start provisioning a sandbox
 # in the background once the managed fire's prompt is saved. ``host_id`` is the
@@ -354,11 +363,23 @@ class _NewRunRecorder:
                 await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
 
 
+def _scheduled_session_title(task: ScheduledTask) -> str:
+    if task.session_mode == "continue" and task.prompt.startswith(
+        tuple(
+            f"This automation watches {source} and starts one Omnigent session"
+            for source in ("Jira", "Slack", "GitHub", "Linear")
+        )
+    ):
+        return f"[automation job] {task.name}"
+    return task.name
+
+
 # Follows the prompt in every message a fire sends. No one watches a run, so a
 # question or a permission request stalls it instead of reaching a person. Only
 # the sent message carries it: the task keeps the prompt its owner wrote, so the
 # automation pages never show it.
 UNATTENDED_RUN_NOTE = (
+    "<omnigent-automation-context>\n"
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
     "No one can answer questions, approve requests or give input, so work toward the "
     "goal above on your own. Don't ask questions, wait for confirmation or stop to "
@@ -372,7 +393,8 @@ UNATTENDED_RUN_NOTE = (
     "independent work and permitted alternatives. Do not change permission settings to "
     "get past the restriction. Lead your final reply with unresolved decisions and assumptions, "
     "prioritizing those the user is most likely to want to change, then summarize what "
-    "you did and anything you couldn't do."
+    "you did and anything you couldn't do.\n"
+    "</omnigent-automation-context>"
 )
 
 
@@ -601,6 +623,8 @@ async def _run_fire_for_task(
         return
 
     if task.continues_session:
+        task = await _release_deleted_session(deps, task)
+    if task.continues_session:
         await _continue_session(
             deps, task, fire_dispatch.reuse or _make_reuse_dispatch(deps), recorder
         )
@@ -701,12 +725,13 @@ async def _run_fire_for_task(
         await _keep_first_session(
             deps, stored, conv.id, host_id=None if managed else effective.host_id
         )
-    except _SessionTaken:
+    except _SessionTaken as exc:
         await _discard_session(deps, conv)
-        await recorder.finish(
-            "skipped",
-            error="another run already started the session this automation continues",
-            error_code="continued_session_busy",
+        await _continue_session(
+            deps,
+            replace(stored, session_id=exc.session_id),
+            fire_dispatch.reuse or _make_reuse_dispatch(deps),
+            recorder,
         )
         return
     except _SessionNotRecorded as exc:
@@ -785,6 +810,34 @@ async def _disable_for_deleted_owner(
     )
 
 
+async def _release_deleted_session(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
+    """Drop a continued session that was deleted, so this run starts a new one.
+
+    Only a session that no longer exists is replaced: one the owner archived or
+    that no longer fits the task still fails the run, so a change they made is
+    never undone silently. The new session is recorded like a first run's, and a
+    managed sandbox is provisioned again when the deleted session's workspace is
+    gone (see :func:`_continued_host_binding`).
+    """
+    session_id = task.session_id
+    assert session_id is not None  # guarded by the caller
+    start_fire_stage("session_validation", session_id=session_id)
+    conv = await asyncio.to_thread(deps.conversation_store.get_conversation, session_id)
+    if conv is not None:
+        return task
+    _logger.info(
+        "scheduled fire: task %s continues deleted session %s; starting a new one",
+        task.id,
+        session_id,
+    )
+    await asyncio.to_thread(deps.scheduled_task_store.release_session, task.id, session_id)
+    # Another run may have recorded its replacement first; continue that one.
+    stored = await asyncio.to_thread(deps.scheduled_task_store.get, task.id)
+    if stored is None or stored.state == "deleted":
+        return task
+    return replace(task, session_id=stored.session_id)
+
+
 async def _continue_session(
     deps: FireDeps,
     task: ScheduledTask,
@@ -796,7 +849,8 @@ async def _continue_session(
     The prompt goes in the way a user's message would, also while the session is
     busy with an earlier turn, and the run succeeds once it is delivered. Never
     falls back to a new session: one that cannot take the prompt records a
-    failed run telling the owner how to start a new one.
+    failed run telling the owner how to start a new one. (A session that was
+    deleted is dropped earlier, by :func:`_release_deleted_session`.)
     """
     session_id = task.session_id
     assert session_id is not None  # guarded by the caller
@@ -813,6 +867,14 @@ async def _continue_session(
         )
         return
     assert conv is not None
+    agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+    unsafe = await _unattended_permission_problem(deps, task, agent, task_mode=False)
+    if unsafe is not None:
+        reason, error_code = unsafe
+        await recorder.finish(
+            "failed", conversation_id=session_id, error=reason, error_code=error_code
+        )
+        return
 
     await recorder.check()
     start_fire_stage("budget_validation", session_id=session_id)
@@ -869,6 +931,69 @@ async def _continue_session(
 
 _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"
 
+UNATTENDED_PERMISSION_ERROR_CODE = "permission_mode_not_allowed"
+
+# Launch flags that start a native CLI without an approval gate, for sessions
+# whose live mode has no label.
+_UNATTENDED_DISALLOWED_LAUNCH_ARGS: tuple[tuple[str, ...], ...] = (
+    *(
+        tuple(args)
+        for modes in PERMISSION_LAUNCH_ARGS.values()
+        for mode, args in modes.items()
+        if mode in UNATTENDED_DISALLOWED_PERMISSION_MODES and args
+    ),
+    ("--dangerously-skip-permissions",),
+    # Codex's full bypass, which spec-derived launch args emit for ``yolo``, and
+    # any launch that turns off its approval prompts.
+    ("--dangerously-bypass-approvals-and-sandbox",),
+    ("--ask-for-approval", "never"),
+)
+
+
+def _contains_args(args: list[str], needle: tuple[str, ...]) -> bool:
+    width = len(needle)
+    return any(tuple(args[i : i + width]) == needle for i in range(len(args) - width + 1))
+
+
+def session_unattended_disallowed_mode(conv: Conversation) -> str | None:
+    """The disallowed permission mode *conv* is running in, or ``None``.
+
+    The Claude label tracks the live mode, including switches made inside the
+    CLI, so it wins over the launch flags it may have replaced.
+    """
+    claude_mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    if claude_mode:
+        return None if unattended_permission_mode_allowed(claude_mode) else claude_mode
+    if conv.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
+        return "bypass"
+    launch_args = list(getattr(conv, "terminal_launch_args", None) or [])
+    for needle in _UNATTENDED_DISALLOWED_LAUNCH_ARGS:
+        if _contains_args(launch_args, needle):
+            return " ".join(needle)
+    return None
+
+
+async def _unattended_permission_problem(
+    deps: FireDeps, task: ScheduledTask, agent: Any, *, task_mode: bool = True
+) -> tuple[str, str] | None:
+    """Why *task* may not run unattended with its saved mode or its agent's default.
+
+    ``task_mode=False`` checks only the agent default, for continued sessions,
+    which keep their own mode.
+    """
+    if task_mode and task.permission_mode is not None:
+        mode: str | None = task.permission_mode
+        source = "the automation's permission setting"
+    else:
+        mode = await scheduled_agent_default_permission_mode(agent, deps.agent_cache)
+        source = "the agent's default"
+    if unattended_permission_mode_allowed(mode):
+        return None
+    return (
+        f"{UNATTENDED_PERMISSION_MODE_MESSAGE.format(mode=mode)} ({source})",
+        UNATTENDED_PERMISSION_ERROR_CODE,
+    )
+
 
 async def continued_session_problem(
     task: ScheduledTask,
@@ -895,6 +1020,14 @@ async def continued_session_problem(
         return "the session is a sub-agent's session", "continued_session_incompatible"
     if conv.agent_id != task.agent_id:
         return "the session runs a different agent", "continued_session_incompatible"
+    session_mode = session_unattended_disallowed_mode(conv)
+    if session_mode is not None:
+        return (
+            f"the session is in permission mode {session_mode!r}, which automations cannot "
+            "use; switch the session to a mode that asks for approval or uses the auto "
+            "classifier",
+            UNATTENDED_PERMISSION_ERROR_CODE,
+        )
     # A pin the task changed since would otherwise be ignored silently: the
     # session keeps running where it was created.
     from omnigent.server.routes._host_worktree import (
@@ -976,6 +1109,10 @@ class _SessionNotRecorded(Exception):
 class _SessionTaken(Exception):
     """Another run already recorded the session a continue task's first firing created."""
 
+    def __init__(self, session_id: str) -> None:
+        super().__init__()
+        self.session_id = session_id
+
 
 async def _keep_first_session(
     deps: FireDeps, task: ScheduledTask, session_id: str, *, host_id: str | None
@@ -1016,7 +1153,15 @@ async def _keep_first_session(
             return True
         raise _SessionNotRecorded(certain=True) from None
     if outcome == "taken":
-        raise _SessionTaken
+        try:
+            stored = await asyncio.to_thread(deps.scheduled_task_store.get, task.id)
+        except Exception:
+            _logger.exception("scheduled fire: could not re-read task %s", task.id)
+            raise _SessionNotRecorded(certain=True) from None
+        if stored is None or stored.state == "deleted" or not stored.continues_session:
+            raise _SessionNotRecorded(certain=True)
+        assert stored.session_id is not None
+        raise _SessionTaken(stored.session_id)
     if outcome == "stale":
         _logger.info(
             "scheduled fire: task %s changed during its first run; not keeping its session",
@@ -1496,7 +1641,7 @@ async def _create_session_resources(
         conv = await asyncio.to_thread(
             deps.conversation_store.create_conversation,
             agent_id=task.agent_id,
-            title=task.name,
+            title=_scheduled_session_title(task),
             host_id=task.host_id,
             workspace=workspace,
             git_branch=worktree.branch if worktree else None,
@@ -1764,6 +1909,10 @@ async def _validate_fire_session_inputs(
             model_override=task.model_override,
             reasoning_effort=task.reasoning_effort,
         )
+        # Tasks saved before modes were restricted still hold them.
+        unsafe = await _unattended_permission_problem(deps, task, agent)
+        if unsafe is not None:
+            return unsafe
         validate_scheduled_permission_mode(task.permission_mode)
         # An unresolvable or incompatible mode fails session creation.
         if validate_workspace:
@@ -2302,21 +2451,39 @@ class _ClaimedRunRecorder:
                 self._deps, conv.id, error, _STAGED_LAUNCH_ERRORS.after_binding
             )
 
-    async def _fail_saved_prompt(self, conversation_id: str, reason: str) -> None:
+    async def _fail_saved_prompt(
+        self, conversation_id: str, reason: str | Callable[[], Awaitable[str]]
+    ) -> str:
         if self._deps.startup_inputs is not None:
-            await self._deps.startup_inputs.record_launch_failure(conversation_id, reason)
+            return await self._deps.startup_inputs.record_launch_failure(conversation_id, reason)
+        return await reason() if callable(reason) else reason
 
     async def _abandon_unregistered_sandbox(
         self, conversation_id: str, launch_task: asyncio.Task[None]
     ) -> None:
         """Fail a sandbox that never registered: its prompt, its launch, then the sandbox."""
         reason = f"the sandbox did not register within {self._registration_timeout_s:g} seconds"
-        # Fail the prompt first, so a host that binds during cleanup delivers nothing,
-        # and the cancelled launch finds no pending prompt to fail with its own reason.
-        await self._fail_saved_prompt(conversation_id, reason)
+        # Use the active provider's recovery guidance before cancellation releases it.
+        tracker = self._deps.managed_launches
+        launch = tracker.get(conversation_id) if tracker is not None else None
+        hint_callback = launch.host_online_failure_hint if launch is not None else None
+
+        async def failure_reason() -> str:
+            if hint_callback is not None:
+                try:
+                    async with asyncio.timeout(_REGISTRATION_HINT_TIMEOUT_S):
+                        hint = await asyncio.to_thread(hint_callback)
+                    if hint:
+                        return f"{reason} — {hint}"
+                except Exception:
+                    _logger.warning("Could not build the sandbox registration hint", exc_info=True)
+            return reason
+
+        # Fence queued inputs before diagnostics yield; late registration cannot deliver them.
+        reason = await self._fail_saved_prompt(conversation_id, failure_reason)
         launch_task.cancel()
         await asyncio.wait({launch_task}, timeout=_ABANDONED_LAUNCH_SETTLE_S)
-        await _terminate_run_sandbox(self._deps, self._lease.run.host_id)
+        await _terminate_run_sandbox(self._deps, self._lease.run.host_id, conversation_id)
         await self.finish(
             "failed",
             conversation_id=conversation_id,
@@ -2607,10 +2774,12 @@ class ClaimedRunExecutor:
         # provider's lifetime cap.
         if run.host_id == continued_sandbox_host_id(run.scheduled_task_id, run.workspace_id):
             return
-        await _terminate_run_sandbox(self._deps, run.host_id)
+        await _terminate_run_sandbox(self._deps, run.host_id, run.conversation_id)
 
 
-async def _terminate_run_sandbox(deps: FireDeps, host_id: str | None) -> None:
+async def _terminate_run_sandbox(
+    deps: FireDeps, host_id: str | None, conversation_id: str | None
+) -> None:
     """Tear down the sandbox registered under a run's host ID, if one exists."""
     from omnigent.server.managed_hosts import terminate_managed_host
 
@@ -2620,4 +2789,13 @@ async def _terminate_run_sandbox(deps: FireDeps, host_id: str | None) -> None:
     # Only a server-managed sandbox is torn down, never a user's own host.
     if host is None or host.sandbox_provider is None:
         return
-    await terminate_managed_host(host, deps.host_store, deps.sandbox_config)
+    if conversation_id is not None:
+        with contextlib.suppress(ConversationNotFoundError):
+            await asyncio.to_thread(
+                deps.conversation_store.clear_host_binding,
+                conversation_id,
+                expected_host_id=host_id,
+                expected_sandbox_id=host.sandbox_id,
+                clear_profile=True,
+            )
+    await terminate_managed_host(host, deps.host_store, deps.sandbox_config, keep_if_bound=True)

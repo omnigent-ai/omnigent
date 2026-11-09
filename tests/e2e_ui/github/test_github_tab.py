@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
+from tests._helpers.pull_request_ui import open_session_pull_requests
 from tests.e2e_ui.conftest import (
     fetch_with_retry,
     open_right_rail,
@@ -188,7 +189,7 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     page.goto(f"{base_url}/{'canvas/' if entry == 'canvas' else ''}c/{session_id}")
     rail = page.get_by_role("complementary", name="Workspace")
     if entry == "canvas":
-        page.get_by_test_id("composer-pr-link").click()
+        open_session_pull_requests(page, mobile=False)
     else:
         open_right_rail(page)
         rail.get_by_role("tab", name="Pull Requests").click()
@@ -273,7 +274,7 @@ def test_pr_diff_retry_keeps_associations(
         open_right_rail(page)
         panel.get_by_role("tab", name="Pull Requests").click()
     else:
-        page.get_by_test_id("composer-pr-link").click()
+        open_session_pull_requests(page, mobile=mobile)
     panel.get_by_role(
         "button", name=f"example.com/acme/app #{_PR_NUMBER} — Add the GitHub tab", exact=True
     ).click()
@@ -348,63 +349,74 @@ def test_composer_pr_link_opens_github_tab(
     page.set_viewport_size({"width": viewport_width, "height": 844 if is_mobile else 900})
     page.goto(f"{base_url}/c/{session_id}")
 
-    pr_link = page.get_by_test_id("composer-pr-link")
-    expect(pr_link).to_be_visible(timeout=30_000)
-    expect(pr_link).to_have_accessible_name(f"#{_PR_NUMBER}" if pr_count == 1 else "2 PRs")
-    expect(page.get_by_test_id("composer-workspace-dir")).to_have_text("demo-app")
-    expect(page.get_by_test_id("composer-git-branch")).to_have_text(branch)
-    context = page.get_by_test_id("composer-context-ring")
-    expect(context).to_have_accessible_name("66% of context used")
-    bar = page.get_by_test_id("composer-workspace-controls")
-    expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
-    expect(bar.get_by_test_id("subagent-task-pill")).to_have_count(0)
-    bar_bounds = bar.bounding_box()
-    assert bar_bounds is not None
-    # When the labels cannot all show in full, the bar collapses to icons (never
-    # ellipses); the collapse must be justified by the expanded layout not fitting.
-    collapsed = bar.get_attribute("data-labels") == "collapsed"
-    assert collapsed == workspace_bar_needs_collapse(bar), (viewport_width, font_size, pr_count)
-    font_sizes = {}
-    centers = {}
-    bounds = {}
-    for test_id in (
-        "composer-pr-link",
-        "composer-workspace-dir",
-        "composer-git-branch",
-        "composer-context-ring",
-    ):
-        indicator = page.get_by_test_id(test_id)
-        label = indicator.locator("span").last
-        parts = [("icon", indicator.locator("svg").first)]
-        # Only the directory and branch text collapse; the PR number and the
-        # context percentage stay visible in a crowded bar.
-        if collapsed and test_id in ("composer-workspace-dir", "composer-git-branch"):
-            expect(label).to_be_hidden()
-        elif test_id != "composer-context-ring":
-            expect(label).to_be_visible()
-            font_sizes[test_id] = label.evaluate("el => parseFloat(getComputedStyle(el).fontSize)")
-            parts.insert(0, ("label", label))
-        for part, element in parts:
-            rect = element.bounding_box()
-            assert rect is not None
-            bounds[f"{test_id}.{part}"] = rect
-            centers[f"{test_id}.{part}"] = rect["y"] + rect["height"] / 2
-    pr_bounds, context_bounds = pr_link.bounding_box(), context.bounding_box()
-    assert pr_bounds is not None and context_bounds is not None
-    group_gap = context_bounds["x"] - pr_bounds["x"] - pr_bounds["width"]
-    pair_gaps = {}
-    for test_id in ("composer-pr-link",):
-        icon, label = bounds[f"{test_id}.icon"], bounds[f"{test_id}.label"]
-        pair_gaps[test_id] = label["x"] - icon["x"] - icon["width"]
-    print(f"Composer fonts ({viewport_width}px, {font_size}px preference): {font_sizes}")
-    print(f"Composer centers: {centers}; group gap: {group_gap}; pair gaps: {pair_gaps}")
-    bar.screenshot(path=tmp_path / "workspace-bar.png", animations="disabled")
-    page.screenshot(path=tmp_path / "composer-pr-link.png", animations="disabled")
-
-    # Mobile has a full-screen drawer, not the desktop workspace tab strip.
     if is_mobile:
-        pr_link.tap()
+        expect(page.get_by_test_id("composer-workspace-controls")).to_have_count(0)
+        pr_link = page.get_by_role(
+            "button", name=re.compile(r"^(?:Conversation|Session) actions$")
+        )
+        pr_link.click()
+        expect(page.get_by_text("demo-app", exact=True)).to_be_visible()
+        page.get_by_role("menuitem", name="Pull Requests", exact=True).click()
     else:
+        pr_link = page.get_by_test_id("composer-pr-link")
+        expect(pr_link).to_be_visible(timeout=30_000)
+        expect(pr_link).to_have_accessible_name(f"#{_PR_NUMBER}" if pr_count == 1 else "2 PRs")
+        expect(page.get_by_test_id("composer-workspace-dir")).to_have_text("demo-app")
+        expect(page.get_by_test_id("composer-git-branch")).to_have_text(branch)
+        context = page.get_by_test_id("composer-context-ring")
+        expect(context).to_have_accessible_name("66% of context used")
+        bar = page.get_by_test_id("composer-workspace-controls")
+        expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
+        expect(bar.get_by_test_id("subagent-task-pill")).to_have_count(0)
+        bar_bounds = bar.bounding_box()
+        assert bar_bounds is not None
+        # When the labels cannot all show in full, the bar collapses to icons (never
+        # ellipses); the collapse must be justified by the expanded layout not fitting.
+        collapsed = bar.get_attribute("data-labels") == "collapsed"
+        assert collapsed == workspace_bar_needs_collapse(bar), (
+            viewport_width,
+            font_size,
+            pr_count,
+        )
+        font_sizes = {}
+        centers = {}
+        bounds = {}
+        for test_id in (
+            "composer-pr-link",
+            "composer-workspace-dir",
+            "composer-git-branch",
+            "composer-context-ring",
+        ):
+            indicator = page.get_by_test_id(test_id)
+            label = indicator.locator("span").last
+            parts = [("icon", indicator.locator("svg").first)]
+            # Only the directory and branch text collapse; the PR number and the
+            # context percentage stay visible in a crowded bar.
+            if collapsed and test_id in ("composer-workspace-dir", "composer-git-branch"):
+                expect(label).to_be_hidden()
+            elif test_id != "composer-context-ring":
+                expect(label).to_be_visible()
+                font_sizes[test_id] = label.evaluate(
+                    "el => parseFloat(getComputedStyle(el).fontSize)"
+                )
+                parts.insert(0, ("label", label))
+            for part, element in parts:
+                rect = element.bounding_box()
+                assert rect is not None
+                bounds[f"{test_id}.{part}"] = rect
+                centers[f"{test_id}.{part}"] = rect["y"] + rect["height"] / 2
+        pr_bounds, context_bounds = pr_link.bounding_box(), context.bounding_box()
+        assert pr_bounds is not None and context_bounds is not None
+        group_gap = context_bounds["x"] - pr_bounds["x"] - pr_bounds["width"]
+        pair_gaps = {}
+        for test_id in ("composer-pr-link",):
+            icon, label = bounds[f"{test_id}.icon"], bounds[f"{test_id}.label"]
+            pair_gaps[test_id] = label["x"] - icon["x"] - icon["width"]
+        print(f"Composer fonts ({viewport_width}px, {font_size}px preference): {font_sizes}")
+        print(f"Composer centers: {centers}; group gap: {group_gap}; pair gaps: {pair_gaps}")
+        bar.screenshot(path=tmp_path / "workspace-bar.png", animations="disabled")
+        page.screenshot(path=tmp_path / "composer-pr-link.png", animations="disabled")
+
         pr_link.click()
     panel = (
         page.get_by_test_id("github-panel-drawer")
@@ -445,6 +457,7 @@ def test_composer_pr_link_opens_github_tab(
         panel.get_by_role("button", name="Close", exact=True).click()
         expect(panel).to_have_attribute("data-state", "closed")
         expect(pr_link).to_be_in_viewport()
+        return
 
     expected_font_size = font_size - 1
     for test_id, actual_font_size in font_sizes.items():
@@ -641,7 +654,7 @@ def test_post_top_level_pr_comment(
         open_right_rail(page)
         panel.get_by_role("tab", name="Pull Requests").click()
     else:
-        page.get_by_test_id("composer-pr-link").click()
+        open_session_pull_requests(page, mobile=mobile)
     panel.get_by_role(
         "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
     ).click()
@@ -879,7 +892,7 @@ def test_reply_to_inline_review_conversation(
         open_right_rail(page)
         panel.get_by_role("tab", name="Pull Requests").click()
     else:
-        page.get_by_test_id("composer-pr-link").click()
+        open_session_pull_requests(page, mobile=mobile)
     panel.get_by_role(
         "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
     ).click()
@@ -1191,7 +1204,7 @@ def test_changes_find_reveals_collapsed_and_filtered(
         else page.get_by_role("complementary", name="Workspace")
     )
     if mobile:
-        page.get_by_test_id("composer-pr-link").click()
+        open_session_pull_requests(page, mobile=mobile)
     else:
         open_right_rail(page)
         panel.get_by_role("tab", name="Pull Requests").click()
@@ -1262,11 +1275,25 @@ def test_changes_find_reveals_collapsed_and_filtered(
     page.screenshot(path=str(tmp_path / f"find-{entry}-reopened.png"))
 
 
+# README.md's hunk, so its viewed mark has a patch to be checked against.
+_README_PATCH = (
+    "diff --git a/README.md b/README.md\n"
+    "new file mode 100644\n"
+    "index 0000000..4c2d3e1\n"
+    "--- /dev/null\n"
+    "+++ b/README.md\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+# Demo\n"
+    "+Adds the GitHub tab.\n"
+)
+
+
 @pytest.mark.parametrize("entry", ["rail", "composer-mobile"])
 def test_changes_viewed_progress_persists_and_resets(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
 ) -> None:
-    """Viewed marks collapse files, survive a reload, and reset when the PR gets a new head."""
+    """Viewed marks collapse files and survive a reload. A new head keeps the mark on an
+    unchanged file and flags a changed one as "Changed since viewed"."""
     base_url, session_id = seeded_session
     mobile = entry == "composer-mobile"
     page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
@@ -1274,6 +1301,11 @@ def test_changes_viewed_progress_persists_and_resets(
     pr_url = _INFO["pr"]["url"]
     # The PR's head moves mid-test, so every resource answers for the current head.
     head = {"sha": "head1"}
+    # head2 reworks main.py's hunk and leaves README.md's hunk as it was.
+    patches = {
+        "head1": _PR_DIFF["patch"] + _README_PATCH,
+        "head2": _PR_DIFF["patch"].replace("+added line", "+reworked line") + _README_PATCH,
+    }
 
     def info_at_head(route: Route) -> None:
         route.fulfill(
@@ -1301,12 +1333,19 @@ def test_changes_viewed_progress_persists_and_resets(
     )
     page.route(
         re.compile(r"/resources/github/diff(?:\?|$)"),
-        lambda r: r.fulfill(json={**_PR_DIFF, "head_sha": head["sha"], "base_sha": "base"}),
+        lambda r: r.fulfill(
+            json={
+                **_PR_DIFF,
+                "patch": patches[head["sha"]],
+                "head_sha": head["sha"],
+                "base_sha": "base",
+            }
+        ),
     )
 
     def open_changes() -> Locator:
         if mobile:
-            page.get_by_test_id("composer-pr-link").click()
+            open_session_pull_requests(page, mobile=mobile)
             panel = page.get_by_test_id("github-panel-drawer")
         else:
             open_right_rail(page)
@@ -1321,11 +1360,12 @@ def test_changes_viewed_progress_persists_and_resets(
     panel = open_changes()
     expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
     panel.get_by_role("checkbox", name="Viewed README.md").click()
+    panel.get_by_role("checkbox", name="Viewed src/app/main.py").click()
     expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
-    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+    expect(panel.get_by_text("2 / 2 files viewed", exact=True)).to_be_visible()
     if not mobile:  # Mobile shows the count without the bar.
         expect(panel.get_by_role("progressbar", name="Files viewed")).to_have_attribute(
-            "aria-valuenow", "50"
+            "aria-valuenow", "100"
         )
     # Marking collapses the file's diff.
     expect(
@@ -1337,22 +1377,26 @@ def test_changes_viewed_progress_persists_and_resets(
     page.reload()
     panel = open_changes()
     expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked(timeout=30_000)
-    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+    expect(panel.get_by_text("2 / 2 files viewed", exact=True)).to_be_visible()
 
-    # A new head starts with no marks and says so until the notice is dismissed.
+    # The new head changes main.py's hunk. README.md keeps its mark, and main.py loses its
+    # mark and is flagged until it is marked again.
     head["sha"] = "head2"
     page.reload()
     panel = open_changes()
-    expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
-    expect(panel.get_by_role("checkbox", name="Viewed README.md")).not_to_be_checked()
-    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_be_visible()
+    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
+    expect(panel.get_by_role("checkbox", name="Viewed src/app/main.py")).not_to_be_checked()
+    expect(panel.get_by_text("Changed since viewed", exact=True)).to_have_count(1)
+    expect(panel.get_by_text(re.compile("changed files lost their viewed marks"))).to_be_visible()
     page.screenshot(path=str(tmp_path / f"viewed-{entry}-reset.png"), animations="disabled")
     panel.get_by_role("button", name="Dismiss", exact=True).click()
-    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_have_count(0)
+    expect(panel.get_by_text(re.compile("changed files lost their viewed marks"))).to_have_count(0)
 
-    # Hiding viewed files, once every file is viewed, shows the all-viewed state.
-    panel.get_by_role("checkbox", name="Viewed README.md").click()
+    # Marking the changed file on the new head clears its badge. Then hiding viewed files,
+    # once every file is viewed, shows the all-viewed state.
     panel.get_by_role("checkbox", name="Viewed src/app/main.py").click()
+    expect(panel.get_by_text("Changed since viewed", exact=True)).to_have_count(0)
     panel.get_by_role("checkbox", name="Hide viewed").click()
     expect(panel.get_by_text("All 2 files viewed", exact=True)).to_be_visible()
     if not mobile:
@@ -1438,7 +1482,7 @@ def test_changes_filter_copy_open(page: Page, seeded_session: tuple[str, str], e
     page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
     page.goto(f"{base_url}/c/{session_id}")
     if is_mobile:
-        page.get_by_test_id("composer-pr-link").click()
+        open_session_pull_requests(page, mobile=True)
         panel = page.get_by_test_id("github-panel-drawer")
         expect(panel).to_have_attribute("data-state", "open")
     else:

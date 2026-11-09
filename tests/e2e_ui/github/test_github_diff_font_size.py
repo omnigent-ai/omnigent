@@ -67,8 +67,8 @@ def test_github_diff_text_tracks_interface_font_size(
     expect(rail.locator("diffs-container").get_by_text("added line")).to_be_visible(timeout=30_000)
 
     at_default: dict[str, Any] = page.evaluate(_MEASURE_JS)
-    print(f"GitHub diff typography (Interface 13): {json.dumps(at_default)}")
-    assert at_default["headerFontSize"] == 13
+    print(f"GitHub diff typography (Interface 14): {json.dumps(at_default)}")
+    assert at_default["headerFontSize"] == 14
     assert at_default["diffFontSize"] < at_default["headerFontSize"], (
         f"diff code renders at {at_default['diffFontSize']}px, not smaller than the panel "
         f"text beside it at {at_default['headerFontSize']}px"
