@@ -141,7 +141,7 @@ jobs:
           KTLINT_VERSION: "1.8.0"
           KTLINT_SHA256: "a3fd620207d5c40da6ca789b95e7f823c54e854b7fade7f613e91096a3706d75"
         run: |
-          curl -sSLf --retry 3 --retry-max-time 60 \
+          curl -sSLf \
             "https://github.com/ktlint/ktlint/releases/download/${KTLINT_VERSION}/ktlint" \
             -o /tmp/ktlint
           echo "${KTLINT_SHA256}  /tmp/ktlint" | sha256sum -c
