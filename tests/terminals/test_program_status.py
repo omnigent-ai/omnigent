@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import os
+import signal
 import subprocess
 import sys
 import time
+import tty
 from pathlib import Path
 
 import pytest
@@ -184,6 +187,81 @@ def test_relay_process_failure_cleanup(tmp_path: Path, failure: str) -> None:
             else:
                 assert process.returncode == (127 if failure == "missing" else 126), output
                 assert b"cannot exec" in output
+            assert not state_file.exists()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+@pytest.mark.parametrize("child_on_stop", ["ignores", "exits"])
+def test_stop_signal_releases_relay_blocked_on_unread_input(
+    tmp_path: Path, child_on_stop: str
+) -> None:
+    """A raw-mode child that stops reading input cannot keep the relay and its PTY alive."""
+    state_file = tmp_path / "status.json"
+    ready = tmp_path / "ready"
+    ignore = ""
+    if child_on_stop == "ignores":
+        ignore = "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    command = [
+        sys.executable,
+        "-c",
+        "import os,signal,time,tty; from pathlib import Path; "
+        f"{ignore}tty.setraw(0); "
+        f"ready = Path({str(ready)!r}); pending = ready.with_suffix('.tmp'); "
+        "pending.write_text(str(os.getpid())); pending.replace(ready); "
+        "time.sleep(30)",
+    ]
+    master, slave = os.openpty()
+    tty.setraw(slave)
+    os.set_blocking(master, False)
+    try:
+        with subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from omnigent.terminals.program_status import main; main()",
+                "--state-file",
+                str(state_file),
+                "--app",
+                "claude-code",
+                "--",
+                *command,
+            ],
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        ) as process:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                assert process.poll() is None
+                time.sleep(0.01)
+            assert ready.exists(), "child never became ready"
+            child = int(ready.read_text())
+            # Fill both PTYs until the relay stops draining its own input.
+            stalled_since = time.monotonic()
+            fill_deadline = stalled_since + 10
+            while time.monotonic() - stalled_since < 0.5:
+                assert time.monotonic() < fill_deadline, "relay kept accepting input"
+                try:
+                    os.write(master, b"x" * 4096)
+                    stalled_since = time.monotonic()
+                except BlockingIOError:
+                    time.sleep(0.05)
+            process.send_signal(signal.SIGTERM)
+            try:
+                output, _ = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(child, signal.SIGKILL)
+                pytest.fail("relay stayed blocked after SIGTERM")
+            assert b"Traceback" not in output, output
+            # The relay mirrors the reaped child's status: SIGKILL after the grace period.
+            expected = signal.SIGKILL if child_on_stop == "ignores" else signal.SIGTERM
+            assert process.returncode == -expected, output
+            with pytest.raises(ProcessLookupError):
+                os.kill(child, 0)
             assert not state_file.exists()
     finally:
         os.close(master)
