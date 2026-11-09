@@ -10,6 +10,7 @@ describe("useChangesViewState", () => {
       first.result.current.setPathFilter("src/");
       first.result.current.setHideViewed(true);
       first.result.current.reveal("src/app.ts");
+      first.result.current.setFind({ open: true, query: "needle", regex: true });
     });
     first.unmount();
 
@@ -17,6 +18,7 @@ describe("useChangesViewState", () => {
     expect(remounted.pathFilter).toBe("src/");
     expect(remounted.hideViewed).toBe(true);
     expect([...remounted.revealedPaths]).toEqual(["src/app.ts"]);
+    expect(remounted.find).toEqual({ open: true, query: "needle", matchCase: false, regex: true });
 
     for (const [conversationId, url] of [
       ["view-state-b", prUrl],
@@ -26,7 +28,22 @@ describe("useChangesViewState", () => {
       expect(other.pathFilter).toBe("");
       expect(other.hideViewed).toBe(false);
       expect(other.revealedPaths.size).toBe(0);
+      expect(other.find).toEqual({ open: false, query: "", matchCase: false, regex: false });
     }
+  });
+
+  it("keeps the dismissed reset head across remounts and isolates PRs", () => {
+    const prUrl = "https://github.com/o/r/pull/3";
+    const first = renderHook(() => useChangesViewState("view-state-dismiss", prUrl));
+    act(() => first.result.current.setDismissedResetHead("head2"));
+    first.unmount();
+
+    const remounted = renderHook(() => useChangesViewState("view-state-dismiss", prUrl));
+    expect(remounted.result.current.dismissedResetHead).toBe("head2");
+    const otherPr = renderHook(() =>
+      useChangesViewState("view-state-dismiss", "https://github.com/o/r/pull/4"),
+    );
+    expect(otherPr.result.current.dismissedResetHead).toBeNull();
   });
 
   it("clears a reveal with stable actions", () => {

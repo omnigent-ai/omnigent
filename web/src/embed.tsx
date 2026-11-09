@@ -25,6 +25,7 @@ import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 // rspack then ingests the single intermediate module and emits the final chunks.
 
 import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
+import { APP_QUERY_DEFAULTS } from "./lib/queryRetry";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { useResolvedThemeMode } from "./components/theme/useResolvedThemeMode";
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
@@ -81,7 +82,7 @@ export { setOmnigentHostConfig } from "./lib/host";
 // refetch, which is noisy for chat).
 const queryClient = new QueryClient({
   defaultOptions: {
-    queries: { staleTime: 30_000, refetchOnWindowFocus: false },
+    queries: APP_QUERY_DEFAULTS,
   },
 });
 
