@@ -29,6 +29,7 @@ import type {
   SandboxStatus,
   Session,
   SessionEventInput,
+  SessionFamily,
   SessionItem,
   SessionStatus,
 } from "./types";
@@ -108,6 +109,7 @@ interface ModelUsageWire {
  * camelCase `Session` type at the parse boundary.
  */
 interface SessionResponseWire {
+  family?: SessionFamily | null;
   sandbox_profile?: SandboxProfile | null;
   id: string;
   agent_id: string;
@@ -347,6 +349,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
+    family: wire.family,
     agentId: wire.agent_id,
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
@@ -641,8 +644,10 @@ function toImportFailureRef(evt: Record<string, unknown>): ImportFailureRef {
  * Prefers the streaming endpoint `POST /v1/imports/local/stream` (NDJSON):
  * `onSession` fires for each newly imported session as its frame lands, so
  * callers list sessions live instead of waiting out the whole batch. A
- * mid-stream host failure throws after the sessions read so far have been
- * delivered through `onSession`. Against a server too old to have the streaming
+ * mid-stream host failure, or a stream that closes before its terminal `done`
+ * tally, throws after the sessions read so far have been delivered through
+ * `onSession` (a by-ID import whose one session arrived resolves instead, since
+ * it has nothing left to do). Against a server too old to have the streaming
  * endpoint (404), it falls back to the buffered `POST /v1/imports/local`, which
  * returns the whole tally at once (`onSession` then fires for every session
  * together). Either way the resolved {@link LocalImportResult} carries the
@@ -678,6 +683,7 @@ export async function importLocalSessions(
   let alreadyImported = 0;
   let failed = 0;
   let errorMessage: string | null = null;
+  let sawDone = false;
 
   const handleLine = (line: string): void => {
     let evt: Record<string, unknown>;
@@ -698,6 +704,7 @@ export async function importLocalSessions(
     } else if (evt.event === "failed") {
       failures.push(toImportFailureRef(evt));
     } else if (evt.event === "done") {
+      sawDone = true;
       imported = typeof evt.imported === "number" ? evt.imported : sessions.length;
       alreadyImported = typeof evt.already_imported === "number" ? evt.already_imported : 0;
       failed = typeof evt.failed === "number" ? evt.failed : failures.length;
@@ -731,6 +738,21 @@ export async function importLocalSessions(
   }
 
   if (errorMessage !== null) throw new Error(errorMessage);
+  // No `done` tally arrived. A by-ID import that delivered its one session did finish;
+  // otherwise fail with what landed rather than report "Imported 0" beside listed sessions.
+  if (!sawDone) {
+    if (sessionId !== undefined) {
+      if (sessions.length === 1) {
+        return { imported: 1, alreadyImported: 0, failed: 0, sessions, failures };
+      }
+      throw new Error("The import stopped before it could finish. Try importing it again.");
+    }
+    const n = sessions.length;
+    throw new Error(
+      `The import stopped before it could finish. ${n} ${n === 1 ? "session was" : "sessions were"} ` +
+        "imported. Import again to pick up the rest.",
+    );
+  }
   return { imported, alreadyImported, failed, sessions, failures };
 }
 
@@ -801,17 +823,25 @@ export async function createBundledSession(
   metadata: {
     host_id?: string;
     host_type?: string;
-    workspace?: string;
+    workspace?: string | null;
+    workspaces?: string[];
+    sandbox_provider?: string;
+    sandbox_profile_id?: string;
+    sandbox_profile_revision?: string;
     project_id?: string;
+    sibling_source_id?: string;
     labels?: Record<string, string>;
+    initial_input?: SessionEventInput;
     terminal_launch_args?: string[];
-    git?: { branch_name: string; base_branch?: string };
+    git?: { branch_name: string; base_branch?: string; existing_worktree?: boolean } | null;
     mcp_registry_services?: string[];
   } = {},
+  initialFiles: File[] = [],
 ): Promise<{ id: string; agentId?: string }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
+  for (const file of initialFiles) form.append("initial_files", file, file.name);
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
     headers: {
@@ -1489,6 +1519,8 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
 
 /** The server's ErrorCode.HOST_OFFLINE: a held send whose host is offline. */
 export const HOST_OFFLINE_CODE = "host_offline";
+/** A request answered by a sign-in page instead of the API. */
+export const SIGN_IN_EXPIRED_CODE = "sign_in_expired";
 
 /** Tells the server this client resends a message once its offline host reconnects. */
 const HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline";
@@ -1518,17 +1550,27 @@ export async function postEvent(
   // on `code` — e.g. surface a friendly "runner didn't come online" message
   // for the 503 the server returns when a host-bound runner never connects.
   if (!res.ok) throw await apiErrorFromResponse(res);
-  return postEventResponseFromWire(
-    (await res.json()) as {
-      queued: boolean;
-      item_id?: string;
-      denied?: boolean;
-      pending_id?: string;
-      recovered?: boolean;
-      recovery?: PostEventResponse["recovery"];
-      session_id?: string;
-    },
-  );
+  const body = (await res.json().catch((error: unknown): never => {
+    // An auth layer's login page answers the POST with a 200 HTML page: an expired
+    // sign-in, not a malformed reply.
+    if ((res.headers.get("content-type") ?? "").toLowerCase().includes("text/html")) {
+      throw new ApiError(
+        "Your sign-in expired. Reload the page to sign in again.",
+        401,
+        SIGN_IN_EXPIRED_CODE,
+      );
+    }
+    throw error;
+  })) as {
+    queued: boolean;
+    item_id?: string;
+    denied?: boolean;
+    pending_id?: string;
+    recovered?: boolean;
+    recovery?: PostEventResponse["recovery"];
+    session_id?: string;
+  };
+  return postEventResponseFromWire(body);
 }
 
 /**

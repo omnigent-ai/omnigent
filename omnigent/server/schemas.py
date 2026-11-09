@@ -18,6 +18,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    RootModel,
     SerializerFunctionWrapHandler,
     Strict,
     field_validator,
@@ -29,8 +30,18 @@ from pydantic.json_schema import SkipJsonSchema
 from omnigent.entities import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
+    CompactionData,
     ConversationItem,
+    ErrorData,
+    FunctionCallData,
+    FunctionCallOutputData,
+    NativeToolData,
+    ResourceEventData,
+    RoutingDecisionData,
+    SlashCommandData,
+    TerminalCommandData,
 )
+from omnigent.entities.conversation import StartupInputOptions
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
@@ -65,20 +76,7 @@ class PaginatedList(BaseModel):
     has_more: bool = False
 
 
-class AgentList(PaginatedList):
-    """
-    The built-in agent list, plus the packaged names this deployment hides.
-
-    :param suppressed_agent_names: Packaged built-ins ``OMNIGENT_SEEDED_AGENTS``
-        trimmed from ``data``. The web picker also discovers agents from a
-        user's recent sessions, so it needs these names to keep a hidden
-        built-in with prior sessions from resurfacing as a custom agent.
-    """
-
-    suppressed_agent_names: list[str] = Field(default_factory=list)
-
-
-# ── Agents ──────────────────────────────────────────────────────
+# ── Agents ──────────────────────────────────────────────────
 
 
 class MCPServerSummary(BaseModel):
@@ -413,6 +411,24 @@ class AgentDetailObject(AgentObject):
     """Agent summary with caller ownership for management actions."""
 
     user_owned: bool
+
+
+class AgentList(BaseModel):
+    """
+    Paginated list of agents; ``data`` is a page of ``AgentObject``.
+
+    :param suppressed_agent_names: Packaged built-ins ``OMNIGENT_SEEDED_AGENTS``
+        trimmed from ``data``. The web picker also discovers agents from a
+        user's recent sessions, so it needs these names to keep a hidden
+        built-in with prior sessions from resurfacing as a custom agent.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[AgentObject] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+    suppressed_agent_names: list[str] = Field(default_factory=list)
 
 
 # ── Session Policies ───────────────────────────────────────────
@@ -1706,6 +1722,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
+    sibling_source_id: str | None = None
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
@@ -1922,6 +1939,8 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         uploaded agent's ``os_env.cwd`` boundary at session create
         (per designs/SESSION_WORKSPACE_SELECTION.md). Optional
         otherwise.
+    :param workspaces: Repository URLs to clone into a managed sandbox.
+    :param git: Optional external-host worktree creation or binding options.
     :param terminal_launch_args: Optional pass-through CLI args for a
         native terminal wrapper (claude / codex), e.g.
         ``["--dangerously-skip-permissions"]``. Set at create-time so
@@ -1957,7 +1976,10 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     model_override: str | None = None
     host_id: str | None = None
     workspace: str | None = None
+    workspaces: list[str] | None = None
+    git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
+    sibling_source_id: str | None = None
     parent_session_id: str | None = None
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
@@ -2003,13 +2025,25 @@ class SessionCreateMetadata(_SandboxProfileSelection):
                     "host_type 'managed' lets the server provision the host; "
                     "host_id must not be set"
                 )
-            if self.workspace is not None:
+            if self.git is not None:
+                raise ValueError("git worktrees require an existing external host")
+            if self.workspace is not None and self.workspaces is not None:
+                raise ValueError(
+                    "set either 'workspace' (one repository) or 'workspaces' "
+                    "(several) for host_type 'managed', not both"
+                )
+            if self.workspaces is not None and len(self.workspaces) > _MAX_MANAGED_WORKSPACES:
+                raise ValueError(
+                    f"host_type 'managed' takes at most {_MAX_MANAGED_WORKSPACES} "
+                    f"repositories in 'workspaces' (got {len(self.workspaces)})"
+                )
+            for candidate in self.managed_repo_workspaces():
                 try:
-                    parse_repo_workspace(self.workspace)
+                    parse_repo_workspace(candidate)
                 except ValueError as exc:
                     raise ValueError(
                         "host_type 'managed' takes a git repository URL "
-                        f"(optionally '#<branch>') as workspace: {exc}"
+                        f"(optionally '#<branch>') in each workspace: {exc}"
                     ) from exc
             return self
         if self.sandbox_provider is not None:
@@ -2017,12 +2051,26 @@ class SessionCreateMetadata(_SandboxProfileSelection):
                 "sandbox_provider only applies to host_type 'managed' — "
                 "external hosts are not server-provisioned"
             )
+        if self.workspaces:
+            raise ValueError(
+                "'workspaces' (multi-repo clone) requires host_type 'managed' — "
+                "external hosts take a single absolute path in 'workspace'"
+            )
         if self.workspace is not None and is_repo_workspace(self.workspace):
             raise ValueError(
                 "a repository-URL workspace requires host_type 'managed' — "
                 "external hosts take an absolute path on the host"
             )
+        if self.git is not None and self.host_id is None:
+            raise ValueError("git worktree creation requires host_id")
         return self
+
+    def managed_repo_workspaces(self) -> list[str]:
+        if self.workspaces:
+            return list(self.workspaces)
+        if self.workspace is not None:
+            return [self.workspace]
+        return []
 
 
 class CreatedSessionResponse(BaseModel):
@@ -2176,6 +2224,13 @@ class BackgroundTaskInfo(BaseModel):
     status: str | None = None
     description: str | None = None
     command: str | None = None
+
+
+class SessionFamily(BaseModel):
+    id: str
+    representative_id: str | None
+    pinned: bool = False
+    pinned_at: str | None = None
 
 
 class SessionResponse(BaseModel):
@@ -2444,6 +2499,7 @@ class SessionResponse(BaseModel):
         snapshots independently of lifecycle status.
     """
 
+    family: SessionFamily | None = None
     id: str
     agent_id: str
     agent_name: str | None = None
@@ -2637,6 +2693,7 @@ class UpdateSessionRequest(BaseModel):
     """
 
     runner_id: str | None = None
+    family_pinned: bool | None = None
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
@@ -3210,6 +3267,7 @@ class SessionListItem(BaseModel):
         "not known yet". ``None`` on servers without PR storage.
     """
 
+    family: SessionFamily | None = None
     id: str
     agent_id: str
     agent_name: str | None = None
@@ -3248,6 +3306,14 @@ class SessionListItem(BaseModel):
     pull_requests_synced: bool | None = None
 
 
+class SessionPageBoundary(BaseModel):
+    """Last visible primary-page row, before family context is appended."""
+
+    id: str
+    created_at: int
+    updated_at: int
+
+
 class SessionList(BaseModel):
     """Paginated list of sessions; ``data`` is a page of ``SessionListItem``."""
 
@@ -3256,6 +3322,7 @@ class SessionList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+    page_boundary: SessionPageBoundary | None = None
 
 
 class ChildSessionList(BaseModel):
@@ -3263,6 +3330,186 @@ class ChildSessionList(BaseModel):
 
     object: Literal["list"] = "list"
     data: list[ChildSessionSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class _SessionItemCommon(BaseModel):
+    """Store-assigned fields shared by every flattened session item."""
+
+    id: str = Field(description='Store-assigned item ID, e.g. ``"msg_abc123"``.')
+    response_id: str = Field(description="ID of the task/response that produced this item.")
+    status: str = Field(description='Item status, e.g. ``"completed"``.')
+    created_at: int = Field(description="Unix epoch seconds of creation.")
+    created_by: str | None = Field(
+        default=None,
+        description="Identity of the human author; omitted for agent, tool, and system items.",
+    )
+
+
+class SessionContentBlock(BaseModel):
+    """
+    One ``content`` or ``summary`` block of a message or reasoning item.
+
+    Blocks are heterogeneous (``input_text``, ``output_text``,
+    ``input_image``, ``summary_text``, ...), so kinds other than text
+    carry extra keys.
+
+    :param type: Block kind, e.g. ``"input_text"`` or ``"output_text"``.
+    :param text: Text body of a text block; absent for other kinds.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+    text: str | None = None
+
+
+class SessionMessageItem(_SessionItemCommon):
+    """
+    ``message`` item as returned by ``GET /v1/sessions/{id}/items``.
+
+    Mirrors ``MessageData`` field for field. The entity keeps the blocks
+    as free-form dicts, so this variant spells out the typed block shape
+    instead of inheriting it.
+
+    :param type: Always ``"message"``.
+    :param role: ``"user"`` or ``"assistant"``.
+    :param content: Content blocks in order.
+    :param model: Agent name; present on assistant messages, absent on
+        user messages.
+    :param is_meta: ``True`` for durable context hidden from user-facing
+        transcripts; omitted when ``False``.
+    :param user_authored: ``True`` for confirmed or conservatively
+        preserved user input; omitted when ``False``.
+    :param subagent_return_id: Native task id of an explicitly completed
+        child; omitted when unset.
+    :param interrupted: ``True`` for a partial assistant response from an
+        interrupted turn; omitted when ``False``.
+    :param stream_message_id: Native live-preview stream finalized by this
+        assistant message.
+    :param phase: Assistant-only harness label, e.g. ``"commentary"``;
+        omitted when unset.
+    :param startup_options: Request options kept while a startup input
+        awaits delivery; omitted when unset.
+    """
+
+    type: Literal["message"]
+    role: Literal["user", "assistant"]
+    content: list[SessionContentBlock]
+    model: str | None = None
+    is_meta: bool = False
+    user_authored: bool = False
+    subagent_return_id: str | None = None
+    interrupted: bool = False
+    stream_message_id: str | None = None
+    phase: str | None = None
+    startup_options: StartupInputOptions | None = None
+
+
+class SessionFunctionCallItem(_SessionItemCommon, FunctionCallData):
+    """``function_call`` item: common fields plus ``FunctionCallData``."""
+
+    type: Literal["function_call"]
+
+
+class SessionFunctionCallOutputItem(_SessionItemCommon, FunctionCallOutputData):
+    """``function_call_output`` item: common fields plus ``FunctionCallOutputData``."""
+
+    type: Literal["function_call_output"]
+
+
+class SessionErrorItem(_SessionItemCommon, ErrorData):
+    """``error`` item: common fields plus ``ErrorData``."""
+
+    type: Literal["error"]
+
+
+class SessionReasoningItem(_SessionItemCommon):
+    """
+    ``reasoning`` item as returned by ``GET /v1/sessions/{id}/items``.
+
+    Mirrors ``ReasoningData`` field for field, with its text blocks typed
+    as ``SessionContentBlock`` like message content.
+
+    :param type: Always ``"reasoning"``.
+    :param model: Agent name.
+    :param summary: Summary text blocks,
+        e.g. ``[{"type": "summary_text", "text": "..."}]``.
+    :param content: Raw reasoning text blocks; absent when redacted.
+    :param encrypted_content: Encrypted reasoning content; absent when none.
+    """
+
+    type: Literal["reasoning"]
+    model: str
+    summary: list[SessionContentBlock]
+    content: list[SessionContentBlock] | None = None
+    encrypted_content: str | None = None
+
+
+class SessionCompactionItem(_SessionItemCommon, CompactionData):
+    """``compaction`` item: common fields plus ``CompactionData``."""
+
+    type: Literal["compaction"]
+
+
+class SessionNativeToolItem(_SessionItemCommon, NativeToolData):
+    """``native_tool`` item: common fields plus ``NativeToolData``."""
+
+    type: Literal["native_tool"]
+
+
+class SessionResourceEventItem(_SessionItemCommon, ResourceEventData):
+    """``resource_event`` item: common fields plus ``ResourceEventData``."""
+
+    type: Literal["resource_event"]
+
+
+class SessionRoutingDecisionItem(_SessionItemCommon, RoutingDecisionData):
+    """``routing_decision`` item: common fields plus ``RoutingDecisionData``."""
+
+    type: Literal["routing_decision"]
+
+
+class SessionSlashCommandItem(_SessionItemCommon, SlashCommandData):
+    """``slash_command`` item: common fields plus ``SlashCommandData``."""
+
+    type: Literal["slash_command"]
+
+
+class SessionTerminalCommandItem(_SessionItemCommon, TerminalCommandData):
+    """``terminal_command`` item: common fields plus ``TerminalCommandData``."""
+
+    type: Literal["terminal_command"]
+
+
+class SessionItem(
+    RootModel[
+        Annotated[
+            SessionMessageItem
+            | SessionFunctionCallItem
+            | SessionFunctionCallOutputItem
+            | SessionErrorItem
+            | SessionReasoningItem
+            | SessionCompactionItem
+            | SessionNativeToolItem
+            | SessionResourceEventItem
+            | SessionRoutingDecisionItem
+            | SessionSlashCommandItem
+            | SessionTerminalCommandItem,
+            Field(discriminator="type"),
+        ]
+    ]
+):
+    """One record of ``GET /v1/sessions/{id}/items``; ``type`` selects the variant."""
+
+
+class SessionItemList(BaseModel):
+    """Paginated list of session items; ``data`` is a page of ``SessionItem``."""
+
+    object: Literal["list"] = "list"
+    data: list[SessionItem] = Field(default_factory=list)
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
