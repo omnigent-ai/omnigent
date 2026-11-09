@@ -3460,6 +3460,7 @@ class SessionMessageItem(_SessionItemCommon):
     model: str | None = None
     is_meta: bool = False
     user_authored: bool = False
+    skill_expansion: Literal[True] | None = None
     subagent_return_id: str | None = None
     interrupted: bool = False
     stream_message_id: str | None = None
