@@ -90,6 +90,7 @@ import {
   snapshotReplyDraft,
 } from "@/lib/replyDraft";
 import { interrupt } from "@/lib/sessionsApi";
+import { requestErrorMessage } from "@/lib/queryRetry";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
 /** The block field that marks it as copied into a side chat. */
@@ -419,7 +420,9 @@ export function SideChatPane({
                 {fullSession ? "Couldn’t load this session" : "Couldn’t load this side chat"}
               </p>
               <p className="max-w-[36ch] text-sm text-muted-foreground">
-                {conversationLoadError?.message ?? "Please try again."}
+                {conversationLoadError
+                  ? requestErrorMessage(conversationLoadError)
+                  : "Please try again."}
               </p>
               <Button
                 type="button"

@@ -42,6 +42,27 @@ describe("ConversationLoadError", () => {
     expect(
       screen.getByRole("heading", { name: "Couldn't load this conversation" }),
     ).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(error.message))).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(retryConversationLoad).toHaveBeenCalledWith("conv_1");
+  });
+
+  it("explains a throttled load in words the user can act on, with a retry", () => {
+    renderError(
+      new ApiError(
+        "Too many requests. Please wait a moment and try again. If the issue persists, consider adjusting your request frequency or reaching out to support for assistance.",
+        429,
+        "REQUEST_LIMIT_EXCEEDED",
+      ),
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "Couldn't load this conversation" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Too many requests right now\. Wait a moment, then try again\./),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/request frequency/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     expect(retryConversationLoad).toHaveBeenCalledWith("conv_1");
   });

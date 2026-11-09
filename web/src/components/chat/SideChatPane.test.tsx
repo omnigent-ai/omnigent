@@ -141,6 +141,26 @@ describe("undelivered startup messages", () => {
   });
 });
 
+describe("a side chat whose load failed", () => {
+  it("explains throttling in words the user can act on", () => {
+    conversationRegistry.acquire(childId).setState({
+      conversationLoadError: new sessionsApi.ApiError(
+        "Too many requests. If the issue persists, consider adjusting your request frequency.",
+        429,
+        null,
+      ),
+    });
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.getByText("Couldn’t load this side chat")).toBeInTheDocument();
+    expect(
+      screen.getByText("Too many requests right now. Wait a moment, then try again."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/request frequency/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  });
+});
+
 describe("side-chat working indicator", () => {
   it("shows the full session history and live state without exposing a read-only composer", () => {
     const entry = conversationRegistry.acquire(childId);
