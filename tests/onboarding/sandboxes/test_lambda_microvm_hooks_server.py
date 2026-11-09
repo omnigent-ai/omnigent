@@ -120,8 +120,8 @@ def test_spawn_failure_clears_started_flag_so_retry_can_succeed(
 class _FakeHostProc:
     """Stands in for start_host.sh: no output, and it exits when the test says so."""
 
-    def __init__(self) -> None:
-        self.stdout = None
+    def __init__(self, stdout: _LineStream | None = None) -> None:
+        self.stdout = stdout
         self.returncode = 0
         self._done = threading.Event()
 
@@ -163,6 +163,98 @@ def test_host_exit_clears_started_flag_and_records_status(
     spawned[0][0].exit(0)
     poll_until(lambda: _hooks._host_started is False, timeout_s=5, interval_s=0.01)
     assert _hooks._host_exit_code == 0
+
+
+class _LineStream:
+    """The host's stdout pipe: yields fixed lines and records how many were drained."""
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+        self.drained = 0
+        self.closed = False
+
+    def __iter__(self) -> Iterator[str]:
+        for line in self._lines:
+            self.drained += 1
+            yield line
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FullDiskLog:
+    """A host log file whose *failing* operation raises like a full filesystem."""
+
+    def __init__(self, failing: str) -> None:
+        self._failing = failing
+
+    def _io(self, operation: str) -> None:
+        if operation == self._failing:
+            raise OSError(28, "No space left on device")
+
+    def write(self, _line: str) -> None:
+        self._io("write")
+
+    def flush(self) -> None:
+        self._io("flush")
+
+    def close(self) -> None:
+        self._io("close")
+
+
+_HOST_OUTPUT = [f"host line {index}\n" for index in range(5)]
+
+
+def _run_host_to_exit(monkeypatch: pytest.MonkeyPatch, stream: _LineStream) -> None:
+    """Spawn a host that writes *stream*, let it exit 3, and wait for the reap."""
+    proc = _FakeHostProc(stdout=stream)
+    monkeypatch.setattr(_hooks.subprocess, "Popen", lambda *_args, **_kwargs: proc)
+    _hooks._start_host_from_payload(json.dumps(_IDENTITY).encode())
+    proc.exit(3)
+    poll_until(lambda: _hooks._host_exit_code is not None, timeout_s=5, interval_s=0.01)
+
+
+@pytest.mark.parametrize("failing", ["write", "flush", "close"])
+def test_log_file_failure_keeps_draining_and_releases_the_latch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], failing: str
+) -> None:
+    """A failing log file must not stop the drain (an unread pipe blocks the host)
+    or skip the reap (a stuck latch makes every later /run and /resume a no-op)."""
+    monkeypatch.setattr(
+        _hooks, "open", lambda *_args, **_kwargs: _FullDiskLog(failing), raising=False
+    )
+    stream = _LineStream(_HOST_OUTPUT)
+
+    _run_host_to_exit(monkeypatch, stream)
+
+    assert stream.drained == len(_HOST_OUTPUT)
+    assert stream.closed
+    assert _hooks._host_started is False
+    assert _hooks._host_exit_code == 3
+    out = capsys.readouterr().out
+    assert all(f"host: {line}" in out for line in _HOST_OUTPUT)
+
+
+def test_stdout_failure_keeps_logging_and_releases_the_latch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken container stdout drops that sink only; the log file still gets
+    every line and the host is reaped."""
+
+    def _broken_stdout(*args: object, file: object = None, **kwargs: object) -> None:
+        if file is None:
+            raise OSError(32, "Broken pipe")
+        print(*args, file=file, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_hooks, "print", _broken_stdout, raising=False)
+    stream = _LineStream(_HOST_OUTPUT)
+
+    _run_host_to_exit(monkeypatch, stream)
+
+    assert stream.drained == len(_HOST_OUTPUT)
+    assert _hooks._host_started is False
+    assert _hooks._host_exit_code == 3
+    assert Path(_hooks._HOST_LOG_PATH).read_text() == "".join(_HOST_OUTPUT)
 
 
 def test_resume_restarts_a_host_that_stood_down(

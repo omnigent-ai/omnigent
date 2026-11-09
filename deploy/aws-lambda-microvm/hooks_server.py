@@ -28,12 +28,14 @@ Stdlib only, so it runs under the image's bare ``python3``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import IO
 
 _HOOKS_PORT = int(os.environ.get("OMNIGENT_MICROVM_HOOKS_PORT", "9000"))
 
@@ -203,24 +205,46 @@ def _spawn_host(env: dict[str, str]) -> None:
         return
 
     def _tee() -> None:
-        """Pump the host's output to stdout (→ CloudWatch) and the file, then reap it."""
+        """Pump the host's output to stdout (→ CloudWatch) and the file, then reap it.
+
+        Each sink is best-effort: one that fails (a full disk, a closed stdout)
+        is dropped while the pipe keeps draining, so the host never blocks on
+        an unread pipe and its exit is always recorded to release the latch.
+        """
         try:
             log_fh = open(_HOST_LOG_PATH, "a")  # noqa: SIM115
         except OSError:
             log_fh = None
+        to_stdout = True
         try:
             if proc.stdout is not None:
                 for line in proc.stdout:
-                    print(f"host: {line}", end="", flush=True)
+                    if to_stdout:
+                        try:
+                            print(f"host: {line}", end="", flush=True)
+                        except (OSError, ValueError):
+                            to_stdout = False
                     if log_fh is not None:
-                        log_fh.write(line)
-                        log_fh.flush()
+                        try:
+                            log_fh.write(line)
+                            log_fh.flush()
+                        except (OSError, ValueError):
+                            _close_quietly(log_fh)
+                            log_fh = None
         finally:
             if log_fh is not None:
-                log_fh.close()
+                _close_quietly(log_fh)
+            if proc.stdout is not None:
+                _close_quietly(proc.stdout)
             _record_host_exit(proc.wait())
 
     threading.Thread(target=_tee, daemon=True).start()
+
+
+def _close_quietly(stream: IO[str]) -> None:
+    """Close *stream*, ignoring a failed final flush so the host is still reaped."""
+    with contextlib.suppress(OSError, ValueError):
+        stream.close()
 
 
 def _record_host_exit(code: int) -> None:
