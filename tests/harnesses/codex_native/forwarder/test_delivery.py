@@ -305,7 +305,10 @@ async def test_idempotent_conversation_items_keep_order_while_older_post_is_slow
 
 
 @pytest.mark.asyncio
-async def test_cancelled_idempotent_item_is_dead_lettered_for_safe_replay(tmp_path: Path) -> None:
+@pytest.mark.parametrize("with_receipt", [False, True], ids=["item", "input-receipt"])
+async def test_cancelled_idempotent_item_is_dead_lettered_for_safe_replay(
+    tmp_path: Path, with_receipt: bool
+) -> None:
     """Shutdown during an in-flight completion keeps a replayable disk record."""
 
     class _BlockingPostClient:
@@ -323,6 +326,15 @@ async def test_cancelled_idempotent_item_is_dead_lettered_for_safe_replay(tmp_pa
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 
+    receipt = (
+        {
+            "version": 1,
+            "identity": {"pending_id": "pending_" + "a" * 32, "delivery_attempt_id": "b" * 32},
+            "receipt_id": "omnigent-paste-" + "c" * 32 + "-" + "d" * 64,
+        }
+        if with_receipt
+        else None
+    )
     client = _BlockingPostClient()
     dead_letter_token = fwd._dead_letter_dir.set(tmp_path)
     locks_token = fwd._conversation_item_locks.set({})
@@ -335,6 +347,7 @@ async def test_cancelled_idempotent_item_is_dead_lettered_for_safe_replay(tmp_pa
                 item_data={"role": "assistant", "content": []},
                 response_id="codex_turn_1",
                 source_id="thread_1:turn_1:item_1",
+                native_input_receipt=receipt,
             )
         )
         await asyncio.wait_for(client.entered.wait(), timeout=5.0)
@@ -350,6 +363,17 @@ async def test_cancelled_idempotent_item_is_dead_lettered_for_safe_replay(tmp_pa
     record = _json.loads((tmp_path / "dead_letter.jsonl").read_text().splitlines()[0])
     assert record["delivered_ambiguous"] is True
     assert record["payload"]["source_id"] == "thread_1:turn_1:item_1"
+    assert record["event_type"] == (
+        "external_native_input_receipt" if with_receipt else "external_conversation_item"
+    )
+    if with_receipt:
+        assert record["payload"]["native_input_receipt"] == receipt
+    replay_client = _RecordingClient()
+    await fwd._replay_dead_letters_before_resume(replay_client, tmp_path)
+    assert replay_client.posts == [
+        ("/v1/sessions/conv_x/events", {"type": record["event_type"], "data": record["payload"]})
+    ]
+    assert not (tmp_path / "dead_letter.jsonl").exists()
 
 
 @pytest.mark.asyncio

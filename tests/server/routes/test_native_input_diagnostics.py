@@ -40,8 +40,7 @@ async def test_rejected_durable_input_restores_by_client_id_after_server_restart
             )
         ],
     )
-    original_pending = pending_inputs.record(conv.id, content, stable_id=stable_id)
-    original = pending_inputs.delivery_attributes_for(conv.id, original_pending)
+    pending_inputs.record(conv.id, content, stable_id=stable_id)
     pending_inputs.reset_for_tests()
     newer = pending_inputs.record(conv.id, [{"type": "input_text", "text": "later message"}])
 
@@ -50,9 +49,7 @@ async def test_rejected_durable_input_restores_by_client_id_after_server_restart
             store,
             conv.id,
             "resp_rejected",
-            stable_id,
-            pending_id=original_pending,
-            delivery_attempt_id=str(original["delivery_attempt_id"]),
+            {"input_stable_id": stable_id},
         )
 
     [saved] = store.list_items(conv.id).data

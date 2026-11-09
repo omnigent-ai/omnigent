@@ -45,20 +45,21 @@ def test_restart_and_concurrent_submission_claims(db_uri):
     assert second.list_pending_inputs(session.id)[0].status == "incomplete"
 
 
-def test_native_receipt_replaces_pending_row_once_and_keeps_order(db_uri):
+@pytest.mark.parametrize("reuse_client_id", [False, True])
+def test_native_receipt_replaces_pending_row_once_and_keeps_order(db_uri, reuse_client_id):
     store = SqlAlchemyConversationStore(db_uri)
     session = store.create_conversation()
     first, second = store.append(session.id, [_input("first"), _input("second")])
     native = NewConversationItem(
         type="message",
         response_id="native-turn",
-        stable_id=uuid4().hex,
+        stable_id=first.id if reuse_client_id else uuid4().hex,
         replaces_pending_id=first.id,
         data=first.data,
     )
     committed = store.append(session.id, [native])[0]
     assert committed.created_at == first.created_at
-    assert store.get_item(session.id, first.id) is None
+    assert store.get_item(session.id, first.id) == (committed if reuse_client_id else None)
     assert store.list_pending_inputs(session.id) == [second]
     # A mirror retry must neither delete the next input nor append another item.
     assert store.append(session.id, [native])[0].deduplicated
