@@ -449,7 +449,7 @@ describe("Sidebar scroll divider", () => {
     fireEvent.scroll(screen.getByRole("navigation"), { target: { scrollTop: 100 } });
     expect(screen.getByTestId("sidebar-scroll-divider")).toHaveClass("opacity-100");
 
-    fireEvent.click(screen.getByTestId("sidebar-settings-float"));
+    fireEvent.click(screen.getByTestId("sidebar-profile-settings"));
     expect(screen.queryByTestId("sidebar-scroll-divider")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("link", { name: /back/i }));
@@ -470,12 +470,132 @@ describe("Sidebar session list", () => {
       selectSessionFilter(filter);
       const pinned = screen.getByText("Pinned").closest("section")!;
       expect(within(pinned).getByText("shared_pin")).toBeInTheDocument();
-      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
+      expect(screen.queryByRole("img", { name: "Shared with others" })).toBeNull();
     }
     selectSessionFilter("all");
     const row = screen.getByText("shared_running").closest("li")!;
     expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-1");
   });
+
+  it("marks the viewer's own sessions only when the server says they're shared", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      mockConversations([
+        conv("owned_shared", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: true,
+        }),
+        conv("owned_shared_running", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: true,
+          status: "running",
+        }),
+        conv("owned_shared_awaiting", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: true,
+          pending_elicitations_count: 1,
+        }),
+        conv("owned_private", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: false,
+        }),
+        // Older servers omit the field; an owned row then shows no icon.
+        conv("owned_legacy", "Claude Code", { owner: "viewer@example.com" }),
+      ]);
+      renderSidebar();
+      selectSessionFilter("all");
+
+      const sharedRow = screen.getByText("owned_shared").closest("li")!;
+      // Fades with the state slot, including while the ⌘-number hint holds its edge.
+      expect(within(sharedRow).getByRole("img", { name: "Shared with others" })).toHaveClass(
+        "right-1",
+        "md:group-hover:opacity-0",
+        "group-has-[[data-session-shortcut-hint]]:opacity-0",
+      );
+      // The icon sits left of the session state, which keeps the rightmost slot.
+      const runningRow = screen.getByText("owned_shared_running").closest("li")!;
+      expect(within(runningRow).getByRole("img", { name: "Shared with others" })).toHaveClass(
+        "right-8",
+      );
+      expect(within(runningRow).getByTestId("session-state-badge").parentElement).toHaveClass(
+        "right-1",
+      );
+      // The natural-width "Needs response" pill reserves pr-29, so the icon sits
+      // at that edge and the title reserve grows to cover both.
+      const awaitingRow = screen.getByText("owned_shared_awaiting").closest("li")!;
+      expect(within(awaitingRow).getByRole("img", { name: "Shared with others" })).toHaveClass(
+        "right-29",
+      );
+      expect(awaitingRow.querySelector("a")).toHaveClass("pr-36");
+      const privateRow = screen.getByText("owned_private").closest("li")!;
+      expect(within(privateRow).queryByRole("img", { name: "Shared with others" })).toBeNull();
+      const legacyRow = screen.getByText("owned_legacy").closest("li")!;
+      expect(within(legacyRow).queryByRole("img", { name: "Shared with others" })).toBeNull();
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
+  it("re-renders a rendered row when its shared flag flips", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      const row = (shared: boolean) =>
+        conv("owned", "Claude Code", { owner: "viewer@example.com", shared_with_others: shared });
+      // A stable projects array keeps context churn from bypassing the memo comparator.
+      projectRowsRef.current = [];
+      mockConversations([row(false)]);
+      const { refresh } = renderSidebar();
+      expect(screen.queryByRole("img", { name: "Shared with others" })).toBeNull();
+
+      mockConversations([row(true)]);
+      refresh();
+      expect(screen.getByRole("img", { name: "Shared with others" })).toBeInTheDocument();
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
+  describe.each(["legacy", "grouping", "pinned"] as const)(
+    "%s hover surface sharing explanation",
+    (surface) => {
+      it.each([true, false])("says shared with others only when shared is %s", async (shared) => {
+        const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+        try {
+          const id = `conv_shared_hint_${surface}`;
+          const pinned = surface === "pinned";
+          if (pinned) {
+            projectsMock.push("Customer X");
+            seedPins([id]);
+          }
+          mockConversations([
+            conv(id, "Codex", {
+              owner: "viewer@example.com",
+              shared_with_others: shared,
+              labels: pinned ? { omni_project: "Customer X" } : {},
+            }),
+          ]);
+          if (surface === "grouping") renderGroupingSidebar();
+          else renderSidebar();
+
+          const link = screen.getByRole("link", { name: id });
+          if (pinned) fireEvent.focus(link);
+          else fireEvent.pointerMove(link, { pointerType: "mouse" });
+          const content = await screen.findByTestId(
+            pinned ? "pinned-project-flyout" : "session-tooltip-content",
+          );
+          if (shared) {
+            expect(within(content).getByTestId("session-shared-hint")).toHaveTextContent(
+              "Shared with others",
+            );
+          } else {
+            expect(within(content).queryByTestId("session-shared-hint")).toBeNull();
+          }
+        } finally {
+          viewer.mockRestore();
+        }
+      });
+    },
+  );
 
   it("uses the interface text token for the empty session-list state", () => {
     mockConversations([]);
@@ -967,13 +1087,12 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("renders Search, Settings, and Collapse as compact header actions", () => {
+  it("keeps navigation controls in the header and moves Settings to the footer", async () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
     const headerActions = screen.getByTestId("sidebar-header-actions");
     const search = within(headerActions).getByTestId("sidebar-search-button");
-    const settings = screen.getByTestId("settings-button");
 
     expect(search).toHaveAttribute("aria-label", "Search");
     expect(search).toHaveAttribute("data-size", "icon-xs");
@@ -981,29 +1100,29 @@ describe("Sidebar session list", () => {
     expect(search).not.toHaveClass("rounded-sm");
     expect(search.querySelector("svg")).toHaveClass("size-4");
     expect(search.querySelector("svg")).not.toHaveClass("ui-icon");
-    expect(settings).toHaveAttribute("aria-label", "Settings");
-    expect(settings).toHaveAttribute("data-size", "icon-xs");
-    expect(settings).toHaveClass("size-6", "rounded-[8px]");
-    expect(settings.querySelector("svg")).toHaveClass("size-4");
-    expect(settings.querySelector("svg")).not.toHaveClass("ui-icon");
+    expect(within(headerActions).queryByLabelText("Settings")).toBeNull();
     const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
     expect(collapse).toHaveAttribute("data-size", "icon-xs");
     expect(collapse).toHaveClass("size-6", "rounded-[var(--radius-md)]");
+    const historyNavigation = within(headerActions).getByTestId("history-navigation-buttons");
+    expect(within(historyNavigation).getByRole("button", { name: "Back" })).toHaveClass("size-6");
+    expect(within(historyNavigation).getByRole("button", { name: "Forward" })).toHaveClass(
+      "size-6",
+    );
     expect(within(headerActions).queryByTestId("inbox-button")).toBeNull();
+    expect(await screen.findByTestId("sidebar-profile-settings")).toHaveAttribute(
+      "href",
+      "/settings",
+    );
   });
 
-  it("omits the desktop server picker outside the Electron shell", async () => {
-    // The picker is Electron-only: it self-hides when the native bridge
-    // reports no connected server (a plain browser tab, as in tests), leaving
-    // the sidebar ending with the session list exactly as before.
+  it("renders the profile footer outside the Electron shell", async () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
-    // Anchor on something that DOES render, so a silently-empty sidebar can't
-    // make this assertion pass for the wrong reason.
-    expect(await screen.findByTestId("settings-button")).toBeInTheDocument();
-    expect(screen.queryByTestId("sidebar-server-picker")).toBeNull();
-    expect(screen.queryByTestId("sidebar-server-picker-row")).toBeNull();
+    expect(await screen.findByTestId("sidebar-profile-settings")).toBeInTheDocument();
+    expect(screen.getByTestId("sidebar-server-picker")).toBeInTheDocument();
+    expect(screen.getByTestId("sidebar-server-picker-row")).toBeInTheDocument();
   });
 
   it("renders Inbox as its own primary navigation row", () => {
@@ -1344,7 +1463,7 @@ describe("Sidebar session list", () => {
         </SidebarDataProvider>
       </QueryClientProvider>,
     );
-    fireEvent.click(screen.getByTestId("settings-button"));
+    fireEvent.click(screen.getByTestId("sidebar-profile-settings"));
     expect(onClose).not.toHaveBeenCalled();
   });
 
@@ -1362,8 +1481,8 @@ describe("Sidebar session list", () => {
     // Active sessions still render in the Sessions list.
     const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_active")).toBeInTheDocument();
-    // The header Settings link points at the settings page.
-    expect(screen.getByTestId("settings-button")).toHaveAttribute("href", "/settings");
+    // The footer Settings link points at the settings page.
+    expect(screen.getByTestId("sidebar-profile-settings")).toHaveAttribute("href", "/settings");
   });
 
   it("renders sessions in one flat list with no connection grouping", () => {
@@ -1938,6 +2057,151 @@ describe("Sidebar sections", () => {
     expect(screen.getAllByText("No sessions")[0]).toBeInTheDocument();
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
+
+  it.each([false, true])(
+    "moves personal pins out of their family until unpinned (project: %s)",
+    (inProject) => {
+      const family = { id: "family", representative_id: "conv_parent", pinned: false };
+      if (inProject) projectsMock.push("Customer X");
+      const projectLabels: Record<string, string> = inProject ? { omni_project: "Customer X" } : {};
+      mockConversations([
+        conv("conv_parent", "Claude Code", { family, labels: projectLabels }),
+        conv("conv_peer", "Codex", { family, labels: projectLabels }),
+        conv("conv_sibling", "Codex", {
+          family,
+          labels: { ...projectLabels, "omnigent.pinned": "1" },
+        }),
+      ]);
+      seedPins(["conv_sibling"]);
+      const { refresh } = renderSidebar();
+      if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+
+      const link = screen.getByText("conv_parent").closest("a")!;
+      const surface = link.parentElement!;
+      const chevron = screen.getByRole("button", { name: "Collapse session family" });
+      expect(surface).toHaveClass("relative");
+      expect(surface).toContainElement(chevron);
+      expect(link).not.toContainElement(chevron);
+      const pinnedSection = screen.getByText("Pinned").closest("section")!;
+      expect(screen.getAllByText("conv_sibling")).toHaveLength(1);
+      expect(within(pinnedSection).getByText("conv_sibling").closest("li")).not.toHaveAttribute(
+        "data-sibling-session",
+      );
+      expect(
+        within(pinnedSection).queryByRole("button", { name: "Collapse session family" }),
+      ).toBeNull();
+
+      const setFamilyPinned = (pinned: boolean) => {
+        mockConversations([
+          conv("conv_parent", "Claude Code", {
+            family: { ...family, pinned },
+            labels: projectLabels,
+          }),
+          conv("conv_peer", "Codex", { family: { ...family, pinned }, labels: projectLabels }),
+          conv("conv_sibling", "Codex", {
+            family: { ...family, pinned },
+            labels: { ...projectLabels, "omnigent.pinned": "1" },
+          }),
+        ]);
+        seedPins(pinned ? ["conv_parent", "conv_sibling"] : ["conv_sibling"]);
+        refresh();
+      };
+      setFamilyPinned(true);
+      fireEvent.click(
+        within(pinnedSection).getByRole("button", { name: "Collapse session family" }),
+      );
+      expect(within(pinnedSection).getByText("conv_sibling")).toBeInTheDocument();
+      expect(within(pinnedSection).queryByText("conv_peer")).toBeNull();
+      setFamilyPinned(false);
+      expect(within(pinnedSection).getByText("conv_sibling").closest("li")).not.toHaveAttribute(
+        "data-sibling-session",
+      );
+      mockConversations([
+        conv("conv_parent", "Claude Code", { family, labels: projectLabels }),
+        conv("conv_peer", "Codex", { family, labels: projectLabels }),
+        conv("conv_sibling", "Codex", { family, labels: projectLabels }),
+      ]);
+      seedPins([]);
+      refresh();
+      expect(screen.queryByText("conv_sibling")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
+      expect(screen.getAllByText("conv_sibling")).toHaveLength(1);
+      expect(screen.getByText("conv_sibling").closest("li")).toHaveAttribute(
+        "data-sibling-session",
+        "true",
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "keeps siblings nested while representative deletion refreshes (project: %s)",
+    (inProject) => {
+      const family = { id: "family", representative_id: "conv_parent", pinned: false };
+      if (inProject) projectsMock.push("Customer X");
+      const labels: Record<string, string> = inProject ? { omni_project: "Customer X" } : {};
+      const members = ["conv_parent", "conv_peer", "conv_last"].map((id, index) =>
+        conv(id, "Claude Code", { family, labels, created_at: index + 1 }),
+      );
+      mockConversations(members);
+      const { refresh } = renderSidebar();
+      if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+      for (const updated of [
+        members.slice(1),
+        members
+          .slice(1)
+          .map((row) => ({ ...row, family: { ...family, representative_id: "conv_peer" } })),
+      ]) {
+        mockConversations(updated);
+        refresh();
+        const representative = screen.getByText("conv_peer").closest("li")!;
+        expect(representative).not.toHaveAttribute("data-sibling-session");
+        expect(
+          within(representative).getByRole("button", { name: "Collapse session family" }),
+        ).toBeInTheDocument();
+        expect(screen.getByText("conv_last").closest("li")).toHaveAttribute(
+          "data-sibling-session",
+          "true",
+        );
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "keeps the representative in the first display page (project: %s)",
+    (inProject) => {
+      const family = { id: "family", representative_id: "conv_0", pinned: false };
+      if (inProject) projectsMock.push("Customer X");
+      mockConversations(
+        Array.from({ length: 6 }, (_, index) =>
+          conv(`conv_${index}`, "Claude Code", {
+            created_at: index,
+            updated_at: index,
+            family,
+            labels: inProject ? { omni_project: "Customer X" } : {},
+          }),
+        ),
+      );
+      renderSidebar(true, "/", undefined, undefined, [], vi.fn(), {
+        ...sidebarConfig,
+        displayPageSize: 5,
+      });
+      if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+      expect(screen.getByText("conv_0")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Collapse session family" })).toBeInTheDocument();
+      for (let index = 1; index < 5; index++) {
+        expect(screen.getByText(`conv_${index}`).closest("li")).toHaveAttribute(
+          "data-sibling-session",
+          "true",
+        );
+      }
+      expect(screen.queryByText("conv_5")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: inProject ? /Show more/ : "Load more" }));
+      expect(screen.getByText("conv_5").closest("li")).toHaveAttribute(
+        "data-sibling-session",
+        "true",
+      );
+    },
+  );
 });
 
 // The sidebar splits sessions across two tabs: "My sessions" (owned, with the
@@ -2410,9 +2674,11 @@ describe("Sidebar project sections", () => {
 
   it("moves a pinned project session out into the global Pinned section", () => {
     projectsMock.push("Customer X");
+    const family = { id: "family", representative_id: "conv_pinned", pinned: true };
     mockConversations([
       conv("conv_plain", "Claude Code", { labels: { omni_project: "Customer X" } }),
-      conv("conv_pinned", "Claude Code", { labels: { omni_project: "Customer X" } }),
+      conv("conv_pinned", "Claude Code", { labels: { omni_project: "Customer X" }, family }),
+      conv("conv_peer", "Codex", { labels: { omni_project: "Customer X" }, family }),
     ]);
     // Pin one of the filed sessions via localStorage (client-side pins).
     seedPins(["conv_pinned"]);
@@ -2422,12 +2688,17 @@ describe("Sidebar project sections", () => {
     // project and renders in the flat global Pinned section.
     const pinnedSection = screen.getByText("Pinned").closest("section")!;
     expect(within(pinnedSection).getByText("conv_pinned")).toBeInTheDocument();
+    expect(within(pinnedSection).getByText("conv_peer").closest("li")).toHaveAttribute(
+      "data-sibling-session",
+      "true",
+    );
 
     // The project folder keeps only its non-pinned session.
     fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_plain")).toBeInTheDocument();
     expect(within(projectSection).queryByText("conv_pinned")).toBeNull();
+    expect(within(projectSection).queryByText("conv_peer")).toBeNull();
   });
 
   it("does not render a project section when useProjects returns nothing", () => {
@@ -3625,11 +3896,23 @@ describe("Sidebar view options", () => {
     mockConversations([
       conv("conv_running", "Codex", { status: "running" }),
       conv("conv_idle", "Codex", { status: "idle" }),
+      conv("conv_parent", "Codex", {
+        status: "idle",
+        updated_at: 30,
+        family: { id: "family", representative_id: "conv_parent", pinned: false },
+      }),
+      conv("conv_peer", "Codex", {
+        status: "failed",
+        updated_at: 1,
+        family: { id: "family", representative_id: "conv_parent", pinned: false },
+      }),
     ]);
     renderGroupingSidebar();
     expect(screen.queryByText("Projects")).toBeNull();
     expect(screen.queryByRole("button", { name: "Sessions" })).toBeNull();
-    expect(groupHeaders()).toEqual(["Working", "Done"]);
+    expect(groupHeaders()).toEqual(["Needs attention", "Working", "Done"]);
+    expect(within(groupSection("Needs attention")).getByText("conv_parent")).toBeInTheDocument();
+    expect(within(groupSection("Needs attention")).getByText("conv_peer")).toBeInTheDocument();
 
     openViewSubmenu("session-grouping-menu");
     expect(screen.getByRole("menuitemradio", { name: "Status" })).toHaveAttribute(

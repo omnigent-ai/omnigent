@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_home_config_model,
     read_mcp_startup,
     read_policy_hook_config,
+    record_acknowledged_turn_id,
     record_app_server_stopped,
     record_certificate_failure,
     record_child_usage_baseline,
@@ -666,6 +668,55 @@ def test_active_turn_update_requires_storage_only_when_state_changes(
             update_active_turn_id(bridge_dir, next_turn_id)
         assert raised.value.errno == errno.ENOSPC
     assert read_bridge_state(bridge_dir) == before
+
+
+@pytest.mark.parametrize(
+    ("sent_turn_id", "forwarder_events", "acknowledged_turn_id", "recorded", "active_after"),
+    [
+        (None, [], "turn_a", True, "turn_a"),
+        (None, [("started", "turn_a")], "turn_a", True, "turn_a"),
+        (None, [("started", "turn_native")], "turn_unstarted", False, "turn_native"),
+        (None, [("started", "turn_a"), ("completed", "turn_a")], "turn_a", False, None),
+        (
+            None,
+            [("started", "turn_native"), ("completed", "turn_native")],
+            "turn_unstarted",
+            False,
+            None,
+        ),
+        ("turn_a", [], "turn_a", True, "turn_a"),
+        ("turn_a", [("completed", "turn_a")], "turn_a", False, None),
+        ("turn_a", [("completed", "turn_a"), ("started", "turn_b")], "turn_a", False, "turn_b"),
+        (None, [("rewritten", "session_id")], "turn_a", False, None),
+        (None, [("rewritten", "thread_id")], "turn_a", False, None),
+        (None, [("rewritten", "socket_path")], "turn_a", False, None),
+    ],
+)
+def test_acknowledged_turn_keeps_turn_changes_recorded_meanwhile(
+    bridge_dir: Path,
+    sent_turn_id: str | None,
+    forwarder_events: list[tuple[str, str]],
+    acknowledged_turn_id: str,
+    recorded: bool,
+    active_after: str | None,
+) -> None:
+    _seed_active_turn(bridge_dir, sent_turn_id)
+    sent_state = read_bridge_state(bridge_dir)
+    assert sent_state is not None
+    for event, value in forwarder_events:
+        if event == "started":
+            update_active_turn_id(bridge_dir, value)
+        elif event == "completed":
+            assert clear_active_turn_id_if_matches(bridge_dir, value)
+        else:
+            # Launch, resume and rotation write fresh state with the revision reset.
+            fresh_state = replace(sent_state, **{value: f"{getattr(sent_state, value)}-new"})
+            write_bridge_state(bridge_dir, fresh_state)
+
+    assert record_acknowledged_turn_id(bridge_dir, sent_state, acknowledged_turn_id) is recorded
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.active_turn_id == active_after
 
 
 def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path) -> None:

@@ -47,6 +47,7 @@ import {
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
@@ -1176,6 +1177,20 @@ describe("workingIndicatorLabel — parked on a dialog", () => {
     // the terminal tab. A bare "Blocked on: dialog open" leaves the user with
     // no idea where to respond, so the label must guide them to the terminal.
     expect(workingIndicatorLabel(2, "dialog open")).toMatch(/terminal/i);
+  });
+
+  it("tentatively points at the terminal when a hidden prompt replaced its input box", () => {
+    expect(workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON)).toBe(
+      "Something in the agent's terminal may need your input.",
+    );
+    expect(
+      workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON, {
+        terminalView: true,
+        answerableInChat: true,
+      }),
+    ).toBe(
+      "Something in the agent's terminal may need your input. Open the Terminal view to check.",
+    );
   });
 
   it("falls back to the normal label when not parked", () => {

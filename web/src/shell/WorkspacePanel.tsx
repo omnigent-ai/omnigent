@@ -70,6 +70,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
+import { requestSandboxWake } from "@/hooks/useSandboxAutoWake";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -91,6 +92,7 @@ import {
   terminalTabKey,
   useCreateTerminal,
   useTerminals,
+  type TerminalInfo,
 } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
@@ -223,7 +225,8 @@ function NewTabMenu({
   onCreateStart?: () => void;
   /** Called when the shell create POST fails, so the caller can disarm the
    *  focus snapshot armed by ``onCreateStart``. */
-  onCreateError?: () => void;
+  /** The create failed; *opened* is the shell tab opened early, if any. */
+  onCreateError?: (opened?: TerminalInfo) => void;
   /** Open session's derived liveness — drives the "Shell" item's connect
    *  affordance. Absent is treated as ready. */
   liveness?: SessionLiveness;
@@ -259,9 +262,9 @@ function NewTabMenu({
     // (runner-asleep) session the POST can lag the tab's arrival by seconds;
     // ``onOpenTerminal`` on success is a backstop for when it's already open.
     onCreateStart?.();
-    create.mutate(name, {
-      onSuccess: (info) => onOpenTerminal(terminalTabKey(info)),
-      onError: () => onCreateError?.(),
+    create.launch(name, {
+      onOpen: (info) => onOpenTerminal(terminalTabKey(info)),
+      onError: (_error, opened) => onCreateError?.(opened),
     });
   };
 
@@ -800,7 +803,7 @@ interface WorkspacePanelProps {
   onShellCreateStart?: () => void;
   /** Called when the shell create POST fails, so the focus snapshot armed by
    *  ``onShellCreateStart`` is disarmed and can't grab an unrelated shell. */
-  onShellCreateFailed?: () => void;
+  onShellCreateFailed?: (opened?: TerminalInfo) => void;
   /** Whether the mobile side-chats drawer is open. The rail is hidden on
    *  phones, so side chats render in this drawer instead. */
   mobileSideChatsOpen?: boolean;
@@ -1452,6 +1455,11 @@ function WorkspacePanelImpl({
     return index === -1 ? undefined : String(index + 1);
   };
   const selectPermanentTab = (tab: RightRailTab) => {
+    // Files, Changes and Pull Requests need the session's host, so picking one wakes
+    // an asleep sandbox.
+    if ((tab === "files" || tab === "changes" || tab === "github") && conversationId) {
+      requestSandboxWake(conversationId);
+    }
     onRightRailTabChange(tab);
   };
   const tabAriaShortcut = (tab: RightRailTab) => {
@@ -1966,7 +1974,7 @@ function WorkspacePanelImpl({
                         aria-label={label}
                         aria-selected={active}
                         className="flex items-center gap-1"
-                        onClick={() => onRightRailTabChange(tab)}
+                        onClick={() => selectPermanentTab(tab)}
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
