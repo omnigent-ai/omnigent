@@ -9203,6 +9203,7 @@ async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card
             "attempt_only",
             "mismatched_attempt",
             "malformed_attempt",
+            "malformed_stable_id",
             "mismatched_pending",
             "attempt_only",
             "mismatched_pending",
@@ -9254,6 +9255,8 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
         identity = {"input_stable_id": first_stable_id}
     elif identity_case == "pending_only":
         identity.pop("delivery_attempt_id")
+    elif identity_case == "malformed_stable_id":
+        identity["input_stable_id"] = "invalid identity"
     elif identity_case == "attempt_only":
         identity.pop("pending_id")
     elif identity_case == "mismatched_attempt":
