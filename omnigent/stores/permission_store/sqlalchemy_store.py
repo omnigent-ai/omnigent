@@ -379,7 +379,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
             next_cursor = None
         return [_to_entity(r) for r in rows], next_cursor
 
-    def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
+    def list_for_sessions(
+        self, conversation_ids: list[str], *, user_id: str | None = None
+    ) -> dict[str, list[SessionPermission]]:
         """Return all grants for multiple sessions.  See base class for contract."""
         if not conversation_ids:
             return {}
@@ -392,6 +394,11 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     select(SqlSessionPermission).where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.conversation_id.in_(conversation_ids),
+                        *(
+                            [SqlSessionPermission.user_id == user_id]
+                            if user_id is not None
+                            else []
+                        ),
                     )
                 )
                 .scalars()
