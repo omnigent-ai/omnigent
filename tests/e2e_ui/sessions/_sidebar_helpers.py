@@ -4,6 +4,17 @@ import httpx
 from playwright.sync_api import Page, Route
 
 
+def wait_for_sidebar_collapse(page: Page) -> None:
+    """Wait for the closed sidebar to release its layout width before measuring."""
+    page.wait_for_function(
+        "() => [...document.querySelectorAll('.conversations-sidebar')]"
+        ".every((sidebar) => sidebar.getBoundingClientRect().width === 0)"
+    )
+    page.evaluate(
+        "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
+    )
+
+
 def patch_session(base_url: str, session_id: str, **fields: object) -> None:
     """PATCH session fields such as ``title`` or ``archived`` over the API."""
     response = httpx.patch(f"{base_url}/v1/sessions/{session_id}", json=fields, timeout=10.0)
