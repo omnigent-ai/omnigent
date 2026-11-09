@@ -70,6 +70,11 @@ _GIT_DISCOVERY_ENV = frozenset(
 )
 
 
+# Global options that keep read-only status/diff from refreshing and writing
+# the index. ``--no-optional-locks`` alone does not stop ``git diff`` doing so.
+_LOCK_FREE_GIT_READ_OPTIONS = ("--no-optional-locks", "-c", "diff.autoRefreshIndex=false")
+
+
 def _anchored_git_env() -> dict[str, str]:
     """Return this process's environment minus repository-redirecting ``GIT_*``.
 
@@ -1464,6 +1469,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
     def _run_git(self, argv: list[str]) -> subprocess.CompletedProcess[bytes]:
         if self._run_git_command is not None:
             return self._run_git_command(argv[1:], self._git_root, _git_timeout_seconds())
+        # These background reads must not take index.lock, or the agent's own
+        # `git add`/`git commit` fails while a slow status is running.
+        argv = [argv[0], *_LOCK_FREE_GIT_READ_OPTIONS, *argv[1:]]
         return subprocess.run(
             argv, cwd=str(self._git_root), capture_output=True, timeout=_git_timeout_seconds()
         )
