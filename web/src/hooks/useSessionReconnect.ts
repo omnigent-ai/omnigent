@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
 import { fetchHosts } from "@/hooks/useHosts";
@@ -11,7 +11,7 @@ import {
   isElectronShell,
   supportsArcaConnect,
 } from "@/lib/nativeBridge";
-import { retrySession } from "@/lib/sessionsApi";
+import { type PostEventResponse, retrySession } from "@/lib/sessionsApi";
 import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import type { SandboxStatus } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
@@ -21,6 +21,57 @@ export const SANDBOX_WAKE_ONLINE_GRACE_POLLS = 3;
 
 /** How long a wake may follow a launch stage that never finishes before Reconnect host returns. */
 export const SANDBOX_WAKE_STAGE_LIMIT_MS = 5 * 60_000;
+
+// One sandbox wake request per session, shared by everything that wakes it
+// (Reconnect host, opening the session, the Files and Changes tabs, the
+// terminal's Resume): a caller during the request joins it and gets its answer.
+const sandboxWakeRequests = new Map<string, Promise<PostEventResponse>>();
+
+/** Send `retry_session` to wake *sessionId*'s sandbox, or join the one in flight. */
+export function wakeSandboxSession(sessionId: string): Promise<PostEventResponse> {
+  const running = sandboxWakeRequests.get(sessionId);
+  if (running) return running;
+  const request = retrySession(sessionId).finally(() => {
+    if (sandboxWakeRequests.get(sessionId) === request) sandboxWakeRequests.delete(sessionId);
+  });
+  sandboxWakeRequests.set(sessionId, request);
+  return request;
+}
+
+// Sessions whose shown view is waking their sandbox, for other panels to say so.
+const startingSandboxes = new Map<string, number>();
+const startingListeners = new Set<() => void>();
+
+function subscribeStartingSandboxes(listener: () => void): () => void {
+  startingListeners.add(listener);
+  return () => startingListeners.delete(listener);
+}
+
+function markSandboxStarting(sessionId: string, delta: 1 | -1): void {
+  const count = (startingSandboxes.get(sessionId) ?? 0) + delta;
+  if (count > 0) startingSandboxes.set(sessionId, count);
+  else startingSandboxes.delete(sessionId);
+  for (const listener of startingListeners) listener();
+}
+
+/**
+ * Whether *sessionId*'s sandbox is starting, as its host dot shows: Reconnect
+ * host is waking it, or the server reports its launch in progress (a wake from
+ * before a session switch, another tab, or a sent message).
+ */
+export function useSandboxStarting(sessionId: string | null | undefined): boolean {
+  const read = useCallback(
+    () => (sessionId ? startingSandboxes.has(sessionId) : false),
+    [sessionId],
+  );
+  const waking = useSyncExternalStore(subscribeStartingSandboxes, read);
+  const launching = useChatStore((s) =>
+    s.conversationId === sessionId && s.sandboxStatus !== null
+      ? !isSandboxLaunchStopped(s.sandboxStatus)
+      : false,
+  );
+  return waking || launching;
+}
 
 /** Identifies a reported launch stage by value; snapshots rebuild the object. */
 function launchKey(launch: SandboxStatus | null): string {
@@ -139,6 +190,13 @@ export function useSessionReconnect({
     }
   }, [hostId, runsArcaConnect]);
 
+  const starting = sandboxWake !== null;
+  useEffect(() => {
+    if (!sessionId || !starting) return;
+    markSandboxStarting(sessionId, 1);
+    return () => markSandboxStarting(sessionId, -1);
+  }, [sessionId, starting]);
+
   // Liveness polls lag the wake, so stay "starting" until the host reads online.
   useEffect(() => {
     if (sandboxWake === "awaiting_online" && hostOnline === true) setSandboxWake(null);
@@ -172,9 +230,11 @@ export function useSessionReconnect({
       if (start && inFlight.current === start.operation) inFlight.current = null;
       wakeStart.current = null;
       setSandboxWake(null);
+      // A request whose answer never comes mustn't capture the next Reconnect host.
+      if (sessionId) sandboxWakeRequests.delete(sessionId);
     }, SANDBOX_WAKE_STAGE_LIMIT_MS);
     return () => clearTimeout(timer);
-  }, [wakeRunning, launchInProgress]);
+  }, [wakeRunning, launchInProgress, sessionId]);
 
   // A failed or waiting stage left over from before the click mustn't end the
   // wake; one reported since then does, even if it repeats the old one.
@@ -199,7 +259,7 @@ export function useSessionReconnect({
     wakeStart.current = { operation, launch: launchKey(clickLaunch), stageChanged: false };
     setSandboxWake("waking");
     try {
-      await retrySession(sessionId);
+      await wakeSandboxSession(sessionId);
       if (inFlight.current !== operation) return;
       setSandboxWake("awaiting_online");
       refreshRunnerHealth();
