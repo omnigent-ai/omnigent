@@ -403,6 +403,47 @@ async def test_create_titled_session_keeps_title_after_first_message(
     assert not message.get("is_meta")
 
 
+@pytest.mark.parametrize("event_type", ["message", "external_conversation_item"])
+async def test_client_meta_and_external_messages_do_not_infer_user_authorship(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    content_text = "Client meta input" if event_type == "message" else "External input"
+    item_data: dict[str, Any] = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": content_text}],
+    }
+    if event_type == "message":
+        item_data["is_meta"] = True
+        event_data = item_data
+    else:
+        event_data = {
+            "item_type": "message",
+            "item_data": item_data,
+            "response_id": "external_turn",
+        }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": event_type, "data": event_data},
+        )
+        assert response.status_code == 202, response.text
+
+    items_response = await client.get(f"/v1/sessions/{session['id']}/items")
+    assert items_response.status_code == 200, items_response.text
+    [message] = [item for item in items_response.json()["data"] if item["type"] == "message"]
+    assert message["content"] == item_data["content"]
+    assert message.get("is_meta", False) is (event_type == "message")
+    assert "user_authored" not in message
+
+
 async def test_sidebar_rename_wins_in_flight_background_title(
     client: httpx.AsyncClient,
     app: Any,
@@ -2785,6 +2826,8 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     items = items_resp.json()["data"]
     visible = next(item for item in items if item["type"] == "slash_command")
     meta = next(item for item in items if item["type"] == "message" and item.get("is_meta"))
+    # Explicit skill invocation marks even its hidden expansion as user-authored.
+    assert meta["user_authored"] is True
     assert visible["name"] == "grill-me"
     assert visible["kind"] == "skill"
     assert visible["arguments"] == "review this rollout"
@@ -11832,6 +11875,7 @@ async def test_patch_approval_mode_forwards_and_persists_label(
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
 async def test_patch_approval_mode_requires_live_runner_before_persisting(
     client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     runner_status: int | None,
 ) -> None:
@@ -11878,10 +11922,25 @@ async def test_patch_approval_mode_requires_live_runner_before_persisting(
             },
         )
 
+        from omnigent.stores.conversation_store import FAMILY_PIN_LABEL_PREFIX
+        from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+        store = SqlAlchemyConversationStore(db_uri)
+        sibling = store.create_conversation(agent_id=agent["id"])
+        store.add_new_sibling(session["id"], sibling.id, user_id=None)
+        project_id = "a" * 32
+        store.set_conversation_project(session["id"], project_id)
         resp = await client.patch(
             f"/v1/sessions/{session['id']}",
-            json={"approval_mode": "full-access"},
+            json={
+                "approval_mode": "full-access",
+                "project_id": "",
+                "labels": {"omnigent.pinned": "1"},
+            },
         )
+        for member in store.get_session_family(session["id"]):
+            assert member.project_id == project_id
+            assert not any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in member.labels)
         snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     finally:
         if fake_runner is not None:
