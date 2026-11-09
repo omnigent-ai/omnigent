@@ -17397,3 +17397,36 @@ async def test_relay_keeps_high_descriptor_connections_alive(
         release.set()
         await asyncio.wait_for(call, 2)
         relay.close()
+
+
+@pytest.mark.parametrize("saved", [False, True])
+@pytest.mark.parametrize("active", [None, [], ["claude"]])
+def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved):
+    from unittest.mock import patch
+
+    from omnigent.mcp_disabled_servers import ServerKey, apply_claude_settings, set_disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    original_args = augment_claude_args(("--model", "test-model"), bridge_dir=bridge_dir)
+    settings_path = Path(original_args[original_args.index("--settings") + 1])
+    original = settings_path.read_bytes()
+    if saved:
+        set_disabled(ServerKey("claude", "fixture"), True)
+    with patch(
+        "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
+    ) as hook:
+        args = augment_claude_args(
+            ("--model", "test-model"), bridge_dir=bridge_dir, active_harnesses=active
+        )
+    hook.assert_called_once()
+    assert hook.call_args.kwargs == {"executor": "claude-native", "active_harnesses": active}
+    assert args == original_args
+    if active and saved:
+        assert json.loads(settings_path.read_bytes()) == {
+            **json.loads(original),
+            "deniedMcpServers": [{"serverName": "fixture"}],
+        }
+    else:
+        assert settings_path.read_bytes() == original
