@@ -332,6 +332,9 @@ class FakeConversationStore:
     def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
         self.label_writes[conversation_id] = dict(labels)
 
+    def clear_host_binding(self, conversation_id: str, **kwargs: Any) -> None:
+        self.updated.append({"id": conversation_id, "clear_host_binding": kwargs})
+
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
 
@@ -960,6 +963,32 @@ def _claude_agent_deps(
             ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
             False,
         ),
+        (
+            "codex-native",
+            "ask-for-approval",
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "-c",
+                'approvals_reviewer="user"',
+            ],
+            False,
+        ),
+        (
+            "codex-native",
+            "approve-for-me",
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ],
+            False,
+        ),
         ("codex-native", "default", None, False),
         ("codex-native", "bypass", None, True),
         ("cursor-native", "auto-review", ["--auto-review"], False),
@@ -991,6 +1020,7 @@ async def test_permission_mode_launch_options(
     [
         ("claude-native", "acceptEdits", ["--permission-mode", "acceptEdits"], False),
         ("codex-native", "default", None, False),
+        ("codex-native", "bypass", None, True),
     ],
 )
 async def test_permission_mode_becomes_terminal_launch_args(
@@ -1045,7 +1075,7 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
 async def test_incompatible_permission_mode_fails_without_session() -> None:
     """A saved mode for another harness must not silently fall back to defaults."""
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
 
     launch = AsyncMock()
 
@@ -1061,7 +1091,7 @@ async def test_incompatible_permission_mode_fails_without_session() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "permission_mode_unsupported"
-    assert "'acceptEdits' is not supported by 'codex-native'" in store.runs[0]["error"]
+    assert "'bypassPermissions' is not supported by 'codex-native'" in store.runs[0]["error"]
     assert "Edit the automation" in store.runs[0]["error"]
     assert store.runs[0]["conversation_id"] is None
 
@@ -2856,13 +2886,13 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
         ),
         (_continued_session(agent_id="ag_other"), {}, "continued_session_incompatible"),
         (_continued_session(), {"base_branch": "HEAD"}, "continued_session_incompatible"),
-        # Under the "new sessions only" contract a reused session keeps its own
-        # mode, so one switched to bypass must not take unattended prompts.
+        # A reused session keeps its own mode, so one switched to a mode that skips
+        # approval must not take prompts from a task that never selected such a mode.
         (
             _continued_session(
                 labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
             ),
-            {},
+            {"permission_mode": "auto"},
             "permission_mode_not_allowed",
         ),
         # Codex's full bypass, as spec-derived launch args emit it, with no label.
@@ -2967,6 +2997,50 @@ async def test_continue_never_replaces_an_unusable_session(
     assert conv_store.created == []
     assert [(run["status"], run["error_code"]) for run in store.runs] == [("failed", error_code)]
     assert "start a new session" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_mode", "session"),
+    [
+        (
+            "bypassPermissions",
+            _continued_session(
+                labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+            ),
+        ),
+        (
+            "full-access",
+            _continued_session(
+                terminal_launch_args=[
+                    "--sandbox",
+                    "danger-full-access",
+                    "--ask-for-approval",
+                    "never",
+                ]
+            ),
+        ),
+        # Any approval-skipping selection opts in; it is not a ceiling on the session's mode.
+        (
+            "dontAsk",
+            _continued_session(
+                labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+            ),
+        ),
+        ("full-access", _continued_session(labels={CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"})),
+    ],
+)
+async def test_continue_accepts_a_session_in_a_mode_the_task_selects(
+    task_mode: str, session: _FakeConversation
+) -> None:
+    """A task that selects a mode skipping approval keeps sending into its session in one."""
+    conv_store = _ExistingConversationStore(session)
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(permission_mode=task_mode)})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert [conv.id for conv in launched] == ["conv_prev"]
+    assert [run["status"] for run in store.runs] == ["succeeded"]
 
 
 @pytest.mark.asyncio
@@ -3793,40 +3867,6 @@ async def test_cancelled_session_creation_waits_for_writes_before_cleanup(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("harness", "mode"),
-    [
-        ("claude-native", "bypassPermissions"),
-        ("claude-native", "dontAsk"),
-        ("codex-native", "bypass"),
-        ("codex-native", "full-access"),
-        ("cursor-native", "yolo"),
-        ("antigravity-native", "skip"),
-        ("devin-native", "dangerous"),
-    ],
-)
-async def test_saved_unattended_disallowed_mode_fails_without_session(
-    harness: str, mode: str
-) -> None:
-    """A task saved before the restriction fails at fire instead of running unattended."""
-    conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=mode)})
-    launch = AsyncMock()
-
-    on_fire = build_on_fire(
-        _claude_agent_deps(store, conv_store, harness=harness), launch_dispatch=launch
-    )
-    await on_fire(0, "task_1")
-    await _drain()
-
-    launch.assert_not_awaited()
-    assert conv_store.created == []
-    assert store.runs[0]["status"] == "failed"
-    assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
-    assert repr(mode) in store.runs[0]["error"]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(("spec_mode", "fires"), [(None, True), ("bypassPermissions", False)])
 async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fires: bool) -> None:
     """A Claude SDK spec with no mode runs in auto; one set to bypassPermissions cannot fire."""
@@ -3850,7 +3890,40 @@ async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fire
         launch.assert_not_awaited()
         assert conv_store.created == []
         assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
-        assert "the agent's default" in store.runs[0]["error"]
+        assert "spec sets permission mode 'bypassPermissions'" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_mode", "fires"),
+    [(None, False), ("auto", False), ("bypassPermissions", True)],
+)
+async def test_sdk_agent_default_mode_gates_a_continued_session(
+    task_mode: str | None, fires: bool
+) -> None:
+    """A continued session keeps the SDK spec's bypassPermissions default.
+
+    SDK agents take no task mode at save, so these tasks were saved while the agent ran a
+    native harness, and it was then reinstalled under the same id as this SDK agent.
+    Only a task selecting an approval-skipping mode may continue; ``auto`` is refused.
+    """
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(permission_mode=task_mode)})
+    conv_store = _ExistingConversationStore(_continued_session())
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness="claude-sdk", permission_mode="bypassPermissions"),
+    )
+
+    launched = await _fire_once(deps)
+
+    if fires:
+        assert [conv.id for conv in launched] == ["conv_prev"]
+    else:
+        assert launched == []
+        assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
+        assert "spec sets permission mode 'bypassPermissions'" in store.runs[0]["error"]
 
 
 @pytest.mark.parametrize(
@@ -3887,9 +3960,9 @@ async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fire
         ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, None, "bypass"),
     ],
 )
-def test_session_unattended_disallowed_mode(
+def test_session_approval_skipping_mode(
     labels: dict[str, str], launch_args: list[str] | None, expected: str | None
 ) -> None:
     conv = SimpleNamespace(labels=labels, terminal_launch_args=launch_args)
 
-    assert fire_mod.session_unattended_disallowed_mode(conv) == expected
+    assert fire_mod.session_approval_skipping_mode(conv) == expected

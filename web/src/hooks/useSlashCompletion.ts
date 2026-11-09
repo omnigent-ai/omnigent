@@ -23,7 +23,6 @@ const NO_LABELS: Readonly<Record<string, string>> = {};
 export interface SlashCompletionKeyEvent {
   key: string;
   shiftKey: boolean;
-  altKey?: boolean;
   preventDefault: () => void;
 }
 
@@ -228,8 +227,7 @@ export function useSlashCompletion({
       if (
         !shouldPreferSendOverCompletion &&
         (e.key === "Tab" ||
-          // Alt+Enter is no completion chord (nor a newline); it does nothing.
-          (e.key === "Enter" && !e.shiftKey && !e.altKey && (!mobile || mobileEnterCompletes))) &&
+          (e.key === "Enter" && !e.shiftKey && (!mobile || mobileEnterCompletes))) &&
         index >= 0
       ) {
         e.preventDefault();

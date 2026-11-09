@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -12,7 +13,7 @@ import shlex
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Collection
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -260,6 +261,17 @@ _CODEX_COLLAB_RUNNING_STATUSES = frozenset({"pendingInit", "running"})
 _CODEX_COLLAB_FAILED_STATUSES = frozenset({"errored", "notFound"})
 # Omnigent control event type sent when a Codex child thread is discovered.
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE = "external_codex_subagent_start"
+# Items that register child threads stay on the ordered parent path so a
+# child's lane only ever starts after its Omnigent session exists.
+_CODEX_CHILD_REGISTRATION_ITEM_TYPES = frozenset(
+    {_CODEX_COLLAB_AGENT_ITEM_TYPE, _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE}
+)
+# Child events handled at once across all sub-agent lanes.
+_CHILD_DELIVERY_CONCURRENCY = 8
+# A child event older than this when delivered means its lane is backlogged.
+_CHILD_DELIVERY_LAG_WARNING_SECONDS = 30.0
+# Upper bound on draining queued child events at forwarder shutdown.
+_CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS = 10.0
 _PLAN_IMPLEMENTATION_QUESTION_ID = "plan_implementation"
 _PLAN_IMPLEMENTATION_TITLE = "Implement this plan?"
 _PLAN_IMPLEMENTATION_YES = "Yes, implement this plan"
@@ -365,6 +377,14 @@ class _ForwarderTarget:
     elicitation_tracker: _CodexElicitationTaskTracker
 
 
+@dataclass(frozen=True)
+class _QueuedChildEvent:
+    """One child-thread notification waiting on its lane."""
+
+    deliver: Callable[[], Awaitable[None]]
+    enqueued_at: float
+
+
 @dataclass
 class _CodexChildStream:
     """Child output and turn identity, independent of the parent's disk bridge."""
@@ -373,6 +393,68 @@ class _CodexChildStream:
     delta_coalescer: _OutputTextDeltaCoalescer
     active_turn_id: str | None = None
     terminal_turn_ids: set[str] = field(default_factory=set)
+    # Ordered lane so a busy child never blocks the parent's notifications.
+    delivery_queue: asyncio.Queue[_QueuedChildEvent | None] = field(default_factory=asyncio.Queue)
+    delivery_worker: asyncio.Task[None] | None = None
+    last_lag_warning_at: float | None = None
+
+    def enqueue(self, queued: _QueuedChildEvent, slots: asyncio.Semaphore) -> None:
+        """Queue one child event and start the lane's worker if needed."""
+        self.delivery_queue.put_nowait(queued)
+        if self.delivery_worker is None or self.delivery_worker.done():
+            self.delivery_worker = asyncio.create_task(
+                self._deliver(slots), name="codex-native-child-delivery"
+            )
+
+    async def _deliver(self, slots: asyncio.Semaphore) -> None:
+        """Deliver this child's events in order, sharing the global post budget."""
+        loop = asyncio.get_running_loop()
+        while (queued := await self.delivery_queue.get()) is not None:
+            waited = loop.time() - queued.enqueued_at
+            if waited >= _CHILD_DELIVERY_LAG_WARNING_SECONDS and (
+                self.last_lag_warning_at is None
+                or loop.time() - self.last_lag_warning_at >= _CHILD_DELIVERY_LAG_WARNING_SECONDS
+            ):
+                self.last_lag_warning_at = loop.time()
+                _logger.warning(
+                    "Codex child delivery is backlogged: waited=%.1fs queued=%d",
+                    waited,
+                    self.delivery_queue.qsize(),
+                )
+            async with slots:
+                try:
+                    await queued.deliver()
+                except Exception:  # keep the lane alive, as the parent loop does.
+                    _logger.warning("Codex child event handling failed", exc_info=True)
+
+    async def drain(self, timeout: float | None = _CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS) -> None:
+        """Deliver queued events, then stop the worker; ``None`` waits without a bound."""
+        worker = self.delivery_worker
+        if worker is None or worker.done():
+            return
+        self.delivery_queue.put_nowait(None)
+        try:
+            async with asyncio.timeout(timeout):
+                await asyncio.shield(worker)
+        except TimeoutError:
+            # The unread sentinel offsets the dequeued event the cancel drops.
+            _logger.warning(
+                "Codex child delivery drain timed out: dropped=%d",
+                self.delivery_queue.qsize(),
+            )
+            await self._stop_worker(worker)
+        except asyncio.CancelledError:
+            # The shield keeps a timeout from killing delivery mid-post; a
+            # cancelled shutdown must still stop the worker before resources close.
+            await self._stop_worker(worker)
+            raise
+
+    @staticmethod
+    async def _stop_worker(worker: asyncio.Task[None]) -> None:
+        """Cancel the lane worker and wait until it has finished."""
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
 
     def accepts_event(self, method: str, params: _JsonObject) -> bool:
         turn_id = _terminal_turn_id_from_params(params) or _turn_id_from_payload(params)
@@ -641,6 +723,9 @@ class _CodexForwarderState:
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
+    child_delivery_slots: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(_CHILD_DELIVERY_CONCURRENCY)
+    )
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
@@ -877,12 +962,58 @@ class _CodexForwarderState:
             self.child_streams[thread_id] = stream
         return stream
 
+    def enqueue_child_event(
+        self,
+        client: httpx.AsyncClient,
+        event: CodexMessage,
+        deliver: Callable[[], Awaitable[None]],
+        parent_thread_id: str | None,
+    ) -> bool:
+        """
+        Hand a registered child's notification to that child's ordered lane.
+
+        Usage frames are recorded here, in connection order, because a child's
+        inherited baseline depends on frames other lanes have not delivered yet.
+
+        :param client: HTTP client the child's coalescer posts through.
+        :param event: Codex app-server notification envelope.
+        :param deliver: Handles ``event`` with its usage frame already recorded.
+        :param parent_thread_id: Current parent Codex thread id.
+        :returns: ``True`` when queued; ``False`` when the caller must handle
+            it inline (parent, unregistered, or child-registration events).
+        """
+        method = event.get("method")
+        params = event.get("params")
+        if method == "thread/started" or not isinstance(params, dict):
+            return False
+        item = params.get("item")
+        if isinstance(item, dict) and item.get("type") in _CODEX_CHILD_REGISTRATION_ITEM_TYPES:
+            return False
+        thread_id = _thread_id_from_params(params)
+        session_id = self.session_for_child_thread(thread_id) if thread_id is not None else None
+        if thread_id is None or session_id is None:
+            return False
+        if method == "thread/tokenUsage/updated":
+            self.note_usage_frame(params, parent_thread_id)
+        queued = _QueuedChildEvent(deliver=deliver, enqueued_at=asyncio.get_running_loop().time())
+        self.child_stream(client, thread_id, session_id).enqueue(queued, self.child_delivery_slots)
+        return True
+
+    async def settle_child_lanes(self) -> None:
+        """Deliver every queued child event before the parent's resources are replaced."""
+        await asyncio.gather(
+            *(stream.drain(timeout=None) for stream in self.child_streams.values())
+        )
+
     async def close_child_streams(self) -> None:
         """Drain child output while the forwarder's HTTP client is still open."""
-        await asyncio.gather(
-            *(stream.delta_coalescer.close() for stream in self.child_streams.values())
-        )
-        self.child_streams.clear()
+        try:
+            await asyncio.gather(*(stream.drain() for stream in self.child_streams.values()))
+        finally:
+            await asyncio.gather(
+                *(stream.delta_coalescer.close() for stream in self.child_streams.values())
+            )
+            self.child_streams.clear()
 
     def note_parent_rotation(self, session_id: str) -> None:
         """
@@ -2558,6 +2689,7 @@ async def supervise_forwarder(
                         bridge_dir=bridge_dir,
                         app_server_url=app_server_url,
                         event=event,
+                        forwarder_state=forwarder_state,
                     )
                     if rotated:
                         await _clear_superseded_background_work(
@@ -2601,7 +2733,8 @@ async def supervise_forwarder(
                         parent_thread_id=target.thread_id,
                         event=event,
                     )
-                    await _handle_event(
+                    handle = functools.partial(
+                        _handle_event,
                         ap_client,
                         session_id=target.session_id,
                         bridge_dir=bridge_dir,
@@ -2613,6 +2746,14 @@ async def supervise_forwarder(
                         codex_client=client,
                         forwarder_state=forwarder_state,
                     )
+                    # Sub-agents share this socket; their posts must not delay the parent.
+                    if not forwarder_state.enqueue_child_event(
+                        ap_client,
+                        event,
+                        functools.partial(handle, usage_frame_recorded=True),
+                        parent_thread_id=target.thread_id,
+                    ):
+                        await handle()
                 except Exception:  # keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         except BaseException as exc:
@@ -2634,11 +2775,12 @@ async def supervise_forwarder(
                 if isinstance(result, BaseException)
                 and not isinstance(result, asyncio.CancelledError)
             ]
+            # Child lanes run first: their queued handlers use the shared tracker.
             for close in (
+                forwarder_state.close_child_streams,
                 target.delta_coalescer.close,
                 target.usage_coalescer.close,
                 target.elicitation_tracker.close,
-                forwarder_state.close_child_streams,
                 client.close,
             ):
                 try:
@@ -2763,6 +2905,7 @@ async def _maybe_rotate_session_on_thread_started(
     bridge_dir: Path,
     app_server_url: str,
     event: CodexMessage,
+    forwarder_state: _CodexForwarderState | None = None,
 ) -> bool:
     """
     Rotate Omnigent ownership when Codex starts a new native thread.
@@ -2780,6 +2923,8 @@ async def _maybe_rotate_session_on_thread_started(
         ``"ws://127.0.0.1:9876"``. Persisted to bridge state for the
         replacement session.
     :param event: Codex app-server notification envelope.
+    :param forwarder_state: Connection state whose child lanes still hold
+        handlers bound to the target's current coalescers and tracker.
     :returns: ``True`` when rotation occurred.
     """
     new_thread_id = _thread_id_from_started_event(event)
@@ -2797,6 +2942,10 @@ async def _maybe_rotate_session_on_thread_started(
     # strands the real turn's output as stale. Ignore all ephemeral threads.
     if _thread_started_is_ephemeral(event):
         return False
+    # Queued child handlers captured this target's tracker and coalescers;
+    # deliver them before those are closed, as the serial loop used to.
+    if forwarder_state is not None:
+        await forwarder_state.settle_child_lanes()
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
     old_usage_coalescer = target.usage_coalescer
@@ -3460,6 +3609,7 @@ async def _handle_event(
     expected_thread_id: str | None = None,
     codex_client: CodexAppServerClient | None = None,
     forwarder_state: _CodexForwarderState | None = None,
+    usage_frame_recorded: bool = False,
 ) -> None:
     """
     Forward one Codex app-server notification.
@@ -3480,6 +3630,8 @@ async def _handle_event(
         JSON-RPC response.
     :param forwarder_state: Optional mutable state for Plan-mode prompt
         synthesis and thread setting tracking.
+    :param usage_frame_recorded: Whether a usage frame was already recorded in
+        connection order before the event was queued on a child lane.
     :returns: None.
     """
     method = event.get("method")
@@ -3546,7 +3698,11 @@ async def _handle_event(
         await _settle_mcp_startup(
             client, session_id=session_id, bridge_dir=bridge_dir, reason="thread went idle"
         )
-    if method == "thread/tokenUsage/updated" and forwarder_state is not None:
+    if (
+        method == "thread/tokenUsage/updated"
+        and forwarder_state is not None
+        and not usage_frame_recorded
+    ):
         forwarder_state.note_usage_frame(params, expected_thread_id)
     # Resolve routing: parent thread, known child thread, or stale/ignored.
     route_session_id, is_child = _resolve_event_session(
@@ -7770,12 +7926,12 @@ def _codex_tool_call_from_item(item: _JsonObject) -> _CodexToolCall | None:
 # guidance so a top-level session degrades with direction instead of an opaque
 # failure. The codex
 # ``--approval-mode`` presets do NOT disable this sandbox — only the "Full
-# access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
+# Access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
 _CODEX_SANDBOX_NAMESPACE_ERROR_MARKER = "No permissions to create new namespace"
 _CODEX_SANDBOX_BYPASS_GUIDANCE = (
     "Omnigent: Codex's command sandbox could not start because this container "
     "disallows unprivileged user namespaces, so the command did not run. To run "
-    'shell commands here, start a new Codex session with the "Full access" '
+    'shell commands here, start a new Codex session with the "Full Access" '
     "approval preset (New chat → permissions dropdown), or set "
     'sandbox_mode = "danger-full-access" in ~/.codex/config.toml on the runner.'
 )

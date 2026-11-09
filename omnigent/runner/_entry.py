@@ -15,6 +15,7 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -32,6 +33,7 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
+from omnigent.runner.busy_check import RunnerBusyCheck
 from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
 from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
@@ -1974,6 +1976,28 @@ async def _run_tunnel_from_env() -> None:
         callback = getattr(app.state, "has_active_work", None)
         return event_dispatcher.has_pending or (callable(callback) and bool(callback()))
 
+    def _last_work_progress() -> float | None:
+        """Return the newest work progress, independently of tunnel polling.
+
+        Covers session events the app published (any turn, however short) and
+        native forwarding (a mirrored sub-agent still streaming while its parent
+        is idle). Request frames are left out: browsing a session is not work.
+
+        :returns: Monotonic time of the newest progress, or ``None`` if none yet.
+        """
+        published = getattr(app.state, "last_event_published_at", None)
+        published_at = published() if callable(published) else None
+        stamps: list[float] = [
+            stamp
+            for stamp in (
+                event_dispatcher.last_dispatch_at,
+                native_forwarder_last_post_at(),
+                published_at if isinstance(published_at, float) else None,
+            )
+            if stamp is not None
+        ]
+        return max(stamps, default=None)
+
     # Human-readable reason for why the runner is shutting down, recorded
     # by whichever path wins the shutdown race and logged on the way out so
     # the runner log explains the exit instead of just stopping.
@@ -2041,6 +2065,23 @@ async def _run_tunnel_from_env() -> None:
                 extra={"session_id": runner_primary_session_id()},
             )
             direct_attach_listener = None
+
+    def _has_sandbox_work() -> bool:
+        """Return whether the runner is doing agent work, ignoring pane viewing.
+
+        :returns: ``True`` while a turn, dispatch or native turn is active.
+        """
+        callback = getattr(app.state, "has_sandbox_work", None)
+        if not callable(callback):
+            return _has_active_work()
+        return event_dispatcher.has_pending or bool(callback())
+
+    # Each pong tells the server whether to keep a managed sandbox warm: while
+    # the runner works, and for its idle timeout after (0: while connected), so
+    # the sandbox lives as long as an idle runner would, but viewing alone does
+    # not count.
+    sandbox_busy = RunnerBusyCheck(_has_sandbox_work, _last_work_progress)
+    keep_warm_grace_s = idle_timeout_s if idle_timeout_s > 0 else math.inf
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -2053,6 +2094,7 @@ async def _run_tunnel_from_env() -> None:
             event_dispatcher=event_dispatcher,
             on_reconnect=getattr(app.state, "catch_up_scan", None),
             on_activity=_mark_activity,
+            report_keep_warm=lambda: sandbox_busy.keep_warm(keep_warm_grace_s),
             shutdown_event=tunnel_shutdown_event,
             on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
             direct_attach_port=(

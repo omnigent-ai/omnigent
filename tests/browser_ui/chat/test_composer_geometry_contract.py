@@ -974,6 +974,7 @@ def _assert_scrolls_to_reveal(composer: Locator, line: int, scroll_before: float
 @pytest.mark.parametrize(
     ("edit", "expected"),
     [
+        pytest.param("Alt+Enter", _ITEMS + "\n", id="alt-enter"),
         pytest.param("paste", _ITEMS + "\nalpha\nbeta", id="paste"),
         pytest.param(
             "Shift+Enter above more text", _ITEMS + "\n  - " + _TEXT_BELOW, id="list-mid-draft"
@@ -1036,7 +1037,7 @@ def test_inserted_lines_scroll_in_without_jumping_past_the_caret(
         pytest.param(10, 10, "8px 10px", True, id="padded-new-line-below-the-box"),
     ],
 )
-def test_shift_enter_scrolls_only_as_far_as_the_caret_line(
+def test_alt_enter_scrolls_only_as_far_as_the_caret_line(
     page: Page,
     chat_session_contract: ChatSessionContract,
     caret_line: int,
@@ -1056,9 +1057,8 @@ def test_shift_enter_scrolls_only_as_far_as_the_caret_line(
     scroll_before = _align_line(composer, aligned_line, "bottom")
     assert _line_in_view(composer, caret_line + 1) is not scrolls
 
-    # The caret ends a list item, so the new line continues the list.
-    composer.press("Shift+Enter")
-    expect(composer).to_have_value(draft[:caret] + "\n  - " + draft[caret:])
+    composer.press("Alt+Enter")
+    expect(composer).to_have_value(draft[:caret] + "\n" + draft[caret:])
     _assert_scrolls_to_reveal(composer, caret_line + 1, scroll_before)
 
 

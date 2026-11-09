@@ -9,22 +9,17 @@ from typing import Any
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.native.permission_modes import (
+    APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
-    UNATTENDED_DISALLOWED_PERMISSION_MODES,
 )
 
 _logger = logging.getLogger(__name__)
 
-
-UNATTENDED_PERMISSION_MODE_MESSAGE = (
-    "Automations run unattended, so they cannot use permission mode {mode!r}; "
-    "choose a mode that asks for approval or uses the auto classifier"
+INHERITED_APPROVAL_SKIPPING_MESSAGE = (
+    "The agent's spec sets permission mode {mode!r}, which skips approval, and an automation "
+    "cannot inherit it; set a mode in the agent spec that asks for approval or uses the auto "
+    "classifier"
 )
-
-
-def unattended_permission_mode_allowed(mode: str | None) -> bool:
-    """Whether a scheduled run may launch with *mode* (``None`` is the harness default)."""
-    return mode not in UNATTENDED_DISALLOWED_PERMISSION_MODES
 
 
 def validate_scheduled_permission_mode(mode: str | None) -> str | None:
@@ -33,10 +28,6 @@ def validate_scheduled_permission_mode(mode: str | None) -> str | None:
         return None
     if not any(mode in modes for modes in PERMISSION_LAUNCH_ARGS.values()):
         raise OmnigentError(f"Unsupported permission_mode: {mode!r}", code=ErrorCode.INVALID_INPUT)
-    if not unattended_permission_mode_allowed(mode):
-        raise OmnigentError(
-            UNATTENDED_PERMISSION_MODE_MESSAGE.format(mode=mode), code=ErrorCode.INVALID_INPUT
-        )
     return mode
 
 
@@ -74,23 +65,26 @@ async def scheduled_agent_default_permission_mode(agent: Any, agent_cache: Any) 
     return None if configured is None else str(configured)
 
 
-async def validate_scheduled_agent_default_permission(*, agent: Any, agent_cache: Any) -> None:
-    """Reject an agent whose own default would run a scheduled fire without approval."""
+async def inherited_approval_skipping_problem(agent: Any, agent_cache: Any) -> str | None:
+    """Why a task without a permission mode may not run in its agent's default, or ``None``.
+
+    An explicit task mode is shown in the automation's settings and its approval
+    prompt; a mode inherited from the agent spec is not, so it may not skip approval.
+    """
     mode = await scheduled_agent_default_permission_mode(agent, agent_cache)
-    if not unattended_permission_mode_allowed(mode):
-        raise OmnigentError(
-            UNATTENDED_PERMISSION_MODE_MESSAGE.format(mode=mode)
-            + " (set by the agent; set permission_mode in the agent spec)",
-            code=ErrorCode.INVALID_INPUT,
-        )
+    if mode not in APPROVAL_SKIPPING_PERMISSION_MODES:
+        return None
+    return INHERITED_APPROVAL_SKIPPING_MESSAGE.format(mode=mode)
 
 
 async def validate_scheduled_permission_support(
     *, permission_mode: str | None, agent: Any, agent_cache: Any
 ) -> None:
-    """Reject modes belonging to a different harness, or an unattended-unsafe agent default."""
+    """Reject modes belonging to a different harness, or an inherited approval-skipping mode."""
     if permission_mode is None:
-        await validate_scheduled_agent_default_permission(agent=agent, agent_cache=agent_cache)
+        problem = await inherited_approval_skipping_problem(agent, agent_cache)
+        if problem is not None:
+            raise OmnigentError(problem, code=ErrorCode.INVALID_INPUT)
         return
     harness = await scheduled_agent_harness(agent, agent_cache)
     if harness is None:

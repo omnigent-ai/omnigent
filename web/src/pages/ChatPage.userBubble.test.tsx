@@ -687,3 +687,27 @@ describe("UserBubble @-mention attachment chips", () => {
     expect(screen.queryByText(/uploads\/image\.png/)).toBeNull();
   });
 });
+
+describe("UserBubble still-sending note", () => {
+  const content: MessageContentBlock[] = [{ type: "input_text", text: "ship it" }];
+
+  it("shows on a send whose POST is unanswered and clears once it is posted", () => {
+    const [unanswered] = buildPendingBubbles(
+      [{ tempId: "pend_slow", content, stillSending: true }],
+      null,
+    );
+    const { rerender } = renderBubble(unanswered!);
+    expect(screen.getByTestId("message-still-sending")).toHaveTextContent("Still sending…");
+
+    const [posted] = buildPendingBubbles(
+      [{ tempId: "pend_slow", content, stillSending: true, posted: true }],
+      null,
+    );
+    rerender(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BubbleView bubble={posted!} />
+      </FileViewerContext.Provider>,
+    );
+    expect(screen.queryByTestId("message-still-sending")).toBeNull();
+  });
+});

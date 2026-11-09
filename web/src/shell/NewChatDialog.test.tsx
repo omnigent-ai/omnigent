@@ -401,6 +401,17 @@ const CLAUDE_MODEL_OPTIONS_RESULT = {
     { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
   ],
 };
+const PI_MODEL_OPTIONS_RESULT = {
+  ...SUCCESS_QUERY_STATE,
+  data: [
+    {
+      id: "omnigent/system.ai.pi-catalog-model",
+      model: "omnigent/system.ai.pi-catalog-model",
+      displayName: "system.ai.pi-catalog-model",
+      isDefault: true,
+    },
+  ],
+};
 // Devin's catalog carries per-model effort rungs, which the effort picker derives
 // from: swe-2 exposes only medium/high/max (`swe-2-low` is a different Fusion
 // model), while claude-opus-5 exposes the full ladder.
@@ -1443,6 +1454,12 @@ function renderLanding(
   };
 }
 
+it.each([false, undefined])("explains unavailable nested-agent links (%s)", (capability) => {
+  renderLanding({ sibling_sessions: capability }, "/?sibling=source");
+  expect(screen.getByRole("alert")).toHaveTextContent("Nested agents are not available");
+  expect(screen.queryByTestId("new-chat-landing-submit")).toBeNull();
+});
+
 function landingInfo(infoOverrides: Partial<ServerInfo>): ServerInfo {
   return {
     accounts_enabled: false,
@@ -2309,6 +2326,50 @@ describe("NewChatLandingScreen cached picker preview", () => {
       useHostModelOptionsMock.mock.calls.filter(([, h]) => h === "claude-native").at(-1),
     ).toEqual(["host_1", "claude-native", false, { poll: false }]);
     expect(readNewChatPickerOptionsCache(snapshot.key)?.models.claude).toEqual(cachedModels);
+  });
+
+  it("does not offer cached models after an unresponsive CLI's catalog request fails", () => {
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
+    ]);
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "pi-native": "cli-unresponsive" },
+      } as Host,
+    ]);
+    localStorage.setItem(LAST_AGENT_KEY, "a_pi");
+    mockModelQueries((harness) =>
+      harness === "pi-native" ? PI_MODEL_OPTIONS_RESULT : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    const { unmount } = renderLanding();
+    const modelValue = () =>
+      within(screen.getByTestId("new-chat-landing-agent-select")).getByTestId(
+        "new-chat-landing-agent-model-value",
+      );
+    expect(modelValue()).toHaveTextContent("pi-catalog-model");
+    unmount();
+    resetLandingDraft();
+    expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey(""))?.models.pi).toEqual(
+      PI_MODEL_OPTIONS_RESULT.data,
+    );
+
+    mockModelQueries((harness) =>
+      harness === "pi-native"
+        ? {
+            ...SUCCESS_QUERY_STATE,
+            status: "error",
+            isError: true,
+            isSuccess: false,
+            data: undefined,
+            error: new Error("Pi catalog request timed out"),
+          }
+        : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    renderLanding();
+    expect(modelValue()).toHaveTextContent("Models unavailable");
+    expect(modelValue()).not.toHaveTextContent("pi-catalog-model");
   });
 
   it("keeps the named preview when a populated catalog becomes offline", () => {
@@ -6818,7 +6879,14 @@ describe("NewChatLandingScreen", () => {
       within(menu)
         .getAllByRole("menuitemradio")
         .map((item) => item.textContent),
-    ).toEqual(["Default", "Full access", "Read only", "Bypass approvals & sandbox"]);
+    ).toEqual([
+      "Default",
+      "Ask for approval",
+      "Approve for me",
+      "Full Access",
+      "Read Only",
+      "Bypass approvals & sandbox",
+    ]);
   });
 
   it("offers the Codex effort ladder in the gear modal and sends the pick as reasoning_effort", async () => {
@@ -7023,9 +7091,11 @@ describe("NewChatLandingScreen", () => {
     [false, "{Shift>}{Enter}{/Shift}"],
     [true, "{Enter}"],
     [true, "{Shift>}{Enter}{/Shift}"],
+    [false, "{Alt>}{Enter}{/Alt}"],
+    [true, "{Alt>}{Enter}{/Alt}"],
   ] as const)("preserves newline input (alternate send: %s)", async (alternate, keys) => {
-    // Same newline contract as the in-session composer: Shift+Enter (and, in
-    // alternate mode, plain Enter) inserts a line break instead of creating.
+    // Same newline contract as the in-session composer: Shift+Enter, Alt+Enter
+    // (and, in alternate mode, plain Enter) insert a line break instead of creating.
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
     renderLanding();
     const input = screen.getByTestId("new-chat-landing-input");
@@ -7066,8 +7136,10 @@ describe("NewChatLandingScreen", () => {
 
   it.each([
     ["default", "Default"],
-    ["full-access", "Full access"],
-    ["read-only", "Read only"],
+    ["ask-for-approval", "Ask for approval"],
+    ["approve-for-me", "Approve for me"],
+    ["full-access", "Full Access"],
+    ["read-only", "Read Only"],
     ["bypass", "Bypass approvals & sandbox"],
   ])("remembers Codex %s across harness switches and fresh visits", (mode, label) => {
     renderLanding();
@@ -7160,11 +7232,35 @@ describe("NewChatLandingScreen", () => {
   it.each([
     ["default", "Default", undefined],
     [
+      "ask-for-approval",
+      "Ask for approval",
+      [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+        "-c",
+        'approvals_reviewer="user"',
+      ],
+    ],
+    [
+      "approve-for-me",
+      "Approve for me",
+      [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+        "-c",
+        'approvals_reviewer="auto_review"',
+      ],
+    ],
+    [
       "full-access",
-      "Full access",
+      "Full Access",
       ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
     ],
-    ["read-only", "Read only", ["--sandbox", "read-only", "--ask-for-approval", "on-request"]],
+    ["read-only", "Read Only", ["--sandbox", "read-only", "--ask-for-approval", "on-request"]],
   ] as const)("clears bypass when the hand dropdown selects %s", async (mode, label, args) => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
@@ -7494,6 +7590,61 @@ describe("NewChatLandingScreen", () => {
       expect(badge).toHaveAccessibleName(badgeName);
       fireEvent.focus(badge);
       expect(await screen.findByRole("tooltip")).toHaveTextContent(warning);
+    },
+  );
+
+  it.each([false, true])(
+    "lets the user pick a harness whose CLI did not respond and warns about it (repair enabled: %s)",
+    (repairEnabled) => {
+      mockAgents([
+        DEFAULT_LANDING_AGENTS[0],
+        {
+          id: "a_pi",
+          name: "pi-native-ui",
+          display_name: "Pi",
+          description: null,
+          harness: "pi-native",
+          skills: [],
+        },
+      ]);
+      mockHosts([
+        {
+          ...host("online"),
+          configured_harnesses: { "claude-native": true, "pi-native": "cli-unresponsive" },
+        } as Host,
+      ]);
+      mockModelQueries((harness) =>
+        harness === "pi-native" ? PI_MODEL_OPTIONS_RESULT : CLAUDE_MODEL_OPTIONS_RESULT,
+      );
+      renderLanding({ harness_install_enabled: repairEnabled });
+      const lastPiModelQuery = () =>
+        useHostModelOptionsMock.mock.calls.filter(([, harness]) => harness === "pi-native").at(-1);
+      expect(lastPiModelQuery()?.[2]).toBe(false);
+      expect(screen.queryByTestId("new-chat-landing-harness-warning")).toBeNull();
+
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+      const row = screen.getByTestId("new-chat-landing-agent-a_pi");
+      expect(row).not.toHaveAttribute("aria-disabled", "true");
+      expect(within(row).queryByTestId("new-chat-landing-agent-warning-a_pi")).toBeNull();
+      fireEvent.click(row);
+      closeMenu();
+
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Harness readiness changed" },
+      });
+      const notice = screen.getByTestId("new-chat-landing-harness-warning");
+      expect(notice).toHaveTextContent("Pi's CLI on machine-1 did not respond to a version check");
+      expect(notice).not.toHaveTextContent("outdated");
+      expect(notice).not.toHaveTextContent("isn't ready");
+      expect(screen.queryByTestId("new-chat-landing-harness-setup")).toBeNull();
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+      expect(lastPiModelQuery()).toEqual(["host_1", "pi-native", true, { poll: true }]);
+      expect(
+        within(screen.getByTestId("new-chat-landing-agent-select")).getByTestId(
+          "new-chat-landing-agent-model-value",
+        ),
+      ).toHaveTextContent("pi-catalog-model");
     },
   );
 

@@ -13,6 +13,22 @@ PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
     },
     "codex-native": {
         "default": [],
+        "ask-for-approval": [
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "on-request",
+            "-c",
+            'approvals_reviewer="user"',
+        ],
+        "approve-for-me": [
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "on-request",
+            "-c",
+            'approvals_reviewer="auto_review"',
+        ],
         "full-access": ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
         "read-only": ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
         "bypass": [],
@@ -33,13 +49,10 @@ PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
     },
 }
 
-# Modes that would run a scheduled fire without a working approval gate. A
-# scheduled run has nobody to answer a prompt, so the auto classifier is the
-# check that stands in for the user. Claude's ``dontAsk`` denies rather than
-# approves, but it skips that classifier and relies only on pre-approved rules
-# the server cannot see. Each name belongs to one harness, so the set is
-# checked without resolving the agent.
-UNATTENDED_DISALLOWED_PERMISSION_MODES: frozenset[str] = frozenset(
+# Modes that skip the approval prompt (``dontAsk`` denies instead, by rules the server
+# cannot see). An automation runs in one only when the task itself selects it, never
+# through an agent default or a reused session's live mode.
+APPROVAL_SKIPPING_PERMISSION_MODES: frozenset[str] = frozenset(
     {
         "bypassPermissions",  # claude-native, claude-sdk, acp
         "dontAsk",  # claude-native
