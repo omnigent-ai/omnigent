@@ -105,7 +105,7 @@ def test_short_vertical_and_edge_drags_leave_drawer_closed(
     chat = chat_session_contract
     cdp = _open_app(page, chat)
 
-    box = _drag(cdp, page, x=80, y=420, dx=70, steps=10, step_ms=60)
+    box = _drag(cdp, page, x=80, y=420, dx=70, steps=7, step_ms=40)
     assert box["right"] > 30, f"the drawer did not follow the short drag: {box}"
     _expect_drawer_closed(page)
 

@@ -5,9 +5,10 @@ import { useSyncExternalStore } from "react";
 // Wide phones (an unfolded foldable, a small phone in landscape) are still below
 // `md`, but have room to show the sidebar beside the chat instead of over it:
 // Material's "medium" width class (600dp+) at a squarish-or-wider aspect ratio.
-// Tall narrow tablets stay on the overlay drawer.
+// Tall narrow tablets and narrow desktop windows (fine pointer) stay on the
+// overlay drawer.
 const SIDE_BY_SIDE_QUERY =
-  "(min-width: 600px) and (max-width: 767.98px) and (min-aspect-ratio: 3/4)";
+  "(pointer: coarse) and (min-width: 600px) and (max-width: 767.98px) and (min-aspect-ratio: 3/4)";
 
 function subscribeSideBySide(callback: () => void): () => void {
   if (typeof window === "undefined" || !window.matchMedia) return () => {};
