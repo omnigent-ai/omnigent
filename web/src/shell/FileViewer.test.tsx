@@ -205,7 +205,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { prepareDiffEditor } from "./MonacoDiffViewer";
-import { MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
+import { MAX_PREVIEW_MARKDOWN_BYTES, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { useFileContent } from "@/hooks/useFileContent";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
@@ -2865,30 +2865,116 @@ describe("large Markdown file routing", () => {
   });
   afterEach(() => setContent(""));
 
-  it.each(["editor", "preview", "source"] as const)(
-    "overrides %s without changing the preference",
-    (mode) => {
-      writeFileViewPreferences({
-        diffActive: false,
-        diffLayout: "unified",
-        previewableViewMode: mode,
-        hideWhitespace: false,
-        wrapLines: false,
-      });
+  const viewModeOf = () => screen.getByTestId("code-viewer").getAttribute("data-view-mode");
+  const seedPreference = (mode: "editor" | "preview" | "source") =>
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: mode,
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+  const selectMode = (mode: "Preview" | "Edit") => {
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: mode }));
+  };
+
+  it.each([
+    { preference: "editor", opensIn: "preview" },
+    { preference: "preview", opensIn: "preview" },
+    { preference: "source", opensIn: "source" },
+  ] as const)(
+    "opens in $opensIn for a $preference preference without changing it",
+    ({ preference, opensIn }) => {
+      seedPreference(preference);
       setContent(large);
       const view = render(viewerTree({ open: true, path: "large.md" }));
-      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+      expect(viewModeOf()).toBe(opensIn);
       expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "true");
-      expect(screen.queryByRole("button", { name: /^View mode/ })).not.toBeInTheDocument();
-      vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux");
-      fireEvent.keyDown(window, { key: "f", ctrlKey: true });
-      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "true");
       setContent("# Small");
       view.rerender(viewerTree({ open: true, path: "small.md" }));
-      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", mode);
+      expect(viewModeOf()).toBe(preference);
       expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "false");
     },
   );
+
+  it("offers only Preview and an Edit that opens source", () => {
+    setContent(large);
+    render(viewerTree({ open: true, path: "large.md" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Preview" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Source" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit" }));
+    expect(viewModeOf()).toBe("source");
+    fireEvent.mouseDown(screen.getByTestId("code-viewer"));
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux");
+    fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "true");
+  });
+
+  it("keeps Edit for this visit only, then reopens in Preview", () => {
+    seedPreference("editor");
+    setContent(large);
+    const view = render(viewerTree({ open: true, path: "large.md" }));
+    selectMode("Edit");
+    expect(viewModeOf()).toBe("source");
+    setContent("# Small");
+    view.rerender(viewerTree({ open: true, path: "small.md" }));
+    expect(viewModeOf()).toBe("editor");
+    setContent(large);
+    view.rerender(viewerTree({ open: true, path: "large.md" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("guards unsaved source edits when returning to Preview", () => {
+    setContent(large);
+    render(viewerTree({ open: true, path: "large.md" }));
+    selectMode("Edit");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    selectMode("Preview");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it.each([
+    { name: "beyond the preview limit", content: "a".repeat(MAX_PREVIEW_MARKDOWN_BYTES + 1) },
+    { name: "truncated", content: large, truncated: true },
+  ])("opens $name Markdown straight in source with no mode picker", (c) => {
+    seedPreference("preview");
+    vi.mocked(useFileContent).mockReturnValue({
+      data: { content: c.content, encoding: "utf-8", truncated: c.truncated },
+    } as ReturnType<typeof useFileContent>);
+    render(viewerTree({ open: true, path: "huge.md" }));
+    expect(viewModeOf()).toBe("source");
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "true");
+    expect(screen.queryByRole("button", { name: /^View mode/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps a citation's source editor when the citation clears, guarding unsaved edits", () => {
+    seedPreference("editor");
+    setContent(large);
+    const view = render(viewerTree({ open: true, path: "large.md", position: { line: 1 } }));
+    expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    view.rerender(viewerTree({ open: true, path: "large.md" }));
+    expect(viewModeOf()).toBe("source");
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(viewModeOf()).toBe("source");
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("opens a comment deep link in source, where its anchor is shown", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    setContent(large);
+    render(viewerTree({ open: true, path: "large.md", initialSearch: "comment=c1" }));
+    expect(viewModeOf()).toBe("source");
+  });
 
   it.each([
     { size: "large", content: large, monaco: true },
