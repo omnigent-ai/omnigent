@@ -4438,7 +4438,22 @@ def register_core_routes(
 
         # Cross-user forks copy the agent (bundle under the copy's id) so its owner
         # can never change code in the caller's sessions; same-user forks share it.
-        needs_own_copy = agent_needs_own_copy(base_agent, user_id)
+        # A fork by a caller without EDIT on the source gets a redacted copy, since
+        # the bundle can carry its author's credentials.
+        redacted_fork = (
+            not switching_agent
+            and permission_store is not None
+            and not await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                source_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+                conversation=source,
+            )
+        )
+        needs_own_copy = redacted_fork or agent_needs_own_copy(base_agent, user_id)
         if needs_own_copy and artifact_store is None:
             raise OmnigentError("artifact store is not configured", code=ErrorCode.INTERNAL_ERROR)
 
@@ -4745,7 +4760,12 @@ def register_core_routes(
             assert artifact_store is not None
             fork_agent_id = generate_agent_id()
             clone_location = await asyncio.to_thread(
-                copy_agent_bundle, artifact_store, base_agent.bundle_location, fork_agent_id
+                copy_agent_bundle,
+                artifact_store,
+                base_agent.bundle_location,
+                fork_agent_id,
+                redacted_name=base_agent.name if redacted_fork else None,
+                operator_authored=base_agent.operator_authored,
             )
 
         async def drop_unused_copy() -> None:

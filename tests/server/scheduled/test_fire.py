@@ -39,12 +39,23 @@ from omnigent.server.routes._host_worktree import (
     worktree_root_fingerprint,
 )
 from omnigent.server.scheduled import fire as fire_mod
-from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+from omnigent.server.scheduled.fire import (
+    BUSY_QUIET_SECONDS,
+    BUSY_RECHECK_SECONDS,
+    BUSY_SKIP_MAX_SECONDS,
+    FireDeps,
+    build_busy_until,
+    build_on_fire,
+    build_run_now,
+)
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    SessionActivity,
+)
 from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
@@ -3966,3 +3977,154 @@ def test_session_approval_skipping_mode(
     conv = SimpleNamespace(labels=labels, terminal_launch_args=launch_args)
 
     assert fire_mod.session_approval_skipping_mode(conv) == expected
+
+
+def _busy_until_check(
+    live_status: str | None,
+    last_scheduled_at: int | None,
+    *,
+    updated_at: int = 0,
+    fired_at: int | None = None,
+    status: str = "succeeded",
+    pending: int | None = None,
+):
+    """The busy check over one session's persisted status and the task's latest run."""
+    session_id = "sess_busy_check"
+    activity = (
+        {}
+        if live_status is None
+        else {
+            session_id: SessionActivity(
+                updated_at,
+                live_status=live_status,
+                pending_elicitation_count=pending,
+                runner_id="runner_busy_check",
+            )
+        }
+    )
+    runs = (
+        []
+        if last_scheduled_at is None
+        else [Mock(scheduled_at=last_scheduled_at, fired_at=fired_at, status=status)]
+    )
+    sched_store = Mock(list_runs=Mock(return_value=(runs, None)))
+    conversation_store = Mock(get_session_activity=Mock(return_value=activity))
+    return build_busy_until(_deps(sched_store, conversation_store=conversation_store))
+
+
+@pytest.mark.parametrize(
+    ("session_mode", "live_status", "minutes_since_last_run", "wait_seconds"),
+    [
+        pytest.param("continue", "running", 2, BUSY_RECHECK_SECONDS, id="turn-in-progress"),
+        # Never later than ten minutes after the latest poll.
+        pytest.param("continue", "waiting", 9, 60, id="waiting-on-approval-until-backstop"),
+        pytest.param(
+            "continue", "running", BUSY_SKIP_MAX_SECONDS // 60, None, id="ten-minute-backstop"
+        ),
+        pytest.param("continue", "idle", 2, None, id="idle"),
+        pytest.param("continue", None, 2, None, id="session-gone"),
+        pytest.param("continue", "running", None, None, id="no-earlier-run"),
+        pytest.param("new", "running", 2, None, id="new-session-each-run"),
+    ],
+)
+async def test_a_busy_session_is_checked_again_later(
+    session_mode, live_status, minutes_since_last_run, wait_seconds
+) -> None:
+    due = 1_800_003_600
+    last = None if minutes_since_last_run is None else due - minutes_since_last_run * 60
+    check = _busy_until_check(live_status, last)
+    task = _task(
+        session_mode=session_mode,
+        session_id="sess_busy_check" if session_mode == "continue" else None,
+        next_run_at=due,
+    )
+    assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+async def test_a_trigger_without_a_session_yet_polls_now() -> None:
+    due = 1_800_003_600
+    check = _busy_until_check("running", due - 60)
+    task = _task(session_mode="continue", session_id=None, next_run_at=due)
+    assert await check(task, due) is None
+
+
+async def test_a_late_poll_counts_the_ten_minutes_from_the_current_time() -> None:
+    due = 1_800_003_600
+    # A Run now went out five minutes before this poll was due.
+    check = _busy_until_check("running", due - 5 * 60)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == due + BUSY_RECHECK_SECONDS
+    # Dispatched half an hour late, the poll is sent even though the session looks busy.
+    assert await check(task, due + 30 * 60) is None
+
+
+async def test_the_ten_minutes_count_from_when_the_latest_poll_went_out() -> None:
+    due = 1_800_003_600
+    # The latest poll was due half an hour ago but only went out two minutes ago.
+    check = _busy_until_check("running", due - 30 * 60, fired_at=due - 2 * 60)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == due + BUSY_RECHECK_SECONDS
+
+
+async def test_the_ten_minutes_count_from_the_tasks_latest_firing() -> None:
+    due = 1_800_003_600
+    # The newest run by schedule went out nine minutes ago, but a later firing two
+    # minutes ago is the task's last run.
+    check = _busy_until_check("running", due - 9 * 60, fired_at=due - 9 * 60)
+    task = _task(
+        session_mode="continue",
+        session_id="sess_busy_check",
+        next_run_at=due,
+        last_run_at=due - 2 * 60,
+    )
+    assert await check(task, due) == due + BUSY_RECHECK_SECONDS
+
+
+@pytest.mark.parametrize("status", ["scheduled", "starting"])
+async def test_a_poll_still_being_delivered_counts_as_busy(status) -> None:
+    due = 1_800_003_600
+    # The session looks quiet, but the previous poll is still on its way, e.g. in a sandbox.
+    check = _busy_until_check("idle", due - 60, fired_at=due - 60, status=status)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == due + BUSY_RECHECK_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("pending", "wait_seconds"),
+    [
+        pytest.param(1, BUSY_RECHECK_SECONDS, id="approval-pending"),
+        pytest.param(0, None, id="nothing-pending"),
+    ],
+)
+async def test_an_idle_native_session_waiting_on_an_approval_counts_as_busy(
+    pending, wait_seconds
+) -> None:
+    due = 1_800_003_600
+    # Quiet for three minutes, and the previous poll went out five minutes ago.
+    check = _busy_until_check("idle", due - 300, updated_at=due - 180, pending=pending)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+async def test_the_backstop_caps_the_quiet_wait() -> None:
+    due = 1_800_003_600
+    # Quiet for only 10 seconds, but the latest poll went out 9.5 minutes ago.
+    check = _busy_until_check("idle", due - 570, updated_at=due - 10)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == due + 30
+
+
+@pytest.mark.parametrize(
+    ("seconds_since_change", "wait_seconds"),
+    [
+        pytest.param(30, BUSY_QUIET_SECONDS - 30, id="pausing-between-steps"),
+        pytest.param(BUSY_QUIET_SECONDS, None, id="quiet-for-two-minutes"),
+    ],
+)
+async def test_an_idle_session_is_polled_two_quiet_minutes_after_its_last_change(
+    seconds_since_change, wait_seconds
+) -> None:
+    due = 1_800_003_600
+    check = _busy_until_check("idle", due - 5 * 60, updated_at=due - seconds_since_change)
+    task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
+    assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
