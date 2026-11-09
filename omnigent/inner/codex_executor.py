@@ -79,7 +79,11 @@ from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
-from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
+from ._subprocess_lifecycle import (
+    close_subprocess_transport,
+    subprocess_exited,
+    terminate_subprocess,
+)
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
@@ -2989,6 +2993,7 @@ class _CodexAppServerSession:
         self._reader_completed_turn: str | None = None
         self._next_id = 1
         self._started = False
+        self._starting = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self.thread_id: str | None = None
         self.active_turn_id: str | None = None
@@ -3042,11 +3047,18 @@ class _CodexAppServerSession:
 
     async def start(self) -> None:
         """Start signer and worker transactionally."""
+        self._starting = True
         try:
             await self._start_unchecked()
         except BaseException:
             await self.close()
             raise
+        finally:
+            self._starting = False
+            # Startup owns the signer across worker replacement. Hand EOF cleanup
+            # back to the reader, including EOF that arrived during initialize.
+            if not self._closing and self._reader_task is not None and self._reader_task.done():
+                await self._close_signer()
 
     async def _start_unchecked(self) -> None:
         if self._started:
@@ -3252,7 +3264,11 @@ class _CodexAppServerSession:
                 initialized = await self._spawn_and_initialize(mcp_plan.config_overrides, proc_env)
             except Exception:
                 fallback = mcp_plan.overrides_after_early_exit()
-                if fallback is None or self._proc is None or self._proc.returncode is None:
+                if (
+                    fallback is None
+                    or self._proc is None
+                    or not await subprocess_exited(self._proc)
+                ):
                     raise
                 logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
                 await self._discard_early_exit_worker()
@@ -3291,6 +3307,12 @@ class _CodexAppServerSession:
     ) -> CodexMessage:
         """Spawn the prepared worker and complete its initialize handshake."""
         assert self._worker_launch is not None
+        self._recent_stderr.clear()
+        self._certificate_failure = None
+        self._saw_connection_retry = False
+        self._pending_fatal_gateway_error = None
+        self._saw_retries_exhausted = False
+        self._fatal_gateway_error = None
         argv = [self._worker_launch.launch_path, "app-server"]
         for override in overrides:
             argv.extend(["-c", override])
@@ -4686,7 +4708,7 @@ class _CodexAppServerSession:
             logger.debug("Codex App Server reader loop ended: %s", exc)
             self._note_transport_closed(f"Codex app-server reader failed: {exc}", clean_eof=False)
         finally:
-            if not self._closing:
+            if not self._closing and not self._starting:
                 await self._close_signer()
 
     async def _stderr_loop(self) -> None:

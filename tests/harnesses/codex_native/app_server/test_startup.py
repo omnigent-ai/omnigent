@@ -1351,11 +1351,10 @@ async def test_malformed_config_read_keeps_the_launch_model_provider_pin(
     assert [method for method, _params in client.requests] == ["config/read"]
 
 
-@pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("saved", [False, True])
 @pytest.mark.parametrize("active", [None, [], ["codex"]])
 async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
-    tmp_path, monkeypatch, active, saved, wrapped
+    tmp_path, monkeypatch, active, saved
 ):
     from tests._helpers.mcp_disabled_servers import launch_activation
 
@@ -1373,8 +1372,6 @@ async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
     harness = _respawn_harness(tmp_path, monkeypatch, ready)
     server = harness.server
     server.active_harnesses = active
-    if wrapped:
-        server.app_server_command = ("wrapper", "codex", "--")
 
     (tmp_path / "source-codex-home/config.toml").write_text(
         '[mcp_servers.fixture]\ncommand="true"\n'
@@ -1402,6 +1399,41 @@ async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
         assert tuple(server.config_overrides) == expected
     finally:
         await server.close()
+
+
+async def test_disabled_mcp_early_exit_waits_for_returncode(tmp_path, monkeypatch, caplog):
+    from omnigent import mcp_disabled_servers as disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
+    attempts = []
+
+    async def ready(server):
+        attempts.append(tuple(server.config_overrides))
+        if len(attempts) == 1:
+            process = server.proc
+
+            async def notify_exit():
+                await asyncio.sleep(0)
+                process.returncode = 1
+                return 1
+
+            process.wait = notify_exit
+            raise BrokenPipeError("EOF before exit notification")
+        return _FakeStartupClient()
+
+    harness = _respawn_harness(tmp_path, monkeypatch, ready)
+    (tmp_path / "source-codex-home/config.toml").write_text(
+        '[mcp_servers.fixture]\ncommand="true"\n'
+    )
+    harness.server.active_harnesses = ["codex"]
+    try:
+        await harness.server.start()
+        assert attempts[0] == (*attempts[1], "mcp_servers.fixture.enabled=false")
+        assert len(harness.spawn_calls) == 2
+        assert caplog.text.count(disabled.RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
+    finally:
+        await harness.server.close()
 
 
 @pytest.mark.parametrize("second_fails", [False, True])

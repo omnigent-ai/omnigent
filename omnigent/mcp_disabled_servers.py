@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal, overload
 
+import tomlkit
+
 from omnigent.config import global_config_path
 from omnigent.harnesses.codex_native.launch_args import _merge_tables
 
@@ -70,7 +72,10 @@ def _validate(key: ServerKey) -> None:
             not isinstance(name, str)
             or not name.strip()
             or len(name) > _MAX_NAME_LENGTH
-            or any(ord(character) < 32 or ord(character) == 127 for character in name)
+            or any(
+                ord(character) < 32 or ord(character) == 127 or 0xD800 <= ord(character) <= 0xDFFF
+                for character in name
+            )
         ):
             raise DisabledServerWriteError("invalid_name")
     if key.harness != "claude" and key.plugin is not None:
@@ -283,23 +288,19 @@ def _codex_cli_overrides(overrides: Sequence[str], config_path: Path) -> dict[st
         try:
             if not separator:
                 raise ValueError("Missing assignment")
-            path = tomllib.loads(f"{key}=0")
             try:
-                parsed = tomllib.loads(override)
+                parsed = tomllib.loads(f"value={value}")["value"]
             except ValueError:
                 # Codex accepts unquoted strings when a value is not valid TOML.
-                parsed = tomllib.loads(f"{key}={json.dumps(value.strip())}")
+                parsed = value.strip()
+            # Codex splits the key literally; TOML quoting applies only to the value.
+            *parents, name = key.strip().split(".")
             target = result
-            while path:
-                name, child = next(iter(path.items()))
-                parsed = parsed[name]
-                if not isinstance(child, dict):
-                    target[name] = parsed
-                    break
-                if not isinstance(target.get(name), dict):
-                    target[name] = {}
-                target = target[name]
-                path = child
+            for parent in parents:
+                if not isinstance(target.get(parent), dict):
+                    target[parent] = {}
+                target = target[parent]
+            target[name] = parsed
         except (ValueError, KeyError, TypeError, RecursionError):
             # Do not log override values: they may contain credentials.
             _log_read_failure(
@@ -438,14 +439,22 @@ def plan_codex_launch(
             event="mcp_disabled_codex_config_read_failed",
         )
         servers = set()
+    applied = [key.server for key in entries if key.server in servers]
+    dropped = [key.server for key in entries if key.server not in servers]
     overrides = []
-    dropped = []
-    for key in entries:
-        if key.server not in servers:
-            dropped.append(key.server)
-            continue
-        name = key.server if _TOML_BARE_KEY.fullmatch(key.server) else json.dumps(key.server)
-        overrides.append(f"mcp_servers.{name}.enabled=false")
+    if any(not _TOML_BARE_KEY.fullmatch(name) for name in applied):
+        # Codex splits dotted paths literally. Rebuild its CLI MCP table so
+        # adding quoted names preserves existing CLI transports.
+        cli_servers = _codex_cli_overrides(original, codex_home / "config.toml").get(
+            "mcp_servers", {}
+        )
+        for name in applied:
+            cli_servers.setdefault(name, {})["enabled"] = False
+        table = tomlkit.inline_table()
+        table.update(cli_servers)
+        overrides.append(f"mcp_servers={table.as_string()}")
+    else:
+        overrides.extend(f"mcp_servers.{name}.enabled=false" for name in applied)
     if dropped:
         _logger.warning(
             "mcp_disabled_servers_not_reported names=%s",

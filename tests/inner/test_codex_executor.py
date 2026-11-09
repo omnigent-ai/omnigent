@@ -6501,6 +6501,7 @@ def disabled_mcp_session(tmp_path, monkeypatch):
     async def spawn(*args, **kwargs):
         spawns.append(args)
         process = _FakeProcess()
+        process.stdout = _ScriptedStdoutPipe([])
         processes.append(process)
         return process
 
@@ -6518,47 +6519,101 @@ def disabled_mcp_session(tmp_path, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("error", [BrokenPipeError(), ConnectionResetError(), RuntimeError("EOF")])
+@pytest.fixture
+def signed_disabled_mcp_session(disabled_mcp_session, monkeypatch):
+    from omnigent.inner.codex_worker import CodexWorkerLaunch
+    from tests.inner.test_model_signer_lifecycle import _Signer
+
+    harness = disabled_mcp_session
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    signer = _Signer([])
+    harness.signer = signer
+    harness.session._signer_factory = lambda: signer
+    harness.session._os_env_spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"))
+    # Signer homes omit ambient MCPs; this server belongs to the caller's CLI layer.
+    harness.baseline = ("base=true", 'mcp_servers.fixture.command="true"')
+    harness.session._base_codex_config_overrides = harness.baseline
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        lambda **kwargs: CodexWorkerLaunch("/bin/echo", sandboxed=True),
+    )
+    return harness
+
+
+@pytest.mark.parametrize(
+    "error",
+    [BrokenPipeError(), ConnectionResetError(), None],
+    ids=["broken-pipe", "connection-reset", "stdout-eof"],
+)
 async def test_disabled_mcp_applied_early_exit_relaunches_baseline(
-    disabled_mcp_session, caplog, error
+    signed_disabled_mcp_session, caplog, error
 ):
     from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
 
-    harness = disabled_mcp_session
+    harness = signed_disabled_mcp_session
+    session = harness.session
 
-    async def initialize(*_args, **_kwargs):
+    async def initialize(method, params):
         if len(harness.spawns) == 1:
-            harness.processes[-1].returncode = 1
-            raise error
+            session._recent_stderr.append(_CERTIFICATE_STDERR_LINE)
+            session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+            session._saw_connection_retry = True
+            process = harness.processes[-1]
+            if error is not None:
+                process.returncode = 1
+                raise error
+
+            async def wait_for_exit():
+                # stdout EOF precedes asyncio's child-exit notification.
+                await asyncio.sleep(0)
+                process.returncode = 1
+                return 1
+
+            process.wait = wait_for_exit
+            process.stdout = _FakePipe()
+            return await _CodexAppServerSession._request(session, method, params)
+        assert not harness.signer.closed
+        assert session._signer is harness.signer
+        assert session._certificate_failure is None
+        assert session._recent_stderr == []
+        assert not session._saw_connection_retry
         return {"result": {}}
 
     harness.initialize.side_effect = initialize
     try:
         await harness.session.start()
-        assert harness.spawns == [
-            (
-                "/bin/echo",
-                "app-server",
-                "-c",
-                "base=true",
-                "-c",
-                "mcp_servers.fixture.enabled=false",
-            ),
-            ("/bin/echo", "app-server", "-c", "base=true"),
+        baseline_argv = (
+            "/bin/echo",
+            "app-server",
+            "-c",
+            harness.baseline[0],
+            "-c",
+            harness.baseline[1],
+            "-c",
+            f"sqlite_home={json.dumps(str(session._codex_home_dir))}",
+            "-c",
+            "features.memories=false",
+        )
+        assert [args[args.index("/bin/echo") :] for args in harness.spawns] == [
+            (*baseline_argv, "-c", "mcp_servers.fixture.enabled=false"),
+            baseline_argv,
         ]
+        assert not harness.signer.closed
         assert caplog.text.count(RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
         harness.hook.assert_called_once()
         assert harness.hook.call_args.kwargs["executor"] == "codex"
         assert harness.hook.call_args.kwargs["active_harnesses"] == ["codex"]
     finally:
         await harness.session.close()
+    assert harness.signer.closed
+    assert harness.signer.order.count("signer-close") == 1
 
 
-async def test_disabled_mcp_second_early_exit_is_final(disabled_mcp_session, caplog):
+async def test_disabled_mcp_second_early_exit_is_final(signed_disabled_mcp_session, caplog):
     from omnigent.errors import HarnessTransportClosedError
     from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
 
-    harness = disabled_mcp_session
+    harness = signed_disabled_mcp_session
 
     async def initialize(*_args, **_kwargs):
         harness.processes[-1].returncode = 1
@@ -6568,8 +6623,16 @@ async def test_disabled_mcp_second_early_exit_is_final(disabled_mcp_session, cap
     with pytest.raises(HarnessTransportClosedError):
         await harness.session.start()
     assert len(harness.spawns) == 2
-    assert harness.spawns[1] == ("/bin/echo", "app-server", "-c", "base=true")
+    fallback = harness.plans[0].fallback_config_overrides
+    assert fallback[:2] == harness.baseline
+    assert harness.spawns[1][harness.spawns[1].index("/bin/echo") :] == (
+        "/bin/echo",
+        "app-server",
+        *(arg for override in fallback for arg in ("-c", override)),
+    )
     assert caplog.text.count(RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
+    assert harness.signer.closed
+    assert harness.signer.order.count("signer-close") == 1
 
 
 async def test_disabled_mcp_not_applied_early_exit_does_not_retry(disabled_mcp_session, caplog):
