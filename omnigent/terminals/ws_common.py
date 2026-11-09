@@ -42,16 +42,18 @@ async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
 
     The pane-dead flag, rather than bare session existence, handles terminals
     configured with ``remain-on-exit``. Probe errors fail closed.
+    Targets must be pane IDs or managed single-pane sessions; tmux may
+    reinterpret a removed window/pane index as a surviving pane.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
             "tmux",
             "-S",
             socket_path,
-            "list-panes",
+            "display-message",
+            "-p",
             "-t",
             tmux_target,
-            "-F",
             "#{pane_dead}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -70,20 +72,20 @@ async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
             proc.kill()
         return False
     panes = stdout.decode().split()
-    return proc.returncode == 0 and bool(panes) and "1" not in panes
+    return proc.returncode == 0 and panes == ["0"]
 
 
 async def _check_pane_dead_definitive(socket_path: str, tmux_target: str) -> bool | None:
-    """Return pane liveness, or ``None`` when the probe is inconclusive."""
+    """Return pane death, or ``None`` if inconclusive; targets follow `_tmux_session_alive`."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "tmux",
             "-S",
             socket_path,
-            "list-panes",
+            "display-message",
+            "-p",
             "-t",
             tmux_target,
-            "-F",
             "#{pane_dead}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -104,7 +106,8 @@ async def _check_pane_dead_definitive(socket_path: str, tmux_target: str) -> boo
     if proc.returncode != 0:
         _logger.debug("tmux pane-dead probe got non-zero rc=%s", proc.returncode)
         return None
-    return "1" in stdout.decode().split()
+    fields = stdout.decode().split()
+    return fields[0] == "1" if fields in (["0"], ["1"]) else None
 
 
 async def _forward_terminal_to_ws(
