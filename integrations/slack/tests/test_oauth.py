@@ -237,25 +237,20 @@ async def test_oidc_poll_malformed_200_raises_oauth_error() -> None:
         await client.aclose()
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param(httpx.Response(200, text="not json"), id="non-json"),
+        # The device grant always issues a refresh token; a 200 without one is malformed.
+        pytest.param(
+            httpx.Response(200, json={"access_token": "at", "expires_in": 3600}),
+            id="missing-refresh-token",
+        ),
+    ],
+)
 @respx.mock
-async def test_device_poll_malformed_200_raises_oauth_error() -> None:
-    respx.post(_TOKEN).mock(return_value=httpx.Response(200, text="not json"))
-    from omnigent_slack import oauth as _oauth
-
-    client = httpx.AsyncClient(base_url=_BASE)
-    try:
-        with pytest.raises(OAuthError):
-            await _oauth._poll_device(client, "dc", interval=0, expires_in=600)
-    finally:
-        await client.aclose()
-
-
-@respx.mock
-async def test_device_poll_200_without_refresh_token_raises_oauth_error() -> None:
-    """The device grant always issues a refresh token; a 200 without one is malformed."""
-    respx.post(_TOKEN).mock(
-        return_value=httpx.Response(200, json={"access_token": "at", "expires_in": 3600})
-    )
+async def test_device_poll_malformed_200_raises_oauth_error(response: httpx.Response) -> None:
+    respx.post(_TOKEN).mock(return_value=response)
     from omnigent_slack import oauth as _oauth
 
     client = httpx.AsyncClient(base_url=_BASE)
@@ -382,7 +377,7 @@ async def test_client_secret_sent_on_refresh_and_revoke() -> None:
 
 @respx.mock
 async def test_oidc_poll_keeps_login_grant_refresh_token() -> None:
-    """Issue #12493: the ticket-flow 200 carries the server's refresh_token.
+    """The ticket-flow 200 carries the server's refresh_token.
 
     With a grant store wired, /auth/cli-poll returns the session JWT plus a
     refresh_token; the bot keeps it so the session renews silently until the

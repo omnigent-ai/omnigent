@@ -282,7 +282,7 @@ async def test_oidc_login_stores_session_jwt_no_refresh(tmp_path: Path) -> None:
 
 @respx.mock
 async def test_oidc_login_grant_renews_after_session_jwt_expiry(tmp_path: Path) -> None:
-    """Issue #12493: an OIDC login's grant outlives the session JWT.
+    """An OIDC login's grant outlives the session JWT.
 
     With a grant store, /auth/cli-poll returns a refresh token beside the
     session JWT. On the expired JWT's 401 the bot renews through
