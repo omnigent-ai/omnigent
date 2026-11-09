@@ -132,7 +132,10 @@ def test_wide_phone_docks_sidebar_beside_chat(page: Page, chat_session_contract)
         f"() => document.querySelector('{_DRAWER}').getBoundingClientRect().width > 300"
     )
     drawer = _drawer_box(page)
-    page.wait_for_timeout(300)
+    page.wait_for_function(
+        "([el, right]) => el.getBoundingClientRect().x >= right - 1",
+        arg=[composer.element_handle(), drawer["right"]],
+    )
     composer_box = composer.bounding_box()
     assert composer_box is not None
     assert composer_box["x"] >= drawer["right"] - 1, (
