@@ -130,6 +130,9 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       error: state.diffError,
       isFetching: false,
     }),
+    usePullRequestCommits: () => ({ data: undefined, isLoading: false, error: null }),
+    usePullRequestCommitDiff: () => ({ data: undefined, isLoading: false, error: null }),
+    usePullRequestCommitsUnsupported: () => false,
     fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
     // The account selector (shown in the repo-unresolved empty state) calls this;
     // stub the mutation shape it reads.
@@ -167,6 +170,8 @@ vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => {
   };
 });
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => state.canEdit }));
+let sandboxStarting = false;
+vi.mock("@/hooks/useSessionReconnect", () => ({ useSandboxStarting: () => sandboxStarting }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),
   useWorkspaceAsleep: () => state.sandboxAsleep,
@@ -2428,6 +2433,8 @@ describe("PullRequestPanel", () => {
       "github-review-threads",
       "github-changed-files",
       "github-pr-diff",
+      "github-pr-commits",
+      "github-pr-commit-diff",
       "session-pull-requests",
     ]);
   });
@@ -3318,6 +3325,36 @@ describe("session PR selection", () => {
         /^To load the PR details, send a message to start the session’s sandbox\.$/,
       ),
     );
+  });
+
+  it("says the sandbox is starting while it wakes", async () => {
+    const url = "https://github.com/acme/app/pull/6001";
+    state.sandboxAsleep = true;
+    sandboxStarting = true;
+    try {
+      state.info = { isLoading: false, error: null, isFetching: false };
+      state.stored.conv_1 = [
+        {
+          url,
+          host: "github.com",
+          repository: "acme/app",
+          number: 6001,
+          title: "Waking PR",
+          relationship: "created",
+          state: "OPEN",
+          is_draft: false,
+          state_checked_at: null,
+        },
+      ];
+      renderPanel();
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId("github-stored-pr")).getByRole("status"),
+        ).toHaveTextContent(/^Starting the session’s sandbox\. The PR details will load/),
+      );
+    } finally {
+      sandboxStarting = false;
+    }
   });
 
   it.each([undefined, null, "", "   "])(

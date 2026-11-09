@@ -160,7 +160,7 @@ function serverSelectorV2EnvForced() {
   return process.env.OMNIGENT_SERVER_SELECTOR_V2 === "1";
 }
 
-/** V2 defaults on for MDM-enabled Databricks macOS users. */
+/** V2 defaults on for macOS users with managed features enabled. */
 function serverSelectorV2Enabled() {
   // If enforced by the environment variable, enable.
   if (serverSelectorV2EnvForced()) {
@@ -179,7 +179,7 @@ function serverSelectorV2Enabled() {
     return false;
   }
 
-  // Enable on Databricks managed devices.
+  // Enable on managed devices.
   if (isDatabricksManaged) {
     return true;
   }
@@ -210,13 +210,13 @@ function serverSelectorV2DevUrl() {
 
 /**
  * Dev-only onboarding mock, driven by env vars so the wizard's four desktop
- * variants can be exercised in the real Electron shell without MDM / a real
- * server. Translates OMNIGENT_ONBOARDING_MOCK* into the `?mock=1&…` query the
+ * variants can be exercised in the real Electron shell without managed
+ * preferences or a real server. Translates OMNIGENT_ONBOARDING_MOCK* into the `?mock=1&…` query the
  * renderer's mockSetup.ts reads. Empty (no query) unless the mock is on, and
  * never active in a packaged build. See web/src/pages/onboarding/mockSetup.ts.
  *
  *   OMNIGENT_ONBOARDING_MOCK=1                 enable
- *   OMNIGENT_ONBOARDING_MOCK_MANAGED=url,url   MDM-preset servers
+ *   OMNIGENT_ONBOARDING_MOCK_MANAGED=url,url   managed preset servers
  *   OMNIGENT_ONBOARDING_MOCK_RECENTS=url,url   recent servers
  *   OMNIGENT_ONBOARDING_MOCK_INSTALLED=1       returning user
  *   OMNIGENT_ONBOARDING_MOCK_REMOTE_ENV=1      offer the remote environment
@@ -325,30 +325,28 @@ function developerModeEnabled() {
   });
 }
 
-/** Read the current macOS MDM-provided server list without persisting it. */
+/** Read the current managed server list from macOS without persisting it. */
 function managedServerUrls() {
   return getManagedServerUrls({ platform: process.platform, getUserDefault });
 }
 
-/** Display names for the MDM-provided servers, keyed by server URL. */
+/** Display names for managed servers, keyed by server URL. */
 function managedServerNames() {
   return getManagedServerNames({ platform: process.platform, getUserDefault });
 }
 
 /**
- * Whether the MDM-managed Databricks-internal-features flag is set. Read from
- * macOS on every call (never persisted), so profile changes apply live.
+ * Whether the managed features flag is set. Read from macOS on
+ * every call (never persisted), so profile changes apply live.
  */
 function databricksInternalFeaturesEnabled() {
   return getDatabricksInternalFeaturesEnabled({ platform: process.platform, getUserDefault });
 }
 
 /**
- * The Arca connect console: a shell-owned modal that asks consent by showing
- * the exact command, then streams its live output (replaces the bare native
- * dialog — same trust model, full transparency). The flow also de-duplicates:
- * a repeat connect while one is in flight re-focuses the existing console and
- * shares its outcome, so a refreshed SPA can always get back to it.
+ * The Arca connect console: a modal owned by the shell that asks consent by
+ * showing the exact command, then streams its live output. A repeat connect
+ * while one is in flight re-focuses the console and shares its outcome.
  */
 const arcaIdentities = createArcaIdentityStore();
 
@@ -462,8 +460,8 @@ function arcaAutoConnectFeatureEnabled() {
 
 /** Launch-time Arca auto-connect, behind the feature flag above. */
 const arcaAutoConnect = createArcaAutoConnect({
-  // Auto-connect needs arca itself: the MDM flag alone keeps the manual item
-  // (which explains what's missing) but shouldn't fail on every launch.
+  // Auto-connect needs arca itself: the managed flag alone keeps the manual
+  // item (which explains what's missing) but shouldn't fail on every launch.
   isEligible: (serverUrl) =>
     arcaAutoConnectFeatureEnabled() &&
     isDatabricksManagedServerUrl(serverUrl) &&
@@ -1931,11 +1929,11 @@ function rememberOnboardingRunner(serverUrl, runner) {
 const ONBOARDING_RUNNER_TTL_MS = 10 * 60 * 1000;
 
 /**
- * CLI command for desktop host enrollment on `serverUrl`. Databricks-internal
- * windows use `isaac omni` behind the same effective gate as Arca (MDM flag +
- * Databricks-managed HTTPS server); every other window keeps the configured /
- * auto-detected public Omnigent CLI. Returns null when the selected launcher
- * is unavailable.
+ * CLI command for desktop host enrollment on `serverUrl`. Managed
+ * windows use `isaac omni` behind the same effective gate as Arca (managed
+ * features flag + managed HTTPS server); every other window keeps the configured
+ * or auto-detected Omnigent CLI. Returns null when the selected launcher is
+ * unavailable.
  *
  * @param {string | null | undefined} serverUrl
  * @returns {string | {
@@ -2057,7 +2055,7 @@ function rememberServerName(serverUrl, rawName) {
 
 /**
  * The name to show for a server outside trust prompts: the organization's
- * (MDM) name, else the server's own beside its host, else its host.
+ * managed name, else the server's own beside its host, else its host.
  *
  * @param {string} serverUrl
  * @param {string | null} [serverName] A name just read from the server's
@@ -2705,6 +2703,13 @@ function createWindow(targetUrl, opts = {}) {
       spellcheck: true,
     },
   });
+  const sendFullScreenState = () => {
+    if (!win.isDestroyed()) {
+      win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
+    }
+  };
+  win.on("enter-full-screen", sendFullScreenState);
+  win.on("leave-full-screen", sendFullScreenState);
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   // CLI config stores the API mount; Electron boots the browser-facing SPA.
@@ -4350,8 +4355,8 @@ const WORKSPACE_PICKER_PAGE = path.join(__dirname, "..", "workspace-picker", "in
 /**
  * Show the searchable workspace picker (workspace-picker/index.html) as a modal
  * of `parent`, and resolve with the chosen workspace (or null if dismissed).
- * Used for account-scoped (SPOG) logins to choose which workspace to bridge the
- * account token to. Sibling in spirit to genie-one-desktop's WorkspacePicker.
+ * Used for account-scoped logins to choose which workspace to bridge the
+ * account token to.
  *
  * @param {Electron.BrowserWindow} parent
  * @param {Array<{workspaceId: string, name: string, fqdn: string}>} workspaces
@@ -4424,8 +4429,16 @@ function pickWorkspaceForBridge(parent, workspaces, { signal } = {}) {
   });
 }
 
+// A mic click moves focus off the message box and back. macOS refuses Dictation
+// ("bottom line input") until it has registered the refocused field.
+const SYSTEM_DICTATION_FOCUS_SETTLE_MS = 150;
+
 function registerIpc() {
   registerWorkspacePickerIpc();
+  ipcMain.handle("omnigent:is-full-screen", (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return win?.isFullScreen() === true;
+  });
   ipcMain.handle("omnigent:cancel-server-connection", (event, requestId) => {
     if (!isSetupPageSender(event))
       throw new Error("Connection cancellation is only available to the setup page");
@@ -4633,7 +4646,7 @@ function registerIpc() {
   // Setup page → capabilities that gate wizard chrome. `v2Forced` means the env
   // var pins the selector on, so "Switch to legacy" can't take effect and the
   // menu item is disabled. `connectedBefore` (returning user) reads the raw
-  // recents, which — unlike get-recent-servers — still count MDM presets.
+  // recents, which — unlike get-recent-servers — still count managed presets.
   ipcMain.handle("omnigent:get-setup-capabilities", (event) => {
     if (!isSetupPageSender(event)) {
       throw new Error("get-setup-capabilities is only available to the setup page");
@@ -4887,6 +4900,25 @@ function registerIpc() {
   ipcMain.handle("omnigent:confirm-quit", (event, options) => {
     if (!isPinnedOriginSender(event)) return false;
     quitConfirmation.confirmQuit({ dontAskAgain: options?.dontAskAgain === true });
+    return true;
+  });
+
+  // Composer mic on macOS when the server has no dictation: the same action as
+  // Edit > Start Dictation…, which types into the focused field. The page has
+  // focused its message box; focusing the page too takes native focus back
+  // from an embedded browser view.
+  ipcMain.handle("omnigent:start-system-dictation", async (event) => {
+    if (process.platform !== "darwin" || !isPinnedOriginSender(event)) return false;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const focused = () => !win.isDestroyed() && BrowserWindow.getFocusedWindow() === win;
+    if (!win || !focused()) return false;
+    win.webContents.focus();
+    await new Promise((resolve) => {
+      setTimeout(resolve, SYSTEM_DICTATION_FOCUS_SETTLE_MS);
+    });
+    // Dictation types into the key window, so don't start it if the user switched away.
+    if (!focused()) return false;
+    Menu.sendActionToFirstResponder("startDictation:");
     return true;
   });
 
@@ -5301,12 +5333,9 @@ function registerIpc() {
     return result;
   });
 
-  // SPA → desktop feature gates the server can't know about, currently just
-  // the MDM-managed Databricks-internal flag (Arca). Scoped per window: the
-  // flag reads true only when the window's own server is Databricks-managed
-  // (a workspace mount or a Databricks App) — internal features must not
-  // light up against arbitrary self-hosted servers. Read fresh per call so
-  // applying/removing the profile takes effect without a restart.
+  // SPA → desktop feature gates. The managed features flag reads true only when
+  // the window's own server is managed, never on arbitrary self-hosted servers.
+  // Read fresh per call so profile changes apply without a restart.
   const canExtendArca = (event) =>
     databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event));
 
@@ -5360,16 +5389,13 @@ function registerIpc() {
     return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
   });
 
-  // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
-  // the window's server as a host, by running `isaac omni host --background`
-  // on the instance over `arca ssh`. Gated three ways: pinned-origin sender,
-  // the MDM flag re-checked HERE (the renderer is not trusted to have checked
-  // it), and user consent in the shell-owned connect console — which shows
-  // the exact command and streams its live output (arca_connect_window.js).
-  // A connect already in flight is re-surfaced (console focused, outcome
-  // shared), never refused; the runner itself enforces CONNECT_TIMEOUT_MS so
-  // a wedged command always settles. No local process outlives the connect:
-  // the enrolled host keeps its own outbound tunnel from the Arca box.
+  // SPA → connect the user's Arca instance to the window's server as a host,
+  // by running `isaac omni host --background` on the instance over `arca ssh`.
+  // Gated three ways: pinned-origin sender, the managed features flag re-checked
+  // HERE (the renderer is not trusted to have checked it), and user consent in
+  // the connect console (arca_connect_window.js), which shows the exact command.
+  // A connect already in flight is re-surfaced, never refused. The runner
+  // enforces CONNECT_TIMEOUT_MS so a wedged command always settles.
   ipcMain.handle("omnigent:arca-connect", async (event) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("arca-connect is only available to a connected server page");
@@ -5379,8 +5405,8 @@ function registerIpc() {
     }
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
-    // Same scope as get-desktop-features, re-checked here: an Arca box may
-    // only be enrolled against a Databricks-managed server.
+    // Same scope as get-desktop-features, re-checked here: an Arca instance may
+    // only be enrolled against a managed server.
     if (!isDatabricksManagedServerUrl(serverUrl)) {
       return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
     }
@@ -5435,9 +5461,8 @@ function registerIpc() {
     }
   });
 
-  // SPA → renew this machine's dbcert from the expired-dbcert banner; Arca
-  // Companion then copies it to the user's boxes. Same gates as arca-extend.
-  // Clicks from several windows share one sign-in.
+  // SPA → renew this machine's dbcert from the expired-dbcert banner. Same
+  // gates as arca-extend. Clicks from several windows share one sign-in.
   let dbcertPreflight = null;
   let dbcertGeneration = 0;
   let dbcertRefresh = null;

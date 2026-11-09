@@ -416,8 +416,10 @@ async def test_executor_error_terminates_with_response_failed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preserve_session", [False, True])
+@pytest.mark.parametrize("retryable", [False, True])
 async def test_executor_error_preserves_only_explicitly_reusable_sessions(
     preserve_session: bool,
+    retryable: bool,
 ) -> None:
     """Ordinary errors still tear down; explicitly reusable executors can be retained."""
     import asyncio
@@ -429,7 +431,7 @@ async def test_executor_error_preserves_only_explicitly_reusable_sessions(
     from omnigent.server.schemas import CreateResponseRequest
 
     executor = MockExecutor()
-    error = ExecutorError(message="model unavailable", retryable=True)
+    error = ExecutorError(message="model unavailable", retryable=retryable, undelivered=True)
     if preserve_session:
         error.preserve_session = True
         executor.enqueue_events([error])
@@ -445,9 +447,10 @@ async def test_executor_error_preserves_only_explicitly_reusable_sessions(
         response_id="resp_failed", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
     )
 
-    with pytest.raises(RuntimeError, match="model unavailable"):
+    with pytest.raises(RuntimeError, match="model unavailable") as raised:
         await adapter.run_turn(request, ctx)
 
+    assert adapter._build_error_detail(raised.value).undelivered is True
     if preserve_session:
         assert adapter._executor is executor
         assert adapter._abandoned_executor_cleanup is None
@@ -1331,6 +1334,113 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
         f"Expected 2 messages (empty assistant skipped), got {len(messages)}: {messages!r}."
     )
     assert [m["role"] for m in messages] == ["user", "user"]
+
+
+@pytest.mark.parametrize("content", ["", [], [{"type": "input_text", "text": ""}]])
+@pytest.mark.parametrize("preserve_content_blocks", [False, True])
+@pytest.mark.parametrize("include_tool_history", [False, True])
+@pytest.mark.parametrize("preserve_empty_initiating_message", [False, True])
+def test_translate_input_to_messages_empty_initiating_item_requires_opt_in(
+    content, preserve_content_blocks, include_tool_history, preserve_empty_initiating_message
+) -> None:
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "user", "id": "msg_old_empty", "content": []},
+            {"type": "message", "role": "assistant", "content": []},
+            {"type": "message", "role": "user", "id": "msg_empty", "content": content},
+        ],
+        preserve_content_blocks=preserve_content_blocks,
+        include_tool_history=include_tool_history,
+        preserve_empty_initiating_message=preserve_empty_initiating_message,
+    )
+
+    normalized_content = content if preserve_content_blocks else ""
+    if not normalized_content and not preserve_empty_initiating_message:
+        assert messages == [{"role": "user", "content": "old"}]
+        return
+    assert len(messages) == 2
+    assert "input_item_id" not in messages[0]
+    assert messages[-1] == {
+        "role": "user",
+        "content": normalized_content,
+        "input_item_id": "msg_empty",
+    }
+
+
+@pytest.mark.parametrize("executor_name", ["acp", "goose", "qwen", "default"])
+@pytest.mark.parametrize("content", ["", [], [{"type": "input_text", "text": ""}]])
+async def test_adapter_only_preserves_empty_input_for_opted_in_executors(
+    executor_name, content, monkeypatch
+) -> None:
+    import asyncio
+
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+    from omnigent.inner.executor import MockExecutor, TurnComplete
+    from omnigent.inner.goose_executor import GooseExecutor
+    from omnigent.inner.qwen_executor import QwenExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    factories = {
+        "acp": lambda: AcpExecutor(AcpAgentConfig(command="unused", omnigent_mcp=False)),
+        "goose": GooseExecutor,
+        "qwen": QwenExecutor,
+        "default": MockExecutor,
+    }
+    executor = factories[executor_name]()
+    captured = []
+
+    async def capture(messages, tools, system_prompt, config=None):
+        captured.extend(messages)
+        yield TurnComplete(response=None)
+
+    monkeypatch.setattr(executor, "run_turn", capture)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    request = CreateResponseRequest(
+        model="test-agent",
+        input=[
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "user", "id": "msg_empty", "content": content},
+        ],
+    )
+    ctx = TurnContext(
+        response_id=f"resp_{uuid.uuid4().hex}",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+
+    await adapter.run_turn(request, ctx)
+
+    if executor_name == "default":
+        assert len(captured) == 1
+        assert captured[-1]["content"] == "old"
+        assert "input_item_id" not in captured[-1]
+    else:
+        assert len(captured) == 2
+        assert captured[-1]["content"] == ""
+        assert captured[-1]["input_item_id"] == "msg_empty"
+
+
+@pytest.mark.parametrize("has_output", [False, True], ids=["tool-call", "tool-call-and-output"])
+def test_translate_input_to_messages_tool_resume_has_no_input_item_id(has_output) -> None:
+    """A tool tail must not reuse the user ID when the agent produced no text."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    history = [
+        {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+        {"type": "function_call", "name": "read", "call_id": "call_1", "arguments": "{}"},
+    ]
+    if has_output:
+        history.append({"type": "function_call_output", "call_id": "call_1", "output": "done"})
+
+    messages = _translate_input_to_messages(history)
+
+    assert messages == [{"role": "user", "content": "old"}]
+    assert "input_item_id" not in messages[-1]
 
 
 def test_translate_input_to_messages_carries_tool_history() -> None:

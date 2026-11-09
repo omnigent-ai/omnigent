@@ -31,7 +31,7 @@ def _wait_for(page: Page, predicate: Callable[[], bool], *, timeout_s: float = 3
 
 def _open_general_settings(page: Page, base_url: str, *, from_chat: bool = False) -> Locator:
     if from_chat:
-        page.get_by_test_id("settings-button").click()
+        page.get_by_test_id("sidebar-profile-settings").click()
     else:
         page.goto(f"{base_url}/settings/appearance")
     general_link = page.get_by_test_id("settings-nav-general")

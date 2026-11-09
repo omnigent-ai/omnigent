@@ -255,6 +255,9 @@ class ServerInfoResponse(BaseModel):
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
     public_sharing_max_level: Literal["read", "edit"] = "read"
+    sibling_session_destinations: Literal[
+        "current_host", "current_host_or_new_sandbox", "any_host"
+    ] = "any_host"
     server_version: str
     smart_routing_enabled: bool
     smart_routing_sources: SmartRoutingSourcesInfo
@@ -278,7 +281,14 @@ class ServerInfoResponse(BaseModel):
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
+    # Scheduled tasks accept explicit modes that skip approval; servers that omit
+    # this may reject them, so clients hide those modes.
+    scheduled_task_approval_skipping_modes: bool = True
     scheduled_task_sandbox_workspaces: bool = True
+    # Owner-private families and reuse of the source session's sandbox.
+    sibling_sessions: bool = False
+    # Uploaded-agent sessions accept repository lists and worktree options.
+    session_bundle_workspaces: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
@@ -1843,7 +1853,7 @@ def create_app(
     # auth_provider wired in, and (c) account_store passed in.
     #
     # account_store is an EXPLICIT parameter (not constructed in
-    # here) so the internal hosted product can opt out of accounts
+    # here) so a hosted deployment can opt out of accounts
     # persistence entirely by passing None — even when it happens
     # to deploy with the accounts code on disk. Without this gate
     # the create_app factory would force every consumer to carry
@@ -1875,7 +1885,10 @@ def create_app(
 
     configure_host_sharding(host_sharded)
     # A tunnel this replica retires on purpose is a handoff, not a lost runner.
-    tunnel_registry = TunnelRegistry(on_retire=shutdown_state.note_runner_tunnel_retired)
+    tunnel_registry = TunnelRegistry(
+        on_retire=shutdown_state.note_runner_tunnel_retired,
+        on_work_dispatched=managed_host_keepalive.record_work_dispatched,
+    )
     host_registry = HostRegistry()
     runner_router = RunnerRouter(
         registry=tunnel_registry,
@@ -2076,6 +2089,7 @@ def create_app(
             from omnigent.server.scheduled.fire import (
                 ClaimedRunExecutor,
                 FireDeps,
+                build_busy_until,
                 build_on_fire,
                 build_run_now,
             )
@@ -2124,6 +2138,10 @@ def create_app(
                     owned_hosts=dispatch_hooks.owned_hosts,
                     dispatch_enabled=dispatch_hooks.dispatch_enabled,
                     poll_interval=dispatch_hooks.poll_interval,
+                    # Skipping assumes the built-in executor's continued-session delivery.
+                    busy_until=(
+                        build_busy_until(fire_deps) if dispatch_hooks.on_fire is None else None
+                    ),
                     poll_seconds=dispatch_config.poll_seconds,
                     renewal_seconds=dispatch_config.renewal_seconds,
                     lease_seconds=dispatch_config.lease_seconds,
@@ -2187,16 +2205,16 @@ def create_app(
             # backstop. Persistent scheduling separately recovers expired startups.
 
         managed_sandbox_reaper: ManagedSandboxReaper | None = None
-        if sandbox_config is not None and sandbox_config.reaper.enabled:
+        if sandbox_config is not None:
             if host_store is None:
                 _logger.warning(
-                    "Managed sandbox reaper is enabled but no host store is configured; "
-                    "the reaper will not run"
+                    "No host store is configured; managed sandbox cleanup will not run"
                 )
             else:
                 managed_sandbox_reaper = ManagedSandboxReaper(
                     host_store=host_store,
                     sandbox_config=sandbox_config,
+                    reap_offline=sandbox_config.reaper.enabled,
                 )
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
@@ -2279,6 +2297,7 @@ def create_app(
         else None
     )
     app.state.startup_inputs = startup_inputs
+    app.state.permission_store = permission_store
     app.state.host_store = host_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
@@ -2543,6 +2562,15 @@ def create_app(
         _default_public_static = DefaultPublicSessions.coerce(default_public_sessions)
         app.state.default_public_sessions = lambda: _default_public_static
         app.state.default_public_sessions_writable = False
+    from omnigent.server.sharing_settings import (
+        SiblingSessionDestinations,
+        read_sibling_session_destinations_override,
+    )
+
+    def _resolve_sibling_session_destinations() -> SiblingSessionDestinations:
+        return read_sibling_session_destinations_override() or SiblingSessionDestinations.ANY_HOST
+
+    app.state.sibling_session_destinations = _resolve_sibling_session_destinations
     from omnigent.server.server_config import parse_filesystem_attachment_policy
 
     if callable(filesystem_attachment_allowed_extensions):
@@ -3484,9 +3512,8 @@ def create_app(
         — when ``accounts_enabled`` is false, the SPA never
         registers ``/login``, ``/register``, ``/members`` and
         never renders the AccountMenu, so the bundle behaves
-        identically to a pre-PR-2008 build for header / OIDC
-        deploys (in particular, the internal hosted product that
-        syncs from this repo).
+        identically to a build without accounts for header / OIDC
+        deploys (in particular, hosted deployments).
 
         Authentication: this endpoint is intentionally UNAUTHED
         so the SPA can probe it before holding a session cookie.
@@ -3522,11 +3549,10 @@ def create_app(
         needs_setup = False
         if accounts_enabled and account_store is not None:
             needs_setup = not any(u.has_password for u in account_store.list_users())
-        # databricks_features gates the Databricks-deployment-only UI hints
-        # (the "Databricks Lakebox" connect tab). True only when the internal
-        # lakebox launcher module is present — it is excluded from the OSS
-        # export, so an OSS build reports False and the SPA shows the clean,
-        # provider-agnostic hints. find_spec is side-effect-free (no import).
+        # databricks_features gates the Databricks-only UI hints (the
+        # "Databricks Lakebox" connect tab). True only when the lakebox launcher
+        # module is present; otherwise the SPA shows the provider-agnostic hints.
+        # find_spec is side-effect-free (no import).
         import importlib.util
 
         databricks_features = (
@@ -3639,6 +3665,7 @@ def create_app(
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
                 "public_sharing_max_level": app.state.public_sharing_max_level().value,
+                "sibling_session_destinations": app.state.sibling_session_destinations().value,
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,
@@ -3649,6 +3676,7 @@ def create_app(
                 "scheduled_task_worktrees": True,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
+                "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,
