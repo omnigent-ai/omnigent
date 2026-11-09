@@ -243,8 +243,9 @@ async def test_post_cap_holds_under_concurrency_and_id_spellings(
     [
         {"links": [{"type": "url", "ref": "https://["}]},
         {"body_md": "".join(chr(0x4E00 + (n * 7919) % 20000) for n in range(8000))},
+        {"topic": "\u0130" * 100},
     ],
-    ids=["unparseable-link", "body-too-large-to-store"],
+    ids=["unparseable-link", "body-too-large-to-store", "topic-too-long-once-lowercased"],
 )
 async def test_post_rejects_items_it_cannot_store(
     client: httpx.AsyncClient, stores: SimpleNamespace, overrides: dict[str, Any]
@@ -284,7 +285,10 @@ async def test_list_and_resolve(client: httpx.AsyncClient, stores: SimpleNamespa
     ).status_code == 422
     assert (await client.patch(f"/v1/inbox/items/{'0' * 32}", json={})).status_code == 404
     assert (await client.patch("/v1/inbox/items/not-an-id", json={})).status_code == 404
-    assert (await client.get("/v1/inbox/items", params={"after": "x"})).status_code == 400
+    for cursor in ("x", "\u00b2:" + "a" * 32, "1:" + "a" * 32 + "\n"):
+        assert (await client.get("/v1/inbox/items", params={"after": cursor})).status_code == 400
+    late_read = (await client.patch(url, json={"state": "read"})).json()
+    assert (late_read["state"], late_read["resolution"]) == ("dismissed", "not_now")
 
 
 async def test_authenticated_owners_see_only_their_items(

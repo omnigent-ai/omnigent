@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable
 from typing import TypeVar
 
-from sqlalchemy import Select, and_, func, or_, select
+from sqlalchemy import Select, func, select, tuple_
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session
 
@@ -36,6 +36,7 @@ from omnigent.stores.inbox_item_store import (
     NewInboxItem,
 )
 
+_OPEN_STATE_CODES = frozenset(encode_inbox_item_state(state) for state in ("unread", "read"))
 # Retries after a concurrent post took the same session slot.
 _SLOT_RETRIES = 3
 _T = TypeVar("_T")
@@ -211,16 +212,8 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         if created_after is not None:
             stmt = stmt.where(SqlInboxItem.created_at >= created_after)
         if after is not None:
-            cursor_created_at, cursor_id = after
-            stmt = stmt.where(
-                or_(
-                    SqlInboxItem.created_at < cursor_created_at,
-                    and_(
-                        SqlInboxItem.created_at == cursor_created_at,
-                        SqlInboxItem.id < cursor_id,
-                    ),
-                )
-            )
+            # A row-value comparison seeks the index instead of filtering earlier history.
+            stmt = stmt.where(tuple_(SqlInboxItem.created_at, SqlInboxItem.id) < after)
         stmt = stmt.order_by(SqlInboxItem.created_at.desc(), SqlInboxItem.id.desc()).limit(limit)
         return list(session.execute(stmt).scalars().all())
 
@@ -294,7 +287,10 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
                 new_code = encode_inbox_item_state(state)
                 if new_code != encode_inbox_item_state("unread") and row.read_at is None:
                     row.read_at = now
-                row.state = new_code
+                # A read or unread mark never reopens a resolved item; only a
+                # resolution of "none" does, and it sets the state itself.
+                if resolution is not None or row.state in _OPEN_STATE_CODES:
+                    row.state = new_code
             if resolution is not None:
                 row.resolution = encode_inbox_item_resolution(resolution)
                 row.resolution_action = resolution_action
