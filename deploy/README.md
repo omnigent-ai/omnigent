@@ -99,6 +99,13 @@ deploy/
 ├── microsandbox/      ← microsandbox sandbox-provider guide (local libkrun
 │   └── README.md         microVMs, embedded SDK, no daemon); NOT a server target.
 │
+├── aws-lambda-microvm/ ← AWS Lambda MicroVMs sandbox-provider guide + MicroVM
+│   ├── Dockerfile        image build inputs (hooks shim on the host image);
+│   ├── entrypoint.sh     server-managed only. NOT a server deploy target.
+│   ├── hooks_server.py
+│   ├── start_host.sh
+│   └── README.md
+│
 ├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
 │   ├── databricks.yml     bundle declarative config
 │   ├── deploy.py          build + `bundle deploy`/`run` orchestrator
@@ -705,8 +712,8 @@ shows the Omnigent mascot, never your logo.
 `server_name` names this particular server, so people who connect the desktop
 app to several servers can tell them apart. It is published in the
 unauthenticated `GET /.well-known/omnigent.json` manifest, not in `/v1/info`.
-Desktop builds that read it always show the host next to it, and an MDM-provided
-name (`omnigentServerName`) takes precedence. When unset, the desktop shows the
+Desktop builds that read it always show the host next to it, and a name set by
+device policy (`omnigentServerName`) takes precedence. When unset, the desktop shows the
 host; it does not fall back to `app_name`.
 
 ## Curating the New Chat picker

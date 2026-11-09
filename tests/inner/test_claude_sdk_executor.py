@@ -5,7 +5,6 @@ import base64
 import json
 import logging
 import os
-import sys
 import tempfile
 import threading
 import unittest
@@ -14,8 +13,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.claude_sdk_executor import _to_anthropic_content_blocks
 from omnigent.inner.executor import (

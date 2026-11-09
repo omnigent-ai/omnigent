@@ -35,6 +35,11 @@ _PERMISSION = """\
 ╰──────────────────────────────────────────────────────────╯
 """
 _COMPOSER = "\n──────────────────────────────\n❯\n──────────────────────────────\n"
+_WRAPPED_QUESTION = _QUESTION.replace("Esc to cancel", "Esc to\ncancel")
+_WRAPPED_SELECT_QUESTION = _QUESTION.replace("Enter to select", "Enter to\nselect")
+_WRAPPED_MULTISELECT = _WRAPPED_QUESTION.replace(
+    "Enter to select", "Space to select · Enter to\nsubmit"
+)
 
 
 @pytest.fixture
@@ -72,7 +77,18 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
     [
         _QUESTION,
         _QUESTION.replace("Enter to select", "Space to select · Enter to submit"),
+        _WRAPPED_QUESTION,
+        _WRAPPED_SELECT_QUESTION,
+        _WRAPPED_MULTISELECT,
         _PERMISSION,
+    ],
+    ids=[
+        "question",
+        "multiselect",
+        "wrapped-cancel",
+        "wrapped-select",
+        "wrapped-submit",
+        "permission",
     ],
 )
 @pytest.mark.parametrize("operation", ["message", "settings"])
@@ -94,7 +110,11 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
     assert sent == []
 
 
-@pytest.mark.parametrize("pane", [_QUESTION, _PERMISSION])
+@pytest.mark.parametrize(
+    "pane",
+    [_QUESTION, _WRAPPED_QUESTION, _WRAPPED_SELECT_QUESTION, _WRAPPED_MULTISELECT, _PERMISSION],
+    ids=["question", "wrapped-cancel", "wrapped-select", "wrapped-submit", "permission"],
+)
 def test_decision_text_above_a_ready_composer_does_not_block_delivery(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
@@ -137,14 +157,20 @@ def test_question_appearing_after_readiness_prevents_paste(
     assert sent == []
 
 
+@pytest.mark.parametrize(
+    "pane",
+    [_QUESTION, _WRAPPED_QUESTION, _WRAPPED_SELECT_QUESTION, _WRAPPED_MULTISELECT],
+    ids=["question", "wrapped-cancel", "wrapped-select", "wrapped-submit"],
+)
 def test_question_appearing_during_readiness_does_not_become_a_terminal_timeout(
-    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _QUESTION)
-    with pytest.raises(bridge.ClaudeUserPromptPending):
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: pane)
+    with pytest.raises(bridge.ClaudeUserPromptPending) as caught:
         bridge._wait_for_claude_prompt_ready(
             "/tmp/example.sock", "main", timeout_s=0, bridge_dir=native_bridge
         )
+    assert caught.value.nothing_typed
 
 
 def test_explicit_interrupt_can_cancel_a_pending_question(
