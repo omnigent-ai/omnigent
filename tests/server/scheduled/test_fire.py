@@ -3020,6 +3020,14 @@ async def test_continue_never_replaces_an_unusable_session(
                 ]
             ),
         ),
+        # Any approval-skipping selection opts in; it is not a ceiling on the session's mode.
+        (
+            "dontAsk",
+            _continued_session(
+                labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+            ),
+        ),
+        ("full-access", _continued_session(labels={CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"})),
     ],
 )
 async def test_continue_accepts_a_session_in_a_mode_the_task_selects(
@@ -3895,9 +3903,9 @@ async def test_sdk_agent_default_mode_gates_a_continued_session(
 ) -> None:
     """A continued session keeps the SDK spec's bypassPermissions default.
 
-    Only a task that itself selects an approval-skipping mode may continue in it; a
-    task selecting ``auto`` is refused before dispatch, since continuation does not
-    apply the task's mode over the agent's default.
+    SDK agents take no task mode at save, so these tasks were saved while the agent ran a
+    native harness, and it was then reinstalled under the same id as this SDK agent.
+    Only a task selecting an approval-skipping mode may continue; ``auto`` is refused.
     """
     store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(permission_mode=task_mode)})
     conv_store = _ExistingConversationStore(_continued_session())

@@ -3051,6 +3051,8 @@ async def test_create_can_continue_a_session_the_owner_picked(
             headers=_headers(),
         )
         assert picked.status_code == status, (permission_mode, picked.text)
+        if status == 400:
+            assert "which skips approval" in picked.json()["error"]["message"]
 
 
 async def test_a_picked_session_must_be_the_owners_and_fit_the_task(
@@ -3138,6 +3140,8 @@ async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
             headers=_headers(),
         )
         assert picked.status_code == status, (update, picked.text)
+        if status == 400:
+            assert "which skips approval" in picked.json()["error"]["message"]
     # Changing only the mode is checked against the session the task continues.
     for permission_mode, status in (("approve-for-me", 400), (None, 400), ("bypass", 200)):
         changed = await auth_client.patch(
@@ -3146,6 +3150,8 @@ async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
             headers=_headers(),
         )
         assert changed.status_code == status, (permission_mode, changed.text)
+        if status == 400:
+            assert "which skips approval" in changed.json()["error"]["message"]
     assert copies == []
 
 

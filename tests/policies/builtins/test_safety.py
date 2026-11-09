@@ -704,7 +704,34 @@ def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: st
     assert result["result"] == "ASK"
     assert "nightly triage" in result["reason"]
     assert "rrule=FREQ=DAILY;BYHOUR=9" in result["reason"]
-    assert "Effective task permission mode: agent default (no task override)" in result["reason"]
+    assert "Task permission setting: agent default (no task override)" in result["reason"]
+
+
+def test_ask_on_scheduled_task_change_notes_a_continued_sessions_own_mode() -> None:
+    """A continuing task's setting doesn't change the mode of the session it continues."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_create",
+            "data": {
+                "arguments": {
+                    "name": "follow up",
+                    "prompt": "Check the deploy.",
+                    "permission_mode": "dontAsk",
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "session_mode": "continue",
+                    "session_id": "conv_1",
+                },
+            },
+        }
+    )
+    assert result["result"] == "ASK"
+    assert (
+        "Task permission setting: dontAsk (skips approval prompts, so unattended runs act "
+        "without asking); a continued session keeps its own permission mode"
+    ) in result["reason"].splitlines()
 
 
 def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -> None:
@@ -751,7 +778,7 @@ def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -
         assert setting in reason, reason
     assert prompt in reason
     assert (
-        "Effective task permission mode: bypassPermissions "
+        "Task permission setting: bypassPermissions "
         "(skips approval prompts, so unattended runs act without asking)"
     ) in reason.splitlines()
 
@@ -973,10 +1000,7 @@ def test_legacy_scheduled_task_approval_identifies_omitted_fields(
                 )
             else:
                 expected_permission = "unchanged (not supplied by legacy caller)"
-        assert (
-            f"Effective task permission mode: {expected_permission}"
-            in result["reason"].splitlines()
-        )
+        assert f"Task permission setting: {expected_permission}" in result["reason"].splitlines()
         assert result["reason"].endswith(
             f"Full automation instructions:\n{expected_prompt}\nApprove?"
         )

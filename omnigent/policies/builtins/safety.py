@@ -509,11 +509,13 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
                 if "agent_id" in args
                 else "unchanged (not supplied by legacy caller)"
             )
+    if args.get("session_mode") == "continue":
+        permission_mode += "; a continued session keeps its own permission mode"
     settings = _scheduled_task_settings(args, skip="prompt")
     return (
         f"Agent wants to {action} {subject}.\n"
         f"{legacy_notice}"
-        f"Effective task permission mode: {permission_mode}\n"
+        f"Task permission setting: {permission_mode}\n"
         f"Settings: {settings or '(none)'}\n"
         "Full automation instructions:\n"
         f"{prompt}\n"
