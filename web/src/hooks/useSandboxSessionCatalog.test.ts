@@ -110,7 +110,8 @@ describe("sandbox session catalog hooks", () => {
     harness = "codex-native",
     { launched = true, enabled = true, modelLabel = null as string | null } = {},
   ) {
-    if (launched) markSandboxLaunch(sessionId, modelLabel);
+    // The launch picks match the store's current choices set in beforeEach.
+    if (launched) markSandboxLaunch(sessionId, { model: "gpt-5", effort: "minimal", modelLabel });
     return renderHook(
       ({ models }: { models: NativeModelOption[] }) =>
         useSandboxLaunchSelectionCheck(sessionId, harness, models, enabled),
@@ -170,20 +171,16 @@ describe("sandbox session catalog hooks", () => {
     expect(toast.info).not.toHaveBeenCalled();
   });
 
-  it("retires the check when the user leaves before the session or catalog loads", async () => {
-    markSandboxLaunch(sessionId, null);
-    // The session snapshot hasn't loaded, so the page has no session id to pass yet.
-    const hook = renderHook(
-      ({ id, models }: { id: string | null; models: NativeModelOption[] }) =>
-        useSandboxLaunchSelectionCheck(id, "codex-native", models, true),
-      { initialProps: { id: null as string | null, models: [] as NativeModelOption[] } },
+  it("never resets a choice the user made after launch", async () => {
+    const { rerender } = renderCheck("claude-native");
+    // Before the catalog arrives, the user picks another unavailable model and clears effort.
+    act(() =>
+      useChatStore.setState({ sessionModelOverride: "gpt-4o", sessionReasoningEffort: null }),
     );
-    act(() => useChatStore.setState({ conversationId: "conv_elsewhere" }));
-    // Reopening later and receiving the catalog must not reset anything.
-    act(() => useChatStore.setState({ conversationId: sessionId }));
-    hook.rerender({ id: sessionId, models: codexModels });
+    rerender({ models: claudeModels });
     await act(async () => {});
     expect(setModel).not.toHaveBeenCalled();
+    expect(setEffort).not.toHaveBeenCalled();
     expect(toast.info).not.toHaveBeenCalled();
   });
 

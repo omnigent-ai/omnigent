@@ -50,23 +50,25 @@ export function launchSelectionNotice(
   return null;
 }
 
-// Sessions this tab created from New Chat, with the launched model's picker label.
-// Waking or reopening a session never adds one, so in-session choices stay untouched.
-const pendingLaunchChecks = new Map<string, string | null>();
-let retiresOnLeave = false;
-
-export function markSandboxLaunch(sessionId: string, modelLabel: string | null): void {
-  pendingLaunchChecks.set(sessionId, modelLabel);
-  if (retiresOnLeave) return;
-  retiresOnLeave = true;
-  // Leaving a launch before its catalog arrives retires the check, so a later reopen never resets.
-  useChatStore.subscribe((state, previous) => {
-    if (previous.conversationId !== null && previous.conversationId !== state.conversationId)
-      pendingLaunchChecks.delete(previous.conversationId);
-  });
+export interface SandboxLaunch {
+  model: string | null;
+  effort: string | null;
+  /** The launched model's picker label, for the notice. */
+  modelLabel: string | null;
 }
 
-/** Once a sandbox this tab launched reports its catalog, reset a model or effort it lacks. */
+// Sessions this tab created from New Chat, with the choices they launched with.
+const pendingLaunchChecks = new Map<string, SandboxLaunch>();
+
+export function markSandboxLaunch(sessionId: string, launch: SandboxLaunch): void {
+  pendingLaunchChecks.set(sessionId, launch);
+}
+
+/**
+ * Once a sandbox this tab launched reports its catalog, reset a launch model or
+ * effort it lacks. Only a choice still equal to the launch pick is reset, so a
+ * choice the user made later is never touched, however late the check runs.
+ */
 export function useSandboxLaunchSelectionCheck(
   sessionId: string | null,
   harness: string | null,
@@ -76,27 +78,28 @@ export function useSandboxLaunchSelectionCheck(
   const conversationId = useChatStore((state) => state.conversationId);
   useEffect(() => {
     if (!enabled || sessionId === null || conversationId !== sessionId) return;
-    if (harness === null || models.length === 0 || !pendingLaunchChecks.has(sessionId)) return;
-    const modelLabel = pendingLaunchChecks.get(sessionId) ?? null;
+    const launch = pendingLaunchChecks.get(sessionId);
+    if (launch === undefined || harness === null || models.length === 0) return;
     pendingLaunchChecks.delete(sessionId);
     const { sessionModelOverride: model, sessionReasoningEffort: effort } = useChatStore.getState();
     const resets = launchSelectionResets(harness, models, model, effort);
-    if (!resets.model && !resets.effort) return;
+    const resetModel = resets.model && model === launch.model;
+    if (!resetModel && !(resets.effort && effort === launch.effort)) return;
     void (async () => {
       try {
-        if (resets.model) await useChatStore.getState().setModel(null);
+        if (resetModel) await useChatStore.getState().setModel(null);
         // Skip the effort if the user switched away or picked a new effort meanwhile.
         const after = useChatStore.getState();
         const resetEffort =
           resets.effort &&
           after.conversationId === sessionId &&
-          after.sessionReasoningEffort === effort;
+          after.sessionReasoningEffort === launch.effort;
         if (resetEffort) await after.setEffort(null);
         const notice = launchSelectionNotice(
-          { model: resets.model, effort: resetEffort },
+          { model: resetModel, effort: resetEffort },
           model,
           effort,
-          modelLabel,
+          launch.modelLabel,
         );
         if (notice !== null) toast.info(notice);
       } catch {

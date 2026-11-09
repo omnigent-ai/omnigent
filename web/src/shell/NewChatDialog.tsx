@@ -6378,15 +6378,13 @@ function NewChatLandingContent({
         // New Chat is the only create path that can produce a managed sandbox;
         // interactionTelemetry completes/settles the span once the session runs.
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
-        // Only a launch the user is still watching gets checked; one they left
-        // behaves like any reopened session.
-        const stillOnLaunch =
-          localConv !== null
-            ? stillViewingLocalSession(localConv.tempConvId)
-            : onScreenRef.current && window.location.href === createLocation;
-        if (sandboxSelected && stillOnLaunch) {
+        if (sandboxSelected) {
           const launchedRow = sandboxCatalog?.find((row) => row.id === normalizedModelOverride);
-          markSandboxLaunch(created.id, launchedRow ? nativeModelLabel(launchedRow) : null);
+          markSandboxLaunch(created.id, {
+            model: normalizedModelOverride ?? null,
+            effort: normalizedReasoningEffort ?? null,
+            modelLabel: launchedRow ? nativeModelLabel(launchedRow) : null,
+          });
         }
       }
       // Persist the configuration that actually launched. Modal Save updates
