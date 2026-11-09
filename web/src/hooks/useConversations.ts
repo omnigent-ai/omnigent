@@ -432,60 +432,26 @@ interface MoveTombstone {
   projectId: string | null;
   /** Legacy label a label-only target is shown through until the PATCH lands. */
   projectLabel?: string;
-  /** The PATCH succeeded. */
-  confirmed: boolean;
-  /** A server copy of the row already reported this membership. */
-  observed: boolean;
-  timer?: ReturnType<typeof setTimeout>;
 }
 
 const movingSessions = new Map<string, MoveTombstone>();
 
 function markSessionMoving(id: string, entry: MoveTombstone): void {
-  const previous = movingSessions.get(id);
-  if (previous?.timer !== undefined) clearTimeout(previous.timer);
   movingSessions.set(id, entry);
 }
 
 function unmarkSessionMoving(id: string, entry?: MoveTombstone): void {
-  const current = movingSessions.get(id);
-  if (current === undefined || (entry !== undefined && current !== entry)) return;
-  if (current.timer !== undefined) clearTimeout(current.timer);
-  movingSessions.delete(id);
+  if (entry === undefined || movingSessions.get(id) === entry) movingSessions.delete(id);
 }
 
-/**
- * The PATCH landed. The tombstone ends once a server copy of the row reports
- * the confirmed membership (possibly already seen), or after a timeout.
- */
-function confirmSessionMoving(id: string, entry: MoveTombstone, projectId: string | null): void {
-  if (movingSessions.get(id) !== entry) return;
-  if (entry.observed && entry.projectId === projectId && entry.projectLabel === undefined) {
-    unmarkSessionMoving(id, entry);
-    return;
-  }
-  entry.projectId = projectId;
-  entry.projectLabel = undefined;
-  entry.observed = false;
-  entry.confirmed = true;
-  entry.timer = setTimeout(() => unmarkSessionMoving(id, entry), DELETED_TOMBSTONE_MS);
-}
-
-/**
- * Give a fetched or streamed row the membership of its in-flight move. A row
- * that already reports it releases the tombstone once the move is confirmed.
- */
+/** Give a fetched or streamed row the membership of its in-flight move. */
 export function withMoveTombstone<
   T extends { id: string; project_id?: string | null; labels?: Record<string, string> },
 >(row: T): T {
   const entry = movingSessions.get(row.id);
   if (entry === undefined) return row;
   const label = row.labels?.[PROJECT_LABEL_KEY] || undefined;
-  if ((row.project_id ?? null) === entry.projectId && label === entry.projectLabel) {
-    if (entry.confirmed) unmarkSessionMoving(row.id, entry);
-    else entry.observed = true;
-    return row;
-  }
+  if ((row.project_id ?? null) === entry.projectId && label === entry.projectLabel) return row;
   const labels = Object.fromEntries(
     Object.entries(row.labels ?? {}).filter(([key]) => key !== PROJECT_LABEL_KEY),
   );
@@ -2660,8 +2626,6 @@ export function useMoveToProject() {
         project: project === "" ? null : project,
         projectId: target?.id ?? null,
         projectLabel: labels[PROJECT_LABEL_KEY],
-        confirmed: false,
-        observed: false,
       };
       markSessionMoving(id, move);
       return { ...previous, move };
@@ -2675,8 +2639,6 @@ export function useMoveToProject() {
       restoreOpenSessionRow(queryClient, id, previous.backfill);
     },
     onSuccess: (updated, { id, project }, previous) => {
-      if (previous !== undefined)
-        confirmSessionMoving(id, previous.move, updated.project_id ?? null);
       markConversationSeen(updated.id, updated.updated_at);
       // Filing can promote a label-only folder to first-class inside the
       // mutation. Seed the confirmed id into the cached projects list before
@@ -2690,10 +2652,20 @@ export function useMoveToProject() {
           old?.map((p) => (p.name === project && p.id === null ? { ...p, id: confirmedId } : p)),
         );
       }
-      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // Reads issued from here on postdate the commit, so the guard holds the
+      // confirmed membership only until the lists below have refetched.
+      if (previous !== undefined) {
+        previous.move.projectId = confirmedId ?? null;
+        previous.move.projectLabel = undefined;
+      }
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["conversations"] }),
+        // Moving into/out of a project changes both folders' paginated lists.
+        queryClient.invalidateQueries({ queryKey: ["project-sessions"] }),
+      ]).finally(() => {
+        if (previous !== undefined) unmarkSessionMoving(id, previous.move);
+      });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      // Moving into/out of a project changes both folders' paginated lists.
-      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       // Moving an archived session relabels which project owns it, shifting the
       // archived-view picker's option set.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });

@@ -3640,7 +3640,7 @@ describe("useMoveToProject", () => {
       return { queryClient, result, fetchRow };
     }
 
-    it("keeps the move on list fetches until the server reports it", async () => {
+    it("keeps the move on list fetches until its post-move refetch", async () => {
       const { queryClient, result, fetchRow } = setup();
       result.current.mutate({ id: "conv_move", project: "New" });
       await waitFor(() =>
@@ -3656,17 +3656,13 @@ describe("useMoveToProject", () => {
 
       settlePatch(true);
       await waitFor(() => expect(result.current.isSuccess).toBe(true));
-      expect((await fetchRow())?.project_id).toBe("p_new");
-
-      // The server now reports the move, so a later remote move shows through.
-      serverProjectId = "p_new";
-      expect((await fetchRow())?.project_id).toBe("p_new");
-      serverProjectId = "p_old";
-      expect((await fetchRow())?.project_id).toBe("p_old");
+      // Once the lists have refetched after the commit, a remote move shows through.
+      serverProjectId = "p_third";
+      await waitFor(async () => expect((await fetchRow())?.project_id).toBe("p_third"));
     });
 
-    it("releases on a server copy that reported the move before the PATCH answered", async () => {
-      const { result, fetchRow } = setup();
+    it("drops a moving row from its old project folder's fetch", async () => {
+      const { queryClient, result } = setup();
       result.current.mutate({ id: "conv_move", project: "New" });
       await waitFor(() =>
         expect(fetchMock).toHaveBeenCalledWith(
@@ -3674,14 +3670,14 @@ describe("useMoveToProject", () => {
           expect.objectContaining({ method: "PATCH" }),
         ),
       );
-      serverProjectId = "p_new";
-      expect((await fetchRow())?.project_id).toBe("p_new");
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const folder = renderHook(() => useProjectSessions("Old", true), { wrapper });
 
+      await waitFor(() => expect(folder.result.current.isSuccess).toBe(true));
+      expect(folder.result.current.data!.pages[0].data).toEqual([]);
       settlePatch(true);
       await waitFor(() => expect(result.current.isSuccess).toBe(true));
-      // Another client moves it on before any further New copy arrives.
-      serverProjectId = "p_third";
-      expect((await fetchRow())?.project_id).toBe("p_third");
     });
 
     it("stops overriding fetches when the PATCH fails", async () => {
