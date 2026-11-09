@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   DownloadIcon,
   ExternalLinkIcon,
@@ -20,6 +20,7 @@ import {
   downloadWorkspaceFile,
   fetchWorkspaceFileBlob,
   useFileContent,
+  workspaceFileMediaUrl,
 } from "@/hooks/useFileContent";
 import { showToast } from "@/components/ui/toast";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
@@ -48,7 +49,13 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   const path = "path" in props ? props.path : undefined;
   const [requested, setRequested] = useState(false);
   const [blobSrc, setBlobSrc] = useState<string>();
-  const src = requested ? (remoteSrc ?? blobSrc) : undefined;
+  // Resolved once per Play so a later routing-key change can't swap the source mid-playback.
+  const directSrc = useMemo(
+    () =>
+      requested && conversationId && path ? workspaceFileMediaUrl(conversationId, path) : null,
+    [requested, conversationId, path],
+  );
+  const src = requested ? (remoteSrc ?? directSrc ?? blobSrc) : undefined;
   const [failed, setFailed] = useState(false);
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState<number | null>(null);
@@ -95,7 +102,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
 
   // Recordings can be large. Fetch only on Play, and release bytes on close.
   useEffect(() => {
-    if (!requested || !conversationId || !path) return;
+    if (!requested || !conversationId || !path || directSrc) return;
     const controller = new AbortController();
     let objectUrl: string | undefined;
     void fetchWorkspaceFileBlob(conversationId, path, controller.signal)
@@ -111,7 +118,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [requested, conversationId, path]);
+  }, [requested, conversationId, path, directSrc]);
 
   useEffect(() => {
     // Capture the element before React clears its ref on unmount.

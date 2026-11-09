@@ -555,7 +555,6 @@ async def test_archive_stop_skips_when_read_never_succeeds(
     session = await create_test_session(client, name="archive-stop-read-outage")
     session_id = session["id"]
     await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
-    await _drain_detached_stops()
 
     conv_store = SqlAlchemyConversationStore(db_uri)
     mock_stop = AsyncMock(return_value=True)

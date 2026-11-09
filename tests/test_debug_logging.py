@@ -2017,3 +2017,15 @@ def test_close_during_a_slow_prefetch_returns_at_its_timeout_and_counts_the_rows
 
     assert client.inserts == 0
     assert _dropped_counts(caplog) == [1]  # past the deadline, the row is dropped and counted
+
+
+def test_stage_timings_split_wall_time_into_marked_stages() -> None:
+    """Each mark closes the stage since the previous one; repeats accumulate."""
+    moments = iter([0.0, 0.010, 0.250, 0.300, 0.400])
+    timings = dl.StageTimings(clock=lambda: next(moments))
+
+    timings.mark("config")
+    timings.mark("catalog")
+    timings.mark("config")
+
+    assert timings.attributes() == {"config_ms": 60, "catalog_ms": 240, "total_ms": 400}
