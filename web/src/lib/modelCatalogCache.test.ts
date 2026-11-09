@@ -113,6 +113,38 @@ it("tolerates unavailable browser storage", () => {
   expect(readModelCatalogCache(key())).toBeNull();
 });
 
+it("reads a runner-reported catalog that sends null for unset fields", () => {
+  const sessionKey = sandboxSessionCatalogKey("company", "claude-native", "ag_1");
+  window.localStorage.setItem(
+    sessionKey!,
+    JSON.stringify({
+      models: [
+        {
+          id: "system.ai.claude-sonnet-5-5",
+          model: "system.ai.claude-sonnet-5-5",
+          displayName: "Claude Sonnet 5.5",
+          defaultReasoningEffort: null,
+          supportedReasoningEfforts: [],
+          isDefault: null,
+          source: { kind: "databricks", label: "Workspace", name: "DEFAULT" },
+        },
+      ],
+      configured: false,
+      savedAt: Date.now(),
+    }),
+  );
+  const saved = readModelCatalogCache(sessionKey, SANDBOX_SESSION_CATALOG_MAX_AGE_MS);
+  expect(saved?.models).toEqual([
+    {
+      id: "system.ai.claude-sonnet-5-5",
+      model: "system.ai.claude-sonnet-5-5",
+      displayName: "Claude Sonnet 5.5",
+      supportedReasoningEfforts: [],
+      source: { kind: "databricks", label: "Workspace", name: "DEFAULT" },
+    },
+  ]);
+});
+
 it("keeps session catalogs apart from previews and other agents, for a week", () => {
   vi.useFakeTimers();
   const now = Date.now();

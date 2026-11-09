@@ -3,23 +3,28 @@ import { getOmnigentServerIdentity } from "./host";
 import { getCurrentUserId } from "./identity";
 import type { NativeModelOption } from "./types";
 
+// Runner-reported catalogs send null for unset fields; read them as absent.
+function unset<T extends z.ZodType>(schema: T) {
+  return schema.nullish().transform((value) => value ?? undefined);
+}
+
 export const modelOptionSchema = z.object({
   id: z.string(),
-  model: z.string().optional(),
-  displayName: z.string().optional(),
-  isDefault: z.boolean().optional(),
-  defaultReasoningEffort: z.string().optional(),
-  supportedReasoningEfforts: z
-    .array(z.object({ reasoningEffort: z.string(), description: z.string().optional() }))
-    .optional(),
-  source: z
-    .object({
+  model: unset(z.string()),
+  displayName: unset(z.string()),
+  isDefault: unset(z.boolean()),
+  defaultReasoningEffort: unset(z.string()),
+  supportedReasoningEfforts: unset(
+    z.array(z.object({ reasoningEffort: z.string(), description: unset(z.string()) })),
+  ),
+  source: unset(
+    z.object({
       kind: z.string(),
       label: z.string(),
-      name: z.string().optional(),
-      host: z.string().optional(),
-    })
-    .optional(),
+      name: unset(z.string()),
+      host: unset(z.string()),
+    }),
+  ),
 });
 
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;

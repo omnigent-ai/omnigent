@@ -30,7 +30,10 @@ export function useSavedSandboxSessionCatalog(
   const text = useSyncExternalStore(subscribeToSavedCatalogs, () => readModelCatalogCacheText(key));
   return useMemo(() => {
     const saved = parseModelCatalogCache(text, SANDBOX_SESSION_CATALOG_MAX_AGE_MS);
-    return saved && saved.models.length > 0 ? saved.models : undefined;
+    if (!saved || saved.models.length === 0) return undefined;
+    // Like the gateway preview it replaces, mark no row default: the picker's
+    // own Default row stands for the sandbox's default model.
+    return saved.models.map(({ isDefault: _default, ...model }) => model);
   }, [text]);
 }
 

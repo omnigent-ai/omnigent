@@ -222,6 +222,8 @@ describe("sandbox session catalog hooks", () => {
   });
 
   it("saves the reported catalog per agent and refreshes a mounted reader", () => {
+    // The picker's own Default row stands for the session's default model.
+    const shown = codexModels.map(({ isDefault: _default, ...model }) => model);
     const reader = renderHook(() =>
       useSavedSandboxSessionCatalog("arclet", "codex-native", "ag_default"),
     );
@@ -233,9 +235,9 @@ describe("sandbox session catalog hooks", () => {
     );
     expect(reader.result.current).toBeUndefined();
     remember.rerender({ models: codexModels, enabled: true });
-    expect(reader.result.current).toEqual(codexModels);
+    expect(reader.result.current).toEqual(shown);
     remember.rerender({ models: [codexModels[0]], enabled: true });
-    expect(reader.result.current).toEqual([codexModels[0]]);
+    expect(reader.result.current).toEqual([shown[0]]);
     // An agent with its own provider keeps its catalog to itself.
     expect(
       readModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native", "ag_private")),
