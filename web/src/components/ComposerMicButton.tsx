@@ -201,6 +201,7 @@ export const ComposerMicButton = ({
     recognizerStartedAt: number;
     quickEnds: number;
     restarting: boolean;
+    started: boolean;
   } | null>(null);
 
   // Surface a failure both in the button (tooltip + red tint) and as a toast,
@@ -235,6 +236,7 @@ export const ComposerMicButton = ({
       const take = webSpeechTakeRef.current;
       // No take: the user stopped while a restart was starting; end follows.
       if (!take) return;
+      take.started = true;
       if (take.restarting) {
         // A restart continues the same take: keep the Esc snapshot and state.
         take.restarting = false;
@@ -250,7 +252,10 @@ export const ComposerMicButton = ({
     // when the take should end instead.
     const restartTake = (): boolean => {
       const take = webSpeechTakeRef.current;
-      if (!take || disabledRef.current || discardingRef.current) return false;
+      // Only a take that reached "start" is listening; a hidden page can't
+      // reacquire the mic, so let the take end rather than fail noisily.
+      if (!take?.started || disabledRef.current || discardingRef.current) return false;
+      if (document.hidden) return false;
       const now = Date.now();
       if (now - take.lastSpeechAt >= WEB_SPEECH_IDLE_LIMIT_MS) return false;
       const heardNothing = take.lastSpeechAt <= take.recognizerStartedAt;
@@ -561,6 +566,7 @@ export const ComposerMicButton = ({
           recognizerStartedAt: now,
           quickEnds: 0,
           restarting: false,
+          started: false,
         };
         recognition.start();
       }

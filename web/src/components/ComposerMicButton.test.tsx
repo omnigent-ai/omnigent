@@ -536,6 +536,43 @@ describe("ComposerMicButton", () => {
       );
     });
 
+    it("does not restart a take that never reported start", () => {
+      render(<ComposerMicButton onTranscript={vi.fn()} />);
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+      fireEvent.click(button);
+
+      act(() => handlers.end?.({}));
+
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("ends the take when the stop lands before the restart reports start", () => {
+      const { button } = startTake();
+      now += 3_000;
+      act(() => handlers.end?.({}));
+      expect(startSpy).toHaveBeenCalledTimes(2);
+
+      fireEvent.click(button);
+      act(() => handlers.end?.({}));
+
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("does not restart while the page is hidden", () => {
+      const { button } = startTake();
+      const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+
+      now += 3_000;
+      act(() => handlers.end?.({}));
+
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+      expect(showToastMock).not.toHaveBeenCalled();
+      hidden.mockRestore();
+    });
+
     it("ends the take on a fatal error instead of restarting", () => {
       const { button } = startTake();
 
