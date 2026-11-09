@@ -737,6 +737,10 @@ class Executor:
         """Whether fresh and queued input must retain original content block boundaries."""
         return False
 
+    def preserves_empty_initiating_message(self) -> bool:
+        """Whether an empty final user message must survive history filtering."""
+        return False
+
     def supports_tool_boundary_interrupt(self) -> bool:
         """Whether queued user input can be applied by interrupting after a tool boundary."""
         return False
@@ -744,6 +748,10 @@ class Executor:
     def supports_stepwise_internal_turns(self) -> bool:
         """Whether the executor can pause and resume its own agent loop between turns."""
         return False
+
+    def close_timeout(self) -> float:
+        """Budget in seconds for background resource cleanup."""
+        return 3.0
 
     async def close(self) -> None:
         """Release executor-wide resources.
