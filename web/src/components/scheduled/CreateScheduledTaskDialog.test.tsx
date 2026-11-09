@@ -3715,6 +3715,79 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
   });
 
+  it("watches review requests from a named reviewer, with link-back off by default", async () => {
+    renderTrigger("github");
+    expect(screen.queryByTestId("task-trigger-target")).toBeNull();
+    pick("task-trigger-event", "task-trigger-event-review");
+    expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Review requested");
+    // The reviewer is part of the event sentence, defaulting to the owner.
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("from");
+    expect(screen.getByTestId("task-trigger-target")).toHaveValue("me");
+    expect(screen.getByTestId("task-trigger-description")).toHaveTextContent(
+      "Runs your automation each time a matching review is requested on an open pull request that isn't a draft, including re-requests. Requests made before this automation existed are skipped.",
+    );
+    expect(
+      screen.getByRole("checkbox", { name: "Comment the session link on it" }),
+    ).not.toBeChecked();
+    // Assignee and the opened-only Reviewer filter don't apply to the queue.
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    fireEvent.keyDown(screen.getByTestId("task-trigger-condition-0-field"), { key: "Enter" });
+    expect(screen.queryByTestId("task-trigger-condition-0-field-assignee")).toBeNull();
+    expect(screen.queryByTestId("task-trigger-condition-0-field-reviewer")).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("task-trigger-condition-0-field"), { key: "Escape" });
+    fireEvent.click(screen.getByTestId("task-trigger-condition-0-remove"));
+
+    type("task-trigger-scope", "acme/app");
+    type("task-trigger-instructions", "Review the pull request.");
+    type("task-trigger-target", " ");
+    expect(screen.getByTestId("task-trigger-target-hint")).toBeVisible();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    type("task-trigger-target", "me");
+    const prompt = await submittedPrompt();
+    expect(prompt).toContain(
+      "gh api -X GET search/issues -f q='repo:acme/app is:pr is:open -is:draft user-review-requested:@me' -f per_page=100 --paginate",
+    );
+    expect(prompt).toContain('title "GitHub <owner/repo>#<number> review <event id>"');
+    expect(prompt).not.toContain("created:>=");
+    expect(prompt).not.toContain("Omnigent session:");
+  });
+
+  it("explains that a Reviewer filter on opened pull requests misses later requests", () => {
+    renderTrigger("github");
+    pick("task-trigger-event", "task-trigger-event-pr");
+    expect(screen.getByTestId("task-trigger-description")).toHaveTextContent(
+      "Runs your automation on all new pull requests that match these conditions.",
+    );
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    expect(screen.queryByTestId("task-trigger-reviewer-hint")).toBeNull();
+    pick("task-trigger-condition-0-field", "task-trigger-condition-0-field-reviewer");
+    expect(screen.getByTestId("task-trigger-reviewer-hint")).toHaveTextContent(
+      "Only matches reviewers requested before the next check after the pull request opens. To catch later requests and re-requests, choose Review requested.",
+    );
+  });
+
+  it("watches Jira assignee changes to anyone when the assignee is cleared", async () => {
+    renderTrigger("jira");
+    pick("task-trigger-event", "task-trigger-event-assigned");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("to");
+    expect(screen.getByTestId("task-trigger-target")).toHaveValue("me");
+    expect(screen.getByTestId("task-trigger-description")).toHaveTextContent(
+      "Runs your automation each time a matching ticket is assigned, including when it is assigned again later.",
+    );
+    // Assignee changes keep link-back, which comments on the owner's own tickets.
+    expect(
+      screen.getByRole("checkbox", { name: "Comment the session link on the ticket" }),
+    ).toBeChecked();
+    type("task-trigger-scope", "ES");
+    type("task-trigger-instructions", "Triage it.");
+    type("task-trigger-target", "");
+    expect(screen.queryByTestId("task-trigger-target-hint")).toBeNull();
+    const prompt = await submittedPrompt();
+    expect(prompt).toContain(
+      '(project = "ES" AND assignee is not EMPTY) AND assignee CHANGED DURING ("-<A>m", "-<B>m")',
+    );
+  });
+
   it("separates the rendered system and user prompts on Edit as prompt", async () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");

@@ -6,6 +6,9 @@ import {
   describeLinearFilter,
   describePagerDutyFilter,
   describeSlackFilter,
+  emptyTriggerFields,
+  githubReviewerQualifier,
+  jiraAssignee,
   isTriggerPrompt,
   readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
@@ -16,6 +19,7 @@ import {
   stripScopePrefix,
   splitJqlOrderBy,
   triggerConditionFields,
+  triggerEventDescription,
   triggerFieldsComplete,
   triggerScopeOperators,
   updateTriggerWorkerSettings,
@@ -430,6 +434,80 @@ describe("compileJiraJql", () => {
   });
 });
 
+describe("jiraAssignee", () => {
+  it.each([
+    ["me", "assignee CHANGED TO currentUser()", "assignee = currentUser()"],
+    ["", "assignee CHANGED", "assignee is not EMPTY"],
+    ["Anyone", "assignee CHANGED", "assignee is not EMPTY"],
+    ["unassigned", "assignee CHANGED TO EMPTY", "assignee is EMPTY"],
+    ['al"ice', 'assignee CHANGED TO "al\\"ice"', 'assignee = "al\\"ice"'],
+  ])("compiles %j", (target, change, current) => {
+    expect(jiraAssignee(target)).toEqual({ change, current });
+  });
+
+  it("keeps only tickets still assigned that way", () => {
+    expect(compileJiraJql(fields({ event: "assigned", target: "me" }))).toBe(
+      `${JQL} AND assignee = currentUser()`,
+    );
+  });
+});
+
+describe("githubReviewerQualifier", () => {
+  it("never counts a team request as the user's own", () => {
+    expect(githubReviewerQualifier("me")).toBe("user-review-requested:@me");
+    expect(githubReviewerQualifier("Me")).toBe("user-review-requested:@me");
+    expect(githubReviewerQualifier("acme/team")).toBe("team-review-requested:acme/team");
+  });
+});
+
+describe("change events", () => {
+  const github = (overrides: Partial<TriggerFields> = {}) =>
+    fields({ event: "pr", scope: "acme/app", conditions: [], ...overrides });
+
+  it("defaults the reviewer to me and turns link-back off unless it was changed", () => {
+    const review = withTriggerEvent("github", github(), "review");
+    expect(review).toMatchObject({ event: "review", target: "me", linkBack: false });
+    // Back on an opened event, the reviewer goes and link-back follows its default.
+    const opened = withTriggerEvent("github", review, "pr");
+    expect(opened.linkBack).toBe(true);
+    expect(opened).not.toHaveProperty("target");
+    // A changed link-back choice survives switching events.
+    expect(withTriggerEvent("github", github({ linkBack: false }), "review").linkBack).toBe(false);
+    expect(withTriggerEvent("github", { ...review, linkBack: true }, "pr").linkBack).toBe(true);
+    expect(withTriggerEvent("github", { ...review, target: "alice" }, "review").target).toBe(
+      "alice",
+    );
+  });
+
+  it("hides fields that the review queue or opened issues can't use", () => {
+    const ids = (event: string) => triggerConditionFields("github", event).map((f) => f.id);
+    expect(ids("review")).toEqual(["label", "author", "qualifiers"]);
+    expect(ids("pr")).toContain("reviewer");
+    expect(ids("issue")).not.toContain("reviewer");
+    expect(ids("any")).not.toContain("reviewer");
+    expect(triggerConditionFields("jira", "assigned").map((f) => f.id)).not.toContain("assignee");
+  });
+
+  it("requires a reviewer but lets an empty assignee mean anyone", () => {
+    expect(triggerFieldsComplete(github({ event: "review", target: " " }), "github")).toBe(false);
+    expect(triggerFieldsComplete(github({ event: "review", target: "me" }), "github")).toBe(true);
+    expect(triggerFieldsComplete(fields({ event: "assigned", target: "" }), "jira")).toBe(true);
+  });
+
+  it("describes when each event fires", () => {
+    expect(triggerEventDescription("github", "issue")).toBe(
+      "Runs your automation on all new issues that match these conditions. Older issues are skipped, even if they are edited to match later.",
+    );
+    expect(triggerEventDescription("github", "review")).toContain("including re-requests");
+    expect(triggerEventDescription("jira", "assigned")).toContain("assigned again later");
+  });
+
+  it("leaves new triggers on their creation event", () => {
+    expect(emptyTriggerFields("github")).not.toHaveProperty("target");
+    expect(emptyTriggerFields("jira").event).toBe("created");
+  });
+});
+
 describe("compileGithubQuery", () => {
   const query = (event: string, ...conditions: TriggerCondition[]) =>
     compileGithubQuery(fields({ event, scope: "acme/app", conditions }));
@@ -449,6 +527,27 @@ describe("compileGithubQuery", () => {
     );
     expect(query("issue", { field: "assignee", operator: "empty", value: "" })).toBe(
       "repo:acme/app is:issue no:assignee",
+    );
+  });
+
+  it("lists the open, ready review queue of the named reviewer", () => {
+    const review = (target: string) =>
+      compileGithubQuery(fields({ event: "review", scope: "acme/app", conditions: [], target }));
+    expect(review("me")).toBe("repo:acme/app is:pr is:open -is:draft user-review-requested:@me");
+    expect(review("@octocat")).toBe(
+      "repo:acme/app is:pr is:open -is:draft user-review-requested:octocat",
+    );
+    expect(review("acme/maintainers")).toBe(
+      "repo:acme/app is:pr is:open -is:draft team-review-requested:acme/maintainers",
+    );
+  });
+
+  it("compiles reviewer rows on opened pull requests", () => {
+    expect(query("pr", { field: "reviewer", operator: "is", value: "me" })).toBe(
+      "repo:acme/app is:pr user-review-requested:@me",
+    );
+    expect(query("pr", { field: "reviewer", operator: "is_not", value: "acme/bots" })).toBe(
+      "repo:acme/app is:pr -team-review-requested:acme/bots",
     );
   });
 
@@ -1014,5 +1113,93 @@ describe("renderTriggerPrompt", () => {
     expect(either).toContain(
       "search for: repo:acme/app created:>=<that time>, oldest first, through every page (for example gh api -X GET search/issues -f q='repo:acme/app created:>=<that time>' -f sort=created -f order=asc -f per_page=100 --paginate).",
     );
+  });
+});
+
+describe("change-event prompts", () => {
+  const review = (target: string) =>
+    renderTriggerPrompt(
+      "github",
+      fields({ event: "review", scope: "acme/app", conditions: [], target, linkBack: false }),
+      CTX,
+    );
+
+  it("reads the review queue and keys each session by its review_requested event", () => {
+    const prompt = review("me");
+    expect(prompt).toContain(
+      "starts one Omnigent session for each new review request that matches.",
+    );
+    expect(prompt).toContain(
+      "Watch: review requests for you on GitHub pull requests matching: repo:acme/app is:pr is:open -is:draft user-review-requested:@me",
+    );
+    expect(prompt).toContain(
+      "gh api -X GET search/issues -f q='repo:acme/app is:pr is:open -is:draft user-review-requested:@me' -f per_page=100 --paginate",
+    );
+    expect(prompt).toContain("so don't add a time to this search");
+    expect(prompt).toContain(
+      "gh api -X GET repos/<owner>/<repo>/issues/<number>/timeline -f per_page=100 --paginate) and find the latest review_requested event whose requested_reviewer login is your own GitHub login",
+    );
+    expect(prompt).toContain(
+      "That review request counts only if the event was created since that time",
+    );
+    expect(prompt).toContain("Leave out review requests made after the time you noted");
+    expect(prompt).toContain('title "GitHub <owner/repo>#<number> review <event id>"');
+    expect(prompt).toContain("whether you started a session for an earlier review request");
+    // Requests from before the automation existed never count.
+    expect(prompt).toContain(
+      "On the first run, use the current time, so changes made before this automation existed don't count",
+    );
+    expect(prompt).not.toContain("one hour ago");
+    expect(prompt).not.toContain("created:>=");
+    expect(prompt).toContain(
+      "the time the last review request you handled (started or skipped) before you stopped was requested",
+    );
+  });
+
+  it("matches team requests by slug and other users by login", () => {
+    expect(review("acme/maintainers")).toContain(
+      "Watch: review requests for team acme/maintainers on GitHub pull requests",
+    );
+    expect(review("acme/maintainers")).toContain('whose requested_team slug is "maintainers"');
+    expect(review("octocat")).toContain(
+      'whose requested_reviewer login is "octocat", ignoring case',
+    );
+  });
+
+  it("finds Jira assignee changes in a bounded window and rechecks earlier sessions", () => {
+    const prompt = renderTriggerPrompt(
+      "jira",
+      fields({ event: "assigned", target: "me", conditions: [] }),
+      CTX,
+    );
+    expect(prompt).toContain(
+      "starts one Omnigent session for each ticket assigned to you that matches.",
+    );
+    expect(prompt).toContain(
+      'search for (project = "ES" AND assignee = currentUser()) AND assignee CHANGED TO currentUser() DURING ("-<A>m", "-<B>m"), through every page, where A and B are the whole minutes from that time and from the time you noted until now.',
+    );
+    // Day offsets snap to calendar days and malformed times silently match nothing.
+    expect(prompt).toContain(
+      'Write both as minute offsets such as "-95m" and "-0m", never days, hours or dates',
+    );
+    expect(prompt).toContain("The window's end already leaves out later assignments");
+    expect(prompt).toContain('title "Jira <ticket key> assigned <the time you noted>"');
+    expect(prompt).toContain(
+      'search for key = <ticket key> AND assignee CHANGED TO currentUser() AFTER "-<C>m", where C is the whole minutes from that title\'s time until now, rounded down.',
+    );
+    expect(prompt).toContain("If that finds the ticket, it was assigned again since: handle it.");
+    expect(prompt).toContain("On the first run, use the current time");
+    expect(prompt).toContain(
+      "handled every match; otherwise the previous check time, and say why you stopped.",
+    );
+    expect(prompt).not.toContain("created >=");
+  });
+
+  it("keeps creation-event prompts on their creation search", () => {
+    const prompt = renderTriggerPrompt("jira", fields(), CTX);
+    expect(prompt).toContain("for each newly created ticket that matches");
+    expect(prompt).toContain("On the first run, use one hour ago");
+    expect(prompt).toContain("AND created >= <that time> ORDER BY created ASC");
+    expect(prompt).not.toContain("CHANGED");
   });
 });

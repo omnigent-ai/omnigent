@@ -25,6 +25,13 @@ to customize.
   senders, or the one group DM with exactly the listed people (two or more; no
   operator). A pink `#` or `@` precedes the input, and pasted prefixes are stripped.
   Switching between channel and people events clears the scope; DMs hide Author.
+- `change-events`: GitHub **Review requested from [reviewer]** (me, a username, or
+  `org/team`; required) fires on each request or re-request on open, non-draft pull
+  requests, and Jira **Assignee changed to [assignee]** (empty means anyone) fires on
+  each assignment. Both skip changes made before the automation existed, show their own
+  help text, and hide the Assignee condition; review requests start with link-back off.
+  Pull request opened gains an optional Reviewer filter with a hint that it only sees
+  reviewers requested before the first check after opening.
 - `link-posting`: a checkbox below the trigger controls posting the session link
   back to Jira, Slack, GitHub, Linear, or PagerDuty (as an incident note). Sessions
   start whether it is checked or not.
