@@ -4,14 +4,14 @@
 // host inventory, and the heavy composer/dialog imports are mocked so it renders
 // without a backend.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SkillContent } from "@/hooks/useSkillContent";
-import type { HarnessInventory } from "@/hooks/useHarnessInventory";
+import type { HarnessInventory, HostMcpServer } from "@/hooks/useHarnessInventory";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/sessionsApi";
 import type { HarnessStartup, Host } from "@/hooks/useHosts";
@@ -1324,12 +1324,22 @@ it.each([
   expect(screen.queryByText(/· 0 tools/)).toBeNull();
 });
 
-it.each([false, true])("uses installed MCP identity and honors enabled=%s", (enabled) => {
+it.each([false, true])("uses installed MCP identity and honors enabled=%s", async (enabled) => {
   hosts = [ONLINE];
   inventory = {
     ...INVENTORY,
     context: {
       ...INVENTORY.context,
+      mcps: ["first", "second"].map((marketplace) => ({
+        id: `inventory-${marketplace}`,
+        name: "docs",
+        harness: "claude",
+        plugin: "toolkit",
+        detail: "toolkit plugin · host",
+        sourceId: `${marketplace}-mcp`,
+        enabled: true,
+        locked: false,
+      })),
       plugins: ["first", "second"].map((marketplace) => ({
         id: marketplace,
         name: "toolkit",
@@ -1342,10 +1352,13 @@ it.each([false, true])("uses installed MCP identity and honors enabled=%s", (ena
       })),
     },
   };
-  renderHarnesses("claude-native");
+  const client = renderHarnesses("claude-native");
   selectTab("Plugins · 2");
   fireEvent.click(screen.getAllByTestId("catalog-row-toolkit")[1]);
   selectTab("MCPs · 1");
+  const toggle = screen.getByRole("switch", { name: "Enable docs for claude" });
+  expect(toggle).toHaveAttribute("aria-checked", "true");
+  expect(screen.queryByText("toolkit plugin · host")).toBeNull();
   const row = screen.getByTestId("catalog-row-docs");
   fireEvent.click(row);
   if (enabled) {
@@ -1358,6 +1371,27 @@ it.each([false, true])("uses installed MCP identity and honors enabled=%s", (ena
     expect(mcpSources).toEqual([]);
     expect(mcpLookups.every((lookup) => !lookup[4])).toBe(true);
   }
+  const refreshEnablement = async (serverEnabled: boolean) => {
+    inventory = {
+      ...inventory,
+      context: {
+        ...inventory.context,
+        mcps: inventory.context.mcps.map((server) =>
+          server.sourceId === "second-mcp" ? { ...server, enabled: serverEnabled } : server,
+        ),
+      },
+    };
+    mcpLookups = [];
+    hosts = [{ ...ONLINE, name: `host-${serverEnabled}` }];
+    await act(async () => {
+      client.setQueryData(["hosts", { includeSandbox: false }], hosts);
+    });
+    expect(screen.getByRole("heading", { name: "toolkit" })).toBeInTheDocument();
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", String(serverEnabled)));
+    expect(mcpLookups.every((lookup) => !lookup[4])).toBe(true);
+  };
+  await refreshEnablement(false);
+  await refreshEnablement(true);
 });
 
 it("requests a host update instead of guessing installed MCP identity", () => {
@@ -1366,6 +1400,7 @@ it("requests a host update instead of guessing installed MCP identity", () => {
     ...INVENTORY,
     context: {
       ...INVENTORY.context,
+      mcps: [{ id: "docs", name: "docs", harness: "claude", plugin: "toolkit", enabled: false }],
       plugins: [
         {
           ...INVENTORY.context.plugins[0],
@@ -1383,6 +1418,10 @@ it("requests a host update instead of guessing installed MCP identity", () => {
   expect(screen.getByText("Update my-laptop to inspect installed plugin MCP tools.")).toBeTruthy();
   expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
   expect(mcpSources).toEqual([]);
+  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toHaveAttribute(
+    "aria-checked",
+    "false",
+  );
 });
 
 it("keeps old-host and unsupported harness rows without a switch", () => {
@@ -1447,26 +1486,28 @@ it.each([false, true])(
         ],
       },
     };
+    const server: HostMcpServer = {
+      name: "docs",
+      harness: "claude",
+      transport: "stdio",
+      scope: "user",
+      plugin: "toolkit",
+      source_id: "a".repeat(64),
+      enabled: true,
+      locked: false,
+    };
     let finish!: () => void;
     setEnabled.mockImplementation(
       () =>
         new Promise((resolve, reject) => {
-          finish = () => (fails ? reject(new Error("offline")) : resolve({ enabled: false }));
+          finish = () =>
+            fails ? reject(new Error("offline")) : resolve({ ...server, enabled: false });
         }),
     );
     const client = renderHarnesses("claude-native");
-    client.setQueryData(
-      ["host-mcp-servers", "h1"],
-      [
-        {
-          name: "docs",
-          harness: "claude",
-          plugin: "toolkit",
-          source_id: "a".repeat(64),
-          enabled: true,
-        },
-      ],
-    );
+    client.setQueryData(["host-mcp-servers", "h1"], [server]);
+    fireEvent.click(screen.getByTestId("catalog-row-docs"));
+    expect(screen.getByTestId("catalog-row-docs")).toHaveAttribute("aria-expanded", "true");
     const toggle = screen.getByRole("switch", { name: "Enable docs for claude" });
     fireEvent.click(toggle);
     await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
@@ -1484,6 +1525,8 @@ it.each([false, true])(
       client.getQueryData<{ enabled: boolean }[]>(["host-mcp-servers", "h1"])?.[0].enabled,
     ).toBe(fails);
     if (fails) expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("catalog-row-docs")).toHaveAttribute("aria-expanded", "false");
+    expect(mcpLookups.at(-1)?.[4]).toBe(false);
   },
 );
 

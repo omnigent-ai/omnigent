@@ -25,8 +25,10 @@ from omnigent.host.frames import (
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes.mcp_servers import (
+    McpServerEnabledRequest,
     create_mcp_servers_router,
     request_host_mcp_servers,
+    request_host_set_mcp_server_enabled,
 )
 from omnigent.stores.host_store import HostStore
 
@@ -206,8 +208,9 @@ async def test_older_host_fails_fast_without_a_frame(mcp_app) -> None:
 
 
 @pytest.mark.parametrize("outcome,status", [("timeout", 504), ("replaced", 502)])
+@pytest.mark.parametrize("enabled_request", [False, True])
 async def test_proxy_cleans_up_unanswered_requests(
-    monkeypatch: pytest.MonkeyPatch, outcome: str, status: int
+    monkeypatch: pytest.MonkeyPatch, outcome: str, status: int, enabled_request: bool
 ) -> None:
     registry = HostRegistry()
     conn = _register(registry, CAP_MCP_INVENTORY)
@@ -216,9 +219,17 @@ async def test_proxy_cleans_up_unanswered_requests(
     else:
         registry.deregister(conn.host_id)
     with pytest.raises(HTTPException) as exc_info:
-        await request_host_mcp_servers(host_registry=registry, host_conn=conn)
-    assert exc_info.value.status_code == status
+        if enabled_request:
+            await request_host_set_mcp_server_enabled(
+                host_registry=registry,
+                host_conn=conn,
+                body=McpServerEnabledRequest(harness="claude", server="docs", enabled=False),
+            )
+        else:
+            await request_host_mcp_servers(host_registry=registry, host_conn=conn)
+    assert exc_info.value.status_code == (502 if enabled_request else status)
     assert conn.pending_mcp_servers == {}
+    assert conn.pending_mcp_server_enabled == {}
 
 
 @pytest.mark.parametrize("enabled", [True, False])

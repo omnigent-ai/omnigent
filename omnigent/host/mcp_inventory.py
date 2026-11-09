@@ -354,11 +354,16 @@ def apply_enabled_status(servers: list[McpServerSummary]) -> list[McpServerSumma
     from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS, ServerKey, read_disabled_servers
 
     disabled = read_disabled_servers()
+    managed_names = {
+        (server["harness"], server["name"])
+        for server in servers
+        if server.get("managed") == "true"
+    }
     for server in servers:
         harness = server["harness"]
         if harness not in HARNESS_EXECUTORS:
             continue
-        locked = server.get("managed") == "true"
+        locked = (harness, server["name"]) in managed_names
         server["locked"] = str(locked).lower()
         server["enabled"] = str(
             locked or ServerKey(harness, server["name"], server.get("plugin")) not in disabled

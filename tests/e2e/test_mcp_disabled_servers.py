@@ -17,23 +17,25 @@ import pytest
 from tests._helpers.compat import (
     compat_server_cwd,
     compat_server_python,
+    resolve_server_version,
     server_executable,
     server_pythonpath,
 )
 from tests._helpers.host import isolated_host
 from tests._helpers.live_server import isolated_local_server
+from tests._helpers.mock_llm import advertised_tool_names
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.session import send_user_text
-from tests.e2e_ui.chat.test_sidecar_mcp_allowlist import _advertised_tool_names
-from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT, configure_mock_llm
+from tests.e2e.conftest import configure_mock_llm, get_mock_requests
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(scope="module")
-def mcp_enabled_server(built_spa: None, tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+def mcp_enabled_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     """Keep MCP release flags local to this journey, preserving old-server compatibility."""
     env = {
-        "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
         "PYTHONPATH": server_pythonpath(_REPO_ROOT),
     }
     if compat_server_python() is None:
@@ -50,6 +52,12 @@ def mcp_enabled_server(built_spa: None, tmp_path_factory: pytest.TempPathFactory
         yield base_url
 
 
+@pytest.fixture(scope="module")
+def server_version(mcp_enabled_server: str) -> str:
+    """Check compatibility against the same isolated server the journey uses."""
+    return resolve_server_version(mcp_enabled_server)
+
+
 @pytest.mark.min_server_version("0.22.0.dev0")
 @pytest.mark.min_runner_version("0.22.0.dev0")
 @pytest.mark.timeout(300)
@@ -63,7 +71,7 @@ def test_disabled_server_absent_from_real_native_session(
     home.mkdir(parents=True)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    fixture = Path(__file__).resolve().parents[2] / "tools/fixtures/echo_stdio_mcp_server.py"
+    fixture = Path(__file__).resolve().parents[1] / "tools/fixtures/echo_stdio_mcp_server.py"
     # A visible control proves absence is selective, rather than failed MCP discovery.
     names = ("off_fixture", "on_fixture")
     config = {name: {"command": sys.executable, "args": [str(fixture)]} for name in names}
@@ -146,7 +154,7 @@ def test_disabled_server_absent_from_real_native_session(
 
             def mcp_controls_advertised() -> bool:
                 nonlocal tools
-                tools = _advertised_tool_names(mock_llm_server_url, model)
+                tools = advertised_tool_names(get_mock_requests(mock_llm_server_url, key=model))
                 return all(
                     any(marker in name for name in tools) for marker in ("on_fixture", "omnigent")
                 )

@@ -20,11 +20,9 @@ from omnigent.host.frames import (
 )
 from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import (
-    Feature,
     FeatureFlags,
     McpDisabledServersGate,
     active_harnesses,
-    resolve_feature_flags,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
@@ -88,17 +86,11 @@ def create_mcp_servers_router(
     host_store: HostStore,
     *,
     auth_provider: AuthProvider | None = None,
-    mcp_disabled_servers: McpDisabledServersGate | None = None,
-    feature_flags: FeatureFlags | None = None,
+    mcp_disabled_servers: McpDisabledServersGate,
+    feature_flags: FeatureFlags,
 ) -> APIRouter:
     """Build the MCP inventory route, mounted under ``/v1``."""
     router = APIRouter()
-    features = feature_flags or resolve_feature_flags()
-    master = (
-        features.enabled(Feature.MCP_DISABLED_SERVERS)
-        if mcp_disabled_servers is None
-        else mcp_disabled_servers
-    )
 
     @router.get("/hosts/{host_id}/mcp-servers")
     async def get_mcp_servers(request: Request, host_id: str) -> McpServersResponse:
@@ -120,7 +112,7 @@ def create_mcp_servers_router(
             raise HTTPException(
                 status_code=502, detail=result.error or "host MCP inventory failed"
             )
-        active = active_harnesses(master, features)
+        active = active_harnesses(mcp_disabled_servers, feature_flags)
         servers = []
         for row in result.mcp_servers:
             summary = dict(row)
@@ -135,7 +127,7 @@ def create_mcp_servers_router(
         request: Request, host_id: str, body: McpServerEnabledRequest
     ) -> McpServerEnabledResponse:
         user_id = require_user(request, auth_provider)
-        if body.harness not in active_harnesses(master, features):
+        if body.harness not in active_harnesses(mcp_disabled_servers, feature_flags):
             raise HTTPException(status_code=404, detail="MCP enablement is not enabled")
         host = await asyncio.to_thread(
             resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store

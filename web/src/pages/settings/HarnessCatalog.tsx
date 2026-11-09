@@ -33,11 +33,6 @@ const KINDS: { id: CatalogKind; label: string; noun: string }[] = [
   { id: "plugins", label: "Plugins", noun: "plugins" },
 ];
 
-interface OpenPlugin {
-  plugin: InventoryPlugin;
-  mcps: InventoryMcpServer[];
-}
-
 /** "← label" row above a page title: a link when `to` is set, else a button. */
 export function BackButton({
   label,
@@ -96,7 +91,7 @@ export function HarnessCatalog({
   const [tab, setTab] = useState<CatalogKind | "settings">(
     searchParams.get("tab") === "settings" ? "settings" : defaultTab,
   );
-  const [open, setOpen] = useState<OpenPlugin | null>(null);
+  const [open, setOpen] = useState<InventoryPlugin | null>(null);
   const [selectedSkill, setSelectedSkill] = useState<{ name: string; sourceId?: string } | null>(
     null,
   );
@@ -112,22 +107,36 @@ export function HarnessCatalog({
     skills: mine(context.skills),
     plugins: mine(context.plugins),
   };
-  const pluginMcps = (plugin: InventoryPlugin): InventoryMcpServer[] =>
-    plugin.mcp_entries?.map(({ id, name }) => ({
-      id,
-      name,
-      ...own.mcps.find((server) => server.sourceId === id),
-      sourceId: id,
-      harness: family,
-      plugin: plugin.name,
-    })) ??
-    plugin.mcp_servers?.map((name) => ({
-      id: `${plugin.id}:${name}`,
-      name,
-      harness: family,
-      plugin: plugin.name,
-    })) ??
-    own.mcps.filter((server) => server.plugin === plugin.name);
+  const pluginMcps = (plugin: InventoryPlugin): InventoryMcpServer[] => {
+    const enablement = (name: string, sourceId?: string) => {
+      const matches = own.mcps.filter(
+        (server) =>
+          server.plugin === plugin.name &&
+          server.name === name &&
+          (sourceId === undefined || server.sourceId === sourceId),
+      );
+      const match = matches.length === 1 ? matches[0] : undefined;
+      return { enabled: match?.enabled, locked: match?.locked };
+    };
+    return (
+      plugin.mcp_entries?.map(({ id, name }) => ({
+        id,
+        name,
+        sourceId: id,
+        harness: family,
+        plugin: plugin.name,
+        ...enablement(name, id),
+      })) ??
+      plugin.mcp_servers?.map((name) => ({
+        id: `${plugin.id}:${name}`,
+        name,
+        harness: family,
+        plugin: plugin.name,
+        ...enablement(name),
+      })) ??
+      own.mcps.filter((server) => server.plugin === plugin.name)
+    );
+  };
   const loading = inventory.status === "loading";
   const failed = (kind: CatalogKind) =>
     kind === "plugins" && family !== "claude"
@@ -141,7 +150,7 @@ export function HarnessCatalog({
         harness={INVENTORY_HARNESS_IDS[family]}
         name={selectedSkill.name}
         sourceId={selectedSkill.sourceId}
-        backLabel={open ? open.plugin.name : "Skills"}
+        backLabel={open ? open.name : "Skills"}
         onBack={() => setSelectedSkill(null)}
         onUnavailable={() => {
           setContentSupported(false);
@@ -153,8 +162,8 @@ export function HarnessCatalog({
     return (
       <PluginPage
         host={host}
-        plugin={open.plugin}
-        mcps={pluginMcps(open.plugin)}
+        plugin={open}
+        mcps={pluginMcps(open)}
         onBack={back}
         onSkillOpen={
           contentSupported ? (name, sourceId) => setSelectedSkill({ name, sourceId }) : undefined
@@ -244,7 +253,7 @@ export function HarnessCatalog({
                     detail={[pluginDetail(plugin, mcps.length), plugin.description]
                       .filter(Boolean)
                       .join(" · ")}
-                    onOpen={() => setOpen({ plugin, mcps })}
+                    onOpen={() => setOpen(plugin)}
                   />
                 );
               })}
@@ -528,6 +537,7 @@ function McpList({
           server={server}
           expanded={expanded.includes(server.id)}
           onUnavailable={() => setSupported(false)}
+          onDisabled={() => setExpanded((current) => current.filter((id) => id !== server.id))}
         />
       ))}
     </AccordionPrimitive.Root>
@@ -544,8 +554,9 @@ function McpSwitch({
   mutation: ReturnType<typeof useSetMcpServerEnabled>;
 }) {
   const harness = server.harness;
-  if (harness !== "claude" && harness !== "codex") return null;
-  return enabled != null ? (
+  if ((harness !== "claude" && harness !== "codex") || enabled === null || enabled === undefined)
+    return null;
+  return (
     <Tooltip>
       <TooltipTrigger asChild>
         <span className="flex items-center px-4">
@@ -569,13 +580,18 @@ function McpSwitch({
         {server.locked ? "Managed by your organization" : "Omnigent sessions only"}
       </TooltipContent>
     </Tooltip>
-  ) : null;
+  );
+}
+
+function useMcpEnabledState(hostId: string, server: InventoryMcpServer) {
+  const mutation = useSetMcpServerEnabled(hostId);
+  // Keep this row pending even when another row settles and refetches inventory.
+  const enabled = mutation.isPending ? mutation.variables.enabled : server.enabled;
+  return { mutation, enabled };
 }
 
 function McpFallbackRow({ host, server }: { host: Host; server: InventoryMcpServer }) {
-  const mutation = useSetMcpServerEnabled(host.host_id);
-  // Keep this row pending even when another row settles and refetches inventory.
-  const enabled = mutation.isPending ? mutation.variables.enabled : server.enabled;
+  const { mutation, enabled } = useMcpEnabledState(host.host_id, server);
   return (
     <CatalogRow
       icon={<LetterAvatar name={server.name} />}
@@ -610,16 +626,19 @@ function McpRow({
   server,
   expanded,
   onUnavailable,
+  onDisabled,
 }: {
   host: Host;
   server: InventoryMcpServer;
   expanded: boolean;
   onUnavailable: () => void;
+  onDisabled: () => void;
 }) {
-  const mutation = useSetMcpServerEnabled(host.host_id);
-  // Keep this row pending even when another row settles and refetches inventory.
-  const enabled = mutation.isPending ? mutation.variables.enabled : server.enabled;
+  const { mutation, enabled } = useMcpEnabledState(host.host_id, server);
   const off = enabled === false;
+  useEffect(() => {
+    if (off && expanded) onDisabled();
+  }, [off, expanded, onDisabled]);
   const query = useMcpServerTools(host.host_id, server.harness, server.name, server.plugin, {
     enabled: expanded && !off,
     sourceId: server.sourceId,

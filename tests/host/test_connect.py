@@ -11967,7 +11967,7 @@ async def test_host_saves_mcp_preference_over_tunnel(
     [
         ("omnigent", None, None, False),
         ("missing", None, None, False),
-        ("docs", "spoof", None, True),
+        ("docs", None, None, True),
         ("docs", None, "0" * 64, False),
     ],
 )
@@ -11990,6 +11990,8 @@ async def test_host_rejects_reserved_managed_or_stale_mcp(
         HostSetMcpServerEnabledFrame("save", "claude", server, False, plugin, source_id)
     )
     assert result.error_code == "invalid_server"
+    if managed:
+        assert result.error == "Managed MCP servers cannot be toggled"
     assert not (tmp_path / FILENAME).exists()
 
 

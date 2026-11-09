@@ -3069,23 +3069,16 @@ def test_picker_restriction_warning_names_the_agents_new_chat_cannot_offer(
         assert text not in caplog.text
 
 
-@pytest.mark.parametrize("mode", ["snapshot", "off", "on", "callable", "raising"])
+@pytest.mark.parametrize("mode", ["snapshot", "off", "on"])
 async def test_mcp_launch_gate_and_hidden_info(db_uri, runtime_init, tmp_path, monkeypatch, mode):
     monkeypatch.setenv(
         "OMNIGENT_FEATURES",
         "mcp_disabled_servers,mcp_disabled_servers_claude,mcp_disabled_servers_codex",
     )
-    values = iter([False, True])
-
-    def broken():
-        raise RuntimeError("gate unavailable")
-
     gate = {
         "snapshot": None,
         "off": False,
         "on": True,
-        "callable": lambda: next(values),
-        "raising": broken,
     }[mode]
     app = _build_branding_app(db_uri, tmp_path, f"mcp-{mode}", mcp_disabled_servers=gate)
     async with httpx.AsyncClient(
@@ -3101,6 +3094,4 @@ async def test_mcp_launch_gate_and_hidden_info(db_uri, runtime_init, tmp_path, m
         "snapshot": (enabled, enabled),
         "off": (None, None),
         "on": (enabled, enabled),
-        "callable": (None, enabled),
-        "raising": (None, None),
     }[mode]

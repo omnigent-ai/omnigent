@@ -192,26 +192,32 @@ async def test_deregister_fails_inventory_waiters_and_ignores_settled_futures() 
     loop = asyncio.get_running_loop()
     live_skills = loop.create_future()
     live_mcp = loop.create_future()
+    live_enabled = loop.create_future()
     cancelled_skills = loop.create_future()
     cancelled_skills.cancel()
     completed_mcp = loop.create_future()
     completed_mcp.set_result(None)
+    completed_enabled = loop.create_future()
+    completed_enabled.set_result(None)
     live_create, live_remove, live_list = (loop.create_future() for _ in range(3))
     conn.pending_skills.update({"live": live_skills, "cancelled": cancelled_skills})
     conn.pending_mcp_servers.update({"live": live_mcp, "completed": completed_mcp})
+    conn.pending_mcp_server_enabled.update({"live": live_enabled, "completed": completed_enabled})
     conn.pending_create_worktrees["live"] = live_create
     conn.pending_remove_worktrees["live"] = live_remove
     conn.pending_list_worktrees["live"] = live_list
 
     assert registry.deregister(conn.host_id) is True
 
-    for future in (live_skills, live_mcp, live_create, live_remove, live_list):
+    for future in (live_skills, live_mcp, live_enabled, live_create, live_remove, live_list):
         with pytest.raises(ConnectionError, match="disconnected"):
             future.result()
     assert cancelled_skills.cancelled()
     assert completed_mcp.result() is None
+    assert completed_enabled.result() is None
     assert conn.pending_skills == {}
     assert conn.pending_mcp_servers == {}
+    assert conn.pending_mcp_server_enabled == {}
     assert conn.pending_create_worktrees == {}
     assert conn.pending_remove_worktrees == {}
     assert conn.pending_list_worktrees == {}
@@ -224,29 +230,36 @@ async def test_replacement_only_fails_old_inventory_waiters() -> None:
     loop = asyncio.get_running_loop()
     old_skills = loop.create_future()
     old_mcp = loop.create_future()
+    old_enabled = loop.create_future()
     old_create_worktree = loop.create_future()
     old.pending_skills["old"] = old_skills
     old.pending_mcp_servers["old"] = old_mcp
+    old.pending_mcp_server_enabled["old"] = old_enabled
     old.pending_create_worktrees["old"] = old_create_worktree
 
     new = registry.register("host_inventory_replace", FakeWebSocket(), _make_hello(), owner="bob")
 
-    for future in (old_skills, old_mcp, old_create_worktree):
+    for future in (old_skills, old_mcp, old_enabled, old_create_worktree):
         with pytest.raises(ConnectionError, match="disconnected"):
             future.result()
     assert old.pending_skills == {}
     assert old.pending_mcp_servers == {}
+    assert old.pending_mcp_server_enabled == {}
     assert old.pending_create_worktrees == {}
 
     new_skills = loop.create_future()
     new_mcp = loop.create_future()
+    new_enabled = loop.create_future()
     new.pending_skills["new"] = new_skills
     new.pending_mcp_servers["new"] = new_mcp
+    new.pending_mcp_server_enabled["new"] = new_enabled
     assert registry.deregister(new.host_id, conn=old) is False
     assert not new_skills.done()
     assert not new_mcp.done()
+    assert not new_enabled.done()
     new_skills.cancel()
     new_mcp.cancel()
+    new_enabled.cancel()
 
 
 async def test_inventory_waiters_on_closed_owner_loop_are_ignored() -> None:
@@ -256,15 +269,19 @@ async def test_inventory_waiters_on_closed_owner_loop_are_ignored() -> None:
     owner_loop = asyncio.new_event_loop()
     closed_skills = owner_loop.create_future()
     closed_mcp = owner_loop.create_future()
+    closed_enabled = owner_loop.create_future()
     owner_loop.close()
     conn.pending_skills["closed"] = closed_skills
     conn.pending_mcp_servers["closed"] = closed_mcp
+    conn.pending_mcp_server_enabled["closed"] = closed_enabled
 
     assert registry.deregister(conn.host_id) is True
     assert conn.pending_skills == {}
     assert conn.pending_mcp_servers == {}
+    assert conn.pending_mcp_server_enabled == {}
     closed_skills.cancel()
     closed_mcp.cancel()
+    closed_enabled.cancel()
 
 
 def test_deregister_returns_false_for_unknown() -> None:

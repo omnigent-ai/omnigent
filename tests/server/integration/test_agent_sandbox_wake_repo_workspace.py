@@ -276,7 +276,7 @@ async def _wait_for_binding(
         ),
     ],
 )
-@pytest.mark.parametrize("mcp_gate", ["on", "off", "raising"])
+@pytest.mark.parametrize("mcp_gate", ["on", "off"])
 async def test_agent_sandbox_wake_reconstructs_repo_workspaces(
     runtime_init: None,
     db_uri: str,
@@ -319,11 +319,8 @@ async def test_agent_sandbox_wake_reconstructs_repo_workspaces(
     )
     from omnigent.server.feature_flags import Feature, FeatureFlags
 
-    def broken():
-        raise RuntimeError("gate unavailable")
-
     app = create_app(
-        mcp_disabled_servers={"on": True, "off": False, "raising": broken}[mcp_gate],
+        mcp_disabled_servers=mcp_gate == "on",
         feature_flags=FeatureFlags(
             frozenset({Feature.MCP_DISABLED_SERVERS_CLAUDE, Feature.MCP_DISABLED_SERVERS_CODEX})
         ),

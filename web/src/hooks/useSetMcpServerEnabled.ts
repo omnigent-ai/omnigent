@@ -27,17 +27,18 @@ export function useSetMcpServerEnabled(hostId: string) {
         client.setQueryData<HostMcpServer[]>(queryKey, (rows) =>
           rows?.map((row) => (context.matches(row) ? context.previous! : row)),
         );
-      const message =
-        error instanceof ApiError && error.status === 422
-          ? "This server changed. Refresh and try again."
-          : error instanceof ApiError && (error.status === 409 || error.code === "host_offline")
-            ? "Host is offline."
-            : error instanceof ApiError && error.status === 501
-              ? "Update the host to turn MCP servers on or off."
-              : error.message || "Couldn't update MCP server. Please try again.";
-      toast.error(message);
+      toast.error(mcpEnablementErrorMessage(error));
     },
     onSuccess: () => toast.success("Applies to new sessions"),
     onSettled: () => client.invalidateQueries({ queryKey }),
   });
+}
+
+function mcpEnablementErrorMessage(error: Error): string {
+  if (error instanceof ApiError) {
+    if (error.status === 422) return "This server changed. Refresh and try again.";
+    if (error.status === 409) return "Host is offline.";
+    if (error.status === 501) return "Update the host to turn MCP servers on or off.";
+  }
+  return error.message || "Couldn't update MCP server. Please try again.";
 }

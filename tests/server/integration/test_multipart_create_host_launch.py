@@ -89,10 +89,7 @@ def app(
     """
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
 
-    def broken():
-        raise RuntimeError("gate unavailable")
-
-    gate = {"on": True, "off": False, "raising": broken}[getattr(request, "param", "off")]
+    gate = getattr(request, "param", "off") == "on"
     from omnigent.server.feature_flags import Feature, FeatureFlags
 
     return create_app(
@@ -245,7 +242,7 @@ async def _multipart_create(
     )
 
 
-@pytest.mark.parametrize("app", ["on", "off", "raising"], indirect=True)
+@pytest.mark.parametrize("app", ["on", "off"], indirect=True)
 async def test_multipart_create_with_host_id_binds_and_launches(
     register_host: RegisterHost,
     client: httpx.AsyncClient,
