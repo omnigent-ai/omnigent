@@ -6,6 +6,7 @@ import {
   mentionTokenAtCaret,
   newFileMentionToken,
   NO_SESSION_MENTIONS,
+  SESSION_MENTION_CAP,
   type MentionItem,
   type MentionState,
   type SessionMention,
@@ -14,6 +15,8 @@ import {
 } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+
+const NO_FILE_ENTRIES: WorkspaceFile[] = [];
 
 /**
  * Inputs the host composer supplies. The data source (workspace API vs. host
@@ -29,7 +32,7 @@ export interface MentionBrowserParams {
   setMention: (next: MentionState | null) => void;
   /** Current directory's entries — already filtered, folders-first, capped. */
   mentionEntries: WorkspaceFile[];
-  /** Matching sessions, listed above the files. Already filtered and capped. */
+  /** Every matching session, uncapped; the browser decides how many to show. */
   sessionEntries?: readonly SessionMention[];
   /** The textarea value and a setter (which may also flag the draft dirty). */
   text: string;
@@ -41,9 +44,22 @@ export interface MentionBrowserParams {
   initialMentions?: TaggedMentions;
 }
 
+/** What the ``@`` menu renders above the files. */
+export interface SessionMenuView {
+  /** Session rows to render, indexed first (after the category row, if any). */
+  rows: readonly SessionMention[];
+  /** Bare ``@``: one "Sessions" row that opens the full list. */
+  showCategory: boolean;
+  /** The full session list is open; files are hidden until Back. */
+  browsing: boolean;
+  openSessions: () => void;
+  closeSessions: () => void;
+}
+
 export interface MentionBrowser {
   mentionIndex: number;
   mentionOpen: boolean;
+  sessionMenu: SessionMenuView;
   mentionedItems: MentionItem[];
   setMentionedItems: React.Dispatch<React.SetStateAction<MentionItem[]>>;
   /** Tag a file (isDir=false) or whole folder (isDir=true) as an inline token. */
@@ -89,9 +105,23 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const [mentionedSessions, setMentionedSessions] = useState<SessionMention[]>(
     () => initialMentions?.sessions ?? [],
   );
-  // Sessions occupy rows [0, sessionEntries.length); files follow.
-  const rowCount = sessionEntries.length + mentionEntries.length;
-  const mentionOpen = rowCount > 0;
+  // The full session list stays open for the "@" token it was opened from.
+  const [browseStart, setBrowseStart] = useState<number | null>(null);
+  if (browseStart !== null && mention?.start !== browseStart) setBrowseStart(null);
+  const browsing = browseStart !== null && mention?.start === browseStart;
+  // Bare "@" collapses sessions into one row; typing lists the top matches inline.
+  const showCategory = !browsing && mention?.query === "" && sessionEntries.length > 0;
+  const sessionRows = browsing
+    ? sessionEntries
+    : showCategory
+      ? NO_SESSION_MENTIONS
+      : sessionEntries.slice(0, SESSION_MENTION_CAP);
+  const fileRows = browsing ? NO_FILE_ENTRIES : mentionEntries;
+  // Rows: the category row (if shown), then sessions, then files.
+  const sessionOffset = showCategory ? 1 : 0;
+  const fileOffset = sessionOffset + sessionRows.length;
+  const rowCount = fileOffset + fileRows.length;
+  const mentionOpen = rowCount > 0 || browsing;
 
   // Pre-select the top row whenever the listing changes — lets Enter/Tab act on
   // the top hit without arrowing first. Keyed by type+path so a file and a dir
@@ -99,8 +129,9 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   // "store-previous-props" pattern — mirrors the slash menu's reset.)
   const prevMentionMatchesRef = useRef<string[]>([]);
   const mentionEntryKeys = [
-    ...sessionEntries.map((session) => `session:${session.id}`),
-    ...mentionEntries.map((e) => `${e.type}:${e.path}`),
+    ...(showCategory ? ["category:sessions"] : []),
+    ...sessionRows.map((session) => `session:${session.id}`),
+    ...fileRows.map((e) => `${e.type}:${e.path}`),
   ];
   if (
     mentionEntryKeys.length !== prevMentionMatchesRef.current.length ||
@@ -198,13 +229,33 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionIndex(-1);
   };
 
+  const openSessions = () => {
+    if (!mention) return;
+    setBrowseStart(mention.start);
+    setMentionIndex(0);
+    textareaRef.current?.focus();
+  };
+
+  const closeSessions = () => {
+    setBrowseStart(null);
+    setMentionIndex(0);
+    textareaRef.current?.focus();
+  };
+
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
     if (!mentionOpen) return false;
-    const activeSession = mentionIndex >= 0 ? sessionEntries[mentionIndex] : undefined;
-    const active =
-      mentionIndex >= sessionEntries.length
-        ? mentionEntries[mentionIndex - sessionEntries.length]
+    if (e.key === "Escape" && browsing) {
+      e.preventDefault();
+      closeSessions();
+      return true;
+    }
+    if (rowCount === 0) return false;
+    const onCategory = showCategory && mentionIndex === 0;
+    const activeSession =
+      mentionIndex >= sessionOffset && mentionIndex < fileOffset
+        ? sessionRows[mentionIndex - sessionOffset]
         : undefined;
+    const active = mentionIndex >= fileOffset ? fileRows[mentionIndex - fileOffset] : undefined;
     if (e.key === "ArrowDown") {
       e.preventDefault();
       setMentionIndex((i) => (i + 1) % rowCount);
@@ -213,6 +264,14 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     if (e.key === "ArrowUp") {
       e.preventDefault();
       setMentionIndex((i) => (i <= 0 ? rowCount - 1 : i - 1));
+      return true;
+    }
+    if (
+      onCategory &&
+      (e.key === "Tab" || e.key === "ArrowRight" || (e.key === "Enter" && !e.shiftKey && !isMobile))
+    ) {
+      e.preventDefault();
+      openSessions();
       return true;
     }
     if (activeSession && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile))) {
@@ -244,6 +303,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   return {
     mentionIndex,
     mentionOpen,
+    sessionMenu: { rows: sessionRows, showCategory, browsing, openSessions, closeSessions },
     mentionedItems,
     setMentionedItems,
     attachMention,

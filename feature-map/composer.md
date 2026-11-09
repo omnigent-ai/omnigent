@@ -174,11 +174,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
-- `at-mentions`: typing `@` in the in-session or new-session composer lists
-  other sessions, the current session's subagents first, then other sessions
-  already loaded in the sidebar. In native coding-agent sessions it also lists
-  workspace files and folders below them. Typing filters both lists and, after a
-  short pause, searches session titles and the workspace. Picking a row puts a
+- `at-mentions`: a bare `@` in the in-session or new-session composer shows a
+  "Sessions" row. Opening it (click, Enter, Tab or →) lists every session the
+  sidebar has loaded, the current session's subagents first; Back or Esc
+  returns. In native coding-agent sessions workspace files and folders sit
+  below the Sessions row. Typing lists the top matching sessions inline above
+  the files and, after a short pause, searches session titles and the
+  workspace. Picking a row puts a
   pill-styled `@name` token in the sentence; Backspace deletes a token whole, and
   deleting it untags the item. On send each token becomes a marker in place
   (`[Attached: path]` or `[Session: "title" id=… subagent=yes|no]`), and a

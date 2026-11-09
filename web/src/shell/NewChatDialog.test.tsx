@@ -10487,9 +10487,10 @@ describe("NewChatLandingScreen @-file-mention", () => {
     } as unknown as Response);
     renderLanding();
 
-    // A bare "@" lists cached sessions only: no files for an SDK agent, no archived rows.
+    // A bare "@" opens to cached sessions only: no files for an SDK agent, no archived rows.
     fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
     expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("session-mention-category"));
     expect(screen.queryByTitle("Tag session Old")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
     expect((input() as HTMLTextAreaElement).value).toBe("@Alpha planning ");

@@ -35,7 +35,7 @@ function topLevelSessions(
 /**
  * Session rows for the composer ``@`` menu: the current session's subagents,
  * then the sessions already loaded for the sidebar, then server title-search
- * hits for the typed text. Only the search issues a request, and only once
+ * hits for the typed text, uncapped. Only the search issues a request, and only once
  * ``debouncedQuery`` is non-empty; the other sources are cache reads.
  *
  * :param mention: Active ``@`` token, or ``null`` when the menu is closed.
@@ -78,6 +78,7 @@ export function useSessionMentionEntries({
         currentSessionId,
       ),
     ];
-    return rankSessionMentions(candidates, mention.query);
+    // Uncapped: the menu shows every loaded session when the list is opened.
+    return rankSessionMentions(candidates, mention.query, Number.POSITIVE_INFINITY);
   }, [mention, subagents, loadedSessions, search.data, currentSessionId]);
 }

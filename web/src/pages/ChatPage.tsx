@@ -3138,6 +3138,7 @@ function ComposerImpl(
   const {
     mentionIndex,
     mentionOpen,
+    sessionMenu,
     mentionedItems,
     setMentionedItems,
     attachMention,
@@ -4364,7 +4365,7 @@ function ComposerImpl(
                   loading={mentionListingPending}
                   onOpenDir={openMentionDir}
                   onAttach={attachMention}
-                  sessions={sessionEntries}
+                  sessionMenu={sessionMenu}
                   onAttachSession={attachSession}
                 />
               )}

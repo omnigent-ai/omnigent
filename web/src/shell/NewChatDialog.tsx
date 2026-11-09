@@ -5254,7 +5254,6 @@ function NewChatLandingContent({
     debouncedQuery: useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS),
     currentSessionId: null,
   });
-  const mentionOpen = mentionEntries.length > 0 || sessionEntries.length > 0;
   const mirrorRef = useRef<HTMLDivElement>(null);
   // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
   // ``isPlaceholderData`` covers the drill-down window where react-query is
@@ -5268,6 +5267,8 @@ function NewChatLandingContent({
   // host-filesystem source + token state above are launcher-specific.
   const {
     mentionIndex,
+    mentionOpen,
+    sessionMenu,
     mentionedItems,
     attachMention,
     openMentionDir,
@@ -7217,7 +7218,7 @@ function NewChatLandingContent({
                         loading={mentionListingPending}
                         onOpenDir={openMentionDir}
                         onAttach={attachMention}
-                        sessions={sessionEntries}
+                        sessionMenu={sessionMenu}
                         onAttachSession={attachSession}
                       />
                     )}

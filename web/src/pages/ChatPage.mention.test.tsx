@@ -146,7 +146,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 }));
 
 import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
-import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import { SESSION_MENTION_CAP, SESSION_MENTION_HINT } from "@/lib/composerMentions";
 
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
@@ -684,22 +684,60 @@ describe("Composer @-session mentions", () => {
     vi.restoreAllMocks();
   });
 
-  it("lists subagents, then loaded sessions, on a non-native harness without searching", () => {
+  it("collapses sessions into one row on a bare @ and opens the full list from it", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
-    const rows = screen.getAllByTestId(/^session-mention-item-/).map((row) => row.textContent);
-    // The current session and archived rows are excluded; untitled rows get a label.
-    expect(rows).toEqual(["authsubagent", "Alpha planning", "Untitled session"]);
-    // Files stay native-only.
+    // A bare "@" shows only the category row: no session rows, no files on SDK harnesses.
+    expect(screen.getByTestId("session-mention-category")).toHaveAttribute("data-active", "true");
+    expect(screen.queryAllByTestId(/^session-mention-item-/)).toHaveLength(0);
     expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
-    // A bare "@" is served from cache alone.
+    fireEvent.click(screen.getByTestId("session-mention-category"));
+    const rows = screen.getAllByTestId(/^session-mention-item-/).map((row) => row.textContent);
+    // Subagents first; the current session and archived rows are excluded; untitled rows get a label.
+    expect(rows).toEqual(["authsubagent", "Alpha planning", "Untitled session"]);
+    // The list is served from cache alone.
     expect(sessions.searchedQueries).toEqual([]);
+  });
+
+  it("lists every loaded session when opened but caps typed matches", () => {
+    sessions.loaded = Array.from({ length: 12 }, (_, i) => sessionRow(`s_${i}`, `Plan ${i}`));
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    // One subagent plus all twelve loaded sessions.
+    expect(screen.getAllByTestId(/^session-mention-item-/)).toHaveLength(13);
+    type("@plan");
+    // Typing in the open list filters it without a cap.
+    expect(screen.getAllByTestId(/^session-mention-item-/)).toHaveLength(12);
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    // Back at the top level, typed matches are capped inline.
+    expect(screen.getAllByTestId(/^session-mention-item-/)).toHaveLength(SESSION_MENTION_CAP);
+  });
+
+  it("returns from the session list with Back or Escape, then Escape closes the menu", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@");
+    fireEvent.click(screen.getByTestId("session-mention-category"));
+    // The open list hides files.
+    expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("session-mention-back"));
+    expect(screen.getByTestId("session-mention-category")).toBeInTheDocument();
+    expect(screen.getByTitle("Open src")).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "ArrowRight" });
+    expect(screen.getByTestId("session-mention-back")).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(screen.getByTestId("session-mention-category")).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(screen.queryByTestId("file-mention-menu")).not.toBeInTheDocument();
   });
 
   it("delivers tagged sessions as inline markers plus one tool hint", () => {
     const onSend = vi.fn();
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
     type("Ask @");
+    // Enter opens the session list, then tags its first row (the subagent).
+    fireEvent.keyDown(textarea(), { key: "Enter" });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     append("to compare with @alpha");
     fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
@@ -750,13 +788,13 @@ describe("Composer @-session mentions", () => {
     expect(screen.getByTitle("Tag session Gamma rollout")).toBeInTheDocument();
   });
 
-  it("lists sessions above files in a native session and navigates across both", () => {
+  it("lists the Sessions row above files in a native session and navigates across both", () => {
     useChatStore.setState({ sessionHarness: "claude-native" });
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
-    expect(screen.getByTestId("session-mention-item-0")).toHaveAttribute("data-active", "true");
-    // Three session rows, then the "src" folder.
-    for (let i = 0; i < 3; i++) fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    expect(screen.getByTestId("session-mention-category")).toHaveAttribute("data-active", "true");
+    // The Sessions row, then the "src" folder.
+    fireEvent.keyDown(textarea(), { key: "ArrowDown" });
     expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
     fireEvent.keyDown(textarea(), { key: "Tab" });
     expect(tokens()).toEqual(["@src/"]);
