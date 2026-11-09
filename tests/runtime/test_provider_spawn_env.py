@@ -39,6 +39,7 @@ from omnigent.onboarding import ambient, harness_install
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
+    _build_genie_spawn_env,
     _build_goose_spawn_env,
     _build_hermes_spawn_env,
     _build_kimi_spawn_env,
@@ -2395,3 +2396,112 @@ def test_stale_login_cache_cannot_shadow_claude_sdk_fallback(
     assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://anthropic.example.com/v1"
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
+
+
+def test_genie_databricks_provider_is_brokered_like_codex(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A ``databricks``-kind default brokers genie through the signer, as for codex.
+
+    The worker gets the signer envelope under ``HARNESS_GENIE_*`` and no gateway
+    auth command, so genie never holds the workspace credential.
+    """
+    _write_config(
+        config_home,
+        {"providers": {"dbx": {"kind": "databricks", "default": True, "profile": "my-dbx"}}},
+    )
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    endpoint = "https://workspace.databricks.com/ai-gateway/codex/v1"
+    spec = _make_spec(
+        harness="genie",
+        model="databricks-gpt-5-4-mini",
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+    with (
+        patch(
+            "omnigent.runtime.workflow.get_workspace_url_for_profile",
+            return_value="https://workspace.databricks.com",
+        ),
+        patch(
+            "omnigent.runtime.workflow.read_ucode_state",
+            return_value=UcodeWorkspaceState(
+                workspace_url="https://workspace.databricks.com",
+                agents={
+                    "codex": UcodeAgentState(
+                        model="databricks-gpt-5",
+                        base_url=endpoint,
+                        auth_command="sh -c arbitrary",
+                    )
+                },
+            ),
+        ),
+    ):
+        env = _build_genie_spawn_env(spec, cwd=tmp_path / "ws", workdir=tmp_path / "bundle")
+
+    assert env["HARNESS_GENIE_SIGNER_PROVIDER"] == "databricks-ucode-v1"
+    assert env["HARNESS_GENIE_SIGNER_ENDPOINT"] == endpoint
+    assert env["HARNESS_GENIE_GATEWAY_HOST"] == "https://workspace.databricks.com"
+    assert env["HARNESS_GENIE_DATABRICKS_PROFILE"] == "my-dbx"
+    assert env["HARNESS_GENIE_MODEL_EGRESS"] == (
+        '["POST workspace.databricks.com/ai-gateway/codex/v1/responses"]'
+    )
+    assert env["HARNESS_GENIE_MODEL"] == "databricks-gpt-5-4-mini"
+    assert "HARNESS_GENIE_GATEWAY" not in env
+    assert "HARNESS_GENIE_GATEWAY_AUTH_COMMAND" not in env
+    assert env["HARNESS_GENIE_CWD"] == str(tmp_path / "ws")
+    assert env["HARNESS_GENIE_BUNDLE_DIR"] == str(tmp_path / "bundle")
+    assert not any(key.startswith("HARNESS_CODEX_") for key in env)
+
+    from omnigent.inner import genie_harness
+    from omnigent.inner.genie_executor import GenieExecutor
+    from omnigent.inner.model_signer import SignerLaunchConfig
+
+    captured: dict[str, object] = {}
+    original_init = GenieExecutor.__init__
+
+    def _capture_init(self: GenieExecutor, **kwargs: object) -> None:
+        captured.update(kwargs)
+        original_init(self, **kwargs)
+
+    with monkeypatch.context() as env_patch:
+        for name in tuple(os.environ):
+            env_patch.delenv(name)
+        for name, value in {**env, "OMNIGENT_GENIE_PATH": "/bin/true"}.items():
+            env_patch.setenv(name, value)
+        with patch.object(GenieExecutor, "__init__", _capture_init):
+            executor = genie_harness._build_genie_executor()
+
+    signer = captured["signer_launch_config"]
+    assert isinstance(signer, SignerLaunchConfig)
+    assert signer.endpoint == endpoint
+    assert captured["gateway"] is False
+    generated = "\n".join(executor._codex_config_overrides)
+    assert 'model_provider="omnigent_brokered"' in generated
+    assert 'model="gpt-5.4-mini"' in generated
+    assert "sh -c arbitrary" not in generated
+
+
+@pytest.mark.parametrize(
+    "providers",
+    [{}, {"sub": {"kind": "subscription", "cli": "codex", "default": True}}],
+    ids=["no-provider", "subscription"],
+)
+def test_genie_without_usable_provider_fails_loud(
+    config_home: Path, providers: dict[str, object], tmp_path: Path
+) -> None:
+    """
+    Genie has no login of its own, so a launch with nothing it can route
+    through fails instead of handing the executor no profile (which would pick
+    the default ``~/.databrickscfg`` profile's workspace).
+    """
+    _write_config(config_home, {"providers": providers} if providers else {})
+    spec = _make_spec(harness="genie")
+
+    with (
+        patch("omnigent.runtime.workflow.effective_config_with_detected", lambda c: c),
+        pytest.raises(OmnigentError, match="'genie' harness needs a Databricks workspace"),
+    ):
+        _build_genie_spawn_env(spec, cwd=tmp_path)

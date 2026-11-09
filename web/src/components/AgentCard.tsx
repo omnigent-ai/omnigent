@@ -4,6 +4,7 @@ import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
 import { DevinIcon } from "@/components/icons/DevinIcon";
+import { GenieIcon } from "@/components/icons/GenieIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
 import { HermesIcon } from "@/components/icons/HermesIcon";
 import { KimiIcon } from "@/components/icons/KimiIcon";
@@ -45,6 +46,8 @@ export function iconForAgent(
   if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
   if (nativeAgent?.iconKind === "hermes") return HermesIcon;
   if (nativeAgent?.iconKind === "devin") return DevinIcon;
+  // Before the codex check: genie is a Codex fork with its own mark.
+  if (agent.harness === "genie") return GenieIcon;
   // A null harness (spec couldn't load) flows through to the bot fallback.
   if (agent.harness?.includes("codex")) return CodexIcon;
   if (agent.harness?.includes("claude")) return ClaudeIcon;

@@ -94,6 +94,26 @@ export function sortAgentsForDisplay<T extends AvailableAgent>(agents: readonly 
   );
 }
 
+// Headless CLI-subprocess harnesses that should appear in the picker's
+// "Harnesses" group alongside native TUIs and ACP harnesses (user experience
+// groups all "pick a harness" rows together, separate from "pick a composed agent").
+// Genie is a headless Codex fork; others may follow this pattern.
+const HEADLESS_CLI_HARNESSES = new Set(["genie"]);
+
+/**
+ * Whether an agent is a headless CLI-subprocess harness — like genie (a Codex
+ * fork). These belong in the picker's "Harnesses" group with native CLIs and ACP
+ * harnesses, not the "Agents" group. They run a harness, not a composed agent.
+ *
+ * @param agent - Agent to classify (only `harness` is read).
+ */
+export function isHeadlessCliHarness(
+  agent: Pick<AvailableAgent, "harness"> | null | undefined,
+): boolean {
+  if (agent == null || agent.harness == null) return false;
+  return HEADLESS_CLI_HARNESSES.has(agent.harness);
+}
+
 // Hidden from session-creation pickers. `nessie` is superseded by polly.
 // `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent /
 // `run --harness kimi` use) — pickers offer only the native TUI
@@ -151,7 +171,7 @@ export function partitionAgentsByKind<T extends AvailableAgent>(
 
 /**
  * Split agents the way the new-session picker's groups do: "Harnesses" are
- * harness-backed picks (native CLIs and generic-ACP harness agents), "agents"
+ * harness-backed picks (native CLIs, generic-ACP harness agents, and headless CLI harnesses like genie), "agents"
  * are composed agents plus the user's own, which stay under "Agents" even on a
  * native harness. Settings' per-entry visibility list shares this so an ACP
  * harness can't sit under a different heading there than in the picker.
@@ -163,7 +183,7 @@ export function partitionPickerEntries<T extends AvailableAgent>(
   agents: readonly T[],
 ): { harnesses: T[]; agents: T[] } {
   const harnessBacked = (a: T): boolean =>
-    !a.mine && (isNativeCodingAgent(a) || isAcpHarnessAgent(a));
+    !a.mine && (isNativeCodingAgent(a) || isAcpHarnessAgent(a) || isHeadlessCliHarness(a));
   return {
     harnesses: agents.filter(harnessBacked),
     agents: agents.filter((a) => !harnessBacked(a)),
