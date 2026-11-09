@@ -1,6 +1,7 @@
 import { createElement, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import { SCHEDULED_TASKS_KEY } from "@/hooks/useScheduledTasks";
@@ -102,10 +103,16 @@ describe("useDeleteSourceAutomations", () => {
     queryClient.setQueryData(SCHEDULED_TASKS_KEY, [{ id: "st_1" }, { id: "st_2" }, { id: "st_3" }]);
   });
 
-  function renderDelete() {
+  function renderDelete(path = "/") {
     const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    return renderHook(() => useDeleteSourceAutomations(), { wrapper }).result.current;
+      createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(MemoryRouter, { initialEntries: [path] }, children),
+      );
+    return renderHook(() => ({ remove: useDeleteSourceAutomations(), location: useLocation() }), {
+      wrapper,
+    }).result;
   }
 
   it("deletes each automation and drops it from the cached list, counting a 404 as deleted", async () => {
@@ -113,7 +120,7 @@ describe("useDeleteSourceAutomations", () => {
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new scheduledTasksApi.ScheduledTaskApiError("gone", 404, null));
 
-    await expect(renderDelete()(["st_1", "st_2"])).resolves.toBe(true);
+    await expect(renderDelete().current.remove(["st_1", "st_2"])).resolves.toBe(true);
 
     expect(deleteScheduledTask).toHaveBeenCalledWith("st_1");
     expect(deleteScheduledTask).toHaveBeenCalledWith("st_2");
@@ -125,8 +132,21 @@ describe("useDeleteSourceAutomations", () => {
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new scheduledTasksApi.ScheduledTaskApiError("boom", 500, null));
 
-    await expect(renderDelete()(["st_1", "st_2"])).resolves.toBe(false);
+    await expect(renderDelete().current.remove(["st_1", "st_2"])).resolves.toBe(false);
 
     expect(queryClient.getQueryData(SCHEDULED_TASKS_KEY)).toEqual([{ id: "st_2" }, { id: "st_3" }]);
+  });
+
+  it.each([
+    ["/tasks/st_1", "/tasks"],
+    ["/tasks/st_3", "/tasks/st_3"],
+    ["/c/conv_1", "/c/conv_1"],
+  ])("leaves %s for the automations list only when its automation is deleted", async (from, to) => {
+    deleteScheduledTask.mockResolvedValue(undefined);
+    const result = renderDelete(from);
+
+    await act(() => result.current.remove(["st_1"]));
+
+    expect(result.current.location.pathname).toBe(to);
   });
 });

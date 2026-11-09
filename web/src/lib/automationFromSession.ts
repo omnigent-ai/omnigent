@@ -11,6 +11,7 @@ import {
   scheduledTaskRunsKey,
 } from "@/hooks/useScheduledTasks";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
+import { useLocation, useNavigate } from "@/lib/routing";
 import {
   deleteScheduledTask,
   ScheduledTaskApiError,
@@ -101,6 +102,8 @@ export function automationPagePath(info: ServerInfo | "loading", task: Scheduled
  */
 export function useDeleteSourceAutomations(): (taskIds: string[]) => Promise<boolean> {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const { pathname } = useLocation();
   return useCallback(
     async (taskIds: string[]) => {
       const results = await Promise.allSettled(
@@ -114,6 +117,10 @@ export function useDeleteSourceAutomations(): (taskIds: string[]) => Promise<boo
       );
       const deleted = taskIds.filter((_, index) => results[index]?.status === "fulfilled");
       if (deleted.length > 0) {
+        // Leave the page of an automation deleted with its session, as deleting it there does.
+        if (deleted.some((taskId) => pathname.endsWith(`/tasks/${encodeURIComponent(taskId)}`))) {
+          navigate("/tasks");
+        }
         // Mirror useDeleteScheduledTask: drop the tasks from every cache.
         queryClient.setQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY, (tasks) =>
           tasks?.filter((task) => !deleted.includes(task.id)),
@@ -126,6 +133,6 @@ export function useDeleteSourceAutomations(): (taskIds: string[]) => Promise<boo
       }
       return deleted.length === taskIds.length;
     },
-    [queryClient],
+    [queryClient, navigate, pathname],
   );
 }
