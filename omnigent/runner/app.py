@@ -6671,6 +6671,13 @@ def create_runner_app(
                 )
                 return lifecycle_event
 
+            if not is_native_harness(harness_name):
+                from omnigent.tools.builtins.load_skill import reuse_skill_context
+
+                content = event_body.get("content")
+                if isinstance(content, list):
+                    event_body = {**event_body, "content": reuse_skill_context(content)}
+
             try:
                 async with client.stream(
                     "POST",

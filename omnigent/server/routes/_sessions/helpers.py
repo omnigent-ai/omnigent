@@ -8205,10 +8205,9 @@ async def _dispatch_skill_slash_command_to_runner(
 
     Skill content is runner-owned: this asks the bound runner to
     resolve the skill (``POST /v1/sessions/{id}/skills/resolve``) into
-    its ``<skill>`` meta text, reading the ``SKILL.md`` body and
-    resource files from the skill's directory *on the runner* — so the
-    embedded ``<path>`` and resource listing are valid where the harness
-    executes. The server then persists the result (runner-resolves,
+    its ``<skill>`` meta text, reading the ``SKILL.md`` body on the runner
+    so the embedded ``<path>`` is valid where the harness executes.
+    The server then persists the result (runner-resolves,
     server-persists). Appends two conversation items with the same
     response id:
 

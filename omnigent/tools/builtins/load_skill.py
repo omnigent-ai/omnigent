@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
+from omnigent.util.json_types import JsonObject
 
 
 class LoadSkillTool(Tool):
@@ -291,32 +293,72 @@ def find_skill_by_name(skills: list[SkillSpec], name: str) -> SkillSpec | None:
 
 
 def format_skill_meta_text(skill: SkillSpec, arguments: str) -> str:
+    """Build a full skill expansion for durable history on the runner filesystem.
+
+    Auxiliary files remain available through ``load_skill`` and ``read_skill_file``.
+    Every invocation retains its arguments, independently of instruction reuse.
     """
-    Build the hidden user-message text injected for a skill invocation.
-
-    The format follows Codex's durable skill wrapper: the complete
-    skill content is enclosed in ``<skill>`` so clients can identify
-    it later, and slash-command arguments are appended in a separate
-    ``<user_request>`` block so the agent sees the actual request.
-
-    The embedded ``<path>`` and the resource listing are resolved
-    against ``skill.skill_dir``, so this MUST run on the host where the
-    harness executes (the runner) — the paths are read at runtime by
-    the ``read_skill_file`` tool, which resolves relative to the same
-    ``skill_dir``.
-
-    :param skill: Skill being invoked, e.g. ``SkillSpec(name="grill-me",
-        ...)``.
-    :param arguments: Raw arguments typed after the slash command,
-        e.g. ``"review this plan"``. Empty string when none.
-    :returns: Hidden message text for a single ``input_text`` block.
-    """
-    resource_files = list_skill_resources(skill)
-    content = format_skill_content(skill, resource_files)
     lines = ["<skill>", f"<name>{skill.name}</name>"]
     if skill.skill_dir is not None:
         lines.append(f"<path>{skill.skill_dir / 'SKILL.md'}</path>")
-    lines.extend([content, "</skill>"])
+    lines.extend([skill.content, "</skill>"])
     if arguments:
         lines.extend(["", "<user_request>", arguments, "</user_request>"])
     return "\n".join(lines)
+
+
+def reuse_skill_context(messages: Sequence[JsonObject]) -> list[JsonObject]:
+    """Shorten repeated skill expansions within one complete outgoing input.
+
+    Keep durable history intact. Only an identical preceding user expansion in
+    this input permits reuse; a changed body or path becomes the new reference.
+    Callers must exclude native sessions, whose live context belongs to the CLI.
+    """
+    latest: dict[str, str] = {}
+
+    def shorten(text: str) -> str:
+        if not text.startswith("<skill>\n<name>") or text.count("\n</skill>") != 1:
+            return text
+        name, separator, _ = text.removeprefix("<skill>\n<name>").partition("</name>\n")
+        if not separator or not name or "\n" in name:
+            return text
+        instructions, closing, arguments = text.rpartition("\n</skill>")
+        if not closing or (
+            arguments
+            and not (
+                arguments.startswith("\n\n<user_request>\n")
+                and arguments.endswith("\n</user_request>")
+            )
+        ):
+            return text
+        previous = latest.get(name)
+        latest[name] = instructions
+        if previous != instructions:
+            return text
+        return (
+            f"<skill_invocation>\n<name>{name}</name>\n"
+            "Apply the skill instructions already present in this conversation.\n"
+            f"</skill_invocation>{arguments}"
+        )
+
+    result: list[JsonObject] = []
+    for message in messages:
+        if message.get("type", "message") != "message" or message.get("role") != "user":
+            result.append(message)
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            result.append({**message, "content": shorten(content)})
+        elif isinstance(content, list):
+            blocks = [
+                {**block, "text": shorten(block["text"])}
+                if isinstance(block, dict)
+                and block.get("type") == "input_text"
+                and isinstance(block.get("text"), str)
+                else block
+                for block in content
+            ]
+            result.append({**message, "content": blocks})
+        else:
+            result.append(message)
+    return result
