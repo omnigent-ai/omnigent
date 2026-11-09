@@ -2538,6 +2538,17 @@ def register_events_routes(
             return {"queued": False}
         if body.type in (_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE):
             status = body.data.get("status")
+            undelivered_input_stable_id = body.data.get("undelivered_input_stable_id")
+            if (
+                body.type == _EXTERNAL_SESSION_STATUS_TYPE
+                and "status" not in body.data
+                and isinstance(undelivered_input_stable_id, str)
+                and undelivered_input_stable_id
+            ):
+                await _settle_empty_native_turn_input(
+                    conversation_store, conv, session_id, undelivered_input_stable_id
+                )
+                return {"queued": False}
             if body.type == _SUBAGENT_STATUS_TYPE:
                 if body.data.get("idle") is not True:
                     raise OmnigentError(
@@ -2704,11 +2715,6 @@ def register_events_routes(
                 )
             elif status == "running" or recovered_from_failure:
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
-            undelivered_input_stable_id = data.get("undelivered_input_stable_id")
-            if status == "idle" and isinstance(undelivered_input_stable_id, str):
-                await _settle_empty_native_turn_input(
-                    conversation_store, conv, session_id, undelivered_input_stable_id
-                )
             _publish_status(
                 session_id,
                 status,
@@ -4191,6 +4197,7 @@ def register_events_routes(
                 delete_branch=True,
                 host_registry=getattr(request.app.state, "host_registry", None),
                 reason="session-delete",
+                host_store=getattr(request.app.state, "host_store", None),
                 expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
                 conversation_store=conversation_store,
                 exclude_conversation_id=conv.id,

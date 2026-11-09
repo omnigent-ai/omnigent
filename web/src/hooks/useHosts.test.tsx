@@ -242,49 +242,59 @@ describe("useHosts", () => {
     ]);
   });
 
-  it("hides server-managed sandbox hosts from the host list", async () => {
-    // Every host picker (NewChatDialog, ForkSessionDialog,
-    // ResumeWithDirectoryDialog) consumes this hook, so filtering here
-    // is what keeps sandbox-backed hosts out of all of them. A host
-    // with a non-null sandbox_provider is server-managed (created from
-    // a managed sandbox); one without the field at all comes from an
-    // older server and must be kept.
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        hosts: [
-          {
-            host_id: "host_sandbox",
-            name: "sandbox-abc123",
-            owner: "alice",
-            status: "online",
-            sandbox_provider: "modal",
-          },
-          {
-            host_id: "host_laptop",
-            name: "Laptop",
-            owner: "alice",
-            status: "online",
-            sandbox_provider: null,
-          },
-          {
-            host_id: "host_legacy",
-            name: "Old server host",
-            owner: "alice",
-            status: "offline",
-          },
-        ],
-      }),
-    );
+  it.each([undefined, "host_sandbox", "host_other"])(
+    "only exposes the selected sandbox alongside regular hosts (source=%s)",
+    async (sourceHostId) => {
+      // Every host picker (NewChatDialog, ForkSessionDialog,
+      // ResumeWithDirectoryDialog) consumes this hook, so filtering here
+      // is what keeps sandbox-backed hosts out of all of them. A host
+      // with a non-null sandbox_provider is server-managed (created from
+      // a managed sandbox); one without the field at all comes from an
+      // older server and must be kept.
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({
+          hosts: [
+            {
+              host_id: "host_sandbox",
+              name: "sandbox-abc123",
+              owner: "alice",
+              status: "online",
+              sandbox_provider: "modal",
+            },
+            {
+              host_id: "host_other",
+              name: "other",
+              owner: "alice",
+              status: "online",
+              sandbox_provider: "modal",
+            },
+            {
+              host_id: "host_laptop",
+              name: "Laptop",
+              owner: "alice",
+              status: "online",
+              sandbox_provider: null,
+            },
+            {
+              host_id: "host_legacy",
+              name: "Old server host",
+              owner: "alice",
+              status: "offline",
+            },
+          ],
+        }),
+      );
 
-    const { result } = renderHook(() => useHosts(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      const { result } = renderHook(() => useHosts({ sourceHostId }), { wrapper });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    // The modal-backed host is dropped; the explicit-null and
-    // field-absent hosts both survive. If host_sandbox appears, the
-    // sandbox filter regressed; if host_legacy disappears, the filter
-    // broke old-server compatibility.
-    expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop", "host_legacy"]);
-  });
+      expect(result.current.data?.map((h) => h.host_id)).toEqual([
+        ...(sourceHostId ? [sourceHostId] : []),
+        "host_laptop",
+        "host_legacy",
+      ]);
+    },
+  );
 
   it("retains sandbox hosts when includeSandbox is set", async () => {
     // The chat-header HostBadge needs sandbox-backed hosts so it can

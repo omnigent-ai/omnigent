@@ -17,10 +17,13 @@ from omnigent.harnesses.codex_egress import detect_certificate_failure
 from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
+    acknowledge_turn_input,
+    pending_turn_input_outcomes,
+    prepare_turn_input,
     read_bridge_state,
     read_certificate_failure,
     record_certificate_failure,
-    record_turn_input_stable_id,
+    update_active_turn_id,
     write_bridge_state,
 )
 from tests.harnesses.codex_native.forwarder._support import (
@@ -918,52 +921,97 @@ def test_terminal_turn_status_edge_empty_turn_idle_and_warns(
     ), "expected a WARN log for the empty (zero-item) turn"
 
 
-def test_empty_turn_reports_the_web_input_it_was_started_with(tmp_path: Path) -> None:
-    """A zero-item turn names the web input its turn/start carried.
+@pytest.mark.parametrize("ack_first", [False, True])
+@pytest.mark.parametrize("resume", [False, True])
+async def test_empty_turn_settlement_survives_late_ack_and_newer_turn(
+    tmp_path: Path,
+    ack_first: bool,
+    resume: bool,
+) -> None:
+    """Exact empty-turn ownership survives either event order and a newer input."""
+    _seed_active_turn(tmp_path, "turn_old")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    claim = prepare_turn_input(tmp_path, state, "a" * 32)
+    if ack_first:
+        acknowledge_turn_input(tmp_path, claim, "turn_old")
+    params = {"turn": {"id": "turn_old", "status": "completed", "items": []}}
+    if resume:
+        fwd._resume_turn_status_edge_for_latest_turn(tmp_path, state.thread_id, [params["turn"]])
+    else:
+        fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+    newer = prepare_turn_input(tmp_path, state, "b" * 32)
+    acknowledge_turn_input(tmp_path, newer, "turn_new")
+    update_active_turn_id(tmp_path, "turn_new")
+    if not ack_first:
+        assert pending_turn_input_outcomes(tmp_path) == []
+        acknowledge_turn_input(tmp_path, claim, "turn_old")
+    client = _RecordingClient()
+    await fwd._drain_turn_input_outcomes(client, tmp_path)  # type: ignore[arg-type]
+    await fwd._drain_turn_input_outcomes(client, tmp_path)  # type: ignore[arg-type]
+    assert client.posts == [
+        (
+            f"/v1/sessions/{state.session_id}/events",
+            {
+                "type": "external_session_status",
+                "data": {"undelivered_input_stable_id": "a" * 32},
+            },
+        )
+    ]
+    current = read_bridge_state(tmp_path)
+    assert current is not None and current.active_turn_id == "turn_new"
 
-    Codex dropped that input, so the edge carries its stable id and the server
-    can settle it as undelivered now instead of at the next mirrored message.
-    """
+
+@pytest.mark.parametrize(
+    "turn",
+    [
+        {"id": "unrelated", "status": "completed", "items": []},
+        {"id": "turn_123", "status": "completed"},
+        {"id": "turn_123", "status": "completed", "items": [{"type": "agentMessage"}]},
+        {"id": "turn_123", "status": "failed", "items": []},
+        {"id": "turn_123", "status": "interrupted", "items": []},
+        {"id": "turn_123", "status": "completed", "items": [], "error": {"message": "failed"}},
+    ],
+)
+async def test_only_exact_successful_empty_turn_settles_input(tmp_path: Path, turn: dict) -> None:
+    """Missing evidence, other inputs, and native refusals never become empty-turn notices."""
     _seed_active_turn(tmp_path, "turn_123")
-    stable_id = "a" * 32
-    record_turn_input_stable_id(tmp_path, "turn_123", stable_id)
-    params = {"turn": {"id": "turn_123", "status": "completed", "items": []}}
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    claim = prepare_turn_input(tmp_path, state, "a" * 32)
+    acknowledge_turn_input(tmp_path, claim, "turn_123")
+    fwd._terminal_turn_status_edge(tmp_path, "turn/completed", {"turn": turn})
+    client = _RecordingClient()
+    await fwd._drain_turn_input_outcomes(client, tmp_path)  # type: ignore[arg-type]
+    assert client.posts == []
 
-    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
 
-    assert edge is not None
-    assert edge.status == "idle"
-    assert edge.undelivered_input_stable_id == stable_id
+async def test_empty_turn_settlement_retries_failed_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected outcome remains durable for the forwarder's next drain."""
+    from unittest.mock import AsyncMock
 
+    import httpx
 
-def test_empty_turn_for_another_turn_reports_no_input(tmp_path: Path) -> None:
-    """The recorded input belongs to its own turn id only."""
     _seed_active_turn(tmp_path, "turn_123")
-    record_turn_input_stable_id(tmp_path, "turn_old", "a" * 32)
-    params = {"turn": {"id": "turn_123", "status": "completed", "items": []}}
-
-    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
-
-    assert edge is not None
-    assert edge.undelivered_input_stable_id is None
-
-
-def test_turn_with_items_never_reports_its_input_undelivered(tmp_path: Path) -> None:
-    """A turn Codex recorded items for has delivered its input."""
-    _seed_active_turn(tmp_path, "turn_123")
-    record_turn_input_stable_id(tmp_path, "turn_123", "a" * 32)
-    params = {
-        "turn": {
-            "id": "turn_123",
-            "status": "completed",
-            "items": [{"type": "agentMessage", "id": "a", "text": "done"}],
-        }
-    }
-
-    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
-
-    assert edge is not None
-    assert edge.undelivered_input_stable_id is None
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    claim = prepare_turn_input(tmp_path, state, "a" * 32)
+    acknowledge_turn_input(tmp_path, claim, "turn_123")
+    fwd._terminal_turn_status_edge(
+        tmp_path,
+        "turn/completed",
+        {"turn": {"id": "turn_123", "status": "completed", "items": []}},
+    )
+    post = AsyncMock(side_effect=[httpx.Response(503), httpx.Response(202)])
+    monkeypatch.setattr(fwd, "_post_session_event", post)
+    client = _RecordingClient()
+    await fwd._drain_turn_input_outcomes(client, tmp_path)  # type: ignore[arg-type]
+    assert len(pending_turn_input_outcomes(tmp_path)) == 1
+    await fwd._drain_turn_input_outcomes(client, tmp_path)  # type: ignore[arg-type]
+    assert pending_turn_input_outcomes(tmp_path) == []
+    assert post.await_count == 2
 
 
 def test_omnigent_status_from_resume_turn_error_parity() -> None:
@@ -1605,3 +1653,69 @@ async def test_system_error_on_a_child_thread_is_not_the_sessions_status(tmp_pat
     await _deliver_to_parent(client, tmp_path, state, _system_error_event("thread_child"))
 
     assert client.posts == []
+
+
+@pytest.mark.parametrize("missing", ["items", "status"])
+async def test_partial_empty_completion_can_recover(tmp_path: Path, missing: str) -> None:
+    """A missing item snapshot waits for resume; the completion method supplies status."""
+    _seed_active_turn(tmp_path, "turn_123")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    claim = prepare_turn_input(tmp_path, state, "a" * 32)
+    acknowledge_turn_input(tmp_path, claim, "turn_123")
+    turn: dict[str, Any] = {"id": "turn_123", "status": "completed", "items": []}
+    partial = {key: value for key, value in turn.items() if key != missing}
+    fwd._terminal_turn_status_edge(tmp_path, "turn/completed", {"turn": partial})
+    client = _RecordingClient()
+    await fwd._drain_turn_input_outcomes(client, tmp_path)  # type: ignore[arg-type]
+    if missing == "items":
+        assert client.posts == []
+        fwd._resume_turn_status_edge_for_latest_turn(tmp_path, state.thread_id, [turn])
+        await fwd._drain_turn_input_outcomes(client, tmp_path)  # type: ignore[arg-type]
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["data"] == {"undelivered_input_stable_id": "a" * 32}
+
+
+async def test_empty_turn_settles_started_and_steered_inputs(tmp_path: Path) -> None:
+    """Each acknowledged input into an empty native turn gets its own notice."""
+    _seed_active_turn(tmp_path, "turn_123")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    for stable_id in ("a" * 32, "b" * 32):
+        claim = prepare_turn_input(tmp_path, state, stable_id)
+        acknowledge_turn_input(tmp_path, claim, "turn_123")
+    fwd._terminal_turn_status_edge(
+        tmp_path,
+        "turn/completed",
+        {"turn": {"id": "turn_123", "status": "completed", "items": []}},
+    )
+    client = _RecordingClient()
+    await fwd._drain_turn_input_outcomes(client, tmp_path)  # type: ignore[arg-type]
+    assert sorted(body["data"]["undelivered_input_stable_id"] for _, body in client.posts) == [
+        "a" * 32,
+        "b" * 32,
+    ]
+    assert pending_turn_input_outcomes(tmp_path) == []
+
+
+async def test_empty_turn_drain_backs_off_without_losing_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected settlement backs off across drain iterations, including old servers."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    drain = AsyncMock(side_effect=[False, False, False, True])
+    monkeypatch.setattr(fwd, "_drain_turn_input_outcomes", drain)
+    delays: list[float] = []
+
+    async def advance(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) == 4:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(fwd, "_sleep", advance)
+    with pytest.raises(asyncio.CancelledError):
+        await fwd._drive_turn_input_outcomes(_RecordingClient(), tmp_path)  # type: ignore[arg-type]
+    assert delays == [2.0, 4.0, 8.0, 1.0]

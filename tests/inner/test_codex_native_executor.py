@@ -23,10 +23,11 @@ from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
     CodexNativeBridgeState,
     clear_active_turn_id_if_matches,
+    pending_turn_input_outcomes,
     read_bridge_state,
     read_codex_config_effort,
     read_codex_config_model,
-    read_turn_input_stable_id,
+    record_turn_input_outcome,
     update_active_turn_id,
     write_bridge_startup_error,
     write_bridge_startup_timeout,
@@ -1037,28 +1038,45 @@ def test_codex_delivery_records_input_and_accepted_native_turn(
     assert "private prompt" not in json.dumps(attrs)
 
 
+@pytest.mark.parametrize("completion_before_ack", [False, True])
+@pytest.mark.parametrize("active_turn_id", [None, "turn_steered"])
 def test_web_started_turn_records_its_input_for_an_empty_turn_report(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    completion_before_ack: bool,
+    active_turn_id: str | None,
 ) -> None:
     """A turn started for a web input remembers that input's stable id.
 
     The forwarder reads the record if Codex completes the turn with no items.
     """
+
+    native_turn_id = active_turn_id or "turn_1"
+
+    class EarlyCompletionClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            response = await super().request(method, params)
+            if completion_before_ack and method in {"turn/start", "turn/steer"}:
+                record_turn_input_outcome(tmp_path, "thread_123", native_turn_id, empty=True)
+            return response
+
     _FakeCodexNativeClient.requests = []
     _FakeCodexNativeClient.created = []
     _FakeCodexNativeClient.next_turn = 1
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
-        _FakeCodexNativeClient,
+        EarlyCompletionClient,
     )
-    _seed_bridge(tmp_path, active_turn_id=None)
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
     identity = {"input_stable_id": "d" * 32, "pending_id": "pending_" + "e" * 32}
     with input_delivery_scope(identity, response_id="resp_web"):
         events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
 
     assert [type(event) for event in events] == [TurnComplete]
-    assert read_turn_input_stable_id(tmp_path, "turn_1") == "d" * 32
+    if not completion_before_ack:
+        record_turn_input_outcome(tmp_path, "thread_123", native_turn_id, empty=True)
+    [outcome] = pending_turn_input_outcomes(tmp_path)
+    assert outcome.input_stable_id == "d" * 32
 
 
 def test_turn_started_without_a_web_input_records_nothing(
@@ -1077,7 +1095,8 @@ def test_turn_started_without_a_web_input_records_nothing(
 
     _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "typed in the terminal")
 
-    assert read_turn_input_stable_id(tmp_path, "turn_1") is None
+    record_turn_input_outcome(tmp_path, "thread_123", "turn_1", empty=True)
+    assert pending_turn_input_outcomes(tmp_path) == []
 
 
 def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
@@ -2773,6 +2792,39 @@ def test_stale_active_turn_mismatch_steer_recovers_to_newer_turn(
     assert state.active_turn_id == "turn_b"
 
 
+def test_steer_ack_does_not_restore_a_turn_completed_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A steer accepted just before its turn ended leaves the bridge idle."""
+
+    class _CompletingSteerClient(_FakeCodexNativeClient):
+        """Complete the steered turn before acknowledging the steer."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Model the forwarder recording ``turn/completed`` ahead of the ack."""
+            type(self).requests.append((method, params))
+            assert method == "turn/steer", method
+            assert clear_active_turn_id_if_matches(tmp_path, "turn_a")
+            return {"result": {"turnId": "turn_a"}}
+
+    _CompletingSteerClient.requests = []
+    _CompletingSteerClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _CompletingSteerClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "follow up")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+
+
 async def test_concurrent_steering_during_turn_start_is_not_dropped(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -4442,3 +4494,110 @@ def test_interrupt_reraises_unrelated_rejections(
     assert state is not None and state.active_turn_id == "turn_active", (
         f"an unexplained rejection must not clear the recorded turn; bridge={state!r}"
     )
+
+
+@pytest.mark.parametrize("failure", ["refused", "socket", "timeout", "cancelled", "malformed"])
+async def test_unacknowledged_input_does_not_keep_collecting_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """Once an RPC exits without a turn ID, later turns cannot acquire its input."""
+    from omnigent.harnesses.codex_native.bridge import acknowledge_turn_input, prepare_turn_input
+
+    claims: list[str] = []
+
+    def capture_claim(*args: Any) -> str:
+        claim = prepare_turn_input(*args)
+        claims.append(claim)
+        return claim
+
+    class FailedClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if failure == "malformed":
+                return {"result": {}}
+            raise {
+                "refused": CodexAppServerResponseError({"code": -32600, "message": "refused"}),
+                "socket": ConnectionResetError("lost acknowledgement"),
+                "timeout": TimeoutError(),
+                "cancelled": asyncio.CancelledError(),
+            }[failure]
+
+    monkeypatch.setattr(codex_native_executor, "prepare_turn_input", capture_claim)
+    _seed_bridge(tmp_path)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    with input_delivery_scope({"input_stable_id": "a" * 32}, response_id="resp_web"):
+        request = codex_native_executor._native_delivery_request_once(
+            FailedClient(),
+            "turn/start",
+            {"threadId": "thread_123"},
+            state,
+            bridge_dir=tmp_path,
+        )
+        if failure == "malformed":
+            await request
+        else:
+            with pytest.raises(
+                (
+                    CodexAppServerResponseError,
+                    InjectionDeliveryAmbiguous,
+                    TimeoutError,
+                    asyncio.CancelledError,
+                )
+            ):
+                await request
+    [claim] = claims
+    record_turn_input_outcome(tmp_path, "thread_123", "unrelated", empty=True)
+    acknowledge_turn_input(tmp_path, claim, "unrelated")
+    assert pending_turn_input_outcomes(tmp_path) == []
+
+
+async def test_cancelled_preclaim_write_cannot_leave_native_input_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop during the file write cleans it after the worker finishes, before any RPC."""
+    import threading
+
+    from omnigent.harnesses.codex_native.bridge import acknowledge_turn_input, prepare_turn_input
+
+    entered = threading.Event()
+    release = threading.Event()
+    claims: list[str] = []
+
+    def delayed_prepare(*args: Any) -> str:
+        entered.set()
+        assert release.wait(10), "test did not release the claim writer"
+        claim = prepare_turn_input(*args)
+        claims.append(claim)
+        return claim
+
+    monkeypatch.setattr(codex_native_executor, "prepare_turn_input", delayed_prepare)
+    _FakeCodexNativeClient.requests = []
+    _seed_bridge(tmp_path)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    with input_delivery_scope({"input_stable_id": "a" * 32}, response_id="resp_web"):
+        request = asyncio.create_task(
+            codex_native_executor._native_delivery_request_once(
+                _FakeCodexNativeClient(),
+                "turn/start",
+                {"threadId": "thread_123"},
+                state,
+                bridge_dir=tmp_path,
+            )
+        )
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        request.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        [claim] = claims
+        record_turn_input_outcome(tmp_path, "thread_123", "later", empty=True)
+        acknowledge_turn_input(tmp_path, claim, "later")
+        assert pending_turn_input_outcomes(tmp_path) == []
+        assert _FakeCodexNativeClient.requests == []
+    finally:
+        release.set()

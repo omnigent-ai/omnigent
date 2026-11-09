@@ -176,11 +176,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   be removed. State: unsupported file type rejected without losing the message.
 - `dictation`: the microphone button beside the message box dictates speech
   into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
-  terminal or code editor. While listening, Enter keeps the dictated text and
-  Escape discards it. The button is absent when neither the browser nor the
-  server can transcribe.
+  terminal or code editor. While a browser or server take is listening, Enter
+  keeps the dictated text and Escape discards it. The button is absent when
+  neither the browser nor the server can transcribe; the desktop app's browser
+  engine cannot, so there the button uses the connected server's dictation.
+  Without it, the button starts macOS Dictation in the message box on a Mac,
+  which then uses its own Dictation controls, and is absent elsewhere.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
-  Shift+Enter inserts a newline in both composers. The
+  Shift+Enter and Alt/Option+Enter insert a newline in both composers. The
   Inbox reply box follows the same shortcut.
 - `blocked-start`: hovering or focusing disabled Start explains the missing
   setup. Clicking, tapping, or trying to submit pins that explanation until
@@ -237,6 +240,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
+- `custom-agent-placement`: New session and Add nested agent can launch an uploaded
+  custom agent on a fresh sandbox with repositories when `session_bundle_workspaces`
+  is advertised. Nested custom agents can also use new or existing worktrees on a
+  connected host. Older servers disable the unsupported worktree combination and
+  retain the registered-agent fallback on sandbox selection. Managed creates send
+  the first task and attachments with the bundle when durable input is supported.
 - `import-bundle`: Create custom agent → Import bundle installs a `.tar.gz` agent
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
@@ -287,7 +296,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   A plugin catalog the host could not read is named in the Skills section with
   a Retry link.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
-  message box; press Enter to keep the text or Escape to discard it.
+  message box. For browser or server dictation, press Enter to keep the text or
+  Escape to discard it. In the desktop app the button uses the connected
+  server's dictation; without it, a Mac opens macOS Dictation in the message
+  box (stop it with the macOS Dictation controls), and other platforms show no
+  button. A side chat's composer ("Ask a side question...") shows the same
+  button under the same rule; the shortcut belongs to the main composer.
 - Send while the agent is working to queue a message, then steer it.
 - With the in-session message box empty, press Up to recall a previous prompt
   (or the last queued message). While writing a draft, Up stops at the top.
@@ -307,6 +321,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 **New-session composer** (landing page, or New session):
 
+- **Add nested agent** opens this composer scoped to the source session, with
+  that session's sandbox preselected. See [sibling entry points](sessions.md#how-to-get-to-it-user-pov).
+  If creation is rejected, the same composer restores the prompt and attachments.
 - Select **Codex → + → Plan** and confirm the **Plan mode** badge before sending.
 - Write a prompt or attach a file before choosing a working directory. Hover
   or focus disabled Start to see what is missing; click, tap, or press Enter to
@@ -399,7 +416,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   to select it; for Databricks, first enter the workspace URL and choose
   **Connect workspace**. Bearer-token services require **Manage MCP accounts**
   before selection. Use **Reconnect** if a selected service loses its connection.
-- Dictate with the microphone button or ⌘/Ctrl+Alt+V before the first send.
+- Dictate with the microphone button or ⌘/Ctrl+Alt+V before the first send,
+  under the same desktop rule as above.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
@@ -724,8 +742,25 @@ Other connection providers alone do not enable the managed MCP picker.
   engine and keeps the transcript on Enter.
   Manually on the landing page: dictate with ⌘/Ctrl+Alt+V, then press Escape
   to restore the previous draft.
+- **`dictation`, desktop:**
+  `web/electron/e2e/desktop_dictation_availability.e2e.js` (new-session
+  composer only), run from `web/electron` after building the SPA
+  (`OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python xvfb-run -a
+  node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
+  server without dictation (on macOS, the macOS Dictation mic instead), then
+  the mic dictating through a fake-engine server. Manually, for the in-session,
+  new-session and side-chat composers: connect the desktop app to a default
+  `omnigent server` (`/v1/info` reports `dictation_available: false`) and
+  expect no mic and ⌘/Ctrl+Alt+V to do nothing on Windows or Linux. On a Mac
+  expect the mic in each composer; clicking it (or, in the in-session and
+  new-session composers, pressing ⌘⌥V; side chat has no shortcut) opens macOS
+  Dictation with that message box focused, and the spoken text stays in it.
+  Restart the server with
+  `OMNIGENT_DICTATION_ENGINE=fake`, reconnect, and expect the mic, the listening
+  state on click, and the fake transcript in the message box.
 - **`send-shortcut`:**
-  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`
+  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
+  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
 - **`list-formatting`, both composers:** no browser-level coverage; the list
   cases in `web/src/components/composer/ChatComposer.test.tsx`
   (`pnpm --dir web test`). Manually: type `1.` then Space and expect ` 1.`;
@@ -905,7 +940,8 @@ Other connection providers alone do not enable the managed MCP picker.
   when unavailable or the browser speech service fails. Audio still comes from
   the client device; choosing a remote host does not change the microphone.
   Denying microphone permission must not start a fallback recording.
-  The desktop app prefers the
-  server when available. A verification instance without a transcription engine
-  depends on browser support; a missing microphone there does not prove that
-  dictation is unavailable on a configured server.
+  The desktop app uses the server, falls back to macOS Dictation on a Mac,
+  and hides the button elsewhere. A
+  verification instance without a transcription engine depends on browser
+  support; a missing microphone there does not prove that dictation is
+  unavailable on a configured server.
