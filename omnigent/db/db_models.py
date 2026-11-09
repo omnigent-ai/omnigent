@@ -1770,3 +1770,106 @@ class SqlScheduledTaskRun(OmnigentBase):
             "id",
         ),
     )
+
+
+# Largest stored (compressed) value for a new column, per the database guide.
+_INBOX_MAX_STORED_BYTES = 16_383
+# Items one session may post; each takes one ``session_slot``.
+INBOX_ITEMS_PER_SESSION = 10
+
+
+class SqlInboxItem(OmnigentBase):
+    """Agent-posted Inbox suggestions, scoped to a workspace and owner.
+
+    Agent and session relationships are maintained by application code (no DB
+    foreign key, Rule R032). ``session_slot`` numbers a session's items from 0
+    so a unique index enforces the per-session cap under concurrent posts.
+    """
+
+    __tablename__ = "inbox_items"
+
+    # Tenant partition key: workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # The reserved "local" user in single-user mode, so the unique indexes apply there too.
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    session_slot: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    agent_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    prompt_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # INBOX_ITEM_KIND code.
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    body_md: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
+    )
+    # JSON list of evidence links (at most ten), stored compressed.
+    links: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
+    )
+    # JSON list of agent-defined actions ({label, prompt}, at most three), stored compressed.
+    actions: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
+    )
+    # JSON chart drawn on the card (see omnigent.server.inbox_chart), stored compressed.
+    chart: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=True
+    )
+    # Duplicate-key inputs and the versioned key built from them.
+    primary_link: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    topic: Mapped[str] = mapped_column(String(128), nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    # INBOX_ITEM_STATE and INBOX_ITEM_RESOLUTION codes.
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    resolution: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    # Index into ``actions`` of the action the owner took; NULL otherwise.
+    resolution_action: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    feedback_text: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=True
+    )
+    # Unix epoch seconds.
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    read_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    acted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("kind IN (1, 2, 3)", name="ck_inbox_items_kind"),
+        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_inbox_items_state"),
+        CheckConstraint("resolution IN (0, 1, 2, 3, 4, 5, 6)", name="ck_inbox_items_resolution"),
+        CheckConstraint(
+            f"session_slot >= 0 AND session_slot < {INBOX_ITEMS_PER_SESSION}",
+            name="ck_inbox_items_session_slot",
+        ),
+        # Newest-first list of all of an owner's items.
+        Index("ix_inbox_items_user_created", "workspace_id", "user_id", "created_at", "id"),
+        # Newest-first list and bounded count of an owner's items in one state.
+        Index(
+            "ix_inbox_items_user_state_created",
+            "workspace_id",
+            "user_id",
+            "state",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "uq_inbox_items_user_dedupe_key",
+            "workspace_id",
+            "user_id",
+            "dedupe_key",
+            unique=True,
+        ),
+        Index(
+            "uq_inbox_items_session_slot",
+            "workspace_id",
+            "user_id",
+            "source_session_id",
+            "session_slot",
+            unique=True,
+        ),
+    )
