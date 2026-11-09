@@ -51,6 +51,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.polling import poll_until
 from tests.e2e.conftest import (
     _CLAUDE_CODER_DIR,
     configure_mock_llm,
@@ -887,3 +888,13 @@ def test_fork_native_source_into_sdk_carries_history(
                 f"SDK clone did not recall {marker!r} (got {text!r}) — the native "
                 "source's transcript was not replayed as context into the SDK clone"
             )
+
+
+def _wait_until_idle(client: httpx.Client, *, session_id: str) -> None:
+    """Wait for *session_id*'s turn to end; the turn-end edge can trail the reply."""
+    poll_until(
+        lambda: (
+            client.get(f"/v1/sessions/{session_id}", timeout=30.0).json()["status"] != "running"
+        ),
+        timeout_s=60.0,
+    )

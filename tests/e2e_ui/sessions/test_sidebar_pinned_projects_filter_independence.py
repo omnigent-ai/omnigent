@@ -1,7 +1,7 @@
 """Browser E2E for pinned visibility and project membership across sidebar filters.
 
 Pins stay visible on every filter. Project folders keep live owned members on
-All / My / Shared and switch to archived owned members on Archived. These
+All / My, switch to archived owned members on Archived, and hide on Shared. These
 journeys use the real REST API and a dedicated multi-user server so the Shared
 filter and owner boundaries are exercised.
 """
@@ -22,6 +22,7 @@ from tests.e2e_ui.collaboration._multi_user_server import (
     create_user_session,
     spawn_multi_user_server,
 )
+from tests.e2e_ui.sessions._sidebar_helpers import choose_session_filter
 
 # Edit access (2): enough to share a session with a non-owner. Mirrors
 # LEVEL_EDIT in omnigent/server/auth.py.
@@ -87,8 +88,9 @@ def _row(page: Page, session_id: str) -> Locator:
 
 def _set_filter(page: Page, value: str) -> None:
     """Open the filter funnel and pick *value* (all/mine/shared/archived)."""
-    page.locator(_FILTER).click()
-    page.locator(f'[data-testid="session-filter-{value}"]').click()
+    choose_session_filter(page, value)
+    # Reopening before the closing menu returns focus to its trigger closes it again.
+    expect(page.get_by_role("menu")).to_have_count(0)
 
 
 def _pin_row(page: Page, session_id: str) -> None:
@@ -124,7 +126,7 @@ def test_pinned_section_ignores_the_session_filter(
     filter through My sessions, Shared sessions, and Archived sessions — both
     pins must stay under Pinned on all three. Before the fix the Pinned section
     was built from the filtered slice, so the shared pin vanished on "My
-    sessions" and the owned pin vanished on "Shared sessions".
+    sessions" and the owned pin vanished on "Shared with me".
     """
     server = multi_user_server
     uniq = uuid.uuid4().hex[:6]
@@ -172,7 +174,7 @@ def test_project_folders_follow_archived_filter(
     browser: Browser,
     multi_user_server: MultiUserServer,
 ) -> None:
-    """Folders survive every filter and switch between live and archived members."""
+    """Folders hide on Shared and switch between live and archived members."""
     server = multi_user_server
     uniq = uuid.uuid4().hex[:6]
     viewer_email = f"viewer-proj-{uniq}@ui.test"
@@ -212,11 +214,10 @@ def test_project_folders_follow_archived_filter(
         expect(folder.locator(f'a[href="/c/{filed}"]')).to_be_visible()
         expect(folder.locator(f'a[href="/c/{archived}"]')).to_have_count(0)
 
-        # Shared sessions: the Projects group and the folder must NOT disappear
-        # (this whole section used to be hidden on the Shared tab).
+        # Shared with me: folders only hold owned sessions, so Projects hides.
         _set_filter(page, "shared")
-        expect(page.get_by_role("button", name="Projects", exact=True)).to_be_visible()
-        expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
+        expect(page.get_by_role("button", name="Projects", exact=True)).to_have_count(0)
+        expect(page.get_by_role("button", name=project, exact=True)).to_have_count(0)
 
         # Archived members are filed in the folder, leaving only unfiled archives flat.
         _set_filter(page, "archived")
@@ -232,7 +233,7 @@ def test_project_folders_follow_archived_filter(
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
-def test_shared_session_stays_in_flat_list_on_project_name_collision(
+def test_shared_session_stays_in_shared_section_on_project_name_collision(
     browser: Browser,
     multi_user_server: MultiUserServer,
 ) -> None:
@@ -242,7 +243,7 @@ def test_shared_session_stays_in_flat_list_on_project_name_collision(
     ownership-gated. The viewer owns a session filed under a project, and a
     DIFFERENT owner's session — shared with the viewer — carries the same
     project-name label. That collision must not pull the foreign session into
-    the viewer's folder (which would also drop it from the flat Sessions list).
+    the viewer's folder (which would also drop it from "Shared with me").
     """
     server = multi_user_server
     uniq = uuid.uuid4().hex[:6]
@@ -266,7 +267,7 @@ def test_shared_session_stays_in_flat_list_on_project_name_collision(
         _set_filter(page, "all")
 
         # The folder exists (the owned session filed it), but the shared session
-        # is NOT filed away: it stays in the flat Sessions list, not the folder.
+        # is NOT filed away: it stays in "Shared with me", not the folder.
         expect(page.get_by_role("button", name=project, exact=True)).to_be_visible(timeout=30_000)
-        expect(_section(page, "Sessions").locator(f'a[href="/c/{shared}"]')).to_be_visible()
+        expect(_section(page, "Shared with me").locator(f'a[href="/c/{shared}"]')).to_be_visible()
         expect(_row(page, shared)).to_be_visible()

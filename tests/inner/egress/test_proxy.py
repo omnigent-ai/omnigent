@@ -1342,17 +1342,27 @@ def _mitm_client_selected_alpn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("use_upstream_proxy", [False, True], ids=["direct", "upstream-proxy"])
 async def test_connect_relays_http2_for_unrestricted_host(
     ca_paths: tuple[Path, Path, Path],
     monkeypatch: pytest.MonkeyPatch,
+    use_upstream_proxy: bool,
 ) -> None:
     cert_path, key_path, bundle_path = ca_paths
     host = "agent.example.com"
     request = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\nopaque-client-frames"
     response = b"opaque-server-frames"
     received: list[bytes] = []
+    connects: list[bytes] = []
+    negotiated_protocols: list[str | None] = []
 
     async def _upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if use_upstream_proxy:
+            connects.append(await reader.readuntil(b"\r\n\r\n"))
+            writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            await writer.drain()
+            await writer.start_tls(upstream_ctx)
+        negotiated_protocols.append(writer.get_extra_info("ssl_object").selected_alpn_protocol())
         received.append(await reader.readexactly(len(request)))
         writer.write(response)
         await writer.drain()
@@ -1360,8 +1370,12 @@ async def test_connect_relays_http2_for_unrestricted_host(
 
     upstream_ctx = HostCertCache(cert_path, key_path).get_ssl_context(host)
     upstream_ctx.set_alpn_protocols(["h2"])
-    upstream = await asyncio.start_server(_upstream, "127.0.0.1", 0, ssl=upstream_ctx)
+    upstream = await asyncio.start_server(
+        _upstream, "127.0.0.1", 0, ssl=None if use_upstream_proxy else upstream_ctx
+    )
     upstream_port = upstream.sockets[0].getsockname()[1]
+    if use_upstream_proxy:
+        monkeypatch.setenv("https_proxy", f"http://127.0.0.1:{upstream_port}")
     proxy = EgressProxy(
         parse_rules([f"* {host}/**"]),
         cert_path,
@@ -1386,6 +1400,17 @@ async def test_connect_relays_http2_for_unrestricted_host(
         )
         assert received == [request]
         assert observed == response
+        assert negotiated_protocols == ["h2"]
+        assert connects == (
+            [
+                (
+                    f"CONNECT {host}:{upstream_port} HTTP/1.1\r\n"
+                    f"Host: {host}:{upstream_port}\r\n\r\n"
+                ).encode()
+            ]
+            if use_upstream_proxy
+            else []
+        )
     finally:
         await proxy.stop()
         upstream.close()
@@ -3014,3 +3039,116 @@ async def test_stop_cancels_in_flight_connection_handlers(
     finally:
         for s in socks:
             s.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("proxy_url", "expected_status"),
+    [
+        ("http://127.0.0.1:{port}", 200),
+        ("http://proxy-user:proxy-secret\uff0fvalue@proxy.example:8080", 502),
+        ("http://proxy-user:proxy-secret@proxy.example:proxy-secret", 502),
+    ],
+    ids=["tunnel", "malformed-authority", "invalid-port"],
+)
+async def test_http_request_with_upstream_proxy(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    proxy_url: str,
+    expected_status: int,
+) -> None:
+    """Tunnel allowed requests; keep invalid proxy credentials out of responses and logs."""
+    cert_path, key_path, _ = ca_paths
+    seen: list[bytes] = []
+
+    async def upstream_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        seen.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        seen.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nvia-up")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(upstream_proxy, "127.0.0.1", 0)
+    monkeypatch.setenv("http_proxy", proxy_url.format(port=server.sockets[0].getsockname()[1]))
+    caplog.set_level("DEBUG", logger="omnigent.inner.egress.proxy")
+    monkeypatch.setattr(
+        asyncio.get_event_loop(),
+        "getaddrinfo",
+        _stub_getaddrinfo_resolving(
+            {"allowed.example.com": "93.184.216.34", "127.0.0.1": "127.0.0.1"}
+        ),
+    )
+    proxy = EgressProxy(parse_rules(["GET allowed.example.com/**"]), cert_path, key_path)
+    port = await proxy.start_tcp()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET http://allowed.example.com/x HTTP/1.1\r\nHost: allowed.example.com\r\n\r\n"
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(), timeout=5)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await proxy.stop()
+        server.close()
+        await server.wait_closed()
+
+    assert response.startswith(f"HTTP/1.1 {expected_status} ".encode())
+    if expected_status == 200:
+        assert response.endswith(b"via-up")
+        assert seen[0].startswith(b"CONNECT 93.184.216.34:80 HTTP/1.1")
+        assert seen[1].startswith(b"GET /x HTTP/1.1")
+    else:
+        assert b"Invalid upstream proxy configuration" in response
+        assert not seen
+        for credential in ("proxy-user", "proxy-secret"):
+            assert credential.encode() not in response
+            assert credential not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_host", "resolved_ip"),
+    [("blocked.example.com", "93.184.216.34"), ("allowed.example.com", "10.0.0.5")],
+    ids=["rule-denied", "private-destination"],
+)
+async def test_denied_request_never_contacts_upstream_proxy(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    request_host: str,
+    resolved_ip: str,
+) -> None:
+    """Rule and private-IP denials return 403 before any upstream proxy dial."""
+    cert_path, key_path, _ = ca_paths
+    contacted: list[bool] = []
+
+    async def upstream_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        contacted.append(True)
+        writer.close()
+
+    server = await asyncio.start_server(upstream_proxy, "127.0.0.1", 0)
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+    monkeypatch.setattr(
+        asyncio.get_event_loop(),
+        "getaddrinfo",
+        _stub_getaddrinfo_resolving({request_host: resolved_ip}),
+    )
+    proxy = EgressProxy(parse_rules(["GET allowed.example.com/**"]), cert_path, key_path)
+    port = await proxy.start_tcp()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            f"GET http://{request_host}/x HTTP/1.1\r\nHost: {request_host}\r\n\r\n".encode()
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(4096), timeout=5)
+        writer.close()
+    finally:
+        await proxy.stop()
+        server.close()
+
+    assert b"403 Forbidden" in response
+    assert not contacted
