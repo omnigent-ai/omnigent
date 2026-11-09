@@ -135,14 +135,25 @@ def test_staged_only_and_existing_lines(
     ]
 
 
-def test_branch_range_checks_committed_changes(repository: Path, prohibited_name: str) -> None:
+@pytest.mark.parametrize("edit_renamed", [False, True], ids=["pure-rename", "edited-rename"])
+def test_branch_range_checks_committed_changes(
+    repository: Path, prohibited_name: str, edit_renamed: bool
+) -> None:
     base = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(repository, "mv", "existing.txt", "renamed.txt")
+    if edit_renamed:
+        (repository / "renamed.txt").write_text(
+            f"{prohibited_name}\nkeep\n{prohibited_name}\n", encoding="utf-8"
+        )
     (repository / "notes.md").write_text(f"# Note\n{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
     git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
     (repository / "notes.md").write_bytes(b"\x00")
     assert check(repository) == []
-    assert check(repository, base, "HEAD") == ["notes.md:2: prohibited reference in added text"]
+    expected = ["notes.md:2: prohibited reference in added text"]
+    if edit_renamed:
+        expected.append("renamed.txt:3: prohibited reference in added text")
+    assert check(repository, base, "HEAD") == expected
 
 
 @pytest.mark.parametrize(
@@ -171,9 +182,12 @@ def test_paths_renames_and_line_numbers(
             f"{name}:1: prohibited reference in new path",
             f"{literal_name}:2: prohibited reference in added text",
             "bracket1.txt:1: prohibited reference in added text",
-            "renamed.txt:1: prohibited reference in added text",
         ]
     )
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "changes")
+    destination = f"{prohibited_name}-renamed.txt"
+    git(repository, "mv", "renamed.txt", destination)
+    assert check(repository) == [f"{destination}:1: prohibited reference in new path"]
 
 
 def test_deletion_and_binary_content(repository: Path, prohibited_name: str) -> None:
@@ -182,7 +196,9 @@ def test_deletion_and_binary_content(repository: Path, prohibited_name: str) -> 
     (repository / ".gitattributes").write_text(
         "notes.txt -diff\nimage.bin diff\n", encoding="utf-8"
     )
-    (repository / "notes.txt").write_text(f"safe\n{prohibited_name}\n", encoding="utf-8")
+    (repository / "notes.txt").write_text(
+        f"Unrelated sample content\n{prohibited_name}\n", encoding="utf-8"
+    )
     git(repository, "add", ".")
     commit = git(repository, "rev-parse", "HEAD").decode().strip()
     git(
@@ -218,6 +234,9 @@ def test_only_policy_definition_is_exempt(repository: Path, prohibited_name: str
         "tests/dev/lint/test_lint_reference_policy.py:1: prohibited reference in added text",
         "tests/other.py:1: prohibited reference in added text",
     ]
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "changes")
+    git(repository, "mv", "dev/lint/lint_reference_policy.py", "docs/moved.py")
+    assert check(repository) == ["docs/moved.py:1: prohibited reference in added text"]
 
 
 def test_missing_base_fails_closed(repository: Path) -> None:

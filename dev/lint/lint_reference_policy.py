@@ -79,21 +79,37 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
         target = head or "HEAD"
         ancestor = git(root, "merge-base", base, target).decode().strip()
         revisions = [ancestor, target]
-    options = ["--no-ext-diff", "--no-textconv", "--no-renames", *revisions]
-    entries = git(
-        root, "diff", *options, "--raw", "--no-abbrev", "-z", "--diff-filter=ACMT", "--"
-    ).split(b"\0")
+    options = ["--no-ext-diff", "--no-textconv", "--find-renames", *revisions]
+    entries = iter(
+        git(
+            root, "diff", *options, "--raw", "--no-abbrev", "-z", "--diff-filter=AMRT", "--"
+        ).split(b"\0")
+    )
     findings = []
-    for index in range(0, len(entries) - 1, 2):
-        metadata, raw_path = entries[index : index + 2]
+    for metadata in entries:
+        if not metadata:
+            break
         _, mode, _, object_id, status = metadata.split()
-        path = os.fsdecode(raw_path)
+        old_path = os.fsdecode(next(entries))
+        renamed = status.startswith(b"R")
+        path = os.fsdecode(next(entries)) if renamed else old_path
         if path in POLICY_FILES:
             continue
-        if status == b"A" and violates(path):
+        if (status == b"A" or renamed) and violates(path):
             findings.append(f"{path}:1: prohibited reference in new path")
-        if mode == b"160000" or b"\0" in git(root, "cat-file", "blob", object_id.decode())[:8000]:
+        if mode == b"160000":
             continue
+        contents = git(root, "cat-file", "blob", object_id.decode())
+        if b"\0" in contents[:8000]:
+            continue
+        if old_path in POLICY_FILES:
+            for line_number, line in enumerate(
+                contents.decode("utf-8", errors="replace").split("\n"), 1
+            ):
+                if violates(line):
+                    findings.append(f"{path}:{line_number}: prohibited reference in added text")
+            continue
+        paths = [old_path, path] if renamed else [path]
         patch = git(
             root,
             "--literal-pathspecs",
@@ -102,7 +118,7 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
             "--text",
             "--unified=0",
             "--",
-            path,
+            *paths,
         ).decode("utf-8", errors="replace")
         line_number = None
         for line in patch.split("\n"):
