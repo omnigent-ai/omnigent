@@ -6252,6 +6252,11 @@
             "title": "Sandbox Providers",
             "type": "array"
           },
+          "scheduled_task_approval_skipping_modes": {
+            "default": true,
+            "title": "Scheduled Task Approval Skipping Modes",
+            "type": "boolean"
+          },
           "scheduled_task_harness_settings": {
             "default": true,
             "title": "Scheduled Task Harness Settings",
