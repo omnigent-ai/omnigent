@@ -69,3 +69,24 @@ GENIE_CATALOG_MODELS: tuple[GenieCatalogModel, ...] = tuple(
         GENIE_BUNDLED_CATALOG.model_ids, _MODEL_METADATA, strict=True
     )
 )
+
+
+def genie_model_options() -> list[dict[str, object]]:
+    """Launch-picker rows for the pinned catalog, with each model's efforts.
+
+    No row is the default: Genie's default model depends on the provider it
+    runs against, so the picker shows "Default" and omits the override.
+
+    :returns: Native model-option rows, e.g. ``{"id": "gpt-5.5", "model":
+        "gpt-5.5", "defaultReasoningEffort": "medium",
+        "supportedReasoningEfforts": [{"reasoningEffort": "low"}, ...]}``.
+    """
+    return [
+        {
+            "id": model.slug,
+            "model": model.slug,
+            "defaultReasoningEffort": model.default_effort,
+            "supportedReasoningEfforts": [{"reasoningEffort": effort} for effort in model.efforts],
+        }
+        for model in GENIE_CATALOG_MODELS
+    ]

@@ -7006,6 +7006,80 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it.each(["claude-sdk", "auto"])(
+    "offers Genie's host catalog under Default and drops a stored %s SDK pick",
+    async (storedHarness) => {
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      // An Agent SDK pick an older picker stored for the Genie row must not ride its launch.
+      localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ g1: storedHarness }));
+      const efforts = (levels: string[]) => levels.map((reasoningEffort) => ({ reasoningEffort }));
+      const genieResult = {
+        ...SUCCESS_QUERY_STATE,
+        data: [
+          {
+            id: "gpt-5.6-sol",
+            model: "gpt-5.6-sol",
+            supportedReasoningEfforts: efforts(["low", "medium", "high", "xhigh", "max", "ultra"]),
+          },
+          {
+            id: "gpt-5.5",
+            model: "gpt-5.5",
+            supportedReasoningEfforts: efforts(["low", "medium", "high", "xhigh"]),
+          },
+        ],
+      };
+      mockModelQueries((harness) =>
+        harness === "genie"
+          ? genieResult
+          : harness === "codex-native"
+            ? CODEX_MODEL_OPTIONS_RESULT
+            : CLAUDE_MODEL_OPTIONS_RESULT,
+      );
+      mockAgents([
+        ...DEFAULT_LANDING_AGENTS,
+        testAgent("g1", "genie", { display_name: "Genie", harness: "genie" }),
+      ]);
+      renderLanding();
+      openAgentModels("g1");
+
+      // A harness row: its model, not its SDK label, and no Agent SDK switcher.
+      expect(screen.getByTestId("new-chat-landing-agent-summary-g1").textContent).toBe("Default");
+      expect(screen.queryByTestId("new-chat-landing-config-harness")).toBeNull();
+      expect(selectedPickerModel().textContent).toContain("Default");
+      // Default runs a provider-chosen model, so only rungs every model lists show.
+      expect(screen.getByRole("menuitemcheckbox", { name: "xHigh" })).toBeTruthy();
+      expect(screen.queryByRole("menuitemcheckbox", { name: "Max" })).toBeNull();
+      pickPrimaryOption("model", "gpt-5.6-sol");
+      pickPrimaryOption("effort", "Max");
+      expect(screen.getByTestId("new-chat-landing-agent-summary-g1").textContent).toBe(
+        "gpt-5.6-sol Max",
+      );
+      closePrimaryPicker();
+
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "run the build" },
+      });
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+      const [, init] = authenticatedFetchMock.mock.calls[0];
+      const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+      expect(body.model_override).toBe("gpt-5.6-sol");
+      expect(body.reasoning_effort).toBe("max");
+      expect(body.harness_override).toBeUndefined();
+      expect(body.cost_control_mode_override).not.toBe("on");
+      expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}").g1).toBeUndefined();
+      expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+        "host_1",
+        "genie",
+        true,
+        expect.any(Object),
+      );
+    },
+  );
+
   it("keeps legacy Mod+Enter as a default-mode send alias", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
