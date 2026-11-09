@@ -81,7 +81,7 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
-from omnigent.claude_launcher import resolve_claude_launch
+from omnigent.claude_launcher import CLAUDE_LAUNCHER_ENV_VAR, resolve_claude_launch
 from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.databricks_ai_gateway import (
@@ -1210,12 +1210,11 @@ def _claude_alias_row(alias: str, resolution: dict[str, str]) -> dict[str, objec
 
 @dataclass(frozen=True)
 class ClaudeModelProbe:
-    """One harness enumeration: picker rows plus the bare-launch default.
+    """One harness catalog: picker rows plus any known launch default.
 
-    :param alias_rows: Enabled CLI picker options, deduplicated by model.
-    :param default_model: The model the enumeration run itself launched on
-        (its init event's ``model``) — what a no-pick launch of this config
-        actually runs — or ``None`` when unreadable.
+    :param alias_rows: Enabled picker options, deduplicated by model.
+    :param default_model: The probe's init-event model or an explicit managed
+        settings default, or ``None`` when unknown.
     :param default_label: The harness's own label for *default_model*, or
         ``None``.
     :param disabled_models: Disabled picker values and their resolved model ids.
@@ -1346,18 +1345,50 @@ def _parse_claude_legacy_models(stdout: str) -> list[dict[str, Any]]:
     return []
 
 
+def _claude_model_catalog_uses_managed_settings(command: str) -> bool:
+    """Isaac discovery stays local even when its launcher plugin is unavailable."""
+    return (
+        Path(command).stem == "isaac"
+        or os.environ.get(CLAUDE_LAUNCHER_ENV_VAR, "").strip() == "isaac"
+    )
+
+
 async def probe_claude_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> ClaudeModelProbe | None:
-    """Read the CLI picker, falling back to /model for older Claude releases.
+    """Read Isaac's managed picker or probe the regular Claude CLI picker.
 
-    Structured options are authoritative, including empty or disabled-only
-    lists. Older CLIs expose only help aliases; resolve those through the CLI
-    using the same launch environment, without adding managed or static rows.
+    Isaac installs its SAFE-derived replacement picker in managed settings.
+    Starting Isaac just to enumerate it also runs session startup machinery.
+    Regular Claude uses structured discovery, then /model for older releases.
 
     :param claude_config: The resolved native launch config, or ``None``.
-    :returns: The probe result, or ``None`` when both discovery methods fail.
+    :returns: The catalog source's result, or ``None`` when unavailable.
     """
+    command, _ = _claude_model_probe_launch(claude_config, stream_input=True)
+    if _claude_model_catalog_uses_managed_settings(command):
+        from omnigent.onboarding.ambient import claude_managed_model_picker
+
+        picker = claude_managed_model_picker(_managed_settings_paths())
+        if picker is None:
+            _logger.info("Isaac managed model picker unavailable; skipping headless discovery")
+            return None
+        disabled_models = frozenset(picker.disabled_models)
+        labels: dict[str, str] = {}
+        for model, label in picker.options:
+            if model not in disabled_models:
+                labels.setdefault(model, label)
+        return ClaudeModelProbe(
+            alias_rows=[
+                {"id": model, "model": model, "displayName": label}
+                for model, label in labels.items()
+            ],
+            default_model=picker.default_model,
+            default_label=labels.get(picker.default_model or ""),
+            disabled_models=disabled_models,
+            empty_picker=not labels,
+        )
+
     text = await _run_claude_model_probe(claude_config, stream_input=True)
     models = _parse_claude_picker_models(text) if text is not None else None
     empty_picker = models is not None and not any(
@@ -1437,7 +1468,8 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_transport = claude_ambient_transport() if uses_cli_settings else None
     return fingerprint_of(
         "claude-native",
-        "control-picker-v3",
+        "managed-isaac-picker-v1",
+        _claude_model_catalog_uses_managed_settings(command),
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -1448,7 +1480,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         binary_identity(command),
         binary_identity("claude"),
         ambient_transport,
-        claude_managed_model_picker() if uses_cli_settings else None,
+        claude_managed_model_picker(_managed_settings_paths()),
     )
 
 

@@ -1094,23 +1094,138 @@ def test_claude_code_managed_mcp_presence_follows_permission_errors(tmp_path, mo
         managed_dir.chmod(0o700)
 
 
-def test_claude_managed_model_picker_reads_replacement_options(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("options", "expected_options", "disabled_models"),
+    [
+        (
+            [
+                {"model": " gateway-opus ", "label": " Opus "},
+                {"model": "gateway-sonnet", "label": "Sonnet"},
+            ],
+            (("gateway-opus", "Opus"), ("gateway-sonnet", "Sonnet")),
+            (),
+        ),
+        ([], (), ()),
+        (
+            [
+                {"model": "disabled", "disabled": True},
+                {"model": "enabled", "disabled": False},
+                {"model": "literal", "disabled": "true"},
+            ],
+            (("enabled", "enabled"), ("literal", "literal")),
+            ("disabled",),
+        ),
+        ([{"model": " disabled ", "disabled": True}], (), ("disabled",)),
+        ([None, {}, {"model": 1}, {"model": " "}, {"model": "bad", "label": None}], (), ()),
+    ],
+    ids=["options", "empty", "availability", "disabled-only", "invalid-rows"],
+)
+def test_claude_managed_model_picker_reads_replacement_options(
+    tmp_path: Path,
+    options: list[object],
+    expected_options: tuple[tuple[str, str], ...],
+    disabled_models: tuple[str, ...],
+) -> None:
     path = tmp_path / "managed-settings.json"
     path.write_text(
         json.dumps(
             {
                 "modelPicker": {
-                    "options": [
-                        {"model": "gateway-opus", "label": "Opus"},
-                        {"model": "gateway-sonnet", "label": "Sonnet"},
-                    ],
+                    "options": options,
                     "replaceBuiltInOptions": True,
                 }
             }
         )
     )
 
-    assert ambient.claude_managed_model_picker((path,)) == (
-        ("gateway-opus", "Opus"),
-        ("gateway-sonnet", "Sonnet"),
+    assert ambient.claude_managed_model_picker((path,)) == ambient.ClaudeManagedModelPicker(
+        options=expected_options, disabled_models=disabled_models
     )
+
+
+@pytest.mark.parametrize(
+    ("settings", "expected"),
+    [
+        ({"env": {"ANTHROPIC_MODEL": " pinned "}, "model": "saved"}, "pinned"),
+        ({"model": " saved "}, "saved"),
+        ({"env": {"ANTHROPIC_MODEL": " "}, "model": "saved"}, "saved"),
+        ({"env": None, "model": "saved"}, "saved"),
+        ({"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "gateway-opus"}}, None),
+        ({"env": {"ANTHROPIC_MODEL": 1}, "model": False}, None),
+    ],
+)
+def test_claude_managed_model_picker_uses_only_explicit_default(
+    tmp_path: Path, settings: dict[str, object], expected: str | None
+) -> None:
+    path = tmp_path / "managed-settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                **settings,
+                "modelPicker": {
+                    "replaceBuiltInOptions": True,
+                    "options": [{"model": "gateway-opus"}],
+                },
+            }
+        )
+    )
+
+    assert ambient.claude_managed_model_picker((path,)) == ambient.ClaudeManagedModelPicker(
+        options=(("gateway-opus", "gateway-opus"),), default_model=expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("high_contents", "expected"),
+    [
+        (None, ambient.ClaudeManagedModelPicker((("low-model", "Low"),))),
+        ("{", ambient.ClaudeManagedModelPicker((("low-model", "Low"),))),
+        ("[]", ambient.ClaudeManagedModelPicker((("low-model", "Low"),))),
+        ("directory", ambient.ClaudeManagedModelPicker((("low-model", "Low"),))),
+        ("{}", None),
+        ('{"modelPicker": {"replaceBuiltInOptions": false, "options": []}}', None),
+        ('{"modelPicker": {"replaceBuiltInOptions": 1, "options": []}}', None),
+        ('{"modelPicker": {"replaceBuiltInOptions": true, "options": {}}}', None),
+        (
+            '{"modelPicker": {"replaceBuiltInOptions": true, "options": []}}',
+            ambient.ClaudeManagedModelPicker(()),
+        ),
+    ],
+    ids=[
+        "missing",
+        "invalid-json",
+        "non-object",
+        "unreadable",
+        "no-picker",
+        "additive",
+        "non-boolean",
+        "invalid-options",
+        "empty",
+    ],
+)
+def test_claude_managed_model_picker_first_readable_object_decides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    high_contents: str | None,
+    expected: ambient.ClaudeManagedModelPicker | None,
+) -> None:
+    high = tmp_path / "high.json"
+    if high_contents == "directory":
+        high.mkdir()
+    elif high_contents is not None:
+        high.write_text(high_contents)
+    low = tmp_path / "low.json"
+    low.write_text(
+        json.dumps(
+            {
+                "modelPicker": {
+                    "replaceBuiltInOptions": True,
+                    "options": [{"model": "low-model", "label": "Low"}],
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (high, low))
+
+    assert ambient.claude_managed_model_picker() == expected
+    assert ambient.claude_managed_model_picker((tmp_path / "absent.json",)) is None
