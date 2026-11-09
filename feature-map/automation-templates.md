@@ -20,7 +20,8 @@ to customize.
   draft until the dialog closes, including the schedule and any custom prompt edits.
 - `scope`: **equals** matches one project, channel, repository, team, or service.
   Choose **in** for a comma-separated list. Equals rejects lists without losing
-  the entered values. Slack can watch a channel, direct messages from listed
+  the entered values. PagerDuty also offers **contains**, matching every service
+  whose name contains one piece of text; it rejects lists the same way. Slack can watch a channel, direct messages from listed
   senders, or the one group DM with exactly the listed people (two or more; no
   operator). A pink `#` or `@` precedes the input, and pasted prefixes are stripped.
   Switching between channel and people events clears the scope; DMs hide Author.
