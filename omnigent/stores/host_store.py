@@ -1402,6 +1402,8 @@ class HostStore:
             values={
                 "token_hash": hash_host_launch_token(token),
                 "token_expires_at": token_expires_at,
+                "status": encode_host_status("offline"),
+                "updated_at": now_epoch(),
             },
         )
 
@@ -1415,7 +1417,8 @@ class HostStore:
         """Claim the exact active generation for a resume that keeps its token.
 
         The same compare-and-update as :meth:`rearm_managed_host`, minus the
-        token rotation, for providers whose resume brings the running host back
+        token rotation or liveness changes, for providers whose resume restores
+        the running host
         (``SandboxCapabilities.resume_preserves_host``). The thawed host still
         presents the launch token it was started with, so the stored hash and
         expiry must stay as they are or it can never re-authenticate.
@@ -1431,7 +1434,9 @@ class HostStore:
             host_id,
             sandbox_id=sandbox_id,
             expected_updated_at=expected_updated_at,
-            values={},
+            # A redundant resume need not reconnect an already-running host.
+            # Preserve its heartbeats without manufacturing a fresh observation.
+            values={"updated_at": SqlHost.updated_at},
         )
 
     def _claim_managed_generation(
@@ -1450,11 +1455,9 @@ class HostStore:
         :param host_id: Host identifier.
         :param sandbox_id: The active sandbox id the caller read.
         :param expected_updated_at: The row's ``updated_at`` the caller read.
-        :param values: Extra columns to set alongside the offline status and
-            the fresh ``updated_at`` (the rotated token for a re-arm).
+        :param values: Columns to update; only a re-arm resets liveness.
         :returns: The updated host, or ``None`` when the snapshot is stale.
         """
-        now = now_epoch()
         with self._lifecycle_session(operation) as session:
             snapshot = session.get(SqlHost, (current_workspace_id(), host_id))
             if snapshot is None:
@@ -1478,11 +1481,7 @@ class HostStore:
                             SqlHost.terminating_sandbox_id != sandbox_id,
                         ),
                     )
-                    .values(
-                        **values,
-                        status=encode_host_status("offline"),
-                        updated_at=now,
-                    )
+                    .values(**values)
                 ),
             )
             if result.rowcount != 1:

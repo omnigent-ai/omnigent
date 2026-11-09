@@ -145,19 +145,6 @@ _MIN_LIFETIME_S: int = 60
 # leaked from a dead VM still expires. Mirrors the e2b/cwsandbox pattern.
 _TOKEN_TTL_SLACK_S: int = 3600
 
-# Idle policy defaults for run-microvm: an idle VM auto-suspends after 15 min,
-# then may stay suspended for the rest of its lifetime. Tuned so a session
-# that sits between turns sleeps to a snapshot instead of holding warm compute,
-# and wakes on the next message via the managed wake path.
-#
-# suspendedDurationSeconds is the time a VM may stay SUSPENDED *before Lambda
-# terminates it*, so build_idle_policy() derives it from the RESOLVED lifetime
-# (not a fixed 8 h constant): a shorter value silently kills any session idle
-# longer than it (the next wake fails with ResourceNotFoundException), and a
-# value contradicting a lowered maximumDurationInSeconds misleads operators
-# about when a suspended VM dies. A suspended VM bills snapshot storage only.
-_DEFAULT_MAX_IDLE_S: int = 900
-
 # boto3 service name for the Lambda MicroVMs control plane.
 _SERVICE_NAME: str = "lambda-microvms"
 
@@ -278,8 +265,8 @@ def resolve_max_idle_s(lifetime_s: int) -> int:
     """
     Resolve the idle policy's ``maxIdleDurationSeconds`` for *lifetime_s*.
 
-    :data:`MAX_IDLE_ENV_VAR` overrides the default of
-    :data:`_DEFAULT_MAX_IDLE_S` capped at the lifetime.
+    :data:`MAX_IDLE_ENV_VAR` opts into a shorter window. By default the window
+    equals the lifetime because outbound agent work does not reset the timer.
 
     :param lifetime_s: The resolved MicroVM lifetime in seconds.
     :returns: The idle window, between 60 s and *lifetime_s*.
@@ -288,7 +275,7 @@ def resolve_max_idle_s(lifetime_s: int) -> int:
     """
     raw = os.environ.get(MAX_IDLE_ENV_VAR)
     if raw is None:
-        return min(_DEFAULT_MAX_IDLE_S, lifetime_s)
+        return lifetime_s
     try:
         seconds = int(raw)
     except ValueError as exc:
@@ -308,29 +295,15 @@ def build_idle_policy(max_lifetime_s: int | None = None) -> dict[str, object]:
     Build the ``idlePolicy`` for ``run-microvm``, consistent with the resolved
     lifetime.
 
-    Auto-suspend on idle is what lets a between-turns session sleep to a
-    snapshot and wake cheaply. The snapshot thaw restores the running
-    ``omnigent host`` process with its still-valid launch token (this provider
-    declares ``resume_preserves_host``), so the managed wake path
-    (:func:`omnigent.server.managed_hosts.resume_managed_host`) resumes the VM
-    WITHOUT restarting the host — the host reconnects on its own.
+    Lambda counts only inbound endpoint traffic as activity; this host uses an
+    outbound tunnel. Default the idle window to the VM lifetime so active work
+    is not frozen early. A shorter window is an explicit operator opt-in via
+    :data:`MAX_IDLE_ENV_VAR` and can suspend even a busy agent.
 
-    Both durations are derived from the lifetime rather than fixed constants,
-    so an operator override (:data:`MAX_LIFETIME_ENV_VAR`) cannot produce a
-    self-contradicting policy: ``suspendedDurationSeconds`` matches the
-    lifetime exactly (a suspended VM may sleep until its lifetime cap, never a
-    fixed 8 h that outlives a shorter cap), and ``maxIdleDurationSeconds`` is
-    capped below the lifetime so a short-lived VM doesn't carry an idle timer
-    longer than its own life (:data:`MAX_IDLE_ENV_VAR` overrides it).
-
-    Lambda measures idleness only by traffic arriving at the MicroVM's inbound
-    endpoint. This host receives none (it holds an *outbound* tunnel to the
-    server), so ``autoResumeEnabled`` never fires on its own and every wake
-    comes from the server's explicit ``resume-microvm``. It stays enabled as a
-    harmless backstop. The same blindness means the idle timer runs from launch
-    or the last resume whatever the session is doing, so a session still
-    working ``maxIdleDurationSeconds`` after its wake is snapshot-frozen
-    mid-work until the next message wakes it.
+    Snapshot thaw restores the host process and launch token. The server wakes
+    it explicitly without restarting the host; inbound auto-resume remains a
+    backstop. The suspended duration matches the lifetime so suspension does
+    not introduce an earlier termination deadline.
 
     :param max_lifetime_s: The resolved MicroVM lifetime; ``None`` resolves
         :func:`resolve_max_lifetime_s` (callers that already resolved it pass

@@ -189,6 +189,7 @@ import asyncio
 import itertools
 import logging
 import math
+import os
 import posixpath
 import re
 import secrets
@@ -216,7 +217,7 @@ from omnigent.onboarding.sandboxes.base import (
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
 from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
-from omnigent.stores.host_store import Host, HostStore
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
@@ -268,11 +269,25 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
     }
 )
 
+
 # How long a managed launch waits for the sandboxed host to register
 # before declaring failure. The image is pre-baked (no pip install at
 # boot), so a healthy launch registers in seconds; the budget covers a
 # cold registry pull of the image on first use.
-MANAGED_HOST_ONLINE_TIMEOUT_S = 120
+def _managed_host_online_timeout_s() -> int:
+    """Allow cold image pulls a bounded, deployment-wide startup budget."""
+    name = "OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S"
+    raw = os.environ.get(name, "120")
+    try:
+        seconds = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer between 1 and 1800 seconds") from exc
+    if not 1 <= seconds <= 1800:
+        raise ValueError(f"{name} must be an integer between 1 and 1800 seconds")
+    return seconds
+
+
+MANAGED_HOST_ONLINE_TIMEOUT_S = _managed_host_online_timeout_s()
 _MANAGED_RECOVERY_HEARTBEAT_S = 20
 _ONLINE_POLL_INTERVAL_S = 1.0
 
@@ -4584,19 +4599,28 @@ async def _register_and_start_host(
     return workspace
 
 
-async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
+async def _wait_for_host_online(
+    host_store: HostStore, host_id: str, *, observed_after: int | None = None
+) -> None:
     """
     Poll the hosts table until the sandbox host registers, or time out.
 
     :param host_store: Persistent host registrations.
     :param host_id: The launched host's identifier.
+    :param observed_after: Require a newer heartbeat when resuming a host whose
+        online status may predate suspension.
     :raises HTTPException: 502 when the host does not come online
         within :data:`MANAGED_HOST_ONLINE_TIMEOUT_S`.
     """
     deadline = time.monotonic() + MANAGED_HOST_ONLINE_TIMEOUT_S
     while time.monotonic() < deadline:
-        if await asyncio.to_thread(host_store.is_online, host_id):
-            return
+        if observed_after is None:
+            if await asyncio.to_thread(host_store.is_online, host_id):
+                return
+        else:
+            host = await asyncio.to_thread(host_store.get_host, host_id)
+            if host is not None and host_is_live(host) and host.updated_at > observed_after:
+                return
         await asyncio.sleep(_ONLINE_POLL_INTERVAL_S)
     raise HTTPException(
         status_code=502,
@@ -4877,7 +4901,11 @@ async def _resume_preserving_host(
         await _settle_stale_wake(launcher, host, host_store, sandbox_id=sandbox_id)
         return
     await asyncio.to_thread(launcher.resume, sandbox_id)
-    await _wait_for_host_online(host_store, host.host_id)
+    await _wait_for_host_online(
+        host_store,
+        host.host_id,
+        observed_after=claimed.updated_at if claimed.status == "online" else None,
+    )
 
 
 async def _settle_stale_wake(

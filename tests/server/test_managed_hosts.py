@@ -4627,7 +4627,9 @@ async def test_resume_preserves_host_keeps_token_and_skips_restart(db_uri: str) 
     def _resume_then_reconnect(sandbox_id: str) -> None:
         fake.resumed.append(sandbox_id)
         assert host_store.resolve_launch_token(first.host_id, first_token) is not None
-        host_store.upsert_on_connect(host_id=first.host_id, name="managed-x", user_id=_OWNER)
+        host_store.upsert_on_connect(
+            host_id=first.host_id, name="managed-x", user_id=_OWNER, managed_token=first_token
+        )
 
     fake.resume = _resume_then_reconnect  # type: ignore[method-assign]
 
@@ -4639,6 +4641,129 @@ async def test_resume_preserves_host_keeps_token_and_skips_restart(db_uri: str) 
     assert woke is not None
     assert woke.status == "online"
     assert host_store.resolve_launch_token(first.host_id, first_token) is not None
+
+
+@pytest.mark.parametrize("stale", [False, True])
+@pytest.mark.parametrize("heartbeat", [False, True])
+async def test_lambda_forced_wake_preserves_existing_tunnel_liveness(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, stale: bool, heartbeat: bool
+) -> None:
+    """Exercise the real launcher and SQL claim with only AWS's response stubbed."""
+    import boto3
+    from botocore.stub import Stubber
+
+    import omnigent.server.managed_hosts as managed
+    import omnigent.stores.host_store as hosts
+    from omnigent.onboarding.sandboxes.lambda_microvm import LambdaMicroVMSandboxLauncher
+
+    store = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    token = "existing-host-token"
+    observed_at = now_epoch() - (hosts.HOST_LIVENESS_TTL_S + 1 if stale else 1)
+    with monkeypatch.context() as clock:
+        clock.setattr(hosts, "now_epoch", lambda: observed_at)
+        store.register_managed_host(
+            host_id=host_id,
+            name="running-host",
+            user_id=_OWNER,
+            token=token,
+            provider="lambda_microvm",
+            sandbox_id="microvm-running",
+            token_expires_at=now_epoch() + 3600,
+        )
+        store.upsert_on_connect(
+            host_id=host_id,
+            name="running-host",
+            user_id=_OWNER,
+            managed_token=token,
+        )
+    launcher = LambdaMicroVMSandboxLauncher(
+        image_identifier="arn:aws:lambda:us-east-1:123456789012:microvm-image:test",
+        execution_role_arn="arn:aws:iam::123456789012:role/test",
+    )
+    client = boto3.client(
+        "lambda-microvms",
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+    launcher._client = client
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://srv.example.com",
+            launcher_factory=lambda: launcher,
+            token_ttl_s=3600,
+        )
+    )
+    monkeypatch.setattr(managed, "MANAGED_HOST_ONLINE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(managed, "_ONLINE_POLL_INTERVAL_S", 0.005)
+
+    def after_resume(**kwargs: Any) -> None:
+        # The claim has completed. A host on another replica keeps heartbeating
+        # over its existing authenticated tunnel; no reconnect is forced.
+        claimed = store.get_host(host_id)
+        assert claimed is not None and claimed.updated_at == observed_at
+        assert claimed.status == "online"
+        if heartbeat:
+            store.heartbeat(host_id, managed_token=token, token_ttl_s=3600)
+
+    client.meta.events.register("after-call.*.ResumeMicrovm", after_resume)
+    with Stubber(client) as stub:
+        stub.add_client_error(
+            "resume_microvm",
+            service_error_code="ConflictException",
+            service_message="MicroVM is already running",
+            http_status_code=409,
+            expected_params={"microvmIdentifier": "microvm-running"},
+        )
+        if heartbeat:
+            await resume_managed_host(host_id, store, config, force=True)
+        else:
+            with pytest.raises(HTTPException, match="did not come online") as caught:
+                await resume_managed_host(host_id, store, config, force=True)
+            assert caught.value.status_code == 502
+        stub.assert_no_pending_responses()
+    current = store.get_host(host_id)
+    assert current is not None and current.status == "online"
+    assert current.sandbox_id == "microvm-running"
+    assert current.updated_at > observed_at if heartbeat else current.updated_at == observed_at
+    assert store.resolve_launch_token(host_id, token) is not None
+
+
+@pytest.mark.parametrize("value", [None, "1", "600", "1800", "0", "1801", "nan", "1.5"])
+async def test_managed_online_timeout_environment(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    import omnigent.server.managed_hosts as managed
+
+    name = "OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S"
+    monkeypatch.delenv(name, raising=False)
+    if value is not None:
+        monkeypatch.setenv(name, value)
+    if value in {"0", "1801", "nan", "1.5"}:
+        with pytest.raises(ValueError, match=name):
+            managed._managed_host_online_timeout_s()
+    else:
+        assert managed._managed_host_online_timeout_s() == (120 if value is None else int(value))
+
+
+async def test_managed_online_timeout_is_applied_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S", "600")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from omnigent.server.managed_hosts import "
+            "MANAGED_HOST_ONLINE_TIMEOUT_S, MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S; "
+            "print(MANAGED_HOST_ONLINE_TIMEOUT_S, MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S)",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "600 720"
 
 
 async def test_resume_preserving_host_claims_before_asking_the_provider(

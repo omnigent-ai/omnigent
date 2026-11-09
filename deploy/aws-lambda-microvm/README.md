@@ -20,13 +20,12 @@ no `omnigent sandbox` CLI flow for this provider.
 
 - **AWS-native isolation.** Sessions stay in your account, VPC, IAM, and
   CloudWatch, with per-tenant Firecracker isolation.
-- **Sleep and wake.** A microVM idles to a snapshot and resumes in place with
+- **Sleep and wake.** A suspended microVM resumes in place with
   the workspace intact. It is the first provider whose resume *preserves the
   running host* (the `resume_preserves_host` capability): the thaw brings the
   host back holding its launch token, the server keeps that token, and the host
-  reconnects without a fresh start, letting
-  a session that sits between turns stop billing compute and wake on the next
-  message.
+  reconnects without a fresh start. Early suspension is opt-in because the
+  provider cannot observe activity on Omnigent’s outbound tunnel.
 
 ## Prerequisites
 
@@ -142,26 +141,42 @@ model key enters the sandbox.
   A clean exit or SIGTERM stands it down; the hooks server then restarts it on
   the next `/resume`, unless it exited with the fatal status (a rejected
   credential or a version mismatch).
-- **Idle suspend/resume.** The launcher sets an idle policy
-  (`maxIdleDurationSeconds` 900, `suspendedDurationSeconds` matched to the
-  requested lifetime, `autoResumeEnabled` true), so an idle microVM suspends to a snapshot
-  and the managed wake path resumes it when the next message arrives. Idle is
-  measured **only** by inbound traffic to the microVM's proxy endpoint, and this
-  host receives none (it holds an **outbound** tunnel), so:
-  - `autoResumeEnabled` never fires on its own — every wake comes from the
-    server's explicit `resume-microvm`. It stays on as a harmless backstop.
-  - The idle timer runs from launch or the last resume, whatever the session
-    is doing, so a session still working 900 s after its wake is
-    snapshot-frozen mid-work until the next message wakes it. Raise the window
-    with `OMNIGENT_LAMBDA_MICROVM_MAX_IDLE_S` (60 s up to the lifetime) for
-    long-running agents; a longer window bills warm compute for longer.
-  - `suspendedDurationSeconds` is when Lambda **terminates** a suspended VM, so
-    the launcher derives it from the requested lifetime (including an
-    `OMNIGENT_LAMBDA_MICROVM_MAX_LIFETIME_S` override). A shorter value silently
-    kills sessions idle past it and the next wake fails with
-    `ResourceNotFoundException`.
+- **Idle suspend/resume.** The idle window defaults to the requested VM lifetime.
+  Lambda counts only inbound endpoint traffic, while this host uses an outbound
+  tunnel. A shorter timer can freeze an active agent, so there is no automatic
+  between-turn suspension by default. To opt in, set
+  `OMNIGENT_LAMBDA_MICROVM_MAX_IDLE_S` on the server (60 s up to the lifetime).
+  This timer runs from launch or the last resume regardless of agent activity.
+  The server explicitly resumes a suspended VM when the next message arrives;
+  the running host and its token survive the snapshot. `autoResumeEnabled`
+  remains enabled as a backstop for inbound traffic. `suspendedDurationSeconds`
+  matches the requested lifetime to avoid an earlier suspension expiry.
+- **Cold startup.** Set `OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S` on the server
+  when the first image pull needs more than the default 120 seconds. Valid
+  values are integer seconds from 1 to 1800; the shared launch rendezvous budget
+  grows with it. This setting applies to all managed providers.
 - **Snapshot uniqueness.** A resumed microVM restores memory state, so reseed
   CSPRNGs and rotate any in-memory secrets on resume (the host does this on
   restart). See the AWS "snapshots and uniqueness" docs.
 - **No self-suspend.** A microVM cannot suspend itself; suspension is driven by
   the idle policy or an external `suspend-microvm` call.
+
+## Live lifecycle validation
+
+Use a quiet test account and a server plus host image built from the candidate
+revision. Run the manual driver with an existing configured agent:
+
+```sh
+python tests/e2e/integrations/deploy/lambda_microvm/e2e_managed.py \
+  --server https://your-test-server --suspend --timeout 600
+```
+
+The driver creates a workspace marker directory through the host API, explicitly
+suspends the identified VM, observes `SUSPENDED`, sends another turn, and checks
+`RUNNING` on the same AWS id, the marker's survival, and absence of a replacement.
+Deleting the session must terminate that VM. The `--suspend` mode requires AWS
+`SuspendMicrovm` permission in addition to list/get access. For an idle-policy
+check instead, configure an explicit short idle window on the test server and
+pass `--idle-wait` longer than that window. Neither mode changes server settings.
+Without these options the driver checks reuse and teardown only. AWS checks
+cannot be skipped in suspend/resume mode. This driver is manual, outside CI.

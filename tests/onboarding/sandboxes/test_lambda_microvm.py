@@ -110,7 +110,7 @@ def test_build_idle_policy_suspends_for_the_full_lifetime() -> None:
     """
     policy = build_idle_policy()
     assert policy["suspendedDurationSeconds"] == resolve_max_lifetime_s()
-    assert policy["maxIdleDurationSeconds"] < policy["suspendedDurationSeconds"]
+    assert policy["maxIdleDurationSeconds"] == policy["suspendedDurationSeconds"]
 
 
 @pytest.mark.parametrize("lifetime_s", [3600, 7200])
@@ -128,14 +128,10 @@ def test_build_idle_policy_follows_lowered_lifetime(
     assert policy["maxIdleDurationSeconds"] <= lifetime_s
 
 
-def test_build_idle_policy_caps_idle_below_tiny_lifetime(
+def test_build_idle_policy_matches_short_lifetime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A lifetime below the 900 s idle default caps the idle window to it.
-
-    Otherwise a 600 s VM would carry a 900 s idle timer — longer than its own
-    life — which the API may reject and operators cannot reason about.
-    """
+    """Even a short lifetime uses its full budget before idle suspension."""
     monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, "600")
     policy = build_idle_policy()
     assert policy["maxIdleDurationSeconds"] == 600
@@ -244,7 +240,7 @@ def test_max_lifetime_env_rejects_under_sixty_seconds(
 
 
 def test_max_idle_env_overrides_the_idle_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Operators can widen the idle window, since outbound work never resets it."""
+    """Operators explicitly opt into earlier suspension."""
     monkeypatch.setenv(MAX_IDLE_ENV_VAR, "3600")
     assert build_idle_policy()["maxIdleDurationSeconds"] == 3600
 

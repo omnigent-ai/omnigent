@@ -21,10 +21,11 @@ The flow (each step asserts, exits non-zero on failure):
      identified by diffing)
   3. wait for the launched MicroVM's host to dial back and register
   4. run a real LLM turn from inside the MicroVM and read the assistant reply
-  5. post a follow-up turn and assert the SAME host_id serves it — the headline
-     feature: ``resume_preserves_host`` means a thawed snapshot reconnects the
-     running host WITHOUT a fresh start (``--idle-wait`` forces a real suspend
-     first; without it this proves host-reuse, not a forced suspend/resume)
+  5. create a workspace marker directory, post a follow-up turn, and verify
+     the same AWS id and marker survive, with no replacement VM. ``--suspend``
+     explicitly suspends the VM first; ``--idle-wait`` observes suspension
+     after an operator-configured idle window. Both require AWS checks and an
+     observed SUSPENDED -> RUNNING transition; neither changes server settings.
   6. delete the session, assert the DELETE succeeded, then poll AWS until the
      launched ``microvmId`` is actually TERMINATED/gone — provider teardown is
      deliberately best-effort on the server, so only AWS can prove the VM died.
@@ -56,6 +57,8 @@ import argparse
 import os
 import sys
 import time
+import uuid
+from urllib.parse import quote
 
 import httpx
 
@@ -282,20 +285,9 @@ def wait_for_reply(base: str, conv_id: str, timeout_s: float) -> str:
 
 
 def followup_turn_reuses_host(base: str, conv_id: str, host_id: str, timeout_s: float) -> None:
-    """Post a second turn and assert the SAME host_id serves it.
+    """Require a new reply on the same host; AWS and marker checks run separately.
 
-    ``lambda_microvm`` declares ``resume_preserves_host`` — a snapshot thaw
-    restores the running host with its still-valid launch token, so a wake
-    reconnects the SAME host_id WITHOUT minting a fresh sandbox. This step does
-    NOT force a suspend (the platform's idle timer is ``maxIdleDurationSeconds``,
-    900s, and can't be driven from here); it posts a follow-up turn and proves
-    identity continuity: the SAME host_id serves the new turn (a fresh launch
-    would change it). To force an actual suspend/resume cycle, run with a wait
-    longer than the idle timeout between turns (``--idle-wait``).
-
-    The assertion is gated on EVIDENCE the follow-up turn actually ran — the new
-    answer ('6') appears in a NEW assistant message — so it can't pass vacuously
-    on the still-idle state left by the previous turn.
+    Host identity alone cannot prove resume: replacement preserves host_id too.
     """
     log("[5/6] follow-up turn: expecting the SAME host_id to serve it")
     before = len(_assistant_messages(base, conv_id))
@@ -337,6 +329,57 @@ def followup_turn_reuses_host(base: str, conv_id: str, host_id: str, timeout_s: 
     raise SystemExit(f"follow-up turn did not complete within {timeout_s:.0f}s")
 
 
+def assert_microvm_state(client, microvm_id: str, expected: str, timeout_s: float) -> None:  # type: ignore[no-untyped-def]
+    """Require an observed AWS state before continuing the lifecycle check."""
+    deadline = time.monotonic() + timeout_s
+    state = "UNKNOWN"
+    while time.monotonic() < deadline:
+        state = client.get_microvm(microvmIdentifier=microvm_id).get("state", "UNKNOWN")
+        if state == expected:
+            log(f"      ✓ MicroVM {microvm_id}: {state}")
+            return
+        if state in {"TERMINATING", "TERMINATED"}:
+            break
+        time.sleep(2.0)
+    raise SystemExit(f"MicroVM {microvm_id}: expected {expected}, observed {state}")
+
+
+def assert_same_microvm(client, microvm_id: str, before_ids: set[str], timeout_s: float) -> None:  # type: ignore[no-untyped-def]
+    """Reject a replacement even if it reused the Omnigent host id."""
+    assert_microvm_state(client, microvm_id, "RUNNING", timeout_s)
+    appeared = _live_microvm_ids(client) - before_ids
+    if appeared != {microvm_id}:
+        raise SystemExit(
+            f"MicroVM replaced or concurrent launch: expected {microvm_id}, got {sorted(appeared)}"
+        )
+
+
+def create_workspace_marker(base: str, host_id: str) -> str:
+    """Create a unique directory outside conversation history as a disk sentinel."""
+    path = f"/root/workspace/.microvm-resume-{uuid.uuid4().hex}"
+    response = httpx.post(
+        f"{base}/v1/hosts/{host_id}/directories",
+        json={"path": path},
+        headers=_HEADERS,
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    return path
+
+
+def assert_workspace_marker(base: str, host_id: str, path: str) -> None:
+    """Read the marker through the host tunnel, independently of the agent reply."""
+    response = httpx.get(
+        f"{base}/v1/hosts/{host_id}/filesystem/{quote(path, safe='')}",
+        headers=_HEADERS,
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    if response.json().get("object") != "list":
+        raise SystemExit(f"workspace marker could not be read: {path}")
+    log(f"      ✓ workspace marker survived: {path}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", required=True, help="Omnigent server base URL")
@@ -369,11 +412,22 @@ def main() -> int:
         default=0.0,
         help=(
             "Seconds to sleep before the follow-up turn so the MicroVM's idle timer "
-            "(maxIdleDurationSeconds, 900s) fires and the turn drives a REAL "
+            "(explicitly configured shorter than the VM lifetime) fires, then verify a "
             "suspend→resume cycle. Default 0 tests host-reuse without a forced suspend."
         ),
     )
+    parser.add_argument(
+        "--suspend",
+        action="store_true",
+        help="Explicitly suspend this test VM via AWS before the follow-up turn.",
+    )
     args = parser.parse_args()
+    if args.idle_wait < 0:
+        parser.error("--idle-wait must be nonnegative")
+    if args.suspend and args.idle_wait:
+        parser.error("choose --suspend or --idle-wait")
+    if (args.suspend or args.idle_wait) and (args.skip_aws_check or args.skip_wake):
+        parser.error("suspend/resume validation requires AWS checks and the follow-up turn")
     base = args.server.rstrip("/")
 
     check_server(base)
@@ -397,10 +451,19 @@ def main() -> int:
         if "4" not in reply:
             raise SystemExit(f"assistant reply {reply!r} does not contain the expected answer '4'")
         if not args.skip_wake:
+            marker = create_workspace_marker(base, host_id)
+            assert_workspace_marker(base, host_id, marker)
+            if args.suspend:
+                aws_client.suspend_microvm(microvmIdentifier=microvm_id)
             if args.idle_wait > 0:
                 log(f"      sleeping {args.idle_wait:.0f}s so the idle timer fires a suspend")
                 time.sleep(args.idle_wait)
+            if args.suspend or args.idle_wait:
+                assert_microvm_state(aws_client, microvm_id, "SUSPENDED", args.timeout)
             followup_turn_reuses_host(base, conv_id, host_id, args.timeout)
+            if aws_client is not None and microvm_id is not None:
+                assert_same_microvm(aws_client, microvm_id, before_ids, args.timeout)
+            assert_workspace_marker(base, host_id, marker)
     finally:
         if args.keep:
             log(f"[6/6] --keep: leaving session {conv_id} (and its MicroVM) running")
@@ -418,6 +481,9 @@ def main() -> int:
             # is best-effort on the server, so prove termination against AWS.
             if aws_client is not None and microvm_id is not None:
                 assert_microvm_terminated(aws_client, microvm_id, args.timeout)
+                remaining = _live_microvm_ids(aws_client) - before_ids
+                if remaining:
+                    raise SystemExit(f"MicroVMs survived session deletion: {sorted(remaining)}")
             elif args.skip_aws_check:
                 log("      --skip-aws-check: teardown-leak verification SKIPPED")
     log("PASS")
