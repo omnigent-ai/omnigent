@@ -17,8 +17,10 @@ const supportsDesktopCommands = vi.fn(() => false);
 const contentSearchEnabled = vi.fn(() => false);
 const gridsEnabled = vi.fn(() => false);
 const splitTerminalEnabled = vi.fn(() => false);
+const siblingSessionsEnabled = vi.fn(() => false);
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
+    sibling_sessions: siblingSessionsEnabled(),
     features: {
       workspace_content_search: contentSearchEnabled(),
       grid_sessions_display_ui: gridsEnabled(),
@@ -44,6 +46,7 @@ beforeEach(() => {
   contentSearchEnabled.mockReturnValue(false);
   gridsEnabled.mockReturnValue(false);
   splitTerminalEnabled.mockReturnValue(false);
+  siblingSessionsEnabled.mockReturnValue(false);
   localStorage.clear();
 });
 afterEach(() => {
@@ -64,11 +67,12 @@ function keysFor(label: string): string[] {
 }
 
 describe("KeyboardShortcutsList composer rows", () => {
-  it("shows Enter to send and Shift+Enter for a new line by default", () => {
+  it("shows Enter to send and Shift+Enter or Alt+Enter for a new line by default", () => {
     render(<KeyboardShortcutsList />);
 
     expect(keysFor("Send message")).toEqual(["↵"]);
-    expect(keysFor("New line in message")).toEqual(["⇧", "↵"]);
+    expect(keysFor("New line in message")).toEqual(["⇧", "↵", "Alt", "↵"]);
+    expect(screen.getByText("New line in message").closest("li")).toHaveTextContent("⇧↵orAlt↵");
   });
 
   it("shows Ctrl+Enter to send and Enter for a new line in alternate mode", () => {
@@ -135,6 +139,14 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);
   });
 
+  it("shows Add nested agent only when sibling sessions are available", () => {
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Add nested agent")).toBeNull();
+    siblingSessionsEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Add nested agent")).toEqual(["Ctrl", "Alt", "A"]);
+  });
+
   it("keeps native new-session keys and updates the Settings reference", () => {
     const { rerender } = render(<KeyboardShortcutsList variant="settings" />);
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
@@ -166,9 +178,9 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
     expect(keysFor("Cycle permission mode (in session)")).toEqual(["⇧", "Tab"]);
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
-    expect(screen.getByText("Go back")).toBeTruthy();
-    expect(keysFor("Go back")).toEqual(["Ctrl", "["]);
-    expect(keysFor("Go forward")).toEqual(["Ctrl", "]"]);
+    // A browser tab keeps its own Back and Forward.
+    expect(screen.queryByText("Go back")).toBeNull();
+    expect(screen.queryByText("Go forward")).toBeNull();
     expect(keysFor("Toggle Chat / Terminal view")).toEqual(["Ctrl", "Alt", "\\"]);
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
@@ -230,7 +242,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(within(row!).getByText("1…0")).toBeTruthy();
   });
 
-  it("shows the recent-session switcher only in Electron", () => {
+  it("shows the recent-session switcher and Back/Forward only in Electron", () => {
     const { rerender } = render(<KeyboardShortcutsList />);
     expect(screen.queryByText("Switch recent sessions")).toBeNull();
 
@@ -238,6 +250,8 @@ describe("KeyboardShortcutsDialog", () => {
     isElectronShell.mockReturnValue(true);
     rerender(<KeyboardShortcutsList />);
     expect(keysFor("Switch recent sessions")).toEqual(["Ctrl", "Tab"]);
+    expect(keysFor("Go back")).toEqual(["Ctrl", "["]);
+    expect(keysFor("Go forward")).toEqual(["Ctrl", "]"]);
     expect(
       screen.getByRole("heading", { name: "Navigation" }).closest("section")?.querySelector("li"),
     ).toHaveTextContent("Switch recent sessions");

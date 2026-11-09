@@ -1037,6 +1037,7 @@ def _host(
         (_host({"claude-native": True, "codex-native": "binary-missing"}), ["claude-native"]),
         (_host({"claude-native": "needs-auth", "codex-native": True}), ["codex-native"]),
         (_host({"claude-native": "version-too-low", "codex-native": False}), []),
+        (_host({"claude-native": "cli-unresponsive", "codex-native": True}), ["codex-native"]),
         (_host({"claude-native": "tmux-unavailable", "codex-native": True}), ["codex-native"]),
         # An unreported harness can't be assumed installed.
         (_host({"claude-native": True}), ["claude-native"]),

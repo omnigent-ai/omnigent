@@ -16,7 +16,11 @@ import { cn } from "@/lib/utils";
 import { insertComposerText } from "@/lib/composerText";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { isComposerSendKey, isComposerSteerAllKey } from "@/lib/composerSendShortcutPreferences";
+import {
+  isComposerAltNewlineKey,
+  isComposerSendKey,
+  isComposerSteerAllKey,
+} from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 
 export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
@@ -309,6 +313,12 @@ export function ComposerTextInput({
     <ComposerTextarea
       {...input}
       onKeyDown={(event) => {
+        // A newline in every mode and on touch devices; completion menus never see it.
+        if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
+          event.preventDefault();
+          insertComposerText(event.currentTarget, "\n");
+          return;
+        }
         if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
         const insertNewline =
           event.key === "Enter" &&
