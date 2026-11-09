@@ -501,7 +501,7 @@ def _deployable_managed_mcp_path() -> Path:
 @pytest.mark.timeout(900)
 # Under bubblewrap the CLI has a private /tmp and a fixed /etc, so the relay bridge
 # and the managed config reach it only through its own launcher's grants.
-@pytest.mark.parametrize("sandbox", [None, "linux_bwrap"], ids=["unsandboxed", "bwrap"])
+@pytest.mark.parametrize("sandbox", [None, "linux_bwrap"], ids=["default", "bwrap"])
 def test_claude_sdk_session_under_managed_mcp_config_keeps_omnigent_tools(
     request: pytest.FixtureRequest,
     live_server: str,
