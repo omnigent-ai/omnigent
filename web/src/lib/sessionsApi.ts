@@ -293,13 +293,9 @@ interface SessionItemsResponseWire {
 }
 
 /**
- * Initial (and per-scroll-up-page) item count for conversation history
- * hydration. Bounds how many items the chat surface fetches, parses,
- * and renders when a conversation is opened. The synchronous first-paint
- * render scales ~linearly with this count (parse/walk are negligible;
- * mounting the markdown/Streamdown tree per bubble is the cost), so a
- * smaller window keeps thread-switch render cheap. `loadMoreHistory`
- * pages older items on scroll-up.
+ * Default `fetchSessionItemsPage` size. The reconnect backfill pages with it:
+ * a short disconnect gap usually fits in one small page. Opening a session
+ * uses `INITIAL_WINDOW_ITEMS` and scroll-up uses `OLDER_HISTORY_PAGE_ITEMS`.
  */
 export const SESSION_HISTORY_PAGE_SIZE = 20;
 
@@ -1473,6 +1469,15 @@ export async function exportSessionTranscript(sessionId: string): Promise<string
  * is then the reader's scroll, not a background fetch.
  */
 export const INITIAL_WINDOW_ITEMS = 100;
+
+/**
+ * Items per scroll-up page (`loadMoreHistory`). Pages are sequential round
+ * trips, and a tool-heavy turn folds hundreds of items into one row, so small
+ * pages leave the reader waiting at the top. The transcript is virtualized,
+ * so a larger page barely adds render work. Equal to the server's
+ * per-statement row cap, so a page is still one query.
+ */
+export const OLDER_HISTORY_PAGE_ITEMS = 200;
 
 /**
  * Flatten a `GET /v1/sessions/{id}` item into the flat
