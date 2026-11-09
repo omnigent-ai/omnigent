@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -88,8 +89,14 @@ _TRIGGER_PROMPT_OPENINGS = tuple(
     f"This automation watches {source} and starts one Omnigent session"
     for source in ("Jira", "Slack", "GitHub", "Linear")
 )
+# A trigger form can save its state as the prompt's first line, before the opening sentence.
+_TRIGGER_HEADER = re.compile(r"<!-- omnigent-trigger v\d+ [^\n]* -->\n")
 
 
 def is_trigger_automation(task: ScheduledTask) -> bool:
     """Whether a task polls for new items, set up from a Jira, Slack, GitHub or Linear template."""
-    return task.session_mode == "continue" and task.prompt.startswith(_TRIGGER_PROMPT_OPENINGS)
+    if task.session_mode != "continue":
+        return False
+    header = _TRIGGER_HEADER.match(task.prompt)
+    body = task.prompt[header.end() :] if header else task.prompt
+    return body.startswith(_TRIGGER_PROMPT_OPENINGS)

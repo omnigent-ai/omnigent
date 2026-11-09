@@ -47,6 +47,9 @@ def test_trigger_automations_are_recognized_by_their_opening_sentence(task, sour
 
     opening = f"This automation watches {source} and starts one Omnigent session per item."
     assert is_trigger_automation(replace(task, prompt=opening, session_mode="continue"))
+    # The trigger form's saved state line can come first.
+    saved = f'<!-- omnigent-trigger v1 {{"source": "{source.lower()}"}} -->\n{opening}'
+    assert is_trigger_automation(replace(task, prompt=saved, session_mode="continue"))
     # A trigger keeps one session, and the sentence has to open the prompt.
     assert not is_trigger_automation(replace(task, prompt=opening, session_mode="new"))
     assert not is_trigger_automation(
