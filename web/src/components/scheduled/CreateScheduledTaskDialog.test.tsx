@@ -38,6 +38,7 @@ import {
   readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
+  type TriggerSource,
 } from "./triggerTemplates";
 
 const gitWorkspace = vi.hoisted(() => ({
@@ -3068,6 +3069,7 @@ describe("automation trigger type", () => {
     ["Slack", "slack", "support"],
     ["GitHub", "github", "acme/app"],
     ["Linear", "linear", "ENG"],
+    ["PagerDuty", "pagerduty", "Checkout API"],
   ])(
     "defaults to Schedule and creates a %s trigger from the selector",
     async (label, source, scope) => {
@@ -3204,7 +3206,7 @@ describe("automation trigger type", () => {
       );
       fireEvent.keyDown(screen.getByLabelText("Trigger type"), { key: "Enter" });
       await screen.findByRole("listbox");
-      for (const label of ["Jira", "Slack", "GitHub", "Linear"]) {
+      for (const label of ["Jira", "Slack", "GitHub", "Linear", "PagerDuty"]) {
         expect(screen.getByRole("option", { name: label })).toHaveAttribute(
           "aria-disabled",
           "true",
@@ -3217,6 +3219,21 @@ describe("automation trigger type", () => {
     },
   );
 
+  it("shows each integration's logo in the Trigger type options and the selected value", async () => {
+    render(dialog());
+    const trigger = screen.getByLabelText("Trigger type");
+    expect(trigger.querySelector("svg.lucide-clock")).not.toBeNull();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    await screen.findByRole("listbox");
+    for (const option of ["schedule", "jira", "slack", "github", "linear", "pagerduty"]) {
+      expect(screen.getByTestId(`task-trigger-type-${option}`).querySelector("svg")).not.toBeNull();
+    }
+    fireEvent.click(screen.getByRole("option", { name: "PagerDuty" }));
+    expect(trigger).toHaveTextContent("PagerDuty");
+    expect(trigger.querySelector("svg.lucide-clock")).toBeNull();
+    expect(trigger.querySelector("svg")).not.toBeNull();
+  });
+
   it("preserves the existing editor for saved automations", () => {
     render(dialog({ editingTask: scheduledTask() }));
     expect(screen.queryByLabelText("Trigger type")).not.toBeInTheDocument();
@@ -3226,7 +3243,7 @@ describe("automation trigger type", () => {
 
 describe("CreateScheduledTaskDialog trigger template", () => {
   function renderTrigger(
-    source: "jira" | "slack" | "github" | "linear",
+    source: TriggerSource,
     extraInfo: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> = {},
     sessionLink = "https://omni.example.com/c/CONVERSATION_ID",
   ) {
@@ -3558,6 +3575,45 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt).toContain("call sys_session_create");
   });
 
+  it("watches Slack DMs from listed senders, or one group DM, with prefixed scopes", async () => {
+    renderTrigger("slack");
+    expect(screen.getByTestId("task-trigger-scope-prefix")).toHaveTextContent("#");
+    // Pasted channel names keep a single, visual "#".
+    type("task-trigger-scope", "#eng-support");
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("eng-support");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    pick("task-trigger-condition-0-field", "task-trigger-condition-0-field-author");
+
+    pick("task-trigger-event", "task-trigger-event-dm");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where sender");
+    expect(screen.getByTestId("task-trigger-scope-prefix")).toHaveTextContent("@");
+    // Channel names aren't people, and Author repeats the sender.
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
+    expect(screen.queryByTestId("task-trigger-condition-0")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can send you a direct message from one of these accounts may direct the agent",
+    );
+
+    pick("task-trigger-event", "task-trigger-event-group_dm");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where group DM with");
+    expect(screen.queryByTestId("task-trigger-scope-operator")).not.toBeInTheDocument();
+    type("task-trigger-scope", "@alice");
+    type("task-trigger-instructions", "Answer the question.");
+    expect(screen.getByTestId("task-trigger-group-hint")).toBeVisible();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    // A trailing comma or a repeated name still lists one person.
+    for (const scope of ["alice,", "alice, @Alice"]) {
+      type("task-trigger-scope", scope);
+      expect(screen.getByTestId("task-trigger-group-hint")).toBeVisible();
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    }
+    type("task-trigger-scope", "alice, @bob");
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("alice, bob");
+
+    const prompt = await submittedPrompt();
+    expect(prompt).toContain("Watch: new Slack messages in your group DM with @alice and @bob\n");
+  });
+
   it("builds a Linear trigger for a team, with an unassigned row and the issue link-back", async () => {
     renderTrigger("linear");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Linear issues");
@@ -3580,6 +3636,32 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt).toContain("Watch: new Linear issues in team ENG that are unassigned");
     expect(prompt).toContain(
       'Comment "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" on each issue',
+    );
+  });
+
+  it("builds a PagerDuty trigger for a service, with an urgency row and the note link-back", async () => {
+    renderTrigger("pagerduty");
+    expect(screen.getByTestId("task-name-input")).toHaveValue("PagerDuty incidents");
+    expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Incident triggered");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where service");
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can trigger an incident on this service may direct the agent",
+    );
+    expect(showWarnings().getByTestId("task-trigger-tools-note")).toHaveTextContent(
+      "This only works if the agent has a PagerDuty MCP server where this task runs.",
+    );
+    type("task-trigger-scope", "Checkout API");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    type("task-trigger-condition-0-value", "high");
+    type("task-trigger-instructions", "Find the likely cause.");
+
+    const prompt = await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].templateId).toBe("pagerduty");
+    expect(prompt).toContain(
+      'Watch: new PagerDuty incidents on service Checkout API that have urgency "high"',
+    );
+    expect(prompt).toContain(
+      'Add a note "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" to each incident',
     );
   });
 

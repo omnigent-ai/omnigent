@@ -828,6 +828,26 @@ def test_git_get_changed_file_returns_none_when_unchanged(tmp_path: Path) -> Non
     assert reg.get_changed_file("any-conv", "a.txt") is None
 
 
+def test_git_changed_file_reads_never_write_the_index(tmp_path: Path) -> None:
+    """Panel reads must not take ``index.lock`` while the agent runs ``git commit``."""
+    _init_git_with_commit(tmp_path, "a.txt", "hello\n")
+    tracked = tmp_path / "a.txt"
+    stat = tracked.stat()
+    # A stat-only change (same content, older mtime) lets status/numstat rewrite the index.
+    os.utime(tracked, ns=(stat.st_atime_ns, stat.st_mtime_ns - 100 * 10**9))
+    index = tmp_path / ".git" / "index"
+    before = index.stat()
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    assert reg.list_changed_files("any-conv", limit=100) == []
+    assert reg.get_changed_file("any-conv", "a.txt") is None
+
+    after = index.stat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns), (
+        "A changed-files read rewrote .git/index, so it held index.lock."
+    )
+
+
 def test_git_list_changed_files_expands_untracked_nested_dir(tmp_path: Path) -> None:
     """A new file in a brand-new untracked directory tree returns its full path.
 

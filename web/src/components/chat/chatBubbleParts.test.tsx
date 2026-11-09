@@ -7,9 +7,12 @@ import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
+import { type ReactNode, useLayoutEffect } from "react";
+import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
 import {
   BubbleView,
   buildUndeliveredBubbles,
+  ConversationScrollRefBridge,
   containsMermaidDiagram,
   keyboardActiveQuestionId,
   placeUndeliveredBubbles,
@@ -885,5 +888,31 @@ describe("keyboardActiveQuestionId", () => {
       nativeDelivery: { state: "sending", attempt: "attempt_1", action: "accept" },
     });
     expect(keyboardActiveQuestionId([question("q_old"), awaiting])).toBeNull();
+  });
+});
+
+describe("ConversationScrollRefBridge", () => {
+  it("hands over the scroll element before paint when rendered after the content", () => {
+    const onScroller = vi.fn();
+    let seenBeforePaint: unknown = "not run";
+    // A parent's layout effect runs after its children's and before paint.
+    function BeforePaint({ children }: { children: ReactNode }) {
+      useLayoutEffect(() => {
+        seenBeforePaint = onScroller.mock.lastCall?.[0]?.el;
+      }, []);
+      return <div>{children}</div>;
+    }
+    render(
+      <BeforePaint>
+        <Conversation>
+          <ConversationContent>
+            <p>row</p>
+          </ConversationContent>
+          <ConversationScrollRefBridge onScroller={onScroller} />
+        </Conversation>
+      </BeforePaint>,
+    );
+    expect(seenBeforePaint).toBeInstanceOf(HTMLElement);
+    expect(seenBeforePaint).toBe(screen.getByText("row").parentElement?.parentElement);
   });
 });

@@ -732,6 +732,10 @@ class Executor:
         """Whether fresh and queued input must retain original content block boundaries."""
         return False
 
+    def preserves_empty_initiating_message(self) -> bool:
+        """Whether an empty final user message must survive history filtering."""
+        return False
+
     def supports_tool_boundary_interrupt(self) -> bool:
         """Whether queued user input can be applied by interrupting after a tool boundary."""
         return False
