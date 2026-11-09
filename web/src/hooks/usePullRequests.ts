@@ -101,6 +101,18 @@ export interface PullRequestComment {
   url: string | null;
 }
 
+export interface PullRequestTimelineEvent {
+  id: string;
+  kind: "commit" | "force_push";
+  author: string | null;
+  /** Commit time for commits; event time for force pushes. */
+  created_at: string | null;
+  url: string | null;
+  sha: string | null;
+  previous_sha?: string | null;
+  message?: string | null;
+}
+
 export type PullRequestReviewerState =
   "PENDING" | "APPROVED" | "COMMENTED" | "CHANGES_REQUESTED" | "DISMISSED";
 
@@ -155,6 +167,9 @@ export interface PullRequest {
   /** Top-level PR comments GitHub shows by default; absent from an older host. */
   comments?: PullRequestComment[];
   comments_partial?: boolean;
+  /** Commit and force-push activity; absent from older hosts and other providers. */
+  timeline_events?: PullRequestTimelineEvent[];
+  timeline_partial?: boolean;
   /** Assigned reviewers and their current review state; absent from older hosts. */
   reviewers?: PullRequestReviewer[];
   /** The PR's labels; absent from older hosts and providers that don't report them. */

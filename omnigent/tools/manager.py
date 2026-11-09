@@ -448,15 +448,20 @@ class ToolManager:
 
         Send/close remain child-only. Create also supports independent
         placements behind the orchestration gate. ``sys_session_message``
-        is always advertised; the deployment flag and server ownership/privacy
-        checks authorize peer sends. Sharing retains its separate opt-in.
+        is advertised unless this runner disables ``peer_session_messaging``;
+        the server's flags and ownership/privacy checks authorize peer sends.
+        Sharing retains its separate opt-in.
         Spec opt-ins control advertisement, not server authority.
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
         """
-        from omnigent.tools.builtins.session_message import SysSessionMessageTool
+        from omnigent.tools.builtins.session_message import (
+            SysSessionMessageTool,
+            peer_session_messaging_enabled,
+        )
 
-        self._tools[SysSessionMessageTool.name()] = SysSessionMessageTool()
+        if peer_session_messaging_enabled():
+            self._tools[SysSessionMessageTool.name()] = SysSessionMessageTool()
         # Read-only discovery tools: always available.
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
@@ -512,17 +517,17 @@ class ToolManager:
 
     def _register_agent_mgmt_tools(self) -> None:
         """
-        Register the read-only ``sys_agent_*`` discovery tools.
+        Register the ``sys_agent_*`` discovery and bundle tools.
 
         ``sys_agent_get``, ``sys_agent_download``, and ``sys_agent_list``
         are registered without spec opt-in, mirroring the always-on
         session reads in :meth:`_register_sub_agent_tools`;
-        ``tool_groups.agent_discovery: false`` drops all three. They are
-        global reads bounded by the server's per-user permission model —
-        they proxy auth-gated ``GET /v1/sessions/{id}/agent``,
+        ``tool_groups.agent_discovery: false`` drops all three. They proxy
+        auth-gated ``GET /v1/sessions/{id}/agent``,
         ``.../agent/contents``, and ``GET /v1/agents`` + ``/v1/sessions``
         endpoints (``sys_agent_list`` also scans the agent's own local
-        config dir), so registration grants no access the caller didn't
+        config dir). Bundle download requires READ access and redacts without
+        EDIT; metadata reads accept READ access. Registration grants no access the caller didn't
         already have. They are runner-dispatched and need no
         construction-time wiring.
         """
