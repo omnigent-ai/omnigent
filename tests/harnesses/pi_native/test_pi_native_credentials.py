@@ -1678,7 +1678,7 @@ model_provider = "Databricks"
 
 [model_providers.Databricks]
 name = "Databricks Unity Gateway"
-base_url = "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
+base_url = "https://4242424242424242.ai-gateway.cloud.databricks.com/codex/v1"
 wire_api = "responses"
 
 [model_providers.Databricks.auth]
@@ -1708,7 +1708,7 @@ def test_cli_config_databricks_resolves_to_anthropic_gateway(
     assert provider.api == "anthropic-messages"
     # /codex/v1 rewritten to the /anthropic surface Pi speaks natively.
     assert (
-        provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
+        provider.base_url == "https://4242424242424242.ai-gateway.cloud.databricks.com/anthropic"
     )
     assert provider.model == "catalog-databricks-claude-default"
     assert provider.auth_header is True
@@ -1733,7 +1733,7 @@ def test_cli_config_databricks_respects_model_override(
     assert provider is not None
     assert provider.model == "databricks-claude-opus-4-8"
     assert (
-        provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
+        provider.base_url == "https://4242424242424242.ai-gateway.cloud.databricks.com/anthropic"
     )
 
 
@@ -1840,7 +1840,7 @@ _LOOKALIKE_GATEWAY_URLS = [
     # Both substrings live in the path, not the host.
     "https://evil.test/databricks/ai-gateway/v1",
     # Right host shape but plaintext http (token must never go over http).
-    "http://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1",
+    "http://4242424242424242.ai-gateway.cloud.databricks.com/codex/v1",
 ]
 
 
@@ -1873,7 +1873,7 @@ def test_real_gateway_still_resolves_after_hardening(
     _write_codex_config(
         tmp_path,
         _codex_config_with_base_url(
-            "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
+            "https://4242424242424242.ai-gateway.cloud.databricks.com/codex/v1"
         ),
     )
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -1882,7 +1882,7 @@ def test_real_gateway_still_resolves_after_hardening(
 
     assert provider is not None
     assert (
-        provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
+        provider.base_url == "https://4242424242424242.ai-gateway.cloud.databricks.com/anthropic"
     )
     assert provider.api == "anthropic-messages"
     assert provider.api_key == (
@@ -1942,7 +1942,7 @@ def test_explicit_pi_pin_selects_cli_config_databricks_over_anthropic_key(
 
     assert provider is not None
     assert (
-        provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
+        provider.base_url == "https://4242424242424242.ai-gateway.cloud.databricks.com/anthropic"
     )
     assert provider.api == "anthropic-messages"
     assert provider.auth_header is True
@@ -1970,7 +1970,7 @@ def test_cli_config_databricks_as_sole_default_selected_for_pi(
 
     assert provider is not None
     assert (
-        provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
+        provider.base_url == "https://4242424242424242.ai-gateway.cloud.databricks.com/anthropic"
     )
 
 
@@ -2007,7 +2007,7 @@ args = ["%s", "sk-static"]
     "gateway_url",
     [
         # Canonical AWS gateway.
-        "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1",
+        "https://4242424242424242.ai-gateway.cloud.databricks.com/codex/v1",
         # Staging variant (still ends in .cloud.databricks.com).
         "https://wkspc.ai-gateway.staging.cloud.databricks.com/codex/v1",
         # Azure / GCP parent domains carrying the ai-gateway label.
@@ -2669,7 +2669,7 @@ def test_cli_config_databricks_registers_gpt_provider(
         creds,
         "resolve_databricks_workspace",
         lambda profile: db_creds_mod.WorkspaceCreds(
-            host="https://dbc-a5d4177a-49dc.cloud.databricks.com", token="sdk-tok"
+            host="https://dbc-12345678-abcd.cloud.databricks.com", token="sdk-tok"
         ),
     )
     monkeypatch.setattr(creds, "_run_auth_command", lambda *_: "cmd-tok")
@@ -2679,7 +2679,7 @@ def test_cli_config_databricks_registers_gpt_provider(
     def _mock_fetch(workspace_url: str, token: str):
         # Assert the auth_command token is used, not the SDK token
         assert token == "cmd-tok", f"expected auth_command token, got {token!r}"
-        assert "dbc-a5d4177a" in workspace_url
+        assert "dbc-12345678" in workspace_url
         return live_claude, live_gpt, [], []
 
     monkeypatch.setattr(creds, "_fetch_pi_model_lists", _mock_fetch)
@@ -2695,7 +2695,7 @@ def test_cli_config_databricks_registers_gpt_provider(
     # from databrickscfg fixes the NXDOMAIN issue for dedicated-subdomain gateways.
     assert (
         openai_entry["baseUrl"]
-        == "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
+        == "https://4242424242424242.ai-gateway.cloud.databricks.com/codex/v1"
     )
     assert openai_entry["api"] == "openai-responses"
     assert any(m["id"] == "databricks-gpt-5-4" for m in openai_entry["models"])

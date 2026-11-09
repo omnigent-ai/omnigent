@@ -6198,7 +6198,7 @@ def _request_claude_repaint(
     without a handler ignores it, so running processes under the pane get it:
     a launcher may run Claude Code as its child. Suspended processes stay paused.
 
-    A launcher may also run Claude Code outside that tree: isaac's fast launch
+    A launcher may also run Claude Code outside that tree: a fast launch
     pumps the pane to a pre-started worker's terminal. Claude Code's session
     registry still names its process, so that process gets the signal too.
 
@@ -6335,13 +6335,15 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    # Narrow panes wrap the decision footer across captured lines.
+    footer = " ".join(region.split())
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
         or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
-            any(hint in region for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in region
+            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
+            and "Esc to cancel" in footer
         )
     )
 
@@ -6611,7 +6613,7 @@ def _restore_occupied_input(
     startup dialogs whose Escape quits Claude Code instead of closing them
     (:func:`_escape_quits_claude`): they are left for the person to answer.
 
-    Isaac's idle-compaction log can overwrite the rendered input box. Redraw
+    A launcher's idle-compaction log can overwrite the rendered input box. Redraw
     it once with Ctrl+L before any edit keys can erase its identifying prefix,
     then check the actual composer and pending prompts again.
 

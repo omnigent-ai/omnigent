@@ -684,7 +684,7 @@ def configure_agent_harness_with_provider(
         if harness_type == "codex":
             # The codex executor symlinks the user's ~/.codex/config.toml
             # into the per-session CODEX_HOME, so a custom default
-            # ``model_provider`` there (e.g. isaac's Databricks Unity Gateway)
+            # ``model_provider`` there (e.g. a Databricks Unity Gateway)
             # would silently hijack a Subscription selection. Pin codex's
             # built-in ``openai`` provider so "Subscription" always means
             # the ChatGPT login — a no-op when the user's config sets no

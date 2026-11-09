@@ -721,7 +721,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # launcher registered in the ``omnigent.claude_launcher`` group (e.g.
         # ``isaac``). Read by omnigent.claude_launcher.resolve_claude_launch in
         # the managed-host runner (``_auto_create_claude_terminal``) to wrap the
-        # Claude launch through a downstream binary (e.g. Databricks' isaac).
+        # Claude launch through a downstream binary.
         # The daemon→runner env strip would otherwise drop it, leaving the
         # runner on the default launch. Safe to propagate: not a secret, just a
         # plugin name.
