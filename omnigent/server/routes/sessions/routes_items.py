@@ -51,6 +51,8 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
+    SessionItem,
+    SessionItemList,
     SideChatList,
     SideChatSummary,
 )
@@ -137,7 +139,7 @@ def register_items_routes(
     @item_read_router.get(
         "/sessions/{session_id}/items",
         response_model=None,
-        responses={200: {"model": PaginatedList}, **STALE_CURSOR_RESPONSE},
+        responses={200: {"model": SessionItemList}, **STALE_CURSOR_RESPONSE},
     )
     async def list_session_items(
         request: Request,
@@ -172,7 +174,8 @@ def register_items_routes(
             ``GET /sessions/{id}/items/{item_id}``. Tool output
             dominates the bytes of a transcript page, so a preview page
             costs a small fraction of a full one.
-        :returns: A :class:`PaginatedList` of conversation items.
+        :returns: A page of flattened conversation items, documented as
+            :class:`SessionItemList`.
         :raises OmnigentError: 404 if no session exists.
         """
         await _require_session_read(request, session_id)
@@ -197,7 +200,9 @@ def register_items_routes(
     @item_read_router.get(
         "/sessions/{session_id}/items/{item_id}",
         response_model=None,
-        responses={200: {"description": "The item, flat as in the list route."}},
+        responses={
+            200: {"model": SessionItem, "description": "The item, flat as in the list route."}
+        },
     )
     async def get_session_item(
         request: Request,

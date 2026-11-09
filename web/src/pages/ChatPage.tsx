@@ -4561,12 +4561,14 @@ function ComposerImpl(
                   !isReadOnly &&
                   supportsSideChat(sessionHarness, canStartSideChat)
                     ? () => {
+                        if (useChatStore.getState().conversationId !== composerSessionId) return;
                         if (usesNativeSideChatFork(sessionHarness)) {
                           // Codex forks in-process from a typed /side; prefill so
                           // the user types the question.
                           setValue(SIDE_CHAT_COMMAND_PREFIX);
                           setCommandError(null);
                           dirtyRef.current = true;
+                          tailTextareaRef.current?.focus();
                           return;
                         }
                         const sourceId = useChatStore.getState().conversationId;
