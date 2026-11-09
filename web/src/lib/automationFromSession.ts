@@ -2,7 +2,7 @@
 // copy its runs start from (labelled with the automation's id), and every
 // run starts a new session from that copy.
 
-import { useCallback } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { forgetScheduledTasks, refreshAutomationSourceSession } from "@/hooks/useScheduledTasks";
@@ -100,6 +100,11 @@ export function useDeleteSourceAutomations(): (taskIds: string[]) => Promise<boo
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const { pathname } = useLocation();
+  // The page to leave is the one the user is on once the deletes finish.
+  const pathnameRef = useRef(pathname);
+  useEffect(() => {
+    pathnameRef.current = pathname;
+  }, [pathname]);
   return useCallback(
     async (taskIds: string[]) => {
       const results = await Promise.allSettled(
@@ -120,15 +125,16 @@ export function useDeleteSourceAutomations(): (taskIds: string[]) => Promise<boo
       const deleted = taskIds.filter((_, index) => results[index]?.status === "fulfilled");
       if (deleted.length > 0) {
         // Leave the page of an automation deleted with its session, as deleting it there does.
-        if (deleted.some((taskId) => pathname.endsWith(`/tasks/${encodeURIComponent(taskId)}`))) {
-          navigate("/tasks");
-        }
+        const onDeletedPage = deleted.some((taskId) =>
+          pathnameRef.current.endsWith(`/tasks/${encodeURIComponent(taskId)}`),
+        );
+        if (onDeletedPage) navigate("/tasks");
         forgetScheduledTasks(queryClient, deleted);
         // Sessions kept after a partial failure lost their automation label too.
         refreshAutomationSourceSession(queryClient);
       }
       return deleted.length === taskIds.length;
     },
-    [queryClient, navigate, pathname],
+    [queryClient, navigate],
   );
 }

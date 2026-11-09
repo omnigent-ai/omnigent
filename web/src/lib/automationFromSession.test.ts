@@ -1,7 +1,7 @@
 import { createElement, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook } from "@testing-library/react";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import { SCHEDULED_TASKS_KEY } from "@/hooks/useScheduledTasks";
@@ -110,9 +110,14 @@ describe("useDeleteSourceAutomations", () => {
         { client: queryClient },
         createElement(MemoryRouter, { initialEntries: [path] }, children),
       );
-    return renderHook(() => ({ remove: useDeleteSourceAutomations(), location: useLocation() }), {
-      wrapper,
-    }).result;
+    return renderHook(
+      () => ({
+        remove: useDeleteSourceAutomations(),
+        location: useLocation(),
+        navigate: useNavigate(),
+      }),
+      { wrapper },
+    ).result;
   }
 
   it("deletes each automation and drops it from the cached list, counting not_found as deleted", async () => {
@@ -139,16 +144,35 @@ describe("useDeleteSourceAutomations", () => {
     expect(queryClient.getQueryData(SCHEDULED_TASKS_KEY)).toEqual([{ id: "st_2" }, { id: "st_3" }]);
   });
 
-  it.each([
-    ["/tasks/st_1", "/tasks"],
-    ["/tasks/st_3", "/tasks/st_3"],
-    ["/c/conv_1", "/c/conv_1"],
-  ])("leaves %s for the automations list only when its automation is deleted", async (from, to) => {
-    deleteScheduledTask.mockResolvedValue(undefined);
-    const result = renderDelete(from);
+  it.each<[string, string | null, string]>([
+    ["/tasks/st_1", null, "/tasks"],
+    ["/tasks/st_3", null, "/tasks/st_3"],
+    ["/c/conv_1", null, "/c/conv_1"],
+    // The page the user is on once the delete finishes decides.
+    ["/tasks/st_1", "/c/conv_1", "/c/conv_1"],
+    ["/c/conv_1", "/tasks/st_1", "/tasks"],
+  ])(
+    "from %s, then %s mid-delete, ends on %s: only a deleted automation's page is left",
+    async (from, moved, to) => {
+      let finish = () => {};
+      deleteScheduledTask.mockReturnValue(
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+      );
+      const result = renderDelete(from);
 
-    await act(() => result.current.remove(["st_1"]));
+      let removal = Promise.resolve(true);
+      act(() => {
+        removal = result.current.remove(["st_1"]);
+      });
+      if (moved !== null) act(() => result.current.navigate(moved));
+      await act(async () => {
+        finish();
+        await removal;
+      });
 
-    expect(result.current.location.pathname).toBe(to);
-  });
+      expect(result.current.location.pathname).toBe(to);
+    },
+  );
 });
