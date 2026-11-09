@@ -163,6 +163,9 @@
         }
       ]
     },
+    "deb": {
+      "afterInstall": "build/deb-after-install.sh"
+    },
     "win": {
       "icon": "icons/icon.ico",
       "target": [
