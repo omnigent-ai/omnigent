@@ -1154,7 +1154,7 @@ def pr_changed_files(
     """List the selected PR's changed files; empty when no provider serves it.
 
     With ``head_sha``/``base_sha``, a provider with :class:`PinnedRevisionFacet` lists
-    that revision and echoes it; other providers list the current revision.
+    that revision, echoing it only when verified; other providers list the current revision.
     """
     reference = _default_pr(session_id, pr_url)
     facet = _serving_facet(root, reference)

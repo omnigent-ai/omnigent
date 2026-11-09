@@ -24,6 +24,7 @@ from omnigent.runner.git_providers import (
     ReviewerRef,
     gitlab_observer,
     local_git,
+    read_pinned_revision,
 )
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -398,29 +399,17 @@ def _content(client: GitLabClient, project: object, path: str, revision: str) ->
         ) from exc
 
 
-def _check_revision(mr: dict[str, Any], *, head_sha: str, base_sha: str) -> None:
-    """Raise when the merge request is no longer at the pinned revisions."""
-    refs = _object(mr.get("diff_refs"))
-    current = (refs.get("head_sha"), refs.get("base_sha"))
-    if None in current:
-        # GitLab has not prepared the diff revisions yet; that is not a moved MR.
-        raise ValueError(
-            "GitLab could not confirm the merge request's revision. Refresh to retry."
-        )
-    if current != (head_sha, base_sha):
-        raise ValueError("The merge request changed. Refresh to retry.")
+_MR_CHANGED = "The merge request changed. Refresh to retry."
 
 
-def _pinned_changes(
-    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
-) -> tuple[list[dict[str, Any]], bool]:
-    """List the changes, checking the pinned revisions before and after the read."""
-    client = _client(root, reference.host)
-    mr = _mr(client, reference)
-    _check_revision(mr, head_sha=head_sha, base_sha=base_sha)
-    changes, partial = _changes(client, reference, mr)
-    _check_revision(_mr(client, reference), head_sha=head_sha, base_sha=base_sha)
-    return changes, partial
+def _mr_revisions(client: GitLabClient, reference: PullRequestRef) -> tuple[str, str] | None:
+    """Return the merge request's diff ``(head, base)``, or ``None`` when it cannot be read."""
+    try:
+        refs = _object(_mr(client, reference).get("diff_refs"))
+    except ValueError:
+        return None
+    head, base = refs.get("head_sha"), refs.get("base_sha")
+    return (head, base) if isinstance(head, str) and isinstance(base, str) else None
 
 
 def _file_list(changes: list[dict[str, Any]], partial: bool) -> dict[str, Any]:
@@ -525,18 +514,26 @@ class GitLabPullRequests:
     def pinned_changed_files(
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
-        files = _file_list(*_pinned_changes(root, reference, head_sha=head_sha, base_sha=base_sha))
-        return {**files, "head_sha": head_sha, "base_sha": base_sha}
+        client = _client(root, reference.host)
+        return read_pinned_revision(
+            lambda: _mr_revisions(client, reference),
+            lambda: _file_list(*_changes(client, reference, _mr(client, reference))),
+            head_sha=head_sha,
+            base_sha=base_sha,
+            moved=_MR_CHANGED,
+        )
 
     def pinned_diff(
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
-        patch = _whole_patch(
-            *_pinned_changes(root, reference, head_sha=head_sha, base_sha=base_sha)
+        client = _client(root, reference.host)
+        return read_pinned_revision(
+            lambda: _mr_revisions(client, reference),
+            lambda: _whole_patch(*_changes(client, reference, _mr(client, reference))),
+            head_sha=head_sha,
+            base_sha=base_sha,
+            moved=_MR_CHANGED,
         )
-        if "unavailable_reason" in patch:
-            return patch
-        return {**patch, "head_sha": head_sha, "base_sha": base_sha}
 
     def file_diff(
         self,

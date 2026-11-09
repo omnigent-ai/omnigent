@@ -606,19 +606,46 @@ def test_pinned_read_refuses_a_merge_request_that_moves_during_the_listing(
         getattr(module.PULL_REQUESTS, read)(root, ref(), head_sha=HEAD, base_sha=BASE)
 
 
-def test_pinned_read_without_prepared_diff_refs_is_unavailable_not_moved(
-    root: str, api: Mock, mr: dict
+def test_partial_pinned_listing_whose_final_check_times_out_returns_it_without_pins(
+    root: str, api: Mock, change: dict
+) -> None:
+    api.pages.side_effect = lambda path, **query: ([change], True)
+    answer = api.object.side_effect
+    merge_request_reads = []
+
+    def final_check_times_out(path: str, **query):
+        # The reads are the check before the listing, the listing's own read, then the final check.
+        if path == MR_PATH:
+            merge_request_reads.append(path)
+            if len(merge_request_reads) == 3:
+                raise GitLabTimeoutError("GitLab request timed out. Refresh to retry.")
+        return answer(path, **query)
+
+    api.object.side_effect = final_check_times_out
+    result = module.PULL_REQUESTS.pinned_changed_files(root, ref(), head_sha=HEAD, base_sha=BASE)
+
+    assert result["has_more"] is True and result["warning"]
+    assert [file["path"] for file in result["data"]] == ["src/new.py"]
+    assert "head_sha" not in result and "base_sha" not in result
+
+
+@pytest.mark.parametrize("read", ["pinned_changed_files", "pinned_diff"])
+def test_pinned_read_without_prepared_diff_refs_returns_data_without_pins(
+    root: str, api: Mock, mr: dict, read: str
 ) -> None:
     mr["diff_refs"] = None
-    with pytest.raises(ValueError, match="could not confirm"):
-        module.PULL_REQUESTS.pinned_changed_files(root, ref(), head_sha=HEAD, base_sha=BASE)
+    result = getattr(module.PULL_REQUESTS, read)(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert "src/new.py" in str(result)
+    assert "head_sha" not in result and "base_sha" not in result
 
 
-def test_incomplete_pinned_diff_echoes_no_revision(root: str, api: Mock, mr: dict) -> None:
+def test_incomplete_pinned_diff_echoes_the_verified_revisions(
+    root: str, api: Mock, mr: dict
+) -> None:
     mr["changes_count"] = "1000+"
     result = module.PULL_REQUESTS.pinned_diff(root, ref(), head_sha=HEAD, base_sha=BASE)
     assert result["unavailable_reason"] == "incomplete_diff"
-    assert "head_sha" not in result and "base_sha" not in result
+    assert result["head_sha"] == HEAD and result["base_sha"] == BASE
 
 
 def test_panel_pinned_reads_route_to_the_gitlab_revisions(

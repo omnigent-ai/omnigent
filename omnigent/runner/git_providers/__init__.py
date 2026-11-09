@@ -163,6 +163,36 @@ class ProviderCapabilities:
         return asdict(self)
 
 
+def read_pinned_revision(
+    current: Callable[[], tuple[str, str] | None],
+    read: Callable[[], dict[str, Any]],
+    *,
+    head_sha: str,
+    base_sha: str,
+    moved: str,
+) -> dict[str, Any]:
+    """Read at the pinned revision, verifying it before and after the read.
+
+    Raises ``ValueError(moved)`` when a completed check shows another revision. Echoes
+    the pins only when both checks match. Otherwise the read's data comes back without
+    them, so the panel shows no revision it could not verify.
+
+    :param current: The PR's ``(head, base)`` now, or ``None`` when it cannot be read.
+    :param read: The read itself, returning its payload.
+    """
+    pinned = (head_sha, base_sha)
+    before = current()
+    if before is not None and before != pinned:
+        raise ValueError(moved)
+    result = read()
+    after = current()
+    if after is not None and after != pinned:
+        raise ValueError(moved)
+    if before is None or after is None:
+        return result
+    return {**result, "head_sha": head_sha, "base_sha": base_sha}
+
+
 @runtime_checkable
 class PinnedRevisionFacet(Protocol):
     """Optional support for reading the changed files and patch at an exact revision."""
@@ -170,7 +200,7 @@ class PinnedRevisionFacet(Protocol):
     def pinned_diff(
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
-        """Return the whole PR's patch, echoing ``head_sha``/``base_sha``.
+        """Return the whole PR's patch, echoing ``head_sha``/``base_sha`` when verified.
 
         Raise ``ValueError`` when the PR's head or base is no longer the pinned revision.
         """
@@ -179,7 +209,10 @@ class PinnedRevisionFacet(Protocol):
     def pinned_changed_files(
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
-        """Return the changed files echoing ``head_sha``/``base_sha``; raise as ``pinned_diff``."""
+        """Return the changed files, echoing ``head_sha``/``base_sha`` when verified.
+
+        Raise as ``pinned_diff`` does.
+        """
         ...
 
 
