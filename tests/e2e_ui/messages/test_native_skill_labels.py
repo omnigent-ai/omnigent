@@ -135,11 +135,15 @@ def test_native_skill_labels(
             }
             assert labels == {"live": expected, "history": expected}
         finally:
-            page.screenshot(path=str(evidence / f"{harness}-skill.png"))
-            (evidence / f"{harness}-session.json").write_text(
-                json.dumps(client.get(f"/v1/sessions/{session_id}").json(), indent=2)
-            )
-            (evidence / f"{harness}-items.json").write_text(
-                json.dumps(client.get(f"/v1/sessions/{session_id}/items").json(), indent=2)
-            )
-            client.delete(f"/v1/sessions/{session_id}")
+            try:
+                page.screenshot(path=str(evidence / f"{harness}-skill.png"))
+                (evidence / f"{harness}-session.json").write_text(
+                    json.dumps(client.get(f"/v1/sessions/{session_id}").json(), indent=2)
+                )
+                (evidence / f"{harness}-items.json").write_text(
+                    json.dumps(client.get(f"/v1/sessions/{session_id}/items").json(), indent=2)
+                )
+            except Exception as error:
+                print(f"Could not capture skill diagnostics: {error!r}")
+            finally:
+                client.delete(f"/v1/sessions/{session_id}")
