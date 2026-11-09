@@ -725,6 +725,16 @@ describe("PullRequestChangesTab viewed files", () => {
 
     expect(isCollapsed("a.ts")).toBe(false);
     expect(isCollapsed("b.ts")).toBe(true);
+
+    // Another tab unmarks a.ts: it stays open. Marking it again collapses it.
+    markInOtherTab({ "b.ts": [unverifiedPatchHash("head1")] });
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+    markInOtherTab({
+      "a.ts": [unverifiedPatchHash("head1")],
+      "b.ts": [unverifiedPatchHash("head1")],
+    });
+    expect(isCollapsed("a.ts")).toBe(true);
   });
 
   it("keeps a file the reader expanded when viewed state drops out and returns on the same head", () => {
