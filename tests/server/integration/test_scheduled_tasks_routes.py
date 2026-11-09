@@ -3406,6 +3406,91 @@ async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
     assert [stored.filename for stored in files.list(source_id).data] == kept
 
 
+async def test_a_copy_that_cannot_take_every_file_is_deleted(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_id = _session_with_history(db_uri)
+    files = SqlAlchemyFileStore(db_uri)
+    for filename in ("notes.txt", "more.txt"):
+        files.create(filename=filename, bytes=5, session_id=source_id)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    before = {conv.id for conv in conversations.list_conversations(limit=100).data}
+    create = SqlAlchemyFileStore.create
+    copy_rows: list[str] = []
+
+    def _second_copy_row_fails(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("session_id") != source_id:
+            copy_rows.append(kwargs["session_id"])
+            if len(copy_rows) == 2:
+                raise RuntimeError("database unavailable")
+        return create(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyFileStore, "create", _second_copy_row_fails)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+
+    assert resp.status_code == 500, resp.text
+    # The partial copy and the row it did get are gone; the source keeps its files.
+    assert {conv.id for conv in conversations.list_conversations(limit=100).data} == before
+    assert files.list(copy_rows[0]).data == []
+    assert sorted(stored.filename for stored in files.list(source_id).data) == [
+        "more.txt",
+        "notes.txt",
+    ]
+
+
+@pytest.mark.parametrize("stage", ["copy", "user", "grant"])
+async def test_a_cancelled_create_deletes_the_copy_once_its_writes_settle(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    import threading
+
+    from omnigent.server.scheduled import source_session
+
+    source_id = _session_with_history(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    before = {conv.id for conv in conversations.list_conversations(limit=100).data}
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+
+    def _held(call: Callable[..., Any]) -> Callable[..., Any]:
+        # The write commits, then its thread waits past the cancellation.
+        def held(*args: Any, **kwargs: Any) -> Any:
+            result = call(*args, **kwargs)
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5)
+            return result
+
+        return held
+
+    if stage == "copy":
+        monkeypatch.setattr(source_session, "copy_session", _held(source_session.copy_session))
+    else:
+        name = "ensure_user" if stage == "user" else "grant"
+        monkeypatch.setattr(
+            SqlAlchemyPermissionStore, name, _held(getattr(SqlAlchemyPermissionStore, name))
+        )
+    pending = asyncio.create_task(
+        auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=source_id),
+            headers=_headers(),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    pending.cancel()
+    await asyncio.sleep(0)
+    # A second cancellation must not interrupt the cleanup.
+    pending.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pending, 5)
+
+    assert {conv.id for conv in conversations.list_conversations(limit=100).data} == before
+
+
 async def test_a_copy_takes_only_attachments_the_deployment_accepts(
     auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

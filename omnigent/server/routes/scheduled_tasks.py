@@ -14,6 +14,7 @@ below the minimum-interval floor) is a 400.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from collections.abc import Callable
@@ -710,26 +711,75 @@ def create_scheduled_tasks_router(
         carry: bool,
     ) -> Conversation:
         """Copy *source*, through its last finished reply, for the task's runs to start from."""
-        from omnigent.server.scheduled.source_session import copy_session, source_copy_title
+        # Its threads can commit after the request is cancelled; the copy is deleted once they do.
+        setup = asyncio.create_task(
+            _copy_and_own_source(
+                source,
+                up_to=up_to,
+                task_id=task_id,
+                name=name,
+                owner=owner,
+                project_id=project_id,
+                carry=carry,
+            )
+        )
+        try:
+            return await asyncio.shield(setup)
+        except asyncio.CancelledError:
+
+            async def settle_and_discard() -> None:
+                # A setup that failed has already deleted its copy.
+                with contextlib.suppress(Exception):
+                    await _delete_session_quietly((await setup).id)
+
+            cleanup = asyncio.create_task(settle_and_discard())
+            while not cleanup.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(cleanup)
+            raise
+
+    async def _copy_and_own_source(
+        source: Conversation,
+        *,
+        up_to: str,
+        task_id: str,
+        name: str,
+        owner: str,
+        project_id: str | None,
+        carry: bool,
+    ) -> Conversation:
+        """Copy *source* and grant its owner the copy, deleting the copy if either fails."""
+        from omnigent.server.scheduled.source_session import (
+            SourceCopyIncompleteError,
+            copy_session,
+            source_copy_title,
+        )
         from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
 
         # _require_source_session rejects a session without an agent.
         assert source.agent_id is not None
-        copy = await asyncio.to_thread(
-            copy_session,
-            conversation_store=conversation_store,
-            file_store=file_store,
-            artifact_store=artifact_store,
-            source_id=source.id,
-            title=source_copy_title(source.title, name),
-            # The copy keeps the session's agent; each run binds the task's own.
-            agent_id=source.agent_id,
-            created_by=owner,
-            project_id=project_id,
-            carry_history_into_native=carry,
-            labels={SCHEDULED_TASK_SOURCE_LABEL_KEY: task_id},
-            up_to_response_id=up_to,
-        )
+        try:
+            copy = await asyncio.to_thread(
+                copy_session,
+                conversation_store=conversation_store,
+                file_store=file_store,
+                artifact_store=artifact_store,
+                source_id=source.id,
+                title=source_copy_title(source.title, name),
+                # The copy keeps the session's agent; each run binds the task's own.
+                agent_id=source.agent_id,
+                created_by=owner,
+                project_id=project_id,
+                carry_history_into_native=carry,
+                labels={SCHEDULED_TASK_SOURCE_LABEL_KEY: task_id},
+                up_to_response_id=up_to,
+            )
+        except SourceCopyIncompleteError as exc:
+            await _delete_session_quietly(exc.copy.id)
+            raise OmnigentError(
+                "Could not copy every file of the session. Try again.",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
         try:
             if permission_store is not None:
                 await asyncio.to_thread(permission_store.ensure_user, owner)

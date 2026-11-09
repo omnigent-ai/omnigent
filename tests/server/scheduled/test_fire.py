@@ -4291,6 +4291,44 @@ async def test_a_run_needs_an_agent_that_opens_the_files_its_source_gained(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_a_run_copy_that_cannot_take_every_file_is_deleted(tmp_path: Path) -> None:
+    class _FailingRowFileStore:
+        def list(self, session_id: str, **kwargs: Any) -> SimpleNamespace:
+            stored = StoredFile(
+                id="f" * 32, created_at=1, filename="notes.txt", bytes=5, session_id=session_id
+            )
+            return SimpleNamespace(data=[stored], has_more=False, last_id=stored.id)
+
+        def create(self, **kwargs: Any) -> None:
+            raise RuntimeError("database unavailable")
+
+        def delete_all_for_session(self, session_id: str) -> list[str]:
+            return []
+
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        file_store=_FailingRowFileStore(),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    # The copy's history names a file it lacks, so the run deletes the copy and fails.
+    assert [fork["source_id"] for fork in conv_store.forked] == ["conv_source"]
+    assert conv_store.deleted == ["conv_1"] and launched == []
+    (run,) = store.runs
+    assert (run["status"], run.get("error_code")) == ("failed", "session_create_failed")
+
+
+@pytest.mark.asyncio
 async def test_a_deleted_source_session_fails_the_run_and_pauses_the_task() -> None:
     conv_store = FakeConversationStore()
     conv_store.get_conversation = lambda conversation_id: None  # type: ignore[method-assign]

@@ -15,7 +15,6 @@ resume the original's current transcript instead of the snapshot.
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from omnigent.entities import NON_CONTENT_ITEM_TYPES, Agent, Conversation, ScheduledTask
@@ -25,8 +24,6 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
 )
-
-_logger = logging.getLogger(__name__)
 
 # Sent when an automation that starts from a session has no instructions of its own.
 SOURCE_RUN_OPENER = "Perform the task from this conversation again."
@@ -43,6 +40,14 @@ _NEVER_COPIED_LABEL_KEYS = frozenset(
 
 class SourceHistoryUnsupportedError(ValueError):
     """The agent's harness cannot start a session from a copied history."""
+
+
+class SourceCopyIncompleteError(RuntimeError):
+    """A session's files did not all copy; the caller deletes the partial :attr:`copy`."""
+
+    def __init__(self, copy: Conversation) -> None:
+        super().__init__("could not copy every file of the session")
+        self.copy = copy
 
 
 def run_prompt_text(task: ScheduledTask) -> str:
@@ -179,6 +184,7 @@ def copy_session(
     :returns: The new session.
     :raises HTTPException: 415 or 413, before anything is copied, when the
         deployment's attachment policy refuses a file the session holds.
+    :raises SourceCopyIncompleteError: When a file row could not be created.
     """
     from omnigent.db.utils import generate_file_id
 
@@ -214,8 +220,7 @@ def copy_session(
         created_by=created_by,
     )
     # The copy's file rows point at the source's blobs, as a fork's do, so no
-    # bytes move. Best-effort: a missing blob yields a row that 404s on read,
-    # exactly as it does in the source.
+    # bytes move. A row that fails would leave history naming a missing file.
     if file_store is not None and artifact_store is not None:
         for stored_file in source_files:
             try:
@@ -228,14 +233,8 @@ def copy_session(
                     blob_key=stored_file.blob_key or stored_file.id,
                     source_metadata=stored_file.source_metadata,
                 )
-            except Exception:
-                _logger.warning(
-                    "could not copy file %s from session %s into %s",
-                    stored_file.id,
-                    source_id,
-                    conv.id,
-                    exc_info=True,
-                )
+            except Exception as exc:
+                raise SourceCopyIncompleteError(conv) from exc
     return conv
 
 

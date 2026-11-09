@@ -115,6 +115,7 @@ from omnigent.server.scheduled.harness_settings import (
 )
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
 from omnigent.server.scheduled.source_session import (
+    SourceCopyIncompleteError,
     SourceHistoryUnsupportedError,
     carries_native_history,
     copy_session,
@@ -1911,6 +1912,10 @@ async def _copy_source_session_for_run(
         raise _CannotLaunchScheduledFire(
             str(exc.detail), error_code="source_session_incompatible"
         ) from exc
+    except SourceCopyIncompleteError as exc:
+        # The run never receives this copy, so its cleanup can't delete it.
+        await _discard_session(deps, exc.copy)
+        raise
     if task.host_id is not None:
         try:
             conv = await asyncio.to_thread(
