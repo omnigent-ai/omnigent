@@ -20,6 +20,7 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.server.auth import AuthProvider
+from omnigent.server.feature_flags import McpServerManagementGate, mcp_server_management_enabled
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
@@ -85,10 +86,15 @@ def create_mcp_tools_router(
     host_store: HostStore,
     *,
     auth_provider: AuthProvider | None = None,
+    mcp_server_management: McpServerManagementGate = False,
 ) -> APIRouter:
     router = APIRouter()
 
-    @router.post("/hosts/{host_id}/mcp-servers/tools")
+    def require_mcp_server_management() -> None:
+        if not mcp_server_management_enabled(mcp_server_management):
+            raise HTTPException(status_code=404, detail="not found")
+
+    @router.post("/hosts/{host_id}/mcp-servers/tools", response_model_exclude_unset=True)
     async def get_mcp_tools(
         request: Request, host_id: str, body: McpToolsRequest
     ) -> McpToolsResponse:
@@ -114,20 +120,21 @@ def create_mcp_tools_router(
         if result.status != "ok":
             raise HTTPException(status_code=502, detail="host MCP tools lookup failed")
         try:
-            return McpToolsResponse.model_validate(
-                {
-                    "tools": result.tools,
-                    "connection": result.connection,
-                    "truncated": result.truncated,
-                    "harness_sign_in": result.harness_sign_in,
-                }
-            )
+            fields: dict[str, Any] = {
+                "tools": result.tools,
+                "connection": result.connection,
+                "truncated": result.truncated,
+            }
+            if mcp_server_management_enabled(mcp_server_management):
+                fields["harness_sign_in"] = result.harness_sign_in
+            return McpToolsResponse.model_validate(fields)
         except ValidationError:
             raise HTTPException(
                 status_code=502, detail="host sent a malformed MCP tools reply"
             ) from None
 
     async def login_host(request: Request, host_id: str) -> HostConnection:
+        require_mcp_server_management()
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(
             resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store

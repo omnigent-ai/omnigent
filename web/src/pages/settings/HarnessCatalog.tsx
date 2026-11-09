@@ -87,12 +87,14 @@ export function HarnessCatalog({
   settings,
   host,
   family,
+  canSignInToMcpServers,
   defaultTab = "mcps",
 }: {
   header: ReactNode;
   settings: ReactNode;
   host: Host;
   family: BrandHarness;
+  canSignInToMcpServers: boolean;
   defaultTab?: CatalogKind | "settings";
 }) {
   // `?tab=settings` (the grid card's gear) opens on Settings; otherwise MCP servers.
@@ -158,6 +160,7 @@ export function HarnessCatalog({
         host={host}
         plugin={open.plugin}
         mcps={open.mcps}
+        canSignInToMcpServers={canSignInToMcpServers}
         onBack={back}
         onSkillOpen={
           contentSupported ? (name, sourceId) => setSelectedSkill({ name, sourceId }) : undefined
@@ -211,7 +214,15 @@ export function HarnessCatalog({
         </TabsList>
         <TabsContent value="settings">{settings}</TabsContent>
         <TabsContent value="mcps">
-          {ownList("mcps", own.mcps.length, <McpList host={host} servers={own.mcps} />)}
+          {ownList(
+            "mcps",
+            own.mcps.length,
+            <McpList
+              host={host}
+              servers={own.mcps}
+              canSignInToMcpServers={canSignInToMcpServers}
+            />,
+          )}
         </TabsContent>
         <TabsContent value="skills">
           {ownList(
@@ -345,12 +356,14 @@ function PluginPage({
   host,
   plugin,
   mcps,
+  canSignInToMcpServers,
   onBack,
   onSkillOpen,
 }: {
   host: Host;
   plugin: InventoryPlugin;
   mcps: InventoryMcpServer[];
+  canSignInToMcpServers: boolean;
   onBack: () => void;
   onSkillOpen?: (name: string, sourceId?: string) => void;
 }) {
@@ -402,6 +415,7 @@ function PluginPage({
           <McpList
             host={host}
             servers={mcps}
+            canSignInToMcpServers={canSignInToMcpServers}
             unavailableReason={
               plugin.enabled === false
                 ? "This plugin is disabled. Enable it in Claude Code to inspect MCP tools."
@@ -488,10 +502,12 @@ const SKILL_MARKDOWN_COMPONENTS: Components = {
 function McpList({
   host,
   servers,
+  canSignInToMcpServers,
   unavailableReason,
 }: {
   host: Host;
   servers: InventoryMcpServer[];
+  canSignInToMcpServers: boolean;
   unavailableReason?: string;
 }) {
   const [expanded, setExpanded] = useState<string[]>([]);
@@ -527,6 +543,7 @@ function McpList({
           key={server.id}
           host={host}
           server={server}
+          canSignInToMcpServers={canSignInToMcpServers}
           expanded={expanded.includes(server.id)}
           onUnavailable={() => setSupported(false)}
         />
@@ -558,21 +575,23 @@ function isHarnessSignedIn(data: McpServerTools) {
   return data.connection === "needs_auth" && data.harness_sign_in === "signed_in";
 }
 
-function mcpRowStatus(data: McpServerTools) {
-  if (isHarnessSignedIn(data)) return SIGNED_IN_STATUS;
+function mcpRowStatus(data: McpServerTools, canSignInToMcpServers: boolean) {
+  if (canSignInToMcpServers && isHarnessSignedIn(data)) return SIGNED_IN_STATUS;
   return CONNECTION_STATUS[data.connection];
 }
 
 function McpServerDetails({
   data,
   harnessLabel,
+  canSignInToMcpServers,
   onSignIn,
 }: {
   data: McpServerTools;
   harnessLabel: string;
+  canSignInToMcpServers: boolean;
   onSignIn: () => void;
 }) {
-  if (isHarnessSignedIn(data)) {
+  if (canSignInToMcpServers && isHarnessSignedIn(data)) {
     return (
       <Notice>
         Signed in through {harnessLabel}, so its sessions can use this server. Omnigent can't list
@@ -580,7 +599,11 @@ function McpServerDetails({
       </Notice>
     );
   }
-  if (data.connection === "needs_auth" && data.harness_sign_in === "available") {
+  if (
+    canSignInToMcpServers &&
+    data.connection === "needs_auth" &&
+    data.harness_sign_in === "available"
+  ) {
     return (
       <div className="my-1 flex flex-wrap items-center gap-3">
         <Notice>Sign in so {harnessLabel} sessions can use this server.</Notice>
@@ -622,11 +645,13 @@ function McpServerDetails({
 function McpRow({
   host,
   server,
+  canSignInToMcpServers,
   expanded,
   onUnavailable,
 }: {
   host: Host;
   server: InventoryMcpServer;
+  canSignInToMcpServers: boolean;
   expanded: boolean;
   onUnavailable: () => void;
 }) {
@@ -639,7 +664,7 @@ function McpRow({
     if (missingRoute) onUnavailable();
   }, [missingRoute, onUnavailable]);
   const data = query.data;
-  const status = data && mcpRowStatus(data);
+  const status = data && mcpRowStatus(data, canSignInToMcpServers);
   const queryClient = useQueryClient();
   const [signingIn, setSigningIn] = useState(false);
   const serverLabel = mcpServerDisplayName(server.name);
@@ -689,6 +714,7 @@ function McpRow({
           <McpServerDetails
             data={data}
             harnessLabel={harnessLabel}
+            canSignInToMcpServers={canSignInToMcpServers}
             onSignIn={() => setSigningIn(true)}
           />
         ) : null}

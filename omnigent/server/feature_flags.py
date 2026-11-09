@@ -30,6 +30,7 @@ class Feature(StrEnum):
     CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
+    MCP_SERVER_MANAGEMENT = "mcp_server_management"
     CANVAS = "canvas"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
@@ -127,6 +128,14 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.11.0",
     ),
     FeatureDefinition(
+        feature=Feature.MCP_SERVER_MANAGEMENT,
+        description="Manage harness MCP servers from Settings (sign-in; later on/off)",
+        owner="onboarding",
+        review_by_release="0.24.0",
+        frontend_visible=True,
+        default_enabled=False,
+    ),
+    FeatureDefinition(
         feature=Feature.CANVAS,
         description="Web Canvas page: sessions as draggable cards grouped by project",
         owner="web",
@@ -203,6 +212,7 @@ class FeatureFlags:
 # A deployment's per-request gate: a static bool, or a callable read on each request.
 DeploymentGate = bool | Callable[[], bool]
 HarnessInstallGate = DeploymentGate
+McpServerManagementGate = DeploymentGate
 
 
 def deployment_gate_enabled(gate: DeploymentGate, name: str) -> bool:
@@ -217,6 +227,11 @@ def deployment_gate_enabled(gate: DeploymentGate, name: str) -> bool:
 def harness_install_enabled(gate: HarnessInstallGate) -> bool:
     """Resolve the harness-install gate for the current request."""
     return deployment_gate_enabled(gate, "harness_install")
+
+
+def mcp_server_management_enabled(gate: McpServerManagementGate) -> bool:
+    """Resolve the MCP-server-management gate for the current request."""
+    return deployment_gate_enabled(gate, "mcp_server_management")
 
 
 def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFlags:

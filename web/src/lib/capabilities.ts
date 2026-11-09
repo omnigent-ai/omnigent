@@ -62,6 +62,7 @@ export type FeatureKey =
   | "sandbox_profiles"
   | "usage_page"
   | "harness_install"
+  | "mcp_server_management"
   | "canvas"
   | "arca_shutdown_warnings"
   | "import_review"

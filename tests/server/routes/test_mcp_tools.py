@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from unittest.mock import AsyncMock
 
 import httpx
@@ -23,6 +24,7 @@ from omnigent.host.frames import (
     decode_host_frame,
 )
 from omnigent.host.mcp_login import CALLBACK_TIMEOUT_SECONDS, START_TIMEOUT_SECONDS
+from omnigent.server.feature_flags import McpServerManagementGate
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes import _host_launch
 from omnigent.server.routes import mcp_tools as mcp_tools_routes
@@ -61,14 +63,21 @@ def _register(registry: HostRegistry, *capabilities: str) -> HostConnection:
     )
 
 
-@pytest.fixture
-def tools_app(db_uri: str) -> tuple[FastAPI, HostRegistry, HostStore]:
+def _make_tools_app(
+    db_uri: str, mcp_server_management: McpServerManagementGate
+) -> tuple[FastAPI, HostRegistry, HostStore]:
     registry = HostRegistry()
     hosts = HostStore(db_uri)
     hosts.upsert_on_connect(_HOST_ID, "laptop", "owner")
     app = FastAPI()
     app.include_router(
-        create_mcp_tools_router(registry, hosts, auth_provider=_Auth()), prefix="/v1"
+        create_mcp_tools_router(
+            registry,
+            hosts,
+            auth_provider=_Auth(),
+            mcp_server_management=mcp_server_management,
+        ),
+        prefix="/v1",
     )
 
     @app.exception_handler(OmnigentError)
@@ -81,8 +90,17 @@ def tools_app(db_uri: str) -> tuple[FastAPI, HostRegistry, HostStore]:
     return app, registry, hosts
 
 
+@pytest.fixture
+def tools_app(db_uri: str) -> tuple[FastAPI, HostRegistry, HostStore]:
+    return _make_tools_app(db_uri, True)
+
+
 def _client(app: FastAPI) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+def _broken_gate() -> bool:
+    raise RuntimeError("gate unavailable")
 
 
 @pytest.mark.parametrize(
@@ -131,6 +149,33 @@ async def test_owner_gets_mcp_tools(
             "harness_sign_in": result.harness_sign_in,
         }
     assert not conn.pending_mcp_tools
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [False, pytest.param(lambda: False, id="callable-false")],
+)
+async def test_disabled_management_omits_harness_sign_in(
+    db_uri: str, gate: bool | Callable[[], bool]
+) -> None:
+    app, registry, _ = _make_tools_app(db_uri, gate)
+    conn = _register(registry, CAP_MCP_TOOLS)
+    async with _client(app) as client:
+        task = asyncio.create_task(client.post(_URL, json=_REQUEST, headers=_OWNER))
+        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
+        assert isinstance(frame, HostMcpToolsFrame)
+        conn.pending_mcp_tools[frame.request_id].set_result(
+            HostMcpToolsResultFrame(
+                frame.request_id,
+                "ok",
+                tools=[],
+                connection="needs_auth",
+                harness_sign_in="available",
+            )
+        )
+        response = await task
+    assert response.status_code == 200
+    assert "harness_sign_in" not in response.json()
 
 
 @pytest.mark.parametrize("user,status", [("stranger", 403), (None, 401)])
@@ -235,6 +280,38 @@ _PENDING = {
     "authorization_url": "https://auth.example.test/authorize?redirect_uri=x",
     "error": None,
 }
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("POST", "", {"harness": "claude", "server": "linear"}),
+        ("GET", "/abc", None),
+        ("POST", "/abc/callback", {"callback_url": "http://localhost:1/callback?code=c"}),
+        ("DELETE", "/abc", None),
+    ],
+)
+@pytest.mark.parametrize(
+    "gate",
+    [
+        False,
+        pytest.param(lambda: False, id="callable-false"),
+        pytest.param(_broken_gate, id="raises"),
+    ],
+)
+async def test_disabled_management_hides_login_routes(
+    db_uri: str,
+    gate: bool | Callable[[], bool],
+    method: str,
+    path: str,
+    body: dict | None,
+) -> None:
+    app, registry, _ = _make_tools_app(db_uri, gate)
+    conn = _register(registry, CAP_MCP_LOGIN)
+    async with _client(app) as client:
+        response = await client.request(method, _LOGIN_URL + path, json=body, headers=_OWNER)
+    assert response.status_code == 404
+    assert conn.outbound_queue.empty()
 
 
 async def _answer_login(

@@ -559,6 +559,50 @@ async def test_info_harness_install_gate_overrides_feature_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_info_mcp_server_management_gate_overrides_feature_snapshot(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", "mcp_server_management")
+    env_app = _build_branding_app(db_uri, tmp_path, "mcp-management-env")
+    static_off_app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "mcp-management-off",
+        mcp_server_management=False,
+    )
+    values = iter([True, False])
+    callable_app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "mcp-management-callable",
+        mcp_server_management=lambda: next(values),
+    )
+
+    async def info(app: FastAPI) -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            return (await client.get("/v1/info")).json()
+
+    env_info = await info(env_app)
+    assert env_info["features"]["mcp_server_management"] is True
+
+    off_info = await info(static_off_app)
+    assert off_info["features"]["mcp_server_management"] is False
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=callable_app), base_url="http://test"
+    ) as client:
+        first = (await client.get("/v1/info")).json()
+        second = (await client.get("/v1/info")).json()
+    assert first["features"]["mcp_server_management"] is True
+    assert second["features"]["mcp_server_management"] is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("server_config", "create_app_kwargs", "expected"),
     [

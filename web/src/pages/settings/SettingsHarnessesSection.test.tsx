@@ -151,11 +151,15 @@ vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
 // The "Set up" button is gated on the harness_install feature (like New Chat),
 // so drive that flag through the server-info mock.
 let harnessInstall = true;
+let mcpServerManagement = true;
 let databricksFeatures = true;
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     databricks_features: databricksFeatures,
-    features: { harness_install: harnessInstall },
+    features: {
+      harness_install: harnessInstall,
+      mcp_server_management: mcpServerManagement,
+    },
     installable_harnesses: [
       "claude-native",
       "codex-native",
@@ -275,6 +279,7 @@ afterEach(() => {
   hosts = [];
   inventory = INVENTORY;
   harnessInstall = true;
+  mcpServerManagement = true;
   databricksFeatures = true;
   fixDialogProps.mockReset();
   signInDialogProps.mockClear();
@@ -1348,6 +1353,24 @@ it("offers the harness sign-in for a server that needs it", () => {
   expect(invalidate).toHaveBeenCalledWith({
     queryKey: ["mcp-tools", ONLINE.host_id, "claude", "linear", "toolkit", undefined],
   });
+});
+
+it("hides cached harness sign-in state when MCP management is disabled", () => {
+  hosts = [ONLINE];
+  mcpServerManagement = false;
+  mcpResult = {
+    data: { tools: [], connection: "needs_auth", truncated: false, harness_sign_in: "available" },
+    isPending: false,
+  };
+  renderHarnesses("claude-native");
+  fireEvent.click(screen.getByTestId("catalog-row-linear"));
+  expect(screen.getByRole("status").textContent).toBe("Needs auth");
+  expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+  expect(
+    screen.getByText(
+      "Authentication required. Harness sign-in credentials cannot be reused for this probe.",
+    ),
+  ).toBeTruthy();
 });
 
 it("signs in to the installed plugin MCP the user chose", () => {

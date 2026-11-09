@@ -126,6 +126,7 @@ export const SettingsHarnessesSection = () => {
   // it off the setup dialog has no runnable install step, so we show status
   // only (no button that opens a dead-end dialog).
   const canSetup = isFeatureEnabled(info, "harness_install");
+  const canManageMcpServers = isFeatureEnabled(info, "mcp_server_management");
 
   // Online hosts first, then offline (disabled in the menu). Default the
   // selection to the first online host; the picker can override.
@@ -176,6 +177,7 @@ export const SettingsHarnessesSection = () => {
           entry={detail}
           host={selectedHost}
           canSetup={canSetup}
+          canManageMcpServers={canManageMcpServers}
           installable={harnessInstallableOnHost(info, detail.harness, selectedHost)}
           credentialKind={
             selectedHost
@@ -625,6 +627,7 @@ function HarnessDetail({
   entry,
   host,
   canSetup,
+  canManageMcpServers,
   installable,
   credentialKind,
   readyNotice,
@@ -633,6 +636,7 @@ function HarnessDetail({
   entry: HarnessEntry;
   host: Host | null;
   canSetup: boolean;
+  canManageMcpServers: boolean;
   installable: boolean;
   credentialKind?: HarnessCredentialKind;
   readyNotice: {
@@ -755,6 +759,7 @@ function HarnessDetail({
         settings={settings}
         host={host}
         family={family}
+        canSignInToMcpServers={canManageMcpServers}
         defaultTab={status.ready ? "mcps" : "settings"}
       />
     );
