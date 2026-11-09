@@ -110,6 +110,8 @@ import {
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { applyJournalEntry } from "@/hooks/useSessionJournal";
+import { isFirstPlan } from "@/lib/sessionJournal";
+import { showTasksTabForNewPlan } from "@/store/sessionTasksActions";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
@@ -9493,8 +9495,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }
       return;
     case "session_journal_appended":
-      // A new journal entry for the Activity tab; the cache drops duplicates by ID.
+      // A new journal entry for the Tasks tab; the cache drops duplicates by ID.
       if (queryClient) applyJournalEntry(queryClient, event.conversationId, event.entry);
+      // The agent's first plan, arriving while its session is on screen, opens the tab.
+      if (
+        isFirstPlan(event.entry) &&
+        event.conversationId === useChatStore.getState().conversationId
+      ) {
+        showTasksTabForNewPlan(event.conversationId);
+      }
       return;
     case "session_changed_files_invalidated":
       // Coarse "something changed" signal. Coalesce bursts into one

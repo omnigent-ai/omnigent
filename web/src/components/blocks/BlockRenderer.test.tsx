@@ -1554,6 +1554,46 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Called 2 tools")).toBeDefined();
     });
 
+    describe("task markers", () => {
+      const marker = (entryId: string, status: string, name: string): RenderItem => ({
+        kind: "subagent_activity",
+        itemId: `item_${entryId}`,
+        data: {
+          type: "resource_event",
+          event_type: "session.journal.task",
+          resource_type: "journal",
+          resource_id: "hello",
+          resource: { name, status, text: null, entry_id: entryId, native: false },
+        },
+      });
+
+      it("keeps a settled turn's task markers in view instead of folding its work", () => {
+        render(
+          <MemoryRouter>
+            <BlockRenderer
+              items={[
+                tool(1, "sys_journal_write_status"),
+                marker("e1", "started", "Say hello"),
+                tool(2, "sys_journal_write_status"),
+                marker("e2", "done", "Say hello"),
+                { kind: "text", itemId: "m1", text: "Said hello.", final: true },
+              ]}
+              sessionStatus="idle"
+              workedForS={9}
+            />
+          </MemoryRouter>,
+        );
+        expect(screen.queryByRole("button", { name: "Worked for 9s" })).toBeNull();
+        expect(screen.getAllByTestId("task-activity").map((node) => node.textContent)).toEqual([
+          "Started Say hello",
+          "Completed Say hello",
+        ]);
+        // The tool calls behind each marker stay in their own group.
+        expect(screen.getAllByText("Called 1 tool")).toHaveLength(2);
+        expect(screen.getByText("Said hello.")).toBeDefined();
+      });
+    });
+
     describe("sub-agent notices", () => {
       const notice = (itemId: string, phase: "delegated" | "returned"): RenderItem => ({
         kind: "subagent_activity",

@@ -10,6 +10,7 @@
 
 import { useCallback, useMemo, useState } from "react";
 import { releaseConversationScrollLock } from "@/components/ai-elements/conversation";
+import { findMessageElement } from "@/lib/messageDeepLink";
 import { useChatStore } from "@/store/chatStore";
 
 export interface UserMessageNav {
@@ -20,8 +21,10 @@ export interface UserMessageNav {
 }
 
 // How long the scroll must stay quiet before we treat the smooth-scroll as
-// finished and fire the flash.
+// finished and fire the flash, where nothing reports the target in view sooner.
 const SCROLL_SETTLE_MS = 120;
+// How much of the target must be in view for the flash to start with the scroll.
+const FLASH_IN_VIEW_RATIO = 0.5;
 // Absolute cap so a flash always happens even if scroll events never settle.
 const SCROLL_SETTLE_MAX_MS = 1200;
 
@@ -55,7 +58,7 @@ export function scrollToMessage(
   // on the next frame, so retry the DOM lookup + centering scroll there.
   const scrolledIntoWindow = ensureVisible?.(messageId) ?? false;
   const el =
-    document.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`) ??
+    findMessageElement(messageId) ??
     document.querySelector(`[data-user-message-id="${CSS.escape(messageId)}"]`);
   if (!el) {
     if (scrolledIntoWindow) {
@@ -84,17 +87,36 @@ export function scrollToMessage(
   // to completion on its own.
   if (!flash) return;
 
-  // Defer the flash until the smooth-scroll settles. On a long jump the
-  // highlight would otherwise burn out before the message is on screen.
-  const scroller: EventTarget = getScrollParent(el) ?? window;
+  // Defer the flash until the message is on screen: as it comes into view, so
+  // the highlight lands with the scroll, or else once the smooth-scroll
+  // settles. On a long jump it would otherwise burn out before it arrives.
+  const scrollParent = getScrollParent(el);
+  const scroller: EventTarget = scrollParent ?? window;
   let settleTimer = 0;
   let maxTimer = 0;
   let done = false;
+  const target = el;
+  const inView =
+    typeof IntersectionObserver === "undefined"
+      ? null
+      : new IntersectionObserver(
+          (records) => {
+            const arrived = records.some(
+              (record) =>
+                record.target === target &&
+                record.isIntersecting &&
+                record.intersectionRatio >= FLASH_IN_VIEW_RATIO,
+            );
+            if (arrived) finish();
+          },
+          { root: scrollParent, threshold: FLASH_IN_VIEW_RATIO },
+        );
 
   function cleanup(): void {
     window.clearTimeout(settleTimer);
     window.clearTimeout(maxTimer);
     scroller.removeEventListener("scroll", onScroll);
+    inView?.disconnect();
     if (cancelPendingFlash === cleanup) cancelPendingFlash = null;
   }
 
@@ -112,6 +134,7 @@ export function scrollToMessage(
 
   cancelPendingFlash = cleanup;
   scroller.addEventListener("scroll", onScroll, { passive: true });
+  inView?.observe(target);
   // First timer doubles as the "already in view, nothing scrolled" fast path;
   // each scroll event reschedules it while the smooth-scroll is in motion.
   settleTimer = window.setTimeout(finish, SCROLL_SETTLE_MS);

@@ -7,6 +7,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   CheckIcon,
+  ChevronRightIcon,
   ListChecksIcon,
   Loader2Icon,
   MessageCircleQuestionMarkIcon,
@@ -35,6 +36,9 @@ import {
   type StepProgress,
   type StepState,
 } from "@/lib/sessionJournal";
+import { messageDeepLinkParams } from "@/lib/messageDeepLink";
+import { useSearchParams } from "@/lib/routing";
+import { taskMarkerTarget } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 
@@ -398,14 +402,17 @@ function StepRow({
   entries,
   names,
   flash,
+  onShowInChat,
 }: {
   item: StepProgress;
   number: number;
   last: boolean;
   entries: readonly JournalEntry[];
   names: ReadonlyMap<string, string>;
-  /** True for a moment after a click on its progress segment. */
+  /** True for a moment after a click on its progress segment or its chat marker. */
   flash: boolean;
+  /** Scroll the chat to a marker, e.g. ``journal-<entry id>``. */
+  onShowInChat: (markerId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const detail = stepDetail(item);
@@ -415,19 +422,21 @@ function StepRow({
     item.state === "needs_input" ||
     item.state === "failed" ||
     item.state === "blocked";
+  // A click goes to the task's marker in the chat; one that hasn't started has none.
+  const markerId = taskMarkerTarget(item);
   // The agent's own tasks have no history to open.
-  const expandable = !item.native;
+  const hasHistory = !item.native;
+  const tint = flash
+    ? "bg-session-active/12"
+    : item.state === "running"
+      ? "bg-session-active/[0.06]"
+      : item.state === "needs_input"
+        ? "bg-brand-accent/[0.06]"
+        : undefined;
   const rowClassName = cn(
-    "grid w-full grid-cols-[18px_minmax(0,1fr)_auto] items-start gap-x-3 rounded-lg px-2 py-1.5 text-left transition-colors duration-500",
-    expandable &&
-      "cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
-    flash
-      ? "bg-session-active/12"
-      : item.state === "running"
-        ? cn("bg-session-active/[0.06]", expandable && "hover:bg-session-active/10")
-        : item.state === "needs_input"
-          ? cn("bg-brand-accent/[0.06]", expandable && "hover:bg-brand-accent/10")
-          : expandable && "hover:bg-muted/50",
+    "grid min-w-0 flex-1 grid-cols-[18px_minmax(0,1fr)_auto] items-start gap-x-3 rounded-lg px-2 py-1.5 text-left",
+    markerId &&
+      "cursor-pointer hover:bg-foreground/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
   );
   const content = (
     <>
@@ -469,18 +478,36 @@ function StepRow({
           className="absolute top-[31px] -bottom-[5px] left-[16.5px] w-px bg-border"
         />
       )}
-      {expandable ? (
-        <button
-          type="button"
-          aria-expanded={open}
-          onClick={() => setOpen((value) => !value)}
-          className={rowClassName}
-        >
-          {content}
-        </button>
-      ) : (
-        <div className={rowClassName}>{content}</div>
-      )}
+      <div className={cn("flex items-start rounded-lg transition-colors duration-500", tint)}>
+        {markerId ? (
+          <button
+            type="button"
+            onClick={() => onShowInChat(markerId)}
+            className={rowClassName}
+            title="Show in the chat"
+            data-testid="tasks-row-show-in-chat"
+          >
+            {content}
+          </button>
+        ) : (
+          <div className={rowClassName}>{content}</div>
+        )}
+        {hasHistory && (
+          <button
+            type="button"
+            aria-expanded={open}
+            aria-label={`${open ? "Hide" : "Show"} ${item.step.name} history`}
+            onClick={() => setOpen((value) => !value)}
+            className="mt-1.5 mr-1 shrink-0 cursor-pointer rounded-md p-1 text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            data-testid="tasks-row-history"
+          >
+            <ChevronRightIcon
+              aria-hidden
+              className={cn("size-4 transition-transform", open && "rotate-90")}
+            />
+          </button>
+        )}
+      </div>
       {(item.note || open) && (
         <div className="pr-2 pl-[38px]">
           {open ? (
@@ -704,11 +731,13 @@ function TaskList({
   entries,
   names,
   flashStep,
+  onShowInChat,
 }: {
   progress: readonly StepProgress[];
   entries: readonly JournalEntry[];
   names: ReadonlyMap<string, string>;
   flashStep: string | null;
+  onShowInChat: (markerId: string) => void;
 }) {
   return (
     <section aria-label="Tasks">
@@ -722,6 +751,7 @@ function TaskList({
             entries={entries}
             names={names}
             flash={flashStep === item.step.id}
+            onShowInChat={onShowInChat}
           />
         ))}
       </ol>
@@ -758,10 +788,13 @@ export function TasksPanel({
   conversationId,
   active,
   onStartWorkflow,
+  onShowInChat,
 }: {
   conversationId: string;
   active: boolean;
   onStartWorkflow?: () => void;
+  /** Called before a task's click scrolls the chat to it, e.g. to close a phone's drawer. */
+  onShowInChat?: () => void;
 }) {
   const tasks = useSessionTasks(conversationId, active);
   const { journal, plan, progress } = tasks;
@@ -788,6 +821,22 @@ export function TasksPanel({
     const timer = window.setTimeout(() => setFlashStep(null), 1400);
     return () => window.clearTimeout(timer);
   }, [flashStep]);
+  // A click on a task's chat marker asks for its row once the tab shows.
+  const taskToShow = useSessionTasksActions((state) => state.taskToShow);
+  useEffect(() => {
+    if (!active || !showPlan || taskToShow?.conversationId !== conversationId) return;
+    useSessionTasksActions.setState({ taskToShow: null });
+    // The rail or drawer may still be opening; its rows mount by the next frame.
+    requestAnimationFrame(() => jumpToStep(taskToShow.stepId));
+  }, [active, showPlan, taskToShow, conversationId, jumpToStep]);
+  const [, setSearchParams] = useSearchParams();
+  const showInChat = useCallback(
+    (markerId: string) => {
+      onShowInChat?.();
+      setSearchParams((current) => messageDeepLinkParams(current, markerId), { replace: true });
+    },
+    [onShowInChat, setSearchParams],
+  );
 
   return (
     <div
@@ -858,6 +907,7 @@ export function TasksPanel({
                   entries={entries}
                   names={names}
                   flashStep={flashStep}
+                  onShowInChat={showInChat}
                 />
               </>
             )}

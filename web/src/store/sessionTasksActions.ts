@@ -5,6 +5,10 @@ interface SessionTasksActionsState {
   startWorkflow: Readonly<Record<string, () => void>>;
   /** A session whose Tasks tab should open; the shell clears it once open. */
   tasksTabToOpen: string | null;
+  /** The task the Tasks tab should scroll to and highlight; the tab clears it once shown. */
+  taskToShow: { conversationId: string; stepId: string } | null;
+  /** True when the agent, not a click, asked for the tab: a phone's drawer then stays shut. */
+  tasksTabAutoOpen: boolean;
 }
 
 /**
@@ -15,6 +19,8 @@ interface SessionTasksActionsState {
 export const useSessionTasksActions = create<SessionTasksActionsState>(() => ({
   startWorkflow: {},
   tasksTabToOpen: null,
+  taskToShow: null,
+  tasksTabAutoOpen: false,
 }));
 
 /**
@@ -37,7 +43,24 @@ export function registerStartWorkflow(conversationId: string, start: () => void)
     });
 }
 
-/** Ask the shell to show a session's Tasks tab: the rail, or the drawer on a phone. */
-export function openTasksTab(conversationId: string): void {
-  useSessionTasksActions.setState({ tasksTabToOpen: conversationId });
+/**
+ * Ask the shell to show a session's Tasks tab: the rail, or the drawer on a phone.
+ *
+ * @param stepId - A task to scroll to and highlight there, e.g. from its chat marker.
+ */
+export function openTasksTab(conversationId: string, stepId?: string): void {
+  useSessionTasksActions.setState({
+    tasksTabToOpen: conversationId,
+    taskToShow: stepId ? { conversationId, stepId } : null,
+    tasksTabAutoOpen: false,
+  });
+}
+
+/** The agent made the session's first plan: show its Tasks tab beside the chat, not over it on a phone. */
+export function showTasksTabForNewPlan(conversationId: string): void {
+  useSessionTasksActions.setState({
+    tasksTabToOpen: conversationId,
+    taskToShow: null,
+    tasksTabAutoOpen: true,
+  });
 }

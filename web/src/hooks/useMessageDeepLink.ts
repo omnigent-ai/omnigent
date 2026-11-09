@@ -4,7 +4,11 @@
 
 import { useEffect, useRef } from "react";
 import { useSearchParams } from "@/lib/routing";
-import { MESSAGE_QUERY_PARAM, findMessageElement } from "@/lib/messageDeepLink";
+import {
+  MESSAGE_QUERY_PARAM,
+  MESSAGE_REQUEST_PARAM,
+  findMessageElement,
+} from "@/lib/messageDeepLink";
 import { scrollToMessage } from "@/hooks/useUserMessageNav";
 import { useChatStore } from "@/store/chatStore";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
@@ -13,6 +17,7 @@ import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 export function useMessageDeepLinkChatView(conversationId: string | null): void {
   const [searchParams] = useSearchParams();
   const messageId = searchParams.get(MESSAGE_QUERY_PARAM);
+  const request = searchParams.get(MESSAGE_REQUEST_PARAM) ?? "";
   const terminalFirst = useTerminalFirst();
   const showTerminal = terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal";
   const setView = terminalFirst?.setView;
@@ -24,11 +29,11 @@ export function useMessageDeepLinkChatView(conversationId: string | null): void 
       return;
     }
     if (loadingConversation) return;
-    const key = `${conversationId}:${messageId}`;
+    const key = `${conversationId}:${messageId}:${request}`;
     if (appliedKeyRef.current === key) return;
     appliedKeyRef.current = key;
     if (showTerminal) setView?.("chat");
-  }, [conversationId, messageId, loadingConversation, showTerminal, setView]);
+  }, [conversationId, messageId, request, loadingConversation, showTerminal, setView]);
 }
 
 interface MessageDeepLinkOptions {
@@ -45,6 +50,7 @@ export function useMessageDeepLink(
 ): void {
   const [searchParams] = useSearchParams();
   const messageId = searchParams.get(MESSAGE_QUERY_PARAM);
+  const request = searchParams.get(MESSAGE_REQUEST_PARAM) ?? "";
   const terminalFirst = useTerminalFirst();
   const showTerminal = terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal";
   const loadingConversation = useChatStore((s) => s.loadingConversation);
@@ -59,7 +65,7 @@ export function useMessageDeepLink(
       appliedKeyRef.current = null;
       return;
     }
-    const key = `${conversationId}:${messageId}`;
+    const key = `${conversationId}:${messageId}:${request}`;
     if (appliedKeyRef.current === key) return;
     if (!ready || showTerminal || loadingConversation || loadingMoreHistory) return;
 
@@ -78,6 +84,7 @@ export function useMessageDeepLink(
   }, [
     conversationId,
     messageId,
+    request,
     ready,
     showTerminal,
     loadingConversation,

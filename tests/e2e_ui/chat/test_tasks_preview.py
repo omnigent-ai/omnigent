@@ -13,6 +13,7 @@ full-state list until the live SSE subscription catches it.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 
@@ -144,3 +145,43 @@ def test_tasks_preview_opens_tasks_tab_tracks_updates_and_clears(
         [],
         lambda: expect(preview).to_have_count(0, timeout=3_000),
     )
+
+
+def test_task_markers_and_the_tasks_tab_link_both_ways(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The server marks the chat where the agent's own tasks start and finish;
+    a marker's task opens the Tasks tab at its row, and a row scrolls the chat
+    back to its marker.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    # From an empty list, one task completed and one started: a marker each.
+    _publish_todos(base_url, session_id, _PLAN)
+    page.goto(f"{base_url}/c/{session_id}")
+    markers = page.locator('[data-testid="task-activity"]')
+    expect(markers).to_have_count(2, timeout=15_000)
+    expect(markers.nth(0)).to_have_text("Completed Read the code")
+    expect(markers.nth(1)).to_have_text("Started Write the tracker")
+
+    # Marker to tab: the task's name opens the Tasks tab, highlighting its row.
+    markers.nth(1).get_by_role("button", name="Write the tracker").click()
+    panel = page.locator(_TASKS_PANEL)
+    expect(panel).to_be_visible(timeout=10_000)
+    row = panel.locator('[data-testid="tasks-row"]').nth(1)
+    expect(row).to_have_attribute("data-flash", "true", timeout=5_000)
+
+    # Tab to chat: a finished task's row scrolls the chat to where it ended.
+    panel.locator('[data-testid="tasks-row"]').nth(0).get_by_test_id(
+        "tasks-row-show-in-chat"
+    ).click()
+    expect(page).to_have_url(re.compile(r"[?&]message=todo-task-1-done"), timeout=5_000)
+    expect(markers.nth(0)).to_be_in_viewport(timeout=5_000)
+    # A task not started yet has no marker, so its row doesn't link.
+    expect(
+        panel.locator('[data-testid="tasks-row"]').nth(2).get_by_test_id("tasks-row-show-in-chat")
+    ).to_have_count(0)

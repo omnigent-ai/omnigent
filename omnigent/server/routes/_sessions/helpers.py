@@ -130,6 +130,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
 )
+from omnigent.server.journal_markers import record_todo_markers
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
     ManagedHostLaunch,
@@ -3149,11 +3150,14 @@ async def _handle_external_session_todos(
         validated = validate_session_todos(todos)
     except ValueError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    previous = list(conversation.session_todos) if conversation is not None else []
     persisted = await asyncio.to_thread(
         conversation_store.set_session_todos, session_id, validated
     )
     if not persisted:
         return
+    await record_todo_markers(conversation_store, session_id, previous, validated)
     event = SessionTodosEvent(
         type="session.todos",
         conversation_id=session_id,

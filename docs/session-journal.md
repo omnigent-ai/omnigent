@@ -118,9 +118,35 @@ with tasks the agent could still run says "Stopped" ("Run ended" after an
 automation run), so it never looks about to run. A summary line and a strip
 count the tasks in each state, and stay at the top as you scroll: hover a
 segment of the strip for that task's status, or click it to jump to the task. When the agent replans, the new
-tasks simply appear. Click a plan's task for what it waits on, its goal and its
+tasks simply appear. A task's chevron opens what it waits on, its goal and its
 history: each status and note, oldest first. Tasks from the agent's own list
 show only their name and state.
+
+### Tasks in the chat
+
+The chat marks where each task starts and ends, in the same form as a
+sub-agent's start and end: "Started", "Completed", "Failed", "Blocked" or
+"Waiting for you on", then the task's name. Each plan the agent writes adds one
+line too, such as "Made a plan: Cut GET /orders p95 by 20% · 5 tasks" or
+"Updated the plan: added Pre-warm the pool, removed Overlap the check". Tasks
+from the agent's own list get Started and Completed.
+
+The two link to each other. Clicking a marker's task opens the Tasks tab
+scrolled to it, and clicking the plan line opens the tab. Clicking a task in
+the tab scrolls the chat to its newest start while it runs, or to where it
+ended, loading older history if needed; a task that hasn't started has no
+marker yet. A task the agent drops from its plan leaves the tab, and its
+markers stay in the chat but no longer link; hovering one says so.
+
+The server writes the markers into the transcript (`resource_event` items
+whose `event_type` is `session.journal.task` or `session.journal.plan`) when
+the journal accepts a status or a plan, or when the agent's own list changes.
+A retried write adds no second marker, and sessions from before markers have
+none.
+
+When the agent writes the session's first plan while you're watching, the
+Tasks tab opens beside the chat; on phones the drawer stays closed so the chat
+stays in view.
 
 Notes that aren't about one task appear under Notes. With no tasks yet, the
 tab links to starting a workflow, the same as **Run a workflow** in the

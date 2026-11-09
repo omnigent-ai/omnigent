@@ -35,6 +35,7 @@ from omnigent.entities.session_journal import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
+from omnigent.server.journal_markers import record_plan_marker, record_status_marker
 from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
 from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
@@ -226,6 +227,28 @@ def create_session_journal_router(
             raise OmnigentError(f"step_not_ready: {exc}", code=ErrorCode.CONFLICT) from exc
         except InvalidJournalEntryError as exc:
             raise OmnigentError(f"invalid_entry: {exc}", code=ErrorCode.INVALID_INPUT) from exc
+        await _mark_in_chat(store, session.id, appended.entry)
         return entry_to_response(appended.entry)
+
+    async def _mark_in_chat(
+        store: SessionJournalStore, session_id: str, entry: JournalEntry
+    ) -> None:
+        # Every attempt writes its marker: a retry after a failed first marker
+        # adds it, and the marker's stable ID keeps it to one.
+        if entry.kind not in ("status", "plan"):
+            return
+        try:
+            page = await asyncio.to_thread(
+                store.list_entries, session_id, kind="plan", order="desc", after=entry.id, limit=1
+            )
+            earlier_plan = page.entries[0] if page.entries else None
+            if entry.kind == "status":
+                await record_status_marker(conversation_store, session_id, entry, earlier_plan)
+            else:
+                await record_plan_marker(conversation_store, session_id, entry, earlier_plan)
+        except Exception:  # markers are display metadata; the write already succeeded
+            _logger.warning(
+                "Could not mark %s in the chat of %s", entry.id, session_id, exc_info=True
+            )
 
     return router

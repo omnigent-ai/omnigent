@@ -117,6 +117,11 @@ export function noteBody(entry: JournalEntry): string {
   return typeof entry.payload.body === "string" ? entry.payload.body : "";
 }
 
+/** Whether *entry* is the session's first plan, which the agent writes when it starts a workflow. */
+export function isFirstPlan(entry: JournalEntry): boolean {
+  return entry.kind === "plan" && entry.payload.version === 1;
+}
+
 /** The newest plan among the entries, which are in position order. */
 export function currentPlan(entries: readonly JournalEntry[]): JournalEntry | null {
   return entries.findLast((entry) => entry.kind === "plan") ?? null;
@@ -271,6 +276,8 @@ export function sessionNotes(entries: readonly JournalEntry[]): JournalEntry[] {
 
 /** One item of the agent's own task list, as its harness reports it (e.g. Claude's tasks). */
 export interface NativeTask {
+  /** The harness's own ID for the task (Claude's task IDs); absent for Codex's plan. */
+  id?: string;
   content: string;
   status: "pending" | "in_progress" | "completed";
   activeForm: string;
@@ -292,7 +299,7 @@ export function nativeTaskProgress(
       state = awaitingUser ? "needs_input" : sessionWorking ? "running" : "stopped";
     }
     return {
-      step: { id: `task-${index + 1}`, name: task.content, goal: null, depends_on: [] },
+      step: { id: task.id ?? `task-${index + 1}`, name: task.content, goal: null, depends_on: [] },
       state,
       status: null,
       startedAt: null,
