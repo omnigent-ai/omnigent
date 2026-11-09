@@ -29,6 +29,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import pending_inputs
+from omnigent.server import session_live_state
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.scheduled.telemetry import (
     current_fire_stage,
@@ -728,6 +729,26 @@ class ManagedStartupInputs:
                 else "not_sent",
                 exception_type=type(exc).__name__,
             )
+            harness_refusal = (
+                isinstance(exc, OmnigentError)
+                and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
+                and not (context and context.submitted)
+            )
+            if harness_refusal:
+                if (scheduled_run := current_scheduled_run()) is not None:
+                    session_live_state.persist_scheduled_run_completion(
+                        session_id,
+                        "failed",
+                        error_code=ErrorCode.HARNESS_NOT_CONFIGURED,
+                        error=str(exc)[:1000],
+                        run_id=scheduled_run.run_id,
+                    )
+                _logger.warning(
+                    "Saved message for session %s is waiting for harness setup: %s",
+                    session_id,
+                    exc,
+                )
+                return
             _logger.exception("Unable to deliver saved message for session %s", session_id)
             uncertain = bool(context and context.submitted)
             await self._report_failure(
