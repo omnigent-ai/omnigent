@@ -877,12 +877,27 @@ describe("system dictation request", () => {
     t.after(harness.cleanup);
     harness.api.registerIpc();
 
-    assert.equal(
-      await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.pinned),
-      true,
+    const started = harness.ipcHandlers.get("omnigent:start-system-dictation")(
+      harness.events.pinned,
     );
     assert.equal(harness.calls.webContentsFocuses, 1);
+    // macOS must register the refocused field first, so Dictation starts after a pause.
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+    assert.equal(await started, true);
     assert.deepEqual(harness.calls.firstResponderActions, ["startDictation:"]);
+  });
+
+  it("doesn't start when the window loses focus during the pause", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    const started = harness.ipcHandlers.get("omnigent:start-system-dictation")(
+      harness.events.pinned,
+    );
+    harness.setFocusedWindow(null);
+    assert.equal(await started, false);
+    assert.deepEqual(harness.calls.firstResponderActions, []);
   });
 
   it("refuses a page off the pinned server", async (t) => {
