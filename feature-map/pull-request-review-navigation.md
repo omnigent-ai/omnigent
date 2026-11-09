@@ -202,9 +202,8 @@ Component coverage for these helpers and views lives in
   clearing that filter first and showing `Filter cleared to show <file>`. Other
   conversations on hidden files stay hidden with their files.
 - **Known rough edges.** Marking a file while Hide viewed is on removes it from the
-  list and drops keyboard focus. Marks made in another tab on the same head show as
-  checked but do not collapse the file until the Changes view remounts (for example
-  after a reload) or the head changes.
+  list and drops keyboard focus. Marks made in another tab on the same head check the
+  file and collapse it, as a mark made here does.
 - **Commits need GitHub and a current server.** GitLab and Azure DevOps show Changes
   only. If the Omnigent server predates the commit view, the switch disappears for that
   pull request and the toast `Commits need an updated Omnigent server.` appears.

@@ -699,14 +699,19 @@ export function PullRequestChangesTab({
     },
     [viewedFiles, collapseMarked],
   );
-  // Marks another tab stores arrive as storage events. Only a newly viewed file collapses here, so
-  // a file the reader expands stays open until it is marked again.
-  const previousViewed = useRef(viewedFiles.viewed);
+  // Marks another tab stores arrive as storage events. A file that becomes viewed on the same head
+  // collapses here. A head change or an unavailable snapshot resets the baseline instead.
+  const previousViewed = useRef<{ head: string | null; viewed: ReadonlySet<string> } | null>(null);
   useEffect(() => {
-    const newlyViewed = [...viewedFiles.viewed].filter((path) => !previousViewed.current.has(path));
-    previousViewed.current = viewedFiles.viewed;
-    for (const path of newlyViewed) collapseMarked(path);
-  }, [viewedFiles.viewed, collapseMarked]);
+    const previous = previousViewed.current;
+    previousViewed.current = viewedFiles.available
+      ? { head: renderedHead, viewed: viewedFiles.viewed }
+      : null;
+    if (!previous || !viewedFiles.available || previous.head !== renderedHead) return;
+    for (const path of viewedFiles.viewed) {
+      if (!previous.viewed.has(path)) collapseMarked(path);
+    }
+  }, [viewedFiles.available, viewedFiles.viewed, renderedHead, collapseMarked]);
 
   // Fixed id keeps repeated failures from stacking toasts.
   useEffect(() => {

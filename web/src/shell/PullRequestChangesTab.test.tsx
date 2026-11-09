@@ -727,6 +727,19 @@ describe("PullRequestChangesTab viewed files", () => {
     expect(isCollapsed("b.ts")).toBe(true);
   });
 
+  it("keeps a file the reader expanded when viewed state drops out and returns on the same head", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-remote-reload" }));
+    markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    rerender(viewedTab({ conversationId: "viewed-remote-reload", identity: null }));
+    rerender(viewedTab({ conversationId: "viewed-remote-reload" }));
+
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+  });
+
   it("expands a file that another tab's mark collapsed once the head moves", () => {
     const { rerender } = render(viewedTab({ conversationId: "viewed-remote-head", head: "head1" }));
     markInOtherTab({ "a.ts": [unverifiedPatchHash("head1")] });
