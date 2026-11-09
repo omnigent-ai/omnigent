@@ -201,8 +201,7 @@ Component coverage for these helpers and views lives in
   conversation reveal a conversation on a file the path filter or Hide viewed hides,
   clearing that filter first and showing `Filter cleared to show <file>`. Other
   conversations on hidden files stay hidden with their files.
-- **Known rough edges.** Marking a file while Hide viewed is on removes it from the
-  list and drops keyboard focus. Marks made in another tab on the same head show as
+- **Known rough edges.** Marks made in another tab on the same head show as
   checked but do not collapse the file until the Changes view remounts (for example
   after a reload) or the head changes.
 - **Commits need GitHub and a current server.** GitLab and Azure DevOps show Changes
