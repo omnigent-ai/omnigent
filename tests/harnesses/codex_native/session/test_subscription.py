@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -910,11 +909,17 @@ def test_late_resume_keeps_identical_live_user_input(
     ]
 
 
-def test_turn_completion_drops_unmatched_live_user_message_copy(tmp_path: Path) -> None:
-    """A live user input is retained by digest only until its turn ends."""
+@pytest.mark.parametrize("client_id", [None, "a" * 32], ids=["legacy", "client-id"])
+def test_turn_completion_drops_unmatched_live_user_message_copy(
+    tmp_path: Path, client_id: str | None
+) -> None:
+    """An unmatched live input is retained only until its turn ends."""
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     forwarder_state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_123")
     text = "Run the tests again."
+    item = _user_message_item("0b6f1c2e-live-user", text)
+    if client_id is not None:
+        item["clientId"] = client_id
     retained: list[dict[tuple[str, str, str], int]] = []
 
     async def run() -> None:
@@ -925,7 +930,7 @@ def test_turn_completion_drops_unmatched_live_user_message_copy(tmp_path: Path) 
                     "params": {
                         "threadId": "thread_123",
                         "turnId": "turn_123",
-                        "item": _user_message_item("0b6f1c2e-live-user", text),
+                        "item": item,
                     },
                 },
                 {
@@ -947,9 +952,11 @@ def test_turn_completion_drops_unmatched_live_user_message_copy(tmp_path: Path) 
 
     asyncio.run(run())
 
-    content = json.dumps([{"type": "text", "text": text}], sort_keys=True)
-    digest = hashlib.sha256(content.encode()).hexdigest()
-    assert retained == [{("thread_123", "turn_123", digest): 1}, {}]
+    assert len(retained) == 2
+    assert [(key[:2], count) for key, count in retained[0].items()] == [
+        (("thread_123", "turn_123"), 1)
+    ]
+    assert retained[1] == {}
 
 
 @pytest.mark.parametrize(
