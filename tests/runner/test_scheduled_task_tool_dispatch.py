@@ -18,6 +18,7 @@ import json
 import jsonschema
 import pytest
 
+from omnigent.errors import OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.tool_dispatch import (
     _ALL_LOCAL_TOOLS,
@@ -26,6 +27,7 @@ from omnigent.runner.tool_dispatch import (
     _execute_scheduled_task_tool,
     execute_tool,
 )
+from omnigent.server.scheduled.harness_settings import validate_scheduled_permission_mode
 from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskUpdateTool
 
 _ALL_NAMES = {
@@ -518,6 +520,20 @@ async def test_server_error_becomes_clean_json() -> None:
         server_client=client,
     )
     assert "server returned 400" in json.loads(out)["error"]
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_rejection_reaches_the_agent_whole() -> None:
+    with pytest.raises(OmnigentError) as rejected:
+        validate_scheduled_permission_mode("unknown-permission-mode")
+    body = {"error": {"code": "invalid_input", "message": rejected.value.message}}
+    client = _RecordingClient(_Resp(status_code=400, body=body))
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps({**_REVIEW_FIELDS, "name": "x", "rrule": "FREQ=DAILY", "agent_id": "a"}),
+        server_client=client,
+    )
+    assert json.loads(out)["details"] == json.dumps(body)
 
 
 @pytest.mark.asyncio

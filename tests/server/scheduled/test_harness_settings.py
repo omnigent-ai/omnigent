@@ -93,5 +93,4 @@ def test_unknown_mode_rejection_lists_every_vocabulary(mode: str) -> None:
     message = str(raised.value)
     for harness, modes in PERMISSION_LAUNCH_ARGS.items():
         assert f"{harness}: {', '.join(map(repr, modes))}" in message
-    assert _NULL_HINT in message
-    assert "claude-sdk" in message
+    assert message.index(_NULL_HINT) < message.index("claude-sdk") < message.index("claude-native")

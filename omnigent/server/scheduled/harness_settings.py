@@ -30,10 +30,10 @@ def _permission_mode_choices(harness: str | None) -> str:
             f"{name}: {', '.join(map(repr, modes))}"
             for name, modes in PERMISSION_LAUNCH_ARGS.items()
         )
+        # The null hint leads because the runner truncates the server errors it relays.
         return (
-            f"Use a mode from the agent's native harness ({vocabularies}), or "
-            f"{AGENT_DEFAULT_PERMISSION_MODE_HINT}; other harnesses, such as claude-sdk, "
-            "have no automation permission modes"
+            f"Use {AGENT_DEFAULT_PERMISSION_MODE_HINT}; other harnesses, such as claude-sdk, "
+            f"have no automation permission modes. Native harness modes: {vocabularies}"
         )
     modes = PERMISSION_LAUNCH_ARGS.get(harness)
     if not modes:
