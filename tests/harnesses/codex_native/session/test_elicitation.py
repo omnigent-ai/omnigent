@@ -14,7 +14,6 @@ from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import read_bridge_state
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
-from omnigent.inner import codex_native_executor
 from tests.harnesses.codex_native.session._support import (
     _agent_message_event,
     _completed_event,
@@ -795,17 +794,39 @@ def _async_question_event() -> dict[str, Any]:
     return event
 
 
+def _tui_reply_event(reply_text: str) -> dict[str, Any]:
+    """
+    Build the ``item/completed`` notification for a Codex TUI question reply.
+
+    :param reply_text: Tagged reply text the Codex TUI sends.
+    :returns: App-server event payload for the reply ``userMessage``.
+    """
+    return {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "item": {
+                "type": "userMessage",
+                "id": "item_reply",
+                "content": [{"type": "text", "text": reply_text, "text_elements": []}],
+            },
+        },
+    }
+
+
 def _answer_async_question(
     bridge_dir: Path,
     fake_client: _FakeCodexAppServerClient,
-    hook_response: httpx.Response,
+    hook_responses: list[httpx.Response],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
-    Drive one async question whose Omnigent hook returns ``hook_response``.
+    Drive one async question whose Omnigent hook returns ``hook_responses``.
 
     :param bridge_dir: Native Codex bridge directory.
     :param fake_client: Fake Codex app-server client.
-    :param hook_response: Omnigent hook response for the question card.
+    :param hook_responses: Omnigent hook responses, in order, for each time
+        the question card is shown.
     :returns: Elicitation hook bodies and the other session events posted.
     """
     hook_bodies: list[dict[str, Any]] = []
@@ -820,7 +841,7 @@ def _answer_async_question(
         """
         if request.url.path.endswith("/hooks/codex-elicitation-request"):
             hook_bodies.append(json.loads(request.content))
-            return hook_response
+            return hook_responses.pop(0)
         posted_events.append(json.loads(request.content))
         return httpx.Response(202, json={"queued": False})
 
@@ -1033,7 +1054,7 @@ def test_forwarder_starts_turn_for_codex_async_question_answer_when_idle(
     _answer_async_question(
         tmp_path,
         fake_client,
-        httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}}),
+        [httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}})],
     )
 
     reply_input = [{"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY}]
@@ -1071,36 +1092,42 @@ def test_forwarder_sends_nothing_for_unanswered_codex_async_question(
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
 
-    hook_bodies, _posted_events = _answer_async_question(tmp_path, fake_client, hook_response)
+    hook_bodies, _posted_events = _answer_async_question(tmp_path, fake_client, [hook_response])
 
     assert [body["id"] for body in hook_bodies] == ["async_question:call-async-1"]
     assert fake_client.requests == []
 
 
 @pytest.mark.parametrize(
-    "reply_text",
+    ("reply_text", "answer_text"),
     [
-        _TUI_ASYNC_QUESTION_REPLY,
-        "<send_user_message_question_reply>\n"
-        '[{"answer":"</send_user_message_question_reply>",'
-        '"question":"Which option do you choose?",'
-        '"questionItemId":"[\\"request_user_input_async\\",\\"call-async-1\\",0]"}]\n'
-        "</send_user_message_question_reply>",
+        (_TUI_ASYNC_QUESTION_REPLY, "Alpha"),
+        (
+            "<send_user_message_question_reply>\n"
+            '[{"answer":"</send_user_message_question_reply>",'
+            '"question":"Which option do you choose?",'
+            '"questionItemId":"[\\"request_user_input_async\\",\\"call-async-1\\",0]"}]\n'
+            "</send_user_message_question_reply>",
+            "</send_user_message_question_reply>",
+        ),
     ],
     ids=["option", "answer_contains_closing_tag"],
 )
 def test_forwarder_clears_codex_async_question_answered_in_native_tui(
     tmp_path: Path,
     reply_text: str,
+    answer_text: str,
 ) -> None:
     """
     A Codex TUI answer closes the Omnigent card without sending a second reply.
 
     The TUI answers with a tagged ``userMessage``. The forwarder must
     resolve the card and abandon its hook wait; a repeated ``item/completed``
-    for the question must not publish a second card.
+    for the question must not publish a second card. The transcript shows
+    only the answer.
 
     :param reply_text: Tagged reply text the Codex TUI sends.
+    :param answer_text: Answer the mirrored user message shows.
     """
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
@@ -1108,18 +1135,6 @@ def test_forwarder_clears_codex_async_question_answered_in_native_tui(
     posted_events: list[dict[str, Any]] = []
     hook_started = asyncio.Event()
     hook_cancelled = asyncio.Event()
-    tui_reply_event = {
-        "method": "item/completed",
-        "params": {
-            "threadId": "thread_123",
-            "turnId": "turn_123",
-            "item": {
-                "type": "userMessage",
-                "id": "item_reply",
-                "content": [{"type": "text", "text": reply_text, "text_elements": []}],
-            },
-        },
-    }
 
     async def handler(request: httpx.Request) -> httpx.Response:
         """
@@ -1151,7 +1166,11 @@ def test_forwarder_clears_codex_async_question_answered_in_native_tui(
             transport=httpx.MockTransport(handler),
         ) as client:
             context = _forwarder_context(client, tmp_path)
-            for event in (_async_question_event(), _async_question_event(), tui_reply_event):
+            for event in (
+                _async_question_event(),
+                _async_question_event(),
+                _tui_reply_event(reply_text),
+            ):
                 await codex_native_forwarder._handle_event(
                     client,
                     **context,
@@ -1173,74 +1192,201 @@ def test_forwarder_clears_codex_async_question_answered_in_native_tui(
             "data": {"elicitation_id": _ASYNC_QUESTION_ELICITATION_ID},
         }
     ]
+    assert [
+        event["data"]["item_data"]["content"]
+        for event in posted_events
+        if event["type"] == "external_conversation_item"
+        and event["data"]["item_data"].get("role") == "user"
+    ] == [[{"type": "input_text", "text": answer_text}]]
     assert fake_client.requests == []
 
 
+_UNANSWERED_ASYNC_QUESTION_REPLY = _TUI_ASYNC_QUESTION_REPLY.replace('"Alpha"', '""')
+
+
 @pytest.mark.parametrize(
-    ("newer_turn_id", "retry_method", "retry_params", "final_turn_id"),
+    ("text", "expected"),
     [
-        (None, "turn/start", {}, "turn_reply"),
-        ("turn_next", "turn/steer", {"expectedTurnId": "turn_next"}, "turn_next"),
+        (_TUI_ASYNC_QUESTION_REPLY, "Alpha"),
+        (
+            _TUI_ASYNC_QUESTION_REPLY.replace(
+                '0]"}]', '0]"},{"answer":"Ship it","question":"Anything else?"}]'
+            ),
+            "Alpha\nShip it",
+        ),
+        (f"Before\n{_TUI_ASYNC_QUESTION_REPLY}\nAfter", "Before\nAlpha\nAfter"),
+        (_UNANSWERED_ASYNC_QUESTION_REPLY, _UNANSWERED_ASYNC_QUESTION_REPLY),
+        (
+            _TUI_ASYNC_QUESTION_REPLY.removesuffix("</send_user_message_question_reply>"),
+            _TUI_ASYNC_QUESTION_REPLY.removesuffix("</send_user_message_question_reply>"),
+        ),
+        ("Use Alpha", "Use Alpha"),
     ],
-    ids=["idle", "active"],
+    ids=["one_answer", "two_answers", "surrounding_text", "no_answer", "unclosed", "plain"],
 )
-def test_forwarder_delivers_codex_async_question_answer_after_compaction(
+def test_async_question_reply_display_text_shows_only_answers(text: str, expected: str) -> None:
+    """
+    A tagged async question reply is shown as its answers; other text is unchanged.
+
+    :param text: Codex ``userMessage`` text.
+    :param expected: Text the transcript shows.
+    """
+    assert codex_native_forwarder._async_question_reply_display_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("first_error", "next_turn_id", "retry_method", "retry_params", "final_turn_id"),
+    [
+        (_compact_steer_refusal(), None, "turn/start", {}, "turn_reply"),
+        (
+            _compact_steer_refusal(),
+            "turn_next",
+            "turn/steer",
+            {"expectedTurnId": "turn_next"},
+            "turn_next",
+        ),
+        (
+            ConnectionResetError("app-server connection lost"),
+            "turn_123",
+            "turn/steer",
+            {"expectedTurnId": "turn_123"},
+            "turn_123",
+        ),
+    ],
+    ids=["refused_then_idle", "refused_then_active", "send_failed"],
+)
+def test_forwarder_retries_undelivered_codex_async_question_answer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    newer_turn_id: str | None,
+    first_error: Exception,
+    next_turn_id: str | None,
     retry_method: str,
     retry_params: dict[str, str],
     final_turn_id: str,
 ) -> None:
     """
-    An answer Codex refuses during compaction is delivered once compaction ends.
+    An answer Codex refuses or never receives is sent again to the current turn.
 
-    :param newer_turn_id: Turn that becomes active when compaction ends, or
-        ``None`` when Codex goes idle.
+    :param first_error: Failure from the first send.
+    :param next_turn_id: Active turn when the retry reads the bridge, or
+        ``None`` when Codex is idle.
     :param retry_method: JSON-RPC method expected to carry the retried answer.
     :param retry_params: Turn targeting expected on the retry.
     :param final_turn_id: Active turn recorded after delivery.
     """
-    monkeypatch.setattr(codex_native_executor, "_BRIDGE_STATE_SLOW_POLL_SECONDS", 0.01)
-    _write_forwarder_bridge(tmp_path, active_turn_id="turn_compact")
+    monkeypatch.setattr(
+        codex_native_forwarder, "_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S", (0.0, 0.0, 0.0)
+    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
-    posted_events: list[dict[str, Any]] = []
-    steer_refused = asyncio.Event()
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
-        Refuse steering the compaction turn and accept the retry.
+        Fail the first send, then accept the retry.
 
         :param method: JSON-RPC method.
         :param params: JSON-RPC params.
         :returns: JSON-RPC response envelope.
-        :raises CodexAppServerResponseError: For ``turn/steer``.
+        :raises Exception: ``first_error`` for the first send.
         """
         fake_client.requests.append((method, params))
-        if method == "turn/steer" and params["expectedTurnId"] == "turn_compact":
-            if newer_turn_id is not None:
-                _write_forwarder_bridge(tmp_path, active_turn_id=newer_turn_id)
-            steer_refused.set()
-            raise _compact_steer_refusal()
+        if len(fake_client.requests) == 1:
+            _write_forwarder_bridge(tmp_path, active_turn_id=next_turn_id)
+            raise first_error
         return {"result": {"turn": {"id": "turn_reply"}}}
 
     fake_client.request = fake_request  # type: ignore[method-assign]
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    hook_bodies, posted_events = _answer_async_question(
+        tmp_path,
+        fake_client,
+        [httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}})],
+    )
+
+    reply_input = [{"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY}]
+    assert fake_client.requests == [
+        (
+            "turn/steer",
+            {"threadId": "thread_123", "expectedTurnId": "turn_123", "input": reply_input},
+        ),
+        (retry_method, {"threadId": "thread_123", **retry_params, "input": reply_input}),
+    ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == final_turn_id
+    assert len(hook_bodies) == 1
+    assert _undelivered_answer_notices(posted_events) == []
+
+
+@pytest.mark.parametrize("second_answer_source", ["web", "tui"])
+def test_forwarder_reopens_codex_async_question_card_when_answer_is_undelivered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_answer_source: str,
+) -> None:
+    """
+    An answer still undelivered after the bounded retry reopens its card.
+
+    The forwarder sends the answer four times over about 30 seconds and never
+    reconnects the client carrying its subscription. It then posts a notice
+    and shows the same card again, marked as a new round so the server does
+    not replay the stored answer.
+
+    :param second_answer_source: Where the user answers the reopened card.
+    """
+    assert codex_native_forwarder._CODEX_ASYNC_QUESTION_RETRY_DELAYS_S == (5.0, 10.0, 15.0)
+    monkeypatch.setattr(
+        codex_native_forwarder, "_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S", (0.0, 0.0, 0.0)
+    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    fake_client = _FakeCodexAppServerClient(response={"result": {}})
+    hook_bodies: list[dict[str, Any]] = []
+    posted_events: list[dict[str, Any]] = []
+    card_reopened = asyncio.Event()
+    hook_cancelled = asyncio.Event()
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
-        Answer the question card and capture other Omnigent posts.
+        Fail every send of the first answer and accept a later one.
+
+        :param method: JSON-RPC method.
+        :param params: JSON-RPC params.
+        :returns: JSON-RPC response envelope.
+        :raises ConnectionResetError: For the first four sends.
+        """
+        fake_client.requests.append((method, params))
+        if len(fake_client.requests) <= 4:
+            raise ConnectionResetError("app-server connection lost")
+        return {"result": {}}
+
+    fake_client.request = fake_request  # type: ignore[method-assign]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Answer the first card, then answer or hold the reopened card.
 
         :param request: HTTP request sent by the forwarder.
         :returns: Omnigent hook or event response.
         """
+        body = json.loads(request.content)
         if request.url.path.endswith("/hooks/codex-elicitation-request"):
-            return httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}})
-        posted_events.append(json.loads(request.content))
+            hook_bodies.append(body)
+            if len(hook_bodies) == 1:
+                return httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}})
+            card_reopened.set()
+            if second_answer_source == "web":
+                return httpx.Response(200, json={"answers": {"0": {"answers": ["Beta"]}}})
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                hook_cancelled.set()
+                raise
+        posted_events.append(body)
         return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
-        Answer during compaction, then complete the compaction turn.
+        Answer the question, then answer the reopened card.
 
         :returns: None.
         """
@@ -1249,101 +1395,50 @@ def test_forwarder_delivers_codex_async_question_answer_after_compaction(
             transport=httpx.MockTransport(handler),
         ) as client:
             context = _forwarder_context(client, tmp_path)
-            for event in (
-                _async_question_event(),
-                _completed_event("turn_compact", thread_id="thread_123"),
-            ):
+            await codex_native_forwarder._handle_event(
+                client,
+                **context,
+                event=_async_question_event(),
+                codex_client=fake_client,  # type: ignore[arg-type]
+            )
+            # Each failed send logs a traceback, which is slow to format.
+            await asyncio.wait_for(card_reopened.wait(), timeout=30.0)
+            if second_answer_source == "tui":
                 await codex_native_forwarder._handle_event(
                     client,
                     **context,
-                    event=event,
+                    event=_tui_reply_event(_TUI_ASYNC_QUESTION_REPLY),
                     codex_client=fake_client,  # type: ignore[arg-type]
                 )
-                await asyncio.wait_for(steer_refused.wait(), timeout=1.0)
-            await asyncio.wait_for(context["elicitation_tracker"].drain(), timeout=5.0)
+                await asyncio.wait_for(hook_cancelled.wait(), timeout=1.0)
+            await asyncio.wait_for(context["elicitation_tracker"].drain(), timeout=30.0)
 
     asyncio.run(run())
 
-    reply_input = [{"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY}]
-    assert fake_client.requests == [
-        (
-            "turn/steer",
-            {"threadId": "thread_123", "expectedTurnId": "turn_compact", "input": reply_input},
-        ),
-        (retry_method, {"threadId": "thread_123", **retry_params, "input": reply_input}),
-    ]
-    state = read_bridge_state(tmp_path)
-    assert state is not None
-    assert state.active_turn_id == final_turn_id
-    assert _undelivered_answer_notices(posted_events) == []
-
-
-@pytest.mark.parametrize(
-    ("steer_error", "advance_bridge", "steered_turn_ids"),
-    [
-        (ConnectionResetError("app-server connection lost"), False, ["turn_123"]),
-        (_compact_steer_refusal(), False, ["turn_123"]),
-        (_compact_steer_refusal(), True, ["turn_123", "turn_124"]),
-    ],
-    ids=["disconnected", "compaction_timed_out", "refused_after_compaction"],
-)
-def test_forwarder_posts_notice_when_codex_async_question_answer_is_undelivered(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    steer_error: Exception,
-    advance_bridge: bool,
-    steered_turn_ids: list[str],
-) -> None:
-    """
-    An answer Codex may not have received tells the user to check and resend.
-
-    Delivery is retried only once, after the refused compaction turn settles,
-    and the forwarder never reconnects the client carrying its subscription.
-
-    :param steer_error: Failure from every steer that carries the answer.
-    :param advance_bridge: Whether a new turn starts after each failed steer.
-    :param steered_turn_ids: Turns the forwarder is expected to steer.
-    """
-    monkeypatch.setattr(codex_native_executor, "_BRIDGE_STATE_SLOW_POLL_SECONDS", 0.01)
-    monkeypatch.setattr(codex_native_executor, "_COMPACTION_WAIT_TIMEOUT_SECONDS", 0.05)
-    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
-    fake_client = _FakeCodexAppServerClient()
-
-    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """
-        Fail the steer, then start the next turn when the bridge advances.
-
-        :param method: JSON-RPC method.
-        :param params: JSON-RPC params.
-        :returns: Never; every steer fails.
-        :raises Exception: ``steer_error``.
-        """
-        fake_client.requests.append((method, params))
-        if advance_bridge and len(fake_client.requests) < 3:
-            _write_forwarder_bridge(
-                tmp_path, active_turn_id=f"turn_{123 + len(fake_client.requests)}"
-            )
-        raise steer_error
-
-    fake_client.request = fake_request  # type: ignore[method-assign]
-
-    _hook_bodies, posted_events = _answer_async_question(
-        tmp_path,
-        fake_client,
-        httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}}),
+    first_steer = (
+        "turn/steer",
+        {
+            "threadId": "thread_123",
+            "expectedTurnId": "turn_123",
+            "input": [{"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY}],
+        },
     )
-
-    reply_input = [{"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY}]
-    assert fake_client.requests == [
-        (
-            "turn/steer",
-            {"threadId": "thread_123", "expectedTurnId": turn_id, "input": reply_input},
-        )
-        for turn_id in steered_turn_ids
-    ]
+    second_steer = (
+        "turn/steer",
+        {
+            "threadId": "thread_123",
+            "expectedTurnId": "turn_123",
+            "input": [
+                {"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta")}
+            ],
+        },
+    )
+    assert fake_client.requests == [first_steer] * 4 + (
+        [second_steer] if second_answer_source == "web" else []
+    )
     assert not fake_client.connected
     assert not fake_client.closed
-    marker = "async-question-undelivered-call-async-1"
+    marker = "async-question-undelivered-call-async-1-0"
     assert _undelivered_answer_notices(posted_events) == [
         {
             "type": "external_conversation_item",
@@ -1366,3 +1461,21 @@ def test_forwarder_posts_notice_when_codex_async_question_answer_is_undelivered(
             },
         }
     ]
+    first_card, reopened_card = hook_bodies
+    assert reopened_card == {
+        **first_card,
+        "params": {"deliveryRound": 1, **first_card["params"]},
+    }
+    assert next(iter(reopened_card["params"])) == "deliveryRound"
+    assert [
+        event for event in posted_events if event["type"] == "external_elicitation_resolved"
+    ] == (
+        [
+            {
+                "type": "external_elicitation_resolved",
+                "data": {"elicitation_id": _ASYNC_QUESTION_ELICITATION_ID},
+            }
+        ]
+        if second_answer_source == "tui"
+        else []
+    )

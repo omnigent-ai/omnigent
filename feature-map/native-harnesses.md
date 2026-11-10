@@ -350,10 +350,12 @@ follow-up in the side pane, then close its tab. The parent conversation stays
 separate. See [sessions](./sessions.md) for all side-chat entry points.
 
 **Codex async question:** in Default mode, ask Codex to call
-`request_user_input_async`. The question card stays open after the turn ends;
-answer it in Chat or Inbox and confirm Codex's next turn uses the answer.
-Cancel dismisses the card without stopping Codex. Answering in the terminal
-closes the card. An open question is not restored after the forwarder
+`request_user_input_async`. The question card stays open after the turn ends
+and leaves the composer usable. Answer it in Chat or Inbox; the transcript
+shows only the answer, and Codex's next turn uses it. Cancel dismisses the card
+without stopping Codex. Answering in the terminal closes the card. An answer
+Codex still hasn't received after about 30 seconds of retries posts a notice
+and reopens the card. An open question is not restored after the forwarder
 reconnects.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with

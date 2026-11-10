@@ -2649,9 +2649,10 @@ function ComposerImpl(
   // editable: disabling it ejects browser focus mid-word when a prompt
   // lands while the user is typing, silently dropping their keystrokes.
   // Mirrored sub-agent prompts (targetSessionId set to a child session)
-  // don't gate this session's inbox, so they don't lock it.
+  // don't gate this session's inbox, and non-blocking cards don't park the
+  // turn, so neither locks it.
   const hasPendingElicitation = useChatStore((s) =>
-    hasPendingOwnElicitation(s.blocks, s.conversationId),
+    hasPendingOwnElicitation(s.blocks, s.conversationId, { blockingOnly: true }),
   );
   const readyPlaceholder = sendReconnectsArca
     ? "Send a message to reconnect Arca…"

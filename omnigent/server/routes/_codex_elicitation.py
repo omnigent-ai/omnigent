@@ -629,6 +629,8 @@ def _codex_tool_request_user_input_params(
         extras["turn_id"] = turn_id
     if isinstance(item_id, str) and item_id:
         extras["item_id"] = item_id
+    if params.get("isBlocking") is False:
+        extras["is_blocking"] = False
     return ElicitationRequestParams(
         mode="form",
         message="Codex needs input",
