@@ -33,8 +33,8 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         # lakebox|databricks|modal|boat|daytona|blaxel|boxlite|cwsandbox|islo|
-         # e2b|openshell|kubernetes|microsandbox|gensee
+         # lakebox|databricks|modal|daytona|blaxel|boxlite|cwsandbox|islo|
+         # e2b|openshell|kubernetes|microsandbox|gensee|boat
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
