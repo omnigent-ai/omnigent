@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -123,6 +124,10 @@ async def test_claude_program_status_real_launch_and_fallback(
 ) -> None:
     """Exercise startup negotiation, raw PTY transport, status arbitration and cleanup."""
     caplog.set_level(logging.INFO)
+    from omnigent.harnesses.claude_native import bridge
+
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     if protocol == "disabled":
         monkeypatch.setenv("OMNIGENT_FEATURES", "-claude_osc_status")
@@ -290,11 +295,63 @@ async def test_claude_program_status_real_launch_and_fallback(
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error_detail", [None, "API Error: 499"])
+@pytest.mark.parametrize("new_turn_during", ["detail_lookup", "queued_publication"])
+@pytest.mark.parametrize("detail", [None, "Prompt is too long"])
+async def test_program_error_detail_lookup_preserves_newer_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    new_turn_during: str,
+    detail: str | None,
+) -> None:
+    """A turn starting during a failure lookup or before its callback stays active."""
+    session_id = "conv_error_lookup_race"
+    path = tmp_path / "program-status.json"
+    on_tick, statuses, registry, _ = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id, program_status_path=path
+    )
+    poller = registry._status_pollers[session_id]
+    clock = {"now": 0.0}
+    monkeypatch.setattr(poller, "_clock", lambda: clock["now"])
+
+    def lookup() -> str | None:
+        if new_turn_during == "detail_lookup":
+            registry.note_session_turn_started(session_id)
+        return detail
+
+    monkeypatch.setattr(poller, "_failure_detail", lookup)
+    for state in ("working", "error"):
+        path.write_text(
+            json.dumps(
+                {"relay_pid": os.getpid(), "status": {"state": state, "app": "claude-code"}}
+            )
+        )
+        on_tick()
+        await asyncio.sleep(0)
+    clock["now"] = 11.0
+    on_tick()
+    if new_turn_during == "queued_publication":
+        registry.note_session_turn_started(session_id)
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    assert registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_detail", "transcript_error"),
+    [(None, None), ("API Error: 499", None), (None, "Prompt is too long")],
+)
 async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_detail: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_detail: str | None,
+    transcript_error: str | None,
 ) -> None:
     """A turn whose StopFailure hook never reaches the runner still ends, failed once."""
+    from omnigent.harnesses.claude_native import bridge
+
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     terminals = TerminalRegistry()
@@ -304,7 +361,8 @@ async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
         lambda _, state, reason: statuses.append((state, reason))
     )
     failures: list[tuple[str, str]] = []
-    if error_detail is not None:
+    expected_detail = error_detail or transcript_error
+    if expected_detail is not None:
 
         def publish_failure(session_id: str, detail: str) -> None:
             failures.append((session_id, detail))
@@ -314,6 +372,13 @@ async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
     spec = _claude_osc_spec(
         tmp_path, _claude_osc_peer(tmp_path / "peer.py", error_detail=error_detail), "osc", "none"
     )
+    if transcript_error is not None:
+        from omnigent.harnesses.claude_native import bridge
+
+        directory = bridge.prepare_bridge_dir(
+            "osc-test", bridge_id="opaque-bridge", workspace=tmp_path
+        )
+        spec.args.extend(["--settings", str(directory / "claude-settings.json")])
     try:
         await registry.launch_required_terminal(
             "osc-test", "claude", "main", spec, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
@@ -327,13 +392,47 @@ async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
             while instance.program_status.child_pid is None:
                 await asyncio.sleep(0.02)
         await _wait_for_status_edge(statuses, ("running", None))
+        if transcript_error is not None:
+            from omnigent.harnesses.claude_native import bridge, forwarder
+            from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
+            from omnigent.inner.terminal_lifecycle import (
+                TERMINAL_INSTANCE_ID_ENV,
+                TERMINAL_LAUNCH_ID_ENV,
+            )
+
+            payload = {"hook_event_name": "UserPromptSubmit", "session_id": "native-session"}
+            bridge.record_hook_event(directory, payload)
+            record_hook_lifecycle(
+                directory,
+                payload,
+                time.time(),
+                env={
+                    TERMINAL_INSTANCE_ID_ENV: instance.diagnostic_id,
+                    TERMINAL_LAUNCH_ID_ENV: instance.lifecycle_trace.launch_id,
+                },
+            )
+            forwarder._write_forward_state(
+                directory,
+                forwarder.TranscriptForwardState(
+                    transcript_path=tmp_path / "session.jsonl",
+                    line_cursor=0,
+                    current_response_id="resp_current",
+                    api_error_response_id="resp_current",
+                    api_error_context={
+                        "native_api_error_message": True,
+                        "native_session_id": "native-session",
+                        "native_error_message": transcript_error,
+                        "native_recorded_at": time.time(),
+                    },
+                ),
+            )
         await instance.send(keys="e")
         # No hook edge arrives, so the runner's grace period is what ends the turn.
         await _wait_for_status_edge(statuses, ("failed", None), timeout=15)
         await asyncio.sleep(0.5)
         assert statuses.count(("failed", None)) == 1
-        assert raw_status.call_args_list.count(call("failed", None)) == int(error_detail is None)
-        assert failures == ([("osc-test", error_detail)] if error_detail is not None else [])
+        assert call("failed", None) not in raw_status.call_args_list
+        assert failures == ([("osc-test", expected_detail)] if expected_detail is not None else [])
     finally:
         await terminals.shutdown()
 
@@ -998,12 +1097,16 @@ async def _observe_native_with_fake_poller(
         session_id: str,
         instance: object,
         on_status: object,
-        on_failure: Callable[[str], None],
+        on_failure: Callable[[str | None, int | None], None],
         on_replay: Callable[[str, str | None], None],
         on_background: object = None,
     ) -> _FakeStatusPoller:
-        del session_id, instance
-        poller = _FakeStatusPoller(on_status, on_failure, on_background=on_background)
+        del instance
+        poller = _FakeStatusPoller(
+            on_status,
+            lambda detail: on_failure(detail, registry.session_activity_epoch(session_id)),
+            on_background=on_background,
+        )
         pollers.append(poller)
         return poller
 
@@ -2719,7 +2822,11 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
     """
     del tmp_path
     registry = SessionResourceRegistry()
+    assert registry.session_activity_recorded_at("conv_cleanup") is None
+    before_activity = time.time()
     registry.note_session_turn_started("conv_cleanup")
+    recorded_at = registry.session_activity_recorded_at("conv_cleanup")
+    assert recorded_at is not None and before_activity <= recorded_at <= time.time()
     assert "conv_cleanup" in registry._last_session_status
     assert registry.session_activity_epoch("conv_cleanup") > 0
     assert registry.session_turn_is_active("conv_cleanup")
@@ -2729,6 +2836,7 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
 
     assert "conv_cleanup" not in registry._last_session_status
     assert registry.session_activity_epoch("conv_cleanup") == 0
+    assert registry.session_activity_recorded_at("conv_cleanup") is None
     assert "conv_cleanup" not in registry._session_turn_generation
     assert not registry.session_turn_is_active("conv_cleanup")
 
@@ -2776,6 +2884,8 @@ async def test_transfer_terminal_moves_status_memo(
         resource_role=CODEX_NATIVE_TERMINAL_ROLE,
     )
     registry.note_session_turn_started("conv_src")
+    activity_recorded_at = registry.session_activity_recorded_at("conv_src")
+    assert activity_recorded_at is not None
 
     moved = await registry.transfer_terminal("conv_src", "conv_dst", view.id)
 
@@ -2785,6 +2895,8 @@ async def test_transfer_terminal_moves_status_memo(
     assert not registry.session_turn_is_active("conv_src")
     assert registry.session_turn_is_active("conv_dst")
     assert registry.session_activity_epoch("conv_dst") > 0
+    moved_activity = registry.session_activity_recorded_at("conv_dst")
+    assert moved_activity is not None and moved_activity >= activity_recorded_at
     assert "conv_src" not in registry._session_turn_generation
 
 

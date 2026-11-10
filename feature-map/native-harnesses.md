@@ -475,6 +475,7 @@ Cross-harness journeys:
 - **`working-status`, Claude (component and real-process checks):** run with
   plain `uv run --no-sync pytest`, `--reruns 0 -n 0`:
   `tests/runner/test_resource_registry.py::test_claude_program_status_real_launch_and_fallback`,
+  `tests/runner/test_resource_registry.py::test_claude_osc_error_without_a_hook_fails_the_turn_once`,
   `tests/runner/test_resource_registry.py::test_program_status_respects_flag_and_claude_role`,
   `tests/runner/test_resource_registry.py::test_queued_turn_republishes_running_after_stop`,
   `tests/runner/test_resource_registry.py::test_failed_hook_does_not_republish_stale_running_status`,
@@ -486,6 +487,8 @@ Cross-harness journeys:
   isolation, reconnect/forwarded-idle replay, fallback, and exit. The concurrency
   tests pause real file reads; they are not elapsed-time or live-Claude canaries.
   Legacy-file and role-gating results do not prove other vendor CLIs ran.
+  The missing-hook case preserves OSC error text, or a timestamped API error
+  belonging to the current launch and prompt; older or unowned detail stays generic.
 - **`working-status`, Claude (real CLI and browser):** requires Claude Code
   2.1.295+ for OSC. In an isolated host/runner, leave `OMNIGENT_FEATURES` unset
   to exercise the enabled default, restart and launch a fresh session. Do not set

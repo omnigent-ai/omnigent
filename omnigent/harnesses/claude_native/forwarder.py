@@ -3802,6 +3802,8 @@ def _transcript_api_error_for_hook(
     record: ClaudeHookRecord,
     response_id: str | None,
     ended_response_ids: Collection[str | None] = (),
+    *,
+    prompt_recorded_at: float | None = None,
 ) -> tuple[FailureContext | None, str, str | None]:
     """Match retained API-error evidence, explaining why it cannot be reused."""
     if not record.claude_session_id:
@@ -3810,7 +3812,7 @@ def _transcript_api_error_for_hook(
     if state is None:
         return None, "forward_state_unavailable", None
     # ``None`` on both sides is between turns: evidence kept then is the ended turn's.
-    if state.current_response_id != response_id:
+    if prompt_recorded_at is None and state.current_response_id != response_id:
         return None, "response_mismatch", None
     context = state.api_error_context
     if not context:
@@ -3824,6 +3826,18 @@ def _transcript_api_error_for_hook(
     if not isinstance(context.get("native_error_message"), str):
         return None, "error_text_unavailable", None
     owner = state.api_error_response_id
+    if prompt_recorded_at is not None:
+        # OSC has no response ID. A launch-owned prompt must independently
+        # place this explicit error after the current submit, before reusing it.
+        error_recorded_at = context.get("native_recorded_at")
+        if (
+            not isinstance(error_recorded_at, (int, float))
+            or not prompt_recorded_at <= error_recorded_at <= time.time()
+        ):
+            return None, "error_before_current_prompt", None
+        if owner is None or owner != state.current_response_id:
+            return None, "response_mismatch", None
+        response_id = owner
     if owner is not None and (
         owner in ended_response_ids
         or owner in (state.pending_settled_response_id, state.settled_response_id)
@@ -3832,6 +3846,62 @@ def _transcript_api_error_for_hook(
     if owner is not None and response_id is not None and owner != response_id:
         return None, "response_mismatch", None
     return context, "matched", owner
+
+
+def program_status_failure_detail(
+    bridge_dir: Path,
+    session_id: str,
+    instance_id: str,
+    launch_id: str,
+    *,
+    activity_recorded_at: float | None,
+) -> str | None:
+    """Recover a bare OSC error only from this launch's still-open native prompt."""
+    from omnigent.harnesses.claude_native.lifecycle import read_lifecycle_snapshot
+
+    evidence = read_lifecycle_snapshot(bridge_dir, instance_id, launch_id)
+    native_session_id = read_claude_session_id(bridge_dir)
+    if (
+        evidence.get("read_status") != "ok"
+        or activity_recorded_at is None
+        or evidence.get("hook_turn_in_progress") is not True
+        or evidence.get("session_end") is not None
+        or not native_session_id
+        or evidence.get("claude_session_id") != native_session_id
+        or read_active_session_id(bridge_dir) != session_id
+    ):
+        return None
+    hooks = evidence.get("recent_hooks")
+    if not isinstance(hooks, list):
+        return None
+    prompt = next(
+        (
+            hook
+            for hook in reversed(hooks)
+            if isinstance(hook, dict)
+            and hook.get("event_name") == "UserPromptSubmit"
+            and hook.get("claude_session_id") == native_session_id
+        ),
+        None,
+    )
+    if prompt is None or prompt.get("bridge_session_id") != session_id:
+        return None
+    recorded_at = prompt.get("recorded_at")
+    if not isinstance(recorded_at, (int, float)):
+        return None
+    context, _, _ = _transcript_api_error_for_hook(
+        bridge_dir,
+        ClaudeHookRecord(
+            event_cursor=0,
+            byte_offset=0,
+            event_name="UserPromptSubmit",
+            claude_session_id=native_session_id,
+        ),
+        None,
+        prompt_recorded_at=max(recorded_at, activity_recorded_at),
+    )
+    detail = context.get("native_error_message") if context else None
+    return detail if isinstance(detail, str) else None
 
 
 def _is_subagent_hook_record(

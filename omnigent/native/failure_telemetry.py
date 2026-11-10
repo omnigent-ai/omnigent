@@ -74,7 +74,9 @@ _INT_FIELDS = frozenset(
         "native_launch_winerror",
     }
 )
-_TIME_FIELDS = frozenset({"native_hook_recorded_at", "diagnostic_last_read_at"})
+_TIME_FIELDS = frozenset(
+    {"native_hook_recorded_at", "native_recorded_at", "diagnostic_last_read_at"}
+)
 _AVAILABILITY_FIELDS = (
     "native_error_category",
     "native_api_error_message",

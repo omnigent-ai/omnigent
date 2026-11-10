@@ -11005,7 +11005,13 @@ def _assistant_transcript_items_from_entry(
                     text=content,
                     is_api_error=is_api_error,
                     failure_context=(
-                        claude_failure_context(entry, error_text=content) if is_api_error else None
+                        claude_failure_context(
+                            entry,
+                            error_text=content,
+                            recorded_at=_transcript_timestamp(entry.get("timestamp")),
+                        )
+                        if is_api_error
+                        else None
                     ),
                 )
             )
@@ -11036,7 +11042,11 @@ def _assistant_transcript_items_from_entry(
                         text=text,
                         is_api_error=is_api_error,
                         failure_context=(
-                            claude_failure_context(entry, error_text=text)
+                            claude_failure_context(
+                                entry,
+                                error_text=text,
+                                recorded_at=_transcript_timestamp(entry.get("timestamp")),
+                            )
                             if is_api_error
                             else None
                         ),
