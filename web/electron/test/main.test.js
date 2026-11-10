@@ -42,6 +42,7 @@ async function until(condition, label, deadline = Date.now() + 1000) {
   await until(condition, label, deadline);
 }
 const urlHelpers = require("../src/url");
+const { SHOW_DELAY_MS } = require("../src/browserSecurityKeyNotice");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
@@ -2512,7 +2513,11 @@ describe("browser permission wiring", () => {
   });
 
   it("installs isolated consent handlers before construction and only prompts for the visible pane", async () => {
-    const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+    const h = loadNavigationHarness({
+      registerFallbacks: false,
+      realBrowserRegistry: true,
+      platform: "linux",
+    });
     try {
       const sessions = new Map();
       const prompts = h.permissionPromptCalls.show;
@@ -2577,7 +2582,7 @@ describe("browser permission wiring", () => {
       registry.setActive("a");
       a.ipc.emit("omnigent:browser-webauthn-pending", { senderFrame: a.mainFrame }, true);
       await new Promise((resolve) => {
-        setTimeout(resolve, 400);
+        setTimeout(resolve, SHOW_DELAY_MS + 100);
       });
       assert.equal(prompts.length, 2, "a waiting security-key request shows the notice");
       assert.equal(prompts[1].kind, "security-key");
@@ -2585,6 +2590,37 @@ describe("browser permission wiring", () => {
       assert.equal(prompts[1].origin, "https://login.example");
       assert.equal(h.electron.session.defaultSession.request, undefined);
       assert.equal(h.electron.session.defaultSession.check, undefined);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("leaves WebAuthn in Windows Browser tabs to the system dialog", () => {
+    const h = loadNavigationHarness({
+      registerFallbacks: false,
+      realBrowserRegistry: true,
+      platform: "win32",
+    });
+    try {
+      h.electron.session.fromPartition = () => ({
+        setPermissionRequestHandler() {},
+        setPermissionCheckHandler() {},
+        webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
+      });
+      const preloads = [];
+      h.electron.createWebContentsView = (opts) => {
+        preloads.push(opts.webPreferences.preload);
+        const wc = Object.assign(new EventEmitter(), {
+          ipc: new EventEmitter(),
+          setWindowOpenHandler() {},
+          loadURL() {},
+        });
+        return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+      };
+      const registry = h.api.createBrowserRegistryForWindow(h.win);
+      const tab = registry.openOrNavigate("browser-tab:conv:t1", "https://login.example/").entry;
+      assert.deepEqual(preloads, [undefined]);
+      assert.equal(tab.view.webContents.ipc.listenerCount("omnigent:browser-webauthn-pending"), 0);
     } finally {
       h.cleanup();
     }

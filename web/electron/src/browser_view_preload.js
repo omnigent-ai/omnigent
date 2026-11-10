@@ -9,6 +9,8 @@ function observeWebAuthnRequests(report) {
   if (!prototype) return;
   const apply = Reflect.apply;
   const then = Promise.prototype.then;
+  const describe = Object.getOwnPropertyDescriptor;
+  const hasOwn = Object.hasOwn;
   let pending = 0;
   const safeReport = (value) => {
     try {
@@ -29,11 +31,16 @@ function observeWebAuthnRequests(report) {
       apply(target, thisArg, args) {
         let prompted = false;
         try {
-          const options = args[0];
-          const mediation = options?.mediation;
+          // Page getters must run only in the native call, so accessor options go unobserved.
+          const own = (key) => {
+            const property = describe(args[0], key);
+            if (property && !hasOwn(property, "value")) throw new TypeError("accessor option");
+            return property?.value;
+          };
+          const mediation = own("mediation");
           // Autofill (conditional), silent and immediate mediation show no browser prompt.
           prompted =
-            Boolean(options?.publicKey) &&
+            Boolean(own("publicKey")) &&
             (mediation === undefined || mediation === "optional" || mediation === "required");
         } catch {
           // Unreadable options are left to the native call.

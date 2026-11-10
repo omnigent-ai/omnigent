@@ -45,12 +45,14 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
 
   function show({ parent, getAnchorBounds, signal, kind = "permission", ...details }) {
     if (!parent || parent.isDestroyed() || signal.aborted) return Promise.resolve("dismiss");
-    // The advisory security-key notice must not discard a pending permission decision.
-    if (kind === "security-key" && prompts.get(parent)?.kind === "permission") {
-      return Promise.resolve("dismiss");
+    const current = prompts.get(parent);
+    // The advisory security-key notice yields to a permission decision; "suppressed" asks it
+    // to retry once that decision is made.
+    if (kind === "security-key" && current?.kind === "permission") {
+      return current.result.then(() => "suppressed");
     }
-    dismiss(parent);
-    return new Promise((resolve) => {
+    current?.finish(current.kind === "security-key" ? "suppressed" : "dismiss");
+    const result = new Promise((resolve) => {
       const popup = new BrowserWindow({
         parent,
         frame: false,
@@ -119,6 +121,8 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
       });
       void popup.loadFile(promptPage).catch(close);
     });
+    if (prompts.has(parent)) prompts.get(parent).result = result;
+    return result;
   }
 
   function registerIpc() {

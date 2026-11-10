@@ -4274,15 +4274,12 @@ function createBrowserRegistryForWindow(win) {
     registry.get(registry.activeConversationId())?.view.webContents === wc;
   const registry = createBrowserViewRegistry({
     WebContentsViewCtor: (opts) => {
+      if (BROWSER_VIEW_PRELOAD) opts.webPreferences.preload = BROWSER_VIEW_PRELOAD;
       // Install before construction: Electron otherwise auto-grants requests.
       const policy = hardenAgentPartition(opts.webPreferences.partition, win, canPrompt, () =>
         view.getBounds(),
       );
-      const view = new WebContentsView(
-        BROWSER_VIEW_PRELOAD
-          ? { ...opts, webPreferences: { ...opts.webPreferences, preload: BROWSER_VIEW_PRELOAD } }
-          : opts,
-      );
+      const view = new WebContentsView(opts);
       policy.attach(view.webContents);
       if (BROWSER_VIEW_PRELOAD) {
         attachSecurityKeyNotice(view.webContents, {

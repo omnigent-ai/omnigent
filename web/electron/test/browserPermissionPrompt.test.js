@@ -192,17 +192,19 @@ describe("browser permission popover", () => {
     assert.equal(await result, "open-in-browser");
   });
 
-  it("never lets a security-key notice discard a pending permission decision", async () => {
+  it("defers a security-key notice until a pending permission decision is made", async () => {
     const h = harness();
     const permission = h.show();
-    assert.equal(await h.show({ kind: "security-key" }), "dismiss");
+    const deferred = h.show({ kind: "security-key" });
+    assert.equal(await Promise.race([deferred, tick().then(() => "waiting")]), "waiting");
     assert.equal(h.windows.length, 1);
     h.choose("allow-once");
     assert.equal(await permission, "allow-once");
+    assert.equal(await deferred, "suppressed");
 
     const notice = h.show({ kind: "security-key" });
     const replacement = h.show();
-    assert.equal(await notice, "dismiss");
+    assert.equal(await notice, "suppressed");
     h.choose("deny");
     assert.equal(await replacement, "deny");
   });
@@ -342,18 +344,20 @@ describe("permission popover page", () => {
     assert.doesNotMatch(html, /Okta Verify|Only allow sites you trust|Always allow and reload/);
   });
 
-  for (const [id, choice] of [
+  for (const [id, choice, info] of [
     ["once", "allow-once"],
     ["always", "always-allow"],
     ["deny", "deny"],
-    ["open-in-browser", "open-in-browser"],
+    ["open-in-browser", "open-in-browser", { kind: "security-key", origin: ORIGIN }],
     ["close", "dismiss"],
   ]) {
     it(`maps ${id} to ${choice} and ignores repeated submissions`, async () => {
-      const h = pageHarness();
+      const h = pageHarness(info);
       await tick();
+      const group = info ? "security-key-choices" : "permission-choices";
+      assert.equal(h.elements.get(group).hidden, false);
       h.elements.get(id).listeners.click();
-      h.elements.get("always").listeners.click();
+      h.elements.get("close").listeners.click();
       assert.deepEqual(h.choices, [choice]);
     });
   }

@@ -107,7 +107,6 @@ describe("security-key notice for embedded browser pages", () => {
   });
 
   for (const [name, end] of [
-    ["navigation", (h) => h.contents.emit("did-start-navigation", {}, PAGE, false, true)],
     ["a committed navigation", (h) => h.contents.emit("did-navigate", {}, PAGE)],
     ["a renderer crash", (h) => h.contents.emit("render-process-gone")],
   ]) {
@@ -132,13 +131,28 @@ describe("security-key notice for embedded browser pages", () => {
     assert.equal(h.prompts[0].options.signal.aborted, true);
   });
 
-  it("ignores in-page and subframe navigations", async () => {
+  it("keeps the notice while a navigation that may not commit is in flight", async () => {
     const h = harness();
     h.report(true);
     await h.wait();
-    h.contents.emit("did-start-navigation", {}, `${PAGE}#step`, true, true);
-    h.contents.emit("did-start-navigation", {}, "https://frame.example/", false, false);
+    h.contents.emit("did-start-navigation", {}, "https://elsewhere.example/", false, true);
     assert.equal(h.prompts[0].options.signal.aborted, false);
+  });
+
+  it("shows again after yielding to a permission prompt while the pane can still prompt", async () => {
+    let visible = true;
+    const h = harness({ canPrompt: () => visible });
+    h.report(true);
+    await h.wait();
+    h.prompts[0].choose("suppressed");
+    await flush();
+    assert.equal(h.prompts.length, 2);
+    assert.equal(h.prompts[1].options.kind, "security-key");
+    visible = false;
+    h.prompts[1].choose("suppressed");
+    await flush();
+    assert.equal(h.prompts.length, 2);
+    assert.deepEqual(h.opened, []);
   });
 
   for (const [name, options, frame] of [

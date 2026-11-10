@@ -40,6 +40,7 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
       .then((choice) => {
         if (shown !== controller) return;
         shown = null;
+        if (choice === "suppressed") return show();
         const url = contents.getURL();
         if (choice === "open-in-browser" && pageOrigin(url) === origin) openExternal(url);
       })
@@ -58,9 +59,7 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
     pending = false;
     hide();
   };
-  contents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
-    if (isMainFrame && !isInPlace) reset();
-  });
+  // The old document's request stays live until a main-frame navigation commits.
   contents.on("did-navigate", reset);
   contents.on("render-process-gone", reset);
   contents.once("destroyed", reset);

@@ -26,6 +26,7 @@ function loadObserver({ report } = {}) {
   const realm = vm.createContext({ report: report ?? script.args[0] });
   vm.runInContext(
     `function track(options) {
+      void [options?.mediation, options?.publicKey];
       const call = { options };
       call.promise = new Promise((resolve, reject) => Object.assign(call, { resolve, reject }));
       calls.push(call);
@@ -118,10 +119,19 @@ describe("embedded browser WebAuthn observer", () => {
     assert.deepEqual(pending(), [true]);
   });
 
-  it("leaves unreadable options and native errors to the page", () => {
+  it("leaves accessor options, unreadable options and native errors to the page", () => {
     const { realm, pending } = loadObserver();
+    const reads = vm.runInContext(
+      `const options = { reads: 0, get publicKey() { this.reads += 1; return {}; } };
+      credentials.get(options);
+      options.reads`,
+      realm,
+    );
+    assert.equal(reads, 1, "only the native call runs page getters");
     const request = vm.runInContext(
-      "credentials.get({ get publicKey() { throw new Error('getter'); } })",
+      `credentials.get(new Proxy({ publicKey: {} }, {
+        getOwnPropertyDescriptor() { throw new Error("trap"); },
+      }))`,
       realm,
     );
     assert.equal(request instanceof vm.runInContext("Promise", realm), true);
