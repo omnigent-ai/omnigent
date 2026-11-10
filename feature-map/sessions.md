@@ -380,8 +380,8 @@ including archived sessions, are retained.
 Dismissing it cancels the archive. Settings → Git → Worktrees holds the saved
 choice only when the server supports cleanup.
 
-**Archive running-session prompt:** archive a session whose sidebar row shows it
-working or awaiting approval from the quick button, row menu, right-click menu,
+**Archive running-session prompt:** archive a session whose agent is working or
+awaiting approval from the quick button, row menu, right-click menu,
 bulk selection, header menu, or desktop Session → Archive. "Archive running
 session?" (or, for bulk, how many of the selected sessions are running) offers
 Cancel and Archive; Archive continues to the worktree prompt when that applies.
@@ -725,7 +725,8 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/shell/Sidebar.archive.test.tsx` (quick button, row menu, bulk
   selection, chaining into the worktree prompt) and
   `web/src/shell/HeaderConversationMenu.test.tsx` (header menu and desktop
-  Session → Archive). Manually: send a message that keeps the agent busy, hover
+  Session → Archive); `web/src/shell/AppShell.test.tsx` covers a session opened
+  outside the loaded sidebar pages. Manually: send a message that keeps the agent busy, hover
   its row, click Archive, and expect the dialog; Cancel leaves the row.
 - **`row-quick-actions`:** component coverage in
   `web/src/shell/Sidebar.archive.test.tsx` and `web/src/pages/SettingsPage.test.tsx`

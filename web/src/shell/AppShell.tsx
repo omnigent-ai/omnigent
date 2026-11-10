@@ -797,10 +797,24 @@ function AppShellImpl() {
   const isKnownTopLevel =
     activeConv != null ||
     (activeSessionMatchesRoute && activeSession != null && activeSession.parentSessionId == null);
+  // An off-window session has no list row to say whether its agent is working,
+  // so archive's confirmation reads the live store (the snapshot only refreshes
+  // on bind) or, before binding, the snapshot.
+  const boundSessionWorking = useChatStore(
+    (s) =>
+      s.conversationId === serverConversationId &&
+      (s.sessionStatus === "running" || s.sessionStatus === "waiting" || s.backgroundTaskCount > 0),
+  );
   const actionConversation = useMemo<Conversation | null>(() => {
     if (!isKnownTopLevel || !isOwnerLevel(permissionLevel)) return null;
     if (activeConv) return activeConv;
     if (!activeSessionMatchesRoute || !activeSession) return null;
+    const working =
+      boundSessionWorking ||
+      activeSession.status === "running" ||
+      activeSession.status === "waiting" ||
+      (activeSession.pendingElicitations?.length ?? 0) > 0 ||
+      (activeSession.backgroundTaskCount ?? 0) > 0;
     return {
       id: activeSession.id,
       object: "conversation",
@@ -820,8 +834,16 @@ function AppShellImpl() {
       agent_name: activeSession.agentName,
       family: activeSession.family,
       git_branch: activeSession.gitBranch ?? null,
+      ...(working ? { status: "running" } : {}),
     };
-  }, [activeConv, activeSession, activeSessionMatchesRoute, isKnownTopLevel, permissionLevel]);
+  }, [
+    activeConv,
+    activeSession,
+    activeSessionMatchesRoute,
+    boundSessionWorking,
+    isKnownTopLevel,
+    permissionLevel,
+  ]);
   // Header action gating, hoisted so the desktop buttons and the mobile
   // three-dot menu render the exact same set (they can't drift apart).
   // Stop session is not a header action — it lives in the sidebar row's

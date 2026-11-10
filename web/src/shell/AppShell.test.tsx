@@ -781,6 +781,7 @@ beforeEach(() => {
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
   useChatStore.setState({
+    conversationId: null,
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
@@ -886,6 +887,49 @@ describe("AppShell header", () => {
       ).toBeInTheDocument();
       if (sibling) expect(screen.queryByTestId("header-move-to-project")).toBeNull();
       else expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    { source: "the live store", snapshotStatus: "idle", boundStatus: "running" },
+    { source: "the snapshot", snapshotStatus: "waiting", boundStatus: "idle" },
+  ] as const)(
+    "asks before archiving an off-window session working per $source, and Cancel keeps it",
+    async ({ snapshotStatus, boundStatus }) => {
+      mockConversations([]);
+      useChatStore.setState({ conversationId: "conv_off_window", sessionStatus: boundStatus });
+      useSessionMock.mockReturnValue({
+        session: {
+          id: "conv_off_window",
+          agentId: "ag_owner",
+          agentName: "developer",
+          runnerId: null,
+          status: snapshotStatus,
+          createdAt: 1_700_000_000,
+          title: "Off-window owner session",
+          archived: false,
+          labels: {},
+          items: [],
+          pendingElicitations: [],
+          permissionLevel: 4,
+          parentSessionId: null,
+          subAgentName: null,
+          kind: "default",
+        },
+        isLoading: false,
+        error: null,
+      });
+
+      renderShell("/c/conv_off_window");
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+        button: 0,
+        ctrlKey: false,
+      });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+
+      const dialog = await screen.findByRole("dialog", { name: "Archive running session?" });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(screen.queryByTestId("archive-running-dialog")).toBeNull());
     },
   );
 
