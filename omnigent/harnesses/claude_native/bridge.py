@@ -5806,6 +5806,18 @@ def _btw_overlay_present(pane: str) -> bool:
     return any(_BTW_ANSWERING_HINT in line for line in region)
 
 
+def _btw_border_index(lines: Sequence[str]) -> int | None:
+    """Return the index of the last ``/btw`` overlay border row, or ``None``."""
+    return next(
+        (
+            index
+            for index in range(len(lines) - 1, -1, -1)
+            if _BTW_OVERLAY_BORDER_GLYPH in lines[index]
+        ),
+        None,
+    )
+
+
 def _btw_answering(pane: str) -> bool:
     """
     Report whether a captured pane shows the ``/btw`` overlay generating.
@@ -5819,14 +5831,7 @@ def _btw_answering(pane: str) -> bool:
     :returns: True when the overlay shows its answering status row.
     """
     lines = pane.splitlines()
-    border_idx = next(
-        (
-            index
-            for index in range(len(lines) - 1, -1, -1)
-            if _BTW_OVERLAY_BORDER_GLYPH in lines[index]
-        ),
-        None,
-    )
+    border_idx = _btw_border_index(lines)
     if border_idx is None:
         return False
     rows = [line.strip() for line in lines[border_idx + 1 :] if line.strip()]
@@ -5847,15 +5852,32 @@ def _btw_display_ended(pane: str) -> bool:
     Report whether a captured pane ends the previous ``/btw`` display.
 
     True only on positive evidence: the overlay is answering anew, or the live
-    input box it hides is back. A torn, failed or unrecognized capture shows
-    neither, and history browsing or the copy indicator keep the overlay up.
+    input box it hides is back. Rows from the overlay's border through its
+    ``Esc to close`` footer belong to the overlay, so a composer-shaped answer
+    in a capture that lost its footer does not count. Failed captures, history
+    browsing and the copy indicator also keep the display open.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: True when a later settled exchange is a new display.
     """
     if _btw_answering(pane):
         return True
-    return _btw_overlay_parts(pane) is None and _composer_row(pane) is not None
+    lines = pane.splitlines()
+    border_idx = _btw_border_index(lines)
+    if border_idx is not None:
+        overlay_rows = ["".join(line.split()) for line in lines[border_idx + 1 :]]
+        footer_end = next(
+            (
+                count
+                for count in range(1, len(overlay_rows) + 1)
+                if "".join(overlay_rows[:count]).endswith(_BTW_FOOTER_CLOSE_HINT)
+            ),
+            None,
+        )
+        if footer_end is None:
+            return False
+        lines = lines[border_idx + 1 + footer_end :]
+    return _composer_row("\n".join(lines)) is not None
 
 
 def _dedent_overlay_lines(overlay_lines: list[str]) -> str:

@@ -1037,17 +1037,18 @@ async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
 
     Claude Code keeps /btw history, so the second ask lists the first above it
     and settles on the same question and answer. One torn capture that loses
-    the footer does not end the display.
+    the footer does not end the display, though the answer quotes a composer.
     """
     scrollback = [f"scrollback line {n}" for n in range(30)]
-    border, question, answer = "▔" * 80, "    /btw hello", "      Hi! How can I help?"
+    border, question = "▔" * 80, "    /btw hello"
+    answer = ["      Type it like this:", "      " + "─" * 40, "      ❯ example"]
     first_ask = "\n".join(
         [
             *scrollback,
             border,
             question,
             "",
-            answer,
+            *answer,
             "",
             "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
         ]
@@ -1059,7 +1060,7 @@ async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
             question,
             question,
             "",
-            answer,
+            *answer,
             "",
             "    ⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close",
         ]
@@ -1080,7 +1081,7 @@ async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
                 "    ⇧←/→ to browse · x to clear history · Esc to close",
             ]
         ),
-        "torn": "\n".join([*scrollback, border, question, "", answer, ""]),
+        "torn": "\n".join([*scrollback, border, question, "", *answer, ""]),
     }
     frames = [first_ask] * 3 + [named_frames[name] for name in later_frames]
     write_tmux_target(tmp_path, socket_path=tmp_path / "tmux.sock", tmux_target="claude:0.0")
@@ -1099,7 +1100,11 @@ async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
             )
 
     relayed = [c["data"] for c in calls if c["type"] == "external_btw_sidechat"]
-    exchange = {"question": "/btw hello", "answer": "Hi! How can I help?", "truncated": False}
+    exchange = {
+        "question": "/btw hello",
+        "answer": "Type it like this:\n" + "─" * 40 + "\n❯ example",
+        "truncated": False,
+    }
     assert relayed == [exchange] * relays
 
 
