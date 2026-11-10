@@ -770,7 +770,7 @@ describe("SettingsPage", () => {
     const group = screen.getByRole("radiogroup", { name: "Default Workspace tab" });
     const options = within(group).getAllByRole("radio");
     expect(options).toHaveLength(5);
-    ["Files", "Changes", "Pull Requests", "Tasks", "Agents"].forEach((label, index) => {
+    ["Files", "Changes", "Pull Requests", "Agents", "Tasks"].forEach((label, index) => {
       expect(options[index]).toHaveAccessibleName(label);
     });
     expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
@@ -802,7 +802,7 @@ describe("SettingsPage", () => {
     );
     expect(
       screen.getByRole("img", {
-        name: "Sidebar preview: Changes, Files, Pull Requests, Tasks, Agents pinned.",
+        name: "Sidebar preview: Changes, Files, Pull Requests, Agents, Tasks pinned.",
       }),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));

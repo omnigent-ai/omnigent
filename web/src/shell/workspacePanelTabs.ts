@@ -1,6 +1,6 @@
 /**
  * Labels, icons and trigger presentation for the Workspace rail's fixed panel
- * tabs (Files, Changes, Pull Requests, Tasks, Agents, Content search). `WorkspacePanel`
+ * tabs (Files, Changes, Pull Requests, Agents, Tasks, Content search). `WorkspacePanel`
  * draws every trigger from these descriptors with one tab-agnostic renderer.
  */
 

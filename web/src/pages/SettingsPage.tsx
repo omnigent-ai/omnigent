@@ -460,8 +460,8 @@ const workspaceTabCards: {
   { value: "files", label: "Files", icon: FilesIcon },
   { value: "changes", label: "Changes", icon: FileDiffIcon },
   { value: "github", label: "Pull Requests", icon: GitPullRequestIcon },
-  { value: "tasks", label: "Tasks", icon: ListChecksIcon },
   { value: "subagents", label: "Agents", icon: BotIcon },
+  { value: "tasks", label: "Tasks", icon: ListChecksIcon },
 ];
 
 /** Inline icon and label for compact settings choices. */
