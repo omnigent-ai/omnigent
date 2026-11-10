@@ -51,6 +51,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     TextChunk,
     ToolSpec,
@@ -184,6 +185,10 @@ class ClaudeNativeExecutor(Executor):
         try:
             async with self._inject_lock:
                 await self._inject_prompt(text, framework_notices(content))
+        except ClaudeSessionChanged as exc:
+            if not exc.undelivered:
+                raise InjectionDeliveryAmbiguous(str(exc)) from exc
+            return False
         except RuntimeError:
             return False
         return True

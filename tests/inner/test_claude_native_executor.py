@@ -27,7 +27,13 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TextChunk, TurnComplete
+from omnigent.inner.executor import (
+    ExecutorConfig,
+    ExecutorError,
+    InjectionDeliveryAmbiguous,
+    TextChunk,
+    TurnComplete,
+)
 from omnigent.inner.native_attachments import attachment_cache_dir
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
@@ -520,6 +526,24 @@ async def test_enqueue_session_message_rejects_stale_session_after_clear(
         injected = await executor.enqueue_session_message("main", "old steering")
 
     assert injected is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_started", [False, True])
+async def test_live_owner_change_retains_delivery_uncertainty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, input_started: bool
+) -> None:
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        Mock(side_effect=claude_bridge.ClaudeSessionChanged(input_started=input_started)),
+    )
+    executor = ClaudeNativeExecutor(tmp_path)
+    if input_started:
+        with pytest.raises(InjectionDeliveryAmbiguous):
+            await executor.enqueue_session_message("main", "retain this input")
+    else:
+        assert await executor.enqueue_session_message("main", "retain this input") is False
 
 
 @pytest.mark.asyncio
