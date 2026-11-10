@@ -17,6 +17,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     record_hook_event,
 )
+from omnigent.runtime import pending_inputs
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from tests.harnesses.claude_native.forwarder._support import (
@@ -460,31 +461,41 @@ def _session_not_bound_rows(caplog: pytest.LogCaptureFixture) -> list[dict[str, 
     ]
 
 
-def _assistant_items_state(path: Path, *uuids: str) -> forwarder.TranscriptForwardState:
-    """Write one assistant record per uuid; return a cursor positioned before them."""
-    path.write_text(
-        "\n".join(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "uuid": uuid,
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": f"private reply {uuid}"}],
-                    },
-                }
-            )
-            for uuid in uuids
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+def _transcript_state(path: Path, *records: dict[str, Any]) -> forwarder.TranscriptForwardState:
+    """Write the records as a transcript; return a cursor positioned before them."""
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
     return forwarder.TranscriptForwardState(
         transcript_path=path,
         line_cursor=0,
         byte_offset=0,
         cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(path, 0),
     )
+
+
+def _assistant_items_state(path: Path, *uuids: str) -> forwarder.TranscriptForwardState:
+    """Write one assistant record per uuid; return a cursor positioned before them."""
+    return _transcript_state(
+        path,
+        *(
+            {
+                "type": "assistant",
+                "uuid": uuid,
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": f"private reply {uuid}"}],
+                },
+            }
+            for uuid in uuids
+        ),
+    )
+
+
+_ENQUEUE_RECORD = {
+    "type": "queue-operation",
+    "operation": "enqueue",
+    "content": "Then summarize the logs",
+    "timestamp": "2026-11-05T09:45:21.000Z",
+}
 
 
 @pytest.mark.asyncio
@@ -843,6 +854,215 @@ async def test_forwarder_retries_user_item_on_connect_error(tmp_path: Path) -> N
     assert first.byte_offset == 0
     assert first.seen_source_ids == ()
     assert second.byte_offset == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "failed_posts", "queue_posts", "mirrored"),
+    [
+        ("connect", 1, 2, True),
+        ("connect", 8, 9, True),
+        ("lost-ack", 8, 9, True),
+        ("lost-ack-restart", 8, 9, True),
+        ("connect", None, 9, False),
+        (422, None, forwarder._HTTP_POST_MAX_PERMANENT_FAILURES, True),
+    ],
+    ids=[
+        "transient-retried",
+        "long-outage-recovered",
+        "lost-ack-idempotent",
+        "lost-ack-after-restart",
+        "outage-held",
+        "permanent-dropped",
+    ],
+)
+async def test_forwarder_posts_queue_operations_before_the_items_after_them(
+    tmp_path: Path,
+    failure: str | int,
+    failed_posts: int | None,
+    queue_posts: int,
+    mirrored: bool,
+) -> None:
+    """An edited native input keeps its pending identity through an unavailable server."""
+    pending_inputs.reset_for_tests()
+    pending_id = pending_inputs.record(
+        "conv_abc", [{"type": "input_text", "text": "Then summarize"}], stable_id="a" * 32
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    state = _transcript_state(
+        transcript_path,
+        {
+            "type": "queue-operation",
+            "operation": "popAll",
+            "content": "Then summarize",
+            "timestamp": "2026-11-05T09:45:20.000Z",
+        },
+        _ENQUEUE_RECORD,
+        {
+            "type": "user",
+            "uuid": "user-msg-3",
+            "message": {"role": "user", "content": "Then summarize the logs"},
+        },
+    )
+    bridge_dir = tmp_path / "bridge"
+    forwarder._write_forward_state(bridge_dir, state)
+    requests: list[dict[str, Any]] = []
+    matched_pending_ids: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        requests.append(payload)
+        queue_attempt = sum(1 for r in requests if r["type"] == "external_queue_operations")
+        queue_post = payload["type"] == "external_queue_operations"
+        failing = queue_post and (failed_posts is None or queue_attempt <= failed_posts)
+        if failing and failure == "connect":
+            raise httpx.ConnectError("connection refused", request=request)
+        if queue_post and (
+            not failing or (isinstance(failure, str) and failure.startswith("lost-ack"))
+        ):
+            pending_inputs.apply_queue_operations(
+                "conv_abc",
+                [pending_inputs.QueueOperation(**op) for op in payload["data"]["operations"]],
+            )
+        if failing and isinstance(failure, str) and failure.startswith("lost-ack"):
+            raise httpx.ReadTimeout("receipt response lost", request=request)
+        if failing:
+            return httpx.Response(failure, json={"error": "invalid_input"})
+        if payload["type"] == "external_conversation_item" and failure != 422:
+            text = "".join(block["text"] for block in payload["data"]["item_data"]["content"])
+            match = pending_inputs.resolve_matching_text("conv_abc", text)
+            assert match.matched is not None
+            assert match.skipped == []
+            assert match.matched.stable_id == "a" * 32
+            matched_pending_ids.append(match.matched.pending_id)
+        return httpx.Response(202, json={})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle), base_url="http://test"
+        ) as client:
+            dedupe = forwarder._ForwardDedupeState()
+            retries = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+            for attempt in range(9):
+                if attempt == 7 and failure == "lost-ack-restart":
+                    restored = forwarder._read_forward_state(bridge_dir)
+                    assert restored is not None
+                    state = restored
+                    dedupe = forwarder._ForwardDedupeState()
+                    retries = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+                state = await forwarder._forward_available_items(
+                    client=client,
+                    session_id="conv_abc",
+                    bridge_dir=bridge_dir,
+                    agent_name="claude-native-ui",
+                    state=state,
+                    retry_tracker=retries,
+                    dedupe=dedupe,
+                )
+        posted = [r["type"] for r in requests if r["type"] != "external_session_status"]
+        assert posted == ["external_queue_operations"] * queue_posts + (
+            ["external_conversation_item"] if mirrored else []
+        )
+        if mirrored:
+            assert state.byte_offset == transcript_path.stat().st_size
+            if failure != 422:
+                assert matched_pending_ids == [pending_id]
+        else:
+            assert state.byte_offset == 0
+            assert state.seen_source_ids == ()
+            assert pending_inputs.snapshot_for("conv_abc")[0]["content"] == [
+                {"type": "input_text", "text": "Then summarize"}
+            ]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_forwarder_stops_posting_queue_operations_to_a_server_without_them(
+    tmp_path: Path,
+) -> None:
+    """An older server's unknown-event rejection does not hold up later transcript regions."""
+
+    def _user(uuid: str, text: str) -> dict[str, Any]:
+        return {"type": "user", "uuid": uuid, "message": {"role": "user", "content": text}}
+
+    transcript_path = tmp_path / "session.jsonl"
+    state = _transcript_state(
+        transcript_path, _ENQUEUE_RECORD, _user("user-msg-3", "Then summarize the logs")
+    )
+    posted: list[str] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        event_type = json.loads(request.content.decode("utf-8"))["type"]
+        posted.append(event_type)
+        if event_type == "external_queue_operations":
+            message = "Unknown event type: 'external_queue_operations'. Expected one of: message."
+            return httpx.Response(
+                400, json={"error": {"code": "invalid_input", "message": message}}
+            )
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        dedupe = forwarder._ForwardDedupeState()
+        retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+        for later_records in (
+            (),
+            (_ENQUEUE_RECORD | {"content": "And list them"}, _user("user-msg-4", "And list them")),
+        ):
+            with transcript_path.open("a", encoding="utf-8") as transcript:
+                transcript.writelines(json.dumps(record) + "\n" for record in later_records)
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=tmp_path / "bridge",
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=retry_tracker,
+                dedupe=dedupe,
+            )
+
+    assert [event for event in posted if event != "external_session_status"] == [
+        "external_queue_operations",
+        "external_conversation_item",
+        "external_conversation_item",
+    ]
+    assert state.byte_offset == transcript_path.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_forwarder_waits_out_the_backoff_before_reposting_queue_operations(
+    tmp_path: Path,
+) -> None:
+    """A failed queue post is not retried on every poll while its backoff runs."""
+    state = _transcript_state(tmp_path / "session.jsonl", _ENQUEUE_RECORD)
+    queue_posts = 0
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        nonlocal queue_posts
+        if json.loads(request.content.decode("utf-8"))["type"] == "external_queue_operations":
+            queue_posts += 1
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        retry_tracker = forwarder._PostRetryTracker(base_delay_s=60.0, max_delay_s=60.0)
+        for _ in range(3):
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=tmp_path / "bridge",
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=retry_tracker,
+                dedupe=forwarder._ForwardDedupeState(),
+            )
+
+    assert queue_posts == 1
+    assert state.byte_offset == 0
 
 
 def test_parse_json_response_returns_value_on_valid_json() -> None:

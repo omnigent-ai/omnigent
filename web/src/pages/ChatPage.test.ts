@@ -24,6 +24,7 @@ import {
   useWorkingSignals,
   containsMarkdownTable,
   dispatchInitialPrompt,
+  editableQueuedInput,
   failedSessionLastError,
   isComposerReadOnly,
   isCostRoutingEligible,
@@ -594,6 +595,75 @@ const routingChipBubble = (id: string, scope: RoutingScope): Bubble => ({
 });
 const bubbleIds = (bubbles: Bubble[]): string[] =>
   bubbles.map((b) => (b.kind === "assistant" ? b.stableId : b.itemId));
+
+describe("editableQueuedInput", () => {
+  const text = (value: string) => [{ type: "input_text" as const, text: value }];
+
+  it.each([null, "alice@example.com"])(
+    "offers the latest accepted message %s sent under its server pending id",
+    (viewer) => {
+      const author = viewer === null ? {} : { author: viewer };
+      const pending = [
+        { tempId: "tmp_1", pendingId: "pending_1", content: text("first") },
+        { tempId: "tmp_2", pendingId: "pending_2", content: text("Then summarize"), ...author },
+      ];
+      expect(editableQueuedInput(pending, viewer)).toEqual({
+        pendingId: "pending_2",
+        text: "Then summarize",
+      });
+    },
+  );
+
+  it("reads the pending id of a snapshot-replayed bubble from its temp id", () => {
+    const pending = [{ tempId: "pending_abc", content: text("replayed") }];
+    expect(editableQueuedInput(pending, null)).toEqual({
+      pendingId: "pending_abc",
+      text: "replayed",
+    });
+  });
+
+  it.each([
+    ["nothing is pending", []],
+    ["the server has not accepted it", [{ tempId: "tmp_1", content: text("in flight") }]],
+    [
+      "it is an unsent draft",
+      [
+        {
+          tempId: "pending_1",
+          content: text("draft"),
+          initialDraft: { text: "draft", files: [] },
+        },
+      ],
+    ],
+    [
+      "it carries an attachment",
+      [
+        {
+          tempId: "pending_1",
+          content: [
+            ...text("look"),
+            { type: "input_image" as const, file_id: "file_1", filename: "shot.png" },
+          ],
+        },
+      ],
+    ],
+    ["it is a shell command", [{ tempId: "pending_1", content: text("!ls") }]],
+    ["it is blank", [{ tempId: "pending_1", content: text("  ") }]],
+    [
+      "someone else sent it",
+      [{ tempId: "pending_1", content: text("Then summarize"), author: "bob@example.com" }],
+    ],
+    [
+      "another queued message has the same text",
+      [
+        { tempId: "pending_1", content: text("Then  summarize") },
+        { tempId: "pending_2", content: text("Then summarize") },
+      ],
+    ],
+  ])("returns null when %s", (_case, pending) => {
+    expect(editableQueuedInput(pending, null)).toBeNull();
+  });
+});
 
 describe("mergePendingBubbles", () => {
   it("appends pending bubbles at the end when nothing trails", () => {

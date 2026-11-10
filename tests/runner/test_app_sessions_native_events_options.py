@@ -500,6 +500,115 @@ async def test_events_compact_on_native_session_types_slash_command(
     assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
 
 
+_EDIT = {"original": "Then summarize", "replacement": "Then list"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "body", "pane_error", "expected_status", "expected_reply"),
+    [
+        ("claude-native", _EDIT, None, 200, None),
+        (
+            "claude-native",
+            _EDIT,
+            claude_native_bridge.ClaudeQueuedMessageMissing("no longer queued"),
+            409,
+            {"error": "queued_message_missing"},
+        ),
+        (
+            "claude-native",
+            _EDIT,
+            claude_native_bridge.ClaudeQueuedMessageAmbiguous("queued twice"),
+            409,
+            {"error": "queued_message_ambiguous"},
+        ),
+        (
+            "claude-native",
+            _EDIT,
+            claude_native_bridge.ClaudeUserPromptPending("Answer it first.", nothing_typed=True),
+            503,
+            {"error": "claude_native_queued_message_edit_failed", "detail": "Answer it first."},
+        ),
+        (
+            "claude-native",
+            _EDIT,
+            claude_native_bridge.ClaudeQueuedEditIncomplete('Resend "Last".', unsent=["Last"]),
+            503,
+            {"error": "claude_native_queued_message_edit_incomplete", "detail": 'Resend "Last".'},
+        ),
+        (
+            "claude-native",
+            _EDIT,
+            RuntimeError("tmux send-keys failed on /tmp/socket"),
+            503,
+            {"error": "claude_native_queued_message_edit_failed"},
+        ),
+        ("claude-native", {"original": "Then summarize"}, None, 400, None),
+        ("codex-native", _EDIT, None, 204, None),
+    ],
+    ids=[
+        "edited",
+        "no-longer-queued",
+        "queued-twice",
+        "prompt-pending",
+        "prompts-unqueued",
+        "pane-failed",
+        "missing-replacement",
+        "other-harness",
+    ],
+)
+async def test_events_queued_message_edit_drives_the_claude_native_pane(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    harness: str,
+    body: dict[str, str],
+    pane_error: Exception | None,
+    expected_status: int,
+    expected_reply: dict[str, str] | None,
+) -> None:
+    """The runner edits a queued Claude Code prompt and reports why an edit failed."""
+    edits: list[tuple[Path, str, str]] = []
+    deadlines: list[tuple[float, float | None]] = []
+
+    def _fake_edit(bridge_dir: Path, *, original: str, replacement: str, deadline: float) -> None:
+        edits.append((bridge_dir, original, replacement))
+        deadlines.append((deadline, _injection_deadline()))
+        if pane_error is not None:
+            raise pane_error
+
+    monkeypatch.setattr(claude_native_bridge, "edit_queued_user_message", _fake_edit)
+    app, _ = await _build_app_for_spec(_harness_spec(harness))
+    session_id = "0b6f2a7c8d9e4f1a2b3c4d5e6f7a8b9c"
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "queued_message_edit", **body},
+        )
+
+    assert resp.status_code == expected_status, resp.text
+    if expected_reply is not None:
+        reply = resp.json()
+        assert {key: reply.get(key) for key in expected_reply} == expected_reply
+        assert "/tmp/socket" not in resp.text
+    expected_edits = (
+        [(bridge_dir_for_conversation_id(session_id), "Then summarize", "Then list")]
+        if expected_status in {200, 409, 503}
+        else []
+    )
+    assert edits == expected_edits
+    # The edit has the same time left as the deadline that stops its keys.
+    assert all(passed == bound for passed, bound in deadlines)
+    if isinstance(pane_error, claude_native_bridge.ClaudeQueuedEditIncomplete):
+        assert "1 prompt(s) unqueued" in caplog.text
+        assert "Last" not in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_events_clear_on_claude_native_types_clear_into_the_tui(
     monkeypatch: pytest.MonkeyPatch,

@@ -371,6 +371,14 @@ _SCROLLED_DRAFT_MAX_FOOTER_ROWS = 4
 # submitting — the draft then sits unsent. Polling for the draft makes
 # the handoff deterministic where the old fixed sleep raced it.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
+# How long Up gets to log its ``popAll`` records, then to finish the batch.
+_QUEUE_POP_TIMEOUT_S = 3.0
+_QUEUE_POP_SETTLE_S = 0.3
+# How long popped prompts wait out a question or an uncleared draft before an
+# edit gives up queueing them again; never past the caller's deadline.
+_QUEUE_RESUBMIT_HOLD_S = 8.0
+# Time an edit must have left before Up to read the pops and queue a few prompts again.
+_QUEUED_EDIT_MIN_BUDGET_S = 6.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
 # before failing loud. Sized to out-wait a transiently unresponsive
@@ -755,6 +763,27 @@ class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
     """A fresh matching native refusal stops retries without proving web ownership."""
 
 
+class ClaudeQueuedMessageMissing(RuntimeError):
+    """The message to edit is no longer in Claude Code's prompt queue."""
+
+
+class ClaudeQueuedMessageAmbiguous(RuntimeError):
+    """More than one prompt in Claude Code's queue has the text to edit."""
+
+
+class ClaudeQueuedEditIncomplete(RuntimeError):
+    """
+    An edit emptied Claude Code's prompt queue but could not queue every prompt again.
+
+    :param message: Human-readable failure naming the prompts to resend.
+    :param unsent: The prompts left out of the queue, in queue order.
+    """
+
+    def __init__(self, message: str, *, unsent: list[str]) -> None:
+        super().__init__(message)
+        self.unsent = unsent
+
+
 @contextlib.contextmanager
 def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
     """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
@@ -986,6 +1015,24 @@ class TranscriptRecordItems:
 
 
 @dataclass(frozen=True)
+class ClaudeQueueOperation:
+    """
+    One edit-relevant ``queue-operation`` record from a Claude transcript.
+
+    :param operation: ``"enqueue"`` when Claude queued a prompt, or
+        ``"popAll"``/``"popOne"`` when Up moved a queued prompt back into
+        the composer for editing.
+    :param content: The queued prompt text, e.g. ``"Then summarize"``.
+    :param timestamp: Claude's ISO timestamp for the record, e.g.
+        ``"2026-11-05T09:45:15.794Z"``; used to deduplicate re-reads.
+    """
+
+    operation: str
+    content: str
+    timestamp: str
+
+
+@dataclass(frozen=True)
 class TranscriptReadResult:
     """
     Result of reading Claude transcript JSONL records.
@@ -1013,6 +1060,9 @@ class TranscriptReadResult:
     :param record_items: Parsed items grouped by their complete source JSONL
         record, with the byte offset immediately after each record. Native
         child-transcript batching uses these boundaries for partial checkpoints.
+    :param queue_operations: User-prompt queue edits in transcript order.
+        They render no items; the forwarder mirrors them onto the server's
+        pending-input queue so a prompt edited in the pane updates the GUI.
     """
 
     line_cursor: int
@@ -1023,6 +1073,7 @@ class TranscriptReadResult:
     latest_model: str | None = None
     latest_custom_title: str | None = None
     record_items: tuple[TranscriptRecordItems, ...] = ()
+    queue_operations: tuple[ClaudeQueueOperation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3675,6 +3726,7 @@ def read_transcript_items_since_with_position(
     latest_model: str | None = None
     latest_custom_title: str | None = None
     record_items: list[TranscriptRecordItems] = []
+    queue_operations: list[ClaudeQueueOperation] = []
     for record in read_result.records:
         parsed: list[ClaudeTranscriptItem] = []
         if record.text is None:
@@ -3720,6 +3772,9 @@ def read_transcript_items_since_with_position(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        queue_operation = _queue_operation_from_transcript_entry(entry)
+        if queue_operation is not None:
+            queue_operations.append(queue_operation)
         record_items.append(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
@@ -3744,6 +3799,7 @@ def read_transcript_items_since_with_position(
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
         record_items=tuple(record_items),
+        queue_operations=tuple(queue_operations),
     )
 
 
@@ -3880,6 +3936,7 @@ def read_transcript_items_from_offset(
     latest_model: str | None = None
     latest_custom_title: str | None = None
     record_items: list[TranscriptRecordItems] = []
+    queue_operations: list[ClaudeQueueOperation] = []
     for record in read_result.records:
         parsed: list[ClaudeTranscriptItem] = []
         if record.text is None:
@@ -3930,6 +3987,9 @@ def read_transcript_items_from_offset(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        queue_operation = _queue_operation_from_transcript_entry(entry)
+        if queue_operation is not None:
+            queue_operations.append(queue_operation)
         record_items.append(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
@@ -3954,6 +4014,7 @@ def read_transcript_items_from_offset(
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
         record_items=tuple(record_items),
+        queue_operations=tuple(queue_operations),
     )
 
 
@@ -4816,6 +4877,226 @@ def inject_user_message(
         text=_escape_slash_command_text(content),
         needle=needle,
     )
+
+
+@_serialize_bridge_injection
+def edit_queued_user_message(
+    bridge_dir: Path, *, original: str, replacement: str, deadline: float | None = None
+) -> None:
+    """
+    Replace a prompt waiting in Claude Code's queue with edited text.
+
+    Presses Up as the person would: Claude moves every queued prompt into the
+    composer and logs one ``popAll`` record each. Each popped prompt is then
+    submitted again in order, with ``replacement`` in place of ``original``,
+    so the queue keeps its order and Claude logs the edit as ``enqueue``.
+
+    A refusal before Up leaves the queue untouched. Once Up has emptied it,
+    the resubmission ignores the caller's cancellation, since stopping would
+    drop the popped prompts; only waiting out a question stops at *deadline*.
+
+    :param bridge_dir: Bridge directory path.
+    :param original: The queued text to replace, e.g. ``"Then summarize"``.
+    :param replacement: The edited text, e.g. ``"Then summarize the logs"``.
+    :param deadline: ``time.monotonic()`` value by which the caller needs the
+        outcome, e.g. the runner's control deadline; ``None`` for no limit.
+    :raises ClaudeInjectionCancelled: If less than
+        :data:`_QUEUED_EDIT_MIN_BUDGET_S` was left before Up; the queue is
+        untouched, but a terminal draft may already have been cleared.
+    :raises ClaudeQueuedMessageMissing: If no queued prompt matches
+        ``original``; any prompts Up popped were submitted again unchanged.
+    :raises ClaudeQueuedMessageAmbiguous: If several queued prompts match
+        ``original``; they were all submitted again unchanged.
+    :raises ClaudeUserPromptPending: If a question or permission prompt is
+        pending; nothing was typed.
+    :raises ClaudeInputBoxOccupied: If the input box stays in shell mode or
+        the prompt-history search; nothing was typed.
+    :raises ClaudeQueuedEditIncomplete: If Up emptied the queue but some
+        popped prompts could not be submitted again.
+    :raises RuntimeError: If the pane is not ready or a ``tmux`` invocation
+        fails before Up.
+    """
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    transcript = read_transcript_path(bridge_dir)
+    if transcript is None:
+        raise ClaudeQueuedMessageMissing("Claude Code has no transcript to edit a message in.")
+    # A dialog would take the keys below as its answer.
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Answer the pending Claude question or permission request before editing a message.",
+            nothing_typed=True,
+        )
+    surface = _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+    if surface is not None and surface != _OVERLAY_SURFACE:
+        raise ClaudeInputBoxOccupied(
+            f"Claude Code's input box is occupied by {surface}, so the message was not "
+            "edited. Open the terminal, dismiss it, then edit the message again.",
+            surface=surface,
+        )
+    _wait_for_claude_prompt_ready(
+        socket_path, tmux_target, timeout_s=_TMUX_READY_TIMEOUT_S, bridge_dir=bridge_dir
+    )
+    _check_queued_edit_budget(deadline)
+    # Up pops the queue only from an empty composer. Claude may drop its "Press up to
+    # edit queued messages" placeholder once cleared, so only the popAll records tell.
+    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    try:
+        offset = transcript.stat().st_size
+    except OSError as exc:
+        raise ClaudeQueuedMessageMissing("Claude Code's transcript is unreadable.") from exc
+    _check_queued_edit_budget(deadline)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Up")
+    cancel_token = _INJECTION_CANCEL_EVENT.set(None)
+    try:
+        popped = _popped_queue_prompts(transcript, offset)
+        if not popped:
+            # With nothing queued, Up recalled a history prompt into the composer instead.
+            clear_failure: RuntimeError | None = None
+            try:
+                _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+            except RuntimeError as exc:
+                clear_failure = exc
+            # Pop records written late mean the composer held queued prompts.
+            popped = _popped_queue_prompts(transcript, offset)
+            if not popped and clear_failure is not None:
+                # Up popped nothing, so retrying the whole edit loses no prompt.
+                raise clear_failure
+            if not popped:
+                raise ClaudeQueuedMessageMissing("Claude Code has no queued message to edit.")
+        target = " ".join(original.split())
+        matches = [index for index, text in enumerate(popped) if " ".join(text.split()) == target]
+        if len(matches) == 1:
+            popped[matches[0]] = replacement
+        hold_until = time.monotonic() + _QUEUE_RESUBMIT_HOLD_S
+        if deadline is not None:
+            hold_until = min(hold_until, deadline)
+        unsent = _resubmit_popped_prompts(
+            bridge_dir, socket_path, tmux_target, popped, hold_until=hold_until
+        )
+    finally:
+        _INJECTION_CANCEL_EVENT.reset(cancel_token)
+    if unsent:
+        from textwrap import shorten
+
+        previews = "; ".join(f'"{shorten(text, width=60, placeholder="…")}"' for text in unsent)
+        raise ClaudeQueuedEditIncomplete(
+            f"Claude Code could not queue {len(unsent)} message(s) again: {previews}. "
+            "Resend them.",
+            unsent=unsent,
+        )
+    if not matches:
+        raise ClaudeQueuedMessageMissing("The message is no longer queued in Claude Code.")
+    if len(matches) > 1:
+        raise ClaudeQueuedMessageAmbiguous(
+            "Claude Code has several queued messages with this text."
+        )
+
+
+def _check_queued_edit_budget(deadline: float | None) -> None:
+    """
+    Refuse an edit that would leave too little time to queue popped prompts again.
+
+    :param deadline: ``time.monotonic()`` value by which the caller needs the
+        outcome; ``None`` for no limit.
+    :raises ClaudeInjectionCancelled: If less than
+        :data:`_QUEUED_EDIT_MIN_BUDGET_S` is left.
+    """
+    if deadline is not None and deadline - time.monotonic() < _QUEUED_EDIT_MIN_BUDGET_S:
+        raise ClaudeInjectionCancelled(
+            "Claude Code took too long to get ready, so the message was not edited."
+        )
+
+
+def _resubmit_popped_prompts(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    prompts: list[str],
+    *,
+    hold_until: float,
+) -> list[str]:
+    """
+    Queue the prompts Up moved into the composer again, in order.
+
+    A question or an uncleared draft only delays a prompt, so those refusals
+    are retried until *hold_until*; any other failure stops. An uncleared
+    draft also gives a short pane room for the rest of the resubmission.
+
+    :param bridge_dir: Bridge directory path.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param prompts: The prompts to submit, e.g. ``["First", "Then summarize the logs"]``.
+    :param hold_until: ``time.monotonic()`` value after which a delayed prompt
+        is reported unsent.
+    :returns: The prompts that were not queued again, in order; empty on success.
+    """
+    with contextlib.ExitStack() as resize:
+        resize_tried = False
+        for index, text in enumerate(prompts):
+            while True:
+                try:
+                    _paste_and_submit(
+                        bridge_dir,
+                        socket_path,
+                        tmux_target,
+                        text=_escape_unsupported_slash_command(text),
+                        needle=_submit_needle(text),
+                    )
+                    break
+                except (ClaudeUserPromptPending, ClaudeComposerNotCleared) as exc:
+                    held = not isinstance(exc, ClaudeUserPromptPending) or exc.nothing_typed
+                    if not held or time.monotonic() >= hold_until:
+                        _logger.warning(
+                            "claude-native: could not requeue a popped prompt: %s", exc
+                        )
+                        return prompts[index:]
+                    if isinstance(exc, ClaudeComposerNotCleared) and not resize_tried:
+                        resize_tried = True
+                        with contextlib.suppress(RuntimeError, OSError):
+                            resize.enter_context(_usable_composer_height(socket_path, tmux_target))
+                    time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                except (RuntimeError, OSError) as exc:
+                    _logger.warning("claude-native: could not requeue a popped prompt: %s", exc)
+                    return prompts[index:]
+    return []
+
+
+def _popped_queue_prompts(transcript: Path, byte_offset: int) -> list[str]:
+    """
+    Wait for the prompts one Up press moved out of Claude Code's queue.
+
+    :param transcript: Claude transcript path.
+    :param byte_offset: Transcript size before Up was pressed.
+    :returns: The popped prompt texts in queue order; empty when none appear.
+    """
+    deadline = time.monotonic() + _QUEUE_POP_TIMEOUT_S
+    settle_until: float | None = None
+    popped: list[str] = []
+    while True:
+        records = _read_complete_jsonl_records(transcript, byte_offset=byte_offset, start_line=0)
+        operations = []
+        for record in records.records:
+            try:
+                entry = json.loads(record.text) if record.text is not None else None
+            except json.JSONDecodeError:
+                continue
+            operation = (
+                _queue_operation_from_transcript_entry(entry) if isinstance(entry, dict) else None
+            )
+            if operation is not None and operation.operation in {"popAll", "popOne"}:
+                operations.append(operation)
+        if len(operations) > len(popped):
+            # Claude writes one pop record per prompt, so wait for a quiet window after the last.
+            popped = [operation.content for operation in operations]
+            settle_until = time.monotonic() + _QUEUE_POP_SETTLE_S
+        now = time.monotonic()
+        if (settle_until is not None and now >= settle_until) or (
+            settle_until is None and now >= deadline
+        ):
+            return popped
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
 def _paste_and_submit(
@@ -9672,6 +9953,44 @@ def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:
     if isinstance(title, str) and title.strip():
         return title
     return None
+
+
+_EDITABLE_QUEUE_OPERATIONS = frozenset({"enqueue", "popAll", "popOne"})
+
+
+def _queue_operation_from_transcript_entry(entry: _JsonObject) -> ClaudeQueueOperation | None:
+    """
+    Return the user-prompt queue edit a ``queue-operation`` record describes.
+
+    Claude logs ``enqueue`` when it queues a prompt behind a busy turn and
+    ``popAll``/``popOne`` when Up pulls queued prompts back into the composer.
+    Agent notifications and system reminders share the queue but are not
+    user-editable, so their ``enqueue`` records are skipped.
+
+    :param entry: One decoded transcript JSONL record.
+    :returns: The operation, or ``None`` for other records, ``dequeue`` and
+        ``remove`` operations, and records without string content.
+    """
+    if entry.get("type") != "queue-operation":
+        return None
+    operation = entry.get("operation")
+    content = entry.get("content")
+    if (
+        not isinstance(operation, str)
+        or operation not in _EDITABLE_QUEUE_OPERATIONS
+        or not isinstance(content, str)
+    ):
+        return None
+    if operation == "enqueue" and (
+        _is_agent_notification_text(content) or _is_system_reminder_text(content)
+    ):
+        return None
+    timestamp = entry.get("timestamp")
+    return ClaudeQueueOperation(
+        operation=operation,
+        content=content,
+        timestamp=timestamp if isinstance(timestamp, str) else "",
+    )
 
 
 def read_claude_context_state(bridge_dir: Path) -> _JsonObject | None:
