@@ -1892,6 +1892,41 @@ async def test_diff_endpoint_returns_null_before_for_new_file(
 
 
 @pytest.mark.asyncio
+async def test_intent_to_add_file_is_listed_and_diffed_as_created(tmp_path: Path) -> None:
+    """A ``git add -N`` file has no HEAD version, so Changes and diff must treat it as added."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / "README.md").write_text("# repo\n")
+    subprocess.run(["git", "add", "README.md"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    content = "".join(f"CASE_{index} = {index}\n" for index in range(5))
+    (ws / "suite").mkdir()
+    (ws / "suite" / "new_suite.py").write_text(content)
+    subprocess.run(
+        ["git", "add", "-N", "suite/new_suite.py"],
+        cwd=ws,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    base = f"/v1/sessions/conv_ita/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_ita") as client:
+        changes = (await client.get(f"{base}/changes")).json()["data"]
+        diff = (await client.get(f"{base}/diff/suite/new_suite.py")).json()
+
+    statuses = {entry["path"]: entry["status"] for entry in changes}
+    assert statuses.get("suite/new_suite.py") == "created", changes
+    assert diff["before"] is None, diff
+    assert diff["after"] == content, diff
+    assert "baseline_state" not in diff, diff
+
+
+@pytest.mark.asyncio
 async def test_diff_endpoint_returns_null_after_for_deleted_file(
     client_with_registry: httpx.AsyncClient,
 ) -> None:
