@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-import contextlib
+import logging
 import ntpath
 import os
 import shutil
+import stat
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from omnigent.host.frames import HostCloneRepositoryFrame, HostCloneRepositoryResultFrame
@@ -15,6 +17,21 @@ from omnigent.onboarding.sandboxes.repositories import normalize_repository
 from omnigent.onboarding.sandboxes.types import GitCloneOptions
 
 CLONE_TIMEOUT_S = 360.0
+_logger = logging.getLogger(__name__)
+
+
+def _retry_readonly_cleanup(
+    remove: Callable[[str], object], path: str, error: BaseException
+) -> None:
+    """Allow removal of Git's read-only files without following links."""
+    entry = Path(path)
+    if not isinstance(error, PermissionError) or entry.is_symlink() or entry.is_junction():
+        raise error
+    mode = entry.stat().st_mode
+    if mode & stat.S_IWUSR:
+        raise error
+    entry.chmod(mode | stat.S_IWUSR)
+    remove(path)
 
 
 def validate_clone_path(path: str) -> str:
@@ -52,7 +69,6 @@ def clone_repository(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResu
             **os.environ,
             "GIT_TERMINAL_PROMPT": "0",
             "GCM_INTERACTIVE": "never",
-            "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", "ssh") + " -oBatchMode=yes",
             "SSH_ASKPASS_REQUIRE": "never",
         }
         command = [
@@ -106,7 +122,11 @@ def clone_repository(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResu
     finally:
         if reserved is not None and destination is not None and not complete:
             # A renamed/replaced leaf belongs to someone else, even after failure.
-            with contextlib.suppress(OSError):
+            try:
                 current = destination.stat(follow_symlinks=False)
                 if (current.st_dev, current.st_ino) == (reserved.st_dev, reserved.st_ino):
-                    shutil.rmtree(destination)
+                    shutil.rmtree(destination, onexc=_retry_readonly_cleanup)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                _logger.warning("Could not remove incomplete repository checkout", exc_info=True)

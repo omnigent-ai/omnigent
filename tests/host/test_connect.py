@@ -12207,7 +12207,7 @@ async def test_dispatch_clone_keeps_orphan_reaper_paused(monkeypatch: pytest.Mon
         assert host._owned_subprocess_ops == 1
         return expected
 
-    monkeypatch.setattr("omnigent.host.git_clone.clone_repository", git_worker)
+    monkeypatch.setattr("omnigent.host.connect.clone_repository", git_worker)
     tunnel = _FakeTunnel()
     await host._dispatch_host_frame(
         tunnel,

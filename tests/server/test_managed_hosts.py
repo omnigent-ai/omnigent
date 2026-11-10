@@ -2218,6 +2218,20 @@ def test_parse_invalid_config_fails_loud(raw: object, expected_fragment: str) ->
             "git@github.com:org/repo.git",
             RepoWorkspace(url="git@github.com:org/repo.git", branch=None, repo_name="repo"),
         ),
+        (
+            "git@[2001:db8::1]:org/repo.git#main",
+            RepoWorkspace(url="git@[2001:db8::1]:org/repo.git", branch="main", repo_name="repo"),
+        ),
+        (
+            "git@[::1]:repo.git",
+            RepoWorkspace(url="git@[::1]:repo.git", branch=None, repo_name="repo"),
+        ),
+        (
+            "git@[::ffff:192.0.2.1]:org/repo.git",
+            RepoWorkspace(
+                url="git@[::ffff:192.0.2.1]:org/repo.git", branch=None, repo_name="repo"
+            ),
+        ),
         # Branches with slashes are legal git refs.
         (
             "https://github.com/org/repo#feature/x",
@@ -2246,6 +2260,15 @@ def test_parse_repo_workspace_accepts_url_forms(workspace: str, expected: RepoWo
         # No repo path at all.
         ("https://github.com", "not a usable https repository URL"),
         ("git@github.com", "not a usable ssh repository URL"),
+        ("git@[2001:db8::1:org/repo", "must use 'git@[address]:path'"),
+        ("git@[2001:db8::1]org/repo", "must use 'git@[address]:path'"),
+        ("git@[2001:db8::1]extra:org/repo", "must use 'git@[address]:path'"),
+        ("git@[2001:db8::1]:", "must use 'git@[address]:path'"),
+        ("git@[2001:db8::1]:/", "must use 'git@[address]:path'"),
+        ("git@[example.com]:org/repo", "At least 3 parts expected"),
+        ("git@[192.0.2.1]:org/repo", "At least 3 parts expected"),
+        ("git@[2001:db8::xyz]:org/repo", "Only hex digits permitted"),
+        ("git@[fe80::1%interface]:org/repo", "must not contain a scope identifier"),
         # Commit SHAs would land the agent on a detached HEAD.
         ("https://github.com/org/repo#" + "a" * 40, "not a commit SHA"),
         # Empty / malformed branch fragments.

@@ -1348,6 +1348,36 @@
         "title": "ClientTaskCancelEvent",
         "type": "object"
       },
+      "CloneRepositoryRequest": {
+        "description": "One credential-free repository and a new directory on the selected host.",
+        "properties": {
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "path"
+        ],
+        "title": "CloneRepositoryRequest",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -6504,6 +6534,11 @@
             "default": {
               "restrict_to_agent_names": []
             }
+          },
+          "project_repository_creation": {
+            "default": true,
+            "title": "Project Repository Creation",
+            "type": "boolean"
           },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
@@ -15309,6 +15344,57 @@
           }
         },
         "summary": "Get Plugins",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/repositories/clone": {
+      "post": {
+        "description": "Clone once on an owned, capable host; transport loss leaves an uncertain result.",
+        "operationId": "clone_host_repository_v1_hosts__host_id__repositories_clone_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloneRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Host Repository",
         "tags": [
           "hosts"
         ]

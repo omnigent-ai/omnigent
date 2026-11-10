@@ -18,10 +18,7 @@ _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # the name is interpolated into an in-sandbox shell path.
 _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
-# Characters git forbids in ref names (plus ``#``, which can never
-# reach the fragment since the workspace splits on its FIRST ``#`` —
-# a second ``#`` means the branch itself contains one, which the
-# fragment form does not support).
+# Git-forbidden ref characters, plus ``#`` (the workspace splits on the first one).
 _BRANCH_FORBIDDEN_CHARS = set(" \t~^:?*[\\#")
 
 
@@ -130,13 +127,8 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
             f"a repository workspace must be at most {LABEL_VALUE_MAX_LEN} characters "
             f"(got {len(workspace)}) — shorten the URL or branch"
         )
-    # Reject embedded credentials (``user:token@host``) BEFORE any error that
-    # echoes the URL: the token would otherwise be persisted verbatim in a
-    # session label and the sandbox Pod spec, and leak into the error/logs. A
-    # well-formed URL of either form has no ``@`` after the scheme (https) or the
-    # ``git@`` user (ssh), so any ``@`` in the remainder is embedded userinfo —
-    # for both forms. The message must not echo the URL (it carries the secret);
-    # connect the account so the clone authenticates via the credential broker.
+    # Reject credentials before any error echoes the URL, so tokens never reach
+    # labels, Pod specs, or logs. Any ``@`` after the scheme/``git@`` is userinfo.
     _cred_msg = (
         "a repository URL must not embed credentials (user:token@host) — "
         "connect the account instead of putting a token in the URL"
@@ -161,7 +153,16 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
         rest = url[len("git@") :]
         if "@" in rest:
             raise ValueError(_cred_msg)
-        host, colon, path = rest.partition(":")
+        if rest.startswith("["):
+            host, close, suffix = rest[1:].partition("]")
+            colon, path = suffix[:1], suffix[1:]
+            if not close or colon != ":" or not path.strip("/"):
+                raise ValueError("an IPv6 SSH repository URL must use 'git@[address]:path'")
+            if "%" in host:
+                raise ValueError("an IPv6 SSH repository URL must not contain a scope identifier")
+            ipaddress.IPv6Address(host)
+        else:
+            host, colon, path = rest.partition(":")
         if not host or not colon or not path.strip("/"):
             raise ValueError(
                 f"'{url}' is not a usable ssh repository URL — expected 'git@<host>:<org>/<repo>'"
