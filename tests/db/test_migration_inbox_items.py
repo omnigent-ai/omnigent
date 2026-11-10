@@ -69,12 +69,8 @@ def _row(**overrides: object) -> dict[str, object]:
         "session_slot": 0,
         "agent_id": bytes(range(1, 17)),
         "kind": 1,
-        "title": "t",
-        "body_md": b"b",
-        "links": b"[]",
-        "actions": b"[]",
-        "media": b"[]",
-        "topic": "x",
+        "content": b"\x01\x00{}",
+        "media": b"\x01\x00[]",
         "dedupe_key": "v1:x",
         "state": 1,
         "resolution": 0,
@@ -86,10 +82,9 @@ def _row(**overrides: object) -> dict[str, object]:
 
 _INSERT = sa.text(
     "INSERT INTO inbox_items (workspace_id, id, user_id, source_session_id, session_slot, "
-    "agent_id, kind, title, body_md, links, actions, media, topic, dedupe_key, state, "
-    "resolution, created_at) VALUES (:workspace_id, :id, :user_id, :source_session_id, "
-    ":session_slot, :agent_id, :kind, :title, :body_md, :links, :actions, :media, :topic, "
-    ":dedupe_key, :state, :resolution, :created_at)"
+    "agent_id, kind, content, media, dedupe_key, state, resolution, created_at) VALUES "
+    "(:workspace_id, :id, :user_id, :source_session_id, :session_slot, :agent_id, :kind, "
+    ":content, :media, :dedupe_key, :state, :resolution, :created_at)"
 )
 
 
@@ -110,26 +105,24 @@ def _second(**overrides: object) -> dict[str, object]:
     return _row(**{"id": bytes([1] * 16), "dedupe_key": "v1:y", "session_slot": 1, **overrides})
 
 
-# A two-byte character, so byte bounds differ from character counts.
-_WIDE = "\u00e9"
-
-
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"title": _WIDE * 512 + "t"},
+        {"dedupe_key": "\u00e9" * 256 + "k"},
         {"created_at": "x" * 16_384},
         {"session_slot": 0.5},
         {"session_slot": 10},
-        {"body_md": b"b" * 16_384},
+        {"content": b"c" * 16_384},
+        {"media": b"m" * 16_384},
         {"source_session_id": b"short"},
     ],
     ids=[
-        "title-one-byte-over",
+        "multibyte-dedupe-key-one-byte-over",
         "text-timestamp",
         "fractional-slot",
         "slot-past-cap",
-        "body-one-byte-over",
+        "content-one-byte-over",
+        "media-one-byte-over",
         "bad-uuid",
     ],
 )
@@ -142,8 +135,13 @@ def test_sqlite_rejects_values_outside_the_column_bounds(
 
 @pytest.mark.parametrize(
     "overrides",
-    [{"title": _WIDE * 512}, {"body_md": b"b" * 16_383}, {"session_slot": 9}],
-    ids=["title-at-limit", "body-at-limit", "last-slot"],
+    [
+        {"dedupe_key": "\u00e9" * 256},
+        {"content": b"c" * 16_383},
+        {"media": b"m" * 16_383},
+        {"session_slot": 9},
+    ],
+    ids=["multibyte-dedupe-key-at-limit", "content-at-limit", "media-at-limit", "last-slot"],
 )
 def test_sqlite_accepts_values_at_the_column_bounds(
     engine: sa.Engine, overrides: dict[str, object]
