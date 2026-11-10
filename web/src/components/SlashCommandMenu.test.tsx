@@ -557,6 +557,14 @@ describe("/mcp panel connection state", () => {
       { name: "wiki", live: { status: "needs-auth" }, liveName: "wiki" },
       { name: "calendar", live: { status: "pending" }, liveName: "calendar" },
       { name: "local-files" },
+      { name: "mail", connection: "connected", live: { status: "not-loaded" } },
+      {
+        name: "notes",
+        connection: "sign-in-required",
+        signIn: { kind: "url", url: "https://example.com/sign-in" },
+        live: { status: "needs-auth" },
+        liveName: "notes",
+      },
     ];
     const panel = (extra: Partial<Parameters<typeof SlashCommandMenu>[0]> = {}) => (
       <MemoryRouter>
@@ -581,6 +589,15 @@ describe("/mcp panel connection state", () => {
     expect(screen.getByTestId("mcp-live-status-wiki")).toHaveTextContent("Needs sign-in");
     expect(screen.getByTestId("mcp-live-status-calendar")).toHaveTextContent("Connecting…");
     expect(screen.queryByTestId("mcp-live-status-local-files")).toBeNull();
+    // A signed-in account the session never loaded is not shown as simply connected.
+    expect(screen.getByTestId("mcp-server-row-mail")).toHaveTextContent("Account: Connected");
+    expect(screen.getByTestId("mcp-live-status-mail")).toHaveTextContent(
+      "In this session: Not loaded",
+    );
+    // A row that still needs its account signed in offers that, not a Reconnect too.
+    expect(
+      within(screen.getByTestId("mcp-server-row-notes")).getByRole("link", { name: /Sign in/ }),
+    ).toBeInTheDocument();
     expect(
       screen.getAllByRole("button", { name: "Reconnect" }).map((b) => b.dataset.testid),
     ).toEqual(["mcp-reconnect-search", "mcp-reconnect-wiki"]);

@@ -210,6 +210,8 @@ def create_session_mcp_servers_router(
                 timeout=_LIVE_MCP_STATUS_TIMEOUT_S,
             )
         except OmnigentError as exc:
+            if exc.code == ErrorCode.WRONG_REPLICA:
+                raise  # The client re-addresses the request to the runner's replica.
             return SessionLiveMCPServers(live=False, reason="unavailable", detail=exc.message)
         except httpx.TimeoutException:
             return SessionLiveMCPServers(
@@ -671,13 +673,20 @@ def _runner_error_detail(response: httpx.Response) -> str | None:
 
 
 def _live_mcp_servers_from_runner(response: httpx.Response) -> SessionLiveMCPServers:
-    """Translate the runner's ``{running, servers, reconnect_error?}`` body."""
+    """Translate the runner's ``{running, servers, status_unavailable?, reconnect_error?}``."""
     payload = _runner_error_payload(response)
     reconnect_error = payload.get("reconnect_error")
     reconnect_error = reconnect_error if isinstance(reconnect_error, str) else None
     if payload.get("running") is not True:
         return SessionLiveMCPServers(
             live=False, reason="not_running", reconnect_error=reconnect_error
+        )
+    if payload.get("status_unavailable") is True:
+        return SessionLiveMCPServers(
+            live=False,
+            reason="unavailable",
+            detail="The session's agent could not report its MCP connections.",
+            reconnect_error=reconnect_error,
         )
     servers: list[LiveMCPServerStatus] = []
     for entry in payload.get("servers") or []:

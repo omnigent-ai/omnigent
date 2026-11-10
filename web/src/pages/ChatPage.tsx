@@ -3712,7 +3712,8 @@ function ComposerImpl(
     const liveByName = new Map((liveMcp ?? []).map((server) => [server.name, server]));
     const takeLive = (liveName: string) => {
       const live = liveByName.get(liveName);
-      if (live === undefined) return {};
+      // An answer that omits a server means the session did not load it.
+      if (live === undefined) return liveMcp ? { live: { status: "not-loaded" } } : {};
       liveByName.delete(liveName);
       return liveMcpRowFields(live);
     };

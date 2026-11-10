@@ -4041,9 +4041,23 @@ async def test_live_mcp_status_and_reconnect_for_the_mcp_panel(
         assert reconnects == ["plugin:tools:search", "docs"]
         assert await turn("q1") is first
 
+        # Control requests wait for one another instead of overlapping on the CLI.
+        state = executor._clients["mcp"]
+        async with state.mcp_control_lock:
+            waiting = asyncio.create_task(executor.live_mcp_statuses("mcp"))
+            await asyncio.sleep(0.01)
+            assert not waiting.done()
+        assert len(await waiting) == 3
+        # Timing out while still waiting leaves the CLI untouched, so the client stays.
+        monkeypatch.setattr("omnigent.inner.claude_sdk_executor._MCP_STATUS_TIMEOUT_SECONDS", 0.05)
+        async with state.mcp_control_lock:
+            with pytest.raises(TimeoutError):
+                await executor.live_mcp_statuses("mcp")
+        assert not state.mcp_control_timed_out
+        assert await turn("q1b") is first
+
         # A panel request that times out leaves the CLI busy, so the next turn uses a new one.
         status_reply = "hang"
-        monkeypatch.setattr("omnigent.inner.claude_sdk_executor._MCP_STATUS_TIMEOUT_SECONDS", 0.05)
         with pytest.raises(TimeoutError):
             await executor.live_mcp_statuses("mcp")
         status_reply = "ok"

@@ -478,12 +478,20 @@ async def test_live_mcp_status_maps_each_runner_answer(
     ]
     assert {request[:2] for request in requests} == {("GET", "live-mcp-servers")}
 
+    # A runner on another replica keeps its routing error so the client re-addresses.
+    answers.append(OmnigentError("Session is on another replica.", code=ErrorCode.WRONG_REPLICA))
+    misrouted = await client.get(url)
+    assert misrouted.status_code == 400, misrouted.text
+    assert misrouted.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+
 
 async def test_live_mcp_reconnect_maps_each_runner_answer(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A refused reconnect answers 200 with its reason; a missing harness or server does not."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
     answers: list[Any] = []
     requests: list[tuple[str, str, Any]] = []
 
@@ -516,6 +524,25 @@ async def test_live_mcp_reconnect_maps_each_runner_answer(
     assert refused.json()["servers"][0]["status"] == "failed"
     assert requests == [("POST", "live-mcp-servers/reconnect", {"name": "docs"})]
 
+    # The harness is running but could not report after the reconnect.
+    answers.append(
+        httpx.Response(
+            200,
+            json={
+                "running": True,
+                "servers": [],
+                "status_unavailable": True,
+                "reconnect_error": "token expired",
+            },
+        )
+    )
+    unreported = (await client.post(url, json={"name": "docs"})).json()
+    assert (unreported["live"], unreported["reason"], unreported["reconnect_error"]) == (
+        False,
+        "unavailable",
+        "token expired",
+    )
+
     cases: list[tuple[Any, int, str]] = [
         (None, 409, "isn't running"),
         (httpx.Response(409, json={"error": "harness_not_running"}), 409, "isn't running"),
@@ -533,6 +560,7 @@ async def test_live_mcp_reconnect_maps_each_runner_answer(
         ),
         (httpx.ReadTimeout("slow"), 503, "did not answer in time"),
         (httpx.ConnectError("refused"), 503, "Could not reach"),
+        (OmnigentError("on another replica", code=ErrorCode.WRONG_REPLICA), 400, "replica"),
     ]
     for answer, status_code, message in cases:
         answers.append(answer)

@@ -2585,10 +2585,12 @@ class ClaudeSDKExecutor(Executor):
         Waiting for another control request to finish counts toward *timeout*
         but leaves the client in place: that CLI is busy, not stuck.
         """
-        async with asyncio.timeout(timeout):
+        deadline = asyncio.get_running_loop().time() + timeout
+        async with asyncio.timeout_at(deadline):
             await state.mcp_control_lock.acquire()
         try:
-            return await asyncio.wait_for(request(), timeout=timeout)
+            async with asyncio.timeout_at(deadline):
+                return await request()
         except TimeoutError:
             state.mcp_control_timed_out = True
             raise

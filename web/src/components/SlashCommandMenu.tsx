@@ -164,7 +164,10 @@ export type McpServerConnection = "connected" | "sign-in-required" | "unavailabl
 
 /** The connection a session's running harness holds for a `/mcp` row. */
 export interface McpLiveConnection {
-  /** `connected`, `failed`, `needs-auth`, `pending`, or `disabled`; others show as-is. */
+  /**
+   * `connected`, `failed`, `needs-auth`, `pending`, `disabled`, or `not-loaded` when the
+   * harness's answer omits the server; others show as-is.
+   */
   status: string;
   error?: string | null;
 }
@@ -178,7 +181,7 @@ export interface McpServerRow {
   signIn?: McpSignIn;
   /** What the session's harness reports right now; absent when it reports nothing. */
   live?: McpLiveConnection;
-  /** The harness's name for this server, for Reconnect; set only with `live`. */
+  /** The harness's name for this server, for Reconnect; set only with a reported `live`. */
   liveName?: string;
 }
 
@@ -207,6 +210,13 @@ const MCP_LIVE_LABEL: Record<string, string> = {
   "needs-auth": "Needs sign-in",
   pending: "Connecting…",
   disabled: "Disabled",
+  // The harness answered without this server: it is not loaded in the session.
+  "not-loaded": "Not loaded",
+};
+
+const MCP_LIVE_TONE: Record<string, string> = {
+  failed: "text-destructive",
+  "needs-auth": "text-amber-600 dark:text-amber-500",
 };
 
 /** Live states a Reconnect can change, as in Claude Code's own `/mcp`. */
@@ -447,11 +457,7 @@ function McpServerRows({
                     data-testid={`mcp-live-status-${server.name}`}
                     className={cn(
                       "break-words text-xs leading-4",
-                      live.status === "failed"
-                        ? "text-destructive"
-                        : live.status === "needs-auth"
-                          ? "text-amber-600 dark:text-amber-500"
-                          : "text-muted-foreground",
+                      MCP_LIVE_TONE[live.status] ?? "text-muted-foreground",
                     )}
                   >
                     In this session: {mcpLiveLabel(live)}
@@ -466,7 +472,8 @@ function McpServerRows({
                   onSignIn={onSignIn}
                 />
               )}
-              {liveTrouble && onReconnect && (
+              {/* Signing in comes first; the row offers Reconnect once the account is connected. */}
+              {liveTrouble && !needsSignIn && onReconnect && (
                 <McpReconnectAction
                   server={server}
                   reconnecting={reconnectingName != null && reconnectingName === server.liveName}

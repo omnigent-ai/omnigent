@@ -166,8 +166,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   without starting a new session. Custom agent servers carry no account state.
   A claude-sdk session whose agent is running also shows each host server's
   live connection in that session (connected, failed with its error, needs
-  sign-in, connecting, disabled), including servers only the CLI loaded; a
-  failed or needs-sign-in row offers **Reconnect**, which shows reconnecting,
+  sign-in, connecting, disabled, or not loaded when the CLI omits it),
+  including servers only the CLI loaded; a failed or needs-sign-in row whose
+  account needs no sign-in offers **Reconnect**, which shows reconnecting,
   then the refreshed state or the reconnect error. Before the first turn the
   panel says live status appears once the agent is running. Read-only viewers
   see the state without Reconnect. **Go to Settings** keeps the session's host

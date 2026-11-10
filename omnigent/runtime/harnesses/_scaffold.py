@@ -885,12 +885,8 @@ def _live_mcp_detail(exc: BaseException) -> str:
     return str(exc).strip()[:_LIVE_MCP_DETAIL_MAX_CHARS]
 
 
-def _live_mcp_failure(status_code: int, error: str, exc: BaseException | None) -> JSONResponse:
-    content: dict[str, str] = {"error": error}
-    detail = _live_mcp_detail(exc) if exc is not None else ""
-    if detail:
-        content["detail"] = detail
-    return JSONResponse(content, status_code=status_code)
+def _live_mcp_failure(status_code: int, error: str) -> JSONResponse:
+    return JSONResponse({"error": error}, status_code=status_code)
 
 
 class HarnessApp:
@@ -1251,10 +1247,10 @@ class HarnessApp:
         try:
             statuses = await self.live_mcp_statuses()
         except TimeoutError:
-            return _live_mcp_failure(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_status_timeout", None)
-        except Exception as exc:
+            return _live_mcp_failure(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_status_timeout")
+        except Exception:
             _logger.warning("Reading live MCP status failed", exc_info=True)
-            return _live_mcp_failure(status.HTTP_502_BAD_GATEWAY, "mcp_status_failed", exc)
+            return _live_mcp_failure(status.HTTP_502_BAD_GATEWAY, "mcp_status_failed")
         return JSONResponse(_live_mcp_body(statuses))
 
     async def _post_live_mcp_reconnect(self, conversation_id: str, request: Request) -> Response:
@@ -1267,27 +1263,25 @@ class HarnessApp:
             return refused
         server_name = await _live_mcp_server_name(request)
         if server_name is None:
-            return _live_mcp_failure(status.HTTP_400_BAD_REQUEST, "invalid_request", None)
+            return _live_mcp_failure(status.HTTP_400_BAD_REQUEST, "invalid_request")
         reconnect_error: str | None = None
         try:
             await self.reconnect_live_mcp_server(server_name)
         except LiveMcpHarnessNotRunning:
-            return _live_mcp_failure(status.HTTP_409_CONFLICT, "harness_not_running", None)
+            return _live_mcp_failure(status.HTTP_409_CONFLICT, "harness_not_running")
         except LiveMcpServerUnknown:
-            return _live_mcp_failure(status.HTTP_404_NOT_FOUND, "mcp_server_unknown", None)
+            return _live_mcp_failure(status.HTTP_404_NOT_FOUND, "mcp_server_unknown")
         except TimeoutError:
-            return _live_mcp_failure(
-                status.HTTP_504_GATEWAY_TIMEOUT, "mcp_reconnect_timeout", None
-            )
+            return _live_mcp_failure(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_reconnect_timeout")
         except Exception as exc:
             _logger.info("Reconnecting MCP server %r failed: %s", server_name, exc)
             reconnect_error = _live_mcp_detail(exc) or "Reconnect failed."
         try:
-            statuses = await self.live_mcp_statuses()
+            body = _live_mcp_body(await self.live_mcp_statuses())
         except Exception:
             _logger.warning("Reading live MCP status after reconnect failed", exc_info=True)
-            statuses = None
-        body = _live_mcp_body(statuses)
+            # The harness is still running; only its status could not be read.
+            body = {"running": True, "servers": [], "status_unavailable": True}
         if reconnect_error is not None:
             body["reconnect_error"] = reconnect_error
         return JSONResponse(body)

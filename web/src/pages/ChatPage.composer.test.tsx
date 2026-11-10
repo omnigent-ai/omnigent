@@ -4378,6 +4378,13 @@ describe("Composer MCP status command", () => {
           auth_status: "connected",
         },
         { name: "glean", harness: "claude", transport: "http", scope: "user" },
+        {
+          name: "mail",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
       ],
       isLoading: false,
       isError: false,
@@ -4418,6 +4425,10 @@ describe("Composer MCP status command", () => {
     // An agent server sharing a host name is a different endpoint and gets no live state.
     expect(screen.getByTestId("mcp-server-row-glean")).toHaveTextContent("Agent glean");
     expect(screen.queryByTestId("mcp-live-status-glean")).toBeNull();
+    // A signed-in host server the CLI did not load is not shown as simply connected.
+    expect(screen.getByTestId("mcp-server-row-mail")).toHaveTextContent("Account: Connected");
+    expect(screen.getByTestId("mcp-live-status-mail")).toHaveTextContent("Not loaded");
+    expect(screen.queryByTestId("mcp-reconnect-mail")).toBeNull();
 
     fireEvent.click(screen.getByTestId("mcp-reconnect-search"));
     expect(reconnect).toHaveBeenCalledWith("plugin:tools:search");

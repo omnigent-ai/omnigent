@@ -3714,12 +3714,15 @@ class _LiveMcpExecutor(Executor):
 
         self.statuses = [LiveMcpServerStatus(name="docs", status="failed", error="HTTP 401")]
         self.reconnect_failure = reconnect_failure
+        self.status_failure: BaseException | None = None
         self.reconnected: list[tuple[str, str]] = []
 
     def supports_live_mcp_control(self) -> bool:
         return True
 
     async def live_mcp_statuses(self, session_key: str) -> list[Any] | None:
+        if self.status_failure is not None:
+            raise self.status_failure
         return self.statuses
 
     async def reconnect_live_mcp_server(self, session_key: str, name: str) -> None:
@@ -3793,6 +3796,27 @@ async def test_live_mcp_routes_reach_only_an_executor_that_reports_them() -> Non
             resp = await client.post(reconnect_path, json={"name": "docs"})
         assert resp.status_code == expected_status
         assert expected_body.items() <= resp.json().items()
+
+    # A failed status read reports the harness as running, without the exception's text.
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: _LiveMcpExecutor(RuntimeError("still unauthorized")),
+        session_key="conv_live_mcp",
+    )
+    executor = adapter._ensure_executor()
+    executor.status_failure = RuntimeError("internal detail")
+    async with _live_mcp_client(adapter) as client:
+        resp = await client.get(status_path)
+        assert (resp.status_code, resp.json()) == (502, {"error": "mcp_status_failed"})
+        resp = await client.post(reconnect_path, json={"name": "docs"})
+    assert (resp.status_code, resp.json()) == (
+        200,
+        {
+            "running": True,
+            "servers": [],
+            "status_unavailable": True,
+            "reconnect_error": "still unauthorized",
+        },
+    )
 
     # A harness that can't report MCP status says so instead of answering empty.
     adapter = ExecutorAdapter(executor_factory=_StubExecutor, session_key="conv_live_mcp")

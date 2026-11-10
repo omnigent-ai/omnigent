@@ -31,6 +31,11 @@ export interface LiveMcpReconnectError {
   message: string;
 }
 
+interface LiveMcpReconnectTarget {
+  sessionId: string;
+  name: string;
+}
+
 // Re-read while a server is still connecting, so the row settles without a reopen.
 const LIVE_MCP_PENDING_POLL_MS = 2_000;
 
@@ -47,6 +52,8 @@ async function fetchSessionLiveMcpServers(
   signal: AbortSignal,
 ): Promise<SessionLiveMcpServers> {
   const response = await authenticatedFetch(sessionLiveMcpServersPath(sessionId), { signal });
+  // A server without this route keeps the panel's inventory-only view.
+  if (response.status === 404) return { live: false, reason: "unsupported", servers: [] };
   if (!response.ok) throw await apiErrorFromResponse(response);
   return (await response.json()) as SessionLiveMcpServers;
 }
@@ -84,29 +91,40 @@ export function useSessionLiveMcpServers(sessionId: string | null, enabled: bool
 /** Reconnect one of the session harness's MCP servers; the panel shows the outcome. */
 export function useReconnectLiveMcpServer(sessionId: string | null) {
   const client = useQueryClient();
-  const [error, setError] = useState<LiveMcpReconnectError | null>(null);
+  const [error, setError] = useState<(LiveMcpReconnectError & { sessionId: string }) | null>(null);
+  // Each reconnect carries its session, so one that settles after a switch stays with it.
   const mutation = useMutation({
-    mutationFn: (name: string) => {
-      if (sessionId === null) throw new Error("This session has not started yet.");
-      return postLiveMcpReconnect(sessionId, name);
-    },
+    mutationFn: ({ sessionId: target, name }: LiveMcpReconnectTarget) =>
+      postLiveMcpReconnect(target, name),
     onMutate: () => setError(null),
-    onSuccess: (result, name) => {
+    onSuccess: (result, { sessionId: target, name }) => {
       const { reconnect_error: reconnectError, ...snapshot } = result;
-      client.setQueryData(sessionLiveMcpServersQueryKey(sessionId), snapshot);
-      if (reconnectError) setError({ name, message: reconnectError });
+      client.setQueryData(sessionLiveMcpServersQueryKey(target), snapshot);
+      if (reconnectError) setError({ sessionId: target, name, message: reconnectError });
     },
-    onError: (failure: Error, name) => {
-      setError({ name, message: failure.message || "Couldn’t reconnect. Try again." });
+    onError: (failure: Error, { sessionId: target, name }) => {
+      setError({
+        sessionId: target,
+        name,
+        message: failure.message || "Couldn’t reconnect. Try again.",
+      });
+      // The harness may have changed state before the request failed.
+      void client.invalidateQueries({ queryKey: sessionLiveMcpServersQueryKey(target) });
     },
   });
   const { mutate } = mutation;
-  const reconnect = useCallback((name: string) => mutate(name), [mutate]);
+  const reconnect = useCallback(
+    (name: string) => {
+      if (sessionId !== null) mutate({ sessionId, name });
+    },
+    [mutate, sessionId],
+  );
   const clearError = useCallback(() => setError(null), []);
+  const pending = mutation.isPending ? mutation.variables : undefined;
   return {
     reconnect,
-    reconnectingName: mutation.isPending ? (mutation.variables ?? null) : null,
-    error,
+    reconnectingName: pending?.sessionId === sessionId ? pending.name : null,
+    error: error?.sessionId === sessionId ? { name: error.name, message: error.message } : null,
     clearError,
   };
 }
