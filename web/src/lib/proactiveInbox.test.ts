@@ -3,6 +3,7 @@ import { authenticatedFetch } from "./identity";
 import {
   applySuggestionUpdate,
   listSuggestions,
+  reconcileSuggestion,
   stateAfterUpdate,
   suggestionLinkTarget,
   suggestionPreview,
@@ -142,6 +143,24 @@ describe("applySuggestionUpdate", () => {
   });
 });
 
+describe("reconcileSuggestion", () => {
+  it("replaces an open item and moves the unread count", () => {
+    const pages = [page([item({ id: "a" })])];
+    const next = reconcileSuggestion(pages, item({ id: "a", state: "read", title: "new" }));
+    expect(next[0].data[0]).toMatchObject({ state: "read", title: "new" });
+    expect(next[0].unreadCount).toBe(0);
+  });
+
+  it("drops a resolved item and ignores one the cache no longer holds", () => {
+    const pages = [page([item({ id: "a" })])];
+    expect(reconcileSuggestion(pages, item({ id: "a", state: "dismissed" }))[0]).toMatchObject({
+      data: [],
+      unreadCount: 0,
+    });
+    expect(reconcileSuggestion(pages, item({ id: "z", state: "read" }))).toEqual(pages);
+  });
+});
+
 it("maps resolutions to states like the server", () => {
   expect(stateAfterUpdate({ resolution: "none" })).toBe("read");
   expect(stateAfterUpdate({ resolution: "already_done" })).toBe("done");
@@ -164,10 +183,14 @@ describe("suggestionLinkTarget", () => {
   });
 
   it("allows only web links", () => {
-    expect(suggestionLinkTarget({ type: "pr", ref: "github.com/acme/app/pull/7" })).toEqual({
-      kind: "external",
-      href: "https://github.com/acme/app/pull/7",
-    });
+    expect(suggestionLinkTarget({ type: "pr", ref: "https://github.com/acme/app/pull/7" })).toEqual(
+      { kind: "external", href: "https://github.com/acme/app/pull/7" },
+    );
+    // Like the server: an explicit scheme, a host, and no credentials.
+    expect(suggestionLinkTarget({ type: "pr", ref: "github.com/acme/app/pull/7" })).toBeNull();
+    expect(suggestionLinkTarget({ type: "url", ref: "https://user:pw@example.com/" })).toBeNull();
+    expect(suggestionLinkTarget({ type: "url", ref: "https://user@example.com/" })).toBeNull();
+    expect(suggestionLinkTarget({ type: "url", ref: "ftp://example.com/" })).toBeNull();
     expect(suggestionLinkTarget({ type: "url", ref: "javascript:alert(1)" })).toBeNull();
     expect(suggestionLinkTarget({ type: "url", ref: "data:text/html,x" })).toBeNull();
     expect(suggestionLinkTarget({ type: "url", ref: "https://[" })).toBeNull();

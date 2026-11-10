@@ -8,7 +8,9 @@ import {
   OPEN_SUGGESTION_STATES,
   applySuggestionUpdate,
   listSuggestions,
+  reconcileSuggestion,
   updateSuggestion,
+  type Suggestion,
   type SuggestionPage,
   type SuggestionState,
   type SuggestionUpdate,
@@ -21,10 +23,12 @@ type Pages = InfiniteData<SuggestionPage, string | null>;
 /**
  * Agent-posted suggestions for the Inbox, when the server offers them.
  *
- * Updates apply optimistically. Fetches in flight when an update starts are
- * cancelled, pending updates are re-applied over any page that lands while
- * they are in flight, and the list refetches once the last one settles, so a
- * stale poll can't bring back a dismissed or read item.
+ * Updates apply optimistically. Fetches in flight when an update starts or
+ * settles are cancelled, pending updates are re-applied over any page that
+ * lands while they are in flight, the server's copy of the item is written into
+ * the cache before the overlay is released, and the list refetches once the last
+ * update settles. So a stale poll can't bring back a dismissed or read item,
+ * even when the refetch fails.
  *
  * :param identityReady: Whether the viewer is known yet.
  * :param states: Which states to list, e.g. only `"unread"` for the Unread tab.
@@ -82,12 +86,25 @@ export function useProactiveInbox(
       );
       const previous = chains.current.get(id) ?? Promise.resolve();
       const request = previous
-        .then(() => updateSuggestion(id, change))
-        .catch(() => {
-          if ("resolution" in change && change.resolution !== "none") {
-            resolved.current.delete(id);
+        .then(async () => {
+          let saved: Suggestion | null = null;
+          try {
+            saved = await updateSuggestion(id, change);
+          } catch {
+            if ("resolution" in change && change.resolution !== "none") {
+              resolved.current.delete(id);
+            }
+            showToast("Couldn’t save your response to this suggestion. Try again.");
           }
-          showToast("Couldn’t save your response to this suggestion. Try again.");
+          // A fetch that started while the PATCH was in flight may carry the old
+          // state; drop it, then write the server's copy before releasing the overlay.
+          await queryClient.cancelQueries({ queryKey: key });
+          if (saved) {
+            const copy = saved;
+            queryClient.setQueriesData<Pages>({ queryKey: key }, (data) =>
+              data ? { ...data, pages: reconcileSuggestion(data.pages, copy) } : data,
+            );
+          }
         })
         .finally(() => {
           if (pending.current.get(id) === change) pending.current.delete(id);

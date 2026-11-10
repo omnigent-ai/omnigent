@@ -197,3 +197,51 @@ it("lists only the requested states after a read mark", async () => {
 
   expect(result.current.items).toEqual([]);
 });
+
+it.each(["fails", "hangs"])(
+  "keeps a dismissal when a poll started during the PATCH carries the old item and the refetch %s",
+  async (refetchOutcome) => {
+    const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+    await waitFor(() => expect(result.current.unreadCount).toBe(1));
+    const patch = deferred<Suggestion>();
+    vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
+
+    act(() => result.current.update("sug", { resolution: "not_now" }));
+    await waitFor(() => expect(updateSuggestion).toHaveBeenCalledOnce());
+    // A poll that read the item before the server applied the dismissal lands
+    // while the PATCH is still in flight.
+    vi.mocked(listSuggestions).mockResolvedValueOnce(page([item], 1));
+    await act(async () => void (await result.current.refetch()));
+    expect(result.current.items).toEqual([]);
+
+    if (refetchOutcome === "fails") {
+      vi.mocked(listSuggestions).mockRejectedValue(new Error("offline"));
+    } else {
+      vi.mocked(listSuggestions).mockReturnValue(new Promise(() => {}));
+    }
+    await act(async () => patch.resolve({ ...item, state: "dismissed", resolution: "not_now" }));
+    await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(3));
+
+    expect(result.current.items).toEqual([]);
+    expect(result.current.unreadCount).toBe(0);
+  },
+);
+
+it("drops a poll still in flight when the PATCH settles", async () => {
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.unreadCount).toBe(1));
+  const patch = deferred<Suggestion>();
+  vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
+  act(() => result.current.update("sug", { resolution: "not_now" }));
+  await waitFor(() => expect(updateSuggestion).toHaveBeenCalledOnce());
+  const stalePoll = deferred<SuggestionPage>();
+  vi.mocked(listSuggestions).mockReturnValueOnce(stalePoll.promise);
+  void act(() => void result.current.refetch());
+
+  vi.mocked(listSuggestions).mockReturnValue(new Promise(() => {}));
+  await act(async () => patch.resolve({ ...item, state: "dismissed", resolution: "not_now" }));
+  await act(async () => stalePoll.resolve(page([item], 1)));
+
+  expect(result.current.items).toEqual([]);
+  expect(result.current.unreadCount).toBe(0);
+});

@@ -172,6 +172,28 @@ export function applySuggestionUpdate(
   );
 }
 
+/**
+ * Write the server's copy of one suggestion into cached pages after its update
+ * succeeds: replace an open item, drop a resolved one, and move the unread count
+ * by the difference from the cached copy. An item the cache no longer holds is
+ * left for the next fetch to place.
+ */
+export function reconcileSuggestion(pages: SuggestionPage[], saved: Suggestion): SuggestionPage[] {
+  const isOpen = OPEN_SUGGESTION_STATES.includes(saved.state);
+  let delta = 0;
+  const updated = pages.map((page) => ({
+    ...page,
+    data: page.data.flatMap((item) => {
+      if (item.id !== saved.id) return [item];
+      delta += Number(saved.state === "unread") - Number(item.state === "unread");
+      return isOpen ? [saved] : [];
+    }),
+  }));
+  return updated.map((page) =>
+    page.unreadCountCapped ? page : { ...page, unreadCount: Math.max(0, page.unreadCount + delta) },
+  );
+}
+
 /** The badge text for an unread count, e.g. `"100+"` once the server stops counting. */
 export function unreadCountText(count: number, capped: boolean): string {
   return capped ? `${count}+` : String(count);
@@ -181,13 +203,19 @@ export function unreadCountText(count: number, capped: boolean): string {
 export type SuggestionLinkTarget =
   { kind: "session"; path: string } | { kind: "external"; href: string } | null;
 
-/** An http(s) URL for an agent-written reference, or `null` for anything else. */
+/**
+ * The URL for an agent-written reference when it is a plain web link: an
+ * explicit http(s) scheme, a host, and no user name or password (the server
+ * applies the same rule). `null` for anything else.
+ */
 export function safeWebHref(ref: string): string | null {
   const trimmed = ref.trim();
-  if (!trimmed) return null;
+  if (!/^https?:\/\//i.test(trimmed)) return null;
   try {
-    const url = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : null;
+    const url = new URL(trimmed);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    if (!url.hostname || url.username || url.password) return null;
+    return url.toString();
   } catch {
     return null;
   }
