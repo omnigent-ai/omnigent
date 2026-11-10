@@ -253,24 +253,26 @@ def _rig_python(work: Path, gate_started: Path, *, ready_timeout_s: float | None
         f"gate_started = Path({str(gate_started)!r})\n"
         "wait_for_prompt = bridge._wait_for_claude_prompt_ready\n"
         "def observe_wait(socket_path, tmux_target, *, timeout_s, bridge_dir=None, "
-        "extend_for_slow_boot=True):\n"
-        f"    if {ready_timeout_s!r} is not None:\n"
+        "extend_for_slow_boot=True, read_only=False):\n"
+        f"    if not read_only and {ready_timeout_s!r} is not None:\n"
         f"        timeout_s = {ready_timeout_s!r}\n"
         "    if not gate_started.exists():\n"
         "        gate_started.write_text(json.dumps({'started_at': time.monotonic(), "
-        "'timeout_s': timeout_s}))\n"
+        "'timeout_s': timeout_s, 'read_only': read_only}))\n"
         "    wait_for_prompt(socket_path, tmux_target, timeout_s=timeout_s, "
-        "bridge_dir=bridge_dir, extend_for_slow_boot=extend_for_slow_boot)\n"
+        "bridge_dir=bridge_dir, extend_for_slow_boot=extend_for_slow_boot, read_only=read_only)\n"
         "bridge._wait_for_claude_prompt_ready = observe_wait\n"
     )
     (site_packages / "omnigent_rig.pth").write_text(
-        "\n".join([*roots, parent_purelib, "import omnigent_slow_ready_gate"]) + "\n"
+        "\n".join(dict.fromkeys([*roots, *sys.path, parent_purelib]))
+        + "\nimport omnigent_slow_ready_gate\n"
     )
     return str(venv_dir / "bin" / "python")
 
 
 @pytest.mark.timeout(30)
-def test_slow_ready_wrapper_waits_for_delivery(tmp_path: Path) -> None:
+@pytest.mark.parametrize("read_only", [False, True])
+def test_slow_ready_wrapper_waits_for_delivery(tmp_path: Path, read_only: bool) -> None:
     gate_started = tmp_path / "gate started"
     real_claude = tmp_path / "real claude"
     real_claude.write_text("#!/usr/bin/env bash\necho READY\n")
@@ -297,8 +299,8 @@ def test_slow_ready_wrapper_waits_for_delivery(tmp_path: Path) -> None:
                 "from omnigent.harnesses.claude_native import bridge\n"
                 f"assert not Path({str(gate_started)!r}).exists()\n"
                 "bridge._capture_pane = lambda *_: '────────────────\\n❯ \\n────────────────'\n"
-                "bridge._wait_for_claude_prompt_ready('/tmp/sock', 'main', timeout_s=0.0, "
-                f"bridge_dir=Path({str(tmp_path)!r}))\n"
+                "bridge._wait_for_claude_prompt_ready('/tmp/sock', 'main', timeout_s=0.05, "
+                f"bridge_dir=Path({str(tmp_path)!r}), read_only={read_only!r})\n"
                 f"assert Path({str(gate_started)!r}).exists()\n",
             ],
             check=True,
@@ -311,6 +313,7 @@ def test_slow_ready_wrapper_waits_for_delivery(tmp_path: Path) -> None:
         assert stdout.strip() == "READY"
         observed = json.loads(gate_started.read_text())
         assert observed["timeout_s"] == 0.05
+        assert observed["read_only"] is read_only
         assert time.monotonic() - observed["started_at"] >= 0.1
     finally:
         if process.poll() is None:
@@ -354,7 +357,8 @@ def slow_ready_claude_session(
     home_dir = work / "home"
     wrapper_bin = work / "wrapper-bin"
     artifacts = work / "artifacts"
-    for path in (config_home, home_dir, wrapper_bin, artifacts):
+    workspace = work / "workspace"
+    for path in (config_home, home_dir, wrapper_bin, artifacts, workspace):
         path.mkdir(parents=True, exist_ok=True)
     gate_started = work / "readiness-gate-started"
     ready_timeout_s, delay_s = request.param
@@ -440,7 +444,7 @@ def slow_ready_claude_session(
             env=runner_env,
             stdout=runner_handle,
             stderr=subprocess.STDOUT,
-            cwd=str(_REPO_ROOT),
+            cwd=str(workspace),
         )
 
         deadline = time.monotonic() + _HEALTH_TIMEOUT_S
@@ -538,6 +542,11 @@ def test_claude_native_first_prompt_survives_slow_terminal_boot(
     elapsed = time.monotonic() - sent_at
     _log.info("turn reached a user-visible outcome after %.0fs", elapsed)
     assert gate_started.exists(), "delivery never entered the readiness gate"
+    observed = json.loads(gate_started.read_text())
+    assert observed["read_only"] is True
+    assert observed["timeout_s"] == 1.0
+    assert time.monotonic() - observed["started_at"] >= delay_s
+    assert delay_s > (30.0 if ready_timeout_s is None else ready_timeout_s)
 
     # Durable assertion against the canonical transcript: the first prompt
     # must have been delivered and answered (an assistant item echoing the
@@ -550,6 +559,3 @@ def test_claude_native_first_prompt_survives_slow_terminal_boot(
         f"Turn errors: {error_messages or '<none>'}. "
         f"Assistant text: {assistant_texts or '<none>'}"
     )
-    observed = json.loads(gate_started.read_text())
-    assert observed["timeout_s"] == (30.0 if ready_timeout_s is None else ready_timeout_s)
-    assert time.monotonic() - observed["started_at"] >= delay_s > observed["timeout_s"]
