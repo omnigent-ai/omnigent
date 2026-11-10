@@ -626,7 +626,7 @@ class _CodexForwarderState:
         message if the live stream missed it (see
         :func:`_ensure_user_message_posted`).
     :param user_message_copy_balance: Unmatched user-message copies of
-        unfinished turns keyed by (thread, turn, content digest): positive
+        unfinished turns keyed by (thread, turn, input fingerprint): positive
         counts live copies and negative counts resumed copies with positional
         ids such as ``item-1``.
     :param resume_echo_thread_ids: Threads whose resume snapshot is being
@@ -1161,11 +1161,11 @@ class _CodexForwarderState:
         Match a user-message copy against the other delivery of the same input.
 
         Codex identifies an in-progress turn's resumed user input by position
-        and its live notification by a native id, so the copies share only
-        their thread, turn and content. A live copy matches a resumed copy
-        only while that thread's echoing replay registered it.
+        and its live notification by a native id. Prefer their shared client
+        input id; older inputs fall back to content. A live copy matches a
+        resumed copy only while that thread's echoing replay registered it.
 
-        :param key: ``(thread_id, turn_id, content_digest)`` for the copy.
+        :param key: ``(thread_id, turn_id, input_fingerprint)`` for the copy.
         :param resumed: Whether the copy came from a resume snapshot.
         :returns: ``True`` when the copy duplicates an unmatched copy.
         """
@@ -6462,11 +6462,15 @@ def _claim_completed_item(
     if is_anon:
         forwarder_state.advance_anon_counter(thread_id, turn_id)
     elif item.get("type") == "userMessage" and isinstance(item.get("content"), list):
-        content = json.dumps(item["content"], sort_keys=True)
-        content_digest = hashlib.sha256(content.encode()).hexdigest()
+        client_id = item.get("clientId")
+        if isinstance(client_id, str) and client_id:
+            fingerprint = "client:" + hashlib.sha256(client_id.encode()).hexdigest()
+        else:
+            content = json.dumps(item["content"], sort_keys=True)
+            fingerprint = "content:" + hashlib.sha256(content.encode()).hexdigest()
         resumed = _CODEX_RESUME_POSITION_ITEM_ID.fullmatch(str(item.get("id"))) is not None
         if forwarder_state.pair_user_message_copy(
-            (thread_id, turn_id, content_digest), resumed=resumed
+            (thread_id, turn_id, fingerprint), resumed=resumed
         ):
             _logger.info("Codex forwarder skipped duplicate user message: key=%s", item_key)
             return None
@@ -10291,7 +10295,8 @@ def _completed_item_key(
     Items with Codex-assigned ``id`` fields use ``threadId:turnId:item.id``.
     Completed turns reuse live ids on replay; an in-progress turn's resumed
     user input instead has a positional id that
-    :meth:`_CodexForwarderState.pair_user_message_copy` matches by content.
+    :meth:`_CodexForwarderState.pair_user_message_copy` matches by client input
+    id when present, with content matching for older inputs.
 
     Items without a stable ``id`` fall back to a per-(thread, turn)
     positional counter. The counter is peeked here and only advanced by
