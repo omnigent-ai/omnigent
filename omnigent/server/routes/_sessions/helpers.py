@@ -3097,6 +3097,22 @@ def _merge_claude_permission_launch_args(
     return [*stripped, "--permission-mode", mode]
 
 
+def _claude_args_without_permission_mode(args: list[str] | None) -> list[str]:
+    """
+    Claude launch args with permission-mode selectors removed, for comparing two sets.
+
+    Everything from an ``--`` option terminator on is positional text, so it
+    is kept exactly as stored.
+
+    :param args: Stored launch args, e.g. ``["--permission-mode", "plan", "--", "hi"]``.
+    :returns: The args without selectors, e.g. ``["--", "hi"]``.
+    """
+    stored = list(args or ())
+    end = stored.index("--") if "--" in stored else len(stored)
+    options, _ = _strip_claude_permission_launch_arg(stored[:end])
+    return [*options, *stored[end:]]
+
+
 def _drop_claude_launch_args_from_another_host(
     conversation_store: ConversationStore, conv: Conversation
 ) -> Conversation:
@@ -3123,13 +3139,13 @@ def _drop_claude_launch_args_from_another_host(
         or conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
     ):
         return conv
-    copied, _ = _strip_claude_permission_launch_arg(list(conv.terminal_launch_args or ()))
+    copied = _claude_args_without_permission_mode(conv.terminal_launch_args)
     if not copied:
         return conv
     source = conversation_store.get_conversation(source_id)
     if source is None:
         return conv
-    source_args, _ = _strip_claude_permission_launch_arg(list(source.terminal_launch_args or ()))
+    source_args = _claude_args_without_permission_mode(source.terminal_launch_args)
     # A side chat shares its source's runner without a host binding of its own.
     source_host_id = routing_host_id(source, conversation_store)
     if copied != source_args or source_host_id is None or source_host_id == conv.host_id:

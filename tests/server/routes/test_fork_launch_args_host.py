@@ -110,11 +110,24 @@ def test_other_harnesses_and_non_forks_keep_their_args(db_uri: str) -> None:
         assert conv.terminal_launch_args == _OPENUI_ARGS
 
 
-def test_fork_with_its_own_args_keeps_them_on_another_host(db_uri: str) -> None:
+@pytest.mark.parametrize(
+    ("source_args", "own_args"),
+    [
+        (_OPENUI_ARGS, ["--mcp-config", "/home/me/servers.json", "--permission-mode", "plan"]),
+        # Text after ``--`` is positional, so a selector-looking difference there counts.
+        (
+            ["--mcp-config", "/workspace/config.json", "--", "--permission-mode=plan"],
+            ["--mcp-config", "/workspace/config.json", "--", "--permission-mode=auto"],
+        ),
+    ],
+    ids=["new-config", "positional-text"],
+)
+def test_fork_with_its_own_args_keeps_them_on_another_host(
+    db_uri: str, source_args: list[str], own_args: list[str]
+) -> None:
     """Args that no longer match the source's are the fork's own, whatever host it binds."""
     store = SqlAlchemyConversationStore(db_uri)
-    fork_id = _fork(store, labels=dict(_CLAUDE_WRAPPER), launch_args=list(_OPENUI_ARGS))
-    own_args = ["--mcp-config", "/home/me/servers.json", "--permission-mode", "plan"]
+    fork_id = _fork(store, labels=dict(_CLAUDE_WRAPPER), launch_args=list(source_args))
     store.update_conversation(fork_id, terminal_launch_args=own_args)
 
     _drop_claude_launch_args_from_another_host(store, _bind(store, fork_id, _OTHER_HOST))
