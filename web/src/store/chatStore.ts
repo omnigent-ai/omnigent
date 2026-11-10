@@ -637,6 +637,12 @@ export interface PendingUserMessage {
   sentMidTurn?: boolean;
 }
 
+/** A steer that Stop handed back to the composer; `pendingId` links it to a later receipt. */
+interface ReturnedSteer {
+  tempId: string;
+  pendingId?: string;
+}
+
 /**
  * A message the user submitted while the agent was busy. It is held
  * client-side — NOT yet POSTed — and shown in the docked queue strip above
@@ -946,6 +952,8 @@ export interface ConversationState {
      * is left, so the composer adds it after newer input instead of dropping it.
      */
     recovered?: boolean;
+    /** The interrupted native steers this draft returns, not yet read by the agent. */
+    returnedSteers?: ReturnedSteer[];
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -961,7 +969,9 @@ export interface ConversationState {
    */
   restoredSendDraft: {
     conversationId: string;
-    stableId: string;
+    /** Unset for interrupted steers, which receipts for `returnedSteers` retract. */
+    stableId?: string;
+    returnedSteers?: ReturnedSteer[];
     text: string;
     files: File[];
     replyDraft?: StoredReplyDraft;
@@ -2985,7 +2995,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // what releases this conversation's entry for eviction, since the
         // server can now replay it. The bubble keeps rendering until its
         // consumed event pops it.
+        const acceptedPendingId = postResult.pendingId;
         setterFor(sessionId)((s) => ({
+          ...(acceptedPendingId
+            ? updateReturnedSteers(s, (steers) =>
+                steers.some((steer) => steer.tempId === tempId)
+                  ? steers.map((steer) =>
+                      steer.tempId === tempId ? { tempId, pendingId: acceptedPendingId } : steer,
+                    )
+                  : null,
+              )
+            : {}),
           pendingUserMessages: s.pendingUserMessages.map((p) =>
             p.tempId === tempId
               ? {
@@ -3089,6 +3109,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         !callerHandlesError &&
         !deliveredDespiteFailure &&
         draftSessionId !== null &&
+        !stopReturnedSteer(setterForState(draftSessionId) ?? get(), tempId) &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {
         setterFor(draftSessionId)({
@@ -3360,6 +3381,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           error: null,
         };
       }
+      const steers = interruptedSteerDraft(sessionId, s.pendingUserMessages);
+      if (steers !== null && s.failedSendDraft === null) patch.failedSendDraft = steers;
       return patch;
     });
     // Optimistic, unbacked write: unlike the session.status SSE caller, no
@@ -7950,7 +7973,7 @@ export function committedItemProvesDelivery(
  */
 export function restoredSendDraftUnchanged(
   restored: ConversationState["restoredSendDraft"],
-  stableId: string,
+  stableId: string | undefined,
   text: string,
   files: File[] | undefined,
   replyDraft: StoredReplyDraft | undefined,
@@ -7985,10 +8008,11 @@ export function takeFailedSendDraft(
   const patch: Partial<ConversationState> = { failedSendDraft: null };
   if (!delivered) patch.pendingRetryStableId = tracked ? (failed.stableId ?? null) : null;
   // A discarded failure must not untrack an earlier draft still in the composer.
-  if (tracked && failed.stableId)
+  if (tracked && (failed.stableId || failed.returnedSteers))
     patch.restoredSendDraft = {
       conversationId,
       stableId: failed.stableId,
+      returnedSteers: failed.returnedSteers,
       text: failed.text,
       files: failed.files,
       replyDraft: failed.replyDraft,
@@ -8052,6 +8076,77 @@ function retractDeliveredSendDraft(
     if (delivered(owner)) patch.pendingRetryStableId = null;
   }
   return patch;
+}
+
+/**
+ * The text of this tab's unread native steers, handed back when Stop interrupts the turn.
+ *
+ * The server stops replaying an interrupted input, and an agent may drop one it
+ * has not read (Codex discards a pending `turn/steer`), so the bubble is the last
+ * copy. A steer still posting may land on either side of the interrupt, so it
+ * returns too. No stable id: the server would dedupe a resend against the original's.
+ *
+ * @param conversationId - The session being stopped.
+ * @param pending - Its optimistic bubbles.
+ * @returns The draft to restore, or `null` when no steer is unread.
+ */
+function interruptedSteerDraft(
+  conversationId: string,
+  pending: readonly PendingUserMessage[],
+): ConversationState["failedSendDraft"] {
+  const steers = pending.flatMap((p) => {
+    const text = p.content.map((b) => (b.type === "input_text" ? b.text : "")).join("");
+    return p.sentMidTurn && text.trim() ? [{ tempId: p.tempId, pendingId: p.pendingId, text }] : [];
+  });
+  if (steers.length === 0) return null;
+  return {
+    conversationId,
+    text: steers.map((steer) => steer.text).join("\n\n"),
+    files: [],
+    returnedSteers: steers.map(({ tempId, pendingId }) =>
+      pendingId ? { tempId, pendingId } : { tempId },
+    ),
+    serverRefused: false,
+    recovered: true,
+  };
+}
+
+/**
+ * Update the steers Stop handed back, in the draft awaiting the composer and in
+ * the composer's restore tracker. Only a read removes a steer, so an empty list
+ * means the agent read them all after all (e.g. Claude Code resubmits queued
+ * input after an interrupt) and the unedited text is retracted.
+ *
+ * @param s - The conversation's state.
+ * @param update - Returns the new list, or `null` when it changes nothing.
+ * @returns The state patch.
+ */
+function updateReturnedSteers(
+  s: ConversationState,
+  update: (steers: ReturnedSteer[]) => ReturnedSteer[] | null,
+): Partial<ConversationState> {
+  const patch: Partial<ConversationState> = {};
+  const failed = s.failedSendDraft;
+  const failedSteers = failed?.returnedSteers && update(failed.returnedSteers);
+  if (failed && failedSteers)
+    patch.failedSendDraft =
+      failedSteers.length > 0 ? { ...failed, returnedSteers: failedSteers } : null;
+  const restored = s.restoredSendDraft;
+  const restoredSteers =
+    restored?.returnedSteers && !restored.delivered && update(restored.returnedSteers);
+  if (restored && restoredSteers)
+    patch.restoredSendDraft =
+      restoredSteers.length > 0
+        ? { ...restored, returnedSteers: restoredSteers }
+        : { ...restored, delivered: true };
+  return patch;
+}
+
+/** Whether Stop already handed this optimistic bubble's text back to the composer. */
+function stopReturnedSteer(s: ConversationState, tempId: string): boolean {
+  return [s.failedSendDraft?.returnedSteers, s.restoredSendDraft?.returnedSteers].some(
+    (steers) => steers?.some((steer) => steer.tempId === tempId) === true,
+  );
 }
 
 /**
@@ -9170,6 +9265,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         );
         return {
           ...retractDeliveredSendDraft(s, committedIds, "consumed"),
+          ...updateReturnedSteers(s, (steers) => {
+            const unread = steers.filter((steer) => steer.pendingId !== event.clearedPendingId);
+            return event.clearedPendingId && unread.length < steers.length ? unread : null;
+          }),
           ...(blocks === s.blocks ? {} : { blocks }),
         };
       });

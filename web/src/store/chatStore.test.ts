@@ -7511,6 +7511,106 @@ describe("chatStore — stop", () => {
     expect(readConversationRows()[0]?.status).toBe("idle");
   });
 
+  const readSteer = (clearedPendingId: string, text: string) =>
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: `item_${clearedPendingId}`,
+      itemType: "message",
+      clearedPendingId,
+      data: { role: "user", content: [{ type: "input_text", text }] },
+    });
+
+  it("returns unread native steers to the composer until the agent reads them", () => {
+    const steer = (tempId: string, text: string, extra: Partial<PendingUserMessage>) => ({
+      tempId,
+      content: [{ type: "input_text" as const, text }],
+      sentMidTurn: true,
+      ...extra,
+    });
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      pendingUserMessages: [
+        { tempId: "pend_0", content: [{ type: "input_text", text: "first" }], posted: true },
+        steer("pend_1", "steer one", { posted: true, pendingId: "pi_1" }),
+        steer("pend_2", "still posting", {}),
+        steer("pend_3", "steer two", { posted: true, pendingId: "pi_3" }),
+      ],
+      status: "streaming",
+      sessionStatus: "running",
+    });
+
+    useChatStore.getState().stop();
+
+    expect(useChatStore.getState().failedSendDraft).toEqual({
+      conversationId: "conv_abc",
+      text: "steer one\n\nstill posting\n\nsteer two",
+      files: [],
+      returnedSteers: [
+        { tempId: "pend_1", pendingId: "pi_1" },
+        { tempId: "pend_2" },
+        { tempId: "pend_3", pendingId: "pi_3" },
+      ],
+      serverRefused: false,
+      recovered: true,
+    });
+    expect(takeFailedSendDraft("conv_abc", false)?.text).toBe(
+      "steer one\n\nstill posting\n\nsteer two",
+    );
+    // A resend must not reuse the original's stable id, which the server dedupes.
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    readSteer("pi_1", "steer one");
+    readSteer("pi_3", "steer two");
+    // The steer whose POST never answered may not have reached the agent.
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      returnedSteers: [{ tempId: "pend_2" }],
+      delivered: false,
+    });
+  });
+
+  it.each([
+    { outcome: "read after its POST answers", read: true },
+    { outcome: "kept when its POST fails", read: false },
+  ])("returns a steer still posting at Stop, $outcome", async ({ read }) => {
+    let answerPost: ((response: Response) => void) | null = null;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/conv_existing/events") && String(init?.body).includes("steer"))
+        return new Promise<Response>((resolve) => {
+          answerPost = resolve;
+        });
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+      status: "streaming",
+      pendingUserMessages: [],
+    });
+
+    const sending = useChatStore.getState().send("late steer", "agent_xyz");
+    useChatStore.getState().stop();
+    const returned = useChatStore.getState().failedSendDraft;
+    expect(returned).toMatchObject({ text: "late steer", returnedSteers: [{}], recovered: true });
+    await vi.waitFor(() => expect(answerPost).not.toBeNull());
+    answerPost!(
+      read
+        ? mockResponse({ queued: true, pending_id: "pi_late" })
+        : mockResponse({ error: "boom" }, { ok: false, status: 500 }),
+    );
+    await sending;
+
+    if (read) {
+      expect(useChatStore.getState().failedSendDraft?.returnedSteers).toEqual([
+        { tempId: returned!.returnedSteers![0]!.tempId, pendingId: "pi_late" },
+      ]);
+      readSteer("pi_late", "late steer");
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+    } else {
+      expect(useChatStore.getState().failedSendDraft).toEqual(returned);
+    }
+  });
+
   it("no-op when no session is bound", () => {
     useChatStore.getState().stop();
     expect(fetchMock).not.toHaveBeenCalled();

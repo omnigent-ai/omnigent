@@ -5816,6 +5816,35 @@ describe("Composer reply quotes", () => {
     expect(getSessionDraft("conv_test")).toBeUndefined();
   });
 
+  it("retracts a steer returned by Stop once the agent reads it after all", () => {
+    render(<Composer {...composerProps()} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "change of plan",
+          files: [],
+          returnedSteers: [{ tempId: "pend_1", pendingId: "pending_1" }],
+          recovered: true,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("change of plan");
+
+    act(() =>
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "item_1",
+        itemType: "message",
+        clearedPendingId: "pending_1",
+        data: { role: "user", content: [{ type: "input_text", text: "change of plan" }] },
+      }),
+    );
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(getSessionDraft("conv_test")).toBeUndefined();
+  });
+
   it("retracts delivery that arrives while the failed draft restore is rendering", () => {
     const stableId = "8".repeat(32);
     render(<Composer {...composerProps()} />);

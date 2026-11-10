@@ -2575,7 +2575,7 @@ function ComposerImpl(
   // `delivered` when the send turns out to have reached the server, so the
   // retraction effect below can empty the composer.
   const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
-  const pendingFailedSendRestore = useRef<{ stableId: string; draft: typeof draft } | null>(null);
+  const pendingFailedSendRestore = useRef<{ stableId?: string; draft: typeof draft } | null>(null);
   const hasPendingInitialMessage = useChatStore((s) =>
     s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
   );
@@ -3365,9 +3365,8 @@ function ComposerImpl(
       dirtyRef.current = true;
       return;
     }
-    pendingFailedSendRestore.current = failed.stableId
-      ? { stableId: failed.stableId, draft }
-      : null;
+    pendingFailedSendRestore.current =
+      failed.stableId || failed.returnedSteers ? { stableId: failed.stableId, draft } : null;
     replaceText(recalled.text, recalled.replyDraft);
     restoreTaggedMentionsRef.current({ files: [], sessions: recalled.sessions });
     textareaRef.current = tailTextareaRef.current;
@@ -3386,7 +3385,8 @@ function ComposerImpl(
     // Delivery can interrupt the queued text restore with a store render.
     // Wait for the local draft update before deciding whether the user edited it.
     const pending = pendingFailedSendRestore.current;
-    if (pending?.stableId === restoredSendDraft.stableId && pending.draft === draft) return;
+    if (pending && pending.stableId === restoredSendDraft.stableId && pending.draft === draft)
+      return;
     pendingFailedSendRestore.current = null;
     useChatStore.setState({ restoredSendDraft: null });
     // Compare with what the restore put in the composer, tokens included.
