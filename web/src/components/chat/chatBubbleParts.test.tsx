@@ -439,7 +439,7 @@ describe("UserBubble literal text", () => {
       path: "src/a`name[1].tsx",
       start_index: 0,
       end_index: 0,
-      body: "**Preserve the existing check**\n\n- Handle `null` values.\n\nKeep <div> visible.",
+      body: "**Preserve the existing check**\n\n- Handle `null` values.\n\nKeep <div> and `[Attached: example.ts]` visible.",
       status: "draft",
       created_at: 0,
       updated_at: 0,
@@ -484,7 +484,7 @@ describe("UserBubble literal text", () => {
       "strong",
     );
     expect(within(cards[0]).getByRole("list")).toHaveTextContent("Handle null values.");
-    expect(cards[0]).toHaveTextContent("Keep <div> visible.");
+    expect(cards[0]).toHaveTextContent("Keep <div> and [Attached: example.ts] visible.");
     expect(within(cards[1]).getByText("Old lines 10–12")).toBeVisible();
     expect(within(cards[1]).getByRole("button", { name: "Copy Code" })).toBeVisible();
     expect(screen.getByText("Please fix these.")).toBeVisible();

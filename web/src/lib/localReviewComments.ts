@@ -51,9 +51,11 @@ export function isLocalReviewComment(value: unknown): value is Comment {
 export function formatLocalReviewComments(comments: Comment[]): string {
   return [
     "Please address these local review comments:",
-    ...comments.map(
-      (comment) => `${LOCAL_REVIEW_COMMENT_FENCE}${JSON.stringify(comment, null, 2)}\n\`\`\``,
-    ),
+    ...comments.map((comment) => {
+      // Keep quoted attachment markers out of the chat's mention-rewriting pass.
+      const snapshot = JSON.stringify(comment, null, 2).replaceAll("[Attached", "\\u005bAttached");
+      return `${LOCAL_REVIEW_COMMENT_FENCE}${snapshot}\n\`\`\``;
+    }),
   ].join("\n\n");
 }
 

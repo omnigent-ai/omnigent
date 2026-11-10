@@ -48,7 +48,7 @@ it("preserves full snapshots and Markdown bodies inside review fences", () => {
       ...comment,
       id: "comment-2",
       path: "src/a`name[1].tsx",
-      body: '**Check** <div>\n\n```json\n{"key": "value"}\n```\n\n- Keep `null`.',
+      body: '**Check** <div>\n\n```json\n{"key": "value"}\n```\n\n- Keep `null` and `[Attached: example.ts]`.',
       anchor_metadata: {
         ...comment.anchor_metadata!,
         side: "RIGHT" as const,
