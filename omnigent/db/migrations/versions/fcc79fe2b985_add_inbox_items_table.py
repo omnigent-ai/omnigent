@@ -1,7 +1,7 @@
 """add inbox_items table
 
 Revision ID: fcc79fe2b985
-Revises: f9b3e6c2a401
+Revises: a7d4c2e9f610
 Create Date: 2026-11-09 00:00:00.000000
 
 Adds the ``inbox_items`` table: suggestions an agent posts to its owner's
@@ -22,7 +22,7 @@ from alembic import op
 from omnigent.db.db_models import Uuid16
 
 revision: str = "fcc79fe2b985"
-down_revision: str | None = "f9b3e6c2a401"
+down_revision: str | None = "a7d4c2e9f610"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

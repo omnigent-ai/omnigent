@@ -435,10 +435,15 @@ def create_scheduled_tasks_router(
                     "managed sandboxes are not configured on this server",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            if sandbox_config.default.manages_profiles:
+            # A default profile is authorized at fire time, like every launch.
+            if sandbox_config.default.manages_profiles and (
+                getattr(request.app.state, "sandbox_profiles", None) is None
+                or sandbox_config.default.default_profile_id is None
+            ):
                 raise OmnigentError(
                     "Scheduled fresh sandboxes cannot select a profile yet; "
-                    "use a connected host or a default provider without profiles",
+                    "use a connected host or a default provider without profiles "
+                    "or with a default profile",
                     code=ErrorCode.INVALID_INPUT,
                 )
             if workspace is not None:

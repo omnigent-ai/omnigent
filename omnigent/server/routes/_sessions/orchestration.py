@@ -4676,6 +4676,7 @@ async def _run_managed_launch(
             session_id,
             user_id=owner,
             host_id=relaunch_host.host_id if relaunch_host is not None else None,
+            bind_host=False,
         )
         if profile is not None:
             sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
@@ -4686,9 +4687,19 @@ async def _run_managed_launch(
                     sandbox_config, None, unprofiled_host=relaunch_host
                 )
             else:
-                await asyncio.to_thread(
-                    sandbox_profiles.require_selection, provider, user_id=owner
+                # A launch without a create-time selection (a scheduled fresh sandbox)
+                # takes the provider's default, saved like an explicit selection.
+                default = await asyncio.to_thread(
+                    sandbox_profiles.default_selection, provider, user_id=owner
                 )
+                if default is None:
+                    await asyncio.to_thread(
+                        sandbox_profiles.require_selection, provider, user_id=owner
+                    )
+                else:
+                    await asyncio.to_thread(sandbox_profiles.bind_session, session_id, default)
+                    sandbox_config = deployment_with_sandbox_profile(sandbox_config, default)
+                    provider = default["provider"]
     except (OmnigentError, HTTPException) as exc:
         reason = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
         tracker.fail(session_id, reason)
@@ -4755,6 +4766,7 @@ async def _run_managed_launch(
             tunnel_registry=tunnel_registry,
             relaunch_host=relaunch_host,
             sandbox_profiles=sandbox_profiles,
+            sandbox_profile=profile,
         )
 
 
@@ -4770,6 +4782,7 @@ async def _bind_and_launch_managed_runner(
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
     sandbox_profiles: Any = None,
+    sandbox_profile: dict[str, Any] | None = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -4806,7 +4819,7 @@ async def _bind_and_launch_managed_runner(
     from omnigent.server.managed_hosts import terminate_managed_host
 
     def persist_binding() -> Conversation:
-        snapshot = (
+        snapshot = sandbox_profile or (
             sandbox_profiles.get_session_snapshot(session_id)
             if sandbox_profiles is not None
             else None
