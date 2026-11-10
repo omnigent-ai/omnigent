@@ -134,28 +134,11 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
 }
 
 # Proactive-agent Inbox items (``inbox_items``).
-INBOX_ITEM_KIND: dict[str, int] = {
-    "followup": 1,
-    "info": 2,
-    "reminder": 3,
-}
-
 INBOX_ITEM_STATE: dict[str, int] = {
     "unread": 1,
     "read": 2,
     "done": 3,
     "dismissed": 4,
-}
-
-# How the owner closed an item: through one of its actions, or a Dismiss reason.
-INBOX_ITEM_RESOLUTION: dict[str, int] = {
-    "none": 0,
-    "action_taken": 1,
-    "already_done": 2,
-    "useful": 3,
-    "not_relevant": 4,
-    "incorrect": 5,
-    "not_now": 6,
 }
 
 
@@ -381,16 +364,6 @@ def decode_scheduled_task_run_status(code: int) -> str:
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
 
 
-def encode_inbox_item_kind(name: str) -> int:
-    """Encode an ``inbox_items.kind`` name to its int code."""
-    return _encode(INBOX_ITEM_KIND, name, field="inbox_items.kind")
-
-
-def decode_inbox_item_kind(code: int) -> str:
-    """Decode an ``inbox_items.kind`` int code to its name."""
-    return _decode(INBOX_ITEM_KIND, code, field="inbox_items.kind")
-
-
 def encode_inbox_item_state(name: str) -> int:
     """Encode an ``inbox_items.state`` name to its int code."""
     return _encode(INBOX_ITEM_STATE, name, field="inbox_items.state")
@@ -399,13 +372,3 @@ def encode_inbox_item_state(name: str) -> int:
 def decode_inbox_item_state(code: int) -> str:
     """Decode an ``inbox_items.state`` int code to its name."""
     return _decode(INBOX_ITEM_STATE, code, field="inbox_items.state")
-
-
-def encode_inbox_item_resolution(name: str) -> int:
-    """Encode an ``inbox_items.resolution`` name to its int code."""
-    return _encode(INBOX_ITEM_RESOLUTION, name, field="inbox_items.resolution")
-
-
-def decode_inbox_item_resolution(code: int) -> str:
-    """Decode an ``inbox_items.resolution`` int code to its name."""
-    return _decode(INBOX_ITEM_RESOLUTION, code, field="inbox_items.resolution")
