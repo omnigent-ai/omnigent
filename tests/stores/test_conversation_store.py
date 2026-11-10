@@ -31,7 +31,7 @@ from omnigent.entities import (
     ResourceEventData,
 )
 from omnigent.errors import StaleCursorError
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -42,6 +42,17 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+_SEARCHER = "searcher@example.com"
+
+
+def _grant_search_access(db_uri: str, *conversation_ids: str) -> None:
+    """Grant ``_SEARCHER`` read access so content search can return these conversations."""
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for conversation_id in conversation_ids:
+        permissions.grant(_SEARCHER, conversation_id, LEVEL_READ)
+
 
 # ── CRUD ──────────────────────────────────────────────
 
@@ -1195,7 +1206,10 @@ def test_append_tool_output_with_nul_bytes(
 
     # The meaningful, NUL-adjacent token is still searchable, proving
     # sanitization dropped only the NUL and left real tokens indexed.
-    results = conversation_store.search("marker_unique_token", conversation_id=conv.id)
+    _grant_search_access(db_uri, conv.id)
+    results = conversation_store.search(
+        "marker_unique_token", conversation_id=conv.id, accessible_by=_SEARCHER
+    )
     assert [r.id for r in results] == [item_id]
 
 
@@ -1842,8 +1856,9 @@ def test_list_items_small_page_stays_single_statement(
 # ── Conversation ID / response ID lookups ────────────
 
 
-def test_search(conversation_store: SqlAlchemyConversationStore) -> None:
+def test_search(conversation_store: SqlAlchemyConversationStore, db_uri: str) -> None:
     conv = conversation_store.create_conversation()
+    _grant_search_access(db_uri, conv.id)
     conversation_store.append(
         conv.id,
         [
@@ -1866,21 +1881,23 @@ def test_search(conversation_store: SqlAlchemyConversationStore) -> None:
             ),
         ],
     )
-    results = conversation_store.search("Paris")
+    results = conversation_store.search("Paris", accessible_by=_SEARCHER)
     assert len(results) == 1
     assert results[0].type == "message"
 
-    results = conversation_store.search("sunny")
+    results = conversation_store.search("sunny", accessible_by=_SEARCHER)
     assert len(results) == 1
 
-    assert conversation_store.search("nonexistent") == []
+    assert conversation_store.search("nonexistent", accessible_by=_SEARCHER) == []
 
 
 def test_search_scoped_to_conversation(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
     conv1 = conversation_store.create_conversation()
     conv2 = conversation_store.create_conversation()
+    _grant_search_access(db_uri, conv1.id, conv2.id)
     conversation_store.append(
         conv1.id,
         [
@@ -1908,18 +1925,26 @@ def test_search_scoped_to_conversation(
         ],
     )
     # Unscoped: both match "hello"
-    assert len(conversation_store.search("hello")) == 2
+    assert len(conversation_store.search("hello", accessible_by=_SEARCHER)) == 2
 
     # Scoped: only one per conversation
-    assert len(conversation_store.search("hello", conversation_id=conv1.id)) == 1
-    assert len(conversation_store.search("hello", conversation_id=conv2.id)) == 1
+    assert (
+        len(conversation_store.search("hello", conversation_id=conv1.id, accessible_by=_SEARCHER))
+        == 1
+    )
+    assert (
+        len(conversation_store.search("hello", conversation_id=conv2.id, accessible_by=_SEARCHER))
+        == 1
+    )
 
 
 def test_search_function_call_item(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
     """FTS indexes function_call items by name and arguments."""
     conv = conversation_store.create_conversation()
+    _grant_search_access(db_uri, conv.id)
     conversation_store.append(
         conv.id,
         [
@@ -1935,9 +1960,9 @@ def test_search_function_call_item(
             ),
         ],
     )
-    assert len(conversation_store.search("get_weather")) == 1
-    assert len(conversation_store.search("Tokyo")) == 1
-    assert conversation_store.search("nonexistent") == []
+    assert len(conversation_store.search("get_weather", accessible_by=_SEARCHER)) == 1
+    assert len(conversation_store.search("Tokyo", accessible_by=_SEARCHER)) == 1
+    assert conversation_store.search("nonexistent", accessible_by=_SEARCHER) == []
 
 
 def test_list_conversations_search_query_matches_content(
@@ -5306,8 +5331,21 @@ def test_fork_marks_source_workspace_failures_as_notices(
     assert original is not None
     assert original.workspace == "/missing-workspace" and original.host_id == host_id
     assert original.labels == source_labels
-    assert len(conversation_store.search("source_workspace_missing", conversation_id=fork.id)) == 2
-    assert conversation_store.search("source_workspace_missing", conversation_id=source.id) == []
+    _grant_search_access(db_uri, fork.id)
+    assert (
+        len(
+            conversation_store.search(
+                "source_workspace_missing", conversation_id=fork.id, accessible_by=_SEARCHER
+            )
+        )
+        == 2
+    )
+    assert (
+        conversation_store.search(
+            "source_workspace_missing", conversation_id=source.id, accessible_by=_SEARCHER
+        )
+        == []
+    )
 
     [new_failure] = conversation_store.append(fork.id, [missing])
     assert conversation_store.list_items(fork.id).data[-1] == new_failure

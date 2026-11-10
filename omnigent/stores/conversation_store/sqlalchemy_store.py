@@ -16,6 +16,7 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    bindparam,
     case,
     delete,
     desc,
@@ -2592,6 +2593,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         query: str,
         conversation_id: str | None = None,
         limit: int = 20,
+        *,
+        accessible_by: str,
     ) -> list[ConversationItem]:
         """
         Full-text search over conversation items.
@@ -2604,9 +2607,46 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: Optional conversation to scope
             the search to, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of results to return.
+        :param accessible_by: Authenticated user whose permissions restrict
+            matches before ranking and limiting results.
         :returns: A list of matching :class:`ConversationItem`
             objects in relevance order.
         """
+        if not accessible_by:
+            return []
+        workspace_id = current_workspace_id()
+        acl_pushdown = self._conv_engine is self._engine
+        allowed_ids: list[bytes] | None = None
+        if not acl_pushdown:
+            # Permission rows live on the Omnigent engine, which can differ
+            # from the conversation engine. Keep filtering before LIMIT even
+            # when the query cannot join the two databases.
+            permission_query = select(SqlSessionPermission.conversation_id).where(
+                SqlSessionPermission.workspace_id == workspace_id,
+                SqlSessionPermission.user_id == accessible_by,
+            )
+            if conversation_id is not None:
+                permission_query = permission_query.where(
+                    SqlSessionPermission.conversation_id == conversation_id
+                )
+            with self._session("search_conversations_acl") as meta_session:
+                allowed_ids = [
+                    uuid_to_bytes(cid)
+                    for cid in meta_session.execute(permission_query).scalars().all()
+                ]
+            if not allowed_ids:
+                return []
+        acl_filter = (
+            "AND EXISTS (SELECT 1 FROM session_permissions AS sp "
+            "WHERE sp.workspace_id = ci.workspace_id "
+            "AND sp.conversation_id = ci.conversation_id "
+            "AND sp.user_id = :user) "
+            if acl_pushdown
+            else "AND ci.conversation_id IN :allowed_ids "
+        )
+        conversation_filter = (
+            "AND ci.conversation_id = :cid " if conversation_id is not None else ""
+        )
         with self._conv_session("search_conversations") as session:
             # Dialect-specific search: the SQLite family (SQLite + D1) has
             # FTS5 virtual tables (MATCH + rank); PostgreSQL doesn't. ILIKE on
@@ -2614,21 +2654,23 @@ class SqlAlchemyConversationStore(ConversationStore):
             # tsvector indexing is a future optimization (tracked in GAPS.md).
             use_fts = _supports_fts5(self._conv_engine.dialect.name)
             if use_fts:
-                if conversation_id is not None:
-                    stmt = text(
-                        "SELECT item_id FROM conversation_items_fts "
-                        "WHERE conversation_id = :cid "
-                        "AND search_text MATCH :query "
-                        "ORDER BY rank LIMIT :limit"
-                    )
-                else:
-                    stmt = text(
-                        "SELECT item_id FROM conversation_items_fts "
-                        "WHERE search_text MATCH :query "
-                        "ORDER BY rank LIMIT :limit"
-                    )
+                # The FTS mirror stores the original spelling of each id.
+                # Compare its UUID tail to the authoritative binary ids, then
+                # apply workspace and permission filters before ranking.
+                stmt = text(
+                    "SELECT ci.conversation_id, ci.id "
+                    "FROM conversation_items_fts AS f "
+                    "JOIN conversation_items AS ci "
+                    "ON lower(hex(ci.id)) = lower(substr(replace(f.item_id, '-', ''), -32)) "
+                    "AND lower(hex(ci.conversation_id)) = "
+                    "lower(substr(replace(f.conversation_id, '-', ''), -32)) "
+                    "WHERE f.search_text MATCH :query AND ci.workspace_id = :ws "
+                    f"{conversation_filter}"
+                    f"{acl_filter}"
+                    "ORDER BY f.rank LIMIT :limit"
+                )
             else:
-                # Non-SQLite fallback: LIKE/ILIKE on the data column.
+                # Non-FTS fallback: LIKE/ILIKE on the data column.
                 # PostgreSQL: cast MEDIUMBLOB/JSONB to text and use ILIKE.
                 # MySQL: CONVERT(data USING utf8mb4) + LIKE (case-insensitive
                 #        by default with utf8mb4_unicode_ci collation).
@@ -2637,54 +2679,63 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if is_mysql:
                     data_expr = "CONVERT(ci.data USING utf8mb4)"
                     like_op = "LIKE"
+                elif self._conv_engine.dialect.name in {"sqlite", "cloudflare_d1"}:
+                    # The fallback can also run on SQLite when FTS is disabled.
+                    data_expr = "CAST(ci.data AS TEXT)"
+                    like_op = "LIKE"
                 else:
                     data_expr = "ci.data::text"
                     like_op = "ILIKE"
-                if conversation_id is not None:
-                    stmt = text(
-                        f"SELECT ci.id FROM conversation_items ci "
-                        f"WHERE ci.workspace_id = :ws "
-                        f"AND ci.conversation_id = :cid "
-                        f"AND {data_expr} {like_op} :query "
-                        f"ORDER BY ci.created_at DESC LIMIT :limit"
-                    )
-                else:
-                    stmt = text(
-                        f"SELECT ci.id FROM conversation_items ci "
-                        f"WHERE ci.workspace_id = :ws "
-                        f"AND {data_expr} {like_op} :query "
-                        f"ORDER BY ci.created_at DESC LIMIT :limit"
-                    )
+                stmt = text(
+                    "SELECT ci.conversation_id, ci.id FROM conversation_items AS ci "
+                    "WHERE ci.workspace_id = :ws "
+                    f"{conversation_filter}"
+                    f"AND {data_expr} {like_op} :query "
+                    f"{acl_filter}"
+                    "ORDER BY ci.created_at DESC LIMIT :limit"
+                )
                 query = like_pattern
-            params: dict[str, str | int | bytes] = {
+            if allowed_ids is not None:
+                stmt = stmt.bindparams(bindparam("allowed_ids", expanding=True))
+            params: dict[str, str | int | bytes | list[bytes]] = {
                 "query": query,
                 "limit": limit,
-                "ws": current_workspace_id(),
+                "ws": workspace_id,
             }
+            if acl_pushdown:
+                params["user"] = accessible_by
+            else:
+                params["allowed_ids"] = allowed_ids or []
             if conversation_id is not None:
-                # Raw SQL bypasses Uuid16: the FTS mirror stores hex text, but
-                # conversation_items.conversation_id is 16 raw bytes — bind the
-                # form each branch actually compares against.
-                params["cid"] = conversation_id if use_fts else uuid_to_bytes(conversation_id)
-            item_ids = [
-                item_id.hex() if isinstance(item_id, (bytes, memoryview)) else item_id
-                for item_id in (row[0] for row in session.execute(stmt, params).fetchall())
+                params["cid"] = uuid_to_bytes(conversation_id)
+            item_keys = [
+                tuple(
+                    bytes(value).hex()
+                    if isinstance(value, (bytes, memoryview))
+                    else uuid_to_bytes(value).hex()
+                    for value in row
+                )
+                for row in session.execute(stmt, params).fetchall()
             ]
-            if not item_ids:
+            if not item_keys:
                 return []
             rows = (
                 session.execute(
                     select(SqlConversationItem).where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.id.in_(item_ids),
+                        SqlConversationItem.workspace_id == workspace_id,
+                        tuple_(
+                            SqlConversationItem.conversation_id,
+                            SqlConversationItem.id,
+                        ).in_(item_keys),
                     )
                 )
                 .scalars()
                 .all()
             )
-            # Preserve FTS rank order
-            order = {iid: i for i, iid in enumerate(item_ids)}
-            ordered = sorted(rows, key=lambda r: order[r.id])
+            # Preserve FTS rank or recency order without widening the result
+            # to a second conversation that reused an item id.
+            order = {key: i for i, key in enumerate(item_keys)}
+            ordered = sorted(rows, key=lambda r: order[(r.conversation_id, r.id)])
             decoded = self._decode_item_data_batch([r.data for r in ordered])
             return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
 
