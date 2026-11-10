@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -81,14 +82,35 @@ async def _assert_monitor_blocked_then_shuts_down(
     *,
     has_active_work: Any,
     release: Any,
+    parent_hangup: bool = False,
 ) -> None:
     """
-    Prove a short idle timeout waits for active work, then shuts down.
+    Prove idle and hangup watchdogs wait for active work, then shut down.
 
     :param has_active_work: Callback matching ``app.state.has_active_work``.
     :param release: Awaitable that clears the active-work pin.
+    :param parent_hangup: Exercise parent-loss draining instead of the idle monitor.
     :returns: None.
     """
+    if parent_hangup:
+        from tests.runner.test_runner_entry import _finish_work_killer
+
+        probed = threading.Event()
+
+        def active_work() -> bool:
+            active = has_active_work()
+            if active:
+                probed.set()
+            return active
+
+        killer = asyncio.create_task(asyncio.to_thread(_finish_work_killer, active_work))
+        try:
+            assert await asyncio.to_thread(probed.wait, 1)
+            assert not killer.done()
+        finally:
+            await release()
+        assert await asyncio.wait_for(killer, timeout=1) == ["idle_close", "exit"]
+        return
     loop = asyncio.get_running_loop()
     shutdowns: list[str] = []
     monitor = asyncio.create_task(
@@ -375,7 +397,16 @@ async def _post_status(client: Any, conv_id: str, status: str) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["running", "waiting"])
-async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: str) -> None:
+@pytest.mark.parametrize("harness", ["pi-native", "claude-native", "codex-native"])
+@pytest.mark.parametrize("parent_hangup", [False, True], ids=["idle_watchdog", "host_hangup"])
+@pytest.mark.parametrize("end_action", ["complete", "stop_session"])
+async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(
+    status: str,
+    harness: str,
+    parent_hangup: bool,
+    end_action: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A native terminal's in-flight status holds the watchdog until it settles.
 
     Native delivery leaves ``active_turns`` once the prompt is typed, so the
@@ -386,21 +417,35 @@ async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: s
     """
     from tests.runner.conftest import _runner_client
 
+    native_name = harness.removesuffix("-native")
+    monkeypatch.setattr(f"omnigent.runner.native._launch_{native_name}", AsyncMock())
     conv_id = "conv_native_in_flight"
-    app = await _native_app_with_session(conv_id)
+    app = await _native_app_with_session(conv_id, harness=harness)
     async with _runner_client(app) as client:
         created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
         assert created.status_code == 201, created.text
-        await _post_status(client, conv_id, status)
+        if harness == "codex-native":
+            from omnigent.harnesses.codex_native.forwarder import _post_status as post_codex_status
+
+            await post_codex_status(client, conv_id, status, response_id=f"codex_{conv_id}")
+        else:
+            await _post_status(client, conv_id, status)
         assert conv_id not in app.state.active_turns
         assert app.state.has_active_work() is True
 
         async def _release() -> None:
-            await _post_status(client, conv_id, "idle")
+            if end_action == "stop_session":
+                stopped = await client.delete(f"/v1/sessions/{conv_id}")
+                assert stopped.status_code == 200, stopped.text
+            elif harness == "codex-native":
+                await post_codex_status(client, conv_id, "idle", response_id=f"codex_{conv_id}")
+            else:
+                await _post_status(client, conv_id, "idle")
 
         await _assert_monitor_blocked_then_shuts_down(
             has_active_work=app.state.has_active_work,
             release=_release,
+            parent_hangup=parent_hangup,
         )
 
 
@@ -790,10 +835,12 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
     "evidence",
     ["permission_prompt", "background_shell", "pane_output", "pane_input", "no_evidence"],
 )
+@pytest.mark.parametrize("parent_hangup", [False, True], ids=["idle_watchdog", "host_hangup"])
 async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     evidence: str,
+    parent_hangup: bool,
 ) -> None:
     """A pane that reads idle but shows live work keeps the idle watchdog open.
 
@@ -879,7 +926,22 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
             assert app.state.has_sandbox_work() is (
                 evidence in ("permission_prompt", "background_shell")
             )
-            if evidence == "background_shell":
+            if evidence == "no_evidence":
+                return
+
+            async def release() -> None:
+                if evidence == "permission_prompt":
+                    bridge.approval_wait_marker_path(conv_id).unlink()
                 background(conv_id, False)
+                monkeypatch.setattr(instance, "screen_changed_within", Mock(return_value=False))
+                monkeypatch.setattr(
+                    instance, "client_interaction_within", Mock(return_value=False)
+                )
                 assert app.state.has_active_work() is False
                 assert app.state.has_sandbox_work() is False
+
+            await _assert_monitor_blocked_then_shuts_down(
+                has_active_work=app.state.has_active_work,
+                release=release,
+                parent_hangup=parent_hangup,
+            )
