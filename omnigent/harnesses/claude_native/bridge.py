@@ -163,10 +163,17 @@ def _bridge_injection_file_lock(bridge_dir: Path) -> FileLock:
 
 
 @contextlib.contextmanager
-def _cancellable_injection_lock(lock: threading.Lock | FileLock) -> Iterator[None]:
+def _cancellable_injection_lock(
+    lock: threading.Lock | FileLock, *, timeout_s: float | None = None
+) -> Iterator[None]:
     """Let cancelled queued writers exit while the active writer keeps its lock."""
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     while True:
         _check_injection_cancelled()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Claude Code terminal metadata is busy; no terminal command was sent."
+            )
         try:
             if lock.acquire(timeout=_INJECTION_LOCK_POLL_INTERVAL_S):
                 break
@@ -6089,7 +6096,10 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
     """
     owner = _INJECTION_OWNER.get()
     lock = (
-        _bridge_metadata_write_lock(owner.bridge_dir)
+        _cancellable_injection_lock(
+            native_bridge_common.bridge_dir_lock(owner.bridge_dir),
+            timeout_s=_TMUX_SEND_TIMEOUT_S if args and args[0] == "kill-session" else None,
+        )
         if owner is not None
         else contextlib.nullcontext()
     )
