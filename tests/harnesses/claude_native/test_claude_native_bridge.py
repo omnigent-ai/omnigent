@@ -8,6 +8,7 @@ import errno
 import io
 import itertools
 import json
+import logging
 import os
 import queue
 import select
@@ -39,6 +40,8 @@ from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _LOGIN_GUIDANCE,
+    _TURN_END_SCAN_BYTES,
+    BackgroundAgentsAfterTurnReader,
     _build_tools,
     _claude_prompt_rendered,
     _escape_slash_command_text,
@@ -838,6 +841,259 @@ def test_record_hook_event_first_event_bootstraps_identity(tmp_path: Path) -> No
 
     assert read_transcript_path(bridge_dir) == transcript_path
     assert read_claude_session_id(bridge_dir) == "claude-session"
+
+
+_STOP_HOOK_FEEDBACK = {
+    "type": "user",
+    "isMeta": True,
+    "message": {"content": "Stop hook feedback:\nwait"},
+}
+
+
+def _write_turn(transcript_path: Path, *later_entries: dict[str, Any]) -> None:
+    entries = [
+        {"type": "user", "message": {"content": "go"}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        *later_entries,
+    ]
+    transcript_path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+
+
+def _stop_leaving_agent_running(transcript_path: Path) -> dict[str, Any]:
+    return {
+        "hook_event_name": "Stop",
+        "session_id": "claude-session",
+        "transcript_path": str(transcript_path),
+        "background_tasks": [{"id": "a1", "type": "subagent", "status": "running"}],
+    }
+
+
+def _append_entries(transcript_path: Path, *entries: dict[str, Any]) -> None:
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        for entry in entries:
+            transcript.write(json.dumps(entry) + "\n")
+
+
+@pytest.mark.parametrize(
+    ("background_tasks", "agent_running"),
+    [
+        ([{"id": "a1", "type": "subagent", "status": "running"}], True),
+        ([{"id": "a1", "type": "local_agent"}], True),
+        ([{"id": "a1", "type": "agent", "status": "completed"}], False),
+        ([{"id": "b1", "type": "local_bash", "status": "running"}], False),
+        (None, False),
+    ],
+)
+def test_record_hook_event_marks_a_stop_that_leaves_a_background_agent(
+    tmp_path: Path, background_tasks: list[dict[str, str]] | None, agent_running: bool
+) -> None:
+    """Each main-session Stop records whether it left an unfinished background agent."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path, {"type": "system", "subtype": "stop_hook_summary"})
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    assert reader.read() is True
+    stop: dict[str, Any] = {
+        "hook_event_name": "Stop",
+        "session_id": "claude-session",
+        "transcript_path": str(transcript_path),
+    }
+    if background_tasks is not None:
+        stop["background_tasks"] = background_tasks
+
+    record_hook_event(bridge_dir, stop)
+
+    assert reader.read() is agent_running
+
+
+def test_background_agent_mark_names_only_the_running_agents(tmp_path: Path) -> None:
+    """The hold keeps each running agent's display fields, not shells or finished agents."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+            "background_tasks": [
+                {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"},
+                {"id": "a2", "type": "agent", "status": "completed", "description": "Done"},
+                {"id": "b1", "type": "local_bash", "status": "running", "command": "sleep 9"},
+                {"id": "a3", "type": "local_agent", "description": "x" * 600, "extra": 1},
+            ],
+        },
+    )
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+
+    assert reader.read() is True
+    assert reader.agents == [
+        {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"},
+        {"id": "a3", "type": "local_agent", "description": "x" * 512},
+    ]
+
+    record_hook_event(
+        bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "claude-session"}
+    )
+    assert reader.read() is False
+    assert reader.agents == []
+
+
+@pytest.mark.parametrize("next_event", ["UserPromptSubmit", "StopFailure", "SessionStart"])
+def test_record_hook_event_clears_the_background_agent_mark_on_the_next_turn(
+    tmp_path: Path, next_event: str
+) -> None:
+    """Only the main session's next turn clears the mark; the agent's own hooks do not."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    for child_event in ("UserPromptSubmit", "Stop"):
+        record_hook_event(
+            bridge_dir,
+            {"hook_event_name": child_event, "session_id": "claude-session", "agent_id": "a1"},
+        )
+    assert reader.read() is True
+
+    record_hook_event(bridge_dir, {"hook_event_name": next_event, "session_id": "claude-session"})
+
+    assert reader.read() is False
+
+
+@pytest.mark.parametrize(
+    ("appended_entries", "still_held"),
+    [
+        (
+            [
+                {"type": "attachment", "attachment": {"type": "hook_success"}},
+                {"type": "system", "subtype": "stop_hook_summary"},
+                {"type": "user", "isSidechain": True, "message": {"content": "agent step"}},
+                {"type": {}},
+                {"type": ["user"]},
+            ],
+            True,
+        ),
+        ([_STOP_HOOK_FEEDBACK], False),
+        ([{"type": "assistant", "message": {"content": []}}], False),
+    ],
+)
+def test_background_agent_mark_ends_when_the_main_conversation_continues(
+    tmp_path: Path, appended_entries: list[dict[str, Any]], still_held: bool
+) -> None:
+    """A blocking Stop hook resumes the turn with no new prompt; its entries end the hold."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    assert reader.read() is True
+
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        transcript.write("not json\n")
+    _append_entries(transcript_path, *appended_entries)
+
+    assert reader.read() is still_held
+
+
+def test_background_agent_mark_ignores_a_stop_another_hook_already_blocked(
+    tmp_path: Path,
+) -> None:
+    """Claude may log a blocking hook's feedback before this hook records the Stop."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path, _STOP_HOOK_FEEDBACK, {"type": "attachment"})
+
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+
+    assert BackgroundAgentsAfterTurnReader(bridge_dir).read() is False
+
+
+@pytest.mark.parametrize(
+    "transcript", ["missing_at_stop", "deleted_after_stop", "no_reply", "reply_beyond_scan"]
+)
+def test_background_agent_mark_needs_a_readable_turn_end(tmp_path: Path, transcript: str) -> None:
+    """Without the turn's last reply in the transcript, a busy session stays running."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    if transcript == "no_reply":
+        transcript_path.write_text('{"type": "user", "message": {"content": "go"}}\n')
+    elif transcript == "reply_beyond_scan":
+        _write_turn(transcript_path, {"type": "attachment", "padding": "x" * _TURN_END_SCAN_BYTES})
+    elif transcript == "deleted_after_stop":
+        _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    if transcript == "deleted_after_stop":
+        assert reader.read() is True
+        transcript_path.unlink()
+
+    assert reader.read() is False
+
+
+def test_background_agent_mark_parses_each_complete_appended_line_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Polling through a long agent run parses only new lines, each once it is complete."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    parsed: list[bytes] = []
+    entry_type = claude_native_bridge._main_conversation_entry_type
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_main_conversation_entry_type",
+        lambda line: parsed.append(line) or entry_type(line),
+    )
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    progress = json.dumps({"type": "progress", "data": {"type": "agent_progress"}})
+    reply = json.dumps({"type": "assistant", "message": {"content": []}})
+
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        transcript.write(progress + "\n")
+        transcript.flush()
+        assert reader.read() is True
+        assert reader.read() is True
+        transcript.write(reply)
+        transcript.flush()
+        assert reader.read() is True
+        transcript.write("\n")
+        transcript.flush()
+        assert reader.read() is False
+        assert reader.read() is False
+
+    assert parsed == [f"{progress}\n".encode(), f"{reply}\n".encode()]
+
+
+@pytest.mark.parametrize("rewrite", ["replaced", "truncated", "cut_before_turn_end"])
+def test_background_agent_mark_rescans_a_rewritten_transcript(
+    tmp_path: Path, rewrite: str
+) -> None:
+    """A replaced or shortened transcript is rescanned; one without the turn's reply ends it."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    padding = {"type": "attachment", "padding": "x" * 1000}
+    _append_entries(transcript_path, padding)
+    assert reader.read() is True
+
+    if rewrite == "replaced":
+        replacement = tmp_path / "replacement.jsonl"
+        _write_turn(replacement, _STOP_HOOK_FEEDBACK, padding)
+        os.replace(replacement, transcript_path)
+    elif rewrite == "truncated":
+        _write_turn(transcript_path, _STOP_HOOK_FEEDBACK)
+    else:
+        transcript_path.write_text('{"type": "user", "message": {"content": "go"}}\n')
+
+    assert reader.read() is False
+    _append_entries(transcript_path, padding)
+    assert reader.read() is False
 
 
 @pytest.mark.parametrize("updated_file", ["hook_identity", "model_vocabulary"])
@@ -2148,6 +2404,120 @@ def test_read_transcript_items_from_offset_skips_existing_prefix(
         "agent": "claude-native-ui",
         "content": [{"type": "output_text", "text": "new output"}],
     }
+
+
+def test_read_transcript_items_from_offset_warns_on_unmirrored_human_prompt(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A human-typed prompt that yields no user message is logged by shape.
+
+    A human prompt the forwarder drops as CLI scaffolding leaves the web
+    message it answers unsettled, so the server later reports it as never
+    recorded. Plain prompts, real command echoes and a queued shell command
+    (dropped on purpose) stay quiet, and the warning never carries the text.
+    """
+    records = [
+        {
+            "type": "user",
+            "uuid": "lost",
+            "origin": {"kind": "human"},
+            "message": {
+                "role": "user",
+                "content": "<command-args>secret-output</command-args> what does this mean?",
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "plain",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": "fix the bug"},
+        },
+        {
+            "type": "user",
+            "uuid": "command",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": "<command-name>/model</command-name>"},
+        },
+        {
+            "type": "attachment",
+            "uuid": "queued-shell",
+            "attachment": {
+                "type": "queued_command",
+                "origin": {"kind": "human"},
+                "prompt": "pwd",
+                "commandMode": "bash",
+            },
+        },
+    ]
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.bridge"):
+        result = read_transcript_items_from_offset(
+            transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+        )
+
+    assert not [item for item in result.items if item.source_id.startswith("lost:")]
+    warnings = [r.getMessage() for r in caplog.records if "human prompt record" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "line=1 " in warnings[0]
+    assert "has_command_markup=False" in warnings[0]
+    assert "item_types=[]" in warnings[0]
+    assert "secret-output" not in warnings[0]
+
+
+def test_user_prompt_quoting_shell_markup_is_mirrored_as_a_message(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A pasted log that quotes ``<bash-*>`` markup is the person's prompt.
+
+    Only a record that starts with the markup is a shell command. Parsing the
+    quoted markup as a terminal command dropped the user message, so the web
+    message it answered was later reported as never recorded.
+    """
+    pasted_logs = (
+        '\n\n<pasted_content id="a1">\nwhy did this fail?\n'
+        "<bash-input>make test</bash-input><bash-stdout>boom</bash-stdout>\n"
+        '</pasted_content id="a1">\n'
+    )
+    records = [
+        {
+            "type": "user",
+            "uuid": "prompt",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": pasted_logs},
+        },
+        {
+            "type": "user",
+            "uuid": "shell",
+            "message": {"role": "user", "content": "<bash-input>pwd</bash-input>"},
+        },
+    ]
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.bridge"):
+        result = read_transcript_items_from_offset(
+            transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+        )
+
+    by_record = {item.source_id.split(":")[0]: item for item in result.items}
+    assert by_record["prompt"].item_type == "message"
+    assert by_record["prompt"].data["role"] == "user"
+    assert by_record["prompt"].data.get("is_meta") is not True
+    assert by_record["prompt"].data["content"][0]["text"] == (
+        "why did this fail?\n<bash-input>make test</bash-input><bash-stdout>boom</bash-stdout>"
+    )
+    assert by_record["shell"].item_type == "terminal_command"
+    assert not [r for r in caplog.records if "human prompt record" in r.getMessage()]
 
 
 def test_read_transcript_items_from_offset_preserves_partial_trailing_line(
@@ -10590,6 +10960,45 @@ def test_queued_message_hint_is_not_a_draft_for_submit_verification(needle: str)
     assert claude_native_bridge._draft_in_input_box(pane, needle) is False
 
 
+def test_a_draft_scrolled_past_its_first_line_is_seen_by_its_end() -> None:
+    """
+    A draft taller than the box keeps only its end in view, which the tail marker finds.
+
+    The first-line marker alone missed it, so long messages were submitted blind
+    and a swallowed Enter left them unsent in the box.
+    """
+    content = (
+        "Please review the change. " + "Check each caller carefully. " * 20 + "Then run tests."
+    )
+    rule = "─" * 60
+    pane = "\n".join(
+        [rule, "❯ each caller carefully. Check each caller", "  carefully. Then run tests.", rule]
+    )
+    needle = claude_native_bridge._submit_needle(content)
+    tail_needle = claude_native_bridge._submit_tail_needle(content)
+
+    assert claude_native_bridge._draft_in_input_box(pane, needle) is False
+    assert claude_native_bridge._draft_in_input_box(pane, needle, tail_needle=tail_needle) is True
+    empty_box = "\n".join([rule, "❯ ", rule])
+    assert not claude_native_bridge._draft_in_input_box(empty_box, needle, tail_needle=tail_needle)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("first line\nlast line of the draft", "last line of the draft"),
+        ("x" * 30 + " and the final words here", "and the final words here"),
+        ("long first line here\nok", ""),
+        ("before\tafter the tab char", "after the tab char"),
+        ("   \n  ", ""),
+    ],
+    ids=["last-line", "truncated", "too-short", "after-control-char", "blank"],
+)
+def test_submit_tail_needle(content: str, expected: str) -> None:
+    """The tail marker is the end of the last line, or empty when too short to be specific."""
+    assert claude_native_bridge._submit_tail_needle(content) == expected
+
+
 def test_typed_draft_is_still_seen_beside_the_queued_message_hint() -> None:
     """A real draft in the box is still detected when the same words appear in it."""
     rule = "─" * 40
@@ -17513,6 +17922,10 @@ async def test_relay_keeps_high_descriptor_connections_alive(
 @pytest.mark.parametrize("saved", [False, True])
 @pytest.mark.parametrize("active", [None, [], ["claude"]])
 def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved):
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
+    active = launch_activation(active)
+
     from unittest.mock import patch
 
     from omnigent.mcp_disabled_servers import ServerKey, apply_claude_settings, set_disabled

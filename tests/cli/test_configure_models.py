@@ -2715,7 +2715,7 @@ def test_build_cli_config_provider_entry_shapes() -> None:
 
 # ── cli-config removal dismissal + re-add ────────────────────────────────────
 
-# The exact state `isaac configure codex` leaves behind: a custom provider
+# The state a Codex setup leaves behind: a custom provider
 # with self-contained auth in config.toml, and NO auth.json.
 _CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
