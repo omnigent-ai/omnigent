@@ -722,6 +722,11 @@ export const MessageResponse = memo(
 
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
     const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
+    let rehypePlugins = SECURE_STREAMDOWN_REHYPE_PLUGINS;
+    if (allowWorkspaceImages) rehypePlugins = WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS;
+    else if (markFileLinks) rehypePlugins = FILE_LINK_STREAMDOWN_REHYPE_PLUGINS;
+    else if (allowGitHubAttachmentImages)
+      rehypePlugins = GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
 
     return (
       <MarkdownErrorBoundary source={props.children}>
@@ -745,15 +750,7 @@ export const MessageResponse = memo(
             controls={messageControls}
             mermaid={mermaidOptions}
             // Block remote image fetches that can exfiltrate data through URLs.
-            rehypePlugins={
-              allowWorkspaceImages
-                ? WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS
-                : markFileLinks
-                  ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
-                  : allowGitHubAttachmentImages
-                    ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
-                    : SECURE_STREAMDOWN_REHYPE_PLUGINS
-            }
+            rehypePlugins={rehypePlugins}
           />
         </StreamingTextContext.Provider>
       </MarkdownErrorBoundary>

@@ -7,6 +7,7 @@ import { resolveChatFilePath, useWorkspaceEnvironment } from "@/hooks/useWorkspa
 import { useFileViewerConversationId, useWorkspacePaths } from "@/shell/FileViewerContext";
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const RASTER_IMAGE_EXTENSION = /\.(png|jpe?g|gif|webp|avif|bmp)$/i;
 const RASTER_IMAGE_TYPES = new Set([
   "image/png",
   "image/jpeg",
@@ -38,7 +39,7 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
   const filename = path.split("/").pop() || alt || "Image";
 
   useEffect(() => {
-    if (!conversationId || !relativePath) return;
+    if (!conversationId || !relativePath || !RASTER_IMAGE_EXTENSION.test(relativePath)) return;
     const controller = new AbortController();
     let objectUrl: string | undefined;
     void fetchFileContent(conversationId, relativePath, controller.signal, { scope: "workspace" })

@@ -280,11 +280,12 @@ function parkWorkspaceImages() {
         return;
       }
       if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(path.trim()) || /[?#\\]/.test(path)) return;
+      const { alt, title } = node.properties ?? {};
       node.tagName = PARKED_WORKSPACE_IMAGE_TAG;
       node.properties = {
         [WORKSPACE_IMAGE_ATTR]: path,
-        alt: node.properties?.alt,
-        title: node.properties?.title,
+        alt: typeof alt === "string" ? alt : undefined,
+        title: typeof title === "string" ? title : undefined,
       };
     });
   };

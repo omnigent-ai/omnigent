@@ -3126,7 +3126,7 @@ def register_resources_routes(
         # way around the owner-scoped host filesystem endpoint.
         absolute, relative_path = _resolve_browse_path(request, relative_path)
         conv, owner = await _authorize_browse_read_with_owner(session_id, request, relative_path)
-        if scope == "workspace" and ntpath.isabs(relative_path):
+        if scope == "workspace" and (absolute or ntpath.isabs(relative_path)):
             raise HTTPException(status_code=400, detail="Workspace scope requires a relative path")
 
         # The owner may browse a workspace symlink's outside target by absolute

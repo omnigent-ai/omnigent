@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import ntpath
 import re
 import threading
 import uuid
@@ -4403,12 +4404,14 @@ async def test_filesystem_read_proxies_to_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("windows_single_slash", [True, False])
 @pytest.mark.parametrize(
     ("path", "query", "status"),
     [
         ("", {"scope": "workspace"}, 200),
         ("", {"scope": "workspace", "base": "host"}, 400),
         ("/sample.png", {"scope": "workspace", "base": "host"}, 400),
+        ("/C:/workspace/sample.png", {"scope": "workspace"}, 400),
         ("/sample.png", {"scope": "reach"}, 422),
     ],
 )
@@ -4417,7 +4420,19 @@ async def test_filesystem_workspace_scope_validates_the_request(
     path: str,
     query: dict[str, str],
     status: int,
+    windows_single_slash: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if not windows_single_slash:
+        # Python 3.13+ does not consider a single leading slash Windows-absolute.
+        original_isabs = ntpath.isabs
+        monkeypatch.setattr(
+            ntpath,
+            "isabs",
+            lambda path: (
+                original_isabs(path) and not (path.startswith("/") and not path.startswith("//"))
+            ),
+        )
     fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
     response = await client.get(

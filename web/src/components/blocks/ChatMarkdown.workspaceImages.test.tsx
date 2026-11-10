@@ -20,6 +20,8 @@ const createObjectURL = vi.fn();
 const revokeObjectURL = vi.fn();
 const ORIGINAL_CREATE = URL.createObjectURL;
 const ORIGINAL_REVOKE = URL.revokeObjectURL;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_ENCODED_LENGTH = Math.ceil(MAX_IMAGE_BYTES / 3) * 4;
 const VIEWER = {
   openFile: vi.fn(),
   openGithubTab: vi.fn(),
@@ -45,7 +47,9 @@ function imageResponse(data: Partial<FileContentResponse> = {}, acknowledged = t
 
 beforeEach(() => {
   fetchMock.mockReset().mockImplementation(() => Promise.resolve(imageResponse()));
-  createObjectURL.mockReset().mockReturnValue("blob:workspace-image");
+  createObjectURL
+    .mockReset()
+    .mockImplementation(() => `blob:workspace-image-${createObjectURL.mock.calls.length}`);
   revokeObjectURL.mockReset();
   workspaceEnvironment.mockReset().mockReturnValue({ data: undefined });
   vi.stubGlobal("fetch", fetchMock);
@@ -105,7 +109,7 @@ describe("assistant workspace markdown images", () => {
       const zoom = await screen.findByRole("button", { name: "Zoom image: Screenshot" });
       expect(screen.getByRole("img", { name: "Screenshot" })).toHaveAttribute(
         "src",
-        "blob:workspace-image",
+        "blob:workspace-image-1",
       );
       expect(fetchMock).toHaveBeenCalledWith(
         "/v1/sessions/session-main/resources/environments/default/filesystem/shot.png?scope=workspace",
@@ -115,13 +119,14 @@ describe("assistant workspace markdown images", () => {
       fireEvent.click(zoom);
       expect(await screen.findByRole("dialog")).toBeVisible();
       result.unmount();
-      expect(revokeObjectURL).toHaveBeenCalledWith("blob:workspace-image");
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:workspace-image-1");
     },
   );
 
   it.each([
     ["shot.png", "shot.png"],
     ["./shot.png", "shot.png"],
+    ["shot.JPEG", "shot.JPEG"],
     ["images/my%20shot.png", "images/my%20shot.png"],
     ["images/my%2520shot.png", "images/my%2520shot.png"],
   ])("resolves %s without decoding twice", async (path, encoded) => {
@@ -129,6 +134,16 @@ describe("assistant workspace markdown images", () => {
     await screen.findByRole("button", { name: "Zoom image: Screenshot" });
     expect(fetchMock.mock.calls[0][0]).toContain(`/filesystem/${encoded}?scope=workspace`);
   });
+
+  it.each([".env", "build.log", "picture", "diagram.svg", "favicon.ico"])(
+    "does not read unsupported image path %s",
+    async (path) => {
+      renderMarkdown(`![Screenshot](${path})`);
+      expect(await screen.findByText(path)).toBeVisible();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(document.querySelector("img")).toBeNull();
+    },
+  );
 
   it.each([
     "https://example.com/shot.png",
@@ -175,15 +190,48 @@ describe("assistant workspace markdown images", () => {
     ["SVG", () => imageResponse({ content_type: "image/svg+xml" })],
     ["HTML", () => imageResponse({ content_type: "text/html" })],
     ["truncated", () => imageResponse({ truncated: true })],
-    ["oversized", () => imageResponse({ bytes: 10 * 1024 * 1024 + 1 })],
+    ["oversized", () => imageResponse({ bytes: MAX_IMAGE_BYTES + 1 })],
+    [
+      "oversized encoding with a small declared size",
+      () => imageResponse({ content: "A".repeat(MAX_ENCODED_LENGTH + 4) }),
+    ],
+    [
+      "oversized decoded bytes with a small declared size",
+      () => imageResponse({ content: "A".repeat(MAX_ENCODED_LENGTH) }),
+    ],
     ["invalid base64", () => imageResponse({ content: "invalid!" })],
+    ["rejected request", () => new Error("connection closed")],
   ])("keeps a filename chip for %s", async (_name, response) => {
-    fetchMock.mockImplementation(() => Promise.resolve(response()));
+    let finishRequest!: (response: Response) => void;
+    let rejectRequest!: (error: Error) => void;
+    const request = new Promise<Response>((resolve, reject) => {
+      finishRequest = resolve;
+      rejectRequest = reject;
+    });
+    fetchMock.mockReturnValue(request);
     renderMarkdown("![Screenshot](shot.png)");
-    await act(async () => {});
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      const result = response();
+      if (result instanceof Error) rejectRequest(result);
+      else finishRequest(result);
+      await request.catch(() => {});
+    });
     expect(screen.getByText("shot.png")).toBeVisible();
     expect(createObjectURL).not.toHaveBeenCalled();
     expect(document.querySelector("img")).toBeNull();
+  });
+
+  it("accepts exactly 10 MiB of decoded image bytes", async () => {
+    fetchMock.mockResolvedValue(
+      imageResponse({ content: btoa("\0".repeat(MAX_IMAGE_BYTES)), bytes: MAX_IMAGE_BYTES }),
+    );
+    renderMarkdown("![Screenshot](shot.png)");
+    await screen.findByRole("button", { name: "Zoom image: Screenshot" });
+    expect(createObjectURL.mock.calls[0][0]).toMatchObject({
+      size: MAX_IMAGE_BYTES,
+      type: "image/png",
+    });
   });
 
   it("falls back when image decoding fails", async () => {
@@ -216,12 +264,12 @@ describe("assistant workspace markdown images", () => {
     const result = renderMarkdown("![Screenshot](/workspace/project/shot.png)", {
       viewer: { ...VIEWER, workspaceRoot: null },
     });
-    await act(async () => {});
+    expect(await screen.findByText("shot.png")).toBeVisible();
     expect(fetchMock).not.toHaveBeenCalled();
     result.update("![Screenshot](/workspace/project/shot.png)");
     await screen.findByRole("button", { name: "Zoom image: Screenshot" });
     result.update("![Screenshot](other.png)", { ...VIEWER, conversationId: undefined });
-    await act(async () => {});
+    expect(await screen.findByText("other.png")).toBeVisible();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(document.querySelector("img")).toBeNull();
   });
@@ -242,9 +290,23 @@ describe("assistant workspace markdown images", () => {
     expect(firstSignal.aborted).toBe(true);
     await act(async () => finishFirst(imageResponse()));
     expect(createObjectURL).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("img", { name: "Screenshot" })).toHaveAttribute(
+      "src",
+      "blob:workspace-image-1",
+    );
+    expect(revokeObjectURL).not.toHaveBeenCalled();
     result.update("![Screenshot](third.png)", { ...VIEWER, conversationId: "session-other" });
     await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(2));
-    expect(revokeObjectURL).toHaveBeenCalledWith("blob:workspace-image");
+    expect(screen.getByRole("img", { name: "Screenshot" })).toHaveAttribute(
+      "src",
+      "blob:workspace-image-2",
+    );
+    expect(revokeObjectURL.mock.calls).toEqual([["blob:workspace-image-1"]]);
     expect(fetchMock.mock.calls[2][0]).toContain("/sessions/session-other/");
+    result.unmount();
+    expect(revokeObjectURL.mock.calls).toEqual([
+      ["blob:workspace-image-1"],
+      ["blob:workspace-image-2"],
+    ]);
   });
 });
