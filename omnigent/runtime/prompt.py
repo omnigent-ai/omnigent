@@ -390,6 +390,11 @@ def history_to_input_items(
                     "call_id": item.data.call_id,
                     "name": item.data.name,
                     "arguments": item.data.arguments,
+                    **(
+                        {"namespace": item.data.namespace}
+                        if item.data.namespace is not None
+                        else {}
+                    ),
                 }
             )
 
