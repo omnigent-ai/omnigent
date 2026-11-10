@@ -788,6 +788,7 @@ beforeEach(() => {
   // failed status can't leak into another's terminalStartingUp.
   useChatStore.setState({
     conversationId: null,
+    loadingConversation: false,
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
@@ -897,44 +898,45 @@ describe("AppShell header", () => {
   );
 
   it.each([
-    {
-      source: "the bound live store",
-      snapshotStatus: "idle",
-      boundStatus: "running",
-      row: null,
-      asks: true,
-    },
+    { source: "the bound live store", snapshot: "idle", bound: "running", row: null, asks: true },
     {
       source: "the snapshot before binding",
-      snapshotStatus: "waiting",
-      boundStatus: null,
+      snapshot: "waiting",
+      bound: null,
       row: null,
       asks: true,
     },
     {
-      source: "the bound live store over a stale snapshot",
-      snapshotStatus: "running",
-      boundStatus: "idle",
+      source: "the snapshot while the bind loads",
+      snapshot: "running",
+      bound: "idle",
       row: null,
-      asks: false,
+      asks: true,
     },
     {
       source: "the streamed row's goal-driven background work",
-      snapshotStatus: "idle",
-      boundStatus: "idle",
+      snapshot: "idle",
+      bound: "idle",
       row: { status: "idle", background_work_running: true },
       asks: true,
     },
     {
+      source: "the streamed row's pending approval",
+      snapshot: "idle",
+      bound: "idle",
+      row: { status: "idle", pending_elicitations_count: 1 },
+      asks: true,
+    },
+    {
       source: "the streamed row over a stale snapshot",
-      snapshotStatus: "running",
-      boundStatus: null,
-      row: { status: "idle", background_work_running: false },
+      snapshot: "running",
+      bound: "idle",
+      row: { status: "idle", pending_elicitations_count: 0, background_work_running: false },
       asks: false,
     },
   ] as const)(
     "archive confirmation for an off-window session follows $source",
-    async ({ snapshotStatus, boundStatus, row, asks }) => {
+    async ({ snapshot, bound, row, asks }) => {
       const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) =>
         Response.json({ id: "conv_off_window", archived: true }),
       );
@@ -946,8 +948,10 @@ describe("AppShell header", () => {
         fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH");
       mockConversations([]);
       useChatStore.setState({
-        conversationId: boundStatus === null ? "conv_other" : "conv_off_window",
-        sessionStatus: boundStatus ?? "idle",
+        conversationId: bound === null ? "conv_other" : "conv_off_window",
+        sessionStatus: bound ?? "idle",
+        // A bound store without a streamed row may still be hydrating.
+        loadingConversation: bound !== null && row === null,
       });
       useSessionMock.mockReturnValue({
         session: {
@@ -955,13 +959,14 @@ describe("AppShell header", () => {
           agentId: "ag_owner",
           agentName: "developer",
           runnerId: null,
-          status: snapshotStatus,
+          status: snapshot,
           createdAt: 1_700_000_000,
           title: "Off-window owner session",
           archived: false,
           labels: {},
           items: [],
-          pendingElicitations: [],
+          // A stale snapshot still lists an approval the streamed row reports resolved.
+          pendingElicitations: snapshot === "running" && row ? [{ id: "elicit_resolved" }] : [],
           permissionLevel: 4,
           parentSessionId: null,
           subAgentName: null,

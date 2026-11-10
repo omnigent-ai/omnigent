@@ -798,9 +798,9 @@ function AppShellImpl() {
   const isKnownTopLevel =
     activeConv != null ||
     (activeSessionMatchesRoute && activeSession != null && activeSession.parentSessionId == null);
-  // Archive's confirmation for an off-window session reads its streamed open-session
-  // row (the only carrier of goal-driven background work) and the live store; the
-  // snapshot, which only refreshes on bind, is a fallback while neither is known.
+  // Archive's confirmation for an off-window session reads its open-session row,
+  // streamed like a sidebar row (and the only carrier of goal-driven background
+  // work), or the snapshot until that row loads. The live store can only add work.
   const openSessionRow = useOpenSessionRow(
     !conversationsLoading && !activeConv && isKnownTopLevel && isOwnerLevel(permissionLevel)
       ? (serverConversationId ?? null)
@@ -816,30 +816,27 @@ function AppShellImpl() {
     if (!isKnownTopLevel || !isOwnerLevel(permissionLevel)) return null;
     if (activeConv) return activeConv;
     if (!activeSessionMatchesRoute || !activeSession) return null;
-    const fallback =
-      boundSessionStatus === null
-        ? {
-            status: activeSession.status,
-            pending: activeSession.pendingElicitations?.length ?? 0,
-            backgroundWork:
-              activeSession.status === "waiting" || (activeSession.backgroundTaskCount ?? 0) > 0,
-          }
-        : { status: "idle", pending: 0, backgroundWork: false };
-    const rowStatus = openSessionRow?.status ?? fallback.status;
-    // A bound session with a pending prompt reports `running`; `waiting` is the
-    // loop parked on background work, which list rows report separately.
+    const reported = openSessionRow
+      ? {
+          status: openSessionRow.status,
+          pending: openSessionRow.pending_elicitations_count ?? 0,
+          backgroundWork: openSessionRow.background_work_running === true,
+        }
+      : {
+          status: activeSession.status,
+          pending: activeSession.pendingElicitations?.length ?? 0,
+          backgroundWork:
+            activeSession.status === "waiting" || (activeSession.backgroundTaskCount ?? 0) > 0,
+        };
+    // `waiting` is the loop parked on background work, which rows report separately.
     const status =
-      boundSessionStatus === "running" || rowStatus === "running"
+      boundSessionStatus === "running" || reported.status === "running"
         ? "running"
-        : rowStatus === "failed"
+        : reported.status === "failed"
           ? "failed"
           : "idle";
     const backgroundWorkRunning =
-      (openSessionRow
-        ? openSessionRow.background_work_running === true
-        : fallback.backgroundWork) ||
-      boundSessionStatus === "waiting" ||
-      boundBackgroundTaskCount > 0;
+      reported.backgroundWork || boundSessionStatus === "waiting" || boundBackgroundTaskCount > 0;
     return {
       id: activeSession.id,
       object: "conversation",
@@ -861,7 +858,7 @@ function AppShellImpl() {
       git_branch: activeSession.gitBranch ?? null,
       // `useArchivePrompt` applies `isSessionWorking` to these.
       status,
-      pending_elicitations_count: openSessionRow?.pending_elicitations_count ?? fallback.pending,
+      pending_elicitations_count: reported.pending,
       background_work_running: backgroundWorkRunning,
     };
   }, [
