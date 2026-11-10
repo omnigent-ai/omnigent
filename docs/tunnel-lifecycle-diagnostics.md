@@ -397,6 +397,10 @@ The disconnect grace task rechecks the local tunnel after loading bound
 sessions. A reconnect during that read logs `reconnected during offline
 lookup; skipping offline-marking`; an older database snapshot must not turn
 the live runner's sessions into disconnect failures.
+The per-session sweep also checks the final ownership read for a fresh heartbeat
+newer than its conversation snapshot. When another replica renewed that runner,
+the departing replica drops its stale local status and leaves the turn alone.
+An unchanged or expired heartbeat does not establish a takeover.
 
 Join the runner's and server's rows for one socket on
 `attributes['connection_id']`. A `runner_connected` row with `reconnect =
