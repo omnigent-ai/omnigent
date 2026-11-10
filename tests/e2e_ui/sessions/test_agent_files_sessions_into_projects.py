@@ -206,12 +206,12 @@ def test_agent_files_existing_sessions_into_projects(
     transcript.get_by_role("button", name="Called 4 tools").click()
     expect(transcript.get_by_role("button", name=re.compile("^Project list"))).to_be_visible()
     into_existing = transcript.get_by_role(
-        "button", name=re.compile(f"^Session update .* · {re.escape(journey.existing_project)}")
+        "button", name=re.compile(f"^Update session .* · {re.escape(journey.existing_project)}")
     )
     expect(into_existing).to_have_count(2)
     expect(
         transcript.get_by_role(
-            "button", name=re.compile(f"^Session update .* · {re.escape(journey.new_project)}")
+            "button", name=re.compile(f"^Update session .* · {re.escape(journey.new_project)}")
         )
     ).to_be_visible()
     into_existing.first.click()
