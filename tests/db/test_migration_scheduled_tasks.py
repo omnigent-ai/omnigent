@@ -38,6 +38,8 @@ _SESSION_MODE_PREVIOUS = "b2e4f6a8c013"
 _SESSION_MODE_REVISION = "d0a1f879a01d"
 _MCP_SERVICES_PREVIOUS = "1ad1db53f99d"
 _MCP_SERVICES_REVISION = "f2c6a9d1b3e8"
+_COMMENT_ANCHOR_REVISION = "f9b3e6c2a401"
+_MCP_SERVICES_MERGE_REVISION = "a7d4c2e9f610"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -976,3 +978,33 @@ def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
         command.upgrade(config, _MCP_SERVICES_REVISION)
     with engine.begin() as conn:
         assert conn.execute(sa.select(tasks.c.mcp_services)).scalars().all() == [None, None]
+
+
+@pytest.mark.parametrize(
+    "starting_revision",
+    [_MCP_SERVICES_PREVIOUS, _MCP_SERVICES_REVISION, _COMMENT_ANCHOR_REVISION],
+    ids=["before-both", "mcp-services-branch", "comment-anchor-branch"],
+)
+def test_merge_reconciles_mcp_services_and_comment_anchor_branches(
+    dispatch_migration_engine: Engine, starting_revision: str
+) -> None:
+    """A database on either branch, or neither, gains both columns and one head."""
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    command.upgrade(config, starting_revision)
+    command.upgrade(config, _MCP_SERVICES_MERGE_REVISION)
+
+    inspector = sa.inspect(engine)
+    assert "mcp_services" in {c["name"] for c in inspector.get_columns("scheduled_tasks")}
+    assert "anchor_metadata" in {c["name"] for c in inspector.get_columns("comments")}
+    with engine.connect() as conn:
+        assert conn.execute(
+            sa.text("SELECT version_num FROM alembic_version")
+        ).scalars().all() == [_MCP_SERVICES_MERGE_REVISION]
+
+    command.downgrade(config, _MCP_SERVICES_REVISION)
+    with engine.connect() as conn:
+        assert set(conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars()) == {
+            _MCP_SERVICES_REVISION,
+            _COMMENT_ANCHOR_REVISION,
+        }
