@@ -104,7 +104,7 @@ class ClaudeProgramStatusPoller:
 
     @property
     def holding_background_agents(self) -> bool:
-        """Whether a working report reads as idle for a turn's background agent."""
+        """Whether a working report reads as waiting on a turn's background agent."""
         if self._retired:
             return False
         if self._using_osc:
@@ -152,8 +152,8 @@ class ClaudeProgramStatusPoller:
                 # The StopFailure hook owns the failed edge and carries the API
                 # error text; an error report here would fail the turn first, bare.
                 if not is_error:
-                    working = report.state in {"working", "blocked"} and not holding
-                    status = "running" if working else "idle"
+                    working = report.state in {"working", "blocked"}
+                    status = "waiting" if holding else "running" if working else "idle"
                     publish = self._on_status if changed else self._on_replay
                     publish(status, blocked_reason(report))
             self._fail_if_hook_overdue(report)

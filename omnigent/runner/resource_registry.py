@@ -49,6 +49,7 @@ from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR, CLIENT_SURFACES
 
 if TYPE_CHECKING:
+    from omnigent.harnesses.claude_native.bridge import BackgroundAgentsAfterTurnReader
     from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -204,9 +205,10 @@ class TerminalExitEvent:
         ``None`` when unknown — e.g. the tmux server vanished before the status
         could be read, or the terminal doesn't keep the pane alive after exit.
     :param session_was_idle: Whether the session's last PTY-derived status was
-        ``idle`` at exit. ``True`` marks a clean shutdown after the turn
-        finished; ``False`` (the default — last seen ``running``, or never
-        observed) keeps a mid-turn crash or boot failure a failure.
+        ``idle`` (or ``waiting`` on a finished turn's background agent) at exit.
+        ``True`` marks a clean shutdown after the turn finished; ``False`` (the
+        default — last seen ``running``, or never observed) keeps a mid-turn
+        crash or boot failure a failure.
     :param expected_close: ``True`` when Omnigent killed the pane itself to
         fail the turn (a delivery timeout). That turn reports its own error,
         so the exit is not a second failure.
@@ -636,6 +638,9 @@ class SessionResourceRegistry:
         # Per-session pollers need re-arming after reconnects or forwarded
         # idle statuses because they keep their own edge/mtime baselines.
         self._status_pollers: dict[str, SessionStatusPoller | ClaudeProgramStatusPoller] = {}
+        # Each Claude poller's background-agent reader, for the agents a
+        # ``waiting`` edge names. Only read while that poller holds.
+        self._background_agent_readers: dict[str, BackgroundAgentsAfterTurnReader] = {}
         # Optional callback invoked on the event loop when a watched terminal
         # disappears unexpectedly. The callback receives the terminal's
         # lifecycle relationship so the runner can decide whether the owning
@@ -786,6 +791,7 @@ class SessionResourceRegistry:
             self._active_session_turns.discard(session_id)
             self._published_session_status.pop(session_id, None)
             self._status_pollers.pop(session_id, None)
+            self._background_agent_readers.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
 
     def _claim_status_edge(
@@ -936,12 +942,28 @@ class SessionResourceRegistry:
     def session_has_background_agents(self, session_id: str) -> bool:
         """Whether a settled Claude turn still has a background agent working.
 
-        Such a session reads idle so it accepts follow-ups, but its pane holds
-        live work that idle shutdown and the pane reaper must spare.
+        Such a session reports ``waiting`` so it accepts follow-ups, but its
+        turn is over, so this is what keeps idle shutdown and the pane reaper
+        off the agent's pane.
         """
         with self._lock:
             poller = self._status_pollers.get(session_id)
         return poller is not None and poller.holding_background_agents
+
+    def session_background_agents(self, session_id: str) -> list[dict[str, object]]:
+        """Display fields of the background agents a settled Claude turn left running.
+
+        :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+        :returns: One entry per agent the turn's ``Stop`` named, e.g.
+            ``[{"id": "a1", "type": "subagent", "description": "Audit"}]``;
+            empty when the session is not waiting on one.
+        """
+        with self._lock:
+            poller = self._status_pollers.get(session_id)
+            reader = self._background_agent_readers.get(session_id)
+        if poller is None or reader is None or not poller.holding_background_agents:
+            return []
+        return reader.agents
 
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
@@ -1775,7 +1797,9 @@ class SessionResourceRegistry:
                     return
             if not _owns_terminal():
                 return
-            explicit_activity = record_activity and status in {"running", "waiting"}
+            # A ``waiting`` hold comes after Claude's turn ended, so only
+            # ``running`` reopens the turn.
+            explicit_activity = record_activity and status == "running"
             if not self._claim_status_edge(
                 session_id,
                 status,
@@ -2149,6 +2173,8 @@ class SessionResourceRegistry:
 
         bridge_dir = bridge_dir_for_conversation_id(session_id)
         background_agents = BackgroundAgentsAfterTurnReader(bridge_dir)
+        with self._lock:
+            self._background_agent_readers[session_id] = background_agents
 
         def _session_id_getter() -> str | None:
             # Best-effort: the bridge records Claude's uuid only after the
@@ -2314,7 +2340,8 @@ class SessionResourceRegistry:
             if superseded_by is None and not before_observation
             else None
         )
-        session_was_idle = session_status_before_exit == "idle"
+        # A turn waiting on its background agent had already ended.
+        session_was_idle = session_status_before_exit in {"idle", "waiting"}
         lifecycle_context["session_status_before_exit"] = session_status_before_exit or "unknown"
         if superseded_by is not None:
             lifecycle_context.pop("session_turn_active_before_exit", None)
@@ -2535,6 +2562,7 @@ class SessionResourceRegistry:
                     # target, so drop the source's entry rather than leaving a
                     # retired poller to be re-armed on every later reconnect.
                     self._status_pollers.pop(source_session_id, None)
+                    self._background_agent_readers.pop(source_session_id, None)
             if (
                 role == CLAUDE_NATIVE_TERMINAL_ROLE
                 and self._session_background_publisher is not None

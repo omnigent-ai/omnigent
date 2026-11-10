@@ -1869,7 +1869,22 @@ def create_runner_app(
         failure_detail: str | None = None,
         inferred: bool = False,
     ) -> None:
+        background_agents: list[dict[str, object]] = []
+        if status == "waiting":
+            # Claude's background-agent hold. A server known to predate
+            # ``waiting`` gets ``idle``: the turn ended, and ``running`` would
+            # hold every follow-up behind Steer. An unknown version still gets
+            # ``waiting``, since the deduplicated edge isn't sent again once
+            # the version probe lands.
+            if _server_version is not None and not _version_supports_waiting_status(
+                _server_version
+            ):
+                status = "idle"
+            else:
+                background_agents = resource_registry.session_background_agents(session_id)
         event: dict[str, object] = {"type": "session.status", "status": status}
+        if background_agents:
+            event["background_agents"] = background_agents
         if status == "failed":
             # A lost terminal hook may still leave a cause in the program-status report.
             event["error"] = {

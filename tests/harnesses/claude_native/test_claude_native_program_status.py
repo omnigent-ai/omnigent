@@ -76,7 +76,7 @@ def _poller(
     )
 
 
-def test_working_report_reads_idle_while_a_settled_turn_runs_a_background_agent(
+def test_working_report_reads_waiting_while_a_settled_turn_runs_a_background_agent(
     tmp_path: Path,
 ) -> None:
     """Claude reports working for a background agent that outlives its turn."""
@@ -93,26 +93,34 @@ def test_working_report_reads_idle_while_a_settled_turn_runs_a_background_agent(
     agent_after_turn[0] = True
     poller.tick()
     poller.tick()
-    assert published == ["running", "idle"]
+    assert published == ["running", "waiting"]
     assert poller.holding_background_agents is True
 
     _write_report(path, {"state": "blocked", "kind": "permission", "message": "allow?"})
     poller.tick()
-    assert published == ["running", "idle", "running"]
+    assert published == ["running", "waiting", "running"]
     assert poller.holding_background_agents is False
+    assert poller.blocked_on == "allow?"
 
     _write_report(path, {"state": "working", "app": "claude-code"})
     poller.tick()
     agent_after_turn[0] = False
     poller.tick()
-    assert published == ["running", "idle", "running", "idle", "running"]
+    assert published == ["running", "waiting", "running", "waiting", "running"]
+    assert poller.holding_background_agents is False
+
+    agent_after_turn[0] = True
+    poller.tick()
+    _write_report(path, {"state": "idle", "app": "claude-code"})
+    poller.tick()
+    assert published[-2:] == ["waiting", "idle"]
     assert poller.holding_background_agents is False
 
 
 def test_file_fallback_keeps_a_background_agent_hold_after_osc_reports_stop(
     tmp_path: Path,
 ) -> None:
-    """Once OSC reports stop, the busy file still reads idle until the hold clears."""
+    """Once OSC reports stop, the busy file still reads waiting until the hold clears."""
     path = tmp_path / "program-status.json"
     _write_report(path, {"state": "working", "app": "claude-code"})
     sessions = tmp_path / "sessions"
@@ -139,17 +147,17 @@ def test_file_fallback_keeps_a_background_agent_hold_after_osc_reports_stop(
         background_agents_after_turn=lambda: agent_after_turn[0],
     )
     poller.tick()
-    assert published == ["idle"]
+    assert published == ["waiting"]
     assert poller.holding_background_agents is True
 
     path.unlink()
     poller.tick()
-    assert published == ["idle", "idle"]
+    assert published == ["waiting", "waiting"]
     assert poller.holding_background_agents is True
 
     agent_after_turn[0] = False
     poller.tick()
-    assert published == ["idle", "idle", "running"]
+    assert published == ["waiting", "waiting", "running"]
     assert poller.holding_background_agents is False
 
     agent_after_turn[0] = True

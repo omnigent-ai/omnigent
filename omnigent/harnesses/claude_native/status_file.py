@@ -50,6 +50,9 @@ _logger = logging.getLogger(__name__)
 # "turn ended, background work remains" — and must not be reused here.)
 RUNNING = "running"
 IDLE = "idle"
+# The session vocabulary's ``waiting``: the turn ended, but a background agent
+# it started still works. Never produced from the file's own ``waiting``.
+WAITING = "waiting"
 
 # Claude interactive-session status literals. The interactive writer emits
 # exactly ``busy`` / ``shell`` / ``idle`` / ``waiting``: ``busy`` while the
@@ -445,7 +448,7 @@ class SessionStatusPoller:
     :param background_agents_after_turn: Returns whether Claude's last turn
         ended with a background agent still running. Claude stays ``busy``
         for that agent although its prompt is free, so such a ``busy`` reads
-        as :data:`IDLE`. ``None`` reports every ``busy`` as running.
+        as :data:`WAITING`. ``None`` reports every ``busy`` as running.
     """
 
     def __init__(
@@ -618,7 +621,7 @@ class SessionStatusPoller:
 
     @property
     def holding_background_agents(self) -> bool:
-        """Whether the last ``busy`` read as idle for a turn's background agent."""
+        """Whether the last ``busy`` read as waiting on a turn's background agent."""
         return self._holding_background_agents and not self._exhausted
 
     def _read_and_publish(self, *, publish_status: bool, reassert: bool = False) -> None:
@@ -673,7 +676,7 @@ class SessionStatusPoller:
         if holding != self._holding_background_agents:
             self._observation_version += 1
         self._holding_background_agents = holding
-        runner_status = IDLE if holding else status.runner_status
+        runner_status = WAITING if holding else status.runner_status
         edge = (runner_status, status.blocked_on)
         if edge == self._last_edge:
             if reassert:

@@ -907,6 +907,40 @@ def test_record_hook_event_marks_a_stop_that_leaves_a_background_agent(
     assert reader.read() is agent_running
 
 
+def test_background_agent_mark_names_only_the_running_agents(tmp_path: Path) -> None:
+    """The hold keeps each running agent's display fields, not shells or finished agents."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+            "background_tasks": [
+                {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"},
+                {"id": "a2", "type": "agent", "status": "completed", "description": "Done"},
+                {"id": "b1", "type": "local_bash", "status": "running", "command": "sleep 9"},
+                {"id": "a3", "type": "local_agent", "description": "x" * 600, "extra": 1},
+            ],
+        },
+    )
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+
+    assert reader.read() is True
+    assert reader.agents == [
+        {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"},
+        {"id": "a3", "type": "local_agent", "description": "x" * 512},
+    ]
+
+    record_hook_event(
+        bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "claude-session"}
+    )
+    assert reader.read() is False
+    assert reader.agents == []
+
+
 @pytest.mark.parametrize("next_event", ["UserPromptSubmit", "StopFailure", "SessionStart"])
 def test_record_hook_event_clears_the_background_agent_mark_on_the_next_turn(
     tmp_path: Path, next_event: str

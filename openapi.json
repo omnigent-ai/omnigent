@@ -731,7 +731,7 @@
         "type": "object"
       },
       "BackgroundTaskInfo": {
-        "description": "One still-running background shell from the claude-native `Stop` hook.\n\nClaude Code leaves finished shells in the hook's `background_tasks`\narray, so the list surfaced here is filtered to the non-terminal ones \u2014\nits length matches the `background_task_count` tally. Every field is\nbest-effort: the hook shape is external, so an entry missing one field\nstill yields a usable row (e.g. a `description` with no `command`).",
+        "description": "One still-running background shell or agent from the claude-native `Stop` hook.\n\nClaude Code leaves finished shells in the hook's `background_tasks`\narray, so the list surfaced here is filtered to the non-terminal ones \u2014\nits length matches the `background_task_count` tally. Every field is\nbest-effort: the hook shape is external, so an entry missing one field\nstill yields a usable row (e.g. a `description` with no `command`).",
         "properties": {
           "command": {
             "anyOf": [
@@ -766,7 +766,7 @@
                 "type": "null"
               }
             ],
-            "description": "Opaque per-shell identifier, e.g. `\"abc123\"`.",
+            "description": "Opaque per-task identifier, e.g. `\"abc123\"`.",
             "title": "Id"
           },
           "status": {
@@ -790,7 +790,7 @@
                 "type": "null"
               }
             ],
-            "description": "Task kind, e.g. `\"shell\"`.",
+            "description": "Task kind, e.g. `\"shell\"` or `\"subagent\"`.",
             "title": "Type"
           }
         },
@@ -9986,6 +9986,21 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "background_agents": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTaskInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Background agents a finished claude-native turn left running, while `status` is `\"waiting\"`, so a reload can name them. `None` otherwise.",
+            "title": "Background Agents"
+          },
           "background_task_count": {
             "anyOf": [
               {
@@ -10414,7 +10429,7 @@
             "type": "boolean"
           },
           "status": {
-            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
+            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Read paths collapse `\"waiting\"` -> `\"running\"`, because headless clients poll this field to tell when a run is done. The one exception is a claude-native turn that ended with a background agent still running: it reads `\"waiting\"` with `background_agents` set, so a reload can show the agent while the composer stays free.",
             "enum": [
               "idle",
               "running",
@@ -10903,6 +10918,22 @@
       "SessionStatusEvent": {
         "description": "Session lifecycle status transition.\n\nEmitted by the runtime / session route handler at every\ntransition between `launching` / `running` / `waiting` /\n`idle` / `failed`. Wire shape is\nFLAT (not enveloped): `{\"type\": \"session.status\", \"conversation_id\": \"...\", \"status\": \"...\", \"sequence_number\": null}`.\n\nThe `waiting` value is emitted by the runtime's parent agent\nloop when it parks on the `async_work_complete` drain\n(`_drain_async_completions(block_for_one=True)` in\n`omnigent/runtime/workflow.py`) \u2014 i.e. while the parent\nturn is suspended waiting for background tools or sub-agents\nto complete. Per the session-rearchitecture spec \u00a73\n(\"Event types and direction\"), `waiting` is the\nsession-status companion of the spec's `turn.waiting`\ntransient \u2014 clients should render the session as actively\nblocked-on-async-work, distinct from `running`. When the\ndrain wakes (a child completed), the runtime emits a follow-up\n`running` to resume.",
         "properties": {
+          "background_agents": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTaskInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "On a claude-native `waiting` edge, the background agents the finished turn left running, so the UI can say what the session still waits on. `None` on every other edge.",
+            "title": "Background Agents"
+          },
           "background_task_count": {
             "anyOf": [
               {
@@ -10990,7 +11021,7 @@
             "title": "Sequence Number"
           },
           "status": {
-            "description": "New session status. `\"launching\"` (session or child task created, but no concrete harness start observed), `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (parent turn parked on the async-work drain), or `\"failed\"` (terminal failure).",
+            "description": "New session status. `\"launching\"` (session or child task created, but no concrete harness start observed), `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (parent turn parked on the async-work drain, or a claude-native turn that ended with a background agent running), or `\"failed\"` (terminal failure).",
             "enum": [
               "idle",
               "launching",

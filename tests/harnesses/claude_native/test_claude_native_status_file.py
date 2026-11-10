@@ -19,6 +19,7 @@ import pytest
 from omnigent.harnesses.claude_native.status_file import (
     IDLE,
     RUNNING,
+    WAITING,
     BackgroundHolder,
     SessionStatusPoller,
     find_background_holder,
@@ -504,8 +505,8 @@ def test_resync_republishes_an_unchanged_file(tmp_path: Path) -> None:
     assert poller.active is True
 
 
-def test_busy_left_by_a_background_agent_reads_idle(tmp_path: Path) -> None:
-    """A busy file reads idle while a settled turn's background agent works.
+def test_busy_left_by_a_background_agent_reads_waiting(tmp_path: Path) -> None:
+    """A busy file reads waiting while a settled turn's background agent works.
 
     Claude keeps the file ``busy`` for the agent's lifetime without rewriting
     it, so the bridge's mark is rechecked on every tick of an unchanged file.
@@ -529,7 +530,7 @@ def test_busy_left_by_a_background_agent_reads_idle(tmp_path: Path) -> None:
     poller.tick()
     poller.resync()
     poller.tick()
-    assert published == [(RUNNING, None), (IDLE, None), (IDLE, None)]
+    assert published == [(RUNNING, None), (WAITING, None), (WAITING, None)]
     assert poller.holding_background_agents is True
 
     # A follow-up prompt starts a turn the same busy file now reports.
@@ -545,9 +546,10 @@ def test_busy_left_by_a_background_agent_reads_idle(tmp_path: Path) -> None:
         sessions, pid=1, session_id="s", status="waiting", blocked_on="permission prompt"
     )
     poller.tick()
-    assert published[-2:] == [(IDLE, None), (RUNNING, "permission prompt")]
+    assert published[-2:] == [(WAITING, None), (RUNNING, "permission prompt")]
     assert poller.holding_background_agents is False
 
+    # The agent finishing lets Claude go idle, which ends the wait.
     _write_session_file(sessions, pid=1, session_id="s", status="idle")
     poller.tick()
     assert published[-1] == (IDLE, None)

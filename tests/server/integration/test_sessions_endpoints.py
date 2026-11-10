@@ -1518,6 +1518,44 @@ async def test_a_session_unbound_from_its_runner_lists_no_background_work(
     assert row["background_work_running"] is False
 
 
+async def test_snapshot_reads_waiting_only_for_a_background_agent_hold(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A Claude turn waiting on its background agent reads ``waiting`` and names the agent.
+
+    Any other ``waiting`` (an SDK orchestrator parked on sub-agents) still reads
+    ``running``: headless ``-p`` clients poll the snapshot to tell when a run ends.
+    The list row collapses both to ``running``.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import BackgroundTaskInfo
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    background_agent = BackgroundTaskInfo(id="a1", type="subagent", description="Audit")
+    try:
+        sessions_module._publish_status(sid, "waiting", background_agents=[background_agent])
+        held = (await client.get(f"/v1/sessions/{sid}")).json()
+        list_resp = await client.get("/v1/sessions")
+        row = next(s for s in list_resp.json()["data"] if s["id"] == sid)
+
+        sessions_module._publish_status(sid, "waiting")
+        parked = (await client.get(f"/v1/sessions/{sid}")).json()
+
+        assert held["status"] == "waiting"
+        assert [(a["id"], a["description"]) for a in held["background_agents"]] == [
+            ("a1", "Audit")
+        ]
+        assert row["status"] == "running"
+        assert parked["status"] == "running"
+        assert parked.get("background_agents") is None
+    finally:
+        sessions_module._session_status_cache.pop(sid, None)
+        sessions_module._session_background_agents_cache.pop(sid, None)
+
+
 async def test_external_background_work_lists_tasks_for_the_composer(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

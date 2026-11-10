@@ -204,7 +204,7 @@ def test_follow_up_after_background_agent_launch_settles_and_delivers_next_messa
     native_claude_mock_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """Working clears after Claude replies, and the next follow-up is not queued."""
+    """After Claude replies, chat names the running agent and the next follow-up is not queued."""
     base_url, session_id = native_claude_mock_session
     nonce = uuid.uuid4().hex[:8]
     next_token = f"next-follow-up-{nonce}-sent-after-the-agent-launched"
@@ -219,9 +219,18 @@ def test_follow_up_after_background_agent_launch_settles_and_delivers_next_messa
     page = request.getfixturevalue("page")
     _open_with_steer_off(page, base_url, session_id)
     working = page.get_by_test_id("working-indicator")
+    background_agents = page.get_by_test_id("background-agents-indicator")
     _launch_background_agent(page, mock_llm_server_url, nonce)
     expect(working).to_have_count(0, timeout=_SETTLE_TIMEOUT_MS)
-    # A brief idle flash does not count; Working must stay clear throughout.
+    expect(background_agents).to_contain_text(
+        "Background agent running", timeout=_SETTLE_TIMEOUT_MS
+    )
+    poll_until(
+        lambda: _session_status(base_url, session_id) == "waiting",
+        timeout_s=_MOCK_REQUEST_TIMEOUT_S,
+        interval_s=0.2,
+    )
+    # A brief flash does not count; Working must stay clear throughout.
     hold_until = time.monotonic() + _IDLE_HOLD_S
     while time.monotonic() < hold_until:
         assert working.count() == 0, "Working reappeared while the background agent ran"

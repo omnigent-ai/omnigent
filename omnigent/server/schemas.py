@@ -2204,7 +2204,7 @@ class ModelUsage(BaseModel):
 
 class BackgroundTaskInfo(BaseModel):
     """
-    One still-running background shell from the claude-native ``Stop`` hook.
+    One still-running background shell or agent from the claude-native ``Stop`` hook.
 
     Claude Code leaves finished shells in the hook's ``background_tasks``
     array, so the list surfaced here is filtered to the non-terminal ones —
@@ -2212,8 +2212,8 @@ class BackgroundTaskInfo(BaseModel):
     best-effort: the hook shape is external, so an entry missing one field
     still yields a usable row (e.g. a ``description`` with no ``command``).
 
-    :param id: Opaque per-shell identifier, e.g. ``"abc123"``.
-    :param type: Task kind, e.g. ``"shell"``.
+    :param id: Opaque per-task identifier, e.g. ``"abc123"``.
+    :param type: Task kind, e.g. ``"shell"`` or ``"subagent"``.
     :param status: Per-task status, e.g. ``"running"``.
     :param description: Human-readable label, e.g. ``"Wait for CI"``.
     :param command: Command the shell is running, e.g. ``"sleep 120"``.
@@ -2253,10 +2253,14 @@ class SessionResponse(BaseModel):
         ``"idle"`` (no loop running), ``"running"`` (loop
         executing), ``"waiting"`` (loop parked on background
         work / sub-agents), or ``"failed"`` (terminal failure).
-        Current read paths collapse ``"waiting"`` -> ``"running"``
-        before building this snapshot; the literal stays a superset
-        of what the runtime can produce so a server that forwards
-        the raw status never 500s on serialization.
+        Read paths collapse ``"waiting"`` -> ``"running"``, because headless
+        clients poll this field to tell when a run is done. The one exception
+        is a claude-native turn that ended with a background agent still
+        running: it reads ``"waiting"`` with :attr:`background_agents` set,
+        so a reload can show the agent while the composer stays free.
+    :param background_agents: Background agents a finished claude-native
+        turn left running, while :attr:`status` is ``"waiting"``, so a
+        reload can name them. ``None`` otherwise.
     :param background_task_count: Background shells (claude-native) still
         running as of the last status edge, so a reload re-shows "N shells
         still running" even though the session has settled to ``"idle"``.
@@ -2504,6 +2508,7 @@ class SessionResponse(BaseModel):
     agent_id: str
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    background_agents: list[BackgroundTaskInfo] | None = None
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
@@ -3780,7 +3785,8 @@ class SessionStatusEvent(_SSEEventBase):
     :param status: New session status. ``"launching"`` (session or
         child task created, but no concrete harness start observed),
         ``"idle"`` (no loop running), ``"running"`` (loop executing),
-        ``"waiting"`` (parent turn parked on the async-work drain), or
+        ``"waiting"`` (parent turn parked on the async-work drain, or a
+        claude-native turn that ended with a background agent running), or
         ``"failed"`` (terminal failure).
     :param response_id: Optional active response id for terminal-backed
         integrations, e.g. ``"codex_turn_abc123"``. Clients use it to
@@ -3800,6 +3806,9 @@ class SessionStatusEvent(_SSEEventBase):
     :param background_tasks: Per-shell detail backing that tally, so the UI
         can name each running shell. ``None`` when the edge reports no detail
         (an older runner may send only the count).
+    :param background_agents: On a claude-native ``waiting`` edge, the
+        background agents the finished turn left running, so the UI can say
+        what the session still waits on. ``None`` on every other edge.
     :param blocked_on: Short human phrase naming what a still-``running``
         session is parked on, e.g. ``"permission prompt"`` or
         ``"dialog open"``. Set by terminal-backed integrations whose agent
@@ -3821,6 +3830,7 @@ class SessionStatusEvent(_SSEEventBase):
     error: ErrorDetail | None = None
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None
+    background_agents: list[BackgroundTaskInfo] | None = None
     blocked_on: str | None = None
 
 

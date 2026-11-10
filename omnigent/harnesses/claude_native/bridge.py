@@ -3290,8 +3290,9 @@ class BackgroundAgentsAfterTurnReader:
     Read whether the main session's last turn ended with a background agent running.
 
     Claude keeps reporting itself busy for as long as such an agent runs,
-    although its prompt is free. Set by the main session's ``Stop`` hook and
-    cleared by its next ``UserPromptSubmit``, ``StopFailure`` or ``SessionStart``.
+    although its prompt is free, so the session reports ``waiting`` instead.
+    Set by the main session's ``Stop`` hook and cleared by its next
+    ``UserPromptSubmit``, ``StopFailure`` or ``SessionStart``.
     A blocking ``Stop`` hook resumes the same turn with no new prompt, so a main
     conversation entry after that turn's last reply also ends it, as does a
     transcript cut short of that reply. Each read parses only the complete
@@ -3306,10 +3307,21 @@ class BackgroundAgentsAfterTurnReader:
         self._transcript_identity: tuple[int, int] | None = None
         self._scanned_to = 0
         self._released = False
+        self._agents: list[_JsonObject] = []
+
+    @property
+    def agents(self) -> list[_JsonObject]:
+        """Display fields of the agents the last ``Stop`` left running.
+
+        Read alongside :meth:`read`; meaningful only while it returns ``True``.
+        An entry has ``id`` / ``type`` / ``status`` / ``description`` when Claude
+        sent them, e.g. ``{"id": "a1", "type": "subagent", "description": "Audit"}``.
+        """
+        return list(self._agents)
 
     def read(self) -> bool:
         """
-        Return whether the last ``Stop`` still holds the session idle.
+        Return whether the last ``Stop`` still holds the session waiting on its agents.
 
         :returns: ``True`` between that ``Stop`` and the next main-session turn.
         """
@@ -3319,11 +3331,18 @@ class BackgroundAgentsAfterTurnReader:
         offset = raw.get("transcript_offset") if isinstance(raw, dict) else None
         if not isinstance(transcript_path, str) or not isinstance(offset, int):
             self._hold = None
+            self._agents = []
             return False
         if self._hold != (transcript_path, offset):
             self._hold = (transcript_path, offset)
             self._transcript_identity = None
             self._released = False
+            raw_agents = raw.get("agents") if isinstance(raw, dict) else None
+            self._agents = (
+                [agent for agent in raw_agents if isinstance(agent, dict)]
+                if isinstance(raw_agents, list)
+                else []
+            )
         if self._released:
             return False
         try:
@@ -4267,22 +4286,33 @@ def _is_background_shell(raw: object) -> bool:
 
 
 def _background_agent_hold(payload: _JsonObject) -> _JsonObject | None:
-    """Where the turn's last reply ends at a ``Stop`` that left an agent running, if one did."""
+    """Where the turn's last reply ends at a ``Stop`` that left an agent running, if one did.
+
+    The hold also keeps the running agents' display fields, so the session can
+    say what it is still waiting on.
+    """
     raw_tasks = payload.get("background_tasks")
     transcript_path = payload.get("transcript_path")
     if not isinstance(raw_tasks, list) or not isinstance(transcript_path, str):
         return None
-    if not any(
-        isinstance(task, dict)
+    running = [
+        task
+        for task in raw_tasks
+        if isinstance(task, dict)
         and task.get("type") in _BACKGROUND_AGENT_TASK_TYPES
         and task.get("status") not in _TERMINAL_BACKGROUND_TASK_STATUSES
-        for task in raw_tasks
-    ):
+    ]
+    if not running:
         return None
     offset = _offset_after_last_main_reply(transcript_path)
     if offset is None:
         return None
-    return {"transcript_path": transcript_path, "transcript_offset": offset}
+    agents = [
+        detail
+        for task in running[:_BACKGROUND_TASK_FORWARD_LIMIT]
+        if (detail := _normalize_background_task(task)) is not None
+    ]
+    return {"transcript_path": transcript_path, "transcript_offset": offset, "agents": agents}
 
 
 def _offset_after_last_main_reply(transcript_path: str) -> int | None:

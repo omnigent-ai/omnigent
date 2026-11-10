@@ -152,6 +152,11 @@ interface SessionResponseWire {
    * it. Absent when none are tracked.
    */
   background_tasks?: BackgroundTaskInfo[] | null;
+  /**
+   * Background agents a finished claude-native turn left running, sent while
+   * `status` is ``"waiting"``. Absent otherwise.
+   */
+  background_agents?: BackgroundTaskInfo[] | null;
   created_at: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -357,6 +362,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
+    backgroundAgents: parseBackgroundTasks(wire.background_agents),
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,

@@ -1724,11 +1724,12 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
     poll_before_idle_edge: bool,
     status_source: str,
 ) -> None:
-    """A Stop that leaves a background agent running settles the turn despite a busy file.
+    """A Stop that leaves a background agent running settles the turn as waiting.
 
     Claude keeps its status file busy and its OSC report working for the agent's
-    lifetime, so the idle edge's resync must not republish running, nor may a
-    restarted runner; a blocking Stop hook's continuation or the next prompt's turn does.
+    lifetime, so the idle edge's resync must republish waiting rather than running
+    or leave the forwarded idle standing, and so must a restarted runner; a
+    blocking Stop hook's continuation or the next prompt's turn reports running.
     """
     from omnigent.harnesses.claude_native.bridge import (
         bridge_dir_for_conversation_id,
@@ -1767,7 +1768,10 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
         hook(
             "Stop",
             transcript_path=str(transcript),
-            background_tasks=[{"id": "a1", "type": "subagent", "status": "running"}],
+            background_tasks=[
+                {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"},
+                {"id": "s1", "type": "shell", "status": "running", "command": "sleep 9"},
+            ],
         )
         if poll_before_idle_edge:
             await tick()
@@ -1776,6 +1780,9 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
         await tick()
         assert not registry.session_turn_is_active(session_id)
         assert registry.session_has_background_agents(session_id)
+        assert registry.session_background_agents(session_id) == [
+            {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"}
+        ]
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text(
@@ -1790,7 +1797,10 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
     assert statuses == ["running"]
 
     await stop_leaving_the_agent_running()
-    settled = ["running", "idle"] if poll_before_idle_edge else ["running"]
+    # The forwarded idle overwrites a waiting edge already sent, so it is resent.
+    settled = (
+        ["running", "waiting", "waiting"] if poll_before_idle_edge else ["running", "waiting"]
+    )
     assert statuses == settled
 
     restarted_tick, restarted_statuses, restarted, _ = await _observe_native_with_real_poller(
@@ -1798,7 +1808,7 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
     )
     restarted_tick()
     await asyncio.sleep(0)
-    assert restarted_statuses == ["idle"]
+    assert restarted_statuses == ["waiting"]
     assert restarted.session_has_background_agents(session_id)
 
     feedback = {
@@ -1812,6 +1822,7 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
     assert statuses == [*settled, "running"]
     assert registry.session_turn_is_active(session_id)
     assert not registry.session_has_background_agents(session_id)
+    assert registry.session_background_agents(session_id) == []
 
     with transcript.open("a", encoding="utf-8") as transcript_file:
         transcript_file.write('{"type": "assistant", "message": {"content": []}}\n')
