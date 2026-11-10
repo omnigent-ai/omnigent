@@ -2249,26 +2249,37 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     },
   );
 
-  it.each([
-    ["bypassPermissions", false, { permissionMode: null }],
-    ["bypassPermissions", true, {}],
-    ["acceptEdits", false, {}],
+  it.each<[string, string, Partial<ServerInfo>, { permissionMode?: null }]>([
+    ["bypassPermissions", "ag_claude_native", {}, { permissionMode: null }],
+    ["bypassPermissions", "ag_claude_native", { scheduled_task_approval_skipping_modes: true }, {}],
+    ["acceptEdits", "ag_claude_native", {}, {}],
+    [
+      "approve-for-me",
+      "ag_codex",
+      { scheduled_task_harness_settings: true },
+      { permissionMode: null },
+    ],
+    [
+      "approve-for-me",
+      "ag_codex",
+      { scheduled_task_harness_settings: true, scheduled_task_codex_reviewer_modes: true },
+      {},
+    ],
   ])(
-    "on a continued-session edit, clears a saved %s only for a server that refuses it (accepts: %s)",
-    async (savedMode, accepted, expectedPermission) => {
+    "on a continued-session edit, clears a saved %s on %s only for a server that refuses it (%o)",
+    async (savedMode, agentId, info, expectedPermission) => {
+      vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+        data: [...AGENTS, testAgent("ag_codex", "codex-native-ui", { harness: "codex-native" })],
+      } as ReturnType<typeof agentsHook.useAvailableAgents>);
       render(
         <CapabilitiesProvider
-          info={{
-            ...SERVER_INFO_OFFLINE_FALLBACK,
-            scheduled_task_session_modes: true,
-            scheduled_task_approval_skipping_modes: accepted,
-          }}
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true, ...info }}
         >
           <CreateScheduledTaskDialog
             open
             onOpenChange={vi.fn()}
             editingTask={scheduledTask({
-              agentId: "ag_claude_native",
+              agentId,
               sessionMode: "continue",
               sessionId: "conv_1",
               modelOverride: "opus",
@@ -5345,14 +5356,14 @@ describe("creating an automation from a session", () => {
     },
   );
 
-  it.each<[string, Partial<ServerInfo>, boolean]>([
+  it.each<[string, Partial<ServerInfo>, string | undefined]>([
     // Servers that don't advertise the Codex reviewer modes reject them.
-    ["ask-for-approval", {}, false],
-    ["approve-for-me", {}, false],
-    ["ask-for-approval", { scheduled_task_codex_reviewer_modes: true }, true],
+    ["ask-for-approval", {}, undefined],
+    ["approve-for-me", {}, undefined],
+    ["ask-for-approval", { scheduled_task_codex_reviewer_modes: true }, "ask-for-approval"],
   ])(
     "starts from the Codex session's %s mode only if automations accept it (%o)",
-    async (mode, info, kept) => {
+    async (mode, info, expected) => {
       vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
         data: [...AGENTS, testAgent("ag_codex", "codex-native-ui", { harness: "codex-native" })],
       } as ReturnType<typeof agentsHook.useAvailableAgents>);
@@ -5362,7 +5373,9 @@ describe("creating an automation from a session", () => {
       };
       renderFromSession({ source: { ...SOURCE, agentId: "ag_codex" }, info });
 
-      expect((await submit()).permissionMode === mode).toBe(kept);
+      const input = await submit();
+      expect(input.permissionMode).toBe(expected);
+      expect("permissionMode" in input).toBe(expected !== undefined);
     },
   );
 
