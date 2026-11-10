@@ -15,7 +15,7 @@ import urllib.parse
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 import httpx
 from fastapi import (
@@ -193,6 +193,12 @@ _PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
 # The largest PR attachment, a video; the runner checks each type's limit. Both
 # the runner and host tunnels carry it base64-encoded (a third larger) in one frame.
 _MAX_PR_ATTACHMENT_BYTES = 70 * 1024 * 1024
+
+# Automatic previews can require this acknowledgement when talking to older servers.
+_WORKSPACE_FILE_SCOPE_HEADERS = {
+    "X-Omnigent-File-Scope": "workspace",
+    "Access-Control-Expose-Headers": "X-Omnigent-File-Scope",
+}
 
 # Admission gate bounding how many image uploads hold their raw bytes in memory
 # and decode/re-encode at once. Created lazily on first use so it binds to the
@@ -1051,7 +1057,9 @@ def register_resources_routes(
         except HostFsUnavailableError:
             return None
         except HostFsError as exc:
-            if exc.status == 404:
+            # An older host rejects an op it lacks with a 400; report it as a missing route.
+            is_unknown_op = exc.status == 400 and exc.message.startswith("unknown fs op")
+            if exc.status == 404 or is_unknown_op:
                 raise OmnigentError(exc.message, code=ErrorCode.NOT_FOUND) from exc
             if exc.status == 400:
                 # Invalid path is a client error; surface it verbatim like the
@@ -1560,9 +1568,9 @@ def register_resources_routes(
         synthesize-from-body path and predate the gate. The markers
         are client-controlled, so the exemption is narrowed to the
         exact shape those wrappers send — a registered native terminal
-        name with ``session_key`` ``"main"`` — anything else carrying a
-        marker still goes through the declared-name gate (it would
-        otherwise be an arbitrary-terminal bypass).
+        name with ``session_key`` ``"main"`` from a session owner.
+        Other callers still pass the declared-name gate, because the
+        bootstrap path may synthesize a terminal from the request body.
 
         :param session_id: Session/conversation identifier.
         :param request: JSON body with ``terminal`` and
@@ -1579,6 +1587,7 @@ def register_resources_routes(
             bool(body.get("ensure_native_terminal") or body.get("bridge_inject_dir"))
             and native_coding_agent_for_terminal_name(body.get("terminal")) is not None
             and body.get("session_key") == "main"
+            and await _caller_owns_session(session_id, request)
         )
         if not is_native_bootstrap:
             spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
@@ -2599,23 +2608,27 @@ def register_resources_routes(
     )
     async def list_environment_root(
         request: Request,
+        response: Response,
         session_id: str,
         environment_id: str,
         limit: int = Query(default=20, ge=1, le=1000),
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        scope: Literal["workspace"] | None = None,
     ) -> Any:
         """
         List root directory of an environment.
 
         :param request: The incoming FastAPI request (for auth).
+        :param response: The response carrying the enforced file scope.
         :param session_id: Session/conversation identifier.
         :param environment_id: Environment resource id.
         :param limit: Maximum number of entries to return (1-1000, default 20).
         :param after: Cursor entry id for forward pagination.
         :param before: Cursor entry id for backward pagination.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
+        :param scope: ``workspace`` confines the read to the workspace root.
         :returns: PaginatedList of filesystem entries.
         """
         # A host-absolute browse of the filesystem root reaches here: its path
@@ -2629,6 +2642,7 @@ def register_resources_routes(
         if request.query_params.get("base") == "host":
             return await read_or_list_environment_path(
                 request,
+                response,
                 session_id,
                 environment_id,
                 "/",
@@ -2636,6 +2650,7 @@ def register_resources_routes(
                 after=after,
                 before=before,
                 order=order,
+                scope=scope,
             )
         params: dict[str, str] = {"limit": str(limit), "order": order}
         if after is not None:
@@ -2648,6 +2663,8 @@ def register_resources_routes(
             f"/{_runner_environment_segment(environment_id)}/filesystem?{qs}"
         )
         conv = await _authorize_browse_read(session_id, request)
+        if scope == "workspace":
+            response.headers.update(_WORKSPACE_FILE_SCOPE_HEADERS)
         return _skip_gzip_for_binary(
             request,
             await _fs_get_with_host_fallback(
@@ -3064,6 +3081,7 @@ def register_resources_routes(
     )
     async def read_or_list_environment_path(
         request: Request,
+        response: Response,
         session_id: str,
         environment_id: str,
         relative_path: str,
@@ -3074,11 +3092,13 @@ def register_resources_routes(
         # A plain default, not ``Query(...)``: the root listing calls this
         # function directly, and a ``Query`` object is truthy.
         download: bool = False,
+        scope: Literal["workspace"] | None = None,
     ) -> Any:
         """
         Read a file or list a directory in an environment.
 
         :param request: The incoming FastAPI request (for auth).
+        :param response: The response carrying the enforced file scope.
         :param session_id: Session/conversation identifier.
         :param environment_id: Environment resource id.
         :param relative_path: Path relative to environment root.
@@ -3090,6 +3110,7 @@ def register_resources_routes(
         :param download: When ``True``, stream the complete file as an
             attachment with no size cap instead of the capped JSON
             envelope. A directory rejects it with 400.
+        :param scope: ``workspace`` also confines owner reads, including symlinks.
         :returns: File content or directory listing, or the raw file.
         """
         params: dict[str, str] = {"limit": str(limit), "order": order}
@@ -3105,22 +3126,29 @@ def register_resources_routes(
         # way around the owner-scoped host filesystem endpoint.
         absolute, relative_path = _resolve_browse_path(request, relative_path)
         conv, owner = await _authorize_browse_read_with_owner(session_id, request, relative_path)
+        if scope == "workspace" and (absolute or ntpath.isabs(relative_path)):
+            raise HTTPException(status_code=400, detail="Workspace scope requires a relative path")
 
         # The owner may browse a workspace symlink's outside target by absolute
         # path already, so the runner is told it may follow the link; everyone
         # else keeps the workspace boundary. The root itself is never a link.
-        reach = {"scope": "reach"} if owner and not absolute and relative_path else {}
-        qs = urllib.parse.urlencode({**params, **reach})
+        scope_params = {"scope": "workspace"} if scope == "workspace" else {}
+        if scope is None and owner and not absolute and relative_path:
+            scope_params["scope"] = "reach"
+        qs = urllib.parse.urlencode({**params, **scope_params})
         runner_rel = _runner_path_segment(relative_path, absolute=absolute)
         if download:
-            return await _stream_download_from_runner(
+            download_response = await _stream_download_from_runner(
                 request,
                 session_id,
                 conv,
                 f"/v1/sessions/{session_id}/resources/environments"
                 f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?"
-                + urllib.parse.urlencode({"download": "true", **reach}),
+                + urllib.parse.urlencode({"download": "true", **scope_params}),
             )
+            if scope == "workspace" and download_response.status_code == 200:
+                download_response.headers.update(_WORKSPACE_FILE_SCOPE_HEADERS)
+            return download_response
         path = (
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?{qs}"
@@ -3134,6 +3162,8 @@ def register_resources_routes(
             if absolute
             else None
         )
+        if scope == "workspace":
+            response.headers.update(_WORKSPACE_FILE_SCOPE_HEADERS)
         # The session is already validated above at the browse level, which is
         # stricter than main's plain LEVEL_READ for an absolute path.
         return _skip_gzip_for_binary(

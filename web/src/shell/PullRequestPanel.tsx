@@ -1063,6 +1063,8 @@ export function PullRequestPanel({
           "github-review-threads",
           "github-changed-files",
           "github-pr-diff",
+          "github-pr-commits",
+          "github-pr-commit-diff",
           "session-pull-requests",
         ].map((key) => queryClient.invalidateQueries({ queryKey: [key, conversationId] })),
       );
@@ -1650,21 +1652,25 @@ function PullRequestPanelDetails({
           hint={
             panelState.remoteHost ? (
               <>
-                The workspace’s remote is on{" "}
-                <span className="font-mono">{panelState.remoteHost}</span>, which isn’t a supported
-                git provider.
+                Omnigent couldn’t identify the git provider for{" "}
+                <span className="font-mono">{panelState.remoteHost}</span>.
               </>
             ) : (
-              "This workspace’s remote isn’t on a supported git provider."
+              "Omnigent couldn’t identify this workspace’s git provider."
             )
           }
-          // A GitHub Enterprise host the user never signed in to lands here.
           note={
             panelState.remoteHost && (
               <>
-                For a GitHub Enterprise host, run{" "}
+                On the execution host, run{" "}
+                <span className="font-mono">
+                  glab auth login --hostname {panelState.remoteHost}
+                </span>{" "}
+                for GitLab or{" "}
                 <span className="font-mono">gh auth login --hostname {panelState.remoteHost}</span>{" "}
-                on the host.
+                for GitHub Enterprise. For a GitHub SSH alias, run{" "}
+                <span className="font-mono">git config --local omnigent.gitprovider github</span> in
+                this checkout, then refresh for installation or sign-in help.
               </>
             )
           }

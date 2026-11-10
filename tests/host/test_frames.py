@@ -1242,6 +1242,31 @@ _READINESS_FRAME_FACTORIES: dict[
 
 
 @pytest.mark.parametrize("frame_kind", sorted(_READINESS_FRAME_FACTORIES))
+def test_unresponsive_cli_readiness_stays_decodable_by_older_servers(
+    frame_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older server still applies the other harnesses' readiness in the same update."""
+    frame = _READINESS_FRAME_FACTORIES[frame_kind](
+        {"pi": "cli-unresponsive", "codex": "binary-missing"}
+    )
+    encoded = encode_host_frame(frame)
+    assert decode_host_frame(encoded) == frame
+
+    legacy_payload = json.loads(encoded)
+    legacy_payload.pop("cli_unresponsive_harnesses", None)
+    monkeypatch.setattr(
+        "omnigent.host.frames.is_harness_availability",
+        lambda value: (
+            isinstance(value, bool) or value in ("binary-missing", "needs-auth", "version-too-low")
+        ),
+    )
+    legacy = decode_host_frame(json.dumps(legacy_payload))
+    assert isinstance(legacy, type(frame))
+    assert legacy.configured_harnesses == {"pi": "version-too-low", "codex": "binary-missing"}
+
+
+@pytest.mark.parametrize("frame_kind", sorted(_READINESS_FRAME_FACTORIES))
 @pytest.mark.parametrize(
     ("server_capabilities", "expected_native"),
     [(frozenset(), True), (frozenset({SERVER_CAP_TMUX_READINESS}), "tmux-unavailable")],
@@ -2983,3 +3008,37 @@ def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) ->
                 }
             )
         )
+
+
+@pytest.mark.parametrize("activation", [None, [], ["claude"], ["claude", "codex"]])
+def test_mcp_launch_activation_round_trip(activation):
+    frame = HostLaunchRunnerFrame(
+        "request", "token", "/repo", mcp_disabled_servers_active_harnesses=activation
+    )
+    wire = encode_host_frame(frame)
+    assert decode_host_frame(wire) == frame
+    assert ("mcp_disabled_servers_active_harnesses" in json.loads(wire)) is (
+        activation is not None
+    )
+
+
+def test_enablement_fields_survive_inventory_allow_list():
+    frame = HostMcpServersResultFrame(
+        "request",
+        "ok",
+        mcp_servers=[
+            {
+                "name": "docs",
+                "harness": "claude",
+                "transport": "stdio",
+                "scope": "user",
+                "enabled": "false",
+                "locked": "true",
+                "command": "private",
+            }
+        ],
+    )
+    decoded = decode_host_frame(encode_host_frame(frame))
+    assert decoded.mcp_servers[0]["enabled"] == "false"
+    assert decoded.mcp_servers[0]["locked"] == "true"
+    assert "command" not in decoded.mcp_servers[0]
