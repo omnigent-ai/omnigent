@@ -203,6 +203,10 @@ describe("browser permission popover", () => {
     const deferred = h.show({ kind: "security-key" });
     assert.equal(await Promise.race([deferred, tick().then(() => "waiting")]), "waiting");
     assert.equal(h.windows.length, 1);
+    const settled = new AbortController();
+    const canceled = h.show({ kind: "security-key", signal: settled.signal });
+    settled.abort();
+    assert.equal(await Promise.race([canceled, tick().then(() => "waiting")]), "dismiss");
     h.choose("allow-once");
     assert.equal(await permission, "allow-once");
     assert.equal(await deferred, "suppressed");
@@ -214,11 +218,12 @@ describe("browser permission popover", () => {
     assert.equal(await replacement, "deny");
   });
 
-  it("keeps only the newest security-key notice open in a window", async () => {
+  it("keeps only the newest security-key notice open and sends it only its own details", async () => {
     const h = harness();
     const replaced = h.show({ kind: "security-key" });
     h.show({ kind: "security-key" });
     assert.equal(await replaced, "suppressed");
+    assert.deepEqual(h.info(), { kind: "security-key", origin: ORIGIN, cookieImport: false });
     assert.deepEqual(
       h.windows.map((popup) => popup.destroyed),
       [true, false],
@@ -258,13 +263,21 @@ describe("browser permission popover", () => {
         await wait();
         assert.equal(h.windows.length, shown + 1, "the pane is back while the request waits");
       };
-      await hideThenReturn(() => h.controller.dismiss(h.parent));
+      // Clicking another conversation blurs the notice before the pane switch closes it.
+      await hideThenReturn(() => {
+        h.windows.at(-1).emit("blur");
+        h.controller.dismiss(h.parent);
+      });
+      await hideThenReturn(() => h.parent.emit("hide"));
       await hideThenReturn(() => h.parent.emit("minimize"));
       h.windows.at(-1).emit("blur");
       await wait();
+      assert.equal(h.windows.at(-1).destroyed, false, "focus leaving keeps the notice");
+      h.choose("dismiss");
+      await wait();
       await wait();
       assert.equal(h.windows.at(-1).destroyed, true);
-      assert.equal(h.windows.length, 3);
+      assert.equal(h.windows.length, 4);
     } finally {
       mock.timers.reset();
     }

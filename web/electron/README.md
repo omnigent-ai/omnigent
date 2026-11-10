@@ -628,8 +628,9 @@ biometrics and saved passkeys are unavailable (see
 the default browser; on macOS the popover also points to the cookie button.
 The popover closes when the request finishes or fails, or when the page navigates.
 It waits until the pane is visible and returns if the pane is hidden or covered
-while the request still waits. Once the user dismisses it, it stays closed until
-the page makes a new request. Conditional (autofill) requests do not open it.
+while the request still waits. Clicking elsewhere leaves it open. Once the user
+closes it or presses Escape, it stays closed until the page makes a new request.
+Conditional (autofill) requests do not open it.
 Windows already shows its own WebAuthn dialog, so the shell skips this notice
 there.
 

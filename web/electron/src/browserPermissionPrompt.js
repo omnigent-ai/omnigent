@@ -8,8 +8,8 @@ const CHOICES = {
   permission: new Set(["allow-once", "always-allow", "deny", "dismiss"]),
   "security-key": new Set(["open-in-browser", "dismiss"]),
 };
-// A security-key notice the app closes is "suppressed" so it can return; only the user's
-// dismissal is final.
+// A security-key notice the app closes is "suppressed" so it can return; only Dismiss or
+// Escape is final.
 const appClosedChoice = (kind) => (kind === "security-key" ? "suppressed" : "dismiss");
 
 function promptBounds(content, anchor) {
@@ -47,13 +47,28 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
     current?.finish(appClosedChoice(current.kind));
   }
 
-  function show({ parent, getAnchorBounds, signal, kind = "permission", ...details }) {
+  function show({
+    parent,
+    getAnchorBounds,
+    signal,
+    kind = "permission",
+    origin,
+    reload,
+    cookieImport,
+  }) {
     if (!parent || parent.isDestroyed() || signal.aborted) return Promise.resolve("dismiss");
     const current = prompts.get(parent);
     // The advisory security-key notice yields to a permission decision; "suppressed" asks it
     // to retry once that decision is made.
     if (kind === "security-key" && current?.kind === "permission") {
-      return current.result.then(() => "suppressed");
+      return new Promise((resolve) => {
+        const abort = () => resolve("dismiss");
+        signal.addEventListener("abort", abort, { once: true });
+        void current.result.then(() => {
+          signal.removeEventListener("abort", abort);
+          resolve("suppressed");
+        });
+      });
     }
     current?.finish(appClosedChoice(current.kind));
     const result = new Promise((resolve) => {
@@ -107,14 +122,20 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
         if (!popup.isDestroyed()) popup.destroy();
         resolve(choice);
       }
-      prompts.set(parent, { window: popup, kind, info: { kind, ...details }, finish });
+      const info =
+        kind === "security-key"
+          ? { kind, origin, cookieImport: Boolean(cookieImport) }
+          : { kind, origin, reload: Boolean(reload) };
+      prompts.set(parent, { window: popup, kind, info, finish });
       signal.addEventListener("abort", close, { once: true });
       parent.on("closed", close);
       for (const event of ["hide", "minimize"]) parent.on(event, hidden);
       for (const event of ["move", "resize"]) parent.on(event, position);
       parent.webContents.on("did-start-navigation", onNavigation);
       popup.on("closed", close);
-      popup.on("blur", close);
+      // The security-key notice reports a request still in progress, so focus moving to
+      // another app, the page or another conversation leaves it open.
+      if (kind === "permission") popup.on("blur", close);
       popup.webContents.on("render-process-gone", close);
       popup.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
       popup.webContents.on("will-navigate", (event) => event.preventDefault());
