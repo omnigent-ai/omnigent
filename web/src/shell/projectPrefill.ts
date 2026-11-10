@@ -212,16 +212,9 @@ function locationStep(
     !inputs.sandboxSelected &&
     (selectedHostId === null || selectedHostId === config!.hostId);
   if (configHostUsable) writes.hostId = config!.hostId;
-  // A configured workspace seeds the field even when the config host is
-  // offline (or config names no host) — dropping the hint would let a
-  // generic recent path fill in, which can belong to another project.
-  // Without a repository, the generic default can select a different host,
-  // whose filesystem might not have this path. Only
-  // a sandbox pick or an explicit switch to a different host suppresses it.
-  // Without one, the composer's home-fallback fills the field. Any opt-in
-  // worktree (config.useWorktree) is handled by a dedicated post-settle
-  // effect once the workspace is in place (see NewChatDialog's worktree
-  // effect).
+  // Preserve the configured path unless a sandbox or a different host was selected.
+  // Folder-only projects may use a generic host fallback; repository targets stay paired.
+  // Worktree seeding runs after location settles.
   const workspaceUsable =
     config?.workspace != null &&
     !inputs.sandboxSelected &&
