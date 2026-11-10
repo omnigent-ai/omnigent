@@ -602,18 +602,24 @@ describe("PullRequestChangesTab", () => {
     expect(screen.getByText("No results")).toBeInTheDocument();
   });
 
-  it("says hidden files were not searched when their regex search times out", async () => {
-    mocks.patternOutcomeByPath.set("b.ts", "tooSlow");
-    renderTab({ conversationId: "find-hidden-too-slow" });
-    fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
-      target: { value: "a.ts" },
-    });
-    openFind("needle");
-    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+  it.each([
+    ["times out", "tooSlow"],
+    ["fails", "failed"],
+  ] as const)(
+    "says hidden files were not searched when their regex search %s",
+    async (_label, outcome) => {
+      mocks.patternOutcomeByPath.set("b.ts", outcome);
+      renderTab({ conversationId: `find-hidden-${outcome}` });
+      fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+        target: { value: "a.ts" },
+      });
+      openFind("needle");
+      fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
 
-    expect(await screen.findByText("Hidden files not searched")).toBeInTheDocument();
-    expect(screen.getByText("No results")).toBeInTheDocument();
-  });
+      expect(await screen.findByText("Hidden files not searched")).toBeInTheDocument();
+      expect(screen.getByText("No results")).toBeInTheDocument();
+    },
+  );
 
   it("closes on Escape, returns focus to the trigger, and reopens on the shortcut", () => {
     renderTab({ conversationId: "find-escape" });

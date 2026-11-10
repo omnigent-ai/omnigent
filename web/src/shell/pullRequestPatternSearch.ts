@@ -90,7 +90,7 @@ export function searchPatternInWorker(
       const request: PatternSearchRequest = { corpus, query, options };
       worker.postMessage(request);
     } catch {
-      // A corpus that can't be cloned, such as one with unclonable values, means the search can't run.
+      // An uncloneable corpus means the search can't run.
       finish(FAILED);
     }
   });

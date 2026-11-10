@@ -101,16 +101,7 @@ describe("searchPatternInWorker", () => {
     expect(FakeWorker.instances[0].terminated).toBe(true);
   });
 
-  it("stops the worker and resolves null when the caller aborts", async () => {
-    const controller = new AbortController();
-    const result = searchPatternInWorker(CORPUS, "(a+)+$", OPTIONS, controller.signal);
-    controller.abort();
-
-    await expect(result).resolves.toBeNull();
-    expect(FakeWorker.instances[0].terminated).toBe(true);
-  });
-
-  it("ignores a reply that arrives after the caller aborts", async () => {
+  it("stops the worker, and ignores a reply that arrives after the caller aborts", async () => {
     const controller = new AbortController();
     const result = searchPatternInWorker(CORPUS, "needle", OPTIONS, controller.signal);
     const [worker] = FakeWorker.instances;
@@ -176,7 +167,7 @@ describe("searchPatternInWorker", () => {
     });
   });
 
-  it("ignores a reply that arrives after the search has timed out", async () => {
+  it("ignores a reply that arrives after the start timeout", async () => {
     const result = searchPatternInWorker(CORPUS, "(a+)+$", OPTIONS);
     const [worker] = FakeWorker.instances;
     vi.advanceTimersByTime(WORKER_START_TIMEOUT_MS);
@@ -186,5 +177,15 @@ describe("searchPatternInWorker", () => {
     await expect(result).resolves.toEqual({ ...NO_MATCHES, failed: true });
     vi.advanceTimersByTime(PATTERN_TIME_BUDGET_MS);
     await expect(result).resolves.toEqual({ ...NO_MATCHES, failed: true });
+  });
+
+  it("ignores a reply that arrives after the matching budget ran out", async () => {
+    const result = searchPatternInWorker(CORPUS, "(a+)+$", OPTIONS);
+    const [worker] = FakeWorker.instances;
+    worker.reply({ started: true });
+    vi.advanceTimersByTime(PATTERN_TIME_BUDGET_MS);
+    worker.reply({ matches: [], truncated: false, invalid: false });
+
+    await expect(result).resolves.toEqual({ ...NO_MATCHES, tooSlow: true });
   });
 });

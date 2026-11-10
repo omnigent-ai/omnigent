@@ -185,6 +185,34 @@ describe("useFindSearch", () => {
     expect(runs[0].signal?.aborted).toBe(true);
   });
 
+  it("searches again when the match case option changes with the same corpus and query", async () => {
+    const { result, rerender } = renderHook(
+      ({ matchCase }) => useFindSearch(CORPUS_A, "needle", { matchCase, regex: true }),
+      { initialProps: { matchCase: false } },
+    );
+    await act(async () => runs[0].settle(FOUND));
+
+    rerender({ matchCase: true });
+
+    expect(runs).toHaveLength(2);
+    expect(runs[0].signal?.aborted).toBe(true);
+    expect(result.current).toEqual(NOTHING_YET);
+  });
+
+  it("returns plain matches at once when regex mode is left with a search outstanding", async () => {
+    const { result, rerender } = renderHook(
+      ({ regex }) => useFindSearch(CORPUS_A, "needle", { matchCase: false, regex }),
+      { initialProps: { regex: true } },
+    );
+
+    rerender({ regex: false });
+
+    expect(runs[0].signal?.aborted).toBe(true);
+    expect(result.current).toEqual({ ...FOUND, searching: false });
+    await act(async () => runs[0].settle(FAILED));
+    expect(result.current).toEqual({ ...FOUND, searching: false });
+  });
+
   it("searches again when regex mode is re-entered with the same corpus and query", async () => {
     const { result, rerender } = renderHook(
       ({ regex }) => useFindSearch(CORPUS_A, "needle", { matchCase: false, regex }),

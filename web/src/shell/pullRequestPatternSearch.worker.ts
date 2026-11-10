@@ -10,10 +10,10 @@ import type {
 
 self.addEventListener("message", (event: MessageEvent<PatternSearchRequest>) => {
   const { corpus, query, options } = event.data;
-  // Tells the caller to start the match budget.
+  const indexOf = new Map(corpus.map((target, index) => [target, index]));
+  // Starts the caller's match budget, so it comes after the index map is built.
   const started: PatternSearchMessage = { started: true };
   self.postMessage(started);
-  const indexOf = new Map(corpus.map((target, index) => [target, index]));
   const { matches, truncated, invalid } = findMatches(corpus, query, options);
   const reply: PatternSearchReply = {
     matches: matches.flatMap((match) => {
