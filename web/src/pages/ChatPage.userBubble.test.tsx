@@ -1,11 +1,22 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { AUTOMATION_CONTEXT_NOTE } from "@/lib/systemMessage";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import { SessionSharedContext } from "@/components/chat/chatBubbleParts";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { EditSentMessageContext, type SentMessage } from "@/components/chat/editSentMessage";
+import type * as IdentityModule from "@/lib/identity";
 import { BubbleView, buildPendingBubbles } from "./ChatPage";
+
+// Unmocked, the viewer id is null in jsdom; Edit tests pin who is signed in.
+const viewer = vi.hoisted(() => ({ id: null as string | null }));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  getCurrentUserId: () => viewer.id,
+}));
 
 // UserBubble renders its text through the same markdown renderer as the
 // assistant bubble (FilePathAwareMessageResponse → Streamdown). These tests
@@ -540,6 +551,114 @@ describe("UserBubble copy button", () => {
       }),
     );
     expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+  });
+});
+
+describe("UserBubble edit button", () => {
+  function renderEditable(bubble: Bubble, { shared = false } = {}) {
+    const editMessage = vi.fn<(message: SentMessage) => void>();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <SessionSharedContext.Provider value={shared}>
+            <EditSentMessageContext.Provider value={editMessage}>
+              {/* A shared session badges other contributors with a tooltip. */}
+              <TooltipProvider>
+                <BubbleView bubble={bubble} />
+              </TooltipProvider>
+            </EditSentMessageContext.Provider>
+          </SessionSharedContext.Provider>
+        </FileViewerContext.Provider>
+      </QueryClientProvider>,
+    );
+    return editMessage;
+  }
+
+  it("hands only the message's text, mention markers included, to the composer", () => {
+    const content: MessageContentBlock[] = [
+      { type: "input_file", file_id: "file_1", filename: "notes.pdf" },
+      { type: "input_text", text: "summarize this\n\n[Attached: src/app.ts]" },
+    ];
+    const editMessage = renderEditable(userBubble("", { content }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit and resend" }));
+
+    // The composer turns the sent mention markers back into tags.
+    expect(editMessage).toHaveBeenCalledWith({
+      text: "summarize this\n\n[Attached: src/app.ts]",
+    });
+    // Editing copies the message; the bubble stays in the transcript.
+    expect(screen.getByText(/summarize this/)).toBeInTheDocument();
+  });
+
+  it("offers no Edit on an attachments-only message, which has no text to copy", () => {
+    renderEditable(
+      userBubble("", { content: [{ type: "input_image", file_id: "img_1", filename: "a.png" }] }),
+    );
+    expect(screen.queryByRole("button", { name: "Edit and resend" })).toBeNull();
+  });
+
+  it("is absent without a composer to take the message", () => {
+    renderBubble(userBubble("hello"));
+    expect(screen.queryByRole("button", { name: "Edit and resend" })).toBeNull();
+  });
+
+  const pendingSend = (posted: boolean, sentMidTurn = true) =>
+    buildPendingBubbles(
+      [
+        {
+          tempId: "pend_mid",
+          content: [{ type: "input_text", text: "hello" }],
+          ...(sentMidTurn ? { sentMidTurn: true } : {}),
+          ...(posted ? { posted: true } : {}),
+        },
+      ],
+      null,
+    )[0]!;
+
+  it("is absent until the server accepts the message", () => {
+    renderEditable(pendingSend(false, false));
+    expect(screen.queryByRole("button", { name: "Edit and resend" })).toBeNull();
+    cleanup();
+    // Sent mid-turn, but the send request hasn't succeeded yet.
+    renderEditable(pendingSend(false));
+    expect(screen.getByText("The agent will read this after its current step")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit and resend" })).toBeNull();
+  });
+
+  it("offers Edit on a mid-turn message the agent hasn't read yet", () => {
+    const onEdit = renderEditable(pendingSend(true));
+    expect(screen.getByText("The agent will read this after its current step")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit and resend" }));
+    expect(onEdit).toHaveBeenCalledWith({ text: "hello" });
+  });
+
+  it("offers Edit on an accepted send that started a turn", () => {
+    renderEditable(pendingSend(true, false));
+    expect(screen.getByRole("button", { name: "Edit and resend" })).toBeInTheDocument();
+  });
+
+  describe("with a signed-in viewer", () => {
+    beforeEach(() => {
+      viewer.id = "me@example.com";
+    });
+    afterEach(() => {
+      viewer.id = null;
+    });
+
+    it("is offered on the viewer's own attributed message", () => {
+      renderEditable(userBubble("hello", { createdBy: "me@example.com" }), { shared: true });
+      expect(screen.getByRole("button", { name: "Edit and resend" })).toBeInTheDocument();
+    });
+
+    // Grid panes and sub-agent tabs render without the shared-session context.
+    it.each([true, false])(
+      "is absent on another contributor's message (session shared: %s)",
+      (shared) => {
+        renderEditable(userBubble("hello", { createdBy: "teammate@example.com" }), { shared });
+        expect(screen.queryByRole("button", { name: "Edit and resend" })).toBeNull();
+      },
+    );
   });
 });
 

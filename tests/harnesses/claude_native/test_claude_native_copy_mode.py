@@ -34,7 +34,7 @@ from pathlib import Path
 
 received, delivered = map(Path, sys.argv[1:3])
 surface = sys.argv[3] if len(sys.argv) > 3 else ""
-panel_open = surface in {"btw", "background", "empty_background"}
+panel_open = surface in {"btw", "background", "empty_background", "transcript"}
 tty.setraw(sys.stdin.fileno())
 sys.stdout.write("\x1b[?2004h")
 
@@ -45,7 +45,11 @@ def render(draft=""):
     sys.stdout.flush()
 
 
-if surface == "btw":
+if surface == "transcript":
+    sys.stdout.write("\x1b[H\x1b[2J" + "─" * os.get_terminal_size().columns + "\r\n"
+        "  Showing detailed transcript · ctrl+o to toggle · ? for shortcuts\r\n")
+    sys.stdout.flush()
+elif surface == "btw":
     sys.stdout.write("\x1b[H\x1b[2J" + "▔" * os.get_terminal_size().columns + "\r\n"
         "    /btw do the checks pass?\r\n      Yes, the checks pass.\r\n"
         "    ↑/↓ to scroll · c to copy · f to fork · Esc to close\r\n")
@@ -69,7 +73,7 @@ while True:
         log.write(chunk)
     buffer += chunk
     if panel_open:
-        if b"\x1b" in buffer:
+        if (b"\x0f" if surface == "transcript" else b"\x1b") in buffer:
             panel_open = False
             buffer = b""
             render()
@@ -143,7 +147,12 @@ def pane(
                     "-s",
                     "main",
                     "-x",
-                    {"background": "50", "empty_background": "41", "btw": "48"}.get(panel, "120"),
+                    {
+                        "background": "50",
+                        "empty_background": "41",
+                        "btw": "48",
+                        "transcript": "48",
+                    }.get(panel, "120"),
                     "-y",
                     "24",
                     command,
@@ -163,7 +172,15 @@ def pane(
             # Keys sent before the composer switches its tty to raw mode are
             # flushed by tcsetattr(TCSAFLUSH), so wait for its first render.
             deadline = time.monotonic() + 5.0
-            marker = "Background" if "background" in panel else "▔" if panel else "❯"
+            marker = (
+                "Showing detailed transcript"
+                if panel == "transcript"
+                else "Background"
+                if "background" in panel
+                else "▔"
+                if panel
+                else "❯"
+            )
             while marker not in bridge._capture_pane(str(socket_path), "main"):
                 assert time.monotonic() < deadline, "The stand-in composer never rendered."
                 time.sleep(0.05)
@@ -193,6 +210,20 @@ def test_message_from_web_ui_reaches_scrolled_back_pane(pane: _Pane) -> None:
 
     assert json.loads(pane.delivered.read_text()) == ["SENT_WHILE_SCROLLED_BACK"]
     assert not pane.in_mode(), "Delivery should return the pane to the live view."
+
+
+@pytest.mark.parametrize("pane", [("emacs", "transcript")], indirect=True)
+def test_message_leaves_detailed_transcript_before_pasting(pane: _Pane) -> None:
+    """The real pane receives one Ctrl+O and then exactly one submitted message."""
+    pane.scroll_back()
+
+    bridge.inject_user_message(pane.bridge_dir, content="SENT_AFTER_TRANSCRIPT", timeout_s=5.0)
+
+    received = pane.received.read_bytes()
+    assert received.count(b"\x0f") == 1
+    assert not received.startswith(b"\x1b")
+    assert json.loads(pane.delivered.read_text()) == ["SENT_AFTER_TRANSCRIPT"]
+    assert not pane.in_mode()
 
 
 @pytest.mark.parametrize("pane", [("emacs", "btw")], indirect=True, ids=["narrow-quick-answer"])
