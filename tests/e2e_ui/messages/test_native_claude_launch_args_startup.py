@@ -53,6 +53,17 @@ def _terminal_resources(base_url: str, session_id: str) -> list[dict]:
     return [r for r in data if r.get("type") == "terminal"]
 
 
+def _assert_skipped_args_notice(base_url: str, session_id: str) -> None:
+    """The chat says which saved launch options were left out, once."""
+    items = (
+        httpx.get(f"{base_url}/v1/sessions/{session_id}/items", timeout=10.0)
+        .json()
+        .get("data", [])
+    )
+    notices = [item for item in items if "claude_native_saved_launch_args_skipped" in str(item)]
+    assert len(notices) == 1, f"expected one skipped-launch-args notice, got {items}"
+
+
 def _await_startup(base_url: str, session_id: str) -> tuple[str, str, list[str]]:
     """Settle the session's terminal launch.
 
@@ -69,6 +80,7 @@ def _await_startup(base_url: str, session_id: str) -> tuple[str, str, list[str]]
         has_terminal = bool(_terminal_resources(base_url, session_id))
         trail.append(f"{status}/{int(has_terminal)}")
         if status == "failed":
+            trail.append(f"error={_session(base_url, session_id).get('last_task_error')}")
             return "failed", status, trail
         if has_terminal and status in {"idle", "running"}:
             up_since = up_since or time.time()
@@ -98,6 +110,7 @@ def test_stored_print_arg_does_not_prevent_terminal_startup(
             "claude-native session with a stored --print arg could not start its "
             f"terminal; last status={status}, trail={trail}"
         )
+        _assert_skipped_args_notice(live_server, session_id)
     finally:
         if session_id is not None:
             httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
@@ -131,6 +144,7 @@ def test_stored_missing_mcp_config_does_not_prevent_terminal_startup(
             "claude-native session whose stored --mcp-config file was deleted "
             f"could not start its terminal; last status={status}, trail={trail}"
         )
+        _assert_skipped_args_notice(live_server, session_id)
     finally:
         if session_id is not None:
             httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)

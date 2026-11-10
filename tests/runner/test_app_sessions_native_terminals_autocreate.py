@@ -3346,77 +3346,6 @@ async def test_auto_create_claude_terminal_resumes_in_place_when_the_registry_ch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("env_chdir", [False, True], ids=["workspace-cwd", "env-chdir-wrapper"])
-async def test_auto_create_claude_terminal_drops_stored_args_claude_cannot_start_with(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    env_chdir: bool,
-) -> None:
-    """
-    Stored print mode and missing MCP config files never reach the launch.
-
-    Either one makes Claude exit at startup, and the session replays its stored
-    launch args on every relaunch, so it could never start again. Relative
-    config paths are checked where Claude runs: under an ``env --chdir``
-    wrapper that is the wrapper's directory, not the workspace.
-
-    :param env_chdir: Whether user config wraps the launch in ``env --chdir=sub``.
-    """
-    workspace = tmp_path / "workspace"
-    launch_dir = workspace / "sub" if env_chdir else workspace
-    launch_dir.mkdir(parents=True)
-    config_home = tmp_path / "config-home"
-    config_home.mkdir()
-    if env_chdir:
-        (config_home / "config.yaml").write_text(
-            "harness:\n  claude-native:\n    command: env\n    args: ['--chdir=sub', 'claude']\n"
-        )
-    (launch_dir / "servers.json").write_text('{"mcpServers": {}}', encoding="utf-8")
-    (workspace / "root-only.json").write_text('{"mcpServers": {}}', encoding="utf-8")
-    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
-    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
-    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
-    )
-    stored_args = [
-        "--print",
-        "--mcp-config",
-        "servers.json",
-        str(tmp_path / "gone.json"),
-        "--mcp-config",
-        "root-only.json",
-        "--model",
-        "opus",
-    ]
-
-    captured: dict[str, Any] = {}
-    await _auto_create_claude_terminal(
-        "5cdbea97a2fb0c659bc09605401e2bb2",
-        _RecordingClaudeRegistry(captured),
-        lambda _sid, _evt: None,
-        server_client=_ResumeSnapshotServerClient(  # type: ignore[arg-type]
-            "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2",
-            {"terminal_launch_args": stored_args},
-        ),
-    )
-
-    launched_args = list(captured["spec"].args)
-    assert "--print" not in launched_args
-    assert str(tmp_path / "gone.json") not in launched_args
-    assert "servers.json" in launched_args
-    assert ("root-only.json" in launched_args) is not env_chdir
-    assert launched_args[launched_args.index("--model") + 1] == "opus"
-    if env_chdir:
-        assert captured["spec"].command == "env"
-        assert launched_args[:2] == ["--chdir=sub", "claude"]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("source_transcript", ["missing", "unreadable", "available"])
 async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
     source_transcript: str,
@@ -6843,3 +6772,90 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
 
     await fake_client.aclose()
+
+
+class _NoticeRecordingServerClient(_ResumeSnapshotServerClient):
+    """Snapshot server client that records the events the launch posts."""
+
+    def __init__(self, session_url: str, snapshot: dict[str, Any]) -> None:
+        super().__init__(session_url, snapshot)
+        self.posted_events: list[dict[str, Any]] = []
+
+    async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+        """Record session event posts; acknowledge everything."""
+        if url == f"{self._session_url}/events":
+            self.posted_events.append(kwargs["json"])
+        return NullServerClient._Response()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_launches_without_stored_args_after_startup_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Stored args a startup exit ruled out are left off later launches, except the mode.
+
+    A launcher can store args that only work on its own machine, such as an
+    ``--mcp-config`` file a fork onto a sandbox does not have. The first launch
+    replays them; once Claude exits during startup the runner launches with only
+    the permission mode Omnigent stores itself, and tells the chat once which
+    options were left out, naming options but not their values.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
+    )
+    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
+    missing_config = "/Users/someone/.openui/mcp-inject.json"
+    stored_args = [
+        "--mcp-config",
+        missing_config,
+        "--plugin-dir=/Users/someone/.openui/plugin",
+        "--permission-mode",
+        "plan",
+    ]
+    captured: dict[str, Any] = {}
+    registry = _RecordingClaudeRegistry(captured)
+    server_client = _NoticeRecordingServerClient(
+        f"/v1/sessions/{session_id}", {"terminal_launch_args": stored_args}
+    )
+
+    async def launch() -> list[str]:
+        await _auto_create_claude_terminal(
+            session_id,
+            registry,
+            lambda _sid, _evt: None,
+            server_client=server_client,  # type: ignore[arg-type]
+        )
+        return list(captured["spec"].args)
+
+    first_args = await launch()
+    assert missing_config in first_args
+    assert server_client.posted_events == []
+
+    assert registry.skip_claude_saved_args_after_startup_exit(session_id) is True
+    # The relaunch's own startup exit is a real failure, not another retry.
+    second_args = await launch()
+    assert registry.skip_claude_saved_args_after_startup_exit(session_id) is False
+    assert missing_config not in second_args
+    assert not any(arg.startswith("--plugin-dir=/Users/someone") for arg in second_args)
+    assert second_args[second_args.index("--permission-mode") + 1] == "plan"
+    assert len(server_client.posted_events) == 1
+    notice = server_client.posted_events[0]["data"]["item_data"]
+    assert notice["code"] == "claude_native_saved_launch_args_skipped"
+    assert notice["level"] == "info"
+    assert "`--mcp-config`" in notice["message"]
+    assert "`--plugin-dir`" in notice["message"]
+    assert "openui" not in notice["message"]
+
+    third_args = await launch()
+    assert missing_config not in third_args
+    assert len(server_client.posted_events) == 1

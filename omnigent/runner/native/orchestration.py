@@ -3199,6 +3199,32 @@ async def _post_native_launch_notice(
         )
 
 
+CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_CODE = "claude_native_saved_launch_args_skipped"
+
+
+def _claude_saved_launch_args_skipped_notice(skipped_args: Sequence[str]) -> str:
+    """
+    Explain that Claude Code was started without the session's stored launch options.
+
+    Only option names are shown: stored values can hold prompts, paths or
+    tokens, and the notice is part of the shared transcript.
+
+    :param skipped_args: The stored args that were left out, e.g.
+        ``["--mcp-config", "/Users/me/.openui/mcp-inject.json"]``.
+    :returns: The notice text.
+    """
+    names = list(
+        dict.fromkeys(arg.partition("=")[0] for arg in skipped_args if arg.startswith("-"))
+    )
+    options = ", ".join(f"`{name}`" for name in names) if names else "its saved options"
+    return (
+        "Claude Code exited while starting with this session's saved launch options "
+        f"({options}), so Omnigent started it without them. They usually come from "
+        "the tool that created the session and may only work on that machine. "
+        "The permission mode was kept."
+    )
+
+
 _CODEX_THREAD_RESET_NOTICE = (
     "Codex could not load this session's saved transcript, so Omnigent started a fresh "
     "Codex thread instead of failing the turn. The chat history here is intact, but "
@@ -9161,7 +9187,6 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
-        drop_startup_fatal_claude_args,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
@@ -9310,6 +9335,22 @@ async def _auto_create_claude_terminal(
     session_effort = launch_metadata.reasoning_effort
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
+    # Stored pass-through args come from whatever launched the session, e.g. an
+    # ``--mcp-config`` file on that machine. Once one made Claude exit during
+    # startup, launch with only the permission mode Omnigent stores there too.
+    from omnigent.harnesses.claude_native.launch_args import (
+        split_claude_permission_launch_args,
+    )
+
+    stored_other_args, stored_permission_args = split_claude_permission_launch_args(
+        session_launch_args or ()
+    )
+    skipped_launch_args: list[str] = []
+    if not resource_registry.note_claude_launch_args(
+        session_id, uses_saved_args=bool(stored_other_args)
+    ):
+        skipped_launch_args = stored_other_args
+        session_launch_args = stored_permission_args or None
     session_external_id = launch_metadata.external_session_id
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history
@@ -9758,45 +9799,6 @@ async def _auto_create_claude_terminal(
         launch_model,
         extra={"session_id": session_id},
     )
-    # Resolve the per-harness config override (``harness.claude-native.{command,args}``)
-    # early so the stored-args filter below can compute the real launch cwd.
-    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
-    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
-        resolve_harness_args,
-        resolve_harness_command,
-    )
-
-    _harness_cfg = load_effective_config(workspace=workspace)
-    launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
-    claude_terminal_env = build_native_claude_terminal_env(
-        claude_config,
-        client_surface=resource_registry.client_surface(session_id),
-    )
-    claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
-    # Inherit the agent's sandbox (and pass ``parent_os_env`` below): otherwise
-    # launch_terminal falls back to _default_sandbox_for_platform, overriding
-    # the YAML config; ``agent_os_env`` matches what prepare_bridge_dir resolved.
-    claude_terminal_os_env = OSEnvSpec(
-        type="caller_process",
-        cwd=workspace,
-        sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
-    )
-    # Where Claude will run: an ``env --chdir`` launch wrapper can move it away
-    # from the workspace. Stored ``--mcp-config`` paths and trust seeding use it.
-    launch_cwd = _claude_terminal_launch_cwd(
-        TerminalEnvSpec(
-            os_env=claude_terminal_os_env,
-            command=launch_command,
-            args=resolve_harness_args("claude-native", (), cfg=_harness_cfg),
-            env=claude_terminal_env,
-            env_unset=claude_terminal_env_unset,
-        ),
-        agent_os_env,
-    )
-    if session_launch_args:
-        session_launch_args = drop_startup_fatal_claude_args(
-            session_launch_args, workspace=launch_cwd
-        )
     base_claude_args = _build_claude_native_base_args(
         reasoning_effort=session_effort,
         # Precedence: per-session ``/model`` override > agent-spec pin
@@ -9900,6 +9902,14 @@ async def _auto_create_claude_terminal(
     # appended above, so the ``--`` stays first). Identity by default. This is
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
     # both terminal-creation paths honour one config surface.
+    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
+    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+        resolve_harness_args,
+        resolve_harness_command,
+    )
+
+    _harness_cfg = load_effective_config(workspace=workspace)
+    launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
     # Validate the binary this terminal will actually spawn: ``launch_command``
     # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
@@ -9910,14 +9920,29 @@ async def _auto_create_claude_terminal(
     if resolved_claude is not None:
         validate_claude_hook_interpreter_compatibility(resolved_claude)
 
+    claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
+
+    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+    # and ``parent_os_env`` below, launch_terminal falls back to
+    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
+    # ``agent_os_env`` was already resolved above for ``prepare_bridge_dir``,
+    # so the terminal process and the bridge's sys_os_* tools agree.
     env_spec = TerminalEnvSpec(
-        os_env=claude_terminal_os_env,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=workspace,
+            sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+        ),
         command=launch_command,
         args=launch_args,
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=claude_terminal_env,
+        env=build_native_claude_terminal_env(
+            claude_config,
+            client_surface=resource_registry.client_surface(session_id),
+        ),
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning
@@ -9939,7 +9964,10 @@ async def _auto_create_claude_terminal(
     )
     # Seed trust and onboarding in the config selected by the terminal's launch environment.
     try:
-        ensure_claude_workspace_trusted(launch_cwd, env=_claude_terminal_launch_env(env_spec))
+        ensure_claude_workspace_trusted(
+            _claude_terminal_launch_cwd(env_spec, agent_os_env),
+            env=_claude_terminal_launch_env(env_spec),
+        )
     except BaseException as seed_error:
         # No forwarder owns the routers yet, so release the ones this launch started.
         # A ``None`` handle would shut down whichever router is registered now.
@@ -10005,6 +10033,13 @@ async def _auto_create_claude_terminal(
     timings.mark("tmux_launch")
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
+    if skipped_launch_args and resource_registry.take_claude_saved_args_notice(session_id):
+        await _post_native_launch_notice(
+            session_id=session_id,
+            server_client=server_client,
+            code=CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_CODE,
+            notice=_claude_saved_launch_args_skipped_notice(skipped_launch_args),
+        )
     # Surface the terminal on the live SSE stream so an already-connected
     # web UI enables the Terminal toggle immediately. The required-terminal
     # launch helper registers the resource and starts the activity watcher but
@@ -10721,22 +10756,42 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
     """
     if ctx.server_client is None:
         raise ValueError("claude-native launch requires a bound server_client")
-    view = await _auto_create_claude_terminal(
-        ctx.session_id,
-        ctx.resource_registry,
-        ctx.publish_event,
-        server_client=ctx.server_client,
-        event_dispatcher=ctx.event_dispatcher,
-        bundle_dir=ctx.bundle_dir,
-        agent_name=ctx.agent_name,
-        agent_spec=ctx.agent_spec,
-        skills_filter=ctx.skills_filter,
-        session_init=ctx.session_init,
-        auth_token_factory=ctx.auth_token_factory,
-        resolve_launch_config=ctx.resolve_launch_config,
-        record_launch_config=ctx.record_launch_config,
-        rebind_bridge=ctx.rebind_bridge,
-    )
+    from omnigent.terminals.registry import TerminalExitedDuringLaunch
+
+    server_client = ctx.server_client
+
+    async def launch() -> SessionResourceView:
+        return await _auto_create_claude_terminal(
+            ctx.session_id,
+            ctx.resource_registry,
+            ctx.publish_event,
+            server_client=server_client,
+            event_dispatcher=ctx.event_dispatcher,
+            bundle_dir=ctx.bundle_dir,
+            agent_name=ctx.agent_name,
+            agent_spec=ctx.agent_spec,
+            skills_filter=ctx.skills_filter,
+            session_init=ctx.session_init,
+            auth_token_factory=ctx.auth_token_factory,
+            resolve_launch_config=ctx.resolve_launch_config,
+            record_launch_config=ctx.record_launch_config,
+            rebind_bridge=ctx.rebind_bridge,
+        )
+
+    try:
+        view = await launch()
+    except TerminalExitedDuringLaunch:
+        # A pane that dies later reaches the runner's terminal-exit handler,
+        # which relaunches the same way.
+        if not ctx.resource_registry.skip_claude_saved_args_after_startup_exit(ctx.session_id):
+            raise
+        _logger.warning(
+            "Claude exited during startup with stored launch args for session=%s; "
+            "relaunching without them",
+            ctx.session_id,
+            extra={"session_id": ctx.session_id},
+        )
+        view = await launch()
     _start_claude_relay_after_launch(ctx)
     return view
 

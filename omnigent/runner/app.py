@@ -2157,6 +2157,30 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
+        # A Claude that never finished starting may have been stopped by a
+        # stored launch arg, which every relaunch would replay. Relaunch once
+        # without the stored args rather than failing a session that cannot
+        # come back; a second startup exit is reported as usual.
+        if (
+            event.exited_during_startup
+            and event.terminal_name == "claude"
+            and event.session_key == "main"
+            and not _shutting_down.is_set()
+            and resource_registry.skip_claude_saved_args_after_startup_exit(event.session_id)
+        ):
+            _logger.warning(
+                "Claude exited during startup with stored launch args for %s; "
+                "relaunching without them",
+                event.session_id,
+                extra={"session_id": event.session_id},
+            )
+            _relaunch_task = asyncio.create_task(
+                _ensure_native_terminal_for_turn(event.session_id, "claude-native")
+            )
+            _relaunch_task.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(_relaunch_task)
+            return
+
         # Record the exit before release severs its stream, preserving the cause.
         diagnosis = classify_terminal_failure(
             command=event.command,

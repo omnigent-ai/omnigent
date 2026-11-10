@@ -5042,6 +5042,82 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
 
 
 @pytest.mark.asyncio
+async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failing() -> None:
+    """A Claude that dies during startup after replaying stored args is relaunched once.
+
+    A stored arg can stop Claude from starting (say an ``--mcp-config`` file that
+    exists only on the machine the session was forked from), and every relaunch
+    replays it. The first such startup exit must not fail or release the
+    session: the runner relaunches without the stored args. If Claude also dies
+    while starting without them, that exit is a real failure.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    conv_id = uuid.uuid4().hex
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+    assert resource_registry.note_claude_launch_args(conv_id, uses_saved_args=True) is True
+
+    def startup_exit() -> TerminalExitEvent:
+        return TerminalExitEvent(
+            session_id=conv_id,
+            terminal_id="terminal_claude_main",
+            terminal_name="claude",
+            session_key="main",
+            lifecycle=TerminalLifecycle.REQUIRED,
+            exit_status=1,
+            last_output="Error: Invalid MCP configuration:\nMCP config file not found",
+            exited_during_startup=True,
+        )
+
+    def failed(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            event
+            for event in events
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+
+    try:
+        publish_exit(startup_exit())
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(100):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            await asyncio.sleep(0)
+        assert failed(queued_events) == []
+        assert pm.released == []
+        # Later launches on this runner leave the stored args out.
+        assert resource_registry.note_claude_launch_args(conv_id, uses_saved_args=True) is False
+
+        publish_exit(startup_exit())
+        for _ in range(1000):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        subagent_work.unregister_child_session(conv_id)
+
+    assert len(failed(queued_events)) == 1
+    assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
 async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

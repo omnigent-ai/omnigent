@@ -81,6 +81,7 @@ from omnigent.harness_plugins import (
     DEVIN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
+from omnigent.harnesses.claude_native.launch_args import split_claude_permission_launch_args
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
 from omnigent.mcp_selection import mcp_selection_revision
@@ -3047,28 +3048,8 @@ def _strip_claude_permission_launch_arg(args: list[str]) -> tuple[list[str], boo
     :param args: Launch args, e.g. ``["--model", "opus", "--permission-mode", "plan"]``.
     :returns: The remaining args in order, and whether a selector was present.
     """
-    stripped: list[str] = []
-    had_flag = False
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--dangerously-skip-permissions":
-            had_flag = True
-            index += 1
-            continue
-        if arg == "--permission-mode":
-            had_flag = True
-            index += 1
-            if index < len(args) and not args[index].startswith("-"):
-                index += 1
-            continue
-        if arg.startswith("--permission-mode="):
-            had_flag = True
-            index += 1
-            continue
-        stripped.append(arg)
-        index += 1
-    return stripped, had_flag
+    stripped, permission_args = split_claude_permission_launch_args(args)
+    return stripped, bool(permission_args)
 
 
 def _merge_claude_permission_launch_args(

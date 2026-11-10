@@ -215,6 +215,9 @@ class TerminalExitEvent:
         ``tmux kill-session`` or ``killall tmux`` run on the host.
     :param terminal_instance_id: Identity of the observed terminal instance.
     :param lifecycle_context: Content-free evidence captured before exit cleanup.
+    :param exited_during_startup: ``True`` when a native agent's terminal died
+        before its input-ready probe ever saw the CLI ready, i.e. the CLI never
+        finished starting.
     """
 
     session_id: str
@@ -232,6 +235,7 @@ class TerminalExitEvent:
     closed_outside_omnigent: bool = False
     terminal_instance_id: str | None = None
     lifecycle_context: dict[str, str] = field(default_factory=dict)
+    exited_during_startup: bool = False
 
 
 def _terminal_lifecycle_context(
@@ -591,6 +595,11 @@ class SessionResourceRegistry:
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
+        # Claude sessions whose live pane was launched with stored pass-through
+        # args, and those whose stored args a startup exit has since ruled out
+        # (mapped to whether the chat notice about it is still owed).
+        self._claude_saved_args_launches: set[str] = set()
+        self._claude_saved_args_skipped: dict[str, bool] = {}
         self._is_alive_cache: TTLCache[str, TerminalInstance] = TTLCache(
             maxsize=_IS_ALIVE_CACHE_MAX,
             ttl=_IS_ALIVE_CACHE_TTL_S,
@@ -1013,6 +1022,57 @@ class SessionResourceRegistry:
                 )
             except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent control requests.
                 _logger.debug("Native terminal control telemetry failed (%s)", type(exc).__name__)
+
+    def note_claude_launch_args(self, session_id: str, *, uses_saved_args: bool) -> bool:
+        """
+        Record whether a Claude launch replays the session's stored pass-through args.
+
+        :param session_id: Session/conversation identifier.
+        :param uses_saved_args: Whether the session has stored args besides the
+            permission mode.
+        :returns: ``True`` when the launch should replay them; ``False`` when a
+            startup exit already ruled them out on this runner.
+        """
+        with self._lock:
+            if session_id in self._claude_saved_args_skipped or not uses_saved_args:
+                self._claude_saved_args_launches.discard(session_id)
+                return False
+            self._claude_saved_args_launches.add(session_id)
+            return True
+
+    def skip_claude_saved_args_after_startup_exit(self, session_id: str) -> bool:
+        """
+        Rule out a session's stored Claude args after its pane died during startup.
+
+        A stored arg Claude cannot start with (say an ``--mcp-config`` file that
+        only exists on the machine the session came from) is replayed on every
+        launch, so the session could never start. Later launches on this runner
+        drop the stored args instead. Only the first such exit counts, so a
+        launch that also fails without them is reported as a failure.
+
+        :param session_id: Session/conversation identifier.
+        :returns: ``True`` when the failed launch replayed stored args and the
+            caller should relaunch without them.
+        """
+        with self._lock:
+            if session_id not in self._claude_saved_args_launches:
+                return False
+            self._claude_saved_args_launches.discard(session_id)
+            self._claude_saved_args_skipped[session_id] = True
+            return True
+
+    def take_claude_saved_args_notice(self, session_id: str) -> bool:
+        """
+        Claim the one chat notice owed after a session's stored Claude args were dropped.
+
+        :param session_id: Session/conversation identifier.
+        :returns: ``True`` exactly once per startup exit that ruled the args out.
+        """
+        with self._lock:
+            if not self._claude_saved_args_skipped.get(session_id):
+                return False
+            self._claude_saved_args_skipped[session_id] = False
+            return True
 
     @property
     def terminal_registry(self) -> TerminalRegistry | None:
@@ -2383,6 +2443,7 @@ class SessionResourceRegistry:
                     closed_outside_omnigent=closed_outside_omnigent,
                     terminal_instance_id=instance.diagnostic_id if instance is not None else None,
                     lifecycle_context=lifecycle_context,
+                    exited_during_startup=startup_exit,
                 )
             )
 
@@ -2567,6 +2628,8 @@ class SessionResourceRegistry:
             self._session_activity_epoch.pop(session_id, None)
             self._session_turn_generation.pop(session_id, None)
             self._client_surfaces.pop(session_id, None)
+            self._claude_saved_args_launches.discard(session_id)
+            self._claude_saved_args_skipped.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             self._primary_env_specs.pop(session_id, None)
             skills_directory = self._codex_skills_dirs.pop(session_id, None)
