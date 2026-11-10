@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -55,8 +55,6 @@ from omnigent.inner.executor import (
 from omnigent.inner.model_auth import ProviderAuthRequired
 from omnigent.inner.model_egress import FrozenModelRoute
 from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigner
-from omnigent.models.codex_model_vocabulary import codex_spawn_model
-from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 
 
@@ -512,9 +510,8 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIsInstance(events[2], ToolCallComplete)
             self.assertIsInstance(events[3], TurnComplete)
             self.assertEqual(fake_session.calls[0]["system_prompt"], "Be helpful.")
-            # Codex's own login defaults from codex's catalog, not the generic
-            # OpenAI one, whose newest row is a family alias codex rejects.
-            self.assertEqual(fake_session.calls[0]["model"], CODEX_DEFAULT_MODEL)
+            # Codex's own login leaves the model to codex.
+            self.assertIsNone(fake_session.calls[0]["model"])
             self.assertEqual(fake_session.calls[0]["tools"][0]["name"], "calculate")
 
         _run(_t())
@@ -4539,6 +4536,305 @@ def test_materialize_codex_provider_config_applies_custom_retry_policy(tmp_path:
     assert provider["stream_idle_timeout_ms"] == 300_000
 
 
+@pytest.mark.parametrize(
+    "private_url,source_defined,selected",
+    [
+        (None, True, True),
+        ("https://private.example.test/v1", True, True),
+        (None, False, True),
+        (None, True, False),
+    ],
+    ids=[
+        "missing-private-provider",
+        "private-provider-wins",
+        "missing-source-provider",
+        "unselected",
+    ],
+)
+def test_materialize_codex_provider_config_backfills_only_missing_selected_provider(
+    tmp_path: Path, private_url: str | None, source_defined: bool, selected: bool
+) -> None:
+    """Host definitions can fill a missing selection without replacing private choices."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    original = '[model_providers.unselected]\nname = "Unselected"\n'
+    if source_defined:
+        original += (
+            '[model_providers.gateway]\nname = "Gateway"\n'
+            'base_url = "https://source.example.test/v1"\nwire_api = "responses"\n'
+        )
+    (source / "config.toml").write_text(original)
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    private_config = (
+        'model = "private-model"\ndeveloper_instructions = "Keep these instructions"\n'
+    )
+    if private_url is not None:
+        private_config += (
+            f'[model_providers.gateway]\nname = "Private"\nbase_url = "{private_url}"\n'
+        )
+    config_path.write_text(private_config)
+    overrides = ['model_provider="gateway"'] if selected else []
+
+    assert materialize_codex_provider_config(private, overrides, source_home=source) == overrides
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    assert config["developer_instructions"] == "Keep these instructions"
+    providers = config.get("model_providers", {})
+    assert "unselected" not in providers
+    if private_url is not None:
+        assert providers["gateway"]["base_url"] == private_url
+        assert providers["gateway"]["name"] == "Private"
+    elif selected and source_defined:
+        assert providers["gateway"]["base_url"] == "https://source.example.test/v1"
+    else:
+        assert "gateway" not in providers
+    assert (source / "config.toml").read_text() == original
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("private_style", ["inline", "standard"])
+def test_materialize_codex_provider_config_backfill_matches_private_table_style(
+    tmp_path: Path, private_style: str
+) -> None:
+    """A copied provider, nested tables included, serializes in the private file's table style."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Gateway"\n'
+        'base_url = "https://source.example.test/v1"\nwire_api = "responses"\n'
+        '[model_providers.gateway.auth]\ncommand = "sh"\nargs = ["-c", "printf token"]\n'
+        '[model_providers.gateway.http_headers]\nX-Trace = "yes"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    if private_style == "inline":
+        config_path.write_text(
+            'model = "private-model"\n'
+            "model_providers = { other = "
+            '{ name = "Other", base_url = "https://other.example.test" } }\n'
+        )
+    else:
+        config_path.write_text(
+            'model = "private-model"\n'
+            '[model_providers.other]\nname = "Other"\nbase_url = "https://other.example.test"\n'
+        )
+    overrides = ['model_provider="gateway"']
+
+    assert materialize_codex_provider_config(private, overrides, source_home=source) == overrides
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    providers = config["model_providers"]
+    assert providers["other"]["name"] == "Other"
+    assert providers["other"]["base_url"] == "https://other.example.test"
+    assert providers["gateway"]["base_url"] == "https://source.example.test/v1"
+    assert providers["gateway"]["auth"]["args"] == ["-c", "printf token"]
+    assert providers["gateway"]["http_headers"]["X-Trace"] == "yes"
+
+
+def test_materialize_codex_provider_config_generated_override_outranks_source_definition(
+    tmp_path: Path,
+) -> None:
+    """A generated table for the selected provider is kept over the host's definition."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Host"\nbase_url = "https://source.example.test/v1"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "config.toml").write_text('model = "private-model"\n')
+    generated = (
+        'model_providers.gateway={name="Generated",'
+        'base_url="https://generated.example.test/v1",wire_api="responses"}'
+    )
+
+    assert materialize_codex_provider_config(
+        private, [generated, 'model_provider="gateway"'], source_home=source
+    ) == ['model_provider="gateway"']
+
+    provider = tomllib.loads((private / "config.toml").read_text())["model_providers"]["gateway"]
+    assert provider["name"] == "Generated"
+    assert provider["base_url"] == "https://generated.example.test/v1"
+
+
+@pytest.mark.parametrize(
+    "private_selection,overrides,expected",
+    [
+        (None, ["model_provider=gateway"], {"gateway"}),
+        (None, ['model_provider="gateway"', "model_provider=other"], {"other"}),
+        ("other", ["model_provider=gateway"], {"gateway"}),
+    ],
+    ids=["bare-value-selects", "last-override-wins", "override-replaces-private-selection"],
+)
+def test_materialize_codex_provider_config_reads_selection_like_codex(
+    tmp_path: Path, private_selection: str | None, overrides: list[str], expected: set[str]
+) -> None:
+    """A bare ``model_provider=name`` selects that provider and the last override wins."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Gateway"\n[model_providers.other]\nname = "Other"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    private_config = 'model = "private-model"\n'
+    if private_selection is not None:
+        private_config += f'model_provider = "{private_selection}"\n'
+    config_path.write_text(private_config)
+
+    assert materialize_codex_provider_config(private, overrides, source_home=source) == overrides
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    assert config.get("model_provider") == private_selection
+    assert set(config["model_providers"]) == expected
+
+
+def test_materialize_codex_provider_config_backfills_the_active_profile_selection(
+    tmp_path: Path,
+) -> None:
+    """Without an override, the private config's active profile decides the selection."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Gateway"\n[model_providers.other]\nname = "Other"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    config_path.write_text(
+        'model = "private-model"\nprofile = "work"\nmodel_provider = "other"\n'
+        '[profiles.work]\nmodel_provider = "gateway"\n'
+    )
+
+    assert materialize_codex_provider_config(private, [], source_home=source) == []
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["profile"] == "work"
+    assert config["model_provider"] == "other"
+    assert set(config["model_providers"]) == {"gateway"}
+
+
+@pytest.mark.parametrize("source_failure", ["toml", "utf8", "read", "stat"])
+def test_materialize_codex_provider_config_skips_unusable_optional_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    source_failure: str,
+) -> None:
+    """A host source failure cannot preempt providers supplied by other Codex layers."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.spec.types import RetryPolicy
+
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    original_private = (
+        'model = "private-model"\n'
+        '[model_providers.existing]\nname = "Private"\nbase_url = "https://private.example.test"\n'
+    )
+    config_path.write_text(original_private)
+    source = tmp_path / "source"
+    source.mkdir()
+    source_path = source / "config.toml"
+    original_source = (
+        b"model_providers = ["
+        if source_failure == "toml"
+        else b"\xff"
+        if source_failure == "utf8"
+        else b""
+    )
+    source_path.write_bytes(original_source)
+    read_text = Path.read_text
+    is_file = Path.is_file
+
+    def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        if path == source_path and source_failure == "read":
+            raise PermissionError("source read unavailable")
+        return read_text(path, encoding=encoding, errors=errors)
+
+    def exists(path: Path) -> bool:
+        if path == source_path and source_failure == "stat":
+            raise OSError("source metadata unavailable")
+        return is_file(path)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(Path, "is_file", exists)
+    overrides = ['model_provider="managed_gateway"']
+
+    assert (
+        materialize_codex_provider_config(
+            private, overrides, source_home=source, retry_policy=RetryPolicy(max_retries=9)
+        )
+        == overrides
+    )
+    assert "skipping unusable Codex source config" in caplog.text
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    assert set(config["model_providers"]) == {"existing"}
+    existing = config["model_providers"]["existing"]
+    assert existing["name"] == "Private"
+    assert existing["base_url"] == "https://private.example.test"
+    assert existing["request_max_retries"] == existing["stream_max_retries"] == 9
+    assert source_path.read_bytes() == original_source
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    "private_config", [b"model_providers = [", b"model_providers = 42\n", b"\xff"]
+)
+def test_materialize_codex_provider_config_preserves_invalid_private_config(
+    tmp_path: Path, private_config: bytes
+) -> None:
+    """A source definition cannot replace malformed private configuration."""
+    import tomlkit
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    config_path.write_bytes(private_config)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text('[model_providers.gateway]\nname = "Gateway"\n')
+
+    with pytest.raises((ValueError, tomlkit.exceptions.TOMLKitError)):
+        materialize_codex_provider_config(
+            private, ['model_provider="gateway"'], source_home=source
+        )
+
+    assert config_path.read_bytes() == private_config
+
+
 def test_materialize_codex_provider_config_leaves_builtin_provider_tables_untouched(
     tmp_path: Path,
 ) -> None:
@@ -5654,12 +5950,11 @@ def test_signer_backed_executor_rejects_ordinary_egress_rules_before_session() -
         )
 
 
-def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
-    """With no model anywhere, a codex-login turn gets a model codex accepts.
+def test_run_turn_leaves_the_default_to_codex_on_codexs_own_login():
+    """With no model anywhere, a codex-login turn starts on codex's own default.
 
-    The bundled OpenAI catalog's newest row is the bare family alias
-    ``gpt-5.6``, which a ChatGPT-account backend rejects with a 400, so this
-    path must default from codex's own catalog instead.
+    Omnigent names no model, so codex resolves its configured or catalog
+    default instead of a release-pinned arm that can lag codex's catalog.
     """
 
     async def _t():
@@ -5675,8 +5970,7 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
         ):
             pass
         model = fake_session.calls[0]["model"]
-        assert model == CODEX_DEFAULT_MODEL
-        assert codex_spawn_model(model) == model, "not codex's own spelling"
+        assert model is None
 
     _run(_t())
 
@@ -6158,3 +6452,246 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
         assert session._certificate_failure is None
 
     _run(_t())
+
+
+@pytest.fixture
+def disabled_mcp_session(tmp_path, monkeypatch):
+    from omnigent import mcp_disabled_servers as disabled
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
+    (source_home / "config.toml").write_text('[mcp_servers.fixture]\ncommand="true"\n')
+    plans = []
+    real_plan = disabled.plan_codex_launch
+
+    def plan(*args, **kwargs):
+        result = real_plan(*args, **kwargs)
+        plans.append(result)
+        return result
+
+    hook = Mock(side_effect=plan)
+    monkeypatch.setattr(disabled, "plan_codex_launch", hook)
+
+    async def prepare(_home, overrides, **_kwargs):
+        return list(overrides)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.prepare_codex_provider_config", prepare
+    )
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd=str(tmp_path),
+        env={},
+        tool_executor=None,
+        codex_config_overrides=["base=true"],
+        active_harnesses=launch_activation(["codex"]),
+    )
+    spawns = []
+    processes = []
+
+    async def spawn(*args, **kwargs):
+        spawns.append(args)
+        process = _FakeProcess()
+        process.stdout = _ScriptedStdoutPipe([])
+        processes.append(process)
+        return process
+
+    initialize = AsyncMock(return_value={"result": {}})
+    monkeypatch.setattr(session, "_request", initialize)
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    return SimpleNamespace(
+        session=session,
+        spawns=spawns,
+        processes=processes,
+        initialize=initialize,
+        source_home=source_home,
+        hook=hook,
+        plans=plans,
+    )
+
+
+@pytest.fixture
+def signed_disabled_mcp_session(disabled_mcp_session, monkeypatch):
+    from omnigent.inner.codex_worker import CodexWorkerLaunch
+    from tests.inner.test_model_signer_lifecycle import _Signer
+
+    harness = disabled_mcp_session
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    signer = _Signer([])
+    harness.signer = signer
+    harness.session._signer_factory = lambda: signer
+    harness.session._os_env_spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"))
+    # Signer homes omit ambient MCPs; this server belongs to the caller's CLI layer.
+    harness.baseline = ("base=true", 'mcp_servers.fixture.command="true"')
+    harness.session._base_codex_config_overrides = harness.baseline
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        lambda **kwargs: CodexWorkerLaunch("/bin/echo", sandboxed=True),
+    )
+    return harness
+
+
+@pytest.mark.parametrize(
+    "error",
+    [BrokenPipeError(), ConnectionResetError(), None],
+    ids=["broken-pipe", "connection-reset", "stdout-eof"],
+)
+async def test_disabled_mcp_applied_early_exit_relaunches_baseline(
+    signed_disabled_mcp_session, caplog, error
+):
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = signed_disabled_mcp_session
+    session = harness.session
+
+    async def initialize(method, params):
+        if len(harness.spawns) == 1:
+            session._recent_stderr.append(_CERTIFICATE_STDERR_LINE)
+            session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+            session._saw_connection_retry = True
+            process = harness.processes[-1]
+            if error is not None:
+                process.returncode = 1
+                raise error
+
+            async def wait_for_exit():
+                # stdout EOF precedes asyncio's child-exit notification.
+                await asyncio.sleep(0)
+                process.returncode = 1
+                return 1
+
+            process.wait = wait_for_exit
+            process.stdout = _FakePipe()
+            return await _CodexAppServerSession._request(session, method, params)
+        assert not harness.signer.closed
+        assert session._signer is harness.signer
+        assert session._certificate_failure is None
+        assert session._recent_stderr == []
+        assert not session._saw_connection_retry
+        return {"result": {}}
+
+    harness.initialize.side_effect = initialize
+    try:
+        await harness.session.start()
+        baseline_argv = (
+            "/bin/echo",
+            "app-server",
+            "-c",
+            harness.baseline[0],
+            "-c",
+            harness.baseline[1],
+            "-c",
+            f"sqlite_home={json.dumps(str(session._codex_home_dir))}",
+            "-c",
+            "features.memories=false",
+        )
+        assert [args[args.index("/bin/echo") :] for args in harness.spawns] == [
+            (*baseline_argv, "-c", "mcp_servers.fixture.enabled=false"),
+            baseline_argv,
+        ]
+        assert not harness.signer.closed
+        assert caplog.text.count(RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
+        harness.hook.assert_called_once()
+        assert harness.hook.call_args.kwargs["executor"] == "codex"
+        assert harness.hook.call_args.kwargs["active_harnesses"] == ["codex"]
+    finally:
+        await harness.session.close()
+    assert harness.signer.closed
+    assert harness.signer.order.count("signer-close") == 1
+
+
+async def test_disabled_mcp_second_early_exit_is_final(signed_disabled_mcp_session, caplog):
+    from omnigent.errors import HarnessTransportClosedError
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = signed_disabled_mcp_session
+
+    async def initialize(*_args, **_kwargs):
+        harness.processes[-1].returncode = 1
+        raise HarnessTransportClosedError("early EOF", replay_safe=True)
+
+    harness.initialize.side_effect = initialize
+    with pytest.raises(HarnessTransportClosedError):
+        await harness.session.start()
+    assert len(harness.spawns) == 2
+    fallback = harness.plans[0].fallback_config_overrides
+    assert fallback[:2] == harness.baseline
+    assert harness.spawns[1][harness.spawns[1].index("/bin/echo") :] == (
+        "/bin/echo",
+        "app-server",
+        *(arg for override in fallback for arg in ("-c", override)),
+    )
+    assert caplog.text.count(RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
+    assert harness.signer.closed
+    assert harness.signer.order.count("signer-close") == 1
+
+
+async def test_disabled_mcp_not_applied_early_exit_does_not_retry(disabled_mcp_session, caplog):
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = disabled_mcp_session
+    (harness.source_home / "config.toml").write_text("")
+
+    async def initialize(*_args, **_kwargs):
+        harness.processes[-1].returncode = 1
+        raise BrokenPipeError
+
+    harness.initialize.side_effect = initialize
+    with pytest.raises(BrokenPipeError):
+        await harness.session.start()
+    assert harness.spawns == [("/bin/echo", "app-server", "-c", "base=true")]
+    assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
+
+
+@pytest.mark.parametrize("active", [None, [], ["codex"]])
+async def test_disabled_mcp_launch_activation(disabled_mcp_session, active):
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
+    harness = disabled_mcp_session
+    harness.session._mcp_active_harnesses = launch_activation(active)
+    try:
+        await harness.session.start()
+        assert harness.plans[0].outcome == ("applied" if active else "none")
+        baseline = ("/bin/echo", "app-server", "-c", "base=true")
+        expected = (*baseline, "-c", "mcp_servers.fixture.enabled=false") if active else baseline
+        assert harness.spawns == [expected]
+        assert harness.hook.call_args.kwargs["executor"] == "codex"
+        assert harness.hook.call_args.kwargs["active_harnesses"] == active
+    finally:
+        await harness.session.close()
+
+
+@pytest.mark.parametrize(
+    "error", [BrokenPipeError(), ConnectionResetError(), RuntimeError("live")]
+)
+async def test_disabled_mcp_live_initialize_failure_does_not_retry(
+    disabled_mcp_session, caplog, error
+):
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = disabled_mcp_session
+    harness.initialize.side_effect = error
+    with pytest.raises(type(error)):
+        await harness.session.start()
+    assert len(harness.spawns) == 1
+    assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
+
+
+async def test_disabled_mcp_restarts_plan_from_original_baseline(disabled_mcp_session):
+    harness = disabled_mcp_session
+    for _ in range(2):
+        await harness.session.start()
+        await harness.session.close()
+    assert harness.spawns == [
+        ("/bin/echo", "app-server", "-c", "base=true", "-c", "mcp_servers.fixture.enabled=false"),
+        ("/bin/echo", "app-server", "-c", "base=true", "-c", "mcp_servers.fixture.enabled=false"),
+    ]
+    assert [plan.fallback_config_overrides for plan in harness.plans] == [
+        ("base=true",),
+        ("base=true",),
+    ]
+    assert harness.session._codex_config_overrides == ["base=true"]

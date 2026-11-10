@@ -112,6 +112,8 @@ class _StubResourceRegistry:
     def set_session_status_publisher(
         self,
         publisher: Callable[[str, str], None],
+        *,
+        accepts_inferred_status: Callable[[], bool] | None = None,
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.
@@ -120,8 +122,10 @@ class _StubResourceRegistry:
         callback (unused) to satisfy ``create_runner_app``'s wiring.
 
         :param publisher: Callable ``(session_id, status) -> None``.
+        :param accepts_inferred_status: Unused server capability check.
         :returns: None.
         """
+        del accepts_inferred_status
         self._session_status_publisher = publisher
 
     def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
@@ -147,6 +151,10 @@ class _StubResourceRegistry:
 
     def uses_copy_on_write(self, session_id: str) -> bool:
         """The stub has no sandbox environment."""
+        return False
+
+    def session_has_background_agents(self, session_id: str) -> bool:
+        """No terminal is running, so no background agent outlives a turn."""
         return False
 
     def compute_default_env_root(self, session_id: str, agent_spec: Any) -> str:
@@ -459,6 +467,8 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_get_info",
         "sys_session_rename",
         "sys_session_message",
+        "sys_project_list",
+        "sys_session_update",
         "ui_open_file",
         "sys_agent_list",
         "sys_agent_get",

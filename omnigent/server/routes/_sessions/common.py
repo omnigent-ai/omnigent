@@ -675,6 +675,13 @@ _session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskIn
 )
 
 
+# Background agents a finished claude-native turn left running, as of this
+# replica's last ``waiting`` edge. Any other status edge drops the entry.
+_session_background_agents_cache: WorkspaceScopedCache[str, list[BackgroundTaskInfo]] = (
+    WorkspaceScopedCache()
+)
+
+
 # Why a running session's agent is parked on a terminal prompt, as of the last
 # status edge this replica published; ``""`` when that edge was not parked.
 # Absent when this replica has no edge, in which case the list reads the row.
@@ -1298,6 +1305,7 @@ __all__ = [
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
+    "_session_background_agents_cache",
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_blocked_on_cache",

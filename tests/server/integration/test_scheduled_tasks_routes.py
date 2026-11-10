@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -533,6 +534,31 @@ async def test_profile_schedules_are_rejected_before_persistence(
             assert tasks[0]["execution_target"] == "connected_host"
 
 
+async def test_profile_schedules_with_a_default_profile_are_saved(auth_app, auth_client, db_uri):
+    import dataclasses
+
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
+
+    _make_user(db_uri)
+    deployment = _sandbox_deployment(manages_profiles=True)
+    factory = Mock(side_effect=AssertionError("Schedule validation must not construct providers"))
+    deployment = ManagedSandboxDeployment.single(
+        dataclasses.replace(
+            deployment.default, launcher_factory=factory, default_profile_id="build"
+        )
+    )
+    auth_app.state.sandbox_config = deployment
+    auth_app.state.sandbox_profiles = SandboxProfileCatalog(
+        SqlAlchemyConversationStore(db_uri), deployment
+    )
+    body = _create_body(execution_target="managed_sandbox")
+    del body["host_id"], body["workspace"]
+    response = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert response.status_code == 200, response.text
+    assert response.json()["execution_target"] == "managed_sandbox"
+    factory.assert_not_called()
+
+
 async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -751,7 +777,14 @@ async def test_create_rejects_invalid_reasoning_effort(
     [(CLAUDE_NATIVE_AGENT_NAME, "acceptEdits")]
     + [
         (CODEX_NATIVE_AGENT_NAME, mode)
-        for mode in ("default", "ask-for-approval", "approve-for-me", "read-only")
+        for mode in (
+            "default",
+            "ask-for-approval",
+            "approve-for-me",
+            "full-access",
+            "read-only",
+            "bypass",
+        )
     ],
 )
 async def test_create_persists_permission_mode(
@@ -772,53 +805,18 @@ async def test_create_persists_permission_mode(
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["permission_mode"] == mode
-    if mode == "default":
-        # Patch to a different allowed mode so the read-back proves the update was saved.
-        changed = await auth_client.patch(
-            f"/v1/scheduled-tasks/{task_id}",
-            json={"permission_mode": "read-only"},
-            headers=_headers(),
-        )
-        assert changed.status_code == 200, changed.text
-        assert changed.json()["permission_mode"] == "read-only"
-        reread = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
-        assert reread.json()["permission_mode"] == "read-only"
-
-
-@pytest.mark.parametrize(
-    ("agent_name", "mode"),
-    [
-        (CLAUDE_NATIVE_AGENT_NAME, "bypassPermissions"),
-        (CLAUDE_NATIVE_AGENT_NAME, "dontAsk"),
-        (CODEX_NATIVE_AGENT_NAME, "full-access"),
-        (CODEX_NATIVE_AGENT_NAME, "bypass"),
-    ],
-)
-async def test_save_rejects_unattended_disallowed_permission_mode(
-    auth_client: httpx.AsyncClient, db_uri: str, agent_name: str, mode: str
-) -> None:
-    """Create and update refuse modes that would run unattended without approval."""
-    _make_user(db_uri)
-    agent_id = builtin_agent_id(agent_name)
-    created = await auth_client.post(
-        "/v1/scheduled-tasks",
-        json=_create_body(agent_id=agent_id, permission_mode=mode),
-        headers=_headers(),
-    )
-    assert created.status_code == 400, created.text
-    assert "unattended" in created.text
-
-    ok = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(agent_id=agent_id), headers=_headers()
-    )
-    assert ok.status_code == 200, ok.text
-    patched = await auth_client.patch(
-        f"/v1/scheduled-tasks/{ok.json()['id']}",
-        json={"permission_mode": mode},
-        headers=_headers(),
-    )
-    assert patched.status_code == 400, patched.text
-    assert "unattended" in patched.text
+    if mode == "full-access":
+        # Patch out of and back into modes that skip approval; read-backs prove each saved.
+        for patched_mode in ("read-only", "bypass"):
+            changed = await auth_client.patch(
+                f"/v1/scheduled-tasks/{task_id}",
+                json={"permission_mode": patched_mode},
+                headers=_headers(),
+            )
+            assert changed.status_code == 200, changed.text
+            assert changed.json()["permission_mode"] == patched_mode
+            reread = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+            assert reread.json()["permission_mode"] == patched_mode
 
 
 @pytest.mark.parametrize("operation", ["create", "update"])
@@ -871,6 +869,7 @@ async def test_create_rejects_invalid_permission_mode(
     )
     assert resp.status_code == 400, resp.text
     assert "Unsupported permission_mode" in resp.text
+    assert "JSON null (not the string 'null') for the agent default" in resp.text
 
 
 async def test_create_rejects_relative_workspace(
@@ -1280,7 +1279,7 @@ async def test_update_agent_switch_clears_the_old_harnesss_settings(
         await auth_client.post(
             "/v1/scheduled-tasks",
             json=_create_body(
-                permission_mode="acceptEdits",
+                permission_mode="bypassPermissions",
                 model_override="databricks-claude-sonnet-4-6",
                 reasoning_effort="high",
             ),
@@ -1288,7 +1287,7 @@ async def test_update_agent_switch_clears_the_old_harnesss_settings(
         )
     ).json()
     task_id = created["id"]
-    assert created["permission_mode"] == "acceptEdits"
+    assert created["permission_mode"] == "bypassPermissions"
 
     patched = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}",
@@ -1454,20 +1453,20 @@ async def test_update_clears_permission_mode_with_explicit_null(
     """PATCH ``permission_mode: null`` clears a previously-set mode end-to-end.
 
     The edit dialog resets the control to Default by sending an explicit null,
-    so a task launched with ``acceptEdits`` must actually revert to the
-    agent default (not silently keep the old mode). Asserts the PERSISTED
+    so a task launched with ``bypassPermissions`` must actually revert to the
+    agent default (not silently keep the dangerous mode). Asserts the PERSISTED
     value via a read-back, not just the response.
     """
     _make_user(db_uri)
     created = (
         await auth_client.post(
             "/v1/scheduled-tasks",
-            json=_create_body(permission_mode="acceptEdits"),
+            json=_create_body(permission_mode="bypassPermissions"),
             headers=_headers(),
         )
     ).json()
     task_id = created["id"]
-    assert created["permission_mode"] == "acceptEdits"
+    assert created["permission_mode"] == "bypassPermissions"
 
     patched = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}",
@@ -1544,9 +1543,15 @@ async def test_update_rejects_invalid_reasoning_effort(
 
 
 @pytest.mark.parametrize("claimed", [False, True])
+@pytest.mark.parametrize("shared", [False, True])
 async def test_delete_removes_task(
-    auth_client: httpx.AsyncClient, db_uri: str, claimed: bool
+    auth_client: httpx.AsyncClient, db_uri: str, claimed: bool, shared: bool
 ) -> None:
+    from omnigent.db.db_models import current_workspace_id
+    from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+    from omnigent.stores.host_store import HostStore
+
     _make_user(db_uri)
     created = (
         await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
@@ -1571,8 +1576,39 @@ async def test_delete_removes_task(
             is not None
         )
 
+    hosts = HostStore(db_uri)
+    host_id = continued_sandbox_host_id(task_id, current_workspace_id())
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="automation",
+        user_id="alice@example.com",
+        token="retained",
+        provider="modal",
+        sandbox_id="retained",
+        token_expires_at=2_000_000_000,
+    )
+    hosts.upsert_on_connect(host_id=host_id, name="automation", user_id="alice@example.com")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    session = conversations.create_conversation(
+        host_id=host_id, workspace="/work", labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id}
+    )
+    if shared:
+        peer = conversations.create_conversation(host_id=host_id, workspace="/work")
+        conversations.update_conversation(peer.id, archived=True)
+    assert await conversations.delete_conversation(session.id)
+    assert hosts.get_host(host_id).status == "online"
+
     deleted = await auth_client.delete(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert deleted.status_code == 200, deleted.text
+    retained_host = hosts.get_host(host_id, include_deleted=True)
+    assert retained_host is not None
+    assert (retained_host.deleted_at is None) is shared
+    if shared:
+        assert retained_host.status == "online"
+        assert conversations.get_conversation(peer.id).host_id == host_id
+    else:
+        assert retained_host.sandbox_id == "retained"
+        assert hosts.resolve_launch_token(host_id, "retained") is None
 
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 404
@@ -3029,6 +3065,22 @@ async def test_create_can_continue_a_session_the_owner_picked(
     # The task runs the session's own agent rather than taking a copy.
     assert body["agent_id"] == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
 
+    # A session that skips approval takes only a task that selects such a mode itself.
+    bypassing = _owned_session(
+        db_uri, labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+    )
+    for permission_mode, status in ((None, 400), ("auto", 400), ("bypassPermissions", 200)):
+        picked = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(
+                session_mode="continue", session_id=bypassing, permission_mode=permission_mode
+            ),
+            headers=_headers(),
+        )
+        assert picked.status_code == status, (permission_mode, picked.text)
+        if status == 400:
+            assert "which skips approval" in picked.json()["error"]["message"]
+
 
 async def test_a_picked_session_must_be_the_owners_and_fit_the_task(
     auth_client: httpx.AsyncClient, db_uri: str
@@ -3061,6 +3113,474 @@ async def test_a_picked_session_must_be_the_owners_and_fit_the_task(
         headers=_headers(),
     )
     assert new_mode.status_code == 422, new_mode.text
+
+
+def _session_with_history(
+    db_uri: str, owner: str = "alice@example.com", *, finished: bool = True, **fields: object
+) -> str:
+    """An owned session with one finished exchange and a turn still in progress.
+
+    The turn in progress has sent progress text, a completed message like a
+    reply, and waits on its tool call. With ``finished=False`` the session holds
+    only the first turn's message, with no reply yet.
+    """
+    from omnigent.entities import FunctionCallData, NewConversationItem
+
+    session_id = _owned_session(db_uri, owner, **fields)
+    items = [_message("user", "resp_1", "summarize the alerts")]
+    if finished:
+        items += [
+            _message("assistant", "resp_1", "three alerts"),
+            _message("user", "resp_2", "and the next turn"),
+            _message("assistant", "resp_2", "checking the next one"),
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_2",
+                data=FunctionCallData(
+                    agent="claude-native", name="Bash", arguments="{}", call_id="call_1"
+                ),
+            ),
+        ]
+    SqlAlchemyConversationStore(db_uri).append(session_id, items)
+    return session_id
+
+
+def _message(role: str, response_id: str, text: str) -> Any:
+    from omnigent.entities import MessageData, NewConversationItem
+
+    part = "input_text" if role == "user" else "output_text"
+    return NewConversationItem(
+        type="message",
+        response_id=response_id,
+        data=MessageData(
+            role=role,
+            content=[{"type": part, "text": text}],
+            agent=None if role == "user" else "claude-native",
+        ),
+    )
+
+
+def _item_texts(db_uri: str, session_id: str) -> list[str]:
+    """Each message's text, and the type of any other item."""
+    texts = []
+    for item in SqlAlchemyConversationStore(db_uri).list_items(session_id).data:
+        if item.type != "message":
+            texts.append(item.type)
+            continue
+        part = item.data.content[0]
+        texts.append(part["text"] if isinstance(part, dict) else part.text)
+    return texts
+
+
+async def test_create_from_a_session_copies_it_for_the_runs(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    source_id = _session_with_history(db_uri)
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=source_id, prompt=""),
+        headers=_headers(),
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert (body["session_mode"], body["prompt"]) == ("new", "")
+    source_copy_id = body["source_session_id"]
+    assert source_copy_id not in (None, source_id)
+    source_copy = SqlAlchemyConversationStore(db_uri).get_conversation(source_copy_id)
+    assert source_copy is not None
+    assert source_copy.title == "nightly triage"
+    assert source_copy.labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] == body["id"]
+    # Copied through the last finished reply; the turn in progress stays behind.
+    assert _item_texts(db_uri, source_copy_id) == ["summarize the alerts", "three alerts"]
+    assert _item_texts(db_uri, source_id)[2:] == [
+        "and the next turn",
+        "checking the next one",
+        "function_call",
+    ]
+    assert SqlAlchemyPermissionStore(db_uri).check_access(
+        "alice@example.com", source_copy_id, LEVEL_OWNER
+    )
+    fetched = await auth_client.get(f"/v1/scheduled-tasks/{body['id']}", headers=_headers())
+    assert fetched.json()["source_session_id"] == source_copy_id
+
+
+@pytest.mark.parametrize(
+    ("live_status", "last_copied"), [("idle", "all fixed"), ("running", "three alerts")]
+)
+async def test_a_running_sessions_newest_reply_stays_out_of_the_copy(
+    auth_client: httpx.AsyncClient, db_uri: str, live_status: str, last_copied: str
+) -> None:
+    from omnigent.entities import FunctionCallOutputData, NewConversationItem
+
+    source_id = _session_with_history(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    # The tool call returns and the turn replies, which ends the turn only once it goes idle.
+    output = FunctionCallOutputData(call_id="call_1", output="ok")
+    store.append(
+        source_id,
+        [
+            NewConversationItem(type="function_call_output", response_id="resp_2", data=output),
+            _message("assistant", "resp_2", "all fixed"),
+        ],
+    )
+    store.set_session_live_status(source_id, live_status)
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert _item_texts(db_uri, resp.json()["source_session_id"])[-1] == last_copied
+
+
+async def test_a_source_session_must_be_the_owners_top_level_session(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri, "bob@example.com")
+    parent = _owned_session(db_uri)
+    existing = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=_session_with_history(db_uri)),
+        headers=_headers(),
+    )
+    assert existing.status_code == 200, existing.text
+    cases = {
+        "someone else's": (_owned_session(db_uri, "bob@example.com"), 404),
+        "missing": ("cd" * 16, 404),
+        "a sub-agent's": (_owned_session(db_uri, parent_conversation_id=parent), 400),
+        "an automation's copy": (existing.json()["source_session_id"], 400),
+        "one with no finished reply yet": (_session_with_history(db_uri, finished=False), 400),
+    }
+    for label, (session_id, status) in cases.items():
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=session_id),
+            headers=_headers(),
+        )
+        assert resp.status_code == status, (label, resp.text)
+
+    continuing = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=parent, session_mode="continue"),
+        headers=_headers(),
+    )
+    assert continuing.status_code == 422, continuing.text
+
+
+async def test_a_task_that_starts_from_a_session_can_switch_agents_but_not_continue(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    codex = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    claude = builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+    # Runs can use another agent than the copied session's; the copy keeps its own.
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=_session_with_history(db_uri), agent_id=codex),
+            headers=_headers(),
+        )
+    ).json()
+    assert created["agent_id"] == codex
+    copy = SqlAlchemyConversationStore(db_uri).get_conversation(created["source_session_id"])
+    assert copy is not None and copy.agent_id == claude
+    url = f"/v1/scheduled-tasks/{created['id']}"
+
+    switched = await auth_client.patch(url, json={"agent_id": claude}, headers=_headers())
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["agent_id"] == claude
+    continuing = await auth_client.patch(
+        url, json={"session_mode": "continue"}, headers=_headers()
+    )
+    assert continuing.status_code == 400, continuing.text
+    cleared = await auth_client.patch(url, json={"prompt": ""}, headers=_headers())
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["source_session_id"] == created["source_session_id"]
+
+
+async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.scheduled import source_session
+    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+
+    claude = builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+    # Only the session's agent rebuilds a copied transcript; the task's doesn't.
+    monkeypatch.setattr(source_session, "carries_native_history", lambda agent: agent.id == claude)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            source_session_id=_session_with_history(db_uri),
+            agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME),
+        ),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+
+    copy = SqlAlchemyConversationStore(db_uri).get_conversation(
+        created.json()["source_session_id"]
+    )
+    assert copy is not None and copy.agent_id == claude
+    assert copy.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+
+
+async def test_runs_need_an_agent_that_can_open_the_sessions_file_attachments(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.native.native_coding_agents import PI_NATIVE_AGENT_NAME
+
+    source_id = _owned_session(db_uri)
+    stored = SqlAlchemyFileStore(db_uri).create(
+        filename="sample.zip", bytes=4, session_id=source_id
+    )
+    SqlAlchemyConversationStore(db_uri).append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(
+                    role="user",
+                    content=[
+                        {"type": "input_text", "text": "summarize this"},
+                        {"type": "input_file", "file_id": stored.id, "filename": "sample.zip"},
+                    ],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "done"}],
+                    agent="claude-native",
+                ),
+            ),
+        ],
+    )
+    pi = builtin_agent_id(PI_NATIVE_AGENT_NAME)
+
+    # Pi can't open the zip the copied history refers to, as with a fork.
+    rejected = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=source_id, agent_id=pi),
+        headers=_headers(),
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "sample.zip" in rejected.json()["error"]["message"]
+
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    switched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created.json()['id']}", json={"agent_id": pi}, headers=_headers()
+    )
+    assert switched.status_code == 400, switched.text
+    assert "sample.zip" in switched.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("source_drops_its_file", [False, True])
+async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    source_drops_its_file: bool,
+) -> None:
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.scheduled import source_session
+
+    source_id = _session_with_history(db_uri)
+    files = SqlAlchemyFileStore(db_uri)
+    files.create(filename="notes.txt", bytes=5, session_id=source_id)
+    copies: list[tuple[str, list[str]]] = []
+    copy_session = source_session.copy_session
+
+    def _recording_copy(**kwargs: Any) -> Any:
+        conv = copy_session(**kwargs)
+        copies.append((conv.id, [stored.filename for stored in files.list(conv.id).data]))
+        return conv
+
+    def _failing_create(*args: Any, **kwargs: Any) -> None:
+        if source_drops_its_file:
+            # The copy then holds the blob's last row, and the blob won't delete.
+            files.delete_all_for_session(source_id)
+        raise OmnigentError("store unavailable", code=ErrorCode.INVALID_INPUT)
+
+    def _failing_blob_delete(self: Any, key: str) -> None:
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr(source_session, "copy_session", _recording_copy)
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "create", _failing_create)
+    monkeypatch.setattr(LocalArtifactStore, "delete", _failing_blob_delete)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+    assert resp.status_code == 400, resp.text
+
+    # The copy and the file row it had are gone; the source keeps its own file.
+    ((copy_id, copied_files),) = copies
+    assert copied_files == ["notes.txt"]
+    assert SqlAlchemyConversationStore(db_uri).get_conversation(copy_id) is None
+    assert files.list(copy_id).data == []
+    kept = [] if source_drops_its_file else ["notes.txt"]
+    assert [stored.filename for stored in files.list(source_id).data] == kept
+
+
+async def test_a_copy_that_cannot_take_every_file_is_deleted(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_id = _session_with_history(db_uri)
+    files = SqlAlchemyFileStore(db_uri)
+    for filename in ("notes.txt", "more.txt"):
+        files.create(filename=filename, bytes=5, session_id=source_id)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    before = {conv.id for conv in conversations.list_conversations(limit=100).data}
+    create = SqlAlchemyFileStore.create
+    copy_rows: list[str] = []
+
+    def _second_copy_row_fails(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("session_id") != source_id:
+            copy_rows.append(kwargs["session_id"])
+            if len(copy_rows) == 2:
+                raise RuntimeError("database unavailable")
+        return create(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyFileStore, "create", _second_copy_row_fails)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+
+    assert resp.status_code == 500, resp.text
+    # The partial copy and the row it did get are gone; the source keeps its files.
+    assert {conv.id for conv in conversations.list_conversations(limit=100).data} == before
+    assert files.list(copy_rows[0]).data == []
+    assert sorted(stored.filename for stored in files.list(source_id).data) == [
+        "more.txt",
+        "notes.txt",
+    ]
+
+
+@pytest.mark.parametrize("stage", ["copy", "user", "grant"])
+async def test_a_cancelled_create_deletes_the_copy_once_its_writes_settle(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    import threading
+
+    from omnigent.server.scheduled import source_session
+
+    source_id = _session_with_history(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    before = {conv.id for conv in conversations.list_conversations(limit=100).data}
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+
+    def _held(call: Callable[..., Any]) -> Callable[..., Any]:
+        # The write commits, then its thread waits past the cancellation.
+        def held(*args: Any, **kwargs: Any) -> Any:
+            result = call(*args, **kwargs)
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5)
+            return result
+
+        return held
+
+    if stage == "copy":
+        monkeypatch.setattr(source_session, "copy_session", _held(source_session.copy_session))
+    else:
+        name = "ensure_user" if stage == "user" else "grant"
+        monkeypatch.setattr(
+            SqlAlchemyPermissionStore, name, _held(getattr(SqlAlchemyPermissionStore, name))
+        )
+    pending = asyncio.create_task(
+        auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=source_id),
+            headers=_headers(),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    pending.cancel()
+    await asyncio.sleep(0)
+    # A second cancellation must not interrupt the cleanup.
+    pending.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pending, 5)
+
+    assert {conv.id for conv in conversations.list_conversations(limit=100).data} == before
+
+
+async def test_a_copy_takes_only_attachments_the_deployment_accepts(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_id = _session_with_history(db_uri)
+    SqlAlchemyFileStore(db_uri).create(filename="bundle.zip", bytes=5, session_id=source_id)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    before = {conv.id for conv in conversations.list_conversations(limit=100).data}
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_denied_extensions": ["zip"]},
+    )
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+
+    assert resp.status_code == 415, resp.text
+    # Refused before anything is copied.
+    assert {conv.id for conv in conversations.list_conversations(limit=100).data} == before
+
+
+@pytest.mark.parametrize("failing", ["label clear", "task delete"])
+async def test_deleting_the_automation_keeps_its_copy_as_an_ordinary_session(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    source_id = _session_with_history(db_uri, title="Daily alerts")
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=source_id),
+            headers=_headers(),
+        )
+    ).json()
+    copy_id = created["source_session_id"]
+    conversations = SqlAlchemyConversationStore(db_uri)
+    copy = conversations.get_conversation(copy_id)
+    assert copy is not None and copy.title == "Daily alerts"
+
+    # Either step failing fails the delete with the automation and its label kept,
+    # so a retry can finish.
+    def _unavailable(self: Any, *args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("database unavailable")
+
+    with monkeypatch.context() as broken:
+        if failing == "label clear":
+            broken.setattr(SqlAlchemyConversationStore, "delete_label", _unavailable)
+        else:
+            broken.setattr(SqlAlchemyScheduledTaskStore, "delete", _unavailable)
+        with pytest.raises(RuntimeError):
+            await auth_client.delete(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    still = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    assert still.status_code == 200, still.text
+    labelled = conversations.get_conversation(copy_id)
+    assert labelled is not None
+    assert labelled.labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] == created["id"]
+
+    deleted = await auth_client.delete(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+
+    assert deleted.status_code == 200, deleted.text
+    kept = conversations.get_conversation(copy_id)
+    assert kept is not None
+    assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in kept.labels
 
 
 async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
@@ -3096,6 +3616,37 @@ async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
 
     assert patched.status_code == 200, patched.text
     assert (patched.json()["agent_id"], patched.json()["session_id"]) == (codex, session_id)
+
+    # Picking a session that skips approval checks the requested mode, else the stored one.
+    full_access = _owned_session(
+        db_uri,
+        agent_id=codex,
+        terminal_launch_args=["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+    )
+    for update, status in (
+        ({"permission_mode": "full-access"}, 200),
+        ({}, 200),
+        ({"permission_mode": "approve-for-me"}, 400),
+        ({"permission_mode": None}, 400),
+    ):
+        picked = await auth_client.patch(
+            f"/v1/scheduled-tasks/{created['id']}",
+            json={"session_id": full_access, **update},
+            headers=_headers(),
+        )
+        assert picked.status_code == status, (update, picked.text)
+        if status == 400:
+            assert "which skips approval" in picked.json()["error"]["message"]
+    # Changing only the mode is checked against the session the task continues.
+    for permission_mode, status in (("approve-for-me", 400), (None, 400), ("bypass", 200)):
+        changed = await auth_client.patch(
+            f"/v1/scheduled-tasks/{created['id']}",
+            json={"permission_mode": permission_mode},
+            headers=_headers(),
+        )
+        assert changed.status_code == status, (permission_mode, changed.text)
+        if status == 400:
+            assert "which skips approval" in changed.json()["error"]["message"]
     assert copies == []
 
 

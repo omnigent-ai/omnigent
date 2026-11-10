@@ -27,8 +27,12 @@ from omnigent.server.sandbox_profiles import SandboxProfileCatalog
 from omnigent.server.scheduled.fire import (
     _STAGED_LAUNCH_ERRORS,
     FireDeps,
+    _continued_host_binding,
     _make_managed_sandbox_start,
+    _session_labels,
 )
+from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.helpers import (
     HostStartInvocation,
     register_test_runner,
@@ -47,7 +51,288 @@ from tests.server.integration._sandbox_profile_support import env as env
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.mark.parametrize("mode", ["profile", "ordinary", "flag-off"])
+@pytest.mark.parametrize("controller", [False, True])
+@pytest.mark.parametrize("operation", ["wake", "relaunch", "replace-missing"])
+async def test_unprofiled_session_survives_provider_opt_in(env, controller, operation):
+    from omnigent.onboarding.sandboxes.base import SandboxGoneError
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
+
+    class LegacyLauncher(_Launcher):
+        provider = env.provider
+
+    class UpgradedLauncher(_ProviderLauncher):
+        supports_sandbox_profile_lookup = controller
+        provision = _Launcher.provision
+        resume = _Launcher.resume
+
+        def list_profiles(self, context):
+            if context.sandbox_id is not None:
+                if env.recording.gone:
+                    raise SandboxGoneError("Legacy sandbox is gone")
+                return None
+            return super().list_profiles(context)
+
+    enabled_config = dataclasses.replace(
+        env.app.state.sandbox_config.default,
+        launcher_factory=lambda: UpgradedLauncher(env.recording, env.hosts, owner=_OWNER),
+    )
+    env.app.state.feature_flags = FeatureFlags(frozenset())
+    env.app.state.sandbox_profiles = None
+    env.app.state.sandbox_config = ManagedSandboxDeployment.single(
+        dataclasses.replace(
+            enabled_config,
+            manages_profiles=False,
+            launcher_factory=lambda: LegacyLauncher(env.recording, env.hosts, owner=_OWNER),
+        )
+    )
+    session_id = await env.settled(await env.create("json"))
+    before = env.conversations.get_conversation(session_id)
+    assert env.recording.allocations == [None]
+
+    env.app.state.feature_flags = FeatureFlags(frozenset({Feature.SANDBOX_PROFILES}))
+    env.app.state.sandbox_config = ManagedSandboxDeployment.single(enabled_config)
+    env.app.state.sandbox_profiles = SandboxProfileCatalog(
+        env.conversations, env.app.state.sandbox_config, env.hosts
+    )
+    env.hosts.set_offline(before.host_id)
+    env.recording.gone = operation == "replace-missing"
+    if operation == "relaunch":
+        env.app.state.managed_launches.begin(session_id)
+        await _run_managed_launch(
+            session_id=session_id,
+            owner=_OWNER,
+            sandbox_config=env.app.state.sandbox_config,
+            repos=(),
+            tracker=env.app.state.managed_launches,
+            conversation_store=env.conversations,
+            host_store=env.hosts,
+            host_registry=None,
+            tunnel_registry=None,
+            relaunch_host=env.hosts.get_host(before.host_id),
+            sandbox_profiles=env.catalog,
+        )
+    else:
+        await env.wake(session_id)
+    launch = env.app.state.managed_launches.get(session_id)
+    assert launch is None or launch.error is None
+    assert env.conversations.get_conversation(session_id).host_id == before.host_id
+    assert env.catalog.get_session_snapshot(session_id) is None
+    assert env.recording.selections == []
+    assert env.recording.allocations == [None] * (1 if operation == "wake" else 2)
+    if operation != "relaunch":
+        assert env.recording.resumes == [("profile-sandbox-1", None)]
+    response = await env.create("json")
+    assert response.status_code == 422
+    response = await env.client.post(
+        f"/v1/sessions/{session_id}/fork",
+        json={"host_type": "managed", "sandbox_provider": env.provider},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("operation", ["wake", "relaunch", "replace-missing"])
+async def test_profiled_session_survives_provider_opt_out(env, operation):
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
+
+    class OptedOutLauncher(_Launcher):
+        provider = env.provider
+
+    session_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+    before = env.conversations.get_conversation(session_id)
+    assert env.recording.allocations == [_PROVIDER_CONFIG]
+
+    opted_in = env.app.state.sandbox_config
+    deployment = ManagedSandboxDeployment.single(
+        dataclasses.replace(
+            env.app.state.sandbox_config.default,
+            manages_profiles=False,
+            launcher_factory=lambda: OptedOutLauncher(env.recording, env.hosts, owner=_OWNER),
+        )
+    )
+    env.app.state.sandbox_config = deployment
+    env.app.state.sandbox_profiles = SandboxProfileCatalog(
+        env.conversations, deployment, env.hosts
+    )
+    env.hosts.set_offline(before.host_id)
+    env.recording.gone = operation == "replace-missing"
+    if operation == "relaunch":
+        env.app.state.managed_launches.begin(session_id)
+        await _run_managed_launch(
+            session_id=session_id,
+            owner=_OWNER,
+            sandbox_config=deployment,
+            repos=(),
+            tracker=env.app.state.managed_launches,
+            conversation_store=env.conversations,
+            host_store=env.hosts,
+            host_registry=None,
+            tunnel_registry=None,
+            relaunch_host=env.hosts.get_host(before.host_id),
+            sandbox_profiles=env.catalog,
+        )
+    else:
+        await env.wake(session_id)
+    launch = env.app.state.managed_launches.get(session_id)
+    assert launch is None or launch.error is None
+    assert env.conversations.get_conversation(session_id).host_id == before.host_id
+    # Launches like a session without a profile; the saved reference is kept.
+    assert env.catalog.get_session_snapshot(session_id) is None
+    assert env.catalog._store.get_session_snapshot(session_id) is not None
+    assert env.recording.allocations == [_PROVIDER_CONFIG] + (
+        [] if operation == "wake" else [None]
+    )
+    if operation != "relaunch":
+        assert env.recording.resumes == [("profile-sandbox-1", None)]
+
+    # Opting back in restores the saved profile: the host keeps its id across replacement.
+    env.app.state.sandbox_config = opted_in
+    env.app.state.sandbox_profiles = SandboxProfileCatalog(env.conversations, opted_in, env.hosts)
+    env.recording.gone = False
+    await env.wake(session_id)
+    launch = env.app.state.managed_launches.get(session_id)
+    assert launch is None or launch.error is None
+    assert env.catalog.get_session_snapshot(session_id) is not None
+    assert env.recording.resumes[-1][1] == _PROVIDER_CONFIG
+
+
+def _with_default_profile(env: _Env, profile_id: str) -> None:
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
+
+    deployment = ManagedSandboxDeployment.single(
+        dataclasses.replace(env.app.state.sandbox_config.default, default_profile_id=profile_id)
+    )
+    env.app.state.sandbox_config = deployment
+    env.app.state.sandbox_profiles = SandboxProfileCatalog(
+        env.conversations, deployment, env.hosts
+    )
+
+
+@pytest.mark.parametrize("transport", ["json", "multipart"])
+async def test_create_without_a_selection_takes_the_default_profile(env, transport):
+    _with_default_profile(env, "build")
+    session_id = await env.settled(await env.create(transport))
+    snapshot = env.catalog.get_session_snapshot(session_id)
+    assert snapshot is not None
+    assert (snapshot["id"], snapshot["revision"]) == ("build", _PROVIDER_PROFILE.revision)
+    assert env.recording.allocations == [_PROVIDER_CONFIG]
+    # Saved like an explicit pick: a wake reauthorizes that exact revision.
+    await env.wake(session_id)
+    assert env.recording.resumes == [("profile-sandbox-1", _PROVIDER_CONFIG)]
+
+
+async def test_profile_list_reports_the_default_for_preselection(env):
+    response = await env.client.get("/v1/sandbox-profiles", params={"provider": env.provider})
+    assert response.status_code == 200, response.text
+    assert response.json()["default_profile_ids"] == {}
+    _with_default_profile(env, "build")
+    response = await env.client.get("/v1/sandbox-profiles", params={"provider": env.provider})
+    assert response.json()["default_profile_ids"] == {env.provider: "build"}
+
+
+async def test_default_profile_is_authorized_like_an_explicit_selection(env):
+    _with_default_profile(env, "build")
+    env.recording.allowed_users = set()
+    response = await env.create("json")
+    assert response.status_code == 403, response.text
+    assert env.recording.allocations == []
+
+
+@pytest.mark.parametrize(
+    ("env", "reset"),
+    [
+        ("provider", "repo-change"),
+        ("controller", "repo-change"),
+        ("controller", "deleted-session"),
+        ("provider", "revoked"),
+        ("controller", "revoked"),
+    ],
+    indirect=["env"],
+)
+async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, reset, db_uri):
+    _with_default_profile(env, "build")
+    response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
+    assert response.status_code == 201, response.text
+    session_id = response.json()["id"]
+    conversation = env.conversations.get_conversation(session_id)
+    assert conversation is not None
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    deps = FireDeps(
+        scheduled_task_store=schedules,
+        agent_store=env.app.state.agent_store,
+        conversation_store=env.conversations,
+        permission_store=None,
+        host_store=env.hosts,
+        host_registry=None,
+        sandbox_config=env.app.state.sandbox_config,
+        managed_launches=env.app.state.managed_launches,
+        app_state=env.app.state,
+    )
+    task = schedules.create(
+        scheduled_task_id=str(uuid.uuid4()),
+        name="Profile automation",
+        prompt="Check the repository",
+        rrule="FREQ=HOURLY",
+        timezone="UTC",
+        user_id=_OWNER,
+        agent_id=env.agent_id,
+        execution_target="managed_sandbox",
+        session_mode="continue",
+    )
+    env.conversations.set_labels(session_id, _session_labels(task))
+    host_id = continued_sandbox_host_id(task.id, task.workspace_id)
+    launching = _make_managed_sandbox_start(deps)(
+        conversation, task, host_id, _STAGED_LAUNCH_ERRORS
+    )
+    launch = env.app.state.managed_launches.get(session_id)
+    assert launch is not None
+    await asyncio.wait_for(launching, timeout=10)
+    assert launch.error is None, launch.error
+    snapshot = env.catalog.get_session_snapshot(session_id)
+    assert snapshot is not None and snapshot["id"] == "build"
+    assert env.recording.allocations == [_PROVIDER_CONFIG]
+
+    # A changed default must not replace the continued host's accepted profile.
+    _with_default_profile(env, "other-default")
+    deps = dataclasses.replace(deps, sandbox_config=env.app.state.sandbox_config)
+    task = dataclasses.replace(
+        task,
+        last_run_conversation_id=session_id,
+        workspace=None
+        if reset == "deleted-session"
+        else "https://example.test/org/another-repo.git",
+    )
+    if reset == "deleted-session":
+        await env.conversations.delete_conversation(session_id)
+    if reset == "revoked":
+        env.recording.allowed_users.clear()
+    assert await _continued_host_binding(deps, task) is None
+
+    response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
+    assert response.status_code == 201, response.text
+    replacement_id = response.json()["id"]
+    replacement = env.conversations.get_conversation(replacement_id)
+    assert replacement is not None and replacement.host_id is None
+    launching = _make_managed_sandbox_start(deps)(
+        replacement, task, host_id, _STAGED_LAUNCH_ERRORS
+    )
+    launch = env.app.state.managed_launches.get(replacement_id)
+    assert launch is not None
+    await asyncio.wait_for(launching, timeout=10)
+    if reset == "revoked":
+        assert launch.error is not None
+        assert "access denied" in launch.error.lower()
+        assert env.catalog.get_session_snapshot(replacement_id) is None
+        assert env.conversations.get_conversation(replacement_id).host_id is None
+        assert env.recording.allocations == [_PROVIDER_CONFIG]
+    else:
+        assert launch.error is None, launch.error
+        assert env.catalog.get_session_snapshot(replacement_id) == snapshot
+        assert env.conversations.get_conversation(replacement_id).host_id == host_id
+        assert env.recording.allocations == [_PROVIDER_CONFIG, _PROVIDER_CONFIG]
+
+
+@pytest.mark.parametrize("mode", ["profile", "ordinary", "flag-off", "legacy-managed"])
 @pytest.mark.parametrize("launch_fails", [False, True])
 async def test_daemon_clear_then_launch_recovers_offline_runner(
     env, monkeypatch, mode, launch_fails
@@ -61,6 +346,16 @@ async def test_daemon_clear_then_launch_recovers_offline_runner(
         if mode == "flag-off":
             env.app.state.sandbox_profiles = None
         host_id = uuid.uuid4().hex
+        if mode == "legacy-managed":
+            env.hosts.register_managed_host(
+                host_id=host_id,
+                name="legacy-host",
+                user_id=_OWNER,
+                token="legacy-token",
+                provider=env.provider,
+                sandbox_id="legacy-sandbox",
+                token_expires_at=2_000_000_000,
+            )
         env.hosts.upsert_on_connect(host_id, "ordinary-host", _OWNER)
         response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
         assert response.status_code == 201, response.text
@@ -111,13 +406,23 @@ async def test_daemon_clear_then_launch_recovers_offline_runner(
     current = env.conversations.get_conversation(session_id)
     if launch_fails:
         assert current.runner_id == ("offline-runner" if mode == "profile" else None)
-        assert current.host_id == (host_id if mode == "profile" else None)
+        assert current.host_id == (host_id if mode in {"profile", "legacy-managed"} else None)
     else:
         assert current.runner_id == response.json()["runner_id"] != "offline-runner"
         assert current.host_id == host_id
     assert env.app.state.sandbox_profiles is None or env.catalog.get_session_snapshot(
         session_id
     ) == (env.profile if mode == "profile" else None)
+    if launch_fails and mode == "legacy-managed":
+        launch_fails = False
+        retry = await env.client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": session_id, "workspace": "/workspace"},
+        )
+        assert retry.status_code == 200, retry.text
+        current = env.conversations.get_conversation(session_id)
+        assert current.host_id == host_id and current.runner_id == retry.json()["runner_id"]
+        assert env.catalog.get_session_snapshot(session_id) is None
 
 
 @pytest.mark.parametrize("race", ["local-live", "fresh-heartbeat", "new-binding"])
@@ -934,7 +1239,7 @@ async def test_profile_acceptance_failure_rolls_back_session_and_preserves_reusa
 
 
 class TestProviderManagedProfiles:
-    async def test_legacy_unprofiled_managed_runner_cannot_hide_or_reuse_its_host(
+    async def test_legacy_unprofiled_runner_rotation_retains_host_after_opt_in(
         self, env: _Env, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         env.app.state.tunnel_registry = env.app.state.profile_test_tunnels
@@ -962,14 +1267,18 @@ class TestProviderManagedProfiles:
         response = await env.client.patch(
             f"/v1/sessions/{target_id}", json={"runner_id": "legacy-runner"}
         )
-        assert response.status_code == 422, response.text
-        assert env.conversations.get_conversation(target_id).runner_id is None
+        assert response.status_code == 200, response.text
+        target = env.conversations.get_conversation(target_id)
+        assert target.runner_id == "legacy-runner"
+        assert target.host_id == host_id and target.workspace == "/workspace"
+        assert env.catalog.get_session_snapshot(target_id) is None
         for runner_id in ("", "ordinary-runner"):
             response = await env.client.patch(
                 f"/v1/sessions/{source_id}", json={"runner_id": runner_id}
             )
-            assert response.status_code == 400, response.text
-            assert env.conversations.get_conversation(source_id).runner_id == "legacy-runner"
+            assert response.status_code == 200, response.text
+        assert env.catalog.admit_runner_connection("legacy-runner")
+        assert env.conversations.get_conversation(target_id).host_id == host_id
         assert env.recording.allocations == []
         assert env.recording.selections == []
 

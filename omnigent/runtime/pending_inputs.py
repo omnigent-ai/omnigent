@@ -421,7 +421,7 @@ def record(
         pending_id = make_pending_id(conversation_id, stable_id)
         entry = _Entry(
             pending_id=pending_id,
-            content=content,
+            content=copy.deepcopy(content),
             created_by=created_by,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
