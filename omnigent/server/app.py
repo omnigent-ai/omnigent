@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
+import yaml
 from fastapi import FastAPI, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -132,6 +133,7 @@ from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.inbox_items import create_inbox_items_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
+from omnigent.server.routes.proactive_agent_admin import create_proactive_agent_admin_router
 from omnigent.server.routes.proactive_agent_settings import (
     create_proactive_agent_settings_router,
 )
@@ -1553,6 +1555,8 @@ def _ensure_default_proactive_agent(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
+    *,
+    prompt_override: str | None = None,
 ) -> None:
     """Register the built-in proactive agent, which only hidden scheduled tasks run.
 
@@ -1560,6 +1564,10 @@ def _ensure_default_proactive_agent(
     it; always hidden from the picker (see :func:`_ensure_default_agents`).
     An operator agent that already uses the name is left as it is, and the
     feature stays off: tasks, hiding, and provisioning all use the built-in id.
+
+    :param prompt_override: An admin's replacement for the bundled prompt. It
+        becomes a new bundle version, so runs and the Inbox items they post
+        (``prompt_version``) record which prompt they used.
     """
     import tempfile
 
@@ -1577,6 +1585,11 @@ def _ensure_default_proactive_agent(
 
     with tempfile.TemporaryDirectory() as tmpdir:
         bundle_dir = materialize_bundle(_PROACTIVE_BUNDLE_SOURCE, Path(tmpdir) / "bundle")
+        if prompt_override is not None:
+            config_path = bundle_dir / "config.yaml"
+            config = yaml.safe_load(config_path.read_text())
+            config["prompt"] = prompt_override
+            config_path.write_text(yaml.safe_dump(config, sort_keys=False))
         bundle_bytes = _tar_gz_dir(bundle_dir)
     _ensure_builtin_agent(
         agent_store,
@@ -1585,6 +1598,12 @@ def _ensure_default_proactive_agent(
         name=PROACTIVE_AGENT_NAME,
         bundle_bytes=bundle_bytes,
     )
+
+
+def proactive_agent_default_prompt() -> str:
+    """The proactive agent's bundled prompt, before any admin override."""
+    config = yaml.safe_load((_PROACTIVE_BUNDLE_SOURCE / "config.yaml").read_text())
+    return str(config["prompt"])
 
 
 def _build_polly_bundle() -> bytes:
@@ -2162,6 +2181,11 @@ def create_app(
             app_inst.state.suppressed_agent_names = _ensure_default_agents(
                 agent_store, artifact_store, agent_cache
             )
+        # Seeding writes the bundled prompt; an admin's override replaces it.
+        try:
+            app_inst.state.reseed_proactive_agent(only_if_overridden=True)
+        except Exception:
+            _logger.exception("Could not apply the proactive agent's prompt override")
         # The roster exists either way, so the check does not depend on seeding here.
         _warn_on_empty_picker_restriction(
             agent_store, picker_curation, app_inst.state.suppressed_agent_names
@@ -2508,6 +2532,25 @@ def create_app(
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     app.state.scheduled_task_store = scheduled_task_store
     app.state.proactive_provisioner = ProactiveProvisioner()
+
+    def reseed_proactive_agent(*, only_if_overridden: bool = False) -> None:
+        """Rebuild the proactive agent's bundle with the workspace's prompt override.
+
+        :param only_if_overridden: Skip the rebuild when there is no override,
+            as at startup, where seeding already wrote the bundled prompt.
+        """
+        override = (
+            proactive_agent_settings_store.read_prompt_override()
+            if proactive_agent_settings_store is not None
+            else None
+        )
+        if override is None and only_if_overridden:
+            return
+        _ensure_default_proactive_agent(
+            agent_store, artifact_store, agent_cache, prompt_override=override
+        )
+
+    app.state.reseed_proactive_agent = reseed_proactive_agent
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
@@ -4131,6 +4174,17 @@ def create_app(
                 create_proactive_agent_settings_router(
                     proactive_agent_settings_store,
                     offered=proactive_agent_available,
+                    auth_provider=auth_provider,
+                    permission_store=permission_store,
+                ),
+                prefix="/v1",
+                tags=["proactive_agent"],
+            )
+            app.include_router(
+                create_proactive_agent_admin_router(
+                    proactive_agent_settings_store,
+                    offered=proactive_agent_available,
+                    default_prompt=proactive_agent_default_prompt,
                     auth_provider=auth_provider,
                     permission_store=permission_store,
                 ),

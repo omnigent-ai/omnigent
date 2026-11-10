@@ -164,6 +164,21 @@ class ScheduledTaskStore(ABC):
         del owner_user_id, generation, check_generation, after, limit, exclude_agent_ids
         return [], None
 
+    def list_for_agent(
+        self, agent_id: str, *, after: str | None = None, limit: int = 100
+    ) -> tuple[builtins.list[ScheduledTask], str | None]:
+        """Page the non-deleted tasks bound to *agent_id*, across owners, by id.
+
+        :param agent_id: The agent, e.g. a built-in agent's fixed id.
+        :param after: Continue after this task id, from a previous page.
+        :param limit: Most tasks to examine, 1 to 500.
+        :returns: The page and the id to continue after, or ``None`` at the end.
+            The cursor advances over examined deleted tasks too, so a page can be
+            empty and still continue. Stores without an agent index return empty.
+        """
+        del agent_id, after, limit
+        return [], None
+
     @abstractmethod
     def list_active(self) -> builtins.list[ScheduledTask]:
         """

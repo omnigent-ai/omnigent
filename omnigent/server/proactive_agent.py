@@ -158,6 +158,12 @@ def _free_task_id(store: Any, user_id: str | None) -> str | ScheduledTask:
     raise RuntimeError(f"no free proactive task id after {_MAX_TASK_SLOTS} deleted tasks")
 
 
+def find_proactive_task(store: Any, user_id: str | None) -> ScheduledTask | None:
+    """Return the owner's live proactive task, or ``None`` if they have none yet."""
+    found = _free_task_id(store, user_id)
+    return None if isinstance(found, str) else found
+
+
 class ProactiveProvisioner:
     """Creates each user's proactive task once per server process.
 

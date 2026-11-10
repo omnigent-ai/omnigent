@@ -1661,6 +1661,8 @@ class SqlScheduledTask(OmnigentBase):
             "created_at",
             "id",
         ),
+        # Pages one agent's tasks across owners, e.g. every proactive-agent task.
+        Index("ix_scheduled_tasks_agent", "workspace_id", "agent_id", "id"),
     )
 
 

@@ -330,6 +330,27 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
+    def list_for_agent(
+        self, agent_id: str, *, after: str | None = None, limit: int = 100
+    ) -> tuple[builtins.list[ScheduledTask], str | None]:
+        """See base class. Seeks ``ix_scheduled_tasks_agent``."""
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        stmt = select(SqlScheduledTask).where(
+            SqlScheduledTask.workspace_id == current_workspace_id(),
+            SqlScheduledTask.agent_id == agent_id,
+        )
+        if after is not None:
+            stmt = stmt.where(SqlScheduledTask.id > after)
+        stmt = stmt.order_by(asc(SqlScheduledTask.id)).limit(limit + 1)
+        with self._session("list_tasks_for_agent") as session:
+            rows = session.execute(stmt).scalars().all()
+        page = rows[:limit]
+        cursor = page[-1].id if len(rows) > limit else None
+        deleted = encode_scheduled_task_state("deleted")
+        # Deleted tasks are dropped after paging so each query examines at most limit + 1 rows.
+        return [_to_entity(row) for row in page if row.state != deleted], cursor
+
     def list_active(self) -> builtins.list[ScheduledTask]:
         """List active scheduled tasks ordered by ``created_at ASC, id ASC``."""
         with self._session("list_active_tasks") as session:
