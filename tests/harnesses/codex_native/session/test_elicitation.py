@@ -1978,9 +1978,8 @@ def test_forwarder_reopens_codex_async_question_card_when_answer_is_undelivered(
     first_card, reopened_card = hook_bodies
     assert reopened_card == {
         **first_card,
-        "params": {"deliveryRound": 1, **first_card["params"]},
+        "params": {**first_card["params"], "deliveryRound": 1},
     }
-    assert next(iter(reopened_card["params"])) == "deliveryRound"
     assert [
         event for event in posted_events if event["type"] == "external_elicitation_resolved"
     ] == (
