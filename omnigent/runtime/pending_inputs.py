@@ -724,6 +724,35 @@ def resolve_delivery_attempt(
         return replace(_drained_input(entry), strict_restore=hold)
 
 
+def resolve_native_delivery_attempt(
+    conversation_id: str, delivery_attempt_id: object, *, hold: bool = False
+) -> DrainedInput | None:
+    """Resolve an ordinary native client ID through the current strict identity checks."""
+    identity = {"delivery_attempt_id": delivery_attempt_id}
+    if not isinstance(delivery_attempt_id, str) or input_attributes(identity) != identity:
+        return None
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entry = next(
+            (
+                entry
+                for entry in _pending.get(conversation_id, {}).values()
+                if entry.delivery_attempt_id == delivery_attempt_id
+            ),
+            None,
+        )
+        if entry is None:
+            return None
+        pending_id, stable_id = entry.pending_id, entry.stable_id
+    return resolve_delivery_attempt(
+        conversation_id,
+        pending_id,
+        delivery_attempt_id,
+        stable_id=stable_id,
+        hold=hold,
+    )
+
+
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
     """
     Drain the oldest pending entry (FIFO) and return it.

@@ -3208,20 +3208,32 @@ async def _persist_external_conversation_item_unlocked(
                 }
             )
     elif drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
-        # Match the mirror to its entry by text: a pasted message the TUI never
-        # recorded leaves a stale head entry, and draining by position would
-        # hand it to THIS message (see ``omnigent.runtime.pending_inputs``).
-        # Skipped older entries are persisted as undelivered. A miss falls back
-        # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
         native_agent = _native_coding_agent_for_session(conv)
-        matched = pending_inputs.resolve_matching_text(
-            session_id,
-            text,
-            hold=True,
-            claude_commands=native_agent is not None and native_agent.harness == "claude-native",
+        has_delivery_receipt = (
+            native_agent is not None
+            and native_agent.harness == "codex-native"
+            and "delivery_attempt_id" in body.data
         )
+        if has_delivery_receipt:
+            try:
+                drained = pending_inputs.resolve_native_delivery_attempt(
+                    session_id, body.data["delivery_attempt_id"], hold=True
+                )
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+            matched = pending_inputs.MatchedDrain(
+                matched=drained, skipped=[], match_method="delivery_attempt_id"
+            )
+        else:
+            matched = pending_inputs.resolve_matching_text(
+                session_id,
+                text,
+                hold=True,
+                claude_commands=native_agent is not None
+                and native_agent.harness == "claude-native",
+            )
         drained = matched.matched
         match_method = matched.match_method
         if agent_message_candidate:
@@ -3241,7 +3253,12 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
+        if (
+            drained is None
+            and not has_delivery_receipt
+            and not agent_message_candidate
+            and not _is_kiro_native_session(conv)
+        ):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
                 match_method = "fifo_fallback"
@@ -3250,7 +3267,17 @@ async def _persist_external_conversation_item_unlocked(
                 pending_inputs.mark_uncertain(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
-            item = _merge_pending_file_blocks(item, drained.content)
+            item = (
+                item.model_copy(
+                    update={
+                        "data": item.data.model_copy(
+                            update={"content": drained.content, "user_authored": True}
+                        )
+                    }
+                )
+                if has_delivery_receipt
+                else _merge_pending_file_blocks(item, drained.content)
+            )
             # A text match preserves the sender recorded at POST time. FIFO
             # settlement alone does not establish authorship of the mirror.
             if (

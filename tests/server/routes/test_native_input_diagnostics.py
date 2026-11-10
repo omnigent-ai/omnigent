@@ -1,13 +1,17 @@
 """Durable native-message decisions can be joined to their original web input."""
 
+import base64
 import json
 import logging
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.harnesses.codex_native import forwarder as codex_forwarder
+from omnigent.inner.codex_native_executor import _content_to_input_items
 from omnigent.runtime import pending_inputs, session_stream
 from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
@@ -17,6 +21,132 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_prompt", [False, True], ids=["file-only", "prompt-first"])
+@pytest.mark.parametrize("failed_append", [False, True])
+async def test_unspilled_file_receipt_preserves_earlier_input_and_upload(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_prompt: bool,
+    failed_append: bool,
+) -> None:
+    """A native client ID settles its input even when file text changes its mirror."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "codex-native-ui"})
+    first = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "earlier"}, {"type": "input_file", "file_id": "file_old"}],
+    )
+    file_block = {"type": "input_file", "filename": "small.txt", "file_id": "file_current"}
+    prompt = [{"type": "input_text", "text": "compare this upload"}] if with_prompt else []
+    current_content = [*prompt, file_block]
+    current = pending_inputs.record(conv.id, current_content, created_by="alice@example.test")
+    attempt = pending_inputs.delivery_attributes_for(conv.id, current)["delivery_attempt_id"]
+    native_content = _content_to_input_items(
+        [
+            *prompt,
+            {
+                **file_block,
+                "file_data": "data:text/plain;base64,"
+                + base64.b64encode(b"small upload").decode(),
+            },
+        ],
+        tmp_path,
+    )
+    assert not hasattr(native_content, "client_message_id")
+    client = _RecordingClient()
+    await codex_forwarder._post_user_message(
+        client,
+        conv.id,
+        {"turnId": "native-turn"},
+        {
+            "id": "native-record",
+            "type": "userMessage",
+            "clientId": attempt,
+            "content": native_content,
+        },
+    )
+    [(_url, envelope)] = client.posts
+    body = SessionEventInput.model_validate(envelope)
+    published = Mock()
+    monkeypatch.setattr(session_stream, "publish", published)
+    original_append = store.append
+    if failed_append:
+        monkeypatch.setattr(store, "append", Mock(side_effect=RuntimeError("store unavailable")))
+        with pytest.raises(RuntimeError, match="store unavailable"):
+            await _persist_external_conversation_item(conv.id, conv, body, store)
+        assert pending_inputs.pending_ids(conv.id) == [first, current]
+        monkeypatch.setattr(store, "append", original_append)
+
+    item_id = await _persist_external_conversation_item(conv.id, conv, body, store)
+    [saved] = store.list_items(conv.id).data
+    assert saved.id == item_id
+    assert saved.data.content == current_content
+    assert saved.created_by == "alice@example.test"
+    assert pending_inputs.pending_ids(conv.id) == [first]
+    receipts = [
+        session_stream._sse_safe_attributes(call.args[1]) for call in published.call_args_list
+    ]
+    assert [
+        event["cleared_pending_id"] for event in receipts if "cleared_pending_id" in event
+    ] == [current]
+
+    newer = pending_inputs.record(conv.id, current_content)
+    assert await _persist_external_conversation_item(conv.id, conv, body, store) == item_id
+    assert len(store.list_items(conv.id).data) == 1
+    assert pending_inputs.pending_ids(conv.id) == [first, newer]
+    pending_inputs.resolve(conv.id, first)
+    pending_inputs.resolve(conv.id, newer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt", ["absent", "unknown", "different-session", "invalid", "restored", None]
+)
+async def test_plain_native_receipt_miss_preserves_pending_inputs(
+    db_uri: str, receipt: str | None
+) -> None:
+    """An explicit receipt miss cannot authorize a text or FIFO match."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "codex-native-ui"})
+    content = [{"type": "input_text", "text": "identical message"}]
+    pending = pending_inputs.record(conv.id, content, stable_id="c" * 32)
+    attempt = pending_inputs.delivery_attributes_for(conv.id, pending)["delivery_attempt_id"]
+    other_session = f"other-{conv.id}"
+    other = pending_inputs.record(other_session, content)
+    values = {
+        "unknown": "f" * 32,
+        "different-session": pending_inputs.delivery_attributes_for(other_session, other)[
+            "delivery_attempt_id"
+        ],
+        "invalid": "not-a-server-generated-id",
+        "restored": attempt,
+        None: None,
+    }
+    if receipt == "restored":
+        pending_inputs.resolve(conv.id, pending)
+        assert (
+            pending_inputs.record(conv.id, content, stable_id="c" * 32, restored=True) == pending
+        )
+    data = {
+        "item_type": "message",
+        "item_data": {"role": "user", "content": content},
+        "response_id": "resp_native",
+        "source_id": "native-record",
+    }
+    if receipt != "absent":
+        data["delivery_attempt_id"] = values[receipt]
+    await _persist_external_conversation_item(
+        conv.id, conv, SessionEventInput(type="external_conversation_item", data=data), store
+    )
+    assert pending_inputs.pending_ids(conv.id) == ([] if receipt == "absent" else [pending])
+    assert pending_inputs.pending_ids(other_session) == [other]
+    pending_inputs.resolve(conv.id, pending)
+    pending_inputs.resolve(other_session, other)
 
 
 @pytest.mark.asyncio
