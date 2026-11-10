@@ -56,6 +56,8 @@ describe("isValidSandboxRepoUrl host validation", () => {
   });
   it.each([
     "https://git.example.com:8443/team/sample.git",
+    "https://work_git.example.com/team/sample.git",
+    "https://_git.example_.com/team/sample.git",
     "https://[::1]/team/sample.git",
     "https://git.example.com./team/sample.git",
     "git@[2001:db8::1]:team/sample.git",

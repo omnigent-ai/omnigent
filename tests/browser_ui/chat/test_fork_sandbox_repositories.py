@@ -221,7 +221,7 @@ def test_sandbox_fork_edits_multiple_repositories_and_branches(
         expect(branch_note).to_be_visible()
         dialog.get_by_role("button", name="Remove acme/customer-web").click()
         expect(branch_note).to_have_count(0)
-        dialog.get_by_role("combobox", name="GitHub repository").click()
+        dialog.get_by_role("combobox", name="Repository").click()
         page.get_by_placeholder("Search repositories…").fill("shared")
         page.get_by_role("option", name="acme/shared-contracts").click()
         dialog.get_by_role("combobox", name="Branch for acme/shared-contracts").click()

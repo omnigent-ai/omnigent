@@ -5,6 +5,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type { Host } from "@/hooks/useHosts";
 import { ApiError } from "@/lib/sessionsApi";
+import { authenticatedFetch } from "@/lib/identity";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { NewProjectButton } from "./NewProjectButton";
 
@@ -14,10 +15,13 @@ const mocks = vi.hoisted(() => ({
   cloneRepository: vi.fn(),
   repositoryCreation: false,
   cloneSupported: true,
+  detailCloneSupported: true,
   hostStatus: "online",
   projects: [] as { name: string }[],
   projectError: null as Error | null,
 }));
+
+vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({
@@ -107,9 +111,22 @@ beforeEach(() => {
   mocks.projectError = null;
   mocks.repositoryCreation = false;
   mocks.cloneSupported = true;
+  mocks.detailCloneSupported = true;
   mocks.hostStatus = "online";
   mocks.projects = [];
   mocks.cloneRepository.mockReset().mockResolvedValue("/work/sample");
+  vi.mocked(authenticatedFetch)
+    .mockReset()
+    .mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            host_id: "host_1",
+            status: "online",
+            clone_repository_supported: mocks.detailCloneSupported,
+          }),
+        ),
+    );
   localStorage.clear();
   mocks.createProject.mockImplementation(
     (input: { name: string }, options?: { onSuccess?: (project: { name: string }) => void }) => {
@@ -307,7 +324,7 @@ describe("NewProjectButton", () => {
   });
 });
 
-function openRepositoryProject() {
+async function openRepositoryProject(waitForHostDetail = true) {
   mocks.repositoryCreation = true;
   renderButton();
   fireEvent.change(screen.getByPlaceholderText("Project name…"), { target: { value: "Garden" } });
@@ -316,6 +333,11 @@ function openRepositoryProject() {
   fireEvent.change(screen.getByRole("combobox", { name: "Repository URL" }), {
     target: { value: "https://git.example.com/team/sample.git" },
   });
+  if (waitForHostDetail) {
+    await waitFor(() =>
+      expect(screen.queryByText("Checking this host's repository support…")).toBeNull(),
+    );
+  }
 }
 
 describe("repository project creation", () => {
@@ -330,7 +352,7 @@ describe("repository project creation", () => {
     mocks.createProject.mockImplementationOnce((_input, callbacks) => {
       failSave = callbacks.onError;
     });
-    openRepositoryProject();
+    await openRepositoryProject();
     fireEvent.click(screen.getByTestId("new-project-confirm"));
     expect(screen.getByText("Cloning…")).toBeInTheDocument();
     expect(screen.getByPlaceholderText("Project name…")).toBeDisabled();
@@ -394,7 +416,7 @@ describe("repository project creation", () => {
   );
 
   it("saves a typed sandbox repository without cloning or allocating a workspace", async () => {
-    openRepositoryProject();
+    await openRepositoryProject();
     fireEvent.change(screen.getByRole("combobox", { name: "Run on" }), {
       target: { value: "__sandbox__:example" },
     });
@@ -418,9 +440,9 @@ describe("repository project creation", () => {
     expect(mocks.cloneRepository).not.toHaveBeenCalled();
   });
 
-  it("checks duplicates and host support before side effects", () => {
+  it("checks duplicates and host support before side effects", async () => {
     mocks.projects = [{ name: "Garden" }];
-    openRepositoryProject();
+    await openRepositoryProject();
     fireEvent.click(screen.getByTestId("new-project-confirm"));
     expect(screen.getByRole("alert")).toHaveTextContent("already exists");
     expect(mocks.cloneRepository).not.toHaveBeenCalled();
@@ -432,7 +454,7 @@ describe("repository project creation", () => {
     new TypeError("Failed to fetch"),
   ])("keeps inputs on clone errors and allows correction", async (error) => {
     mocks.cloneRepository.mockRejectedValueOnce(error);
-    openRepositoryProject();
+    await openRepositoryProject();
     fireEvent.click(screen.getByTestId("new-project-confirm"));
     expect(await screen.findByRole("alert")).toHaveTextContent(
       error instanceof ApiError ? "already exists" : "result is unknown",
@@ -452,9 +474,9 @@ describe("repository project creation", () => {
       path: "/work/other",
     });
   });
-  it("prevents old-host clone requests and overlong names before side effects", () => {
-    mocks.cloneSupported = false;
-    openRepositoryProject();
+  it("prevents old-host clone requests and overlong names before side effects", async () => {
+    mocks.detailCloneSupported = false;
+    await openRepositoryProject();
     fireEvent.click(screen.getByTestId("new-project-confirm"));
     expect(screen.getByRole("alert")).toHaveTextContent("Update this host");
     fireEvent.change(screen.getByPlaceholderText("Project name…"), {
@@ -464,6 +486,68 @@ describe("repository project creation", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("100 characters");
     expect(mocks.cloneRepository).not.toHaveBeenCalled();
     expect(mocks.createProject).not.toHaveBeenCalled();
+  });
+
+  it("uses the routed detail capability when the list does not advertise clone support", async () => {
+    mocks.cloneSupported = false;
+    await openRepositoryProject();
+    expect(authenticatedFetch).toHaveBeenCalledWith("/v1/hosts/host_1?include=capabilities");
+    expect(screen.queryByText(/Update this host/)).toBeNull();
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    await waitFor(() => expect(mocks.cloneRepository).toHaveBeenCalledOnce());
+    expect(mocks.createProject).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the selected host and retries a failed capability lookup without inferring support", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(new Response(null, { status: 503 }));
+    await openRepositoryProject();
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Couldn't check this host's repository support",
+    );
+    expect(screen.queryByText(/Update this host/)).toBeNull();
+    expect(screen.getByRole("combobox", { name: "Run on" })).toHaveValue("host_1");
+    expect(mocks.cloneRepository).not.toHaveBeenCalled();
+    expect(mocks.createProject).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Retry host check" }));
+    await waitFor(() =>
+      expect(screen.queryByText("Checking this host's repository support…")).toBeNull(),
+    );
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    await waitFor(() => expect(mocks.createProject).toHaveBeenCalledOnce());
+    expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+    expect(mocks.cloneRepository).toHaveBeenCalledOnce();
+  });
+
+  it("blocks cloning while capability discovery is pending without treating the host as unsupported", async () => {
+    let finishLookup!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishLookup = resolve;
+      }),
+    );
+    await openRepositoryProject(false);
+    expect(screen.getByText("Checking this host's repository support…")).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    expect(screen.queryByText(/Update this host/)).toBeNull();
+    expect(mocks.cloneRepository).not.toHaveBeenCalled();
+    expect(mocks.createProject).not.toHaveBeenCalled();
+    await act(async () =>
+      finishLookup(
+        new Response(
+          JSON.stringify({
+            host_id: "host_1",
+            status: "online",
+            clone_repository_supported: true,
+          }),
+        ),
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.queryAllByText("Checking this host's repository support…")).toHaveLength(0),
+    );
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    await waitFor(() => expect(mocks.createProject).toHaveBeenCalledOnce());
   });
 
   it("chooses a clone parent and invalidates clone reuse after changing the branch", async () => {
@@ -476,7 +560,7 @@ describe("repository project creation", () => {
     mocks.createProject.mockImplementationOnce((_input, callbacks) =>
       callbacks.onError(new Error("network")),
     );
-    openRepositoryProject();
+    await openRepositoryProject();
     fireEvent.click(screen.getByRole("button", { name: "Browse" }));
     fireEvent.click(screen.getByRole("button", { name: "Select test folder" }));
     expect(screen.getByRole("textbox", { name: "Clone into" })).toHaveValue("/work/repo/sample");
@@ -549,6 +633,9 @@ describe("repository project creation", () => {
       mocks.hostStatus = "offline";
       localStorage.setItem("omnigent:last-host-choice", hostId);
       renderButton();
+      fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+        target: { value: "Garden" },
+      });
       fireEvent.click(screen.getByRole("button", { name: /Workspace/ }));
       expect(screen.getByRole("combobox", { name: "Run on" })).toHaveValue(hostId);
       expect(
@@ -558,12 +645,40 @@ describe("repository project creation", () => {
       expect(browse).toBeDisabled();
       fireEvent.click(browse);
       expect(screen.queryByRole("button", { name: "Select test folder" })).toBeNull();
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      expect(screen.getByRole("alert")).toHaveTextContent("Reconnect the selected host");
       fireEvent.click(screen.getByRole("radio", { name: "Repository" }));
       expect(screen.getByRole("button", { name: "Browse" })).toBeDisabled();
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      expect(screen.getByRole("alert")).toHaveTextContent("Reconnect the selected host");
       expect(mocks.createDirectory).not.toHaveBeenCalled();
       expect(mocks.cloneRepository).not.toHaveBeenCalled();
+      expect(mocks.createProject).not.toHaveBeenCalled();
     },
   );
+
+  it("derives the checkout name from the repository until a full destination is typed", async () => {
+    await openRepositoryProject();
+    const repositoryInput = screen.getByLabelText("Repository URL");
+    const destinationInput = screen.getByRole("textbox", { name: "Clone into" });
+    fireEvent.change(repositoryInput, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+    fireEvent.click(screen.getByRole("button", { name: "Select test folder" }));
+    expect(destinationInput).toHaveValue("/work/repo/repository");
+    fireEvent.change(repositoryInput, {
+      target: { value: "https://git.example.com/team/first.git" },
+    });
+    expect(destinationInput).toHaveValue("/work/repo/first");
+    fireEvent.change(repositoryInput, {
+      target: { value: "https://git.example.com/team/second.git" },
+    });
+    expect(destinationInput).toHaveValue("/work/repo/second");
+    fireEvent.change(destinationInput, { target: { value: "/work/chosen" } });
+    fireEvent.change(repositoryInput, {
+      target: { value: "https://git.example.com/team/third.git" },
+    });
+    expect(destinationInput).toHaveValue("/work/chosen");
+  });
 
   it("blocks a requested folder creation if its host goes offline", () => {
     mocks.repositoryCreation = true;

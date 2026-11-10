@@ -7,8 +7,8 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
-from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.onboarding.sandboxes.types import RepoWorkspace
+from omnigent.util.labels import LABEL_VALUE_MAX_LEN
 
 # A full 40-hex object id — rejected as a clone fragment: cloning a
 # commit lands the agent on a detached HEAD it cannot push from.
@@ -171,7 +171,7 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
             not host
             or len(host) > 253
             or not all(
-                re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                re.fullmatch(r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?", label)
                 for label in host.removesuffix(".").split(".")
             )
         ):

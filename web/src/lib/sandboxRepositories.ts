@@ -59,7 +59,7 @@ export function isValidSandboxRepoUrl(url: string): boolean {
     hostname
       .replace(/\.$/, "")
       .split(".")
-      .every((label) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label))
+      .every((label) => /^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$/.test(label))
   );
 }
 

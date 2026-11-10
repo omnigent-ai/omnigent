@@ -369,7 +369,7 @@ async def test_host_skills_requires_directory(
 @pytest.mark.parametrize(
     "host_state,status", [("missing", 404), ("offline", 409), ("other_replica", 400)]
 )
-@pytest.mark.parametrize("route", ["skills", "clone"])
+@pytest.mark.parametrize("route", ["skills", "clone", "capabilities"])
 async def test_host_routes_require_connected_host(
     fs_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
     host_state: str,
@@ -392,6 +392,8 @@ async def test_host_routes_require_connected_host(
                 "/v1/skills",
                 params={"host_id": _HOST_ID, "harness": "claude-native", "path": "~"},
             )
+        elif route == "capabilities":
+            response = await client.get(f"/v1/hosts/{_HOST_ID}?include=capabilities")
         else:
             response = await client.post(
                 f"/v1/hosts/{_HOST_ID}/repositories/clone",

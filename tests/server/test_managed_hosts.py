@@ -2107,6 +2107,15 @@ def test_parse_invalid_config_fails_loud(raw: object, expected_fragment: str) ->
                 repo_name="repo",
             ),
         ),
+        *[
+            (
+                f"https://{hostname}/team/sample.git",
+                RepoWorkspace(
+                    url=f"https://{hostname}/team/sample.git", branch=None, repo_name="sample"
+                ),
+            )
+            for hostname in ["work_git.example.com", "_git.example_.com"]
+        ],
         # scp-style ssh form.
         (
             "git@github.com:org/repo.git",

@@ -1011,6 +1011,8 @@ def create_hosts_router(
         # replicas, gated on the liveness freshness window — see
         # list_hosts above for the full rationale.
         conn = host_registry.get(host.host_id)
+        if include == "capabilities" and conn is None:
+            raise _host_absent_error(host)
         harness_setup_enabled = harness_install_enabled(harness_install_gate)
         result: dict[str, Any] = {
             "host_id": host.host_id,

@@ -379,8 +379,11 @@ async def test_clone_repository_tunnel_contract(
             json={"url": "https://git.example.com/team/sample.git", "path": "~/sample"},
         )
         hosts = (await client.get("/v1/hosts")).json()["hosts"]
+        detail = await client.get(f"/v1/hosts/{_HOST_ID}?include=capabilities")
     assert response.status_code == expected_status, response.text
     assert hosts[0]["clone_repository_supported"] is True
+    assert detail.status_code == 200
+    assert detail.json()["clone_repository_supported"] is True
     if expected_code:
         assert response.json()["error"]["code"] == expected_code
     else:
@@ -392,10 +395,13 @@ async def test_clone_repository_old_host_gets_no_frame(mkdir_setup) -> None:
     app, registry, _comm, _replies, _drain = mkdir_setup
     registry.get(_HOST_ID).hello.capabilities.clear()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        detail = await client.get(f"/v1/hosts/{_HOST_ID}?include=capabilities")
         response = await client.post(
             f"/v1/hosts/{_HOST_ID}/repositories/clone",
             json={"url": "https://git.example.com/team/sample.git", "path": "~/sample"},
         )
+    assert detail.status_code == 200
+    assert detail.json()["clone_repository_supported"] is False
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "clone_unsupported"
     assert not registry.get(_HOST_ID).pending_clones

@@ -77,7 +77,8 @@ function SandboxRepoCombobox({
                 <CommandItem
                   key={repositoryIdentity(repo.url)}
                   className="mobile-touch-target"
-                  value={repo.name}
+                  value={repositoryIdentity(repo.url)}
+                  keywords={[repo.name]}
                   onSelect={() => {
                     onSelect(repo);
                     setOpen(false);

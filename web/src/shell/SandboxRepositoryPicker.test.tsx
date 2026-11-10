@@ -333,6 +333,24 @@ describe("SandboxRepositoryPicker", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("selects distinct repositories with the same display name by keyboard", async () => {
+    const catalog = [
+      { name: "org/api", url: "https://git.example.com/team/first.git" },
+      { name: "org/api", url: "https://git.example.com/team/second.git" },
+    ];
+    const { onChange } = renderPicker([], 10, { catalog });
+    await waitFor(() => expect(fetchGithubRepos).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("combobox", { name: "Repository" }));
+    const search = screen.getByPlaceholderText("Search repositories…");
+    fireEvent.change(search, { target: { value: "org/api" } });
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(3));
+    expect(screen.getAllByRole("option", { selected: true })).toHaveLength(1);
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getAllByRole("option", { selected: true })).toHaveLength(1);
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onChange).toHaveBeenLastCalledWith([{ url: catalog[1].url, branch: "" }]);
+  });
+
   it("retains a single selection through loading and a catalog-only target switch", () => {
     const selection = { url: "https://git.example.com/team/custom.git", branch: "release" };
     const { onChange, setCapabilities } = renderPicker([selection], 1, { single: true });

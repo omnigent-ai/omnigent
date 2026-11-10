@@ -80,7 +80,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   sandbox provider, repository, and optional branch. An untouched draft waits
   for these defaults even after leaving and returning while config loads;
   explicitly clearing a repository stays cleared for that launch. Switching
-  projects uses the new project's defaults. The Fork dialog and CLI, API, and
+  projects uses the new project's defaults; projects without a repository start
+  with none. Updated project placement applies independently of repository edits
+  in the current draft. The Fork dialog and CLI, API, and
   scheduled creates don't apply model or effort. States: no default, a Codex
   effort the pinned model lacks (or, with no project model, the remembered
   model lacks), an explicit composer pick, remembered Smart Routing, another

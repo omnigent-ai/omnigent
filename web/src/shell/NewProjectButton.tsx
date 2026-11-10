@@ -1,4 +1,5 @@
 import { type CSSProperties, useEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { ChevronRightIcon, FolderOpenIcon, PlusIcon, SmilePlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -34,6 +35,8 @@ import {
 import { deriveRepoName, repositorySelectionError } from "@/lib/sandboxRepositories";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import { ApiError } from "@/lib/sessionsApi";
+import { authenticatedFetch } from "@/lib/identity";
+import { getOmnigentServerIdentity } from "@/lib/host";
 import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
 
 import { isNavigablePath, joinPath } from "./WorkspacePicker";
@@ -141,8 +144,9 @@ export function NewProjectButton({
   const [repositories, setRepositories] = useState<LastSandboxRepo[]>([]);
   const repository = repositories[0] ?? { url: "", branch: "" };
   const repositoryName = deriveRepoName(repository.url) ?? "repository";
+  const [cloneParent, setCloneParent] = useState("~");
   const [cloneDestination, setCloneDestination] = useState<string | null>(null);
-  const destination = cloneDestination ?? joinPath("~", repositoryName);
+  const destination = cloneDestination ?? joinPath(cloneParent, repositoryName);
   const [clonedWorkspace, setClonedWorkspace] = useState<{ key: string; path: string } | null>(
     null,
   );
@@ -156,6 +160,39 @@ export function NewProjectButton({
   const selectedHost = hosts.find((host) => host.host_id === dialogHostId);
   const hostFilesystemAvailable =
     dialogHostId !== null && (!repositoryCreation || selectedHost?.status === "online");
+  // The capability lookup reaches the replica with the live host connection.
+  const {
+    data: hostDetail,
+    isFetching: hostDetailLoading,
+    isError: hostDetailFailed,
+    refetch: refetchHostDetail,
+  } = useQuery({
+    queryKey: ["project-clone-host", getOmnigentServerIdentity(), dialogHostId],
+    enabled: open && repositoryMode && !sandboxSelected && selectedHost?.status === "online",
+    queryFn: async (): Promise<Host> => {
+      const response = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(dialogHostId!)}?include=capabilities`,
+      );
+      if (!response.ok) throw new Error("Couldn't check this host's repository support.");
+      const detail = (await response.json()) as Host;
+      if (detail.host_id !== dialogHostId) {
+        throw new Error("Couldn't check this host's repository support.");
+      }
+      return detail;
+    },
+    staleTime: 0,
+    retry: false,
+  });
+  let hostCloneMessage: string | null = null;
+  if (hostDetailLoading || (!hostDetail && !hostDetailFailed)) {
+    hostCloneMessage = "Checking this host's repository support…";
+  } else if (hostDetailFailed) {
+    hostCloneMessage = "Couldn't check this host's repository support. Retry the host check.";
+  } else if (hostDetail?.status !== "online") {
+    hostCloneMessage = "Reconnect the selected host or choose another target.";
+  } else if (hostDetail.clone_repository_supported !== true) {
+    hostCloneMessage = "Update this host to clone repositories, or choose an existing folder.";
+  }
   const initialTarget = () => {
     if (
       contextHost?.sandbox_provider &&
@@ -216,6 +253,15 @@ export function NewProjectButton({
       setSubmitError("A project with this name already exists. Use a different name.");
       return;
     }
+    if (
+      repositoryCreation &&
+      !sandboxSelected &&
+      dialogHostId !== null &&
+      !hostFilesystemAvailable
+    ) {
+      setSubmitError("Reconnect the selected host or choose another target.");
+      return;
+    }
     if (repositoryMode) {
       const error = repositorySelectionError(repository, repositoryCapabilities);
       if (error) {
@@ -231,8 +277,8 @@ export function NewProjectButton({
           setSubmitError("Reconnect the selected host or choose another target.");
           return;
         }
-        if (!selectedHost.clone_repository_supported) {
-          setSubmitError("Update this host to clone repositories, or choose an existing folder.");
+        if (hostCloneMessage !== null) {
+          setSubmitError(hostDetailLoading ? null : hostCloneMessage);
           return;
         }
         if (!isNavigablePath(destination) || destination.includes("\0")) {
@@ -602,10 +648,25 @@ export function NewProjectButton({
                       <p className="text-xs text-muted-foreground">
                         The repository will be cloned before the project is created.
                       </p>
-                      {selectedHost && !selectedHost.clone_repository_supported && (
-                        <p className="text-xs text-destructive">
-                          Update this host to clone repositories, or choose an existing folder.
-                        </p>
+                      {selectedHost?.status === "online" && hostCloneMessage !== null && (
+                        <div className="flex flex-col items-start gap-1">
+                          <p className="text-xs text-muted-foreground" aria-live="polite">
+                            {hostCloneMessage}
+                          </p>
+                          {hostDetailFailed && !hostDetailLoading && (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                setSubmitError(null);
+                                void refetchHostDetail();
+                              }}
+                            >
+                              Retry host check
+                            </Button>
+                          )}
+                        </div>
                       )}
                     </>
                   )}
@@ -663,7 +724,8 @@ export function NewProjectButton({
                 title={repositoryMode ? "Choose parent folder" : "Select working directory"}
                 onConfirm={(path) => {
                   if (repositoryMode) {
-                    setCloneDestination(joinPath(path, repositoryName));
+                    setCloneParent(path);
+                    setCloneDestination(null);
                     setClonedWorkspace(null);
                   } else if (dialogHostId !== null) {
                     setWorkspace({ hostId: dialogHostId, path });
@@ -733,6 +795,7 @@ export function NewProjectButton({
               setTargetChoice(initialTarget());
               setWorkspaceMode("folder");
               setRepositories([]);
+              setCloneParent("~");
               setCloneDestination(null);
               setClonedWorkspace(null);
               setPhase(null);

@@ -12,6 +12,7 @@ import {
 } from "@/components/composer/HarnessPicker";
 import {
   type ReactNode,
+  type SetStateAction,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -2089,6 +2090,11 @@ export function AgentHarnessPicker({
 
 // Drafts survive navigation within this page load, with one slot per source.
 // Successful creation clears only its slot; a page refresh starts clean.
+interface RepositoryOverride {
+  selections: LastSandboxRepo[];
+  pendingUrl: string;
+}
+
 interface LandingDraft {
   mcpRegistryServices: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
@@ -2103,9 +2109,8 @@ interface LandingDraft {
   sandboxSelected: boolean;
   sandboxProvider: string | null;
   sandboxProfile: SandboxProfileSelection | null;
-  sandboxRepoSelections: LastSandboxRepo[];
-  repositorySeeded: boolean;
-  repositoryPlacementEdited: boolean;
+  repositoryOverride: RepositoryOverride | null;
+  prefillConfigSignature: string | null;
   workspace: string;
   branchName: string;
   autoSeededBranch: string;
@@ -2458,9 +2463,8 @@ function NewChatLandingContent({
           // The repo inputs compose the managed create's workspace string, so
           // they are location state too — keeping them would clone another
           // project's repository into this project's sandbox.
-          sandboxRepoSelections: [],
-          repositorySeeded: false,
-          repositoryPlacementEdited: false,
+          repositoryOverride: null,
+          prefillConfigSignature: null,
           workspace: "",
           branchName: "",
           // The branch may be the worktree-default's auto-seed, generated for
@@ -2675,17 +2679,33 @@ function NewChatLandingContent({
   const [arcaError, setArcaError] = useState<string | null>(null);
   // Mirrors pendingConnectRef for the Arca row: connect after the menu closes.
   const pendingArcaConnectRef = useRef(false);
-  // Sandbox repository inputs — composed into the managed create's
-  // `workspace` string (`<url>[#<branch>]`); both blank = empty
-  // server-created workspace.
-  // Seed from the in-session draft, else the last repos the user launched with
-  // (remembered across visits) so returning users don't re-pick them. The repo
-  // combobox derives its selection from each URL, so a remembered repo the
-  // account can no longer access just shows unselected.
-  const [sandboxRepoSelections, setSandboxRepoSelections] = useState<LastSandboxRepo[]>(
-    () =>
-      restoredDraft?.sandboxRepoSelections ?? (projectParam !== "" ? [] : readLastSandboxRepos()),
+  // Untouched repositories follow project defaults; only plain visits use global memory.
+  // An explicit selection (including a clear) belongs to this project's draft.
+  const [repositoryOverride, setRepositoryOverride] = useState<RepositoryOverride | null>(
+    () => restoredDraft?.repositoryOverride ?? null,
   );
+  const defaultSandboxRepos = useMemo<LastSandboxRepo[]>(() => {
+    if (projectParam === "") return readLastSandboxRepos();
+    const repository = prefillConfig?.repository;
+    return repository ? [{ url: repository.url, branch: repository.branch ?? "" }] : [];
+  }, [projectParam, prefillConfig?.repository]);
+  const sandboxRepoSelections = repositoryOverride?.selections ?? defaultSandboxRepos;
+  const pendingRepoUrl = repositoryOverride?.pendingUrl ?? "";
+  function setSandboxRepoSelections(next: SetStateAction<LastSandboxRepo[]>) {
+    setRepositoryOverride((current) => ({
+      selections:
+        typeof next === "function" ? next(current?.selections ?? defaultSandboxRepos) : next,
+      pendingUrl: current?.pendingUrl ?? "",
+    }));
+  }
+  function setPendingRepoUrl(pendingUrl: string) {
+    setRepositoryOverride((current) => ({
+      selections: current?.selections ?? defaultSandboxRepos,
+      pendingUrl,
+    }));
+  }
+  // The last defaults consumed by the placement/agent machine, including across remounts.
+  const seededConfigSigRef = useRef<string | null>(restoredDraft?.prefillConfigSignature ?? null);
   // Whether the launch provider clones several repos (server-declared per
   // provider via /v1/info). A single-repo provider caps the picker at one, so
   // it reads as a plain single-repo picker and never offers a multi-repo menu.
@@ -2700,10 +2720,7 @@ function NewChatLandingContent({
     effectiveSandboxProvider !== null &&
     info.sandbox_provider_capabilities?.[effectiveSandboxProvider]?.multi_repo === true;
   const maxSandboxRepos = sandboxMultiRepo ? MAX_SANDBOX_REPOS : 1;
-  const repositorySeededRef = useRef(restoredDraft?.repositorySeeded ?? false);
-  const repositoryPlacementEditedRef = useRef(restoredDraft?.repositoryPlacementEdited ?? false);
   const repositoryCapabilities = sandboxRepositoryCapabilities(info, effectiveSandboxProvider);
-  const [pendingRepoUrl, setPendingRepoUrl] = useState("");
   const [sandboxRepoPopoverOpen, setSandboxRepoPopoverOpen] = useState(false);
   const sandboxRepoPopoverRef = useRef<HTMLDivElement>(null);
   const [workspace, setWorkspace] = useState<string>(
@@ -2907,9 +2924,8 @@ function NewChatLandingContent({
     sandboxSelected,
     sandboxProvider,
     sandboxProfile,
-    sandboxRepoSelections,
-    repositorySeeded: repositorySeededRef.current,
-    repositoryPlacementEdited: repositoryPlacementEditedRef.current,
+    repositoryOverride,
+    prefillConfigSignature: seededConfigSigRef.current,
     workspace,
     branchName,
     autoSeededBranch,
@@ -2936,8 +2952,7 @@ function NewChatLandingContent({
       if (!submittedRef.current) {
         writeLandingDraft(draftState, {
           ...draftRef.current,
-          repositorySeeded: repositorySeededRef.current,
-          repositoryPlacementEdited: repositoryPlacementEditedRef.current,
+          prefillConfigSignature: seededConfigSigRef.current,
         });
       } else if (submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
@@ -3013,9 +3028,6 @@ function NewChatLandingContent({
   const [prefill, setPrefill] = useState<ProjectPrefillState>(() =>
     initialPrefillState(projectParam),
   );
-  // The generic defaults gate on the location track only — the agent seed
-  // waits on its own fetch and must not hold up the host/workspace fill.
-  const prefillSettled = prefill.phase === "settled";
   // Host whose workspace was already seeded once, so a host re-pick doesn't
   // clobber the field (used by the per-host seeding effect below).
   const seededHostRef = useRef<string | null>(null);
@@ -3023,14 +3035,19 @@ function NewChatLandingContent({
   // once per settled workspace (and can't loop once it sets a branch name).
   const worktreeSeededForRef = useRef<string | null>(null);
 
-  // Signature of the stored config the machine last settled from. Lets a later
-  // save be noticed even when the pencil re-opens the SAME project — the config
-  // content changes while `projectParam` does not. `null` = not yet seeded.
-  const seededConfigSigRef = useRef<string | null>(null);
   const prefillConfigSig = useMemo(
     () => (prefillConfig === undefined ? null : JSON.stringify(prefillConfig)),
     [prefillConfig],
   );
+  const projectChanged = prefill.project !== projectParam;
+  const prefillResetPending =
+    projectChanged ||
+    (projectParam !== "" &&
+      prefillConfigSig !== null &&
+      seededConfigSigRef.current !== null &&
+      prefillConfigSig !== seededConfigSigRef.current);
+  // Reset placement before either the project machine or generic defaults can seed it.
+  const prefillSettled = !prefillResetPending && prefill.phase === "settled";
 
   // The landing screen stays mounted while `?project=` changes (clicking
   // another project's pencil), so re-create a fresh visit by hand: clear
@@ -3040,31 +3057,18 @@ function NewChatLandingContent({
   // its settings, then re-opened its composer): `projectParam` stays put, so
   // without this the already-settled machine would keep the stale seeds.
   useEffect(() => {
-    const projectChanged = prefill.project !== projectParam;
-    const configChanged =
-      !projectChanged &&
-      projectParam !== "" &&
-      prefillConfigSig !== null &&
-      seededConfigSigRef.current !== null &&
-      prefillConfigSig !== seededConfigSigRef.current;
-    if (!projectChanged && !configChanged) return;
-    const preservePlacement = !projectChanged && repositoryPlacementEditedRef.current;
-    if (!preservePlacement) {
-      setSandboxSelected(false);
-      setSandboxProvider(null);
-      setSandboxProfile(null);
-      setSelectedHostId(null);
-      repositorySeededRef.current = false;
-      repositoryPlacementEditedRef.current = false;
-      setWorkspace("");
-      setBranchName("");
-      setAutoSeededBranch("");
-      setSandboxRepoSelections([]);
-      setPendingRepoUrl("");
-      workspaceFromConfigRef.current = false;
-      seededHostRef.current = null;
-      worktreeSeededForRef.current = null;
-    }
+    if (!prefillResetPending) return;
+    setSandboxSelected(false);
+    setSandboxProvider(null);
+    setSandboxProfile(null);
+    setSelectedHostId(null);
+    setWorkspace("");
+    setBranchName("");
+    setAutoSeededBranch("");
+    if (projectChanged) setRepositoryOverride(null);
+    workspaceFromConfigRef.current = false;
+    seededHostRef.current = null;
+    worktreeSeededForRef.current = null;
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     agentExplicitlySelectedRef.current = false;
     agentFromConfigRef.current = false;
@@ -3072,17 +3076,7 @@ function NewChatLandingContent({
     pickedOptionKeysRef.current.clear();
     seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
-  }, [projectParam, prefill.project, prefillConfigSig]);
-
-  // Record the config the machine settled from, once it's loaded and the
-  // machine is done, so the reseed effect above can spot a later change to it
-  // (the reseed on a project switch runs before the config has loaded, leaving
-  // the signature `null` until this fills it in).
-  useEffect(() => {
-    if (prefill.project !== projectParam) return;
-    if (prefillConfigSig === null || !prefillDone(prefill)) return;
-    seededConfigSigRef.current = prefillConfigSig;
-  }, [prefill, projectParam, prefillConfigSig]);
+  }, [projectParam, projectChanged, prefillResetPending, prefillConfigSig]);
 
   // Auto-select an option so a session can be started without an explicit
   // pick. Prefer the user's last explicit choice (persisted across visits);
@@ -4970,7 +4964,7 @@ function NewChatLandingContent({
   // unset. An opt-in worktree is generated by the dedicated effect below once
   // the workspace is in place.
   useEffect(() => {
-    if (prefill.project !== projectParam || prefillDone(prefill)) return;
+    if (prefillResetPending || prefillDone(prefill)) return;
     const step = projectPrefillStep(prefill, {
       hosts,
       // The pickable list, not the raw one — a hidden agent's id would seed
@@ -4985,6 +4979,7 @@ function NewChatLandingContent({
       config: prefillConfig,
     });
     if (step === null) return;
+    seededConfigSigRef.current = prefillConfigSig;
     const { writes } = step;
     if (writes.selectSandbox) {
       setSandboxSelected(true);
@@ -5018,7 +5013,7 @@ function NewChatLandingContent({
     setPrefill(step.state);
   }, [
     prefill,
-    projectParam,
+    prefillResetPending,
     hosts,
     agents,
     agentsArePlaceholder,
@@ -5028,26 +5023,10 @@ function NewChatLandingContent({
     selectedHostId,
     pickedAgentId,
     prefillConfig,
+    prefillConfigSig,
     projectLaunch,
     defaultSandboxProvider,
   ]);
-
-  useEffect(() => {
-    if (
-      prefill.project !== projectParam ||
-      !prefillSettled ||
-      prefillConfig === undefined ||
-      repositorySeededRef.current
-    )
-      return;
-    repositorySeededRef.current = true;
-    const repository = prefillConfig.repository;
-    setSandboxRepoSelections(
-      repository
-        ? [{ url: repository.url, branch: repository.branch ?? "" }]
-        : readLastSandboxRepos(),
-    );
-  }, [prefill.project, projectParam, prefillSettled, prefillConfig]);
 
   // Seed a fresh worktree branch once the workspace settles, from the effective
   // default (project `use_worktree` wins, else the user-global setting).
@@ -5683,7 +5662,6 @@ function NewChatLandingContent({
   };
 
   function selectHost(hostId: string) {
-    if (prefillConfig?.repository) repositoryPlacementEditedRef.current = true;
     // Persist the explicit pick even when it matches the current selection, so
     // clicking the auto-selected host still records it as the sticky default
     // for the next visit.
@@ -5707,7 +5685,6 @@ function NewChatLandingContent({
   }
 
   function selectSandbox(provider: string | null = null) {
-    if (prefillConfig?.repository) repositoryPlacementEditedRef.current = true;
     if (provider !== sandboxProvider) setSandboxProfile(null);
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
@@ -6770,18 +6747,10 @@ function NewChatLandingContent({
                 <SandboxRepositoryPicker
                   {...repositoryCapabilities}
                   selections={sandboxRepoSelections}
-                  onChange={(repositories) => {
-                    repositorySeededRef.current = true;
-                    repositoryPlacementEditedRef.current = true;
-                    setSandboxRepoSelections(repositories);
-                  }}
+                  onChange={setSandboxRepoSelections}
                   maxRepos={maxSandboxRepos}
                   pendingUrl={pendingRepoUrl}
-                  onPendingUrlChange={(url) => {
-                    repositorySeededRef.current = true;
-                    repositoryPlacementEditedRef.current = true;
-                    setPendingRepoUrl(url);
-                  }}
+                  onPendingUrlChange={setPendingRepoUrl}
                 />
                 <p className="text-sm text-muted-foreground">
                   {maxSandboxRepos > 1
