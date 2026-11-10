@@ -35,7 +35,11 @@ from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
-from omnigent.server.proactive_agent import PROACTIVE_AGENT_IDS, is_proactive_task
+from omnigent.server.proactive_agent import (
+    PROACTIVE_AGENT_IDS,
+    is_proactive_task,
+    reject_proactive_agent_id,
+)
 from omnigent.server.routes._agent_origin import require_agent_origin
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
@@ -520,12 +524,7 @@ def create_scheduled_tasks_router(
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
 
-    def _reject_proactive_agent(agent_id: str | None) -> None:
-        # Agent lookup accepts dashed and legacy-prefixed spellings of an id.
-        if normalize_uuid(agent_id) in PROACTIVE_AGENT_IDS:
-            raise OmnigentError(
-                "This agent runs only on its built-in schedule", code=ErrorCode.INVALID_INPUT
-            )
+    _reject_proactive_agent = reject_proactive_agent_id
 
     async def _require_continuable(request: Request, task: ScheduledTask) -> Conversation:
         """Return a picked session *task* can continue; reject it otherwise, hiding one

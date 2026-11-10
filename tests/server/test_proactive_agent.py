@@ -469,3 +469,25 @@ async def test_a_proactive_run_cannot_seed_an_automation(client: httpx.AsyncClie
     assert resp.status_code == 400, resp.text
     assert "proactive" in resp.text
     assert app.state.scheduled_task_store.list() == []
+
+
+@pytest.mark.parametrize("enabled", [True, False], ids=["gate-on", "gate-off"])
+@pytest.mark.parametrize(
+    "agent_id",
+    [PROACTIVE_AGENT_ID, str(uuid.UUID(PROACTIVE_AGENT_ID)), f"ag_{PROACTIVE_AGENT_ID}"],
+    ids=["canonical", "dashed", "legacy-prefix"],
+)
+async def test_a_client_cannot_start_a_session_with_the_proactive_agent(
+    db_uri: str, tmp_path: Path, agent_id: str, enabled: bool
+) -> None:
+    app = _app(db_uri, tmp_path, enabled=enabled)
+    app.state.seed_builtin_agents()
+    conversations: Any = app.state.test_conversations
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
+
+    assert resp.status_code == 400, resp.text
+    assert "built-in schedule" in resp.text
+    assert conversations.list_conversations(limit=10).data == []

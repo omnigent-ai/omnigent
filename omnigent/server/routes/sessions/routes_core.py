@@ -93,6 +93,7 @@ from omnigent.server.permissions import check_session_access
 from omnigent.server.proactive_agent import (
     finish_provisioning as finish_proactive_provisioning,
 )
+from omnigent.server.proactive_agent import reject_proactive_agent_id
 from omnigent.server.proactive_agent import (
     start_provisioning as start_proactive_provisioning,
 )
@@ -1166,6 +1167,7 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        reject_proactive_agent_id(body.agent_id)
         orchestration_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
         source = None
         if orchestration_source is not None:
@@ -4411,6 +4413,7 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
 
+        reject_proactive_agent_id(body.agent_id)
         source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
         target_agent_id = body.agent_id
         switching_agent = target_agent_id is not None and target_agent_id != source.agent_id

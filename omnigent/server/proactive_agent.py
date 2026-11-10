@@ -23,7 +23,9 @@ from omnigent.db.account_authority import account_generation
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import ScheduledTask
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
 
@@ -49,6 +51,20 @@ _MAX_TIMEZONE_CHARS = 64
 _MAX_TASK_SLOTS = 32
 _ProvisionTask = asyncio.Task[ScheduledTask | None]
 _TASK_ID_NAMESPACE = uuid.UUID("7b6c3e0a-5a7e-4b55-9a3c-2f1d6e9c8b41")
+
+
+def reject_proactive_agent_id(agent_id: str | None) -> None:
+    """Refuse a client's request to run the proactive agent outside its schedule.
+
+    Agent lookup accepts dashed and legacy-prefixed spellings of an id, so
+    those are refused too. Scheduled runs create their sessions internally.
+
+    :raises OmnigentError: 400 when *agent_id* names the proactive agent.
+    """
+    if normalize_uuid(agent_id) in PROACTIVE_AGENT_IDS:
+        raise OmnigentError(
+            "This agent runs only on its built-in schedule", code=ErrorCode.INVALID_INPUT
+        )
 
 
 def is_proactive_task(task: ScheduledTask) -> bool:
