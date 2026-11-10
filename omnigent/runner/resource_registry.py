@@ -19,7 +19,7 @@ import re
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -236,6 +236,20 @@ class TerminalExitEvent:
     terminal_instance_id: str | None = None
     lifecycle_context: dict[str, str] = field(default_factory=dict)
     exited_during_startup: bool = False
+
+
+@dataclass
+class _SkippedClaudeLaunchArgs:
+    """Stored Claude args a startup exit ruled out for a session on this runner.
+
+    :param other_args: The non-permission stored args the failed launch replayed.
+    :param permission_args: The permission-mode args stored at that launch.
+    :param notice_owed: Whether the chat has not been told yet.
+    """
+
+    other_args: list[str]
+    permission_args: list[str]
+    notice_owed: bool = True
 
 
 def _terminal_lifecycle_context(
@@ -595,11 +609,10 @@ class SessionResourceRegistry:
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
-        # Claude sessions whose live pane was launched with stored pass-through
-        # args, and those whose stored args a startup exit has since ruled out
-        # (mapped to whether the chat notice about it is still owed).
-        self._claude_saved_args_launches: set[str] = set()
-        self._claude_saved_args_skipped: dict[str, bool] = {}
+        # Stored Claude args the live pane was launched with (other args,
+        # permission args), and those a startup exit has since ruled out.
+        self._claude_saved_args_launches: dict[str, tuple[list[str], list[str]]] = {}
+        self._claude_saved_args_skipped: dict[str, _SkippedClaudeLaunchArgs] = {}
         self._is_alive_cache: TTLCache[str, TerminalInstance] = TTLCache(
             maxsize=_IS_ALIVE_CACHE_MAX,
             ttl=_IS_ALIVE_CACHE_TTL_S,
@@ -1023,22 +1036,43 @@ class SessionResourceRegistry:
             except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent control requests.
                 _logger.debug("Native terminal control telemetry failed (%s)", type(exc).__name__)
 
-    def note_claude_launch_args(self, session_id: str, *, uses_saved_args: bool) -> bool:
+    def claude_launch_args(
+        self, session_id: str, stored_args: Sequence[str]
+    ) -> tuple[list[str], bool]:
         """
-        Record whether a Claude launch replays the session's stored pass-through args.
+        Choose the stored args a Claude launch replays.
+
+        Stored args that made Claude exit during startup on this runner are left
+        out, permission mode included, so the launch starts like a new session
+        and never keeps a stored bypass while dropping a stored restriction. A
+        permission mode set after that exit (a pick in the web UI, or the mode
+        the recovered pane reported) is a current choice and is kept. Any other
+        change to the stored args is a new set, tried again.
 
         :param session_id: Session/conversation identifier.
-        :param uses_saved_args: Whether the session has stored args besides the
-            permission mode.
-        :returns: ``True`` when the launch should replay them; ``False`` when a
-            startup exit already ruled them out on this runner.
+        :param stored_args: The session's stored launch args, e.g.
+            ``["--mcp-config", "/Users/me/mcp.json", "--permission-mode", "plan"]``.
+        :returns: ``(args, skipped)``: the args to launch with, and whether
+            stored args were left out.
         """
+        from omnigent.harnesses.claude_native.launch_args import (
+            split_claude_permission_launch_args,
+        )
+
+        other, permission = split_claude_permission_launch_args(stored_args)
         with self._lock:
-            if session_id in self._claude_saved_args_skipped or not uses_saved_args:
-                self._claude_saved_args_launches.discard(session_id)
-                return False
-            self._claude_saved_args_launches.add(session_id)
-            return True
+            if not other:
+                # A permission mode alone never stops Claude from starting.
+                self._claude_saved_args_launches.pop(session_id, None)
+                return list(stored_args), False
+            failed = self._claude_saved_args_skipped.get(session_id)
+            if failed is not None and failed.other_args == other:
+                self._claude_saved_args_launches.pop(session_id, None)
+                kept = permission if permission != failed.permission_args else []
+                return kept, True
+            self._claude_saved_args_skipped.pop(session_id, None)
+            self._claude_saved_args_launches[session_id] = (other, permission)
+            return list(stored_args), False
 
     def skip_claude_saved_args_after_startup_exit(self, session_id: str) -> bool:
         """
@@ -1047,7 +1081,7 @@ class SessionResourceRegistry:
         A stored arg Claude cannot start with (say an ``--mcp-config`` file that
         only exists on the machine the session came from) is replayed on every
         launch, so the session could never start. Later launches on this runner
-        drop the stored args instead. Only the first such exit counts, so a
+        leave those args out instead. Only the first such exit counts, so a
         launch that also fails without them is reported as a failure.
 
         :param session_id: Session/conversation identifier.
@@ -1055,10 +1089,12 @@ class SessionResourceRegistry:
             caller should relaunch without them.
         """
         with self._lock:
-            if session_id not in self._claude_saved_args_launches:
+            replayed = self._claude_saved_args_launches.pop(session_id, None)
+            if replayed is None:
                 return False
-            self._claude_saved_args_launches.discard(session_id)
-            self._claude_saved_args_skipped[session_id] = True
+            self._claude_saved_args_skipped[session_id] = _SkippedClaudeLaunchArgs(
+                other_args=replayed[0], permission_args=replayed[1]
+            )
             return True
 
     def take_claude_saved_args_notice(self, session_id: str) -> bool:
@@ -1069,9 +1105,10 @@ class SessionResourceRegistry:
         :returns: ``True`` exactly once per startup exit that ruled the args out.
         """
         with self._lock:
-            if not self._claude_saved_args_skipped.get(session_id):
+            failed = self._claude_saved_args_skipped.get(session_id)
+            if failed is None or not failed.notice_owed:
                 return False
-            self._claude_saved_args_skipped[session_id] = False
+            failed.notice_owed = False
             return True
 
     @property
@@ -2628,7 +2665,7 @@ class SessionResourceRegistry:
             self._session_activity_epoch.pop(session_id, None)
             self._session_turn_generation.pop(session_id, None)
             self._client_surfaces.pop(session_id, None)
-            self._claude_saved_args_launches.discard(session_id)
+            self._claude_saved_args_launches.pop(session_id, None)
             self._claude_saved_args_skipped.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             self._primary_env_specs.pop(session_id, None)

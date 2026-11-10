@@ -5043,9 +5043,13 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("relaunch_starts", [True, False], ids=["relaunched", "relaunch-failed"])
+@pytest.mark.parametrize(
+    ("relaunch_starts", "closed_outside_omnigent"),
+    [(True, False), (False, False), (True, True)],
+    ids=["relaunched", "relaunch-failed", "tmux-killed-outside"],
+)
 async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failing(
-    monkeypatch: pytest.MonkeyPatch, relaunch_starts: bool
+    monkeypatch: pytest.MonkeyPatch, relaunch_starts: bool, closed_outside_omnigent: bool
 ) -> None:
     """A Claude that dies during startup after replaying stored args is relaunched once.
 
@@ -5053,9 +5057,11 @@ async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failin
     exists only on the machine the session was forked from), and every relaunch
     replays it. The first such startup exit re-creates the pane instead of
     failing the session. A relaunch that cannot produce a pane is reported as
-    the original exit, once; a second startup exit is an ordinary failure.
+    the original exit, once; a second startup exit is an ordinary failure. A
+    pane killed from outside Omnigent is not a startup failure to recover from.
 
     :param relaunch_starts: Whether the replacement pane comes up.
+    :param closed_outside_omnigent: Whether tmux was killed outside Omnigent.
     """
     import omnigent.runner.app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
@@ -5089,7 +5095,8 @@ async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failin
     resource_registry = app.state.session_resource_registry
     publish_exit = resource_registry._terminal_exit_publisher
     assert callable(publish_exit)
-    assert resource_registry.note_claude_launch_args(conv_id, uses_saved_args=True) is True
+    stored_args = ["--mcp-config", "/Users/someone/.openui/mcp-inject.json"]
+    assert resource_registry.claude_launch_args(conv_id, stored_args) == (stored_args, False)
 
     def startup_exit() -> TerminalExitEvent:
         return TerminalExitEvent(
@@ -5101,6 +5108,7 @@ async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failin
             exit_status=1,
             last_output="Error: Invalid MCP configuration:\nMCP config file not found",
             exited_during_startup=True,
+            closed_outside_omnigent=closed_outside_omnigent,
         )
 
     def failed(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -5122,6 +5130,11 @@ async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failin
     try:
         publish_exit(startup_exit())
         await settle()
+        if closed_outside_omnigent:
+            assert relaunches == []
+            assert len(failed(queued_events)) == 1
+            assert pm.released == [conv_id]
+            return
         assert relaunches == [(conv_id, "claude-native")]
         if not relaunch_starts:
             assert len(failed(queued_events)) == 1
@@ -5131,7 +5144,7 @@ async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failin
         assert pm.released == []
         # Later launches on this runner leave the stored args out, and the
         # replacement's own startup exit fails the session.
-        assert resource_registry.note_claude_launch_args(conv_id, uses_saved_args=True) is False
+        assert resource_registry.claude_launch_args(conv_id, stored_args) == ([], True)
         publish_exit(startup_exit())
         await settle()
     finally:

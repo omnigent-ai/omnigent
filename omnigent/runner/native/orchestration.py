@@ -9323,21 +9323,12 @@ async def _auto_create_claude_terminal(
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
     # Stored args come from whatever launched the session, e.g. an
-    # ``--mcp-config`` file on that machine. Once one made Claude exit during
-    # startup, launch without any of them, as a fresh session would start; the
-    # permission mode goes too, so no stored restriction is dropped while a
-    # stored bypass is kept. A permission mode alone is never the cause.
-    from omnigent.harnesses.claude_native.launch_args import (
-        split_claude_permission_launch_args,
+    # ``--mcp-config`` file on that machine; after one made Claude exit during
+    # startup, the registry leaves them out.
+    stored_launch_args, skipped_launch_args = resource_registry.claude_launch_args(
+        session_id, session_launch_args or ()
     )
-
-    stored_other_args, _ = split_claude_permission_launch_args(session_launch_args or ())
-    replays_stored_args = resource_registry.note_claude_launch_args(
-        session_id, uses_saved_args=bool(stored_other_args)
-    )
-    skipped_launch_args = bool(stored_other_args) and not replays_stored_args
-    if skipped_launch_args:
-        session_launch_args = None
+    session_launch_args = stored_launch_args or None
     session_external_id = launch_metadata.external_session_id
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history

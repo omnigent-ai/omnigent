@@ -2165,6 +2165,7 @@ def create_runner_app(
             event.exited_during_startup
             and event.terminal_name == "claude"
             and event.session_key == "main"
+            and not event.closed_outside_omnigent
             and not _shutting_down.is_set()
             and resource_registry.skip_claude_saved_args_after_startup_exit(event.session_id)
         ):

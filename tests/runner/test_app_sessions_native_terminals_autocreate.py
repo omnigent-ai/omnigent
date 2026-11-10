@@ -6863,6 +6863,19 @@ async def test_auto_create_claude_terminal_launches_without_stored_args_after_st
     assert missing_config not in third_args
     assert len(server_client.posted_events) == 1
 
+    # A mode picked after recovery is the user's current choice and survives.
+    server_client._snapshot = {
+        "terminal_launch_args": [*stored_args[:-2], "--permission-mode", "plan"]
+    }
+    picked_args = await launch()
+    assert missing_config not in picked_args
+    assert picked_args[picked_args.index("--permission-mode") + 1] == "plan"
+
+    # Different stored args are a new set, tried again.
+    server_client._snapshot = {"terminal_launch_args": ["--mcp-config", "/elsewhere.json"]}
+    changed_args = await launch()
+    assert "/elsewhere.json" in changed_args
+
 
 @pytest.mark.asyncio
 async def test_auto_create_claude_terminal_stored_permission_mode_alone_is_not_retried(
@@ -6915,31 +6928,41 @@ class _DeadPane:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stored_args_replayed", [True, False], ids=["stored-args", "no-args"])
+@pytest.mark.parametrize(
+    ("stored_args", "retry_starts"),
+    [
+        (["--mcp-config", "/missing.json"], True),
+        (["--mcp-config", "/missing.json"], False),
+        ([], False),
+    ],
+    ids=["retry-starts", "retry-dies", "no-stored-args"],
+)
 async def test_launch_claude_retries_once_when_the_pane_dies_inside_the_launch(
-    monkeypatch: pytest.MonkeyPatch, stored_args_replayed: bool
+    monkeypatch: pytest.MonkeyPatch, stored_args: list[str], retry_starts: bool
 ) -> None:
     """A pane that dies before the launch returns gets the same single retry.
 
     Only a launch that replayed stored args is retried, and only once: the
     retry's own death is the launch failure.
 
-    :param stored_args_replayed: Whether the failed launch replayed stored args.
+    :param stored_args: The session's stored launch args.
+    :param retry_starts: Whether the retry's pane comes up.
     """
     from omnigent.runner.native import orchestration
     from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
     session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
     registry = SessionResourceRegistry()
-    attempts: list[bool] = []
+    attempts: list[list[str]] = []
+    view = object()
 
     async def auto_create(*_args: Any, **_kwargs: Any) -> object:
         # The builder itself is covered above; this test is about the retry
-        # around it, so each attempt records whether it would replay stored args.
-        replays = registry.note_claude_launch_args(
-            session_id, uses_saved_args=stored_args_replayed
-        )
-        attempts.append(replays)
+        # around it, so each attempt records the stored args it would replay.
+        launch_args, _ = registry.claude_launch_args(session_id, stored_args)
+        attempts.append(launch_args)
+        if len(attempts) == 2 and retry_starts:
+            return view
         raise TerminalExitedDuringLaunch(_DeadPane())  # type: ignore[arg-type]
 
     monkeypatch.setattr(orchestration, "_auto_create_claude_terminal", auto_create)
@@ -6950,7 +6973,10 @@ async def test_launch_claude_retries_once_when_the_pane_dies_inside_the_launch(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(TerminalExitedDuringLaunch):
-        await orchestration._launch_claude(ctx)
+    if retry_starts:
+        assert await orchestration._launch_claude(ctx) is view
+    else:
+        with pytest.raises(TerminalExitedDuringLaunch):
+            await orchestration._launch_claude(ctx)
 
-    assert attempts == ([True, False] if stored_args_replayed else [False])
+    assert attempts == ([stored_args, []] if stored_args else [[]])
