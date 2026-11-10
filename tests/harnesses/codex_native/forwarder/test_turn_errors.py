@@ -33,6 +33,55 @@ from tests.harnesses.codex_native.forwarder._support import (
     _turn_started,
 )
 
+_CONTEXT_ERROR = (
+    "Codex ran out of room in the model's context window. "
+    "Start a new thread or clear earlier history before retrying."
+)
+
+
+@pytest.mark.parametrize(
+    "info,message,expected",
+    [
+        (
+            "contextWindowExceeded",
+            "Native diagnostic details remain intact.",
+            "context_length_exceeded",
+        ),
+        (
+            "context_window_exceeded",
+            "Native diagnostic details remain intact.",
+            "context_length_exceeded",
+        ),
+        (
+            {"type": "contextWindowExceeded"},
+            "Native diagnostic details remain intact.",
+            "context_length_exceeded",
+        ),
+        (
+            {"variant": "context_window_exceeded"},
+            "401 appears only in diagnostic context",
+            "context_length_exceeded",
+        ),
+        (None, _CONTEXT_ERROR, "context_length_exceeded"),
+        (None, _CONTEXT_ERROR.replace("model's", "model’s"), "context_length_exceeded"),
+        ("unauthorized", _CONTEXT_ERROR, "auth"),
+        ({"type": "contextWindowExceeded", "httpStatusCode": 401}, "401 Unauthorized", "auth"),
+        ({"type": "contextWindowExceeded", "httpStatusCode": 403}, "403 Forbidden", "auth"),
+        (None, "The tool quoted: " + _CONTEXT_ERROR, "generic"),
+        (None, '"' + _CONTEXT_ERROR + '"', "generic"),
+        (None, json.dumps({"message": _CONTEXT_ERROR}), "generic"),
+        (None, "Ordinary model failure mentioning context windows.", "generic"),
+        ({"type": []}, "Ordinary model failure.", "generic"),
+        ({"type": ["contextWindowExceeded"]}, "Ordinary model failure.", "generic"),
+        ({"httpStatusCode": {}}, "Ordinary model failure.", "generic"),
+    ],
+)
+def test_codex_context_error_requires_native_evidence(
+    info: object, message: str, expected: str
+) -> None:
+    error = {"codexErrorInfo": info} if info is not None else {}
+    assert fwd._classify_codex_error(error, message) == expected
+
 
 def test_classify_codex_error_auth_vs_generic() -> None:
     """The shared classifier flags auth errors and leaves the rest generic.
@@ -240,7 +289,30 @@ def test_terminal_error_from_notification_reads_usage_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_event_surfaces_non_retrying_error_notification(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "error,code",
+    [
+        (
+            {"message": "You've hit your usage limit.", "codexErrorInfo": "usageLimitExceeded"},
+            None,
+        ),
+        (
+            {"message": _CONTEXT_ERROR, "codexErrorInfo": "contextWindowExceeded"},
+            "context_length_exceeded",
+        ),
+        (
+            {
+                "message": "native details " * 100 + "end",
+                "codexErrorInfo": "contextWindowExceeded",
+            },
+            "context_length_exceeded",
+        ),
+        ({"message": _CONTEXT_ERROR}, "context_length_exceeded"),
+    ],
+)
+async def test_handle_event_surfaces_non_retrying_error_notification(
+    tmp_path: Path, error: dict[str, Any], code: str | None
+) -> None:
     """A terminal standalone ``error`` notification reaches the session UI."""
     client = _RecordingClient()
 
@@ -254,10 +326,7 @@ async def test_handle_event_surfaces_non_retrying_error_notification(tmp_path: P
                 "threadId": "thread_123",
                 "turnId": "turn_123",
                 "willRetry": False,
-                "error": {
-                    "message": "You've hit your usage limit.",
-                    "codexErrorInfo": "usageLimitExceeded",
-                },
+                "error": error,
             },
         },
         usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
@@ -273,7 +342,8 @@ async def test_handle_event_surfaces_non_retrying_error_notification(tmp_path: P
                 "data": {
                     "status": "failed",
                     "response_id": "codex_turn_123",
-                    "output": "You've hit your usage limit.",
+                    "output": error["message"],
+                    **({"error_code": code} if code is not None else {}),
                 },
             },
         )
@@ -775,14 +845,26 @@ def test_terminal_error_from_turn_none_for_clean_turn() -> None:
         "turn": {
             "id": "turn_123",
             "status": "completed",
-            "items": [{"type": "agentMessage", "id": "a", "text": "done"}],
+            "items": [{"type": "agentMessage", "id": "a", "text": _CONTEXT_ERROR}],
         }
     }
 
     assert fwd._terminal_error_from_turn(params) is None
 
 
-def test_terminal_turn_status_edge_error_item_forces_failed(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "error,kind",
+    [
+        ({"message": "model stream broke"}, "generic"),
+        (
+            {"message": _CONTEXT_ERROR, "codexErrorInfo": "contextWindowExceeded"},
+            "context_length_exceeded",
+        ),
+    ],
+)
+def test_terminal_turn_status_edge_error_item_forces_failed(
+    tmp_path: Path, error: dict[str, Any], kind: str
+) -> None:
     """A ``turn/completed`` carrying an ``error`` item (no ``turn.error``) fails.
 
     The item-fallback path must flip the live edge to ``failed`` just like the
@@ -793,7 +875,7 @@ def test_terminal_turn_status_edge_error_item_forces_failed(tmp_path: Path) -> N
         "turn": {
             "id": "turn_123",
             "status": "completed",
-            "items": [{"type": "error", "message": "model stream broke"}],
+            "items": [{"type": "error", **error}],
         }
     }
 
@@ -802,11 +884,24 @@ def test_terminal_turn_status_edge_error_item_forces_failed(tmp_path: Path) -> N
     assert edge is not None
     assert edge.status == "failed"
     assert edge.error is not None
-    assert edge.error.message == "model stream broke"
+    assert edge.error.message == error["message"]
+    assert edge.error.kind == kind
     assert edge.source == "turn/completed:turn-error"
 
 
-def test_terminal_turn_status_edge_turn_error_forces_failed(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "error,kind",
+    [
+        ({"message": "model stream broke"}, "generic"),
+        (
+            {"message": _CONTEXT_ERROR, "codexErrorInfo": "contextWindowExceeded"},
+            "context_length_exceeded",
+        ),
+    ],
+)
+def test_terminal_turn_status_edge_turn_error_forces_failed(
+    tmp_path: Path, error: dict[str, Any], kind: str
+) -> None:
     """A ``turn/completed`` carrying ``turn.error`` is forced to ``failed``.
 
     This is the core of #1108: Codex reported a *completed* boundary, but the
@@ -818,7 +913,7 @@ def test_terminal_turn_status_edge_turn_error_forces_failed(tmp_path: Path) -> N
         "turn": {
             "id": "turn_123",
             "status": "failed",
-            "error": {"message": "model stream broke"},
+            "error": error,
         }
     }
 
@@ -828,8 +923,8 @@ def test_terminal_turn_status_edge_turn_error_forces_failed(tmp_path: Path) -> N
     assert edge.status == "failed"
     assert edge.turn_id == "turn_123"
     assert edge.error is not None
-    assert edge.error.message == "model stream broke"
-    assert edge.error.kind == fwd._CODEX_ERROR_KIND_GENERIC
+    assert edge.error.message == error["message"]
+    assert edge.error.kind == kind
     assert edge.source == "turn/completed:turn-error"
 
 
@@ -942,7 +1037,19 @@ def test_omnigent_status_from_resume_turn_error_parity() -> None:
     assert fwd._omnigent_status_from_resume_turn(turn_clean) == "idle"
 
 
-def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "error,kind",
+    [
+        ({"message": "please sign in again"}, "auth"),
+        (
+            {"message": _CONTEXT_ERROR, "codexErrorInfo": "contextWindowExceeded"},
+            "context_length_exceeded",
+        ),
+    ],
+)
+def test_resume_terminal_status_edge_attaches_error(
+    tmp_path: Path, error: dict[str, Any], kind: str
+) -> None:
     """The resume edge carries the classified error like the live edge does."""
     write_bridge_state(
         tmp_path,
@@ -958,7 +1065,7 @@ def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
         {
             "id": "turn_123",
             "status": "failed",
-            "error": {"message": "please sign in again"},
+            "error": error,
         }
     ]
 
@@ -967,7 +1074,8 @@ def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
     assert edge is not None
     assert edge.status == "failed"
     assert edge.error is not None
-    assert edge.error.is_auth is True
+    assert edge.error.kind == kind
+    assert edge.error.is_auth is (kind == "auth")
     assert edge.source == "thread/resume:turn-error"
     # The active turn id is cleared once the terminal edge is derived.
     state = read_bridge_state(tmp_path)

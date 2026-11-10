@@ -199,17 +199,27 @@ def test_append_dead_letter_never_raises_on_unwritable_dir() -> None:
     )
 
 
-def test_append_dead_letter_writes_classification_fields(tmp_path: Path) -> None:
+@pytest.mark.parametrize("event_type", ["external_conversation_item", "external_session_status"])
+def test_append_dead_letter_writes_classification_fields(tmp_path: Path, event_type: str) -> None:
     """
     The structured classification replay reads is persisted on each record (#1579).
 
     :param tmp_path: Pytest temp dir standing in for a bridge dir.
     """
+    payload = (
+        {
+            "status": "failed",
+            "error_code": "context_length_exceeded",
+            "output": "native detail " * 1000,
+        }
+        if event_type == "external_session_status"
+        else {"item_type": "message"}
+    )
     append_dead_letter(
         tmp_path,
         session_id="conv_abc123",
-        event_type="external_conversation_item",
-        payload={"item_type": "message"},
+        event_type=event_type,
+        payload=payload,
         reason="ambiguous transport failure (may already be committed)",
         delivered_ambiguous=True,
         http_status=None,
@@ -217,6 +227,8 @@ def test_append_dead_letter_writes_classification_fields(tmp_path: Path) -> None
     )
 
     record = _read_records(tmp_path / _DEAD_LETTER_FILE)[0]
+    assert record["payload"] == payload
+    assert record["event_type"] == event_type
     assert record["delivered_ambiguous"] is True
     assert record["http_status"] is None
     assert record["transport_error"] == "ReadTimeout"

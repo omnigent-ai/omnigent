@@ -2640,6 +2640,13 @@ def register_events_routes(
                 # Codex-specific codes require a resolved Codex session.
                 if harness == "codex-native" and data.get("reauth_required") is True:
                     error_code = "codex_reauth_required"
+                elif (
+                    harness == "codex-native"
+                    and data.get("error_code") == "context_length_exceeded"
+                    and isinstance(body.data.get("output"), str)
+                    and body.data["output"].strip()
+                ):
+                    error_code = "context_length_exceeded"
                 elif harness == "codex-native" and body.data.get("output"):
                     error_code = "codex_turn_error"
                 else:
@@ -2664,7 +2671,11 @@ def register_events_routes(
                     harness == "codex-native"
                     # A fork doesn't renew an expired login, so keep its sign-in recovery.
                     and classified_code
-                    not in {"codex_reauth_required", CODEX_PROVIDER_AUTH_FAILED}
+                    not in {
+                        "codex_reauth_required",
+                        CODEX_PROVIDER_AUTH_FAILED,
+                        "context_length_exceeded",
+                    }
                     and isinstance(compaction_model, str)
                     and compaction_model
                     and isinstance(selected_model, str)
