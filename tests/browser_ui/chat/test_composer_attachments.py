@@ -269,6 +269,92 @@ def test_failed_upload_restores_the_message(
     expect(composer).to_have_value("look at this file", timeout=10_000)
 
 
+# Samples the first painted frame of each image tile. A ResizeObserver's first
+# callback runs after layout and before paint, so its state is what the user
+# sees first. The sampler is installed before the paste so it catches the mount.
+_FIRST_PAINT_SAMPLER = """
+(fileName) => {
+  window.__firstPaint = null;
+  let observed = false;
+  const read = () => {
+    const img = document.querySelector(`img[alt="${fileName}"]`);
+    return img ? { src: img.getAttribute("src"), complete: img.complete } : null;
+  };
+  const step = () => {
+    const img = document.querySelector(`img[alt="${fileName}"]`);
+    if (img && !observed) {
+      observed = true;
+      const tile = img.parentElement;
+      const observer = new ResizeObserver(() => {
+        observer.disconnect();
+        window.__firstPaint = read();
+      });
+      observer.observe(tile);
+    }
+    if (window.__firstPaint === null) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+"""
+
+# Pastes a 12-megapixel JPEG of random pixels. Large files reach the paint
+# race more often than a solid swatch, so a fixed trial count reliably catches it.
+_PASTE_LARGE_PHOTO = """
+async (composerInput, [fileName]) => {
+  const width = 4032;
+  const height = 3024;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const pixels = context.createImageData(width, height);
+  for (let offset = 0; offset < pixels.data.length; offset += 65536) {
+    crypto.getRandomValues(pixels.data.subarray(offset, offset + 65536));
+  }
+  context.putImageData(pixels, 0, 0);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
+  const transfer = new DataTransfer();
+  transfer.items.add(new File([blob], fileName, { type: "image/jpeg" }));
+  composerInput.dispatchEvent(
+    new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true }),
+  );
+}
+"""
+
+
+def test_pasted_image_tile_paints_its_picture_on_first_frame(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """A pasted image's first painted tile already has its picture source.
+
+    An empty first frame reads as a flicker: the tile paints with no image and the
+    picture appears a frame later. Each paste is an independent trial, so several
+    run on one page.
+    """
+    chat = chat_session_contract
+
+    page.goto(chat.url)
+    composer = page.get_by_placeholder(_COMPOSER)
+    expect(composer).to_be_visible(timeout=30_000)
+
+    unpainted: list[str] = []
+    trials = 6
+    for index in range(trials):
+        file_name = f"paste-{index}.jpg"
+        page.evaluate(_FIRST_PAINT_SAMPLER, file_name)
+        composer.evaluate(_PASTE_LARGE_PHOTO, [file_name])
+        page.wait_for_function("() => window.__firstPaint !== null", timeout=10_000)
+        first_paint = page.evaluate("() => window.__firstPaint")
+        if first_paint["src"] is None:
+            unpainted.append(file_name)
+        expect(page.get_by_role("img", name=file_name)).to_be_visible(timeout=10_000)
+        page.get_by_role("button", name=f"Remove {file_name}").click()
+
+    assert unpainted == [], (
+        f"{len(unpainted)} of {trials} pasted image tiles painted without a source: {unpainted}"
+    )
+
+
 # Synthesises an OS file drag: Playwright can't drive a real desktop-to-browser
 # drag, but a page-built ``DataTransfer`` fires the same events.
 _DISPATCH_FILE_DRAG = """

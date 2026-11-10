@@ -153,11 +153,16 @@ def test_every_harness_is_covered_by_a_real_builder():
 
 
 @pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))
-def test_real_builder_preserves_forge_cli_config_paths(harness, hostile_env, monkeypatch):
-    paths = {"GH_CONFIG_DIR": "/test/gh", "GLAB_CONFIG_DIR": "/test/glab"}
-    monkeypatch.setattr("os.environ", {**hostile_env, **paths})
+def test_real_builder_preserves_forge_cli_settings(harness, hostile_env, monkeypatch):
+    settings = {
+        "GH_CONFIG_DIR": "/test/gh",
+        "GLAB_CONFIG_DIR": "/test/glab",
+        "GITLAB_HOST": "git.example.test:8443",
+        "GLAB_HOST": "git.example.test:8443",
+    }
+    monkeypatch.setattr("os.environ", {**hostile_env, **settings})
     env = SPAWN_ENV_BUILDERS[harness]()
-    assert {name: env.get(name) for name in paths} == paths
+    assert {name: env.get(name) for name in settings} == settings
     assert not (set(env) & CANARY_SECRETS.keys())
 
 
@@ -193,6 +198,15 @@ def test_real_builders_pass_node_extra_ca_certs(monkeypatch):
         assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/corp-ca.pem", harness
 
 
+def test_real_builders_pass_git_ca_paths(monkeypatch):
+    """git's CA paths must survive filtering, or git over HTTPS breaks behind a TLS proxy."""
+    git_ca = {"GIT_SSL_CAINFO": "/etc/corp-ca.pem", "GIT_SSL_CAPATH": "/etc/corp-certs"}
+    monkeypatch.setattr("os.environ", dict(git_ca))
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert {name: env.get(name) for name in git_ca} == git_ca, harness
+
+
 def test_real_builders_pass_ssh_auth_sock(monkeypatch):
     """ssh-agent must survive filtering, or git-over-SSH breaks in every harness."""
     sock = "/private/tmp/com.apple.launchd.7Qk/Listeners"
@@ -206,6 +220,47 @@ def test_real_builders_pass_browser(monkeypatch):
     monkeypatch.setattr("os.environ", {"BROWSER": "www-browser"})
     for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
         assert build().get("BROWSER") == "www-browser", harness
+
+
+def test_real_builders_pass_variables_forwarded_for_the_session(hostile_env, monkeypatch):
+    """Variables the launching shell forwarded to this runner reach every harness CLI."""
+    # An exported-but-empty value is still a forwarded value, not an absent one.
+    forwarded = {
+        "ARCATERM_CAPABILITY": "capability-for-pane-1",
+        "MACTERM_SOCKET": "/tmp/mt.sock",
+        "ARCATERM_PANE_TITLE": "",
+    }
+    monkeypatch.setattr(
+        "os.environ",
+        {
+            **hostile_env,
+            **forwarded,
+            "OMNIGENT_RUNNER_SESSION_ENV_NAMES": ",".join(sorted(forwarded)),
+        },
+    )
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert {name: env.get(name) for name in forwarded} == forwarded, harness
+        assert not (set(env) & CANARY_SECRETS.keys()), harness
+
+
+def test_forwarded_session_names_cannot_admit_runner_secrets_or_desktop_session():
+    """The forwarded-name list never re-admits runner auth, desktop or denied names."""
+    source = {
+        "OMNIGENT_RUNNER_SESSION_ENV_NAMES": (
+            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN,omnigent_runner_initial_auth_token,"
+            "XDG_RUNTIME_DIR,OPENAI_API_KEY,ARCATERM_CAPABILITY"
+        ),
+        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": "binding-secret",
+        "omnigent_runner_initial_auth_token": "initial-secret",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+        "OPENAI_API_KEY": "developer-key",
+        "ARCATERM_CAPABILITY": "capability-for-pane-1",
+    }
+
+    env = clean_agent_env(deny_exact=("OPENAI_API_KEY",), source=source)
+
+    assert env == {"ARCATERM_CAPABILITY": "capability-for-pane-1"}
 
 
 def test_real_builders_strip_desktop_session(monkeypatch):

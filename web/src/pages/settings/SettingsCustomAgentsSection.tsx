@@ -4,7 +4,7 @@ import { BotIcon, PlusIcon, SearchIcon, TrashIcon } from "lucide-react";
 import { Link, useNavigate } from "@/lib/routing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { customAgentsSettingsEnabled } from "@/lib/capabilities";
-import { useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
+import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { isAcpHarnessAgent } from "@/lib/agentGrouping";
 import { Button } from "@/components/ui/button";
@@ -92,10 +92,10 @@ export function SettingsCustomAgentsSection() {
     return (
       <div className="@container">
         {back}
-        <h1 className="mb-6 text-2xl font-semibold">Create custom agent</h1>
+        <h1 className="settings-page-title mb-6 text-2xl font-medium">Create custom agent</h1>
         <CreateAgentForm
           submitLabel="Save agent"
-          notice="Saving an existing installed agent's name replaces its entire configuration. Sessions using that agent will receive the update. Use a new name to keep both agents."
+          notice="Reusing an installed agent's name replaces its configuration and updates its sessions. Use a new name to keep both agents."
           onCancel={() => navigate(BASE)}
           onCreate={async (input) => {
             const agent = await save.mutateAsync(input);
@@ -139,7 +139,7 @@ export function SettingsCustomAgentsSection() {
           />
         ) : (
           <>
-            <h1 className="mb-6 text-2xl font-semibold">Custom agent</h1>
+            <h1 className="settings-page-title mb-6 text-2xl font-medium">Custom agent</h1>
             <p className="text-ui text-muted-foreground">
               {detail.isPending
                 ? "Loading agent…"
@@ -152,7 +152,7 @@ export function SettingsCustomAgentsSection() {
   }
   return (
     <div className="@container">
-      <h1 className="pb-6 text-2xl font-semibold">Custom agents</h1>
+      <h1 className="settings-page-title pb-6 text-2xl font-medium">Custom agents</h1>
       <div className="mb-6 flex items-center gap-2">
         <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-border px-2.5">
           <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
@@ -191,9 +191,9 @@ export function SettingsCustomAgentsSection() {
             >
               <span className="flex items-center gap-3 font-medium">
                 <BotIcon className="size-5 shrink-0" aria-hidden />
-                {agent.name}
+                {capitalizeAgentName(agent.name)}
               </span>
-              <span className="text-ui text-muted-foreground">
+              <span className="text-sm text-muted-foreground">
                 {agent.description || "Server-provided agent"}
               </span>
             </Link>
@@ -282,7 +282,7 @@ export function SettingsCustomAgentsSection() {
 function UnsupportedServer() {
   return (
     <div>
-      <h1 className="mb-6 text-2xl font-semibold">Custom agents</h1>
+      <h1 className="settings-page-title mb-6 text-2xl font-medium">Custom agents</h1>
       <p role="alert" className="text-ui text-muted-foreground">
         Custom agents settings is unavailable on this server. Update the server and reload to enable
         it.
@@ -373,14 +373,16 @@ function AgentDetail({
         <>
           <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
           <div className="flex items-start justify-between gap-4">
-            <h1 className="min-w-0 break-words text-2xl font-semibold">{agent.name}</h1>
+            <h1 className="settings-page-title min-w-0 break-words text-2xl font-medium">
+              {agent.name}
+            </h1>
             {owned === true && (
               <Button variant="ghost" size="icon" aria-label="Delete agent" onClick={confirmDelete}>
                 <TrashIcon className="size-4" />
               </Button>
             )}
           </div>
-          <p className="mt-3 text-ui text-muted-foreground">
+          <p className="mt-3 text-sm text-muted-foreground">
             {agent.description || "No description."}
           </p>
         </>

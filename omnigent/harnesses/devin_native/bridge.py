@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent._platform import stable_user_id
+from omnigent.inner.agent_env import forwarded_session_env_names
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -269,6 +270,7 @@ def build_devin_native_terminal_env(
     """Build the allowlisted child environment for the ``devin`` TUI."""
     env = os.environ if source_env is None else source_env
     child = {key: env[key] for key in _CHILD_ENV_ALLOWLIST if env.get(key)}
+    child.update({key: env[key] for key in forwarded_session_env_names(env) if key in env})
     bridge_dir = prepare_bridge_dir(session_id)
     child[DEVIN_NATIVE_BRIDGE_DIR_ENV_VAR] = str(bridge_dir)
     return child

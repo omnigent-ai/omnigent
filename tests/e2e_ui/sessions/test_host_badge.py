@@ -233,6 +233,16 @@ def test_host_badge_shows_offline_when_host_unreachable(
         host_online=False,
         host_resumable=True,
     )
+    # Opening the session presses Reconnect host after a second; failing that wake
+    # keeps the badge asleep (the wake itself is in test_host_asleep_composer.py).
+    page.route(
+        re.compile(rf"/v1/sessions/{re.escape(session_id)}/events(\?|$)"),
+        lambda route: (
+            route.fulfill(status=503, json={"error": {"message": "Sandbox is asleep."}})
+            if "retry_session" in (route.request.post_data or "")
+            else route.continue_()
+        ),
+    )
 
     page.goto(f"{base_url}/c/{session_id}")
 

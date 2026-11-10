@@ -349,7 +349,8 @@ def test_store_databricks_org_id_preserves_session_token(token_dir) -> None:
     assert load_databricks_org_id(server) == "123"
 
 
-def test_pinned_org_id_wins_over_stored_record(token_dir, monkeypatch) -> None:
+@pytest.mark.parametrize("selected_org", [None, "111"])
+def test_pinned_org_id_wins_over_stored_record(token_dir, monkeypatch, selected_org) -> None:
     """A daemon pinned to one workspace ignores later ``?o=`` launches' records."""
     from omnigent.cli_auth import (
         PINNED_DATABRICKS_ORG_ENV_VAR,
@@ -361,11 +362,11 @@ def test_pinned_org_id_wins_over_stored_record(token_dir, monkeypatch) -> None:
 
     server = "https://example.databricks.com/api/2.0/omnigent"
     store_databricks_org_id(server, "222")
-    pin_databricks_org_id(server, "111")
+    pin_databricks_org_id(server, selected_org)
 
-    assert load_databricks_org_id(server) == "111"
-    assert load_databricks_org_id(f"{server}/") == "111"
-    assert databricks_request_headers(server)["X-Databricks-Org-Id"] == "111"
+    assert load_databricks_org_id(server) == selected_org
+    assert load_databricks_org_id(f"{server}/") == selected_org
+    assert databricks_request_headers(server).get("X-Databricks-Org-Id") == selected_org
 
     monkeypatch.delenv(PINNED_DATABRICKS_ORG_ENV_VAR)
     assert load_databricks_org_id(server) == "222"
