@@ -242,8 +242,8 @@ from omnigent.server.schemas import (
     UpdateSessionRequest,
 )
 from omnigent.server.session_orchestration import (
+    require_named_source_private,
     require_orchestration_source,
-    require_private_bound_source,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -3178,23 +3178,16 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
-        if set_project and ORCHESTRATION_SOURCE_HEADER in request.headers:
-            from omnigent.server.auth import RESERVED_USER_LOCAL
-
-            # Agent tools name their calling session; one shared with edit access
-            # must not let collaborators refile the owner's other sessions.
-            if (
-                user_id is not None
-                and user_id != RESERVED_USER_LOCAL
-                and permission_store is not None
-            ):
-                await asyncio.to_thread(
-                    require_private_bound_source,
-                    request,
-                    user_id,
-                    conversation_store,
-                    permission_store,
-                )
+        if set_project:
+            # A session shared with edit access must not let collaborators
+            # refile the owner's other sessions through agent tools.
+            await asyncio.to_thread(
+                require_named_source_private,
+                request,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store

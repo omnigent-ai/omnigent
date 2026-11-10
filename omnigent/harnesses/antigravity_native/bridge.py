@@ -394,6 +394,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_session_get_history",
     "sys_session_get_info",
     "sys_session_list",
+    "sys_session_move",
     "sys_session_send",
     "sys_terminal_close",
     "sys_terminal_launch",

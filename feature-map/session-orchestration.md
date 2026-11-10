@@ -77,9 +77,9 @@ MCP independent creation.
   stays collapsed. Moving changes only folder membership,
   so running sessions, including the caller, keep their turn. Sub-agents follow
   their parent and a family moves through its representative (`moves_with`);
-  each session gets its own result. An edit-shared caller cannot move sessions,
-  while listing stays an ordinary owner read. `tool_groups.projects: false` drops
-  both tools. Covered by
+  each session gets its own result. An edit-shared caller cannot move sessions
+  or create a project through the move, while listing stays an ordinary owner
+  read. `tool_groups.projects: false` drops both tools. Covered by
   `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_bulk_move_running_sessions`
   and the browser journeys in
   `tests/e2e_ui/sessions/test_agent_moves_sessions_to_project.py`.

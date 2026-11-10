@@ -18,7 +18,9 @@ _DEFAULT_LISTED_SESSIONS = 50
 _SNAPSHOT_PARAMS = {"include_items": "false", "include_liveness": "false"}
 
 
-async def resolve_project_id(client: httpx.AsyncClient, name: str) -> tuple[str, bool]:
+async def resolve_project_id(
+    client: httpx.AsyncClient, name: str, *, headers: dict[str, str] | None = None
+) -> tuple[str, bool]:
     """
     Return the id of the caller's project named *name* and whether it was created.
 
@@ -28,6 +30,7 @@ async def resolve_project_id(client: httpx.AsyncClient, name: str) -> tuple[str,
 
     :param client: HTTP client pointed at the Omnigent server.
     :param name: The project name, e.g. ``"nightly triage"``.
+    :param headers: Extra headers for the create request, e.g. the orchestration source.
     :returns: ``(project_id, created)``.
     :raises ValueError: If the name is blank or the project can't be resolved.
     """
@@ -45,7 +48,9 @@ async def resolve_project_id(client: httpx.AsyncClient, name: str) -> tuple[str,
     existing = await find()
     if existing is not None:
         return existing, False
-    created = await client.post("/v1/projects", json={"name": trimmed}, timeout=30.0)
+    created = await client.post(
+        "/v1/projects", json={"name": trimmed}, headers=headers, timeout=30.0
+    )
     if created.status_code < 400:
         return str(created.json()["id"]), True
     racer = await find() if created.status_code == 409 else None
@@ -212,8 +217,8 @@ async def execute_session_move(
 
     Each move is the sidebar's ``PATCH /v1/sessions/{id}``, which only changes
     folder membership, so a running session keeps its turn. The calling session
-    is sent as the orchestration source so the server can refuse moves from a
-    session shared with edit access.
+    is sent as the orchestration source on every write, so the server refuses
+    both the moves and any project creation from a session shared with edit access.
 
     :param args: Tool arguments: ``session_ids`` and ``project``.
     :param client: HTTP client pointed at the Omnigent server.
@@ -237,13 +242,13 @@ async def execute_session_move(
     if client is None or source_id is None:
         return json.dumps({"error": "sys_session_move requires an authenticated runner"})
     name = project.strip()
+    headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
     project_id, created = "", False
     if name:
         try:
-            project_id, created = await resolve_project_id(client, name)
+            project_id, created = await resolve_project_id(client, name, headers=headers)
         except (httpx.HTTPError, ValueError) as exc:
             return json.dumps({"error": f"sys_session_move: {exc}"})
-    headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
     results = [
         await _move_one(client, raw_id, project_id=project_id, headers=headers)
         for raw_id in dict.fromkeys(session_ids)

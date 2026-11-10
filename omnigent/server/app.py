@@ -4071,6 +4071,8 @@ def create_app(
             create_projects_router(
                 project_store=project_store,
                 auth_provider=auth_provider,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
             ),
             prefix="/v1",
             tags=["projects"],

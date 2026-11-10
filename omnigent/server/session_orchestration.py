@@ -10,7 +10,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.feature_flags import Feature
 from omnigent.server.schemas import SessionStartupInput
 from omnigent.server.sharing_settings import peer_session_messaging_enabled
@@ -97,6 +97,25 @@ def require_private_bound_source(
             "Session orchestration requires the sender's bound runner", code=ErrorCode.FORBIDDEN
         )
     return source
+
+
+def require_named_source_private(
+    request: Request,
+    user_id: str | None,
+    conversations: ConversationStore,
+    permissions: PermissionStore | None,
+) -> None:
+    """
+    Refuse an agent-tool write whose named calling session is shared with edit access.
+
+    Requests without the orchestration-source header, and servers without
+    per-user sharing (no auth or the local user), are left alone.
+    """
+    if ORCHESTRATION_SOURCE_HEADER not in request.headers:
+        return
+    if user_id is None or user_id == RESERVED_USER_LOCAL or permissions is None:
+        return
+    require_private_bound_source(request, user_id, conversations, permissions)
 
 
 def require_orchestration_source(

@@ -31,6 +31,9 @@ from omnigent.server.schemas import (
     ProjectOrderResponse,
     UpdateProjectRequest,
 )
+from omnigent.server.session_orchestration import require_named_source_private
+from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
 
 
@@ -53,12 +56,16 @@ def _to_response(project: Project) -> dict[str, Any]:
 def create_projects_router(
     project_store: ProjectStore,
     auth_provider: AuthProvider | None = None,
+    conversation_store: ConversationStore | None = None,
+    permission_store: PermissionStore | None = None,
 ) -> APIRouter:
     """Build the projects router (``/v1/projects``).
 
     :param project_store: The store backing project persistence.
     :param auth_provider: Auth provider used to identify the requesting user.
         ``None`` in single-user mode (owner scope is ``None``).
+    :param conversation_store: Resolves the calling session an agent tool names.
+    :param permission_store: Checks whether that session is shared with edit access.
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
@@ -77,6 +84,14 @@ def create_projects_router(
             if the caller already has a project with this name.
         """
         user_id = require_user(request, auth_provider)
+        if conversation_store is not None:
+            await asyncio.to_thread(
+                require_named_source_private,
+                request,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
         project = await asyncio.to_thread(
             project_store.create,
             uuid.uuid4().hex,

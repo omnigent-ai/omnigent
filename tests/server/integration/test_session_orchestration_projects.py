@@ -328,8 +328,16 @@ async def test_project_move_refuses_a_source_shared_with_edit_access(auth_client
 
     listed = await _project_tool(auth_client, source, "sys_project_list")
     assert target["id"] in {row["session_id"] for row in listed["sessions"]}
-    moved = await _project_tool(
+    refused_create = await _project_tool(
         auth_client, source, "sys_session_move", session_ids=[target["id"]], project="Shared"
+    )
+    assert "shared with edit access cannot" in refused_create["error"], refused_create
+    projects = (await auth_client.get("/v1/projects")).json()["data"]
+    assert "Shared" not in {project["name"] for project in projects}
+    existing = await auth_client.post("/v1/projects", json={"name": "Existing"})
+    assert existing.status_code == 200, existing.text
+    moved = await _project_tool(
+        auth_client, source, "sys_session_move", session_ids=[target["id"]], project="Existing"
     )
     assert "shared with edit access cannot" in moved["results"][0]["error"], moved
     assert SqlAlchemyConversationStore(db_uri).get_conversation(target["id"]).project_id is None
