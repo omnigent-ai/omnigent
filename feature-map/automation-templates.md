@@ -81,6 +81,8 @@ to customize.
   edit saves the harness default in place of a saved one; non-Claude harnesses also
   need `scheduled_task_harness_settings` for that, so convert their overrides before
   rolling back (Scheduler compatibility and rollback in `docs/AUTOMATIONS.md`).
+  Codex's Ask for approval and Approve for me need `scheduled_task_codex_reviewer_modes`;
+  without it the picker hides them and a new Codex automation starts on Default.
 - `trigger-controls`: continued trigger templates
   show polling cadence instead of schedule controls, Run now, or next-run times.
   New templates use `automation_trigger_poll_minutes` from the server (10–240 minutes,

@@ -16,6 +16,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import {
   APPROVAL_SKIPPING_PERMISSION_MODES,
+  CODEX_NATIVE_REVIEWER_MODE_VALUES,
   nativePermissionOptions,
 } from "@/lib/nativeHarnessModes";
 import { nativeEffortOptions } from "@/components/HarnessConfigControls";
@@ -125,10 +126,14 @@ export function useScheduledHarnessSettings(
     harness === "claude-native" ||
     (info !== "loading" && info.scheduled_task_harness_settings === true);
   const approvalSkippingAccepted = acceptsApprovalSkippingModes(info);
+  // Older servers reject the Codex reviewer modes, so offer (and prefill) them only when advertised.
+  const codexReviewerModesAccepted =
+    info !== "loading" && info.scheduled_task_codex_reviewer_modes === true;
   const permissions = supportsHarnessPermissions
     ? nativePermissionOptions(harness).filter(
         (option) =>
-          approvalSkippingAccepted || !APPROVAL_SKIPPING_PERMISSION_MODES.has(option.value),
+          (approvalSkippingAccepted || !APPROVAL_SKIPPING_PERMISSION_MODES.has(option.value)) &&
+          (codexReviewerModesAccepted || !CODEX_NATIVE_REVIEWER_MODE_VALUES.has(option.value)),
       )
     : [];
   const loading = sandbox ? sandboxModels.isLoading : hostModels.isLoading;

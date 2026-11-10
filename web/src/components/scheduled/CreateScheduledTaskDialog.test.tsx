@@ -256,6 +256,7 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
           ...SERVER_INFO_OFFLINE_FALLBACK,
           features: { automations_v2: true },
           scheduled_task_harness_settings: true,
+          scheduled_task_codex_reviewer_modes: true,
           scheduled_task_approval_skipping_modes: true,
           scheduled_task_worktrees: true,
         }}
@@ -279,12 +280,18 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
   };
 }
 
-/** A server with harness settings that predates modes that skip approval. */
-const REFUSES_APPROVAL_SKIPPING = {
+/** A server with harness settings that predates the Codex reviewer modes. */
+const PREDATES_CODEX_REVIEWER_MODES = {
   ...SERVER_INFO_OFFLINE_FALLBACK,
   features: { automations_v2: true },
   scheduled_task_harness_settings: true,
   scheduled_task_worktrees: true,
+};
+
+/** A server with harness settings that predates modes that skip approval. */
+const REFUSES_APPROVAL_SKIPPING = {
+  ...PREDATES_CODEX_REVIEWER_MODES,
+  scheduled_task_codex_reviewer_modes: true,
 };
 
 function serverInfo(acceptsApprovalSkipping: boolean) {
@@ -632,9 +639,8 @@ describe("agent picker readiness (needs-setup badges)", () => {
     fireEvent.click(submit);
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0].agentId).toBe("ag_codex");
-    // A new automation starts on Approve for me; model and effort keep the agent's defaults.
-    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("approve-for-me");
-    for (const override of ["modelOverride", "reasoningEffort"]) {
+    // This server doesn't advertise the Codex reviewer modes, so nothing is prefilled.
+    for (const override of ["permissionMode", "modelOverride", "reasoningEffort"]) {
       expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty(override);
     }
 
@@ -4433,6 +4439,25 @@ describe("automation harness settings", () => {
       }
     },
   );
+
+  it("hides and never prefills the Codex reviewer modes on an older server", async () => {
+    mockHarness("codex-native");
+    render(
+      <CapabilitiesProvider info={PREDATES_CODEX_REVIEWER_MODES}>
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Read Only" })).toBeInTheDocument();
+    for (const name of ["Ask for approval", "Approve for me"]) {
+      expect(screen.queryByRole("option", { name })).not.toBeInTheDocument();
+    }
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("permissionMode");
+  });
 
   it("starts a new Codex automation on Approve for me", async () => {
     mockHarness("codex-native");
