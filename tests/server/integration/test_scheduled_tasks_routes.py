@@ -4009,6 +4009,26 @@ async def test_duplicate_creates_a_paused_copy(
     assert other.status_code == 404
 
 
+async def test_duplicating_a_long_name_keeps_the_copy_within_the_name_column(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    name = "n" * 250
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(name=name), headers=_headers()
+        )
+    ).json()
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/duplicate", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    # scheduled_tasks.name is String(256).
+    assert resp.json()["name"] == "n" * 249 + " (copy)"
+
+
 async def test_duplicate_gives_the_copy_its_own_source_session(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

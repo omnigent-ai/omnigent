@@ -77,6 +77,9 @@ _logger = logging.getLogger(__name__)
 # owner's own machine; ``managed_sandbox`` provisions a FRESH server-managed
 # sandbox per fire, using the server's normal sandbox lifecycle.
 _VALID_EXECUTION_TARGETS = frozenset({"connected_host", "managed_sandbox"})
+_COPY_SUFFIX = " (copy)"
+# Matches the scheduled_tasks.name column, String(256).
+_NAME_MAX_LENGTH = 256
 _MANAGED_SANDBOX_WITH_HOST_MSG = (
     "a managed_sandbox task runs in a fresh sandbox each fire; do not set host_id"
 )
@@ -893,7 +896,8 @@ def create_scheduled_tasks_router(
             # Runs of a task whose project was deleted already file nowhere.
             project_id = None
         body = CreateScheduledTaskRequest(
-            name=f"{original.name} (copy)",
+            # Shorten a long name so the suffix still fits the column.
+            name=original.name[: _NAME_MAX_LENGTH - len(_COPY_SUFFIX)] + _COPY_SUFFIX,
             prompt=original.prompt,
             rrule=original.rrule,
             agent_id=original.agent_id,
