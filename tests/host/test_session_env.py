@@ -205,9 +205,20 @@ def test_windows_daemon_ignores_and_removes_a_handoff_it_cannot_verify(
 def test_consume_ignores_and_removes_a_handoff_owned_by_another_user(
     _data_dir: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _plant_handoff("conv_a", {"ARCATERM_CAPABILITY": "planted"})
-    daemon_uid = os.getuid() + 1
-    monkeypatch.setattr(os, "getuid", lambda: daemon_uid)
+    path = _plant_handoff("conv_a", {"ARCATERM_CAPABILITY": "planted"})
+    real_fstat = os.fstat
+    planted_inode = path.stat().st_ino
+
+    def fstat_as_foreign_owner(fd: int) -> os.stat_result:
+        # Only the file is foreign; the directory stays the daemon's own.
+        info = real_fstat(fd)
+        if info.st_ino != planted_inode:
+            return info
+        fields = list(info)
+        fields[stat.ST_UID] = os.getuid() + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", fstat_as_foreign_owner)
 
     assert consume_session_env_handoff("conv_a", _PLANTED_LAUNCH) == {}
     assert _handoff_files(_data_dir) == []
@@ -273,4 +284,61 @@ def test_consume_ignores_a_malformed_handoff(_data_dir: Path) -> None:
     path.write_text("{not json", encoding="utf-8")
 
     assert consume_session_env_handoff("conv_a", _PLANTED_LAUNCH) == {}
+    assert _handoff_files(_data_dir) == []
+
+
+@_POSIX_ONLY
+def test_consume_does_not_block_on_a_planted_fifo(
+    _data_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _plant_handoff("conv_a", {})
+    path.unlink()
+    os.mkfifo(path, 0o600)
+
+    started = time.monotonic()
+    assert consume_session_env_handoff("conv_a", _PLANTED_LAUNCH) == {}
+
+    assert time.monotonic() - started < 5
+    assert _handoff_files(_data_dir) == []
+    assert "not a regular file" in caplog.text
+
+
+@_POSIX_ONLY
+def test_consume_ignores_handoffs_in_a_directory_other_users_can_write(
+    _data_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _plant_handoff("conv_a", {"ARCATERM_CAPABILITY": "planted-by-another-user"})
+    os.chmod(path.parent, 0o777)
+
+    assert consume_session_env_handoff("conv_a", _PLANTED_LAUNCH) == {}
+    assert "accessible by other users" in caplog.text
+    assert "planted-by-another-user" not in caplog.text
+
+
+@_POSIX_ONLY
+def test_launch_tightens_its_own_permissive_handoff_directory(_data_dir: Path) -> None:
+    directory = _data_dir / "session-env"
+    directory.mkdir(parents=True)
+    os.chmod(directory, 0o755)
+
+    with session_env_handoff("conv_a", {"ARCATERM_CAPABILITY": "cap"}) as handoff_id:
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        assert handoff_id is not None
+        assert consume_session_env_handoff("conv_a", handoff_id) == {"ARCATERM_CAPABILITY": "cap"}
+
+
+@_POSIX_ONLY
+def test_launch_refuses_a_handoff_directory_owned_by_another_user(
+    _data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (_data_dir / "session-env").mkdir(mode=0o700, parents=True)
+    launching_uid = os.getuid() + 1
+    monkeypatch.setattr(os, "getuid", lambda: launching_uid)
+
+    with (
+        pytest.raises(click.ClickException, match="owned by another user"),
+        session_env_handoff("conv_a", {"ARCATERM_CAPABILITY": "value-secret"}),
+    ):
+        pass
+
     assert _handoff_files(_data_dir) == []

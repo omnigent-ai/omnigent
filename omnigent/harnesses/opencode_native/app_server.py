@@ -64,8 +64,8 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MIN_VERSION,
     OpenCodeClient,
 )
-from omnigent.process_logging import harness_stderr_capture_enabled
 from omnigent.inner.agent_env import forwarded_session_env_names
+from omnigent.process_logging import harness_stderr_capture_enabled
 
 _logger = logging.getLogger(__name__)
 

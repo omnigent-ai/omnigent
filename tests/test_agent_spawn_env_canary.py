@@ -224,13 +224,18 @@ def test_real_builders_pass_browser(monkeypatch):
 
 def test_real_builders_pass_variables_forwarded_for_the_session(hostile_env, monkeypatch):
     """Variables the launching shell forwarded to this runner reach every harness CLI."""
-    forwarded = {"ARCATERM_CAPABILITY": "capability-for-pane-1", "MACTERM_SOCKET": "/tmp/mt.sock"}
+    # An exported-but-empty value is still a forwarded value, not an absent one.
+    forwarded = {
+        "ARCATERM_CAPABILITY": "capability-for-pane-1",
+        "MACTERM_SOCKET": "/tmp/mt.sock",
+        "ARCATERM_PANE_TITLE": "",
+    }
     monkeypatch.setattr(
         "os.environ",
         {
             **hostile_env,
             **forwarded,
-            "OMNIGENT_RUNNER_SESSION_ENV_NAMES": "ARCATERM_CAPABILITY,MACTERM_SOCKET",
+            "OMNIGENT_RUNNER_SESSION_ENV_NAMES": ",".join(sorted(forwarded)),
         },
     )
     for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):

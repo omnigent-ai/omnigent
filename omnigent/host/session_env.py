@@ -120,6 +120,7 @@ def session_env_handoff(session_id: str, values: Mapping[str, str]) -> Iterator[
         return
     directory = _handoff_dir()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _make_handoff_dir_private(directory)
     _remove_expired_handoffs(directory)
     handoff_id = secrets.token_urlsafe(16)
     path = _handoff_path(session_id, handoff_id)
@@ -161,12 +162,19 @@ def consume_session_env_handoff(session_id: str, handoff_id: str | None) -> dict
     :returns: Forwarded variables, or ``{}`` when none are waiting or the file
         is not a fresh, owner-only regular file.
     """
-    _remove_expired_handoffs(_handoff_dir())
+    directory = _handoff_dir()
+    if (problem := _handoff_dir_problem(directory)) is not None:
+        if handoff_id:
+            _logger.warning("Ignoring session env handoffs in %s: %s", directory, problem)
+        return {}
+    _remove_expired_handoffs(directory)
     if not handoff_id:
         return {}
     path = _handoff_path(session_id, handoff_id)
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        # O_NONBLOCK keeps a planted FIFO from stalling the launch in open();
+        # the fstat below then rejects anything but a regular file.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         return {}
     except OSError as exc:
@@ -194,6 +202,50 @@ def consume_session_env_handoff(session_id: str, handoff_id: str | None) -> dict
         for name, value in payload.items()
         if isinstance(name, str) and isinstance(value, str) and is_forwardable_name(name)
     }
+
+
+def _handoff_dir_problem(directory: Path) -> str | None:
+    """Describe why *directory* cannot be trusted to hold handoffs, if it can't.
+
+    A directory other local users can write to lets them plant or swap files
+    between the CLI's write and the daemon's read.
+
+    :param directory: The ``session-env/`` handoff directory.
+    :returns: A short reason, or ``None`` when absent or owner-only.
+    """
+    try:
+        info = os.lstat(directory)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"unreadable ({type(exc).__name__})"
+    if not stat.S_ISDIR(info.st_mode):
+        return "not a directory"
+    if IS_WINDOWS:
+        return None
+    if info.st_uid != os.getuid():
+        return "owned by another user"
+    if info.st_mode & 0o077:
+        return "accessible by other users"
+    return None
+
+
+def _make_handoff_dir_private(directory: Path) -> None:
+    """Tighten our own handoff directory to owner-only, or refuse to use it.
+
+    :param directory: The ``session-env/`` handoff directory, already created.
+    :raises click.ClickException: If the directory is not ours to tighten.
+    """
+    problem = _handoff_dir_problem(directory)
+    if problem == "accessible by other users":
+        os.chmod(directory, 0o700)
+        problem = _handoff_dir_problem(directory)
+    if problem is not None:
+        raise click.ClickException(
+            f"Cannot forward {SESSION_ENV_PASSTHROUGH_ENV_VAR} variables through "
+            f"{directory}: it is {problem}. Remove it or unset "
+            f"{SESSION_ENV_PASSTHROUGH_ENV_VAR} to launch without forwarding."
+        )
 
 
 def _handoff_problem(info: os.stat_result) -> str | None:

@@ -1214,6 +1214,8 @@ async def test_handle_launch_refuses_when_workspace_mkdir_denied(
     assert not workspace.exists(), "a denied mkdir must leave no workspace behind"
 
     _cleanup_host(host)
+
+
 _FORWARDS_SESSION_ENV = pytest.mark.skipif(
     sys.platform == "win32", reason="Session env forwarding is disabled on Windows"
 )
@@ -1307,143 +1309,6 @@ async def test_cli_launch_forwards_named_shell_env_to_only_that_sessions_runner(
     plain_env = spawned_envs["conv_plain"]
     assert not {"ARCATERM_CAPABILITY", "MACTERM_SOCKET"} & plain_env.keys()
     assert "OMNIGENT_RUNNER_SESSION_ENV_NAMES" not in plain_env
-
-
-@_FORWARDS_SESSION_ENV
-async def test_concurrent_cli_launches_of_one_session_give_the_runner_its_own_launchs_values(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A second terminal resuming the same session cannot swap in its values mid-launch."""
-    host = _make_host_process()
-    host._auth_token_factory = lambda: "host-bootstrap-bearer"
-    host._auth_token_factory_resolved = True
-    workspace = tmp_path / "project"
-    workspace.mkdir()
-    monkeypatch.setenv("OMNIGENT_SESSION_ENV_PASSTHROUGH", "ARCATERM_CAPABILITY")
-    monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-a")
-    launch_bodies: list[object] = []
-    spawned_envs: list[dict[str, str]] = []
-    first_launch_reached_server = asyncio.Event()
-    server_session_lock = asyncio.Lock()
-    original_popen = subprocess.Popen
-
-    async def _server(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        launch_bodies.append(body)
-        async with server_session_lock:
-            if spawned_envs:
-                return httpx.Response(400, json={"detail": "session already has a runner bound"})
-            return await _launch_on_host(body)
-
-    async def _launch_on_host(body: dict[str, str]) -> httpx.Response:
-        first_launch_reached_server.set()
-        await asyncio.sleep(0.5)
-        monkeypatch.delenv("ARCATERM_CAPABILITY", raising=False)
-
-        def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
-            spawned_envs.append(dict(kwargs["env"]))  # type: ignore[call-overload]
-            return original_popen(
-                ["sleep", "10"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-
-        frame = _relayed_launch_frame(body, "req_shared")
-        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
-            result = await host._handle_launch(frame)
-        assert result.status == "launched", result.error
-        return httpx.Response(200, json={"runner_id": result.runner_id})
-
-    def _launch(client: httpx.AsyncClient) -> asyncio.Task[str]:
-        return asyncio.create_task(
-            daemon_launch.launch_or_reuse_daemon_runner(
-                client,
-                host_id="host_test_connect",
-                session_id="conv_shared",
-                workspace=str(workspace),
-                fresh=True,
-            )
-        )
-
-    try:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(_server), base_url="https://server.example"
-        ) as client:
-            first = _launch(client)
-            await asyncio.wait_for(first_launch_reached_server.wait(), timeout=10)
-            monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-b")
-            second = _launch(client)
-            results = await asyncio.gather(first, second, return_exceptions=True)
-    finally:
-        _cleanup_host(host)
-
-    assert isinstance(results[0], str)
-    assert isinstance(results[1], click.ClickException)
-    assert len(launch_bodies) == 2
-    (runner_env,) = spawned_envs
-    assert runner_env["ARCATERM_CAPABILITY"] == "capability-for-pane-a"
-
-
-@_FORWARDS_SESSION_ENV
-async def test_launch_frame_the_server_gave_up_on_cannot_take_the_next_launchs_values(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A timed-out launch's frame that reaches the host late gets none of the retry's values."""
-    host = _make_host_process()
-    host._auth_token_factory = lambda: "host-bootstrap-bearer"
-    host._auth_token_factory_resolved = True
-    workspace = tmp_path / "project"
-    workspace.mkdir()
-    monkeypatch.setenv("OMNIGENT_SESSION_ENV_PASSTHROUGH", "ARCATERM_CAPABILITY")
-    monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-a")
-    delayed_frames: list[HostLaunchRunnerFrame] = []
-    spawned_envs: dict[str, dict[str, str]] = {}
-    original_popen = subprocess.Popen
-
-    async def _run_on_host(frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
-        def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
-            spawned_envs[frame.request_id] = dict(kwargs["env"])  # type: ignore[call-overload]
-            return original_popen(
-                ["sleep", "10"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-
-        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
-            result = await host._handle_launch(frame)
-        assert result.status == "launched", result.error
-        return result
-
-    async def _server(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        if not delayed_frames:
-            delayed_frames.append(_relayed_launch_frame(body, "req_timed_out"))
-            return httpx.Response(504, json={"detail": "timed out waiting for host launch"})
-        monkeypatch.delenv("ARCATERM_CAPABILITY")
-        await _run_on_host(delayed_frames[0])
-        result = await _run_on_host(_relayed_launch_frame(body, "req_retry"))
-        return httpx.Response(200, json={"runner_id": result.runner_id})
-
-    async def _launch(client: httpx.AsyncClient) -> str:
-        return await daemon_launch.launch_or_reuse_daemon_runner(
-            client,
-            host_id="host_test_connect",
-            session_id="conv_shared",
-            workspace=str(workspace),
-            fresh=True,
-        )
-
-    try:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(_server), base_url="https://server.example"
-        ) as client:
-            with pytest.raises(click.ClickException, match="504"):
-                await _launch(client)
-            monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-b")
-            await _launch(client)
-    finally:
-        _cleanup_host(host)
-
-    assert "ARCATERM_CAPABILITY" not in spawned_envs["req_timed_out"]
-    assert spawned_envs["req_retry"]["ARCATERM_CAPABILITY"] == "capability-for-pane-b"
 
 
 @pytest.mark.parametrize("binding_token", ["token_xyz", "", "   "])

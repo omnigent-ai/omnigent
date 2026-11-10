@@ -528,6 +528,8 @@ def test_launch_audit_context_is_bounded_and_contains_no_arguments() -> None:
             launch_audit_headers(host_id="host_b", fresh=False)["X-Omnigent-Launch-Command"]
             == "unknown"
         )
+
+
 @pytest.mark.skipif(IS_WINDOWS, reason="Session env forwarding is disabled on Windows")
 async def test_launch_warns_when_an_older_peer_leaves_forwarded_values_unconsumed(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -549,3 +551,97 @@ async def test_launch_warns_when_an_older_peer_leaves_forwarded_values_unconsume
     stderr = capsys.readouterr().err
     assert "did not receive the OMNIGENT_SESSION_ENV_PASSTHROUGH variables" in stderr
     assert "capability-for-pane-1" not in stderr
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="Session env forwarding is disabled on Windows")
+async def test_overlapping_launches_of_one_session_each_offer_only_their_own_values(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second terminal resuming the same session mid-launch cannot swap in its values."""
+    import asyncio
+    import json
+
+    from omnigent.host.session_env import consume_session_env_handoff
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_SESSION_ENV_PASSTHROUGH", "ARCATERM_CAPABILITY")
+    handoff_ids: list[str] = []
+    both_in_flight = asyncio.Event()
+    consumed: dict[str, dict[str, str]] = {}
+
+    async def server(request: httpx.Request) -> httpx.Response:
+        handoff_ids.append(json.loads(request.content)["session_env_handoff_id"])
+        if len(handoff_ids) == 1:
+            await asyncio.wait_for(both_in_flight.wait(), timeout=10)
+            # The first request wins the session binding; its daemon reads
+            # while the second terminal's file is also on disk.
+            consumed["winner"] = consume_session_env_handoff("conv_shared", handoff_ids[0])
+            return httpx.Response(200, json={"runner_id": "runner_a"})
+        both_in_flight.set()
+        return httpx.Response(400, json={"detail": "session already has a runner bound"})
+
+    def launch(client: httpx.AsyncClient) -> asyncio.Task[str]:
+        return asyncio.create_task(
+            launch_or_reuse_daemon_runner(
+                client, host_id="host_x", session_id="conv_shared", workspace="/w", fresh=True
+            )
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server), base_url="http://test"
+    ) as client:
+        monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-a")
+        first = launch(client)
+        while not handoff_ids:
+            await asyncio.sleep(0)
+        monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-b")
+        second = launch(client)
+        results = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert results[0] == "runner_a"
+    assert isinstance(results[1], click.ClickException)
+    assert len(set(handoff_ids)) == 2
+    assert consumed["winner"] == {"ARCATERM_CAPABILITY": "capability-for-pane-a"}
+    assert not (tmp_path / "session-env").exists() or not any((tmp_path / "session-env").iterdir())
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="Session env forwarding is disabled on Windows")
+async def test_launch_frame_the_server_gave_up_on_cannot_take_the_retrys_values(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timed-out launch's frame reaching the daemon late gets none of the retry's values."""
+    import json
+
+    from omnigent.host.session_env import consume_session_env_handoff
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_SESSION_ENV_PASSTHROUGH", "ARCATERM_CAPABILITY")
+    handoff_ids: list[str] = []
+    consumed: dict[str, dict[str, str]] = {}
+
+    def server(request: httpx.Request) -> httpx.Response:
+        handoff_ids.append(json.loads(request.content)["session_env_handoff_id"])
+        if len(handoff_ids) == 1:
+            return httpx.Response(504, json={"detail": "timed out waiting for host launch"})
+        # The abandoned frame lands first, then the retry's own frame.
+        consumed["timed_out"] = consume_session_env_handoff("conv_shared", handoff_ids[0])
+        consumed["retry"] = consume_session_env_handoff("conv_shared", handoff_ids[1])
+        return httpx.Response(200, json={"runner_id": "runner_retry"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server), base_url="http://test"
+    ) as client:
+        monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-a")
+        with pytest.raises(click.ClickException, match="504"):
+            await launch_or_reuse_daemon_runner(
+                client, host_id="host_x", session_id="conv_shared", workspace="/w", fresh=True
+            )
+        monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-b")
+        await launch_or_reuse_daemon_runner(
+            client, host_id="host_x", session_id="conv_shared", workspace="/w", fresh=True
+        )
+
+    assert consumed == {
+        "timed_out": {},
+        "retry": {"ARCATERM_CAPABILITY": "capability-for-pane-b"},
+    }
