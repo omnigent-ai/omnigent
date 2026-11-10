@@ -4,7 +4,13 @@ import { sandboxProfilesEnabled } from "@/lib/capabilities";
 import { useQuery } from "@tanstack/react-query";
 import { BoxIcon, ChevronDownIcon } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Command, CommandInput, CommandList, CommandItem } from "@/components/ui/command";
+import {
+  Command,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
 import {
   fetchSandboxProfiles,
   SANDBOX_PROFILES_QUERY_KEY,
@@ -110,6 +116,10 @@ export function useSandboxProfileCatalog(
     queryFn: ({ signal }) =>
       fetchSandboxProfiles(provider ?? undefined, { profileId: selection?.id, signal }),
     enabled: selection !== null,
+    // Picked from the first page at this revision: that page already checked it.
+    ...(profiles.some((p) => p.id === selection?.id && p.revision === selection?.revision)
+      ? { initialData: query.data, initialDataUpdatedAt: query.dataUpdatedAt }
+      : {}),
     staleTime: 30_000,
     retry: false,
   });
@@ -125,7 +135,7 @@ export function useSandboxProfileCatalog(
           query.isFetching ||
           remembered.fetching ||
           fallback.fetching ||
-          (selection && (selectedQuery.isPending || selectedQuery.isFetching))
+          (selection && selectedQuery.isPending)
         ? "Loading sandbox profiles…"
         : query.isError || (selection && selectedQuery.isError) || fallback.failed
           ? "Could not load sandbox profiles. Try again."
@@ -225,7 +235,7 @@ export function SandboxProfilePicker({
         </button>
       </PopoverTrigger>
       <PopoverContent align="start" className="w-80 max-w-[calc(100vw-2rem)] p-0">
-        <Command label="Search sandbox profiles" shouldFilter={false}>
+        <Command label="Search sandbox profiles" shouldFilter={false} defaultValue={selection?.id}>
           <CommandInput
             aria-label="Search sandbox profiles"
             placeholder="Search profiles…"
@@ -234,33 +244,36 @@ export function SandboxProfilePicker({
             maxLength={200}
           />
           <CommandList aria-label="Sandbox profiles" className="max-h-64">
-            {!loading &&
-              !active.isError &&
-              rows.map((profile) => (
-                <CommandItem
-                  key={`${profile.provider}:${profile.id}`}
-                  value={profile.id}
-                  onSelect={() => {
-                    onChange(profile);
-                    setOpen(false);
-                    setSearch("");
-                  }}
-                >
-                  <span className="flex min-w-0 flex-col gap-0.5">
-                    <span className="truncate" title={profile.name}>
-                      {profile.name}
-                    </span>
-                    {profile.description && (
-                      <span
-                        className="line-clamp-2 text-xs text-muted-foreground"
-                        title={profile.description}
-                      >
-                        {profile.description}
+            {!loading && !active.isError && rows.length > 0 && (
+              <CommandGroup>
+                {rows.map((profile) => (
+                  <CommandItem
+                    key={`${profile.provider}:${profile.id}`}
+                    value={profile.id}
+                    data-checked={profile.id === selection?.id}
+                    onSelect={() => {
+                      onChange(profile);
+                      setOpen(false);
+                      setSearch("");
+                    }}
+                  >
+                    <span className="flex min-w-0 flex-col gap-0.5">
+                      <span className="truncate" title={profile.name}>
+                        {profile.name}
                       </span>
-                    )}
-                  </span>
-                </CommandItem>
-              ))}
+                      {profile.description && (
+                        <span
+                          className="line-clamp-2 text-xs text-muted-foreground"
+                          title={profile.description}
+                        >
+                          {profile.description}
+                        </span>
+                      )}
+                    </span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            )}
             {loading && (
               <p role="status" className="p-3 text-xs text-muted-foreground">
                 Searching profiles…

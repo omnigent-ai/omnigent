@@ -206,6 +206,30 @@ it("keeps an explicit choice over the last launched profile and the default", as
   ).toBeTruthy();
 });
 
+it("switches to a listed profile without loading it again", async () => {
+  defaults = { company: "profile-3" };
+  mount();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Start" })).toBeEnabled());
+  await open("Build profile 3");
+  fireEvent.click(screen.getByRole("option", { name: /Build profile 5/ }));
+  expect(screen.getByRole("button", { name: "Start" })).toBeEnabled();
+  expect(fetchSandboxProfiles).not.toHaveBeenCalledWith(
+    "company",
+    expect.objectContaining({ profileId: "profile-5" }),
+  );
+});
+
+it("opens on the current profile, checked", async () => {
+  mount(rows[5]);
+  await open(rows[5].name);
+  const current = screen.getByRole("option", { name: /Build profile 5/ });
+  expect(current).toHaveAttribute("aria-selected", "true");
+  expect(current).toHaveAttribute("data-checked", "true");
+  const first = screen.getByRole("option", { name: /Build profile 0/ });
+  expect(first).toHaveAttribute("aria-selected", "false");
+  expect(first).toHaveAttribute("data-checked", "false");
+});
+
 it("caps the menu and finds profiles beyond the first page", async () => {
   const { onChange } = mount();
   const input = await open();
