@@ -8803,7 +8803,7 @@ def create_runner_app(
             """Whether the server still records the session's turn as in flight.
 
             Most native turns report their end to the server, which relays it here.
-            When that relay is lost, the runner's record says ``running`` until the
+            When that relay is lost, the runner's record stays in flight until the
             session is deleted; the server's status settles it.
 
             :param conv_id: Session/conversation id, e.g. ``"conv_abc123"``.
@@ -8812,6 +8812,8 @@ def create_runner_app(
                 including when the server cannot be asked.
             """
             epoch = _turn_bind_epoch.get(conv_id)
+            observed_status = _native_pane_status.get(conv_id)
+            activity_epoch = resource_registry.session_activity_epoch(conv_id)
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
@@ -8826,14 +8828,16 @@ def create_runner_app(
             if (
                 conv_id in _active_turns
                 or _turn_bind_epoch.get(conv_id) != epoch
-                or _native_pane_status.get(conv_id) != "running"
+                or _native_pane_status.get(conv_id) != observed_status
+                or resource_registry.session_activity_epoch(conv_id) != activity_epoch
             ):
                 return True
             _logger.info(
                 "native pane reaper: server reports %s for conversation %s, whose turn "
-                "this runner still recorded as running",
+                "this runner still recorded as %s",
                 status,
                 conv_id,
+                observed_status,
                 extra={"session_id": conv_id},
             )
             _native_pane_status[conv_id] = status
@@ -8883,7 +8887,7 @@ def create_runner_app(
                 )
             if screen_changed:
                 return True
-            if _native_pane_status.get(conv_id) == "running":
+            if _native_pane_status.get(conv_id) in _IN_FLIGHT_SESSION_STATUSES:
                 return await _server_confirms_turn_in_flight(conv_id)
             return False
 

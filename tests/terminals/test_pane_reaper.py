@@ -395,30 +395,33 @@ class _SessionStatusServerClient(NullServerClient):
         return SimpleNamespace(status_code=status_code, json=parse)
 
 
-async def test_runner_busy_check_settles_a_running_record_the_server_has_settled(
+@pytest.mark.parametrize("status", ["running", "waiting"])
+async def test_runner_busy_check_settles_an_in_flight_record_the_server_has_settled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    status: str,
 ) -> None:
     """
-    A ``running`` record with no other evidence spares the pane only while the server agrees.
+    An in-flight record spares a quiet pane until the server confirms it settled.
 
     The end of most native turns reaches the runner as a server relay; a lost
-    relay leaves the record ``running`` until the session is deleted.
+    relay leaves the record in flight until the session is deleted.
     """
     monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
     monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
     monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
     server = _SessionStatusServerClient()
     registry = TerminalRegistry()
+    resources = SessionResourceRegistry(terminal_registry=registry)
     app = create_runner_app(
         terminal_registry=registry,
-        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        resource_registry=resources,
         server_client=server,  # type: ignore[arg-type]
     )
     reaper = app.state.native_pane_reaper
     assert reaper is not None
     pane = PaneRef("conv_lost_idle", terminal_resource_id("codex", "main"), "codex", tmp_path)
-    app.state.native_pane_status["conv_lost_idle"] = "running"
+    app.state.native_pane_status["conv_lost_idle"] = status
 
     for reply in (
         httpx.ConnectError("server unreachable"),
@@ -429,6 +432,7 @@ async def test_runner_busy_check_settles_a_running_record_the_server_has_settled
         (200, ["idle"]),
         (200, {}),
         (200, {"status": "running"}),
+        (200, {"status": "waiting"}),
     ):
         server.reply = reply
         assert await reaper._is_busy(pane), f"reply {reply!r} must keep the pane"
@@ -436,7 +440,22 @@ async def test_runner_busy_check_settles_a_running_record_the_server_has_settled
     # The server read its status before a new turn started, so the reply is stale.
     server.while_in_flight = lambda: app.state.turn_bind_epoch.__setitem__("conv_lost_idle", 1)
     assert await reaper._is_busy(pane), "an idle read before a new turn must not settle it"
-    assert app.state.native_pane_status["conv_lost_idle"] == "running"
+    assert app.state.native_pane_status["conv_lost_idle"] == status
+    changed_status = "waiting" if status == "running" else "running"
+    server.while_in_flight = lambda: app.state.native_pane_status.__setitem__(
+        "conv_lost_idle", changed_status
+    )
+    assert await reaper._is_busy(pane), "a newer in-flight edge must survive an old idle reply"
+    assert app.state.native_pane_status["conv_lost_idle"] == changed_status
+    app.state.native_pane_status["conv_lost_idle"] = status
+
+    def observe_native_activity() -> None:
+        resources.note_external_session_status("conv_lost_idle", "idle")
+        resources.note_external_session_status("conv_lost_idle", status)
+
+    server.while_in_flight = observe_native_activity
+    assert await reaper._is_busy(pane), "a new native turn can return to the same status"
+    assert app.state.native_pane_status["conv_lost_idle"] == status
     server.while_in_flight = lambda: None
     assert not await reaper._is_busy(pane)
     assert app.state.native_pane_status["conv_lost_idle"] == "idle"
