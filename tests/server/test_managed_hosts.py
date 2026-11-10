@@ -4306,7 +4306,7 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
 
 
 async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
-    """A wake reports launch-pipeline stages through ``on_stage``.
+    """A wake reports launch-pipeline stages through ``on_stage`` on the event loop.
 
     Parity with the fresh-launch path (``_register_and_start_host``): base
     ``start_host`` emits ``"starting"`` before it execs the host, so a wake
@@ -4328,10 +4328,17 @@ async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
     host_store.set_offline(first.host_id)
 
     stages: list[str] = []
-    await resume_managed_host(first.host_id, host_store, config, on_stage=stages.append)
+    stage_threads: set[int] = set()
+
+    def _observe(stage: str, details: str | None = None) -> None:
+        stages.append(stage)
+        stage_threads.add(threading.get_ident())
+
+    await resume_managed_host(first.host_id, host_store, config, on_stage=_observe)
 
     assert fake.resumed == ["sb-fake-1"]
     assert "starting" in stages
+    assert stage_threads == {threading.get_ident()}
 
 
 async def test_cancelled_wake_keeps_lock_through_host_start_without_stages(
@@ -4395,14 +4402,33 @@ async def test_cancelled_wake_keeps_lock_through_host_start_without_stages(
     assert stages == []
 
 
-@pytest.mark.parametrize(
-    ("preserves_host", "claim"),
-    [(False, "rearm_managed_host"), (True, "claim_managed_host_resume")],
+_WAKE_STEPS = (
+    "is_online",
+    "get_host",
+    "select_launch_profile",
+    "prepare_for_launch",
+    "resume",
+    "rearm_managed_host",
+    "start_host",
 )
-async def test_wake_cancelled_while_claiming_starts_nothing_further(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch, preserves_host: bool, claim: str
+_PRESERVING_WAKE_STEPS = (
+    "is_online",
+    "get_host",
+    "select_launch_profile",
+    "prepare_for_launch",
+    "claim_managed_host_resume",
+    "resume",
+)
+
+
+@pytest.mark.parametrize(
+    ("preserves_host", "stalled"),
+    [(False, step) for step in _WAKE_STEPS[:-1]] + [(True, "claim_managed_host_resume")],
+)
+async def test_wake_cancelled_during_a_step_starts_nothing_further(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, preserves_host: bool, stalled: str
 ) -> None:
-    """A wake cancelled while claiming its generation starts no provider resume or host."""
+    """A wake cancelled while one step runs begins no later step once that step returns."""
     import omnigent.server.managed_hosts as managed
 
     host_store = HostStore(db_uri)
@@ -4415,82 +4441,47 @@ async def test_wake_cancelled_while_claiming_starts_nothing_further(
     config = _injected_config(fake)
     first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
     host_store.set_offline(first.host_id)
-    claim_entered = threading.Event()
-    claim_unblocked = threading.Event()
-    claim_generation = getattr(host_store, claim)
+    resume_lock = managed._resume_locks.setdefault(first.host_id, asyncio.Lock())
+    steps: list[str] = []
+    stall_entered = threading.Event()
+    stall_unblocked = threading.Event()
 
-    def _stalled_claim(*args: Any, **kwargs: Any) -> Any:
-        claim_entered.set()
-        claim_unblocked.wait(timeout=30)
-        return claim_generation(*args, **kwargs)
+    def _recorded(name: str, step: Callable[..., Any]) -> Callable[..., Any]:
+        def _run(*args: Any, **kwargs: Any) -> Any:
+            if resume_lock.locked():
+                steps.append(name)
+                if name == stalled:
+                    stall_entered.set()
+                    stall_unblocked.wait(timeout=30)
+            return step(*args, **kwargs)
 
-    monkeypatch.setattr(host_store, claim, _stalled_claim)
+        return _run
+
+    select_launch_profile = managed._select_launch_profile
+
+    async def _recorded_selection(*args: Any, **kwargs: Any) -> None:
+        await asyncio.to_thread(_recorded("select_launch_profile", lambda: None))
+        await select_launch_profile(*args, **kwargs)
+
+    # The host is offline; the real check would also read the row through get_host.
+    monkeypatch.setattr(host_store, "is_online", _recorded("is_online", lambda _host_id: False))
+    for name in ("get_host", "claim_managed_host_resume", "rearm_managed_host"):
+        monkeypatch.setattr(host_store, name, _recorded(name, getattr(host_store, name)))
+    for name in ("prepare_for_launch", "resume", "start_host"):
+        monkeypatch.setattr(fake, name, _recorded(name, getattr(fake, name)))
+    monkeypatch.setattr(managed, "_select_launch_profile", _recorded_selection)
     wake = asyncio.create_task(resume_managed_host(first.host_id, host_store, config))
     try:
-        assert await asyncio.to_thread(claim_entered.wait, 30)
+        assert await asyncio.to_thread(stall_entered.wait, 30)
         wake.cancel()
         with pytest.raises(asyncio.CancelledError):
             await wake
     finally:
-        claim_unblocked.set()
-    resume_lock = managed._resume_locks[first.host_id]
+        stall_unblocked.set()
     await asyncio.wait_for(resume_lock.acquire(), timeout=5)
     resume_lock.release()
-    # The preserving path claims before resuming; the re-arm path claims after it.
-    assert fake.resumed == ([] if preserves_host else ["sb-fake-1"])
-    assert len(fake.host_starts) == 1
-
-
-async def test_stage_entered_before_a_wake_is_abandoned_cannot_follow_its_failure(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A stage the launcher reported before its caller gave up never lands after the failure."""
-    import omnigent.server.managed_hosts as managed
-
-    host_store = HostStore(db_uri)
-    register = _registering_host(host_store)
-    host_start_unblocked = threading.Event()
-    stall_host_start = False
-
-    def _register_when_unblocked(invocation: HostStartInvocation) -> None:
-        if stall_host_start:
-            host_start_unblocked.wait(timeout=30)
-        register(invocation)
-
-    fake = _IsloFakeLauncher(on_host_start=_register_when_unblocked, can_resume=True)
-    config = _injected_config(fake)
-    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
-    host_store.set_offline(first.host_id)
-    stall_host_start = True
-    monkeypatch.setattr(managed, "_ONLINE_POLL_INTERVAL_S", 0.01)
-    loop_thread = threading.get_ident()
-    observer_entered = threading.Event()
-    observer_unblocked = threading.Event()
-    stages: list[str] = []
-
-    def _slow_observer(stage: str, details: str | None = None) -> None:
-        # A publish begun off the loop can still be running when the caller settles.
-        if threading.get_ident() != loop_thread:
-            observer_entered.set()
-            observer_unblocked.wait(timeout=30)
-        stages.append(stage)
-
-    wake = asyncio.create_task(
-        resume_managed_host(first.host_id, host_store, config, on_stage=_slow_observer)
-    )
-    try:
-        await poll_until_async(lambda: observer_entered.is_set() or "starting" in stages)
-        wake.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await wake
-        stages.append("failed")
-    finally:
-        observer_unblocked.set()
-        host_start_unblocked.set()
-    resume_lock = managed._resume_locks[first.host_id]
-    await asyncio.wait_for(resume_lock.acquire(), timeout=5)
-    resume_lock.release()
-    assert stages == ["starting", "failed"]
+    sequence = _PRESERVING_WAKE_STEPS if preserves_host else _WAKE_STEPS
+    assert steps == list(sequence[: sequence.index(stalled) + 1])
 
 
 async def test_stage_queued_as_a_wake_is_abandoned_is_dropped(

@@ -4786,8 +4786,9 @@ async def resume_managed_host(
     + workspace are the user's and must survive for a retry. A wake that does
     not finish within :data:`MANAGED_WAKE_TIMEOUT_S` fails. Provider calls
     cannot be cancelled, so a timed-out or cancelled wake keeps the host's lock
-    until its current step returns and then begins no further step; a host
-    start already under way is still awaited, so a retry reuses that host.
+    until its current step returns and then begins no further step. It still
+    waits for a host it already started or resumed in place, so a retry reuses
+    that host, and still releases a sandbox whose generation claim it lost.
 
     :param host_id: The session's bound host id, e.g. ``"host_a1b2c3d4..."``.
     :param host_store: Persistent host registrations (cross-replica liveness).
@@ -4906,8 +4907,10 @@ async def _wake_managed_host(
             host_store.is_online, host_id
         ):
             return
+        if abandoned.is_set():
+            return
         host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
+        if host is None or abandoned.is_set():
             return
         # Provider-matched launcher (None if config dropped / provider changed).
         # Non-resumable providers (e.g. Modal) fall through to a fresh relaunch.
@@ -4921,6 +4924,8 @@ async def _wake_managed_host(
         await _select_launch_profile(
             launcher, entry, host.user_id, sandbox_id=host.sandbox_id, host_id=host.host_id
         )
+        if abandoned.is_set():
+            return
         workspace_repos = _apply_git_clone_options(launcher, workspace_repos, entry.git_clone)
         sandbox_id = host.sandbox_id
         _logger.info(
