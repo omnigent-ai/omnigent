@@ -337,8 +337,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   that session. From the file viewer, **Attach to agent** adds a file token to
   the end of the draft.
 - Send while the agent is working to queue a message, then steer it.
-- Hover one of your sent messages and click Edit (pencil) to load its text and
-  attachments into the message box, revise, and send it as a new message.
+- Hover one of your sent messages and click Edit (pencil) to copy its text into
+  the message box, revise, and send it as a new message. Attachments stay on the
+  original message.
 - With the in-session message box empty, press Up to recall a previous prompt
   (or the last queued message). While writing a draft, Up stops at the top.
 - With a native session's host offline, send a message; it waits in the queue

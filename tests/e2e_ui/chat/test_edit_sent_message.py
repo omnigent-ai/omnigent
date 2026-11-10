@@ -9,7 +9,6 @@ authors, read-only); these drive the real server and runner through the browser.
 
 from __future__ import annotations
 
-import base64
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -24,20 +23,9 @@ from tests.e2e_ui.conftest import configure_mock_llm
 _COMPOSER_LABEL = "Message the agent"
 _USER = '[data-testid="message-bubble"][data-role="user"]'
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
-_IMAGE_NAME = "chart.png"
+_IMAGE = Path(__file__).resolve().parents[2] / "resources" / "test_image.png"
 # Background titles would send the turn's text to the mock model and take its reply.
 _TITLES_OFF = "localStorage.setItem('omnigent:background-session-titles', 'off')"
-
-# 240x180 PNG (same fixture as test_fork_preserves_image_attachment.py).
-_PNG_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAPAAAAC0CAIAAAAl/ja/AAABaUlEQVR42u3SQREAMAjAsDFdyEEdKvHAk0sk"
-    "9BpZ/eCKLwGGBkODocHQGBoMDYYGQ4OhMTQYGgwNhgZDY2gwNBgaDA2GxtBgaDA0GBoMjaHB0GBoMDQYGkOD"
-    "ocHQYGgwNIYGQ4OhwdAYGgwNhgZDg6ExNBgaDA2GBkNjaDA0GBoMDYbG0GBoMDQYGgyNocHQYGgwNBgaQ4Oh"
-    "wdBgaDA0hgZDg6HB0GBoDA2GBkODoTE0GBoMDYYGQ2NoMDQYGgwNhsbQYGgwNBgaDI2hwdBgaDA0GBpDg6HB"
-    "0GBoMDSGBkODocHQYGgMDYYGQ4OhMTQYGgwNhgZDY2gwNBgaDA2GxtBgaDA0GBoMjaHB0GBoMDQYGkODocHQ"
-    "YGgwNIYGQ4OhwdBgaAwNhgZDg6HB0BgaDA2GBkNjaDA0GBoMDYbG0GBoMDQYGgyNocHQYGgwNBgaQ4OhwdBg"
-    "aDA0hgZDg6HB0GBoDA2GBkPD3gAlVgKygGocMwAAAABJRU5ErkJggg=="
-)
 
 
 def _user_bubble(page: Page | Locator, text: str) -> Locator:
@@ -72,7 +60,6 @@ def test_edit_sent_message_copies_text_and_sends_revision(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
-    tmp_path: Path,
 ) -> None:
     """Edit copies the text, not the image; the revision sends as a new turn."""
     base_url, session_id = seeded_session
@@ -84,8 +71,6 @@ def test_edit_sent_message_copies_text_and_sends_revision(
     configure_mock_llm(
         mock_llm_server_url, [{"text": "It climbs every month."}], match="edit-e2e-a2"
     )
-    png = tmp_path / _IMAGE_NAME
-    png.write_bytes(base64.b64decode(_PNG_B64))
 
     page: Page = request.getfixturevalue("page")
     page.add_init_script(_TITLES_OFF)
@@ -93,8 +78,8 @@ def test_edit_sent_message_copies_text_and_sends_revision(
     composer = page.get_by_label(_COMPOSER_LABEL)
     expect(composer).to_be_visible(timeout=30_000)
 
-    page.locator('input[type="file"][accept*="image/"]').set_input_files(str(png))
-    remove_chip = page.get_by_role("button", name=f"Remove {_IMAGE_NAME}")
+    page.locator('input[type="file"][accept*="image/"]').set_input_files(str(_IMAGE))
+    remove_chip = page.get_by_role("button", name=f"Remove {_IMAGE.name}")
     expect(remove_chip).to_be_visible(timeout=10_000)
     _send(page, original)
     first = _user_bubble(page, original)
