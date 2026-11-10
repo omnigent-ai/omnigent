@@ -1086,6 +1086,7 @@ _CODEX_INTERNAL_ERROR_CODE = -32603
 
 #: JSON-RPC invalid-request code codex returns for protocol-level rejections.
 _CODEX_INVALID_REQUEST_CODE = -32600
+_CODEX_INVALID_PARAMS_CODE = -32602
 
 #: Substring in codex's ``-32603`` message when its thread-store cannot
 #: load/resume a thread's rollout — stable across the wrapper phrasings
@@ -1186,6 +1187,19 @@ def codex_resume_unconfigured_model_provider(exc: BaseException) -> str | None:
     return missing if isinstance(missing, str) and missing else None
 
 
+def is_project_hooks_config_refusal(exc: BaseException) -> bool:
+    """Identify a project hooks path failure from Codex's pre-input config check."""
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == _CODEX_INVALID_REQUEST_CODE
+        and exc.message is not None
+        and exc.message.startswith(
+            "failed to load configuration: Failed to read project hooks config file "
+        )
+        and exc.message.endswith("/.codex/config.toml: Not a directory (os error 20)")
+    )
+
+
 async def _codex_effective_model_provider(client: CodexAppServerClient, cwd: Path) -> str | None:
     """
     Read the provider Codex runs for *cwd*, or ``None`` when it cannot be read.
@@ -1214,6 +1228,29 @@ def is_server_draining_error(error: CodexAppServerResponseError) -> bool:
         error.code == _CODEX_INVALID_REQUEST_CODE
         and error.message == "Server is draining; retry after reconnecting"
     )
+
+
+def input_too_large_limits(error: CodexAppServerResponseError) -> tuple[int, int] | None:
+    """Read the sizes when Codex refused turn input as too large to accept.
+
+    Codex validates ``turn/start`` and ``turn/steer`` input before submitting
+    it, answering ``-32602`` with ``data.input_error_code == "input_too_large"``,
+    so nothing reached the thread.
+
+    :param error: Structured JSON-RPC response error.
+    :returns: ``(actual_chars, max_chars)`` for that refusal, ``(0, 0)`` when it
+        omits the sizes, or ``None`` for any other error.
+    """
+    if error.code != _CODEX_INVALID_PARAMS_CODE:
+        return None
+    data = error.error.get("data") if isinstance(error.error, dict) else None
+    if not isinstance(data, dict) or data.get("input_error_code") != "input_too_large":
+        return None
+    actual = data.get("actual_chars")
+    limit = data.get("max_chars")
+    if isinstance(actual, int) and isinstance(limit, int):
+        return actual, limit
+    return 0, 0
 
 
 def is_compaction_steer_refusal(error: CodexAppServerResponseError) -> bool:
@@ -1367,24 +1404,27 @@ class CodexAppServerClient:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CodexMessage] = loop.create_future()
         self._pending_requests[request_id] = future
+        rpc_identity = f"Codex app-server RPC: method={method} request_id={request_id}"
         try:
-            await self._ws.send(
-                json.dumps(
-                    {
-                        "id": request_id,
-                        "method": method,
-                        "params": params,
-                    }
+            try:
+                await self._ws.send(
+                    json.dumps(
+                        {
+                            "id": request_id,
+                            "method": method,
+                            "params": params,
+                        }
+                    )
                 )
-            )
+            except (OSError, ConnectionClosed) as send_error:
+                send_error.add_note(f"{rpc_identity} phase=send")
+                raise
             if self._reader_task is not None:
                 await asyncio.wait(
                     (future, self._reader_task), return_when=asyncio.FIRST_COMPLETED
                 )
                 if not future.done():
-                    raise ConnectionError(
-                        f"Codex app-server disconnected before responding to {method}"
-                    )
+                    raise self._disconnected_before_response(method, rpc_identity)
             response = await future
         finally:
             self._pending_requests.pop(request_id, None)
@@ -1392,7 +1432,7 @@ class CodexAppServerClient:
         error = response.get("error")
         if error:
             exc = CodexAppServerResponseError(error)
-            exc.add_note(f"Codex app-server RPC: method={method} request_id={request_id}")
+            exc.add_note(rpc_identity)
             raise exc
         if method in {"thread/start", "thread/resume"}:
             result = response.get("result")
@@ -1401,6 +1441,28 @@ class CodexAppServerClient:
             if isinstance(thread_id, str) and thread_id:
                 self._subscribed_thread_ids.add(thread_id)
         return response
+
+    def _disconnected_before_response(self, method: str, rpc_identity: str) -> ConnectionError:
+        """
+        Build the error for an RPC whose reader exited before its response.
+
+        The reader's own failure becomes the cause, and the note records the
+        websocket close code without addresses, close reasons or payloads.
+
+        :param method: App-server method, e.g. ``"turn/start"``.
+        :param rpc_identity: Method and request id note, e.g.
+            ``"Codex app-server RPC: method=turn/start request_id=2"``.
+        :returns: Connection error chained to the reader's failure, if any.
+        """
+        reader = self._reader_task
+        reader_error = (
+            reader.exception() if reader is not None and not reader.cancelled() else None
+        )
+        close_code = self._ws.close_code if self._ws is not None else None
+        error = ConnectionError(f"Codex app-server disconnected before responding to {method}")
+        error.__cause__ = reader_error
+        error.add_note(f"{rpc_identity} phase=response close_code={close_code}")
+        return error
 
     def is_subscribed_to_thread(self, thread_id: str) -> bool:
         """
@@ -4121,6 +4183,7 @@ def build_codex_native_server(
     model_catalog_rows: list[_JsonObject] | None = None,
     reconcile_process_registry: bool = True,
     terminal_launch_args: Sequence[str] = (),
+    active_harnesses: Collection[str] | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -4232,6 +4295,7 @@ def build_codex_native_server(
     ):
         config_overrides.append(f"model={json.dumps(pinned_model)}")
     return CodexNativeAppServer(
+        active_harnesses=active_harnesses,
         codex_path=resolved_codex,
         socket_path=socket_path,
         codex_home=codex_home,
@@ -4671,8 +4735,8 @@ def _resolve_subscription_launch(
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     # Pin codex's built-in ``openai`` provider: the bridged config.toml may
-    # set a custom default ``model_provider`` (e.g. isaac's Databricks AI
-    # Gateway), which would silently hijack a Subscription selection. A
+    # set a custom default ``model_provider`` (e.g. a Databricks AI
+    # Gateway provider), which would silently hijack a Subscription selection. A
     # no-op when the user's config sets no custom default.
     subscription_overrides = ['model_provider="openai"']
     if _codex_login_usable():
@@ -4909,7 +4973,7 @@ def resolve_native_codex_launch(
     from omnigent.host.databricks_credential import api_key_auth_precludes_broker
 
     if entry is None and not api_key_auth_precludes_broker(spec):
-        # Use the managed host's Databricks broker only when no provider or
+        # Use the managed host's credential broker only when no provider or
         # explicit API-key auth selected a route. Host boot populated ucode
         # state so the model resolves to a served id.
         from omnigent.host.databricks_credential import (

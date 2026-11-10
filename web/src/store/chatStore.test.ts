@@ -1285,6 +1285,36 @@ describe("chatStore — switchTo", () => {
     expect(useChatStore.getState().backgroundTasks).toEqual([{ description: "Wait for CI" }]);
   });
 
+  it("restores the background agents a waiting snapshot names", async () => {
+    seedSession("conv_waiting_agent", []);
+    const routed = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        String(input).split("?")[0] === "/v1/sessions/conv_waiting_agent" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return mockResponse({
+          id: "conv_waiting_agent",
+          agent_id: "agent_xyz",
+          // The server's wire shape for the hold: collapsed status plus the agents.
+          status: "running",
+          background_agents: [{ id: "a1", type: "subagent", description: "Audit" }],
+          created_at: 0,
+          items: [],
+        });
+      }
+      return routed(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_waiting_agent");
+
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("waiting");
+    expect(state.backgroundAgents).toEqual([{ id: "a1", type: "subagent", description: "Audit" }]);
+    // The turn is over, so the composer sends rather than queueing.
+    expect(state.status).toBe("idle");
+  });
+
   it("revalidates a retained live conversation on revisit, recovering items its stream never delivered", async () => {
     // The stale-revisit bug: a session stream can be open yet deliver nothing
     // (on a sharded deployment an unkeyed open routes to the wrong replica and
@@ -6236,6 +6266,27 @@ describe("chatStore — background-shell tally (claude-native)", () => {
     const state = useChatStore.getState();
     expect(state.sessionStatus).toBe("idle");
     expect(state.backgroundTaskCount).toBe(0);
+  });
+
+  it("keeps a waiting edge's background agents until the next edge", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "idle",
+      backgroundAgents: [],
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "waiting",
+      backgroundAgents: [{ id: "a1", description: "Audit" }],
+    });
+    expect(useChatStore.getState().sessionStatus).toBe("waiting");
+    expect(useChatStore.getState().backgroundAgents).toEqual([{ id: "a1", description: "Audit" }]);
+
+    // The agent finished, so Claude went idle.
+    handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "idle" });
+    expect(useChatStore.getState().backgroundAgents).toEqual([]);
   });
 
   it("adopts the per-shell detail alongside an authoritative count", () => {
@@ -17999,8 +18050,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await loop;
     }
 
-    // `isDatabricksWorkspace()` gates slice-key routing. The standalone build
-    // never keys a request, so there the rebind has nothing to correct.
+    // Keyed routing is only enabled in workspace mode. Elsewhere no request is
+    // keyed, so the rebind has nothing to correct.
     function workspaceMode(): void {
       vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
     }
@@ -18334,7 +18385,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       setSessionHost(id, null);
     });
 
-    it("stays inert outside a Databricks workspace", async () => {
+    it("stays inert outside workspace mode", async () => {
       const id = "conv_rekey_standalone";
       seedSession(id, []);
       const route = routeKeyedStreamOpens();

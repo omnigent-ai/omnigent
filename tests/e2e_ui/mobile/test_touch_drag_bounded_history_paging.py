@@ -38,11 +38,11 @@ _CALLS_PER_BIG_TURN = 250
 
 # One drag keeps paging while every page folds into the giant turn already on
 # screen and stops at the first page that shows something new — bounded by the
-# loader's per-gesture budget (a first page plus 600 items chained: three
-# 200-item pages) so it can never run through the whole transcript. The buggy
+# loader's per-gesture budget (a first page plus 600 items chained: six
+# 100-item pages) so it can never run through the whole transcript. The buggy
 # build chained ~47 pages from one drag and kept going after a new row had
 # appeared.
-_MAX_PAGES_PER_GESTURE = 4
+_MAX_PAGES_PER_GESTURE = 7
 
 # Paging is considered settled once no new /items request lands for this long.
 _SETTLE_SECONDS = 3.0
