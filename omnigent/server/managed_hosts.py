@@ -749,8 +749,10 @@ class ManagedSandboxConfig:
         Supplies choices without selecting a default or provisioning a host.
         Raise :class:`NoReachableModels` when no model can serve the harness;
         the picker then blocks launch instead of offering Default.
-    :param manages_profiles: Static opt-in copied from plugin metadata. Embedding
-        deployments set it explicitly for launchers that require profile selection.
+    :param manages_profiles: Whether sessions on this provider require a profile.
+        Copied from plugin metadata; embedding deployments set it explicitly, and
+        may leave it off for a launcher that manages profiles. Such a session
+        launches without a selection, while one with a saved profile still applies it.
     :param default_profile_id: Profile a new managed session takes when its caller
         names none, from ``sandbox.default_profile_id``. Authorized and saved like an
         explicit selection. ``None`` keeps a selection mandatory.
@@ -3984,7 +3986,7 @@ async def _select_launch_profile(
                 status_code=403, detail="Sandbox profile execution identity mismatch"
             )
         await asyncio.to_thread(select_provider_profile, launcher, snapshot, sandbox_id=sandbox_id)
-    elif getattr(launcher, "manages_profiles", False) and not (
+    elif entry.manages_profiles and not (
         host_id is not None and entry.unprofiled_host_id == host_id
     ):
         raise HTTPException(status_code=422, detail="Choose a sandbox profile for this provider")

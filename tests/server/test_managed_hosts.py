@@ -133,10 +133,10 @@ async def test_direct_launch_without_catalog_rejects_missing_selection_before_pr
         def prepare(self) -> None:
             pytest.fail("Unselected provider must not prepare")
 
+    deployment = _injected_config(ProfileLauncher())
+    config = replace(deployment, configs=(replace(deployment.default, manages_profiles=True),))
     with pytest.raises(HTTPException) as caught:
-        await launch_managed_host(
-            config=_injected_config(ProfileLauncher()), owner=_OWNER, host_store=HostStore(db_uri)
-        )
+        await launch_managed_host(config=config, owner=_OWNER, host_store=HostStore(db_uri))
     assert caught.value.status_code == 422
 
 
