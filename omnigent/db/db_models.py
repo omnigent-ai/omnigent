@@ -32,6 +32,7 @@ from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
+from omnigent.db.envelope import EnvelopedJSON
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
@@ -1815,35 +1816,28 @@ class SqlInboxItem(OmnigentBase):
     prompt_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # INBOX_ITEM_KIND code.
     kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    title: Mapped[str] = mapped_column(String(256), nullable=False)
-    body_md: Mapped[str] = mapped_column(
-        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
+    # The agent's content, which a deployment may encrypt, as one storage
+    # envelope (see omnigent.db.envelope): {"title", "body_md", "links",
+    # "actions", "topic", "primary_link"}. Always read and written together.
+    content: Mapped[dict[str, Any]] = mapped_column(
+        EnvelopedJSON(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
     )
-    # JSON list of evidence links (at most ten), stored compressed.
-    links: Mapped[str] = mapped_column(
-        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
+    # JSON list of typed rich-content blocks, such as a chart (see
+    # omnigent.server.inbox_media), in its own envelope so it has its own size
+    # budget. A new block type needs no schema change.
+    media: Mapped[list[dict[str, Any]]] = mapped_column(
+        EnvelopedJSON(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
     )
-    # JSON list of agent-defined actions ({label, prompt}, at most three), stored compressed.
-    actions: Mapped[str] = mapped_column(
-        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
-    )
-    # JSON list of typed rich-content blocks drawn on the card, such as a chart
-    # (see omnigent.server.inbox_media), stored compressed. A new block type
-    # needs no schema change.
-    media: Mapped[str] = mapped_column(
-        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
-    )
-    # Duplicate-key inputs and the versioned key built from them.
-    primary_link: Mapped[str | None] = mapped_column(String(2048), nullable=True)
-    topic: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Versioned duplicate key: a hash of the kind, primary link, and topic.
     dedupe_key: Mapped[str] = mapped_column(String(128), nullable=False)
     # INBOX_ITEM_STATE and INBOX_ITEM_RESOLUTION codes.
     state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     resolution: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    # Index into ``actions`` of the action the owner took; NULL otherwise.
+    # Index into the content's actions of the action the owner took; NULL otherwise.
     resolution_action: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    feedback_text: Mapped[str | None] = mapped_column(
-        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=True
+    # The owner's comment, {"text": ...}, in its own envelope since it is updated alone.
+    feedback: Mapped[dict[str, Any] | None] = mapped_column(
+        EnvelopedJSON(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=True
     )
     # Unix epoch seconds.
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -1870,40 +1864,20 @@ class SqlInboxItem(OmnigentBase):
             name="ck_inbox_items_prompt_version_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
-            "title IS NULL OR length(CAST(title AS BLOB)) <= 1024",
-            name="ck_inbox_items_title_bytes",
-        ).ddl_if(callable_=_on_sqlite_family),
-        CheckConstraint(
-            "primary_link IS NULL OR length(CAST(primary_link AS BLOB)) <= 8192",
-            name="ck_inbox_items_primary_link_bytes",
-        ).ddl_if(callable_=_on_sqlite_family),
-        CheckConstraint(
-            "topic IS NULL OR length(CAST(topic AS BLOB)) <= 512",
-            name="ck_inbox_items_topic_bytes",
-        ).ddl_if(callable_=_on_sqlite_family),
-        CheckConstraint(
             "dedupe_key IS NULL OR length(CAST(dedupe_key AS BLOB)) <= 512",
             name="ck_inbox_items_dedupe_key_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
-            "body_md IS NULL OR length(CAST(body_md AS BLOB)) <= 16383",
-            name="ck_inbox_items_body_md_bytes",
-        ).ddl_if(callable_=_on_sqlite_family),
-        CheckConstraint(
-            "links IS NULL OR length(CAST(links AS BLOB)) <= 16383",
-            name="ck_inbox_items_links_bytes",
-        ).ddl_if(callable_=_on_sqlite_family),
-        CheckConstraint(
-            "actions IS NULL OR length(CAST(actions AS BLOB)) <= 16383",
-            name="ck_inbox_items_actions_bytes",
+            "content IS NULL OR length(CAST(content AS BLOB)) <= 16383",
+            name="ck_inbox_items_content_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
             "media IS NULL OR length(CAST(media AS BLOB)) <= 16383",
             name="ck_inbox_items_media_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
-            "feedback_text IS NULL OR length(CAST(feedback_text AS BLOB)) <= 16383",
-            name="ck_inbox_items_feedback_text_bytes",
+            "feedback IS NULL OR length(CAST(feedback AS BLOB)) <= 16383",
+            name="ck_inbox_items_feedback_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
             "workspace_id IS NULL OR typeof(workspace_id) = 'integer'",
