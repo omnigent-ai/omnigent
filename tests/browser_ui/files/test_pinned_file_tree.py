@@ -322,6 +322,8 @@ def test_tree_minimum_width_keeps_controls_separate_and_persists(
     expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text(
         _FILES["src/app.md"]
     )
+    tree.get_by_text("src/", exact=True).click()
+    expect(tree.get_by_text("app.md", exact=True)).to_be_visible()
     header.get_by_role("button", name="Close file", exact=True).click()
     expect(page.get_by_test_id("workspace-files-split")).to_have_count(0)
     expect(handle).to_have_count(0)
