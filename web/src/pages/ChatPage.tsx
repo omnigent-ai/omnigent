@@ -114,7 +114,7 @@ import {
   type PendingUserMessage,
   useChatStore,
 } from "@/store/chatStore";
-import { isRetryableRequestError } from "@/lib/queryRetry";
+import { isRetryableRequestError, requestErrorMessage } from "@/lib/queryRetry";
 import { useTrueForAtMost } from "@/hooks/useTrueForAtMost";
 import {
   isNativeTerminalSession,
@@ -2077,7 +2077,7 @@ function HydratingPlaceholder() {
 
 /**
  * Error state for `/c/:id` when the items endpoint fails. Shown
- * verbatim instead of falling through to the chat surface so the user
+ * instead of falling through to the chat surface so the user
  * sees the problem (instead of a blank chat that silently posts to a
  * non-existent conversation on next send). Most common cause: invalid
  * conversation id in the URL — surfaces quickly because the store retries
@@ -2101,7 +2101,7 @@ export function ConversationLoadError({
         <p className="text-muted-foreground text-ui">
           Couldn't load{" "}
           <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-sm">{conversationId}</code>
-          : {error.message}
+          : {requestErrorMessage(error)}
         </p>
         <div className="flex gap-2">
           {isRetryableRequestError(error) && (

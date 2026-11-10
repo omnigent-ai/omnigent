@@ -35,6 +35,20 @@ export function isRetryableRequestError(error: unknown): boolean {
 }
 
 /**
+ * Text that explains a failed request to the user.
+ *
+ * @param error - The request's error.
+ * @returns The error's message, except for throttling (a 429): a proxy's text
+ *   for it addresses API clients ("adjust your request frequency"), not app users.
+ */
+export function requestErrorMessage(error: Error): string {
+  if (error instanceof ApiError && error.status === 429) {
+    return "Too many requests right now. Wait a moment, then try again.";
+  }
+  return error.message;
+}
+
+/**
  * Delay before retry number `failureCount + 1`; the default `retryDelay` for
  * every query.
  *
