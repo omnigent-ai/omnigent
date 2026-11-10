@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import Generator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,6 +12,7 @@ import httpx
 import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from tests.harnesses.codex_native.forwarder._support import (
     _RaisingPostClient,
     _RecordingClient,
@@ -160,6 +163,163 @@ class _SequencedPostClient:
         if isinstance(outcome, httpx.HTTPError):
             raise outcome
         return outcome
+
+
+class _RecoveringDatabricksAuth(httpx.Auth):
+    """Fail token acquisition before HTTPX sends an authenticated request."""
+
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.attempts = 0
+        self.error = DatabricksAuthError("credential service unavailable")
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise self.error
+        yield request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "source_id"), [("idle", None), ("failed", None), (None, None), (None, "item_1")]
+)
+async def test_post_session_event_retries_auth_before_sending(
+    monkeypatch: pytest.MonkeyPatch, status: str | None, source_id: str | None
+) -> None:
+    """A recovering token service must not lose completion or duplicate a legacy item."""
+    sleep = AsyncMock()
+    monkeypatch.setattr(fwd, "_sleep", sleep)
+    auth = _RecoveringDatabricksAuth(failures=1)
+    sent: list[httpx.Request] = []
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(202)
+
+    data = (
+        {"status": status, "response_id": "codex_turn_1", "output": "native turn detail"}
+        if status is not None
+        else {"item_type": "message", "item_data": {"role": "assistant"}}
+    )
+    if source_id is not None:
+        data["source_id"] = source_id
+    event_type = "external_session_status" if status is not None else "external_conversation_item"
+    async with httpx.AsyncClient(
+        base_url="http://test", auth=auth, transport=httpx.MockTransport(receive)
+    ) as client:
+        result = await fwd._post_session_event_inner(
+            client,
+            "conv_x",
+            event_type=event_type,
+            data=data,
+            max_attempts=None if source_id is not None else 3,
+        )
+
+    assert result.response is not None and result.response.status_code == 202
+    assert auth.attempts == 2
+    assert sleep.await_count == 1
+    assert [json.loads(request.content) for request in sent] == [
+        {"type": event_type, "data": data}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejected_status", [401, 403, 302])
+async def test_post_status_recovers_runner_auth_refresh_after_rejection(
+    monkeypatch: pytest.MonkeyPatch, rejected_status: int
+) -> None:
+    """A failed refresh after a rejected bearer still delivers completion once."""
+    from omnigent.runner._entry import _RunnerDatabricksAuth
+
+    monkeypatch.setattr("omnigent.cli_auth.databricks_request_headers", lambda *a, **k: {})
+    sleep = AsyncMock()
+    monkeypatch.setattr(fwd, "_sleep", sleep)
+    tokens = iter(["expired", DatabricksAuthError("credential service unavailable"), "renewed"])
+
+    def token() -> str:
+        result = next(tokens)
+        if isinstance(result, DatabricksAuthError):
+            raise result
+        return result
+
+    sent: list[tuple[str, object]] = []
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        bearer = request.headers["Authorization"]
+        sent.append((bearer, json.loads(request.content)))
+        return (
+            httpx.Response(202)
+            if bearer == "Bearer renewed"
+            else httpx.Response(rejected_status, headers={"Location": "/oidc/authorize"})
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://test",
+        auth=_RunnerDatabricksAuth(token, server_url="http://test"),
+        transport=httpx.MockTransport(receive),
+    ) as client:
+        await fwd._post_status(client, "conv_x", "idle", response_id="codex_turn_1")
+
+    payload = {
+        "type": "external_session_status",
+        "data": {"status": "idle", "response_id": "codex_turn_1"},
+    }
+    assert sent == [("Bearer expired", payload), ("Bearer renewed", payload)]
+    assert sleep.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_attempts", [1, 2, None])
+async def test_post_session_event_auth_failure_remains_bounded(
+    monkeypatch: pytest.MonkeyPatch, max_attempts: int | None
+) -> None:
+    """Permanent credential loss preserves the original failure after the retry budget."""
+    sleep = AsyncMock()
+    monkeypatch.setattr(fwd, "_sleep", sleep)
+    auth = _RecoveringDatabricksAuth(failures=10)
+    receive = MagicMock(return_value=httpx.Response(202))
+    async with httpx.AsyncClient(
+        base_url="http://test", auth=auth, transport=httpx.MockTransport(receive)
+    ) as client:
+        with pytest.raises(DatabricksAuthError) as caught:
+            await fwd._post_session_event_inner(
+                client,
+                "conv_x",
+                event_type="external_conversation_item",
+                data={"item_type": "message", "item_data": {}, "source_id": "item_1"},
+                max_attempts=max_attempts,
+            )
+
+    assert caught.value is auth.error
+    expected_attempts = max_attempts if max_attempts is not None else fwd._POST_MAX_ATTEMPTS
+    assert auth.attempts == expected_attempts
+    assert sleep.await_count == expected_attempts - 1
+    receive.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_auth_retry_can_be_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stopped forwarder does not retain an auth retry or post a delayed idle edge."""
+    sleep = AsyncMock(side_effect=asyncio.CancelledError)
+    monkeypatch.setattr(fwd, "_sleep", sleep)
+    auth = _RecoveringDatabricksAuth(failures=10)
+    receive = MagicMock(return_value=httpx.Response(202))
+    async with httpx.AsyncClient(
+        base_url="http://test", auth=auth, transport=httpx.MockTransport(receive)
+    ) as client:
+        with pytest.raises(asyncio.CancelledError):
+            await fwd._post_session_event_inner(
+                client,
+                "conv_x",
+                event_type="external_session_status",
+                data={"status": "idle", "response_id": "codex_turn_1"},
+            )
+
+    assert auth.attempts == 1
+    receive.assert_not_called()
 
 
 @pytest.mark.asyncio
