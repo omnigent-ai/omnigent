@@ -4328,7 +4328,7 @@
             "title": "Enabled"
           },
           "harness": {
-            "description": "Harness family that loads it: `claude`, `codex`, or `cursor`.",
+            "description": "Harness family that loads it: `claude`, `codex`, `cursor`, or `pi`.",
             "title": "Harness",
             "type": "string"
           },

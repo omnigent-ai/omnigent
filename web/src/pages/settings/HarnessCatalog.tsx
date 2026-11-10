@@ -3,17 +3,17 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useSetMcpServerEnabled } from "@/hooks/useSetMcpServerEnabled";
 import * as AccordionPrimitive from "radix-ui/accordion";
 import { useMcpServerTools, type McpServerTools } from "@/hooks/useMcpServerTools";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { ArrowLeftIcon, ChevronRightIcon, PlugIcon, SparkleIcon } from "lucide-react";
 import { Link, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type { BrandHarness } from "@/components/onboarding/harnessBrand";
 import type { Host } from "@/hooks/useHosts";
 import {
   INVENTORY_HARNESS_IDS,
+  type InventoryHarness,
   type InventoryMcpServer,
   type InventoryPlugin,
   useHarnessInventory,
@@ -26,6 +26,9 @@ import { ApiError } from "@/lib/sessionsApi";
 import { Spinner } from "../../components/ui/spinner";
 
 type CatalogKind = "mcps" | "skills" | "plugins";
+
+// The server probes MCP tools and reads skill contents for these families only.
+const DETAILED_HARNESSES: ReadonlySet<InventoryHarness> = new Set(["claude", "codex", "cursor"]);
 
 const KINDS: { id: CatalogKind; label: string; noun: string }[] = [
   { id: "mcps", label: "MCP servers", noun: "MCP servers" },
@@ -83,7 +86,7 @@ export function HarnessCatalog({
   header: ReactNode;
   settings: ReactNode;
   host: Host;
-  family: BrandHarness;
+  family: InventoryHarness;
   defaultTab?: CatalogKind | "settings";
 }) {
   // `?tab=settings` (the grid card's gear) opens on Settings; otherwise MCP servers.
@@ -95,12 +98,16 @@ export function HarnessCatalog({
   const [selectedSkill, setSelectedSkill] = useState<{ name: string; sourceId?: string } | null>(
     null,
   );
-  const [contentSupported, setContentSupported] = useState(true);
-  const inventory = useHarnessInventory(host, { includePluginMetadata: family === "claude" });
+  const [contentSupported, setContentSupported] = useState(DETAILED_HARNESSES.has(family));
+  const families = useMemo(() => [family], [family]);
+  const inventory = useHarnessInventory(host, {
+    includePluginMetadata: family === "claude",
+    families,
+  });
   const back = () => setOpen(null);
 
   const { context, unavailable } = inventory;
-  const mine = <T extends { harness: BrandHarness }>(items: T[]) =>
+  const mine = <T extends { harness: InventoryHarness }>(items: T[]) =>
     items.filter((item) => item.harness === family);
   const own = {
     mcps: mine(context.mcps),
@@ -511,7 +518,8 @@ function McpList({
   const [expanded, setExpanded] = useState<string[]>([]);
   const [supported, setSupported] = useState(true);
   if (servers.length === 0) return <Notice>No MCPs found.</Notice>;
-  if (!supported || unavailableReason)
+  const probed = servers.every((server) => DETAILED_HARNESSES.has(server.harness));
+  if (!supported || unavailableReason || !probed)
     return (
       <>
         {unavailableReason && <Notice>{unavailableReason}</Notice>}
