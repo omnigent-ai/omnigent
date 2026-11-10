@@ -79,6 +79,7 @@ import {
   HOST_OFFLINE_CODE,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
+  OLDER_HISTORY_PAGE_ITEMS,
   openSessionStream,
   postEvent,
   SIGN_IN_EXPIRED_CODE,
@@ -693,6 +694,8 @@ export interface ComposerAttachment {
   path: string;
   isDir: boolean;
   lineRange?: { start: number; end: number };
+  /** Composer ``@`` token once tagged; unique across tagged files and sessions. */
+  token?: string;
 }
 
 /**
@@ -1260,9 +1263,8 @@ export interface AppChatState {
 export interface ChatActions {
   send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
   clearSideChatToOpen: () => void;
-  /** Open a generic side chat as a rail tab under `parentId`, seeding its
-   *  composer with `draft` (the typed `/side` question) so it isn't lost while
-   *  the fork launches. */
+  /** Open a side chat as a rail tab under `parentId`, optionally seeding its
+   *  composer with `draft` so it isn't lost while the fork launches. */
   openSideChatWithDraft: (childSessionId: string, draft: string, parentId: string) => void;
   /** Clear a side chat's seeded composer draft (called after it's consumed). */
   clearSideChatDraft: (childSessionId: string) => void;
@@ -3924,6 +3926,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     try {
       const { items, hasMore } = await fetchSessionItemsPage(conversationId, {
         olderThan: oldestItemId,
+        limit: OLDER_HISTORY_PAGE_ITEMS,
       });
       if (stale()) return;
       const newBlocks = itemsToBlocks(items);

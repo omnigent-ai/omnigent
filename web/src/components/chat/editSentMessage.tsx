@@ -12,7 +12,6 @@ import {
 } from "@/components/ui/dialog";
 import { showToast } from "@/components/ui/toast";
 import type { MessageContentBlock } from "@/lib/blocks";
-import type { MentionItem } from "@/lib/composerMentions";
 import {
   notifyMissingAttachments,
   recoverMessageAttachments,
@@ -22,19 +21,16 @@ import {
 export interface SentMessage {
   /** The session the message was sent in, for downloading its attachments. */
   sessionId: string | null;
-  /** The text the bubble's Copy action copies. */
+  /** The text as sent, with its file and session mention markers. */
   text: string;
   /** The message blocks; uploaded images and files are downloaded. */
   content: MessageContentBlock[];
-  /** Workspace files and folders the message "@"-mentioned. */
-  mentions: MentionItem[];
 }
 
 /** What the composer receives in place of its draft. */
 export interface EditedDraft {
   text: string;
   files: File[];
-  mentions: MentionItem[];
 }
 
 /**
@@ -92,7 +88,7 @@ export function useEditSentMessage({
   const apply = useCallback((message: SentMessage, { files, missing }: RecoveredAttachments) => {
     notifyMissingAttachments(missing);
     appliedRef.current = true;
-    latestRef.current.applyDraft({ text: message.text, files, mentions: message.mentions });
+    latestRef.current.applyDraft({ text: message.text, files });
   }, []);
 
   const load = useCallback(

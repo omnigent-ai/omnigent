@@ -35,6 +35,11 @@ the header menu), and each place is a separate entry point.
   above them; a drop on another project's row still files the session there.
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
   on desktop; long titles are limited.
+- `title-instructions`: Settings → General → Sessions → **Title instructions**
+  saves personal guidance (up to 4,000 characters) for automatic titles of
+  sessions you own. The server adds it after any operator
+  `session_title_instructions`; Clear removes only the personal guidance, so
+  titles fall back to the operator setting or, without one, the default prompt.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
   Sessions whose title matches list under **Sessions**, then sessions matching
   only in chat content under **In messages** with a snippet; each group has its
@@ -126,11 +131,11 @@ the header menu), and each place is a separate entry point.
   before submission, including branch clones.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app reconnects a local host
-  itself, and starts an Arca host recognized by its saved ID or CLI-seeded name
+  itself, and starts an Arca host recognized by its saved ID or default name
   from the same action (the desktop's Arca console still asks before running).
   A failed attempt opens the dialog for retry; so does an Arca connect after
-  which the server still lists the session's host offline (usually because Arca
-  came back as a different host), with **Switch host** to move the session.
+  which the server still lists the session's host offline (usually because the
+  host came back under a new ID), with **Switch host** to move the session.
   States: reconnecting (spinner), reconnect failed (retry), host offline.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory, optionally with a new git
@@ -288,8 +293,14 @@ Open the imported session and choose a host and working directory to resume it,
 then continue from Chat or Terminal.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
-offer pin, fork, rename, mark as unread or read, add to project (or move
-session), archive or unarchive, and delete.
+offer pin, fork, rename, mark as unread or read, create automation (when
+automations are on), add to project (or move session), archive or unarchive,
+and delete. Create automation opens the New automation dialog for the session;
+saving files its copy in the automation's project and opens the automation. The
+dialog and the automation's page link the session it starts from under Starts
+from. Deleting a session an automation runs from asks to Delete both, and leaves
+the automation's page for the automations list. With automations off for the
+caller, the session is deleted alone and its automation pauses at its next run.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens.
@@ -311,11 +322,12 @@ right-click menu do the same. On mobile, press and hold a row in the sidebar
 drawer, then drag it. Ordering → Custom in the filter menu keeps the order shown.
 
 **Bulk selection:** select several rows in the sidebar, then use the selection
-actions (mark as read or unread, archive, unarchive, delete).
+actions (mark as read or unread, archive, unarchive, delete). Deleting sessions
+automations run from names those automations and deletes them first.
 
 **Session header menu:** open a session and use the menu next to its title for
-pin, fork, export, rename, mark as unread, add to project, archive or
-unarchive, and delete. Clicking the title also renames, and the title's folder
+pin, fork, export, rename, mark as unread, create automation, add to project,
+archive or unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
 actions. On phones, the sidebar toggle has a circular glass surface; host,
 harness/model, background tasks, and session actions share the top-right glass
@@ -678,6 +690,13 @@ plain `uv run pytest`, which starts a private server for the test.
   test drives a touch drag: in a narrow window open the drawer, press and hold a
   row, drop it on another row of its list, and expect the new order without the
   session opening.
+- **`title-instructions`:**
+  `tests/e2e_ui/sessions/test_session_title_instructions_setting.py` saves and
+  clears the field in the browser, then checks the next Claude SDK session's
+  title request against a scripted mock model. The field appears only when
+  `/v1/info` reports `session_title_instructions`. Per-user isolation, limits
+  and invalid stored values are covered in `tests/stores/test_user_settings_store.py`
+  and `tests/server/routes/test_user_settings_routes.py`.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`.
@@ -992,8 +1011,8 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_arca_reconnect_failure_offers_retry`,
   `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_send_reconnects_offline_arca_then_sends`
   drive the real SPA and server with an injected desktop bridge and offline host
-  responses. The Arca journeys cover a remembered host and a CLI-seeded host
-  with no saved ID; they check one-action start, progress, failure and retry,
+  responses. The Arca journeys cover a remembered host and a host that was not
+  saved; they check one-action start, progress, failure and retry,
   and a message that waits for the host, not live SSH or the desktop's consent
   console.
 - **`reconnect`, asleep sandbox:**

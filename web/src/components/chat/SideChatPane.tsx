@@ -15,7 +15,6 @@ import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { buildMentionPreamble } from "@/lib/composerMentions";
 import {
   type Bubble,
   type BubbleCache,
@@ -233,11 +232,12 @@ export function SideChatPane({
       const draft = useChatStore.getState().sideChatComposers[childId];
       return Boolean(draft && (draft.text.trim() || draft.files.length || draft.quotes?.length));
     },
-    applyDraft: ({ text, files, mentions }) => {
+    applyDraft: ({ text, files }) => {
       const { accepted, errors } = validateAttachments(files, sideChatAttachmentPolicy);
       useChatStore.getState().updateSideChatComposer(childId, (current) => ({
         ...current,
-        text: buildMentionPreamble(mentions, sessionHarness) + text,
+        // This composer has no mention picker, so mentions stay as their markers.
+        text,
         files: accepted,
         quotes: [],
         autoFocus: true,
@@ -1193,6 +1193,7 @@ function SideChatComposer({
                   voiceEditsRef.current.clear();
                   for (const [id, edit] of edits) editText(id, edit.before);
                 }}
+                inputRef={textareaRef}
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}
                 onInterim={(spoken) => dictation.replaceInterim(spoken)}
               />

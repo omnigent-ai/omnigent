@@ -8646,10 +8646,12 @@ async def test_relay_fences_cancelled_turn_and_resumes_on_next_turn(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_first_append", [False, True])
+@pytest.mark.parametrize("with_client_id", [False, True])
 async def test_relay_settles_queued_native_message_on_failed_turn(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     fail_first_append: bool,
+    with_client_id: bool,
 ) -> None:
     """A failed native turn commits the queued web message ahead of its error item.
 
@@ -8670,13 +8672,19 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
     sid = "64a784c3aa907d1774f44313546947c6"
     store = _FailOnceStore() if fail_first_append else _ConversationStore()
     content = [{"type": "input_text", "text": "set up the worktree"}]
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d" if with_client_id else None
     pending_id = pending_inputs.record(
         sid,
         content,
         created_by="alice@example.com",
-        stable_id="7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+        stable_id=stable_id,
     )
     original = pending_inputs.delivery_attributes_for(sid, pending_id)
+    identity = {
+        key: value
+        for key, value in original.items()
+        if key in {"input_stable_id", "pending_id", "delivery_attempt_id"}
+    }
     caplog.set_level(logging.INFO)
     # A second message the runner is still holding for the next turn.
     queued_next = pending_inputs.record(
@@ -8702,7 +8710,7 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
                 {
                     "type": "response.failed",
                     # The runner names the message this turn carried.
-                    "input_stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+                    **identity,
                     "response": {
                         "id": "resp_fail",
                         "model": "codex",
@@ -8736,7 +8744,9 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
                 store,  # type: ignore[arg-type]
                 sid,
                 "resp_fail",
-                "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+                stable_id,
+                pending_id=pending_id,
+                delivery_attempt_id=str(original["delivery_attempt_id"]),
             )
             assert store.appended_items == []
             assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
@@ -8752,6 +8762,16 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
             )
             assert not any(e.get("type") == "session.input.consumed" for e in published)
         await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+        if not with_client_id:
+            await _settle_undelivered_native_input(
+                store,  # type: ignore[arg-type]
+                sid,
+                "resp_fail",
+                None,
+                pending_id=pending_id,
+                delivery_attempt_id=str(original["delivery_attempt_id"]),
+            )
 
         types = [i.type for i in store.appended_items]
         assert types == ["message", "error"], types
@@ -8786,12 +8806,14 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         attrs = record.attributes
         assert attrs["outcome"] == "reported_undelivered"
         assert attrs["pending_id"] == pending_id
-        assert attrs["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+        assert attrs.get("input_stable_id") == stable_id
         assert attrs["delivery_attempt_id"] == original["delivery_attempt_id"]
         assert attrs["input_enqueued_at_ms"] == original["input_enqueued_at_ms"]
         assert attrs["item_id"] == consumed[0]["data"]["item_id"]
         assert attrs["response_id"] == message.response_id == "resp_fail"
-        assert attrs["match_method"] == "input_stable_id"
+        assert attrs["match_method"] == (
+            "input_stable_id" if with_client_id else "pending_id_and_delivery_attempt_id"
+        )
         assert attrs["cause_class"] == "rejected_before_handoff"
         assert attrs["reason_code"] == "databricks_sign_in_pending"
         assert attrs["lifecycle_response_id"] == "resp_fail"
@@ -8881,8 +8903,13 @@ async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("undelivered", [True, False])
+@pytest.mark.parametrize(
+    "identity_kind",
+    ["stable", "server", "missing_attempt", "wrong_attempt", "conflicting", "malformed"],
+)
 async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
     undelivered: bool,
+    identity_kind: str,
 ) -> None:
     """Preserve one real error without a second missing-transcript error on the next turn."""
     from omnigent.inner.executor import ExecutorError, MockExecutor
@@ -8900,13 +8927,28 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
     store = _ConversationStore()
     conv = store.get_conversation(sid)
     assert conv is not None
-    first_stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    first_stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d" if identity_kind == "stable" else None
     first_content = [{"type": "input_text", "text": "set up the worktree"}]
     next_content = [{"type": "input_text", "text": "then run the tests"}]
     first_pending = pending_inputs.record(
         sid, first_content, created_by="alice@example.com", stable_id=first_stable_id
     )
     next_pending = pending_inputs.record(sid, next_content, created_by="alice@example.com")
+    identity = {
+        key: value
+        for key, value in pending_inputs.delivery_attributes_for(sid, first_pending).items()
+        if key in {"input_stable_id", "pending_id", "delivery_attempt_id"}
+    }
+    if identity_kind == "stable":
+        identity = {"input_stable_id": first_stable_id}
+    elif identity_kind == "missing_attempt":
+        identity.pop("delivery_attempt_id")
+    elif identity_kind == "wrong_attempt":
+        identity["delivery_attempt_id"] = "f" * 32
+    elif identity_kind == "conflicting":
+        identity["pending_id"] = next_pending
+    elif identity_kind == "malformed":
+        identity["input_stable_id"] = "invalid identity"
     # Script only the executor boundary; the real adapter must transport its evidence.
     executor = MockExecutor()
     executor.enqueue_events(
@@ -8933,7 +8975,7 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
                 _sse_frame(
                     {
                         "type": "response.failed",
-                        "input_stable_id": first_stable_id,
+                        **identity,
                         "response": {
                             "id": "resp_not_ready",
                             "model": "claude",
@@ -8945,7 +8987,7 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
             ]
         )
         await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
-        if not undelivered:
+        if not undelivered or identity_kind not in {"stable", "server"}:
             assert [item.type for item in store.appended_items] == ["error"]
             assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
                 first_pending,

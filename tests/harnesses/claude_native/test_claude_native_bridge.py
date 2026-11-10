@@ -8,6 +8,7 @@ import errno
 import io
 import itertools
 import json
+import logging
 import os
 import queue
 import select
@@ -2037,6 +2038,120 @@ def test_read_transcript_items_from_offset_skips_existing_prefix(
         "agent": "claude-native-ui",
         "content": [{"type": "output_text", "text": "new output"}],
     }
+
+
+def test_read_transcript_items_from_offset_warns_on_unmirrored_human_prompt(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A human-typed prompt that yields no user message is logged by shape.
+
+    A human prompt the forwarder drops as CLI scaffolding leaves the web
+    message it answers unsettled, so the server later reports it as never
+    recorded. Plain prompts, real command echoes and a queued shell command
+    (dropped on purpose) stay quiet, and the warning never carries the text.
+    """
+    records = [
+        {
+            "type": "user",
+            "uuid": "lost",
+            "origin": {"kind": "human"},
+            "message": {
+                "role": "user",
+                "content": "<command-args>secret-output</command-args> what does this mean?",
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "plain",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": "fix the bug"},
+        },
+        {
+            "type": "user",
+            "uuid": "command",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": "<command-name>/model</command-name>"},
+        },
+        {
+            "type": "attachment",
+            "uuid": "queued-shell",
+            "attachment": {
+                "type": "queued_command",
+                "origin": {"kind": "human"},
+                "prompt": "pwd",
+                "commandMode": "bash",
+            },
+        },
+    ]
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.bridge"):
+        result = read_transcript_items_from_offset(
+            transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+        )
+
+    assert not [item for item in result.items if item.source_id.startswith("lost:")]
+    warnings = [r.getMessage() for r in caplog.records if "human prompt record" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "line=1 " in warnings[0]
+    assert "has_command_markup=False" in warnings[0]
+    assert "item_types=[]" in warnings[0]
+    assert "secret-output" not in warnings[0]
+
+
+def test_user_prompt_quoting_shell_markup_is_mirrored_as_a_message(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A pasted log that quotes ``<bash-*>`` markup is the person's prompt.
+
+    Only a record that starts with the markup is a shell command. Parsing the
+    quoted markup as a terminal command dropped the user message, so the web
+    message it answered was later reported as never recorded.
+    """
+    pasted_logs = (
+        '\n\n<pasted_content id="a1">\nwhy did this fail?\n'
+        "<bash-input>make test</bash-input><bash-stdout>boom</bash-stdout>\n"
+        '</pasted_content id="a1">\n'
+    )
+    records = [
+        {
+            "type": "user",
+            "uuid": "prompt",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": pasted_logs},
+        },
+        {
+            "type": "user",
+            "uuid": "shell",
+            "message": {"role": "user", "content": "<bash-input>pwd</bash-input>"},
+        },
+    ]
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.bridge"):
+        result = read_transcript_items_from_offset(
+            transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+        )
+
+    by_record = {item.source_id.split(":")[0]: item for item in result.items}
+    assert by_record["prompt"].item_type == "message"
+    assert by_record["prompt"].data["role"] == "user"
+    assert by_record["prompt"].data.get("is_meta") is not True
+    assert by_record["prompt"].data["content"][0]["text"] == (
+        "why did this fail?\n<bash-input>make test</bash-input><bash-stdout>boom</bash-stdout>"
+    )
+    assert by_record["shell"].item_type == "terminal_command"
+    assert not [r for r in caplog.records if "human prompt record" in r.getMessage()]
 
 
 def test_read_transcript_items_from_offset_preserves_partial_trailing_line(
@@ -10479,6 +10594,45 @@ def test_queued_message_hint_is_not_a_draft_for_submit_verification(needle: str)
     assert claude_native_bridge._draft_in_input_box(pane, needle) is False
 
 
+def test_a_draft_scrolled_past_its_first_line_is_seen_by_its_end() -> None:
+    """
+    A draft taller than the box keeps only its end in view, which the tail marker finds.
+
+    The first-line marker alone missed it, so long messages were submitted blind
+    and a swallowed Enter left them unsent in the box.
+    """
+    content = (
+        "Please review the change. " + "Check each caller carefully. " * 20 + "Then run tests."
+    )
+    rule = "─" * 60
+    pane = "\n".join(
+        [rule, "❯ each caller carefully. Check each caller", "  carefully. Then run tests.", rule]
+    )
+    needle = claude_native_bridge._submit_needle(content)
+    tail_needle = claude_native_bridge._submit_tail_needle(content)
+
+    assert claude_native_bridge._draft_in_input_box(pane, needle) is False
+    assert claude_native_bridge._draft_in_input_box(pane, needle, tail_needle=tail_needle) is True
+    empty_box = "\n".join([rule, "❯ ", rule])
+    assert not claude_native_bridge._draft_in_input_box(empty_box, needle, tail_needle=tail_needle)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("first line\nlast line of the draft", "last line of the draft"),
+        ("x" * 30 + " and the final words here", "and the final words here"),
+        ("long first line here\nok", ""),
+        ("before\tafter the tab char", "after the tab char"),
+        ("   \n  ", ""),
+    ],
+    ids=["last-line", "truncated", "too-short", "after-control-char", "blank"],
+)
+def test_submit_tail_needle(content: str, expected: str) -> None:
+    """The tail marker is the end of the last line, or empty when too short to be specific."""
+    assert claude_native_bridge._submit_tail_needle(content) == expected
+
+
 def test_typed_draft_is_still_seen_beside_the_queued_message_hint() -> None:
     """A real draft in the box is still detected when the same words appear in it."""
     rule = "─" * 40
@@ -17397,3 +17551,40 @@ async def test_relay_keeps_high_descriptor_connections_alive(
         release.set()
         await asyncio.wait_for(call, 2)
         relay.close()
+
+
+@pytest.mark.parametrize("saved", [False, True])
+@pytest.mark.parametrize("active", [None, [], ["claude"]])
+def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved):
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
+    active = launch_activation(active)
+
+    from unittest.mock import patch
+
+    from omnigent.mcp_disabled_servers import ServerKey, apply_claude_settings, set_disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    original_args = augment_claude_args(("--model", "test-model"), bridge_dir=bridge_dir)
+    settings_path = Path(original_args[original_args.index("--settings") + 1])
+    original = settings_path.read_bytes()
+    if saved:
+        set_disabled(ServerKey("claude", "fixture"), True)
+    with patch(
+        "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
+    ) as hook:
+        args = augment_claude_args(
+            ("--model", "test-model"), bridge_dir=bridge_dir, active_harnesses=active
+        )
+    hook.assert_called_once()
+    assert hook.call_args.kwargs == {"executor": "claude-native", "active_harnesses": active}
+    assert args == original_args
+    if active and saved:
+        assert json.loads(settings_path.read_bytes()) == {
+            **json.loads(original),
+            "deniedMcpServers": [{"serverName": "fixture"}],
+        }
+    else:
+        assert settings_path.read_bytes() == original

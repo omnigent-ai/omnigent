@@ -475,6 +475,15 @@ session_title_instructions: |
 Server operators can set the same key in the YAML passed to
 `omnigent server --config`.
 
+Each user can also add personal requirements under Settings → General →
+**Title instructions** in the web UI, up to 4,000 characters. The server stores
+them per user and adds them after the server's `session_title_instructions`
+when titling that user's sessions; where the two conflict, the personal ones
+win. Leave the field blank to use only the server setting or the default
+prompt. Runners older than this server accept at most 4,000 characters, so for
+them the server shortens longer guidance: it drops the language rule first,
+then the server's instructions, and keeps the personal ones.
+
 Claude Code sessions generate titles with the `haiku` model alias. If that
 model answers the message instead of returning a title, set
 `OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL` to another Claude model alias, such as

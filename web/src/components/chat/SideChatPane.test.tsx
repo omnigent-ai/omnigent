@@ -163,9 +163,9 @@ describe("editing a sent side-chat message", () => {
 
   it("loads the message, its attachment, and its @-mention into this side chat's composer", async () => {
     // The side-chat composer has no mention picker, so the mention returns as the
-    // marker this session's harness reads.
-    seedSentMessage("[Attached: src/app.ts]\n\nWhy did this build fail?");
-    const withMention = "[Attached file: src/app.ts]\n\nWhy did this build fail?";
+    // marker it was sent with.
+    const withMention = "[Attached: src/app.ts]\n\nWhy did this build fail?";
+    seedSentMessage(withMention);
     const download = vi
       .spyOn(filesApi, "downloadSessionFile")
       .mockResolvedValue(new File(["error: boom"], "build.log", { type: "text/plain" }));

@@ -4,7 +4,11 @@ import {
   compileGithubQuery,
   compileJiraJql,
   describeLinearFilter,
+  describePagerDutyFilter,
   describeSlackFilter,
+  emptyTriggerFields,
+  jiraAssignee,
+  parseGithubReviewer,
   isTriggerPrompt,
   readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
@@ -15,7 +19,9 @@ import {
   stripScopePrefix,
   splitJqlOrderBy,
   triggerConditionFields,
+  triggerEventDescription,
   triggerFieldsComplete,
+  triggerScopeOperators,
   updateTriggerWorkerSettings,
   withTriggerEvent,
   TRIGGER_SOURCES,
@@ -428,6 +434,100 @@ describe("compileJiraJql", () => {
   });
 });
 
+describe("jiraAssignee", () => {
+  it.each([
+    ["me", "assignee CHANGED TO currentUser()", "assignee = currentUser()"],
+    ["", "assignee CHANGED", "assignee is not EMPTY"],
+    ["Anyone", "assignee CHANGED", "assignee is not EMPTY"],
+    ["unassigned", "assignee CHANGED TO EMPTY", "assignee is EMPTY"],
+    ['al"ice', 'assignee CHANGED TO "al\\"ice"', 'assignee = "al\\"ice"'],
+  ])("compiles %j", (target, change, current) => {
+    expect(jiraAssignee(target)).toEqual({ change, current });
+  });
+
+  it("keeps only tickets still assigned that way", () => {
+    expect(compileJiraJql(fields({ event: "assigned", target: "me" }))).toBe(
+      `${JQL} AND assignee = currentUser()`,
+    );
+  });
+});
+
+describe("change events", () => {
+  const github = (overrides: Partial<TriggerFields> = {}) =>
+    fields({ event: "pr", scope: "acme/app", conditions: [], ...overrides });
+
+  it("defaults the reviewer to me and turns link-back off unless it was changed", () => {
+    const review = withTriggerEvent("github", github(), "review");
+    expect(review).toMatchObject({ event: "review", target: "me", linkBack: false });
+    // Back on an opened event, the reviewer goes and link-back follows its default.
+    const opened = withTriggerEvent("github", review, "pr");
+    expect(opened.linkBack).toBe(true);
+    expect(opened).not.toHaveProperty("target");
+    // An explicit link-back choice survives switching events, even a round trip.
+    const unchecked = github({ linkBack: false, linkBackTouched: true });
+    const roundTrip = withTriggerEvent(
+      "github",
+      withTriggerEvent("github", unchecked, "review"),
+      "pr",
+    );
+    expect(roundTrip.linkBack).toBe(false);
+    const checked = { ...review, linkBack: true, linkBackTouched: true };
+    const checkedRoundTrip = withTriggerEvent(
+      "github",
+      withTriggerEvent("github", checked, "pr"),
+      "review",
+    );
+    expect(checkedRoundTrip.linkBack).toBe(true);
+    expect(withTriggerEvent("github", { ...review, target: "alice" }, "review").target).toBe(
+      "alice",
+    );
+  });
+
+  it("hides fields that the review queue or opened issues can't use", () => {
+    const ids = (event: string) => triggerConditionFields("github", event).map((f) => f.id);
+    expect(ids("review")).toEqual(["label", "author", "qualifiers"]);
+    expect(ids("pr")).toContain("reviewer");
+    expect(ids("issue")).not.toContain("reviewer");
+    expect(ids("any")).not.toContain("reviewer");
+    expect(triggerConditionFields("jira", "assigned").map((f) => f.id)).not.toContain("assignee");
+  });
+
+  it("requires a reviewer but lets an empty assignee mean anyone", () => {
+    expect(triggerFieldsComplete(github({ event: "review", target: " " }), "github")).toBe(false);
+    expect(triggerFieldsComplete(github({ event: "review", target: "me" }), "github")).toBe(true);
+    expect(triggerFieldsComplete(fields({ event: "assigned", target: "" }), "jira")).toBe(true);
+  });
+
+  it.each([
+    ["me", true],
+    ["@octocat", true],
+    ["acme/release-team", true],
+    ["octo cat", false],
+    ["acme/a/b", false],
+    ['"octocat"', false],
+  ])("accepts %j as a GitHub reviewer: %s", (reviewer, valid) => {
+    expect(parseGithubReviewer(reviewer) !== null).toBe(valid);
+    expect(triggerFieldsComplete(github({ event: "review", target: reviewer }), "github")).toBe(
+      valid,
+    );
+    const filter = { field: "reviewer", operator: "is" as const, value: reviewer };
+    expect(triggerFieldsComplete(github({ conditions: [filter] }), "github")).toBe(valid);
+  });
+
+  it("describes when each event fires", () => {
+    expect(triggerEventDescription("github", "issue")).toBe(
+      "Runs your automation on all new issues that match these conditions. Older issues are skipped, even if they are edited to match later.",
+    );
+    expect(triggerEventDescription("github", "review")).toContain("including re-requests");
+    expect(triggerEventDescription("jira", "assigned")).toContain("assigned again later");
+  });
+
+  it("leaves new triggers on their creation event", () => {
+    expect(emptyTriggerFields("github")).not.toHaveProperty("target");
+    expect(emptyTriggerFields("jira").event).toBe("created");
+  });
+});
+
 describe("compileGithubQuery", () => {
   const query = (event: string, ...conditions: TriggerCondition[]) =>
     compileGithubQuery(fields({ event, scope: "acme/app", conditions }));
@@ -447,6 +547,28 @@ describe("compileGithubQuery", () => {
     );
     expect(query("issue", { field: "assignee", operator: "empty", value: "" })).toBe(
       "repo:acme/app is:issue no:assignee",
+    );
+  });
+
+  it("lists the open, ready review queue of the named reviewer", () => {
+    const review = (target: string) =>
+      compileGithubQuery(fields({ event: "review", scope: "acme/app", conditions: [], target }));
+    expect(review("me")).toBe("repo:acme/app is:pr is:open -is:draft user-review-requested:@me");
+    expect(review("Me")).toBe("repo:acme/app is:pr is:open -is:draft user-review-requested:@me");
+    expect(review("@octocat")).toBe(
+      "repo:acme/app is:pr is:open -is:draft user-review-requested:octocat",
+    );
+    expect(review("acme/maintainers")).toBe(
+      "repo:acme/app is:pr is:open -is:draft team-review-requested:acme/maintainers",
+    );
+  });
+
+  it("compiles reviewer rows on opened pull requests", () => {
+    expect(query("pr", { field: "reviewer", operator: "is", value: "me" })).toBe(
+      "repo:acme/app is:pr user-review-requested:@me",
+    );
+    expect(query("pr", { field: "reviewer", operator: "is_not", value: "acme/bots" })).toBe(
+      "repo:acme/app is:pr -team-review-requested:acme/bots",
     );
   });
 
@@ -518,13 +640,55 @@ describe("describeLinearFilter", () => {
   });
 });
 
+describe("describePagerDutyFilter", () => {
+  const filter = (...conditions: TriggerCondition[]) =>
+    describePagerDutyFilter(fields({ scope: "Checkout API", conditions }));
+
+  it("joins the rows into one clause, with me as the owner", () => {
+    expect(filter()).toBe("");
+    expect(
+      filter(
+        { field: "urgency", operator: "is", value: "high" },
+        { field: "priority", operator: "is_not", value: "P5" },
+        { field: "status", operator: "is_not", value: "resolved" },
+        { field: "assignee", operator: "is", value: "Me" },
+        { field: "title", operator: "contains", value: "database" },
+      ),
+    ).toBe(
+      'that have urgency "high", don\'t have priority "P5", don\'t have status "resolved", are assigned to you and have "database" in the title',
+    );
+    expect(
+      filter(
+        { field: "assignee", operator: "is_not", value: "ana@example.com" },
+        { field: "title", operator: "not_contains", value: "test" },
+      ),
+    ).toBe('that aren\'t assigned to "ana@example.com" and don\'t have "test" in the title');
+  });
+});
+
+describe("triggerScopeOperators", () => {
+  it("offers contains only where the template opts in", () => {
+    expect(triggerScopeOperators("pagerduty")).toEqual(["is", "in", "contains"]);
+    for (const source of ["jira", "slack", "github", "linear"] as const) {
+      expect(triggerScopeOperators(source)).toEqual(["is", "in"]);
+    }
+  });
+
+  it("treats contains as one value, like equals", () => {
+    const complete = (scope: string) =>
+      triggerFieldsComplete(
+        fields({ event: "triggered", scope, scopeOperator: "contains", conditions: [] }),
+        "pagerduty",
+      );
+    expect(complete("payments")).toBe(true);
+    expect(complete("payments, checkout")).toBe(false);
+  });
+});
+
 describe("isTriggerPrompt", () => {
-  it.each(["jira", "slack", "github", "linear"] as const)(
-    "recognizes a rendered %s prompt",
-    (source) => {
-      expect(isTriggerPrompt(renderTriggerPrompt(source, fields(), CTX))).toBe(true);
-    },
-  );
+  it.each(TRIGGER_SOURCES)("recognizes a rendered %s prompt", (source) => {
+    expect(isTriggerPrompt(renderTriggerPrompt(source, fields(), CTX))).toBe(true);
+  });
 
   it("doesn't match a prompt written by hand", () => {
     expect(isTriggerPrompt("Summarize the new Jira tickets.")).toBe(false);
@@ -545,6 +709,8 @@ describe("renderTriggerPrompt", () => {
   it("renders the Jira manager prompt with the JQL, placement, dedupe title and link", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
     expect(prompt).toContain("On the first run, use one hour ago and nothing pending.");
+    expect(prompt).not.toContain("CHANGED");
+    expect(prompt).not.toContain("Watching since:");
 
     // Only creation fires: an older ticket that's edited or starts matching later doesn't.
     expect(prompt).toContain(
@@ -825,6 +991,81 @@ describe("renderTriggerPrompt", () => {
     expect(unfiltered).toContain("Every issue counts.");
   });
 
+  it("renders the PagerDuty search across statuses, reading every page before starting sessions", () => {
+    const prompt = renderTriggerPrompt(
+      "pagerduty",
+      fields({
+        event: "triggered",
+        scope: "Checkout API, Payments",
+        conditions: [{ field: "urgency", operator: "is", value: "high" }],
+        instructions: "Investigate the incident.",
+      }),
+      CTX,
+    );
+
+    expect(prompt).toContain(
+      "This automation watches PagerDuty and starts one Omnigent session for each newly created incident that matches.",
+    );
+    expect(prompt).toContain(
+      'Watch: new PagerDuty incidents on services Checkout API, Payments that have urgency "high"',
+    );
+    // Services are named by the owner, so an ambiguous name must not silently pick one.
+    expect(prompt).toContain(
+      "Use your PagerDuty tools to find each of those services by name or ID. A name that matches no service or more than one counts as no match: say so in your reply.",
+    );
+    // An incident acknowledged before the run, or assigned to someone else, still counts.
+    expect(prompt).toContain(
+      'Then list the incidents created on them since that time, in any status and not only the ones assigned to you, for example GET /incidents with service_ids[] set to their IDs, since set to that time in ISO 8601 and sort_by "created_at:asc". Only incidents that have urgency "high" count.',
+    );
+    expect(prompt).toContain(
+      "Read every page of results, following the offset while more is true, then work through them oldest first. If you can't read every page, start no sessions in this run and keep the previous check time.",
+    );
+    expect(prompt).not.toContain("stop at the last result you read");
+    expect(prompt).toContain('title "PagerDuty #<incident number>"');
+    expect(prompt).toContain(
+      "gives the incident's number, link, title, service, urgency, priority and description between <pagerduty-incident> and </pagerduty-incident> lines.",
+    );
+    expect(prompt).toContain(
+      'Add a note "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" to each incident you started a session for.',
+    );
+    expect(prompt).toContain(
+      "say that this automation needs a PagerDuty MCP server where it runs.",
+    );
+
+    const unfiltered = renderTriggerPrompt(
+      "pagerduty",
+      fields({ event: "triggered", scope: "Checkout API", conditions: [] }),
+      CTX,
+    );
+    expect(unfiltered).toContain("Watch: new PagerDuty incidents on service Checkout API\n");
+    expect(unfiltered).toContain("find that service by name or ID.");
+    expect(unfiltered).toContain("service_ids[] set to its ID,");
+    expect(unfiltered).toContain("Every incident counts.");
+  });
+
+  it("renders a PagerDuty service name contains scope as a service search", () => {
+    const prompt = renderTriggerPrompt(
+      "pagerduty",
+      fields({
+        event: "triggered",
+        scope: " payments ",
+        scopeOperator: "contains",
+        conditions: [],
+        instructions: "Investigate the incident.",
+      }),
+      CTX,
+    );
+
+    expect(prompt).toContain(
+      'Watch: new PagerDuty incidents on services whose name contains "payments"\n',
+    );
+    expect(prompt).toContain(
+      'Use your PagerDuty tools to find every service whose name contains "payments", ignoring case, for example GET /services with query set to "payments", reading every page and keeping only names that contain it. If none does, say so in your reply and list no incidents, since an incident list without service IDs covers every service. Then list the incidents created on them since that time, in any status and not only the ones assigned to you, for example GET /incidents with service_ids[] set to their IDs,',
+    );
+    // The text names no single service, so it skips the exact-name lookup.
+    expect(prompt).not.toContain("by name or ID");
+  });
+
   it("shell-quotes the GitHub example so an apostrophe can't break it", () => {
     const prompt = renderTriggerPrompt(
       "github",
@@ -895,5 +1136,107 @@ describe("renderTriggerPrompt", () => {
     expect(either).toContain(
       "search for: repo:acme/app created:>=<that time>, oldest first, through every page (for example gh api -X GET search/issues -f q='repo:acme/app created:>=<that time>' -f sort=created -f order=asc -f per_page=100 --paginate).",
     );
+  });
+});
+
+describe("change-event prompts", () => {
+  const review = (target: string) =>
+    renderTriggerPrompt(
+      "github",
+      fields({ event: "review", scope: "acme/app", conditions: [], target, linkBack: false }),
+      CTX,
+    );
+
+  it("reads the review queue and keys each session by its review_requested event", () => {
+    const prompt = review("me");
+    expect(prompt).toContain(
+      "starts one Omnigent session for each new review request that matches.",
+    );
+    expect(prompt).toContain(
+      "Watch: review requests for you on GitHub pull requests matching: repo:acme/app is:pr is:open -is:draft user-review-requested:@me",
+    );
+    expect(prompt).toContain(
+      "gh api -X GET search/issues -f q='repo:acme/app is:pr is:open -is:draft user-review-requested:@me' -f per_page=100 --paginate",
+    );
+    expect(prompt).toContain("so don't add a time to this search");
+    expect(prompt).toContain(
+      "gh api -X GET repos/<owner>/<repo>/issues/<number>/timeline -f per_page=100 --paginate) and find the latest review_requested event whose requested_reviewer login is your own GitHub login",
+    );
+    expect(prompt).toContain(
+      "That review request counts only if the event was created since that time",
+    );
+    expect(prompt).toContain("Leave out review requests made after the time you noted");
+    expect(prompt).toContain('title "GitHub <owner/repo>#<number> review <event id>"');
+    expect(prompt).toContain("whether you started a session for an earlier review request");
+    // Requests from before activation never count, even inside the search overlap.
+    expect(prompt).toContain(
+      'On the first run, use the current time as both the check time and the "Watching since:" time',
+    );
+    expect(prompt).toContain(
+      'Then search from 5 minutes before the check time or from the "Watching since:" time, whichever is later',
+    );
+    expect(prompt).toContain('Above it, repeat the "Watching since: <time>" line unchanged.');
+    expect(prompt).not.toContain("one hour ago");
+    // A queue past the search cap can't be read in full, so the run keeps its check time.
+    expect(prompt).toContain(
+      "if the queue reaches that, start no sessions in this run, keep the previous check time",
+    );
+    expect(prompt).not.toContain("created:>=");
+    expect(prompt).toContain(
+      "the time the last review request you handled (started or skipped) before you stopped was requested",
+    );
+  });
+
+  it("matches team requests by slug and other users by login", () => {
+    expect(review("acme/maintainers")).toContain(
+      "Watch: review requests for team acme/maintainers on GitHub pull requests",
+    );
+    expect(review("acme/maintainers")).toContain(
+      'whose requested_team slug is "maintainers", ignoring case',
+    );
+    expect(review("octocat")).toContain(
+      'whose requested_reviewer login is "octocat", ignoring case',
+    );
+  });
+
+  it("finds Jira assignee changes and rechecks earlier sessions after their search time", () => {
+    const prompt = renderTriggerPrompt(
+      "jira",
+      fields({ event: "assigned", target: "me", conditions: [] }),
+      CTX,
+    );
+    expect(prompt).toContain(
+      "starts one Omnigent session for each ticket assigned to you that matches.",
+    );
+    expect(prompt).toContain(
+      'search for (project = "ES" AND assignee = currentUser()) AND assignee CHANGED TO currentUser() AFTER "-<A>m", through every page, where A is the whole minutes from that time until now, rounded up; when that time is the "Watching since:" time, round down instead, so nothing from before it counts.',
+    );
+    // Day offsets snap to calendar days and malformed times silently match nothing.
+    expect(prompt).toContain(
+      'Write it as a minute offset such as "-95m", never days, hours or dates',
+    );
+    // The title's time is after every assignment the search found, so a recheck never repeats one.
+    expect(prompt).toContain(
+      "note its search time: the current UTC time rounded up to the next whole minute.",
+    );
+    expect(prompt).toContain('title "Jira <ticket key> assigned <search time>"');
+    expect(prompt).toContain(
+      "the ticket counts again only if its latest matching assignee change is after that time",
+    );
+    expect(prompt).toContain(
+      'Otherwise search for key = <ticket key> AND assignee CHANGED TO currentUser() AFTER "-<C>m", where C is the whole minutes from that time until now, rounded down',
+    );
+    expect(prompt).toContain("Rounding down never repeats an assignment");
+    // A pending delivery covers only its own assignment, not a later reassignment.
+    expect(prompt).toContain(
+      "a pending entry covers only that assignment, so a newer one still counts and gets its own session, while the pending one is never resent",
+    );
+    expect(prompt).not.toContain('Skip any ticket on a "Delivery pending:" line');
+    expect(prompt).toContain("rely on your earlier replies for archived ones");
+    expect(prompt).toContain('or from the "Watching since:" time, whichever is later');
+    expect(prompt).toContain(
+      "handled every match; otherwise the previous check time, and say why you stopped.",
+    );
+    expect(prompt).not.toContain("created >=");
   });
 });

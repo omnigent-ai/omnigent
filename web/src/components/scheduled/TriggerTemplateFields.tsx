@@ -19,19 +19,25 @@ import {
   MAX_INSTRUCTIONS_CHARS,
   MAX_SESSIONS_PER_RUN,
   OMNIGENT_ATTRIBUTION,
+  singleValueScope,
   stripScopePrefix,
+  TRIGGER_SCOPE_OPERATOR_LABELS,
   TRIGGER_TEMPLATES,
   triggerConditionFields,
   triggerEvent,
+  triggerEventDescription,
   triggerOperatorLabel,
   triggerScope,
   triggerScopeEntries,
+  triggerScopeOperators,
+  triggerTargetValid,
   triggerServiceName,
   VALUELESS_OPERATORS,
   withTriggerEvent,
   type TriggerCondition,
   type TriggerFields,
   type TriggerOperator,
+  type TriggerScopeOperator,
   type TriggerSource,
 } from "@/components/scheduled/triggerTemplates";
 import { cn } from "@/lib/utils";
@@ -63,7 +69,13 @@ export function TriggerTemplateFields({
   const [warningsOpen, setWarningsOpen] = useState(false);
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
-  const { authorAction } = triggerEvent(source, fields.event);
+  const { authorAction, target } = triggerEvent(source, fields.event);
+  const targetInvalid = !triggerTargetValid(fields, source);
+  // Reviewers added after the pull request opens never match the opened event.
+  const reviewerOnOpen =
+    source === "github" &&
+    fields.event === "pr" &&
+    fields.conditions.some((c) => c.field === "reviewer");
   const scope = triggerScope(source, fields.event);
   const conditionFields = triggerConditionFields(source, fields.event);
   const scopeEntries = triggerScopeEntries(source, fields);
@@ -91,9 +103,8 @@ export function TriggerTemplateFields({
     <div className="flex flex-col gap-4" data-testid="task-trigger-fields">
       <div className="flex flex-col gap-1.5">
         <Label>Trigger</Label>
-        <p className="text-sm text-muted-foreground">
-          Runs your automation on all new {template.itemPlural} that match these conditions. Older{" "}
-          {template.itemPlural} are skipped, even if they are edited to match later.
+        <p className="text-sm text-muted-foreground" data-testid="task-trigger-description">
+          {triggerEventDescription(source, fields.event)}
         </p>
         <div
           className="flex flex-col gap-2 rounded-lg border border-border p-3"
@@ -128,12 +139,29 @@ export function TriggerTemplateFields({
                 {template.events[0].label}
               </span>
             )}
+            {target && (
+              <>
+                <span className="text-muted-foreground">{target.word}</span>
+                <Input
+                  value={fields.target ?? ""}
+                  placeholder={target.placeholder}
+                  aria-label={target.label}
+                  data-testid="task-trigger-target"
+                  className={cn(CHIP, "min-w-16 placeholder:text-primary/50")}
+                  // Fit the placeholder or value so neither is cut off.
+                  style={{
+                    width: `calc(${Math.max((fields.target ?? "").length, target.placeholder.length) + 2}ch + 1rem)`,
+                  }}
+                  onChange={(e) => onChange({ ...fields, target: e.target.value })}
+                />
+              </>
+            )}
             <span className="text-muted-foreground">where {scope.label}</span>
             {!scope.isGroup && (
               <Select
                 value={fields.scopeOperator ?? "in"}
                 onValueChange={(operator) =>
-                  onChange({ ...fields, scopeOperator: operator as "is" | "in" })
+                  onChange({ ...fields, scopeOperator: operator as TriggerScopeOperator })
                 }
                 onOpenChange={onSelectOpenChange}
               >
@@ -146,8 +174,11 @@ export function TriggerTemplateFields({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
-                  <SelectItem value="is">equals</SelectItem>
-                  <SelectItem value="in">in</SelectItem>
+                  {triggerScopeOperators(source).map((operator) => (
+                    <SelectItem key={operator} value={operator}>
+                      {TRIGGER_SCOPE_OPERATOR_LABELS[operator]}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             )}
@@ -165,7 +196,7 @@ export function TriggerTemplateFields({
               <Input
                 value={fields.scope}
                 placeholder={
-                  fields.scopeOperator === "is" && !scope.isGroup
+                  singleValueScope(fields) && !scope.isGroup
                     ? scope.placeholder.split(",")[0]
                     : scope.placeholder
                 }
@@ -179,15 +210,27 @@ export function TriggerTemplateFields({
             </span>
           </div>
 
+          {targetInvalid && target?.hint && (
+            <p
+              className="pl-6 text-sm text-muted-foreground"
+              data-testid="task-trigger-target-hint"
+            >
+              {target.hint}
+            </p>
+          )}
+
           {scope.isGroup && scopeEntries.length > 0 && scopeEntries.length < 2 && (
             <p className="pl-6 text-sm text-muted-foreground" data-testid="task-trigger-group-hint">
               List at least two people. For one person, choose Direct message received.
             </p>
           )}
 
-          {!scope.isGroup && fields.scopeOperator === "is" && fields.scope.includes(",") && (
+          {!scope.isGroup && singleValueScope(fields) && fields.scope.includes(",") && (
             <p className="pl-6 text-sm text-destructive" role="alert">
-              Equals matches one value. Choose in to match a comma-separated list.
+              {fields.scopeOperator === "contains"
+                ? "Contains matches one piece of text."
+                : "Equals matches one value."}{" "}
+              Choose in to match a comma-separated list.
             </p>
           )}
 
@@ -296,6 +339,16 @@ export function TriggerTemplateFields({
             );
           })}
 
+          {reviewerOnOpen && (
+            <p
+              className="pl-6 text-sm text-muted-foreground"
+              data-testid="task-trigger-reviewer-hint"
+            >
+              Only matches reviewers requested before the next check after the pull request opens.
+              To catch later requests and re-requests, choose Review requested.
+            </p>
+          )}
+
           <div className="pl-6">
             <Button
               type="button"
@@ -322,7 +375,9 @@ export function TriggerTemplateFields({
           <Checkbox
             id="task-trigger-link-back"
             checked={fields.linkBack}
-            onCheckedChange={(checked) => onChange({ ...fields, linkBack: checked === true })}
+            onCheckedChange={(checked) =>
+              onChange({ ...fields, linkBack: checked === true, linkBackTouched: true })
+            }
             data-testid="task-trigger-link-back"
             componentId="tasks.scheduled.trigger_link_back"
           />

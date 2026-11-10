@@ -16,6 +16,7 @@ import logging
 import re
 import subprocess
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -268,15 +269,10 @@ def _default_pr(session_id: str | None, pr_url: str | None) -> SessionPullReques
 def _cannot_serve(info: dict[str, Any], capabilities: ProviderCapabilities) -> bool:
     """Whether a provider's workspace info shows that it cannot serve the workspace.
 
-    True when its CLI, if it has one, is present and signed in, yet no
-    repository resolved and the panel offers no other account to try.
+    True when no repository resolved and the panel offers no other account to try.
     """
     auth = info.get("auth")
     if info.get("available") is not True or not isinstance(auth, dict):
-        return False
-    cli = auth.get("cli")
-    if not auth.get("authenticated") or (isinstance(cli, dict) and not cli.get("available")):
-        # The panel shows the provider's install or sign-in guidance instead.
         return False
     repo = info.get("repo")
     if info.get("pr") is not None or (isinstance(repo, dict) and repo.get("name_with_owner")):
@@ -452,6 +448,49 @@ def _associate_discovered_pr(
             candidate["pr"] = None
             candidate.pop("selected_pr_url", None)
             candidate.setdefault("warnings", []).append("Could not associate this pull request.")
+
+
+# (session, checkout, pushed state) already checked, so repeat git calls cost one local read.
+_CHECKED_CHECKOUTS: OrderedDict[tuple[str, str, str], None] = OrderedDict()
+_CHECKED_CHECKOUTS_LOCK = Lock()
+
+
+def infer_checkout_pr(session_id: str, checkout: str) -> None:
+    """Infer the PR of *checkout*'s branch, as the panel does for the workspace's.
+
+    Agents often push from a checkout other than the session workspace, such as a
+    worktree. Discovery runs once per pushed commit: until a remote-tracking ref
+    points at HEAD, the branch has no PR to find.
+    """
+    try:
+        code, pushed = _git_output(
+            [
+                "for-each-ref",
+                "--points-at=HEAD",
+                "--format=%(objectname) %(refname)",
+                "refs/remotes/",
+            ],
+            cwd=checkout,
+        )
+        if code != 0 or not pushed.strip():
+            return
+        key = (session_id, checkout, pushed)
+        with _CHECKED_CHECKOUTS_LOCK:
+            if key in _CHECKED_CHECKOUTS:
+                return
+            _CHECKED_CHECKOUTS[key] = None
+            while len(_CHECKED_CHECKOUTS) > 1024:
+                _CHECKED_CHECKOUTS.popitem(last=False)
+        registry = SessionPrRegistry(session_id)
+        for resolution in _workspace_providers(checkout):
+            candidate = _discovery_info(checkout, resolution)
+            pr = candidate.get("pr")
+            # Recording again would demote a PR the session already attached or worked on.
+            if isinstance(pr, dict) and any(e.url == pr.get("url") for e in registry.list()):
+                continue
+            _associate_discovered_pr(checkout, registry, candidate, time.time())
+    except Exception:  # optional inference must never affect the tool call
+        _logger.warning("Could not infer the PR of %s", checkout, exc_info=True)
 
 
 def _background_discovery(

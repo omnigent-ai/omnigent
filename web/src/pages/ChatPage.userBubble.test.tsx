@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
@@ -60,10 +61,13 @@ function assistantBubble(
 }
 
 function renderBubble(bubble: Bubble) {
+  // File mention pills check the workspace through a query.
   return render(
-    <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
-      <BubbleView bubble={bubble} />
-    </FileViewerContext.Provider>,
+    <QueryClientProvider client={new QueryClient()}>
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BubbleView bubble={bubble} />
+      </FileViewerContext.Provider>
+    </QueryClientProvider>,
   );
 }
 
@@ -554,16 +558,18 @@ describe("UserBubble edit button", () => {
   function renderEditable(bubble: Bubble, { shared = false } = {}) {
     const editMessage = vi.fn<(message: SentMessage) => void>();
     render(
-      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
-        <SessionSharedContext.Provider value={shared}>
-          <EditSentMessageContext.Provider value={editMessage}>
-            {/* A shared session badges other contributors with a tooltip. */}
-            <TooltipProvider>
-              <BubbleView bubble={bubble} />
-            </TooltipProvider>
-          </EditSentMessageContext.Provider>
-        </SessionSharedContext.Provider>
-      </FileViewerContext.Provider>,
+      <QueryClientProvider client={new QueryClient()}>
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <SessionSharedContext.Provider value={shared}>
+            <EditSentMessageContext.Provider value={editMessage}>
+              {/* A shared session badges other contributors with a tooltip. */}
+              <TooltipProvider>
+                <BubbleView bubble={bubble} />
+              </TooltipProvider>
+            </EditSentMessageContext.Provider>
+          </SessionSharedContext.Provider>
+        </FileViewerContext.Provider>
+      </QueryClientProvider>,
     );
     return editMessage;
   }
@@ -577,14 +583,14 @@ describe("UserBubble edit button", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
 
+    // The composer turns the sent mention markers back into tags.
     expect(editMessage).toHaveBeenCalledWith({
       sessionId: null,
-      text: "summarize this",
+      text: "summarize this\n\n[Attached: src/app.ts]",
       content,
-      mentions: [{ path: "src/app.ts", isDir: false }],
     });
     // Editing copies the message; the bubble stays in the transcript.
-    expect(screen.getByText("summarize this")).toBeInTheDocument();
+    expect(screen.getByText(/summarize this/)).toBeInTheDocument();
   });
 
   it("offers Edit on an attachments-only message", () => {
@@ -602,6 +608,16 @@ describe("UserBubble edit button", () => {
   it("is absent while the message is still sending", () => {
     renderEditable(userBubble("hello", { pending: true }));
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    cleanup();
+    renderEditable(userBubble("hello", { pending: true, awaitingAgent: true, stillSending: true }));
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
+
+  it("offers Edit on a mid-turn message the agent hasn't read yet", () => {
+    const onEdit = renderEditable(userBubble("hello", { pending: true, awaitingAgent: true }));
+    expect(screen.getByText("The agent will read this after its current step")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(onEdit).toHaveBeenCalledWith(expect.objectContaining({ text: "hello" }));
   });
 
   describe("with a signed-in viewer", () => {
@@ -707,28 +723,37 @@ describe("AssistantBubble copy-link button", () => {
   });
 });
 
-describe("UserBubble @-mention attachment chips", () => {
-  it("shows file and folder chips from [Attached: …] markers and hides the markers", () => {
-    renderBubble(userBubble("[Attached: src/server.ts]\n[Attached: docs/]\n\nsummarize these"));
+function pills() {
+  return screen.queryAllByTestId("mention-pill").map((pill) => pill.textContent);
+}
 
-    // The marker paths surface as chips (folder keeps its trailing slash)...
-    expect(screen.getByText("@src/server.ts")).toBeInTheDocument();
-    expect(screen.getByText("@docs/")).toBeInTheDocument();
-    // ...while the raw "[Attached: …]" marker text is stripped from the body.
+describe("UserBubble @-mention pills", () => {
+  it("renders file and folder markers as pills where they sit in the sentence", () => {
+    renderBubble(userBubble("summarize [Attached: src/server.ts] and [Attached: docs/] please"));
+
+    // The marker paths render as pills (folder keeps its trailing slash) inline...
+    expect(pills()).toEqual(["@src/server.ts", "@docs/"]);
+    expect(screen.getAllByTestId("mention-pill")[0].closest("p")?.textContent).toBe(
+      "summarize @src/server.ts and @docs/ please",
+    );
+    // ...while the raw "[Attached: …]" marker text never shows.
     expect(screen.queryByText(/\[Attached:/)).toBeNull();
-    expect(screen.getByText("summarize these")).toBeInTheDocument();
   });
 
-  it("renders chips for the codex 'Attached file:' wording too", () => {
+  it("renders pills for the codex 'Attached file:' wording too", () => {
     renderBubble(userBubble("[Attached file: src/a.ts]\n\ncheck this"));
-    expect(screen.getByText("@src/a.ts")).toBeInTheDocument();
+    expect(pills()).toEqual(["@src/a.ts"]);
     expect(screen.queryByText(/\[Attached/)).toBeNull();
   });
 
-  it("shows the line span of a partial-file attach in its own (non-truncating) node", () => {
-    renderBubble(userBubble("[Attached: bob-max-gain/docker-compose.yml:2-9]\n\nreview"));
-    expect(screen.getByText("@bob-max-gain/docker-compose.yml")).toBeInTheDocument();
-    expect(screen.getByText(":2-9")).toBeInTheDocument();
+  it("keeps the line span of a partial-file attach in its pill", () => {
+    renderBubble(userBubble("review [Attached: bob-max-gain/docker-compose.yml:2-9]"));
+    expect(pills()).toEqual(["@bob-max-gain/docker-compose.yml:2-9"]);
+    // A long path can truncate the label; the hover title keeps the full span.
+    const longPath = `${"deeply/nested/".repeat(8)}service/docker-compose.yml`;
+    cleanup();
+    renderBubble(userBubble(`review [Attached: ${longPath}:120-188]`));
+    expect(screen.getByTestId("mention-pill")).toHaveAttribute("title", `${longPath}:120-188`);
   });
 
   // An explicit upload is materialized to disk by the native executor, which
@@ -736,13 +761,13 @@ describe("UserBubble @-mention attachment chips", () => {
   // The upload already rides in as an input_image / input_file block, so the
   // marker must NOT also surface as a path chip (it would double-render, and
   // the path is an internal temp dir).
-  it("does not chip an absolute upload marker (already shown via its file block)", () => {
+  it("does not pill an absolute upload marker (already shown via its file block)", () => {
     renderBubble(
       userBubble(
         "[Attached: /var/folders/x/omnigent-1/claude-native/abc/uploads/image.png]\n\nwhat is this",
       ),
     );
-    // No "@…" chip for the absolute upload path.
+    // No "@…" pill for the absolute upload path.
     expect(screen.queryByText(/^@\//)).toBeNull();
     expect(screen.queryByText(/uploads\/image\.png/)).toBeNull();
     // The marker is still stripped from the body and the prose survives.
@@ -757,21 +782,21 @@ describe("UserBubble @-mention attachment chips", () => {
     ["C:\\Users\\me\\AppData\\Local\\Temp\\omnigent\\uploads\\image.png", "drive (backslash)"],
     ["C:/Users/me/AppData/Local/Temp/omnigent/uploads/image.png", "drive (forward slash)"],
     ["\\\\host\\share\\omnigent\\uploads\\image.png", "UNC"],
-  ])("does not chip a Windows-style absolute upload marker (%s)", (path) => {
+  ])("does not pill a Windows-style absolute upload marker (%s)", (path) => {
     renderBubble(userBubble(`[Attached: ${path}]\n\nwhat is this`));
     expect(screen.queryByText(/uploads/)).toBeNull();
     expect(screen.getByText("what is this")).toBeInTheDocument();
   });
 
-  it("chips a relative @-mention but not an absolute upload in the same message", () => {
+  it("pills a relative @-mention but not an absolute upload in the same message", () => {
     renderBubble(
       userBubble(
         "[Attached: /tmp/omnigent/claude-native/abc/uploads/image.png]\n" +
           "[Attached: src/server.ts]\n\ncompare",
       ),
     );
-    // Workspace @-mention still chips...
-    expect(screen.getByText("@src/server.ts")).toBeInTheDocument();
+    // Workspace @-mention still renders as a pill...
+    expect(pills()).toEqual(["@src/server.ts"]);
     // ...the materialized upload does not.
     expect(screen.queryByText(/uploads\/image\.png/)).toBeNull();
   });

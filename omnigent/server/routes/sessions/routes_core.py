@@ -194,6 +194,7 @@ from omnigent.server.routes._sessions.helpers import (
     reconcile_orphaned_running_status,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    HOST_OFFLINE_HOLD_S,
     _best_effort_stop,
     _build_session_list_item,
     _build_session_response,
@@ -204,6 +205,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _ensure_runner_relay_ready,
     _ensure_runner_session_initialized,
     _get_session_snapshot,
+    _host_row_offline,
     _is_native_terminal_session,
     _labels_for_viewer,
     _mark_session_moving,
@@ -963,6 +965,7 @@ def register_core_routes(
                 # spawning. None (agent not resolvable) skips the
                 # host-side check.
                 harness=harness,
+                mcp_disabled_servers_active_harnesses=host_registry.mcp_disabled_servers_active_harnesses(),
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
                     if target.conv.inference_snapshot
@@ -2345,16 +2348,31 @@ def register_core_routes(
                     orphan_liveness = await asyncio.to_thread(
                         liveness_lookup, [conv.id for conv in orphan_suspects]
                     )
+                    offline_hosts: dict[str, bool | None] = {}
+                    now = int(time.time())
+                    # Heartbeat expiry and reconnect grace can precede the hold.
+                    hold_stale_before = now - HOST_OFFLINE_HOLD_S - 2 * RUNNER_LIVENESS_TTL_S
                     for conv in orphan_suspects:
                         result = orphan_liveness.get(conv.id)
                         # False means no replica has a tunnel and the heartbeat
                         # expired, so reconnecting runners within grace survive.
                         if result is not None and not result.runner_online:
+                            if result.host_online is False and conv.host_id is not None:
+                                # A sleeping host can resume its runner; a list read
+                                # must not end that bounded wait on another replica.
+                                if conv.host_id not in offline_hosts:
+                                    offline_hosts[conv.host_id] = await _host_row_offline(
+                                        getattr(request.app.state, "host_store", None),
+                                        conv.host_id,
+                                        updated_since=hold_stale_before,
+                                    )
+                                if offline_hosts[conv.host_id] is not False:
+                                    continue
                             await asyncio.to_thread(
                                 reconcile_orphaned_running_status,
                                 conv.id,
                                 conversation_store,
-                                int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                                now - RUNNER_LIVENESS_TTL_S,
                             )
             # Build items after reconciliation so each settled row reads its new
             # status straight from the (now-updated) cache.
@@ -4437,7 +4455,22 @@ def register_core_routes(
 
         # Cross-user forks copy the agent (bundle under the copy's id) so its owner
         # can never change code in the caller's sessions; same-user forks share it.
-        needs_own_copy = agent_needs_own_copy(base_agent, user_id)
+        # A fork by a caller without EDIT on the source gets a redacted copy, since
+        # the bundle can carry its author's credentials.
+        redacted_fork = (
+            not switching_agent
+            and permission_store is not None
+            and not await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                source_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+                conversation=source,
+            )
+        )
+        needs_own_copy = redacted_fork or agent_needs_own_copy(base_agent, user_id)
         if needs_own_copy and artifact_store is None:
             raise OmnigentError("artifact store is not configured", code=ErrorCode.INTERNAL_ERROR)
 
@@ -4744,7 +4777,12 @@ def register_core_routes(
             assert artifact_store is not None
             fork_agent_id = generate_agent_id()
             clone_location = await asyncio.to_thread(
-                copy_agent_bundle, artifact_store, base_agent.bundle_location, fork_agent_id
+                copy_agent_bundle,
+                artifact_store,
+                base_agent.bundle_location,
+                fork_agent_id,
+                redacted_name=base_agent.name if redacted_fork else None,
+                operator_authored=base_agent.operator_authored,
             )
 
         async def drop_unused_copy() -> None:

@@ -174,11 +174,34 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
+- `at-mentions`: a bare `@` in the in-session or new-session composer shows a
+  "Sessions" row. Opening it (click, Enter, Tab or →) shows a "Subagents" row
+  for the current session's subagents, then every other session the sidebar
+  has loaded; Back or Esc goes up one level. In native coding-agent sessions workspace files and folders sit
+  below the Sessions row. Typing lists the top matching sessions inline above
+  the files and, after a short pause, searches session titles and the
+  workspace. Picking a row puts a
+  pill-styled `@name` token in the sentence; Backspace deletes a token whole, and
+  deleting it untags the item. On send each token becomes a marker in place
+  (`[Attached: path]` or `[Session: "title" id=… subagent=yes|no]`), and a
+  tagged session adds one tool hint at the end, so native terminals show the
+  markers as typed text. The sent message shows the tokens as inline pills; a
+  session pill opens that session. The new-session composer lists the same
+  sessions (no subagents yet) with the same title search; its files come from
+  the host directory listing only, without the recursive workspace search.
+  States: file listing still loading (Enter holds; a pending session search
+  does not hold it), no match (Enter sends the literal text), late results
+  arriving (the highlighted row stays put), a file and a session with the same
+  name (the later one gets a suffix such as `@README.md (file)`), Attach to
+  agent from the file viewer (adds a token at the end).
 - `dictation`: the microphone button beside the message box dictates speech
   into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
-  terminal or code editor. While listening, Enter keeps the dictated text and
-  Escape discards it. The button is absent when neither the browser nor the
-  server can transcribe.
+  terminal or code editor. While a browser or server take is listening, Enter
+  keeps the dictated text and Escape discards it. The button is absent when
+  neither the browser nor the server can transcribe; the desktop app's browser
+  engine cannot, so there the button uses the connected server's dictation.
+  Without it, the button starts macOS Dictation in the message box on a Mac,
+  which then uses its own Dictation controls, and is absent elsewhere.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers. The
   Inbox reply box follows the same shortcut.
@@ -244,7 +267,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   renewal. States: valid, invalid, checking, skipped, refreshing, failed, and
   CLI not installed.
 - `launch-action-required`: while a managed launch needs the user to do
-  something, such as an Arclet waiting for its owner's dbcert, the session's chat
+  something, such as a sandbox still waiting for its owner's credentials, the session's chat
   transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
@@ -304,7 +327,17 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   A plugin catalog the host could not read is named in the Skills section with
   a Retry link.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
-  message box; press Enter to keep the text or Escape to discard it.
+  message box. For browser or server dictation, press Enter to keep the text or
+  Escape to discard it. In the desktop app the button uses the connected
+  server's dictation; without it, a Mac opens macOS Dictation in the message
+  box (stop it with the macOS Dictation controls), and other platforms show no
+  button. A side chat's composer ("Ask a side question...") shows the same
+  button under the same rule; the shortcut belongs to the main composer.
+- Type `@` mid-sentence and pick a session, a subagent of this session, or (in a
+  native coding-agent session) a file or folder; the pick becomes a pill in the
+  sentence. Send it, then click the session pill in the sent message to open
+  that session. From the file viewer, **Attach to agent** adds a file token to
+  the end of the draft.
 - Send while the agent is working to queue a message, then steer it.
 - Hover one of your sent messages and click Edit (pencil) to load its text and
   attachments into the message box, revise, and send it as a new message.
@@ -346,9 +379,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   alone must not open the browser, and renewal alone must not create a sandbox.
   While **Checking laptop credentials…** is visible, **Skip** starts that launch
   without waiting for verification or opening sign-in. Later launches check again.
-- On a deployment whose launches report that the user needs to act, such as
-  Databricks' managed Arclets, start a managed session whose launch needs you,
-  e.g. an Arclet whose owner's dbcert hasn't arrived. The session's chat
+- On a deployment whose launches can report that the user needs to act, start a
+  managed session whose launch needs you, e.g. a sandbox still waiting for its
+  owner's credentials. The session's chat
   transcript keeps showing **Provisioning sandbox…** and adds a yellow banner
   saying what to do. The terminal view doesn't show it.
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
@@ -405,9 +438,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - With an Arca connected, choose **Arclet Sandbox** with a native terminal agent
   and type `/` for Claude or `$` for Codex before the first send. The menu previews that Arca's home-level
   catalog; selecting a skill completes the prompt while the launch stays on Arclet.
-  Runtime availability follows Arclet's existing skill sync and plugin installation;
-  custom skill roots or plugins installed only on Arca may be absent on Arclet.
-  With no connected Arca, host skills become available after the sandbox starts.
+  Skill roots or plugins installed only on the connected host may be missing on
+  the sandbox. With no connected Arca, host skills become available after the sandbox starts.
   SDK agents continue using their bundled skills before the sandbox starts.
   Browser coverage: `tests/browser_ui/chat/test_arclet_skills.py`.
 - Open **MCPs** in the workspace bar above the composer (the plug icon when space is tight), then turn
@@ -421,7 +453,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   to select it; for Databricks, first enter the workspace URL and choose
   **Connect workspace**. Bearer-token services require **Manage MCP accounts**
   before selection. Use **Reconnect** if a selected service loses its connection.
-- Dictate with the microphone button or ⌘/Ctrl+Alt+V before the first send.
+- Dictate with the microphone button or ⌘/Ctrl+Alt+V before the first send,
+  under the same desktop rule as above.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
@@ -747,6 +780,22 @@ Other connection providers alone do not enable the managed MCP picker.
   engine and keeps the transcript on Enter.
   Manually on the landing page: dictate with ⌘/Ctrl+Alt+V, then press Escape
   to restore the previous draft.
+- **`dictation`, desktop:**
+  `web/electron/e2e/desktop_dictation_availability.e2e.js` (new-session
+  composer only), run from `web/electron` after building the SPA
+  (`OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python xvfb-run -a
+  node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
+  server without dictation (on macOS, the macOS Dictation mic instead), then
+  the mic dictating through a fake-engine server. Manually, for the in-session,
+  new-session and side-chat composers: connect the desktop app to a default
+  `omnigent server` (`/v1/info` reports `dictation_available: false`) and
+  expect no mic and ⌘/Ctrl+Alt+V to do nothing on Windows or Linux. On a Mac
+  expect the mic in each composer; clicking it (or, in the in-session and
+  new-session composers, pressing ⌘⌥V; side chat has no shortcut) opens macOS
+  Dictation with that message box focused, and the spoken text stays in it.
+  Restart the server with
+  `OMNIGENT_DICTATION_ENGINE=fake`, reconnect, and expect the mic, the listening
+  state on click, and the fake transcript in the message box.
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
@@ -862,8 +911,8 @@ Other connection providers alone do not enable the managed MCP picker.
   native bridge, CLI process, and local server with a fake dbcert executable and
   machine policy. Follow `web/electron/e2e/README.md` for build and recording
   prerequisites. It proves explicit refresh and launch, preserved input, skipping
-  a pending check, and skipped kubeconfig updates and existing-Arca sync; macOS
-  SSO and Companion transfer need a manual managed-desktop check. Component tests in
+  a pending check, and skipped kubeconfig updates and host sync; macOS sign-in
+  needs a manual managed-desktop check. Component tests in
   `web/src/shell/NewChatDialog.test.tsx` and
   `web/src/components/DbcertBanner.test.tsx` cover leaving during a check, late
   results after skipping, retry, dismissal, check errors, and older shells.
@@ -891,11 +940,10 @@ Other connection providers alone do not enable the managed MCP picker.
 - Test touch sizing with a real touch device or browser touch emulation; resizing
   a mouse browser alone does not enable it.
 
-- The Arclet dbcert preflight needs both the updated desktop shell and web UI,
-  with Databricks-internal features enabled for the managed server. Browsers,
-  older shells, other sandbox providers, and already-connected hosts do not
-  perform this laptop check. The existing session banner checks the host's
-  certificate instead; refreshing it does not prove new-session gating works.
+- The Arclet dbcert preflight needs the updated desktop shell and web UI, with
+  managed features enabled on the server. Browsers, older shells, other sandbox
+  providers, and already-connected hosts skip this check. Refreshing a host's
+  credential from the session banner does not prove new-session gating works.
   Skip bypasses only this launch's check; it does not renew credentials or
   guarantee that sandbox authentication will succeed.
 - The launch action banner appears only on deployments whose launch code
@@ -942,7 +990,8 @@ Other connection providers alone do not enable the managed MCP picker.
   when unavailable or the browser speech service fails. Audio still comes from
   the client device; choosing a remote host does not change the microphone.
   Denying microphone permission must not start a fallback recording.
-  The desktop app prefers the
-  server when available. A verification instance without a transcription engine
-  depends on browser support; a missing microphone there does not prove that
-  dictation is unavailable on a configured server.
+  The desktop app uses the server, falls back to macOS Dictation on a Mac,
+  and hides the button elsewhere. A
+  verification instance without a transcription engine depends on browser
+  support; a missing microphone there does not prove that dictation is
+  unavailable on a configured server.
