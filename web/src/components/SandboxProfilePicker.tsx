@@ -64,7 +64,7 @@ export function useSandboxProfileCatalog(
     enabled && provider !== null && (query.data?.managed_providers ?? []).includes(provider);
   const explicit = required && value?.provider === provider ? value : null;
   const unpicked = required && explicit === null && provider !== null;
-  // Prefer the last launched profile; unavailable or failed lookups fall back to the default.
+  // Prefer the last picked profile; unavailable or failed lookups fall back to the default.
   const remembered = useProfileById(provider, profiles, unpicked ? rememberedProfileId : null);
   const rememberedCheck = useQuery({
     queryKey: [

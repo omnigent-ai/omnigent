@@ -340,7 +340,7 @@ def test_composer_preselects_the_provider_default(
 
 
 @pytest.mark.parametrize("provider_profile_server", ["demo-small"], indirect=True)
-def test_composer_starts_on_the_last_launched_profile(
+def test_composer_starts_on_the_last_picked_profile(
     page: Page, provider_profile_server: tuple[str, Path], tmp_path: Path
 ) -> None:
     base, _catalog_file = provider_profile_server
@@ -384,7 +384,7 @@ def test_composer_starts_on_the_last_launched_profile(
     )
     start("Build in the large sandbox.")
 
-    # A fresh composer starts on the profile the last session launched with, not the default.
+    # A fresh composer starts on the profile picked last, not the default.
     page.goto(base)
     expect(
         page.get_by_role("button", name="Sandbox profile: Large development sandbox", exact=True)

@@ -1,4 +1,4 @@
-// Remembers the last started profile id per provider for the new-session composer.
+// Remembers the last picked profile id per provider for the new-session composer.
 
 const STORAGE_KEY = "omnigent:last-sandbox-profile-by-provider";
 
@@ -22,7 +22,7 @@ function readMap(): ProfileMap {
 }
 
 /**
- * Read the profile id the user last launched `provider` with, or `null` when
+ * Read the profile id the user last picked for `provider`, or `null` when
  * nothing is stored, on a server render, or when storage is inaccessible.
  */
 export function readLastSandboxProfile(provider: string | null | undefined): string | null {
@@ -31,8 +31,8 @@ export function readLastSandboxProfile(provider: string | null | undefined): str
 }
 
 /**
- * Persist `profileId` as the last profile launched on `provider`. Swallows
- * quota/access errors so a failed write can't break session creation.
+ * Persist `profileId` as the last profile picked for `provider`. Swallows
+ * quota/access errors so a failed write can't break the composer.
  */
 export function writeLastSandboxProfile(provider: string, profileId: string): void {
   if (typeof window === "undefined") return;

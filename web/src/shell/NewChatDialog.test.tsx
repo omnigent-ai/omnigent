@@ -9178,11 +9178,11 @@ describe("NewChatLandingScreen", () => {
         );
         fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
         fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
-        fireEvent.click(
-          await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
-        );
-        fireEvent.click(screen.getByText("Large workspace"));
-        await waitFor(() => expect(screen.queryByText("Loading sandbox profiles…")).toBeNull());
+        // Back on the first provider, the profile picked there is picked again.
+        expect(
+          await screen.findByRole("button", { name: "Sandbox profile: Large workspace" }),
+        ).toBeVisible();
+        await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
       }
       const file = new File(["build context"], "context.txt", { type: "text/plain" });
       if (attachments)
@@ -9208,7 +9208,7 @@ describe("NewChatLandingScreen", () => {
     },
   );
 
-  it("starts the next session on the profile the last one launched with", async () => {
+  it("opens the next composer on the profile last picked", async () => {
     const profile = {
       id: "large",
       name: "Large workspace",
@@ -9234,13 +9234,9 @@ describe("NewChatLandingScreen", () => {
       await screen.findByRole("button", { name: "Sandbox profile: Small workspace" }),
     );
     fireEvent.click(screen.getByText("Large workspace"));
-    await waitFor(() => expect(screen.queryByText("Loading sandbox profiles…")).toBeNull());
-    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
-      target: { value: "build the project" },
-    });
-    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     cleanup();
+    // A fresh composer, not this one's draft.
+    resetLandingDraft();
 
     renderLanding(info);
     expect(
@@ -9251,8 +9247,8 @@ describe("NewChatLandingScreen", () => {
     });
     await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
-    expect(JSON.parse(authenticatedFetchMock.mock.calls[1][1]?.body as string)).toMatchObject({
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(authenticatedFetchMock.mock.calls[0][1]?.body as string)).toMatchObject({
       sandbox_profile_id: "large",
       sandbox_profile_revision: "revision-1",
     });

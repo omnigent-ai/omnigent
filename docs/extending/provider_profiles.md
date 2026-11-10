@@ -95,7 +95,7 @@ sessions, which keep their legacy behavior. It requires a provider with
 `GET /v1/sandbox-profiles` reports it in `default_profile_ids`, and the composer
 and fork dialog preselect it when nothing else is chosen (a same-provider fork
 still starts on its source's profile). The composer prefers the profile the user
-last launched on that provider while it is still listed.
+last picked on that provider while it is still listed.
 
 Opting a provider into profiles without a default makes a selection mandatory, so
 clients that don't pick (older API clients, scheduled fresh sandboxes) are rejected

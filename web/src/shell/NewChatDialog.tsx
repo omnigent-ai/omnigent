@@ -2720,7 +2720,7 @@ function NewChatLandingContent({
   // is what the launch will use.
   const effectiveSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
-  // The profile last launched on this provider seeds the picker, like the last provider and repos.
+  // The profile last picked on this provider seeds the picker, like the last provider.
   const rememberedSandboxProfileId = useMemo(
     () => readLastSandboxProfile(effectiveSandboxProvider),
     [effectiveSandboxProvider],
@@ -5991,9 +5991,6 @@ function NewChatLandingContent({
       if (sandboxRepoSelections.length > 0) {
         writeLastSandboxRepos(sandboxRepoSelections);
       }
-      if (sandboxSelected && selectedSandboxProfile !== null) {
-        writeLastSandboxProfile(selectedSandboxProfile.provider, selectedSandboxProfile.id);
-      }
       const trimmedBranch = branchName.trim();
       const composerContextLabels = composerContextToLabels(composerContextState);
       // `shouldCreateWorktree` (component scope): true only when a branch is
@@ -6843,7 +6840,11 @@ function NewChatLandingContent({
           <SandboxProfilePicker
             provider={effectiveSandboxProvider}
             value={sandboxProfile}
-            onChange={setSandboxProfile}
+            onChange={(profile) => {
+              setSandboxProfile(profile);
+              // Saved on pick, like the agent, harness and sandbox provider.
+              if (profile) writeLastSandboxProfile(profile.provider, profile.id);
+            }}
             rememberedProfileId={rememberedSandboxProfileId}
           />
         </ComposerWorkspaceBar>

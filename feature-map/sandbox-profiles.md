@@ -81,7 +81,7 @@ integration evidence separately; the browser test does not exercise them.
   authorized and saved like an explicit pick. `GET /v1/sandbox-profiles` reports it as
   `default_profile_ids`, and the composer and fork dialog preselect it when nothing else
   is chosen.
-- The composer starts on the profile last launched on that provider (stored per
+- The composer starts on the profile last picked on that provider (saved on pick, per
   provider in `localStorage`), resolved by id on its current revision, ahead of the
   default. A profile the provider no longer lists falls back to the default.
 - Discovery is scoped to the selected provider so unrelated outages do not block

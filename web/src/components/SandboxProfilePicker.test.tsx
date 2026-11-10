@@ -121,7 +121,7 @@ it.each([
 it.each([
   ["on the first page", "profile-5", "Build profile 5"],
   ["beyond the first page", "profile-30", "Build profile 30"],
-])("starts on the profile last launched %s, ahead of the default", async (_where, id, name) => {
+])("starts on the profile last picked %s, ahead of the default", async (_where, id, name) => {
   defaults = { company: "profile-3" };
   mount(null, id);
   expect(await screen.findByRole("button", { name: `Sandbox profile: ${name}` })).toBeTruthy();
@@ -130,7 +130,7 @@ it.each([
   );
 });
 
-it("falls back to the provider default when the last launched profile is gone", async () => {
+it("falls back to the provider default when the last picked profile is gone", async () => {
   defaults = { company: "profile-3" };
   mount(null, "retired-profile");
   expect(
@@ -141,7 +141,7 @@ it("falls back to the provider default when the last launched profile is gone", 
   );
 });
 
-it("falls back to the provider default when looking up the last launched profile fails", async () => {
+it("falls back to the provider default when looking up the last picked profile fails", async () => {
   defaults = { company: "profile-3" };
   const listPage = vi.mocked(fetchSandboxProfiles).getMockImplementation()!;
   vi.mocked(fetchSandboxProfiles).mockImplementation(async (provider, options) => {
@@ -161,7 +161,7 @@ it.each([
   ["fails", () => Promise.reject(new Error("check failed"))],
   ["no longer lists it", null],
 ])(
-  "falls back to the provider default when checking a listed last launched profile %s",
+  "falls back to the provider default when checking a listed last picked profile %s",
   async (_case, check) => {
     defaults = { company: "profile-3" };
     const listPage = vi.mocked(fetchSandboxProfiles).getMockImplementation()!;
@@ -180,7 +180,7 @@ it.each([
   },
 );
 
-it("launches the last launched profile on its current revision", async () => {
+it("launches the last picked profile on its current revision", async () => {
   available = rows.map((p) => (p.id === "profile-5" ? { ...p, revision: "v2" } : p));
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const { result } = renderHook(() => useSandboxProfileCatalog("company", null, "profile-5"), {
@@ -194,7 +194,7 @@ it("launches the last launched profile on its current revision", async () => {
   );
 });
 
-it("keeps an explicit choice over the last launched profile and the default", async () => {
+it("keeps an explicit choice over the last picked profile and the default", async () => {
   defaults = { company: "profile-3" };
   const { onChange } = mount(null, "profile-4");
   await screen.findByRole("button", { name: "Sandbox profile: Build profile 4" });
