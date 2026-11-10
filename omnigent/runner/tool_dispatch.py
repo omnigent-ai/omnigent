@@ -6581,7 +6581,7 @@ async def _collect_global_sessions(
 
     An archive-inclusive ``mine``/``shared`` listing against a server that does
     not advertise ``session_list_scoped_archives`` lists ``all`` and keeps the
-    rows whose ``owner`` matches the scope (see :func:`_session_row_scope`).
+    rows whose ``owner`` matches the scope (see :func:`_session_row_in_scope`).
     It fails closed when the caller's identity cannot be read.
 
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -6639,7 +6639,7 @@ async def _collect_global_sessions(
         return page
     rows = page.rows
     if scope_locally:
-        rows = [r for r in rows if _session_row_scope(r, viewer_id) == visibility]
+        rows = [r for r in rows if _session_row_in_scope(r, viewer_id, visibility)]
     return _DiscoveryPage(
         [
             {
@@ -6721,28 +6721,27 @@ async def _session_list_viewer(
     return True, user_id
 
 
-def _session_row_scope(row: _JsonObject, viewer_id: str | None) -> str:
+def _session_row_in_scope(row: _JsonObject, viewer_id: str | None, visibility: str) -> bool:
     """
-    Classify a ``GET /v1/sessions`` row as the viewer's own or shared.
+    Whether a ``visibility=all`` row belongs to the ``mine`` / ``shared`` scope.
 
-    Mirrors the web sidebar's ownership inference: the row's ``owner`` decides
-    when both it and the viewer are known, because an admin's elevated
-    permission level does not make another user's session theirs.
+    Matches the server's own scoping: ``mine`` is an ownership grant held by the
+    viewer, and ``shared`` is everything else the viewer can access. Only the
+    row's ``owner`` counts, never ``permission_level``, because an admin's
+    elevated level does not make another user's session (or one whose owner was
+    deleted) theirs. A server without authentication has no ownership scopes
+    and lists every session for both.
 
-    :param row: One ``GET /v1/sessions`` row.
-    :param viewer_id: The caller's user id, or ``None`` without authentication.
-    :returns: ``"mine"`` or ``"shared"``.
+    :param row: One ``GET /v1/sessions?visibility=all`` row.
+    :param viewer_id: The caller's user id, or ``None`` when ``GET /v1/me``
+        reported an unauthenticated server.
+    :param visibility: ``"mine"`` or ``"shared"``.
+    :returns: ``True`` when the row is in the requested scope.
     """
-    from omnigent.server.auth import LEVEL_OWNER
-
-    owner = row.get("owner")
-    if viewer_id is not None and isinstance(owner, str) and owner:
-        return "mine" if owner == viewer_id else "shared"
-    level = row.get("permission_level")
-    if isinstance(level, int) and 0 < level < LEVEL_OWNER:
-        return "shared"
-    # Servers with permissions disabled omit ownership; every row is the caller's.
-    return "mine"
+    if viewer_id is None:
+        return True
+    owned = row.get("owner") == viewer_id
+    return owned if visibility == "mine" else not owned
 
 
 def _child_rows_to_entries(

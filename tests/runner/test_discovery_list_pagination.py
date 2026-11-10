@@ -14,6 +14,7 @@ import pytest
 
 from omnigent.runner import tool_dispatch
 from omnigent.runner.tool_dispatch import execute_tool
+from omnigent.server.auth import LEVEL_OWNER
 
 _ROW_COUNT = 12
 
@@ -503,29 +504,38 @@ _VIEWER = "alice@example.com"
 _OTHER_USER = "bob@example.com"
 
 
-def _archive_scope_rows() -> list[dict[str, object]]:
-    """The caller's trigger workers interleaved with sessions another user shared.
+def _scope_row(index: int, owner: str | None, *, archived: bool) -> dict[str, object]:
+    """One ``GET /v1/sessions`` row. The caller is an admin, so every row reports owner level."""
+    return {
+        "id": f"conv_{index:04d}",
+        "agent_id": "ag_1",
+        "agent_name": "claude",
+        "title": f"GitHub acme/app#{index}",
+        "status": "idle",
+        "runner_id": None,
+        "parent_session_id": None,
+        "archived": archived,
+        "owner": owner,
+        "permission_level": LEVEL_OWNER,
+        "labels": {"omnigent.created_by_session_id": "conv_caller"} if owner == _VIEWER else {},
+    }
 
-    Even ids are the caller's and carry the creator label; odd ids are the
-    other user's. Every other row of each owner is archived.
+
+def _archive_scope_rows() -> list[dict[str, object]]:
+    """The caller's trigger workers among sessions other users shared with them.
+
+    Even ids are the caller's; odd ids are another user's. Every other row of
+    each owner is archived. ``conv_orphan`` has no owner: deleting its owner's
+    account removed the ownership grant but kept the session and its shares.
     """
-    return [
-        {
-            "id": f"conv_{index:04d}",
-            "agent_id": "ag_1",
-            "agent_name": "claude",
-            "title": f"GitHub acme/app#{index}",
-            "status": "idle",
-            "runner_id": None,
-            "parent_session_id": None,
-            "archived": (index // 2) % 2 == 0,
-            "owner": _VIEWER if index % 2 == 0 else _OTHER_USER,
-            "labels": (
-                {"omnigent.created_by_session_id": "conv_caller"} if index % 2 == 0 else {}
-            ),
-        }
+    rows = [
+        _scope_row(
+            index, _VIEWER if index % 2 == 0 else _OTHER_USER, archived=(index // 2) % 2 == 0
+        )
         for index in range(300)
     ]
+    orphan = {**_scope_row(9999, None, archived=False), "id": "conv_orphan"}
+    return [rows[0], orphan, *rows[1:]]
 
 
 def _archive_scope_server(
@@ -533,13 +543,14 @@ def _archive_scope_server(
     requests: list[tuple[str, dict[str, str]]],
     *,
     scoped_archives: bool,
-    me_status: int = 200,
-    me_body: dict[str, object] | None = None,
+    me: dict[str, Any] | None = None,
 ) -> Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]:
     """A ``/v1/sessions`` fake with current or older archive semantics.
 
     An older server ignores ``include_archived`` unless ``visibility=all`` and
-    does not advertise ``session_list_scoped_archives``.
+    does not advertise ``session_list_scoped_archives``. ``me`` holds the
+    ``/v1/me`` answer as ``{"status": ..., "body": ...}`` and may change between
+    calls; omitted, the caller is signed in.
     """
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -554,13 +565,17 @@ def _archive_scope_server(
                 200, json={"session_list_scoped_archives": True} if scoped_archives else {}
             )
         if path == "/v1/me":
-            body = {"user_id": _VIEWER, "is_admin": False} if me_body is None else me_body
-            return httpx.Response(me_status, json=body)
+            answer = me or {}
+            return httpx.Response(
+                answer.get("status", 200),
+                json=answer.get("body", {"user_id": _VIEWER, "is_admin": True}),
+            )
         if path == "/v1/sessions":
             visibility = request.url.params.get("visibility")
             archived = request.url.params.get("include_archived") == "true"
             if not scoped_archives and visibility != "all":
                 archived = False
+            # Ownership comes from the owner grant alone, as the server's owned_by filter.
             scoped = [
                 row
                 for row in rows
@@ -584,6 +599,8 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
     archiving a worker must not hide it from the next page either. An older
     server drops archived rows under ``visibility=mine``, so the runner lists
     everything there and keeps the caller's own rows, never another user's.
+    An admin's owner-level permission on an ownerless session does not make it
+    theirs.
     """
     rows = _archive_scope_rows()
     requests: list[tuple[str, dict[str, str]]] = []
@@ -622,9 +639,11 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
     assert mismatched == {"error": "sys_session_list: cursor uses different filter arguments"}
     # Callers that don't ask keep the old row shape.
     assert "archived" not in default["sessions"][0]
+    # Everything not owned is shared, including the ownerless session.
     assert [(row["session_id"], row["owner"]) for row in shared["sessions"]] == [
-        (row["id"], _OTHER_USER) for row in rows if row["owner"] == _OTHER_USER
+        (row["id"], row["owner"]) for row in rows if row["owner"] != _VIEWER
     ]
+    assert shared["sessions"][0]["session_id"] == "conv_orphan"
     listing = "mine" if scoped_archives else "all"
     shared_listing = "shared" if scoped_archives else "all"
     assert [
@@ -637,27 +656,93 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
 
 
 @pytest.mark.asyncio
+async def test_sys_session_list_archive_fallback_continues_past_a_page_with_no_owned_rows() -> (
+    None
+):
+    """A fallback source page holding only other users' sessions still advances the cursor."""
+    rows = [_scope_row(index, _OTHER_USER, archived=index % 2 == 0) for index in range(1_000)]
+    rows += [_scope_row(index, _VIEWER, archived=index % 2 == 0) for index in range(1_000, 1_005)]
+    requests: list[tuple[str, dict[str, str]]] = []
+    handler = _archive_scope_server(rows, requests, scoped_archives=False)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        first = await _call_session(client, {"limit": 100, "include_archived": True})
+        second = await _call_session(
+            client,
+            {"limit": 100, "include_archived": True, "cursor": first["page"]["next_cursor"]},
+        )
+
+    assert first["sessions"] == []
+    assert first["page"]["has_more"] == {"sessions": True}
+    assert [row["session_id"] for row in second["sessions"]] == [
+        f"conv_{index:04d}" for index in range(1_000, 1_005)
+    ]
+    assert second["page"]["has_more"] == {"sessions": False}
+    # The empty page resumes after the last source row it read.
+    assert [params.get("after") for path, params in requests if path == "/v1/sessions"] == [
+        None,
+        "conv_0999",
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("me_status", "me_body"),
-    [(503, None), (200, {"is_admin": True})],
+    [(503, {"user_id": _VIEWER, "is_admin": True}), (200, {"is_admin": True})],
     ids=["identity-unavailable", "identity-missing"],
 )
 async def test_sys_session_list_archive_fallback_fails_closed_without_identity(
-    me_status: int, me_body: dict[str, object] | None
+    me_status: int, me_body: dict[str, object]
 ) -> None:
     """Without the caller's identity, the older-server fallback lists nothing, not everything.
 
     A ``/v1/me`` answer without ``user_id`` is not the same as an explicit
     anonymous ``null``: reading it as anonymous would let an admin's access to
-    other users' sessions pass as ownership.
+    other users' sessions pass as ownership. Once the identity is readable, the
+    returned cursor resumes the listing from the start.
     """
+    rows = _archive_scope_rows()
+    requests: list[tuple[str, dict[str, str]]] = []
+    me: dict[str, Any] = {"status": me_status, "body": me_body}
+    handler = _archive_scope_server(rows, requests, scoped_archives=False, me=me)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        result = await _call_session(client, {"limit": 100, "include_archived": True})
+        failed_paths = [path for path, _ in requests]
+        me.update(status=200, body={"user_id": _VIEWER, "is_admin": True})
+        recovered = await _call_session(
+            client,
+            {"limit": 100, "include_archived": True, "cursor": result["page"]["next_cursor"]},
+        )
+
+    assert result["sessions"] == []
+    # A failed read keeps its position, so the continuation retries it.
+    assert result["page"]["has_more"] == {"sessions": True}
+    assert "/v1/sessions" not in failed_paths
+    owned_ids = [row["id"] for row in rows if row["owner"] == _VIEWER]
+    assert [row["session_id"] for row in recovered["sessions"]] == owned_ids[:100]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_archive_fallback_without_authentication_lists_every_session() -> (
+    None
+):
+    """An explicit anonymous identity keeps the server's no-auth behavior.
+
+    A server without authentication treats ``mine`` and ``shared`` as ``all``,
+    so the fallback keeps every row instead of failing closed.
+    """
+    rows = _archive_scope_rows()
     requests: list[tuple[str, dict[str, str]]] = []
     handler = _archive_scope_server(
-        _archive_scope_rows(),
+        rows,
         requests,
         scoped_archives=False,
-        me_status=me_status,
-        me_body=me_body,
+        me={"status": 200, "body": {"user_id": None, "is_admin": False}},
     )
 
     async with httpx.AsyncClient(
@@ -665,10 +750,7 @@ async def test_sys_session_list_archive_fallback_fails_closed_without_identity(
     ) as client:
         result = await _call_session(client, {"limit": 100, "include_archived": True})
 
-    assert result["sessions"] == []
-    # A failed read keeps its position, so the continuation retries it.
-    assert result["page"]["has_more"] == {"sessions": True}
-    assert "/v1/sessions" not in [path for path, _ in requests]
+    assert [row["session_id"] for row in result["sessions"]] == [row["id"] for row in rows[:100]]
 
 
 @pytest.mark.asyncio
