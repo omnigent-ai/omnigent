@@ -78,7 +78,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_agent_list",
         # Project listing and session moves proxy owner-gated endpoints.
         "sys_project_list",
-        "sys_session_move",
+        "sys_session_update",
         # Policy tools are always auto-registered so agents can
         # browse the registry and add policies at runtime.
         "sys_add_policy",
@@ -1728,7 +1728,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
     "comments": frozenset({"list_comments", "update_comment"}),
     "policies": frozenset({"sys_add_policy", "sys_policy_registry"}),
     "agent_discovery": frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list"}),
-    "projects": frozenset({"sys_project_list", "sys_session_move"}),
+    "projects": frozenset({"sys_project_list", "sys_session_update"}),
 }
 
 

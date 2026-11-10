@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.runner.session_projects import execute_project_list, execute_session_move
+from omnigent.runner.session_projects import execute_project_list, execute_session_update
 
 pytestmark = pytest.mark.asyncio
 
@@ -17,6 +17,7 @@ SUB_AGENT = "d" * 32
 PARENT = "e" * 32
 PROJECT_ID = "f" * 32
 READ_SHARED = "0" * 32
+MISSING = "1" * 31 + "2"
 CHECKED_INFO = {"session_move_source_checks": True}
 
 
@@ -27,15 +28,16 @@ def _client(handler) -> httpx.AsyncClient:
 @pytest.mark.parametrize(
     ("args", "message"),
     [
-        ({"session_ids": [], "project": "Q3"}, "session_ids must list"),
-        ({"session_ids": [SOURCE] * 101, "project": "Q3"}, "session_ids must list"),
-        ({"session_ids": [7], "project": "Q3"}, "session_ids must list"),
-        ({"session_ids": [SOURCE]}, "project must be a name"),
-        ({"session_ids": [SOURCE], "project": "x" * 101}, "project must be a name"),
-        ({"session_ids": [SOURCE], "project": "  "}, "project must be a name"),
+        ({"project": "Q3"}, "session_id must be"),
+        ({"session_id": 7, "project": "Q3"}, "session_id must be"),
+        ({"session_id": SOURCE}, "nothing to update"),
+        ({"session_id": SOURCE, "project": None}, "project must be a name"),
+        ({"session_id": SOURCE, "project": "x" * 101}, "project must be a name"),
+        ({"session_id": SOURCE, "project": "  "}, "project must be a name"),
+        ({"session_id": "not-a-session", "project": "Q3"}, "invalid session ID"),
     ],
 )
-async def test_move_rejects_invalid_arguments_before_any_request(args, message):
+async def test_update_rejects_invalid_arguments_before_any_request(args, message):
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -43,13 +45,13 @@ async def test_move_rejects_invalid_arguments_before_any_request(args, message):
         return httpx.Response(500)
 
     async with _client(handler) as client:
-        result = json.loads(await execute_session_move(args, client, SOURCE))
+        result = json.loads(await execute_session_update(args, client, SOURCE))
     assert message in result["error"]
     assert requests == []
 
 
 @pytest.mark.parametrize("info", [{}, {"session_move_source_checks": False}, None])
-async def test_move_refuses_a_server_without_source_checks_before_any_write(info):
+async def test_update_refuses_a_server_without_source_checks_before_any_write(info):
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -60,16 +62,15 @@ async def test_move_refuses_a_server_without_source_checks_before_any_write(info
 
     async with _client(handler) as client:
         result = json.loads(
-            await execute_session_move({"session_ids": [SOURCE], "project": "Q3"}, client, SOURCE)
+            await execute_session_update({"session_id": SOURCE, "project": "Q3"}, client, SOURCE)
         )
     assert "cannot check the calling session's sharing" in result["error"]
     assert [(r.method, r.url.path) for r in requests] == [("GET", "/v1/info")]
 
 
-async def test_move_isolates_failures_and_sends_the_source_header():
-    patched: list[httpx.Request] = []
-
+def _session_server(requests: list[httpx.Request]):
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         path = request.url.path
         if path == "/v1/info":
             return httpx.Response(200, json=CHECKED_INFO)
@@ -79,74 +80,82 @@ async def test_move_isolates_failures_and_sends_the_source_header():
             raise httpx.ConnectError("connection reset")
         if request.method == "GET" and path.endswith(SUB_AGENT):
             return httpx.Response(200, json={"id": SUB_AGENT, "parent_session_id": PARENT})
+        if request.method == "GET" and path.endswith(FAMILY_MEMBER):
+            family = {"id": FAMILY_MEMBER, "family": {"representative_id": PARENT}}
+            return httpx.Response(200, json=family)
         if request.method == "GET" and path.endswith(READ_SHARED):
             # Already in the target project, so only the owner check keeps it from "unchanged".
             shared = {"id": READ_SHARED, "project_id": PROJECT_ID, "permission_level": 1}
             return httpx.Response(200, json=shared)
+        if request.method == "GET" and path.endswith(MISSING):
+            return httpx.Response(404, json={"detail": "Session not found"})
         if request.method == "GET":
             return httpx.Response(200, json={"id": path.rsplit("/", 1)[-1], "labels": {}})
-        patched.append(request)
-        if path.endswith(FAMILY_MEMBER):
-            error = {"code": "conflict", "message": "Only the family representative can move"}
-            return httpx.Response(409, json={"error": error})
         return httpx.Response(200, json={})
 
-    hyphenated_source = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
-    async with _client(handler) as client:
+    return handler
+
+
+@pytest.mark.parametrize(
+    ("session_id", "error"),
+    [
+        (FAILING, "session could not be read: connection reset"),
+        (SUB_AGENT, f"sub-agent sessions follow their parent's project; update {PARENT} instead"),
+        (FAMILY_MEMBER, f"this session shares its family's project; update {PARENT} instead"),
+        (READ_SHARED, "only the session's owner can change its project"),
+        (MISSING, "session not found or not visible to you (Session not found)"),
+    ],
+)
+async def test_update_refuses_a_session_it_cannot_refile_without_any_write(session_id, error):
+    requests: list[httpx.Request] = []
+    async with _client(_session_server(requests)) as client:
         result = json.loads(
-            await execute_session_move(
-                {
-                    "session_ids": [
-                        FAILING,
-                        SUB_AGENT,
-                        FAMILY_MEMBER,
-                        READ_SHARED,
-                        SOURCE,
-                        hyphenated_source,
-                    ],
-                    "project": " Q3 ",
-                },
-                client,
-                SOURCE,
+            await execute_session_update(
+                {"session_id": session_id, "project": "New"}, client, SOURCE
             )
         )
-    statuses = [(r["status"], r.get("error", "")) for r in result["results"]]
-    assert len(statuses) == 5, "two spellings of one session move it once"
-    assert statuses[0][0] == "error" and "could not be read" in statuses[0][1]
-    assert statuses[1] == (
-        "error",
-        f"sub-agent sessions follow their parent; move {PARENT} instead",
-    )
-    assert statuses[2][0] == "error" and "moves with its family" in statuses[2][1]
-    assert statuses[3] == ("error", "only the session's owner can move it between projects")
-    assert statuses[4] == ("moved", "")
-    assert result["project"] == "Q3" and result["project_created"] is False
-    assert all(r.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE for r in patched)
-    assert not [r for r in patched if r.url.path.endswith(READ_SHARED)]
-    assert json.loads(patched[-1].content) == {
+    assert result == {"session_id": session_id, "error": error}
+    assert not [r for r in requests if r.url.path == "/v1/projects" or r.method != "GET"]
+
+
+async def test_update_files_the_session_and_sends_the_source_header():
+    requests: list[httpx.Request] = []
+    hyphenated_source = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+    async with _client(_session_server(requests)) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": hyphenated_source, "project": " Q3 "}, client, SOURCE
+            )
+        )
+    assert result == {
+        "session_id": hyphenated_source,
+        "status": "updated",
+        "project": "Q3",
+        "project_created": False,
+    }
+    (patched,) = [r for r in requests if r.method == "PATCH"]
+    assert patched.url.path == f"/v1/sessions/{SOURCE}"
+    assert patched.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    assert json.loads(patched.content) == {
         "project_id": PROJECT_ID,
         "labels": {"omni_project": ""},
     }
 
 
-async def test_move_creates_no_project_when_no_session_can_move():
-    requests: list[httpx.Request] = []
-
+async def test_update_maps_a_family_refusal_from_the_server():
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
         if request.url.path == "/v1/info":
             return httpx.Response(200, json=CHECKED_INFO)
-        return httpx.Response(404, json={"detail": "Session not found"})
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": SOURCE, "project_id": PROJECT_ID})
+        error = {"code": "conflict", "message": "Only the family representative can move"}
+        return httpx.Response(409, json={"error": error})
 
     async with _client(handler) as client:
         result = json.loads(
-            await execute_session_move(
-                {"session_ids": ["not-a-session", FAILING], "project": "New"}, client, SOURCE
-            )
+            await execute_session_update({"session_id": SOURCE, "project": ""}, client, SOURCE)
         )
-    assert [r["status"] for r in result["results"]] == ["error", "error"]
-    assert result["project_created"] is False
-    assert not [r for r in requests if r.url.path == "/v1/projects" or r.method != "GET"]
+    assert "update the moves_with session instead" in result["error"]
 
 
 async def test_list_pages_projects_and_sessions_until_the_last_page():

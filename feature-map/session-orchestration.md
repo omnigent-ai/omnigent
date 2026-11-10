@@ -72,21 +72,23 @@ MCP independent creation.
 - `projects`: `sys_project_list` pages the owner's projects oldest first and
   their own sessions with each one's project, marking the calling session; a
   legacy label folder shows only as a session's project.
-  `sys_session_move` files up to 100 of those sessions into a project by name,
-  creating a missing project only when some session can move, or unfiles them
-  with `""`, through the sidebar's move request. An open sidebar regroups
-  without a reload; a collapsed folder stays collapsed. Moving changes only
+  `sys_session_update` files one of those sessions into a project by name,
+  creating a missing project only once the session can move, or unfiles it
+  with `""`, through the sidebar's move request; agents call it once per
+  session, and `project` is its only field. An open sidebar regroups without a
+  reload; a collapsed folder stays collapsed. Changing the project changes only
   folder membership, so running sessions, including the caller, keep their
-  turn. Sub-agents follow their parent and a family moves through its
-  representative; each refusal names the session to move instead, and each
-  session gets its own result. An edit-shared caller cannot move sessions or
-  create a project through the move, while listing stays an ordinary owner
-  read. A session shared with the caller but owned by someone else is refused,
-  even when it is already in the target project. Moves refuse to run against a
-  server that does not advertise `session_move_source_checks` in `/v1/info`. `tool_groups.projects: false` drops both tools. Covered by
-  `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_bulk_move_running_sessions`
+  turn. Sub-agents follow their parent and a family follows its
+  representative; each refusal names the session to update instead. An
+  edit-shared caller cannot change a project or create one through the update,
+  while listing stays an ordinary owner read. A session shared with the caller
+  but owned by someone else is refused, even when it is already in the target
+  project. Updates refuse to run against a server that does not advertise
+  `session_move_source_checks` in `/v1/info`. `tool_groups.projects: false`
+  drops both tools. Covered by
+  `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_file_running_sessions`
   and the browser journeys in
-  `tests/e2e_ui/sessions/test_agent_moves_sessions_to_project.py`.
+  `tests/e2e_ui/sessions/test_agent_files_sessions_into_projects.py`.
 - `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
@@ -112,8 +114,8 @@ MCP independent creation.
   update while the agent keeps running.
 - In a native Claude Code session's Chat or agent terminal, ask the same; the
   relay exposes `mcp__omnigent__sys_project_list` and
-  `mcp__omnigent__sys_session_move`, and the session lands in its folder
-  mid-turn (`test_native_claude_moves_itself_into_a_project`, nightly).
+  `mcp__omnigent__sys_session_update`, and the session lands in its folder
+  mid-turn (`test_native_claude_files_itself_into_a_project`, nightly).
 - Use the existing Share dialog to share the sender or receiver, then repeat.
   A read-only share of the sender keeps both tools working; an edit share
   refuses them.

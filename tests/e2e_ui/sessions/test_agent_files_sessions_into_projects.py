@@ -1,8 +1,8 @@
 """An agent files existing sessions into projects and the sidebar regroups live.
 
-The scripted model calls ``sys_project_list`` and then ``sys_session_move``:
-two unfiled sessions go into an existing project, and the agent's own running
-session goes into a project the move creates. The open sidebar must show each
+The scripted model calls ``sys_project_list`` and then ``sys_session_update``
+once per session: two unfiled sessions go into an existing project, and the
+agent's own running session goes into a project the update creates. The open sidebar must show each
 row under its new folder without a reload. A nightly variant drives a real
 Claude Code CLI, which reaches the same tools through the MCP relay.
 """
@@ -46,7 +46,7 @@ spec_version: 1
 name: project_filer
 prompt: |
   You organize the user's sessions into projects with sys_project_list and
-  sys_session_move, then reply with one short sentence.
+  sys_session_update, then reply with one short sentence.
 
 executor:
   model: {model}
@@ -153,24 +153,27 @@ def _tool_call(name: str, arguments: dict[str, object]) -> dict[str, object]:
 
 @pytest.mark.timeout(300)
 @pytest.mark.browser_context_args(viewport=_VIEWPORT, record_video_size=_VIEWPORT)
-def test_agent_moves_existing_sessions_into_projects(
+def test_agent_files_existing_sessions_into_projects(
     request: pytest.FixtureRequest,
     mock_llm_server_url: str,
     filing_journey: FilingJourney,
 ) -> None:
-    """Listed sessions move by project name, and the open sidebar regroups them."""
+    """Listed sessions are filed by project name, and the open sidebar regroups them."""
     journey = filing_journey
     configure_mock_llm(
         mock_llm_server_url,
         [
             _tool_call("sys_project_list", {}),
-            _tool_call(
-                "sys_session_move",
-                {"session_ids": list(journey.unfiled), "project": journey.existing_project},
+            *(
+                _tool_call(
+                    "sys_session_update",
+                    {"session_id": session_id, "project": journey.existing_project},
+                )
+                for session_id in journey.unfiled
             ),
             _tool_call(
-                "sys_session_move",
-                {"session_ids": [journey.agent_session_id], "project": journey.new_project},
+                "sys_session_update",
+                {"session_id": journey.agent_session_id, "project": journey.new_project},
             ),
         ],
         key=journey.model,
@@ -200,18 +203,20 @@ def test_agent_moves_existing_sessions_into_projects(
     expect(page.get_by_text(_REPLY, exact=True).first).to_be_visible(timeout=_TURN_TIMEOUT_MS)
     transcript = page.get_by_role("log")
     transcript.get_by_role("button", name=re.compile("^Worked for")).first.click()
-    transcript.get_by_role("button", name="Called 3 tools").click()
+    transcript.get_by_role("button", name="Called 4 tools").click()
     expect(transcript.get_by_role("button", name=re.compile("^Project list"))).to_be_visible()
-    bulk_move = transcript.get_by_role(
-        "button", name=re.compile(f"^Session move .* · {re.escape(journey.existing_project)}")
+    into_existing = transcript.get_by_role(
+        "button", name=re.compile(f"^Session update .* · {re.escape(journey.existing_project)}")
     )
+    expect(into_existing).to_have_count(2)
     expect(
         transcript.get_by_role(
-            "button", name=re.compile(f"^Session move .* · {re.escape(journey.new_project)}")
+            "button", name=re.compile(f"^Session update .* · {re.escape(journey.new_project)}")
         )
     ).to_be_visible()
-    bulk_move.click()
-    expect(transcript.get_by_text("moved", exact=True)).to_have_count(2)
+    into_existing.first.click()
+    into_existing.last.click()
+    expect(transcript.get_by_text("updated", exact=True)).to_have_count(2)
     _hold(page)
 
     for title in journey.unfiled.values():
@@ -241,7 +246,7 @@ def test_agent_moves_existing_sessions_into_projects(
 @pytest.mark.nightly
 @pytest.mark.timeout(600)
 @pytest.mark.browser_context_args(viewport=_VIEWPORT, record_video_size=_VIEWPORT)
-def test_native_claude_moves_itself_into_a_project(
+def test_native_claude_files_itself_into_a_project(
     request: pytest.FixtureRequest,
     native_claude_mock_session: tuple[str, str],
     mock_llm_server_url: str,
@@ -256,14 +261,14 @@ def test_native_claude_moves_itself_into_a_project(
         [
             _tool_call("mcp__omnigent__sys_project_list", {}),
             _tool_call(
-                "mcp__omnigent__sys_session_move",
-                {"session_ids": [session_id], "project": project},
+                "mcp__omnigent__sys_session_update",
+                {"session_id": session_id, "project": project},
             ),
             {"text": _REPLY},
         ],
         key="native-project-move",
         match=go_token,
-        required_tools=["mcp__omnigent__sys_project_list", "mcp__omnigent__sys_session_move"],
+        required_tools=["mcp__omnigent__sys_project_list", "mcp__omnigent__sys_session_update"],
     )
     patch_session(base_url, session_id, title=title)
     try:
@@ -280,7 +285,7 @@ def test_native_claude_moves_itself_into_a_project(
         composer.fill(f"Put this session in a new '{project}' project. {go_token}")
         page.get_by_role("button", name="Send", exact=True).click()
         # Manual permission mode asks before each MCP tool call, as for any relayed tool.
-        for tool in ("mcp__omnigent__sys_project_list", "mcp__omnigent__sys_session_move"):
+        for tool in ("mcp__omnigent__sys_project_list", "mcp__omnigent__sys_session_update"):
             card = page.locator(_PENDING_APPROVAL).filter(has_text=tool)
             expect(card).to_be_visible(timeout=_NATIVE_READY_MS)
             _hold(page)

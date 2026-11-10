@@ -1,4 +1,4 @@
-"""List projects and file the owner's existing sessions into them via the session APIs."""
+"""List projects and update the owner's existing sessions via the session APIs."""
 
 import asyncio
 import json
@@ -13,7 +13,6 @@ from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
 from omnigent.tools.builtins.session_projects import (
     MAX_LISTED_SESSIONS,
     MAX_PROJECT_NAME_LENGTH,
-    MAX_SESSIONS_PER_MOVE,
 )
 
 _DEFAULT_LISTED_SESSIONS = 50
@@ -205,14 +204,14 @@ def _refusal(response: httpx.Response) -> str:
     if response.status_code == 404:
         return f"session not found or not visible to you ({detail})"
     if response.status_code == 409 and "representative" in detail:
-        return "this session moves with its family; move the moves_with session instead"
+        return "this session shares its family's project; update the moves_with session instead"
     return f"HTTP {response.status_code}: {detail}"
 
 
 async def _movable_snapshot(
     client: httpx.AsyncClient, session_id: str
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Return ``(snapshot, None)`` for a session this tool may move, else ``(None, error)``."""
+    """Return ``(snapshot, None)`` for a session this tool may refile, else ``(None, error)``."""
     try:
         snapshot = await client.get(
             f"/v1/sessions/{session_id}", params=_SNAPSHOT_PARAMS, timeout=30.0
@@ -225,41 +224,42 @@ async def _movable_snapshot(
     level = current.get("permission_level")
     # Filing is owner-gated; refuse here so a readable foreign session is never "unchanged".
     if isinstance(level, int) and level < LEVEL_OWNER:
-        return None, "only the session's owner can move it between projects"
+        return None, "only the session's owner can change its project"
     parent = current.get("parent_session_id")
     if parent:
-        return None, f"sub-agent sessions follow their parent; move {parent} instead"
+        return None, f"sub-agent sessions follow their parent's project; update {parent} instead"
     representative = (current.get("family") or {}).get("representative_id")
     if representative and representative != current.get("id"):
-        return None, f"this session moves with its family; move {representative} instead"
+        return None, f"this session shares its family's project; update {representative} instead"
     return current, None
 
 
-async def _move_one(
+async def _set_project(
     client: httpx.AsyncClient,
     current: dict[str, Any],
     session_id: str,
     *,
     project_id: str,
     headers: dict[str, str],
-) -> dict[str, Any]:
+) -> tuple[str, str | None]:
+    """Return ``(status, error)`` after filing the session into *project_id*."""
     labels = current.get("labels") or {}
     if (current.get("project_id") or "") == project_id and not labels.get(PROJECT_LABEL_KEY):
-        return {"status": "unchanged"}
+        return "unchanged", None
     payload = {"project_id": project_id, "labels": {PROJECT_LABEL_KEY: ""}}
     try:
-        moved = await client.patch(
+        updated = await client.patch(
             f"/v1/sessions/{session_id}", json=payload, headers=headers, timeout=30.0
         )
     except httpx.HTTPError as exc:
-        return {"status": "error", "error": f"move could not be confirmed: {exc}"}
-    if moved.is_error:
-        return {"status": "error", "error": _refusal(moved)}
-    return {"status": "moved"}
+        return "error", f"update could not be confirmed: {exc}"
+    if updated.is_error:
+        return "error", _refusal(updated)
+    return "updated", None
 
 
 async def _server_checks_move_source(client: httpx.AsyncClient) -> bool:
-    """Whether the server refuses moves whose calling session is shared with edit access."""
+    """Whether the server refuses project changes from a source shared with edit access."""
     try:
         info = await client.get("/v1/info", timeout=30.0)
         body = info.json() if info.status_code == 200 else None
@@ -268,87 +268,77 @@ async def _server_checks_move_source(client: httpx.AsyncClient) -> bool:
     return isinstance(body, dict) and body.get("session_move_source_checks") is True
 
 
-def _unique_targets(session_ids: list[str]) -> list[tuple[str, str | None]]:
-    """Pair each requested ID with its canonical form, once per session."""
-    targets: dict[str, tuple[str, str | None]] = {}
-    for raw_id in session_ids:
-        try:
-            canonical: str | None = normalize_session_id(raw_id)
-        except ValueError:
-            canonical = None
-        targets.setdefault(canonical or raw_id, (raw_id, canonical))
-    return list(targets.values())
-
-
-async def execute_session_move(
+async def execute_session_update(
     args: dict[str, Any], client: httpx.AsyncClient | None, source_id: str | None
 ) -> str:
     """
-    File each listed session into the named project, or unfile it for ``""``.
+    Update one of the owner's sessions; ``project`` is currently the only field.
 
-    Each move is the sidebar's ``PATCH /v1/sessions/{id}``, which only changes
+    Filing is the sidebar's ``PATCH /v1/sessions/{id}``, which only changes
     folder membership, so a running session keeps its turn. The calling session
     is sent as the orchestration source on every write, so the server refuses
-    both the moves and any project creation from a session shared with edit
-    access. A project is created only when at least one session can move.
+    both the update and any project creation from a session shared with edit
+    access. A project is created only after the session is known to be movable.
 
-    :param args: Tool arguments: ``session_ids`` and ``project``.
+    :param args: Tool arguments: ``session_id`` and ``project`` (``""`` unfiles).
     :param client: HTTP client pointed at the Omnigent server.
     :param source_id: The calling session.
-    :returns: JSON with the resolved ``project``, ``project_created`` and per-session ``results``.
+    :returns: JSON with ``session_id``, ``status``, ``project`` and ``project_created``,
+        or ``session_id`` and ``error``.
     """
-    session_ids = args.get("session_ids")
-    project = args.get("project")
-    if (
-        not isinstance(session_ids, list)
-        or not 1 <= len(session_ids) <= MAX_SESSIONS_PER_MOVE
-        or not all(isinstance(item, str) for item in session_ids)
-    ):
-        return json.dumps(
-            {"error": f"session_ids must list 1 to {MAX_SESSIONS_PER_MOVE} session IDs"}
-        )
-    # Only an exact "" unfiles; a blank-looking name must not unfile every target.
+    session_id = args.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return json.dumps({"error": "session_id must be a session ID"})
+    if "project" not in args:
+        return json.dumps({"session_id": session_id, "error": "nothing to update: pass project"})
+    project = args["project"]
+    # Only an exact "" unfiles; a blank-looking name must not unfile the session.
     if (
         not isinstance(project, str)
         or len(project) > MAX_PROJECT_NAME_LENGTH
         or (project and not project.strip())
     ):
         return json.dumps(
-            {"error": 'project must be a name of at most 100 characters, or "" to unfile'}
+            {
+                "session_id": session_id,
+                "error": 'project must be a name of at most 100 characters, or "" to unfile',
+            }
         )
+    try:
+        canonical = normalize_session_id(session_id)
+    except ValueError:
+        return json.dumps({"session_id": session_id, "error": "invalid session ID"})
     if client is None or source_id is None:
-        return json.dumps({"error": "sys_session_move requires an authenticated runner"})
+        return json.dumps({"error": "sys_session_update requires an authenticated runner"})
     if not await _server_checks_move_source(client):
         return json.dumps(
             {
-                "error": "sys_session_move: this Omnigent server cannot check the calling "
-                "session's sharing before a move; upgrade the server or move the sessions "
-                "from the sidebar"
+                "error": "sys_session_update: this Omnigent server cannot check the calling "
+                "session's sharing before changing a project; upgrade the server or move "
+                "the session from the sidebar"
             }
         )
-    results: list[dict[str, Any]] = []
-    movable: list[tuple[dict[str, Any], dict[str, Any], str]] = []
-    for raw_id, canonical in _unique_targets(session_ids):
-        result: dict[str, Any] = {"session_id": raw_id, "status": "error"}
-        results.append(result)
-        if canonical is None:
-            result["error"] = "invalid session ID"
-            continue
-        current, error = await _movable_snapshot(client, canonical)
-        if current is None:
-            result["error"] = error
-        else:
-            movable.append((result, current, canonical))
+    current, error = await _movable_snapshot(client, canonical)
+    if current is None:
+        return json.dumps({"session_id": session_id, "error": error})
     name = project.strip()
     headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
     project_id, created = "", False
-    if name and movable:
+    if name:
         try:
             project_id, created = await resolve_project_id(client, name, headers=headers)
         except (httpx.HTTPError, ValueError) as exc:
-            return json.dumps({"error": f"sys_session_move: {exc}"})
-    for result, current, canonical in movable:
-        result.update(
-            await _move_one(client, current, canonical, project_id=project_id, headers=headers)
-        )
-    return json.dumps({"project": name or None, "project_created": created, "results": results})
+            return json.dumps({"session_id": session_id, "error": f"sys_session_update: {exc}"})
+    status, error = await _set_project(
+        client, current, canonical, project_id=project_id, headers=headers
+    )
+    if error is not None:
+        return json.dumps({"session_id": session_id, "error": error})
+    return json.dumps(
+        {
+            "session_id": session_id,
+            "status": status,
+            "project": name or None,
+            "project_created": created,
+        }
+    )

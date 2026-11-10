@@ -1,11 +1,10 @@
-"""Schema-only tools for listing projects and filing the owner's sessions into them."""
+"""Schema-only tools for listing projects and updating the owner's sessions."""
 
 from typing import Any
 
 from omnigent.tools.base import Tool
 
 MAX_PROJECT_NAME_LENGTH = 100
-MAX_SESSIONS_PER_MOVE = 100
 MAX_LISTED_SESSIONS = 200
 
 
@@ -23,8 +22,8 @@ class SysProjectListTool(Tool):
             "projects_next_cursor as projects_after for more projects. A session whose "
             "project is null is unfiled; this_session marks the session calling the "
             'tool. Filter sessions by project name, or pass project "" for unfiled '
-            "sessions only. A session with moves_with is in a family and moves with "
-            "that session. Use sys_session_move to file sessions into a project."
+            "sessions only. A session with moves_with is in a family and shares that "
+            "session's project. Use sys_session_update to file a session into a project."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -70,21 +69,21 @@ class SysProjectListTool(Tool):
         }
 
 
-class SysSessionMoveTool(Tool):
+class SysSessionUpdateTool(Tool):
     @classmethod
     def name(cls) -> str:
-        return "sys_session_move"
+        return "sys_session_update"
 
     @classmethod
     def description(cls) -> str:
         return (
-            "File one or more of the user's own sessions into a project by name, the "
-            "same as moving them in the sidebar. A project that does not exist yet is "
-            'created. Pass project "" to remove the sessions from their project. Moving '
-            "only changes the folder: running sessions, including this one, keep "
-            "working. Sub-agent sessions follow their parent, and a family moves "
-            "together through the session its members list as moves_with. Each "
-            "session gets its own result; a refused session does not stop the others."
+            "Update one of the user's own sessions. project files the session into a "
+            "project by name, the same as moving it in the sidebar; a project that does "
+            'not exist yet is created, and "" removes the session from its project. '
+            "Changing the project only changes the folder: a running session, including "
+            "this one, keeps working. Sub-agent sessions follow their parent's project, "
+            "and a family shares the project of the session its members list as "
+            "moves_with. Call once per session."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -96,22 +95,18 @@ class SysSessionMoveTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "session_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "minItems": 1,
-                            "maxItems": MAX_SESSIONS_PER_MOVE,
-                            "uniqueItems": True,
-                            "description": "IDs of the sessions to move.",
+                        "session_id": {
+                            "type": "string",
+                            "description": "ID of the session to update.",
                         },
                         "project": {
                             "type": "string",
                             "maxLength": MAX_PROJECT_NAME_LENGTH,
-                            "description": 'Target project name; "" removes the sessions '
-                            "from their project.",
+                            "description": 'Project name to file the session into; "" '
+                            "removes it from its project.",
                         },
                     },
-                    "required": ["session_ids", "project"],
+                    "required": ["session_id"],
                     "additionalProperties": False,
                 },
             },

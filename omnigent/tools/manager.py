@@ -40,10 +40,10 @@ from omnigent.tools.builtins import (
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
-    SysSessionMoveTool,
     SysSessionRenameTool,
     SysSessionSendTool,
     SysSessionShareTool,
+    SysSessionUpdateTool,
     SysTimerCancelTool,
     SysTimerSetTool,
     UpdateCommentTool,
@@ -542,7 +542,7 @@ class ToolManager:
 
     def _register_project_tools(self) -> None:
         """
-        Register ``sys_project_list`` and ``sys_session_move``.
+        Register ``sys_project_list`` and ``sys_session_update``.
 
         They proxy the owner-gated projects and session PATCH endpoints the
         sidebar uses, so they grant no access the caller lacks;
@@ -551,7 +551,7 @@ class ToolManager:
         if not self._spec.tool_groups.projects:
             return
         self._tools[SysProjectListTool.name()] = SysProjectListTool()
-        self._tools[SysSessionMoveTool.name()] = SysSessionMoveTool()
+        self._tools[SysSessionUpdateTool.name()] = SysSessionUpdateTool()
 
     def _register_task_lifecycle_tools(self) -> None:
         """

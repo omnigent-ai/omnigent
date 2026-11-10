@@ -245,7 +245,7 @@ async def _project_tool(client, source, tool_name, **arguments):
 
 
 @_ONE_ENVIRONMENT
-async def test_project_tools_list_and_bulk_move_running_sessions(auth_client, peers, db_uri):
+async def test_project_tools_list_and_file_running_sessions(auth_client, peers, db_uri):
     source, target, captured = peers
     store = SqlAlchemyConversationStore(db_uri)
     existing_id = await _project(auth_client, "Release prep")
@@ -260,16 +260,20 @@ async def test_project_tools_list_and_bulk_move_running_sessions(auth_client, pe
 
     # The calling session is mid-turn; filing it must not touch the turn.
     store.set_session_live_status(source["id"], "running")
-    moved = await _project_tool(
-        auth_client,
-        source,
-        "sys_session_move",
-        session_ids=[source["id"], target["id"]],
-        project="Release prep",
-    )
-    assert moved["project_created"] is False
-    assert [r["status"] for r in moved["results"]] == ["moved", "moved"], moved
     for session_id in (source["id"], target["id"]):
+        updated = await _project_tool(
+            auth_client,
+            source,
+            "sys_session_update",
+            session_id=session_id,
+            project="Release prep",
+        )
+        assert updated == {
+            "session_id": session_id,
+            "status": "updated",
+            "project": "Release prep",
+            "project_created": False,
+        }
         saved = store.get_conversation(session_id)
         assert saved.project_id == existing_id
         assert not saved.labels.get("omni_project")
@@ -277,24 +281,24 @@ async def test_project_tools_list_and_bulk_move_running_sessions(auth_client, pe
     assert not captured.get("posts")
 
     created = await _project_tool(
-        auth_client, source, "sys_session_move", session_ids=[target["id"]], project="Follow-ups"
+        auth_client, source, "sys_session_update", session_id=target["id"], project="Follow-ups"
     )
-    assert created["project_created"] is True and created["results"][0]["status"] == "moved"
+    assert created["project_created"] is True and created["status"] == "updated"
     filtered = await _project_tool(auth_client, source, "sys_project_list", project="Follow-ups")
     assert [row["session_id"] for row in filtered["sessions"]] == [target["id"]]
     again = await _project_tool(
-        auth_client, source, "sys_session_move", session_ids=[target["id"]], project="Follow-ups"
+        auth_client, source, "sys_session_update", session_id=target["id"], project="Follow-ups"
     )
-    assert again["results"][0]["status"] == "unchanged"
+    assert again["status"] == "unchanged"
     unfiled = await _project_tool(
-        auth_client, source, "sys_session_move", session_ids=[target["id"]], project=""
+        auth_client, source, "sys_session_update", session_id=target["id"], project=""
     )
-    assert unfiled["results"][0]["status"] == "moved"
+    assert unfiled["status"] == "updated" and unfiled["project"] is None
     assert store.get_conversation(target["id"]).project_id is None
 
 
 @_ONE_ENVIRONMENT
-async def test_project_move_refuses_sessions_per_session(auth_client, peers, db_uri):
+async def test_project_update_refuses_sessions_it_cannot_refile(auth_client, peers, db_uri):
     source, target, _ = peers
     store = SqlAlchemyConversationStore(db_uri)
     others = await _create_session_as(auth_client, "", "bob")
@@ -304,40 +308,38 @@ async def test_project_move_refuses_sessions_per_session(auth_client, peers, db_
     family_member = await _create_session_as(auth_client, "", "alice")
     store.add_new_sibling(target["id"], family_member["id"], user_id="alice")
 
-    moved = await _project_tool(
-        auth_client,
-        source,
-        "sys_session_move",
-        session_ids=[others["id"], child.id, family_member["id"], "not-a-session", source["id"]],
-        project="Triage",
+    async def update(session_id: str, project: str) -> dict:
+        return await _project_tool(
+            auth_client, source, "sys_session_update", session_id=session_id, project=project
+        )
+
+    assert "not found" in (await update(others["id"], "Triage"))["error"]
+    refused_child = await update(child.id, "Triage")
+    assert (
+        f"follow their parent's project; update {source['id']} instead" in refused_child["error"]
     )
-    errors = {r["session_id"]: r.get("error", "") for r in moved["results"]}
-    assert "not found" in errors[others["id"]]
-    assert f"follow their parent; move {source['id']} instead" in errors[child.id]
-    assert f"move {target['id']} instead" in errors[family_member["id"]]
-    assert errors["not-a-session"] == "invalid session ID"
-    assert moved["results"][-1]["status"] == "moved"
+    refused_member = await update(family_member["id"], "Triage")
+    assert f"update {target['id']} instead" in refused_member["error"]
+    assert (await update("not-a-session", "Triage"))["error"] == "invalid session ID"
     assert store.get_conversation(others["id"]).project_id is None
     assert store.get_conversation(family_member["id"]).project_id is None
+    projects = (await auth_client.get("/v1/projects")).json()["data"]
+    assert "Triage" not in {project["name"] for project in projects}
 
     read_shared = await _create_session_as(auth_client, "", "bob")
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("alice")
     permissions.grant("alice", read_shared["id"], LEVEL_READ)
-    unfile = await _project_tool(
-        auth_client, source, "sys_session_move", session_ids=[read_shared["id"]], project=""
-    )
-    assert "only the session's owner" in unfile["results"][0]["error"], unfile
+    unfile = await update(read_shared["id"], "")
+    assert "only the session's owner" in unfile["error"], unfile
 
-    family = await _project_tool(
-        auth_client, source, "sys_session_move", session_ids=[target["id"]], project="Triage"
-    )
-    assert family["results"][0]["status"] == "moved"
+    family = await update(target["id"], "Triage")
+    assert family["status"] == "updated"
     assert store.get_conversation(family_member["id"]).project_id is not None
 
 
 @_ONE_ENVIRONMENT
-async def test_project_move_refuses_a_source_shared_with_edit_access(auth_client, peers, db_uri):
+async def test_project_update_refuses_a_source_shared_with_edit_access(auth_client, peers, db_uri):
     source, target, _ = peers
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
@@ -346,17 +348,17 @@ async def test_project_move_refuses_a_source_shared_with_edit_access(auth_client
     listed = await _project_tool(auth_client, source, "sys_project_list")
     assert target["id"] in {row["session_id"] for row in listed["sessions"]}
     refused_create = await _project_tool(
-        auth_client, source, "sys_session_move", session_ids=[target["id"]], project="Shared"
+        auth_client, source, "sys_session_update", session_id=target["id"], project="Shared"
     )
     assert "shared with edit access cannot" in refused_create["error"], refused_create
     projects = (await auth_client.get("/v1/projects")).json()["data"]
     assert "Shared" not in {project["name"] for project in projects}
     existing = await auth_client.post("/v1/projects", json={"name": "Existing"})
     assert existing.status_code == 200, existing.text
-    moved = await _project_tool(
-        auth_client, source, "sys_session_move", session_ids=[target["id"]], project="Existing"
+    refused = await _project_tool(
+        auth_client, source, "sys_session_update", session_id=target["id"], project="Existing"
     )
-    assert "shared with edit access cannot" in moved["results"][0]["error"], moved
+    assert "shared with edit access cannot" in refused["error"], refused
     assert SqlAlchemyConversationStore(db_uri).get_conversation(target["id"]).project_id is None
     direct = await auth_client.patch(
         f"/v1/sessions/{target['id']}",
