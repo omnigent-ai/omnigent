@@ -61,7 +61,12 @@ async def _scheduled_agent_executor(agent: Any, agent_cache: Any) -> tuple[str |
     if agent is None or agent_cache is None or getattr(agent, "bundle_location", None) is None:
         return None, None
     try:
-        loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
+        loaded = await asyncio.to_thread(
+            agent_cache.load,
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.operator_authored,
+        )
         executor = getattr(loaded.spec, "executor", None)
         raw = (executor.config.get("harness") or executor.type) if executor else None
         return canonicalize_harness(raw) or raw, executor

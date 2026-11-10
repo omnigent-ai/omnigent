@@ -1019,3 +1019,78 @@ def test_cleanup_warning_preserves_original_validation_error(
     assert "Could not clean agent cache staging directory" in caplog.text
     assert "cleanup denied" in caplog.text
     assert not (cache_dir / "agent").exists()
+
+
+_UNREGISTERED_HANDLER_CONFIG = yaml.dump(
+    {
+        "spec_version": 1,
+        "name": "handler-agent",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        "guardrails": {
+            "policies": {
+                "custom_gate": {
+                    "type": "function",
+                    "on": ["tool_call"],
+                    "function": {"path": "example_org.policies.custom_gate", "arguments": {}},
+                }
+            }
+        },
+    }
+)
+
+
+def test_load_rejects_unregistered_handler_in_tenant_bundle(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tenant bundle naming an unregistered policy handler fails to load."""
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: False)
+    loc = "handler-tenant/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        agent_cache.load("handler-tenant", loc, expand_env=False)
+
+
+def test_memory_hit_revalidates_handler_for_tenant_load(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec cached in memory is re-checked against the registry on each tenant load."""
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: False)
+    loc = "handler-warm/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+    agent_cache.load("handler-warm", loc, expand_env=True)
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler"):
+        agent_cache.load("handler-warm", loc, expand_env=False)
+
+
+def test_operator_bundle_keeps_custom_handler(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+) -> None:
+    """Operator-authored bundles (``expand_env=True``) may use custom handlers."""
+    loc = "handler-operator/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+
+    loaded = agent_cache.load("handler-operator", loc, expand_env=True)
+
+    assert loaded.spec.name == "handler-agent"
+
+
+def test_local_single_user_keeps_custom_handler_for_tenant_load(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local single-user server keeps its operator's custom handlers."""
+    monkeypatch.setattr(agent_cache_module, "local_single_user_enabled", lambda: True)
+    loc = "handler-local/h1"
+    _store_bundle(artifact_store, loc, {"config.yaml": _UNREGISTERED_HANDLER_CONFIG})
+
+    loaded = agent_cache.load("handler-local", loc, expand_env=False)
+
+    assert loaded.spec.name == "handler-agent"
