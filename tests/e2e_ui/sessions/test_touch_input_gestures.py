@@ -168,7 +168,7 @@ def test_session_row_left_swipe_opens_default_delete_confirmation(
             hold_before_move_s=0.05,
         )
 
-        expect(page.get_by_text("Delete conversation?", exact=True)).to_be_visible()
+        expect(page.get_by_text("Delete session?", exact=True)).to_be_visible()
     finally:
         context.close()
 
@@ -262,7 +262,7 @@ def test_session_row_swipe_reversal_keeps_action_colors(
             touch(cdp, "touchCancel")
             page.evaluate("cancelAnimationFrame(window.swipeSampleFrame)")
         expect(frame.get_by_test_id("conversation-swipe-reveal")).to_have_count(0)
-        expect(page.get_by_text("Delete conversation?", exact=True)).to_have_count(0)
+        expect(page.get_by_text("Delete session?", exact=True)).to_have_count(0)
         expect(row_link).to_be_visible()
         mismatches = [
             {"actual": sample, "expected": expected[offset]}
