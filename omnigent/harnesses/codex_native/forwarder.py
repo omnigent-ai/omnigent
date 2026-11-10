@@ -36,7 +36,6 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexMessage,
     client_for_transport,
     codex_rejects_request_method,
-    is_stale_active_turn_error,
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -57,7 +56,6 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_effort,
     read_codex_config_model,
     read_mcp_startup,
-    record_acknowledged_turn_id,
     record_child_usage_baseline,
     settle_pending_mcp_startup,
     update_active_turn_id,
@@ -296,10 +294,6 @@ _CODEX_ASYNC_QUESTION_REQUEST_PREFIX = "async_question:"
 _CODEX_ASYNC_QUESTION_REPLY_TAG = "send_user_message_question_reply"
 _CODEX_ASYNC_QUESTION_REPLY_OPEN_PATTERN = re.compile(rf"<{_CODEX_ASYNC_QUESTION_REPLY_TAG}>\s*")
 _CODEX_ASYNC_QUESTION_REPLY_CLOSE_PATTERN = re.compile(rf"\s*</{_CODEX_ASYNC_QUESTION_REPLY_TAG}>")
-# Waits before each retry of an answer Codex refused or never received.
-_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S = (5.0, 10.0, 15.0)
-# Codex acknowledges turn input before running it; a send unanswered this long is stuck.
-_CODEX_ASYNC_QUESTION_SEND_TIMEOUT_S = 30.0
 _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
     {
         _CODEX_MCP_ELICITATION_REQUEST_METHOD,
@@ -2334,8 +2328,6 @@ class _CodexElicitationTaskTracker:
         self._posted_resolutions: set[str] = set()
         self._started_async_questions: set[str] = set()
         self._unanswered_async_questions: dict[str, asyncio.Task[None]] = {}
-        # Items whose web answer is being sent; an answer Codex echoes removes them.
-        self._delivering_async_questions: set[str] = set()
         # Whether ``GET /v1/info`` advertised async question cards; ``None`` until read.
         self._server_shows_async_question_cards: bool | None = None
 
@@ -2388,23 +2380,19 @@ class _CodexElicitationTaskTracker:
     def start_async_question(
         self,
         client: httpx.AsyncClient,
-        codex_client: CodexAppServerClient,
         *,
         session_id: str,
-        bridge_dir: Path | None,
         params: _JsonObject,
     ) -> None:
         """
         Publish a Codex async question and send its answer back as a user message.
 
         The tool returns before the user answers, so the card stays open after
-        its turn ends and the answer steers or starts a turn when it arrives.
+        its turn ends. The answer goes through the session's ordinary message
+        path, like a reply typed in the Codex TUI.
 
-        :param client: HTTP client for Omnigent hook posts.
-        :param codex_client: Connected Codex app-server client.
+        :param client: HTTP client for Omnigent hook and event posts.
         :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-        :param bridge_dir: Parent native Codex bridge directory, or ``None``
-            for a child thread.
         :param params: Codex ``item/completed`` params for an ``agentMessage``.
         :returns: None.
         """
@@ -2413,13 +2401,7 @@ class _CodexElicitationTaskTracker:
             return
         self._started_async_questions.add(question.item_id)
         task = asyncio.create_task(
-            self._run_async_question(
-                client,
-                codex_client,
-                session_id=session_id,
-                bridge_dir=bridge_dir,
-                question=question,
-            ),
+            self._run_async_question(client, session_id=session_id, question=question),
             name="codex-native-async-question",
         )
         # No thread or turn scope, so a finished turn leaves the question open.
@@ -2436,64 +2418,33 @@ class _CodexElicitationTaskTracker:
         self._unanswered_async_questions[question.item_id] = task
         task.add_done_callback(self._discard_done)
 
-    @property
-    def async_question_item_ids(self) -> Collection[str]:
-        """
-        Item ids of the async questions Codex asked on this connection.
-
-        Empty until the server advertises async question cards: an older server
-        would match a plain answer to a queued web message, so replies stay raw.
-
-        :returns: ``agentMessage`` item ids, e.g. ``{"call_abc"}``.
-        """
-        if self._server_shows_async_question_cards:
-            return self._started_async_questions
-        return ()
-
-    def note_async_questions_answered(self, params: _JsonObject) -> list[asyncio.Task[None]]:
-        """
-        Record async questions a Codex reply answered, before it is mirrored.
-
-        Ends any web answer delivery for them at once, so a slow transcript
-        post cannot let a retry send a second answer.
-
-        :param params: Codex ``item/completed`` params for a ``userMessage``.
-        :returns: Hook tasks of the still-open cards the reply answered, for
-            :meth:`resolve_async_questions_answered_natively`.
-        """
-        item = params.get("item")
-        if not isinstance(item, dict) or item.get("type") != "userMessage":
-            return []
-        answered_tasks: list[asyncio.Task[None]] = []
-        for item_id in _async_question_reply_item_ids(
-            _user_message_text(item), self._started_async_questions
-        ):
-            # Our own reply or a TUI answer: either way Codex has an answer.
-            self._delivering_async_questions.discard(item_id)
-            task = self._unanswered_async_questions.pop(item_id, None)
-            if task is not None:
-                answered_tasks.append(task)
-        return answered_tasks
-
     async def resolve_async_questions_answered_natively(
         self,
         client: httpx.AsyncClient,
         *,
         session_id: str,
-        answered_tasks: list[asyncio.Task[None]],
+        params: _JsonObject,
     ) -> None:
         """
-        Close async question cards that a native Codex reply already answered.
+        Close async question cards that a Codex user message already answered.
+
+        Covers both a reply typed in the Codex TUI and the echo of an answer
+        sent from the card.
 
         :param client: HTTP client for Omnigent event posts.
         :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-        :param answered_tasks: Hook tasks from
-            :meth:`note_async_questions_answered`.
+        :param params: Codex ``item/completed`` params.
         :returns: None.
         """
-        for task in answered_tasks:
-            pending = self._pending.get(task)
-            if pending is None:
+        item = params.get("item")
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            return
+        for item_id in _async_question_reply_item_ids(
+            _user_message_text(item), self._started_async_questions
+        ):
+            task = self._unanswered_async_questions.pop(item_id, None)
+            pending = self._pending.get(task) if task is not None else None
+            if task is None or pending is None:
                 continue
             await self._post_resolved_once(client, session_id, pending)
             task.cancel()
@@ -2583,7 +2534,6 @@ class _CodexElicitationTaskTracker:
         self._posted_resolutions.clear()
         self._started_async_questions.clear()
         self._unanswered_async_questions.clear()
-        self._delivering_async_questions.clear()
 
     async def _run_one(
         self,
@@ -2621,73 +2571,31 @@ class _CodexElicitationTaskTracker:
     async def _run_async_question(
         self,
         client: httpx.AsyncClient,
-        codex_client: CodexAppServerClient,
         *,
         session_id: str,
-        bridge_dir: Path | None,
         question: _CodexAsyncQuestion,
     ) -> None:
         """
-        Wait for the Omnigent answer to one async question and deliver it.
+        Wait for the Omnigent answer to one async question and send it on.
 
-        After an undelivered answer, the card opens again for another answer.
-
-        :param client: HTTP client for Omnigent hook posts.
-        :param codex_client: Connected Codex app-server client.
+        :param client: HTTP client for Omnigent hook and event posts.
         :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-        :param bridge_dir: Parent native Codex bridge directory, or ``None``
-            for a child thread.
         :param question: Parsed Codex async question.
         :returns: None.
         """
         item_id = question.item_id
-        delivery_round = 0
         try:
             if not await self._async_question_cards_supported(client):
                 return
-            while True:
-                result = await _codex_elicitation_hook_result(
-                    client,
-                    session_id,
-                    event=_async_question_request_event(question, delivery_round=delivery_round),
-                )
-                # Popping first keeps our own reply echo from cancelling this delivery.
-                answered_natively = self._unanswered_async_questions.pop(item_id, None) is None
-                reply = _async_question_reply_text(question, result)
-                if reply is None or answered_natively:
-                    return
-                self._delivering_async_questions.add(item_id)
-                try:
-                    delivered = await _send_codex_async_question_reply(
-                        codex_client,
-                        bridge_dir=bridge_dir,
-                        question=question,
-                        text=reply,
-                        answered=lambda: item_id not in self._delivering_async_questions,
-                    )
-                except asyncio.CancelledError:
-                    # Teardown ended the retries; bounded so a down server can't stall it.
-                    if item_id in self._delivering_async_questions:
-                        with contextlib.suppress(TimeoutError):
-                            await asyncio.wait_for(
-                                _post_async_question_undelivered_notice(
-                                    client, session_id, question, delivery_round
-                                ),
-                                timeout=_DURABLE_ITEM_POST_TIMEOUT_SECONDS,
-                            )
-                    raise
-                if delivered:
-                    return
-                await _post_async_question_undelivered_notice(
-                    client, session_id, question, delivery_round
-                )
-                if item_id not in self._delivering_async_questions:
-                    return  # Codex echoed an answer while the notice was posted.
-                self._delivering_async_questions.discard(item_id)
-                delivery_round += 1
-                task = asyncio.current_task()
-                if task is not None:
-                    self._unanswered_async_questions[item_id] = task
+            result = await _codex_elicitation_hook_result(
+                client, session_id, event=_async_question_request_event(question)
+            )
+            # Absent once a Codex user message answered it (TUI reply or our echo).
+            if self._unanswered_async_questions.pop(item_id, None) is None:
+                return
+            reply = _async_question_reply_text(question, result)
+            if reply is not None:
+                await _send_async_question_reply(client, session_id, question, reply)
         except asyncio.CancelledError:
             raise
         except Exception:  # keep the long-lived forwarder alive.
@@ -2698,14 +2606,13 @@ class _CodexElicitationTaskTracker:
             )
         finally:
             self._unanswered_async_questions.pop(item_id, None)
-            self._delivering_async_questions.discard(item_id)
 
     async def _async_question_cards_supported(self, client: httpx.AsyncClient) -> bool:
         """
         Report whether the Omnigent server can show async question cards.
 
-        Older servers treat a declined card as an interrupt and can match the
-        answer echo to a queued web message, so the question stays terminal-only.
+        Older servers treat a declined card as an interrupt, so the question
+        stays terminal-only there.
         An unreadable ``/v1/info`` counts as unsupported and is read again later.
 
         :param client: HTTP client pointed at the Omnigent server.
@@ -4124,11 +4031,6 @@ async def _handle_event(
             in {_CODEX_COLLAB_AGENT_ITEM_TYPE, _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE}
             else event_state
         )
-        answered_tasks = (
-            elicitation_tracker.note_async_questions_answered(params)
-            if codex_client is not None
-            else []
-        )
         await _handle_completed_event(
             client,
             session_id=route_session_id,
@@ -4137,20 +4039,13 @@ async def _handle_event(
             forwarder_state=item_state,
             bridge_dir=event_bridge_dir,
             file_observer_bridge_dir=bridge_dir,
-            async_question_item_ids=elicitation_tracker.async_question_item_ids,
         )
         if codex_client is not None:
             elicitation_tracker.start_async_question(
-                client,
-                codex_client,
-                session_id=route_session_id,
-                bridge_dir=event_bridge_dir,
-                params=params,
+                client, session_id=route_session_id, params=params
             )
             await elicitation_tracker.resolve_async_questions_answered_natively(
-                client,
-                session_id=route_session_id,
-                answered_tasks=answered_tasks,
+                client, session_id=route_session_id, params=params
             )
 
 
@@ -5394,7 +5289,6 @@ async def _handle_completed_event(
     forwarder_state: _CodexForwarderState | None,
     bridge_dir: Path | None = None,
     file_observer_bridge_dir: Path | None = None,
-    async_question_item_ids: Collection[str] = (),
 ) -> None:
     """
     Flush pending text and mirror one completed Codex item.
@@ -5407,8 +5301,6 @@ async def _handle_completed_event(
     :param forwarder_state: Optional state that records completed
         Plan-mode items.
     :param file_observer_bridge_dir: Runner relay directory shared by native children.
-    :param async_question_item_ids: Async questions Codex asked on this
-        connection, for :func:`_post_user_message`.
     :returns: None.
     """
     if delta_coalescer is not None:
@@ -5422,7 +5314,6 @@ async def _handle_completed_event(
         forwarder_state=forwarder_state,
         bridge_dir=bridge_dir,
         file_observer_bridge_dir=file_observer_bridge_dir,
-        async_question_item_ids=async_question_item_ids,
     )
 
 
@@ -6540,15 +6431,11 @@ def _codex_async_question(params: _JsonObject) -> _CodexAsyncQuestion | None:
     )
 
 
-def _async_question_request_event(
-    question: _CodexAsyncQuestion, *, delivery_round: int = 0
-) -> CodexMessage:
+def _async_question_request_event(question: _CodexAsyncQuestion) -> CodexMessage:
     """
     Build the ``requestUserInput`` request that shows an async question card.
 
     :param question: Parsed Codex async question.
-    :param delivery_round: Number of earlier answers Codex did not receive.
-        A later round reopens the same card.
     :returns: Codex JSON-RPC request envelope.
     """
     params: _JsonObject = {
@@ -6567,9 +6454,6 @@ def _async_question_request_event(
             for index, title, labels in question.questions
         ],
     }
-    if delivery_round:
-        # The server replays a stored answer to an unchanged request.
-        params["deliveryRound"] = delivery_round
     return {
         "id": question.request_id,
         "method": _CODEX_TOOL_REQUEST_USER_INPUT_METHOD,
@@ -6693,24 +6577,6 @@ def _async_question_reply_entry_item_id(entry: object) -> str | None:
     return None
 
 
-def _async_question_reply_display_text(text: str, question_item_ids: Collection[str]) -> str:
-    """
-    Replace each async question reply in a user message with its answers.
-
-    :param text: Codex ``userMessage`` text.
-    :param question_item_ids: Item ids of the async questions Codex asked.
-    :returns: Text shown to the user, e.g. ``"Alpha"`` for a reply that
-        answers one question with ``"Alpha"``.
-    """
-    parts: list[str] = []
-    position = 0
-    for start, end, entries in _async_question_replies(text, question_item_ids):
-        parts.extend((text[position:start], "\n".join(_async_question_reply_answers(entries))))
-        position = end
-    parts.append(text[position:])
-    return "".join(parts)
-
-
 def _async_question_reply_item_ids(text: str, question_item_ids: Collection[str]) -> list[str]:
     """
     Return the async question items a Codex user message answers.
@@ -6728,188 +6594,47 @@ def _async_question_reply_item_ids(text: str, question_item_ids: Collection[str]
     return item_ids
 
 
-async def _post_async_question_undelivered_notice(
+async def _send_async_question_reply(
     client: httpx.AsyncClient,
     session_id: str,
     question: _CodexAsyncQuestion,
-    delivery_round: int,
+    reply: str,
 ) -> None:
     """
-    Tell the user Codex may not have received their async question answer.
+    Send an async question answer as an ordinary user message on the session.
+
+    The server delivers it like composer input, steering the running turn or
+    starting one, as the Codex TUI does with its own reply.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param question: Answered Codex async question.
-    :param delivery_round: Card round the answer came from, which keeps
-        each round's notice distinct.
+    :param reply: Tagged reply from :func:`_async_question_reply_text`.
     :returns: None.
     """
-    title = question.questions[0][1]
-    await _post_assistant_notice(
-        client,
-        session_id,
-        marker=f"async-question-undelivered-{question.item_id}-{delivery_round}",
-        text=f'Couldn\'t confirm that Codex received your answer to "{title}". '
-        "Check the terminal and send your answer again if Codex didn't get it.",
-    )
-
-
-async def _send_codex_async_question_reply(
-    codex_client: CodexAppServerClient,
-    *,
-    bridge_dir: Path | None,
-    question: _CodexAsyncQuestion,
-    text: str,
-    answered: Callable[[], bool],
-) -> bool:
-    """
-    Deliver an async question reply, retrying a refused or failed send.
-
-    An attempt made while a shell command runs sends nothing and waits for the
-    next retry.
-
-    :param codex_client: Connected Codex app-server client.
-    :param bridge_dir: Parent native Codex bridge directory, or ``None`` for
-        a child thread, whose only known turn is the asking one.
-    :param question: Answered Codex async question.
-    :param text: Tagged reply text from :func:`_async_question_reply_text`.
-    :param answered: Whether Codex has since echoed an answer to the
-        question, which ends the retries.
-    :returns: Whether Codex accepted the reply or already has an answer;
-        ``False`` when every send failed or one went unacknowledged and
-        Codex has not echoed an answer.
-    """
-    for attempt in range(len(_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S) + 1):
-        if attempt:
-            await asyncio.sleep(_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S[attempt - 1])
-            if answered():
-                return True
-        try:
-            state = read_bridge_state(bridge_dir) if bridge_dir is not None else None
-            if state is not None and state.thread_id != question.thread_id:
-                state = None
-            async with asyncio.timeout(_CODEX_ASYNC_QUESTION_SEND_TIMEOUT_S):
-                sent = await _send_codex_async_question_reply_once(
-                    codex_client,
-                    bridge_dir=bridge_dir,
-                    state=state,
-                    question=question,
-                    text=text,
-                    answered=answered,
-                )
-            if sent:
-                return True
-            _logger.info(
-                "Codex async question answer waits for a shell command: item=%s",
-                question.item_id,
-            )
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            # Codex may have taken the unacknowledged send, so resending could duplicate it.
-            _logger.warning(
-                "Codex async question answer unacknowledged: item=%s", question.item_id
-            )
-            return answered()
-        except Exception:
-            _logger.warning(
-                "Codex async question answer not delivered: item=%s attempt=%d",
-                question.item_id,
-                attempt + 1,
-                exc_info=True,
-            )
-    return answered()
-
-
-async def _send_codex_async_question_reply_once(
-    codex_client: CodexAppServerClient,
-    *,
-    bridge_dir: Path | None,
-    state: CodexNativeBridgeState | None,
-    question: _CodexAsyncQuestion,
-    text: str,
-    answered: Callable[[], bool],
-) -> bool:
-    """
-    Steer the active Codex turn with an async question reply, or start one.
-
-    :param codex_client: Connected Codex app-server client.
-    :param bridge_dir: Parent native Codex bridge directory, or ``None``.
-    :param state: Bridge state for the asking thread, or ``None`` when the
-        bridge does not track it.
-    :param question: Answered Codex async question.
-    :param text: Tagged reply text from :func:`_async_question_reply_text`.
-    :param answered: Whether Codex has since echoed an answer to the question.
-    :returns: ``False`` when a shell command held the reply back, else ``True``.
-    """
-    if _shell_command_running(state):
-        return False
-    thread_id = question.thread_id
-    input_items = [{"type": "text", "text": text}]
-    tracked_bridge_dir: Path | None = None
-    expected_turn_id = question.turn_id
-    if state is not None:
-        tracked_bridge_dir, expected_turn_id = bridge_dir, state.active_turn_id
-    if expected_turn_id:
-        try:
-            await codex_client.request(
-                "turn/steer",
-                {"threadId": thread_id, "expectedTurnId": expected_turn_id, "input": input_items},
-            )
-            return True
-        except CodexAppServerResponseError as error:
-            if not is_stale_active_turn_error(error):
-                raise
-        if tracked_bridge_dir is not None:
-            clear_active_turn_id_if_matches(tracked_bridge_dir, expected_turn_id)
-        if answered():
-            return True  # Codex echoed an answer while the steer was pending.
-    start_state = read_bridge_state(tracked_bridge_dir) if tracked_bridge_dir is not None else None
-    if start_state is not None and start_state.thread_id != thread_id:
-        start_state = None
-    if _shell_command_running(start_state):
-        return False
-    if start_state is not None and start_state.active_turn_id:
-        # Steer a turn that started before this re-read, not the rejected one.
-        await codex_client.request(
-            "turn/steer",
-            {
-                "threadId": thread_id,
-                "expectedTurnId": start_state.active_turn_id,
-                "input": input_items,
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": reply}]},
             },
         )
-        return True
-    # A turn started meanwhile absorbs this input instead of starting another.
-    response = await codex_client.request(
-        "turn/start",
-        {"threadId": thread_id, "input": input_items},
-    )
-    result = response.get("result")
-    turn = result.get("turn") if isinstance(result, dict) else None
-    turn_id = turn.get("id") if isinstance(turn, dict) else None
-    if (
-        tracked_bridge_dir is not None
-        and start_state is not None
-        and isinstance(turn_id, str)
-        and turn_id
-    ):
-        try:
-            record_acknowledged_turn_id(tracked_bridge_dir, start_state, turn_id)
-        except OSError:
-            # Codex already accepted the reply, so a retry would send it twice.
-            _logger.warning("Codex async question turn not recorded: %s", turn_id, exc_info=True)
-    return True
-
-
-def _shell_command_running(state: CodexNativeBridgeState | None) -> bool:
-    """
-    Report whether the bridge records a shell command, whose turn drops steered input.
-
-    :param state: Bridge state for the asking thread, or ``None``.
-    :returns: ``True`` while a shell command is pending or its turn is running.
-    """
-    return state is not None and bool(state.pending_shell_command_id or state.active_shell_turn_id)
+        response.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Codex async question answer could not be sent: item=%s",
+            question.item_id,
+            exc_info=True,
+        )
+        title = question.questions[0][1]
+        await _post_assistant_notice(
+            client,
+            session_id,
+            marker=f"async-question-undelivered-{question.item_id}",
+            text=f'Couldn\'t send your answer to "{title}" to Codex. '
+            "Answer it again in the terminal.",
+        )
 
 
 async def _handle_turn_started(
@@ -7202,7 +6927,6 @@ async def _handle_completed_item(
     forwarder_state: _CodexForwarderState | None = None,
     bridge_dir: Path | None = None,
     file_observer_bridge_dir: Path | None = None,
-    async_question_item_ids: Collection[str] = (),
 ) -> None:
     """Serialize and forward one completed Codex transcript item."""
     async with _conversation_item_delivery_scope(session_id):
@@ -7213,7 +6937,6 @@ async def _handle_completed_item(
             forwarder_state=forwarder_state,
             bridge_dir=bridge_dir,
             file_observer_bridge_dir=file_observer_bridge_dir,
-            async_question_item_ids=async_question_item_ids,
         )
 
 
@@ -7225,7 +6948,6 @@ async def _handle_completed_item_inner(
     forwarder_state: _CodexForwarderState | None = None,
     bridge_dir: Path | None = None,
     file_observer_bridge_dir: Path | None = None,
-    async_question_item_ids: Collection[str] = (),
 ) -> None:
     """
     Forward one Codex completed item event when it maps to Omnigent history.
@@ -7237,8 +6959,6 @@ async def _handle_completed_item_inner(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param params: Codex ``item/completed`` params.
     :param forwarder_state: Optional mutable state for dedup tracking.
-    :param async_question_item_ids: Async questions Codex asked on this
-        connection, for :func:`_post_user_message`.
     :returns: None.
     """
     item = params.get("item")
@@ -7297,14 +7017,7 @@ async def _handle_completed_item_inner(
     if source_id is None:
         return
     if item_type == "userMessage":
-        posted = await _post_user_message(
-            client,
-            session_id,
-            params,
-            item,
-            source_id=source_id,
-            async_question_item_ids=async_question_item_ids,
-        )
+        posted = await _post_user_message(client, session_id, params, item, source_id=source_id)
         if posted and forwarder_state is not None:
             turn_id = _turn_id_from_payload(params)
             if turn_id:
@@ -8449,7 +8162,6 @@ async def _post_user_message(
     item: _JsonObject,
     *,
     source_id: str | None = None,
-    async_question_item_ids: Collection[str] = (),
 ) -> bool:
     """
     Persist a Codex user message observed from the TUI.
@@ -8459,13 +8171,9 @@ async def _post_user_message(
     :param params: Codex notification params.
     :param item: Codex ``userMessage`` item.
     :param source_id: Stable native item id used for server-side deduplication.
-    :param async_question_item_ids: Async questions Codex asked on this
-        connection. Only a reply to them is shown as its answers and kept
-        out of pending-input matching.
     :returns: Whether the item was accepted by the server.
     """
-    raw_text = _user_message_text(item)
-    text = _async_question_reply_display_text(raw_text, async_question_item_ids)
+    text = _user_message_text(item)
     # An image/file-only message has no text but must still be posted: the
     # server drains its optimistic pending-input entry (FIFO) and folds the
     # image in by file_id (``_merge_pending_file_blocks``). Bailing here would
@@ -8497,10 +8205,6 @@ async def _post_user_message(
         item_data=item_data,
         response_id=_response_id(params),
         source_id=source_id or _source_id(params, item),
-        # An async question answer was never queued from the web composer.
-        agent_message_candidate=bool(
-            _async_question_reply_item_ids(raw_text, async_question_item_ids)
-        ),
     )
 
 
@@ -9132,7 +8836,6 @@ async def _post_external_item(
     response_id: str,
     message_id: str | None = None,
     source_id: str | None = None,
-    agent_message_candidate: bool = False,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -9148,8 +8851,6 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :param message_id: Optional live-preview stream finalized by this item.
     :param source_id: Stable native source id for server-side idempotency.
-    :param agent_message_candidate: Whether this is an async question answer,
-        which a Codex session's server keeps out of pending-input matching.
     :returns: Whether the item was accepted by the server.
     """
     data: _JsonObject = {
@@ -9161,8 +8862,6 @@ async def _post_external_item(
         data["message_id"] = message_id
     if source_id is not None:
         data["source_id"] = _bounded_source_id(source_id)
-    if agent_message_candidate:
-        data["agent_message_candidate"] = True
 
     async def _post() -> httpx.Response | None:
         return await _post_session_event(

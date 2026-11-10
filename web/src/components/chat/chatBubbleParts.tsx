@@ -98,6 +98,7 @@ import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNo
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
+import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
@@ -121,7 +122,7 @@ export const SessionSharedContext = createContext(false);
 /** A user message's raw text, minus runtime context and any sender prefix. */
 function userMessageBody(content: MessageContentBlock[]): string {
   const text = stripAutomationContext(joinTextBlocks(content));
-  return splitSessionMessageOrigin(text)?.body ?? text;
+  return codexAsyncQuestionReplyText(splitSessionMessageOrigin(text)?.body ?? text);
 }
 
 /** A user message's text for reading and copying: mention markers become ``@name``. */

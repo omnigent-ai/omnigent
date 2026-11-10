@@ -3353,14 +3353,12 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
 
 
 @pytest.mark.parametrize(
-    ("marker_text", "source_id", "is_meta", "agent_message_candidate"),
+    ("marker_text", "source_id", "is_meta"),
     [
-        ("[Request interrupted by user]", None, False, False),
-        ("[Request interrupted by user for tool use]", None, False, False),
-        ("[System: Message from another session]", "peer-input:0:peer_message_wake", False, False),
-        ("[System: Message from another session]", "peer-input:0:peer_message_wake", True, False),
-        ("Blue", "async-question-answer", False, True),
-        ("[Attached: /tmp/example.png]\nBlue", "async-question-answer", False, True),
+        ("[Request interrupted by user]", None, False),
+        ("[Request interrupted by user for tool use]", None, False),
+        ("[System: Message from another session]", "peer-input:0:peer_message_wake", False),
+        ("[System: Message from another session]", "peer-input:0:peer_message_wake", True),
     ],
 )
 async def test_external_native_marker_leaves_pending_input_for_real_message(
@@ -3369,7 +3367,6 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
     marker_text: str,
     source_id: str | None,
     is_meta: bool,
-    agent_message_candidate: bool,
 ) -> None:
     """
     Regression: steering with an upload must not feed it to a native marker.
@@ -3385,8 +3382,7 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
     its file blocks are gone). Assert the marker persists bare and the
     steering message keeps the image.
 
-    Bridge-generated peer labels also have no pending input of their own, and
-    neither does a Codex question answer, even one matching the queued text.
+    Bridge-generated peer labels also have no pending input of their own.
     """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes._sessions.orchestration import _drains_pending_inputs
@@ -3395,31 +3391,17 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
     _capture_published(monkeypatch, published)
     pending_inputs.reset_for_tests()
     agent = await create_test_agent(client)
-    session = await _create_session(
-        client,
-        agent["id"],
-        labels={"omnigent.wrapper": "codex-native-ui"} if agent_message_candidate else None,
-    )
+    session = await _create_session(client, agent["id"])
 
-    # The optimistic entry for the steering message: an image-only upload, or
-    # one whose text a question answer also carries.
-    queued_text = "Blue" if agent_message_candidate else ""
-    sender = "alice@example.com"
-    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    # The optimistic entry for the steering message: an image-only upload.
     pid = pending_inputs.record(
         session["id"],
-        [
-            {"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"},
-            *([{"type": "input_text", "text": queued_text}] if queued_text else []),
-        ],
-        created_by=sender,
-        stable_id=stable_id,
+        [{"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"}],
     )
-    steered_text = "\n\n".join(filter(None, ["[Attached: /tmp/uploads/shot.png]", queued_text]))
     try:
-        for text, item_source_id, item_is_meta, item_candidate in (
-            (marker_text, source_id, is_meta, agent_message_candidate),
-            (steered_text, None, False, False),
+        for text, item_source_id, item_is_meta in (
+            (marker_text, source_id, is_meta),
+            ("[Attached: /tmp/uploads/shot.png]", None, False),
         ):
             item_data = MessageData(
                 role="user", content=[{"type": "input_text", "text": text}], is_meta=item_is_meta
@@ -3440,15 +3422,12 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
                         "item_data": item_data.model_dump(),
                         "response_id": "native_turn_1",
                         **({"source_id": item_source_id} if item_source_id else {}),
-                        **({"agent_message_candidate": True} if item_candidate else {}),
                     },
                 },
             )
             assert resp.status_code == 202, resp.text
             if text == marker_text:
-                assert [
-                    row["pending_id"] for row in pending_inputs.snapshot_for(session["id"])
-                ] == [pid]
+                assert len(pending_inputs.snapshot_for(session["id"])) == 1
                 consumed = next(
                     ev["data"] for _sid, ev in published if ev["type"] == "session.input.consumed"
                 )
@@ -3463,20 +3442,16 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
         # system marker instead of rendering it as user text beside an image.
         assert marker["content"] == [{"type": "input_text", "text": marker_text}]
         assert not marker.get("is_meta")
-        assert marker["id"] != stable_id
-        assert marker.get("created_by") != sender
         # The upload landed on the message that actually queued it.
         assert steered["content"][0] == {
             "type": "input_image",
             "file_id": "file_shot1",
             "filename": "shot.png",
         }
-        assert steered["content"][1]["text"] == steered_text
-        assert steered["id"] == stable_id
-        if queued_text:
-            assert steered["created_by"] == sender
+        assert steered["content"][1]["text"] == "[Attached: /tmp/uploads/shot.png]"
         # The real message drained the entry (the marker must not have).
         assert pending_inputs.snapshot_for(session["id"]) == []
+        assert pid
     finally:
         pending_inputs.reset_for_tests()
 

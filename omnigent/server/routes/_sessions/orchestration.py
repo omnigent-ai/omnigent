@@ -3169,14 +3169,12 @@ async def _persist_external_conversation_item_unlocked(
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
         native_agent = _native_coding_agent_for_session(conv)
-        harness = native_agent.harness if native_agent is not None else None
-        if agent_message_candidate and harness == "codex-native":
-            # Codex flags only async question answers, which never enter the queue.
-            matched = pending_inputs.MatchedDrain(matched=None, skipped=[])
-        else:
-            matched = pending_inputs.resolve_matching_text(
-                session_id, text, hold=True, claude_commands=harness == "claude-native"
-            )
+        matched = pending_inputs.resolve_matching_text(
+            session_id,
+            text,
+            hold=True,
+            claude_commands=native_agent is not None and native_agent.harness == "claude-native",
+        )
         drained = matched.matched
         match_method = matched.match_method
         if agent_message_candidate:

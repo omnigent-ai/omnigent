@@ -238,8 +238,6 @@ def _write_forwarder_bridge(
     active_turn_id: str | None,
     session_id: str = "conv_123",
     thread_id: str = "thread_123",
-    pending_shell_command_id: str | None = None,
-    active_shell_turn_id: str | None = None,
 ) -> None:
     """Write bridge state with overridable identities and an explicit active turn."""
     write_bridge_state(
@@ -250,8 +248,6 @@ def _write_forwarder_bridge(
             thread_id=thread_id,
             codex_home=str(bridge_dir / "codex-home"),
             active_turn_id=active_turn_id,
-            pending_shell_command_id=pending_shell_command_id,
-            active_shell_turn_id=active_shell_turn_id,
         ),
     )
 

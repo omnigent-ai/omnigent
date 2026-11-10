@@ -356,14 +356,12 @@ separate. See [sessions](./sessions.md) for all side-chat entry points.
 
 **Codex async question:** in Default mode, ask Codex to call
 `request_user_input_async`. The question card stays open after the turn ends
-and leaves the composer usable. Answer it in Chat or Inbox; the transcript
-shows only the answer, and Codex's next turn uses it. Cancel dismisses the card
-without stopping Codex. Answering in the terminal closes the card and stops
-any retries of a web answer. If Codex still hasn't received a web answer after
-about 30 seconds of retries, a notice is posted and the card reopens. A send
-Codex doesn't acknowledge within 30 seconds is not retried; it gets the same
-notice and reopened card. If the forwarder stops first, only the notice is
-posted. An open question is not restored after the forwarder reconnects.
+and leaves the composer usable. Answer it in Chat or Inbox: the answer is sent
+as an ordinary message in the Codex TUI's reply format, so it steers Codex's
+current turn or starts the next one, and the transcript shows only the answer.
+Cancel dismisses the card without stopping Codex. Answering in the terminal
+closes the card. If the answer can't be sent, a notice asks the user to answer
+in the terminal. An open question is not restored after the forwarder reconnects.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -609,16 +607,14 @@ Cross-harness journeys:
 - **`codex-async-questions`:**
   `tests/harnesses/codex_native/session/test_elicitation.py` (the
   `*codex_async_question*` tests) drives the forwarder with a fake app-server
-  client: the card, answers steering or starting a turn, terminal answers,
-  retries, unacknowledged sends, teardown, and the undelivered notice with its
-  reopened card.
+  client: the card, the answer sent as a user message, a declined or expired
+  card, an older server, a terminal answer, and the notice when the answer
+  can't be sent.
   `tests/server/integration/test_sessions_permission_request_hook.py::test_codex_request_user_input_decline_interrupts_only_blocking_questions`
-  and `::test_codex_async_question_delivery_round_reopens_answered_card` cover
-  Cancel and reopening on the server, and
-  `tests/server/integration/test_sessions_endpoints.py::test_external_native_marker_leaves_pending_input_for_real_message`
-  keeps an answer echo from taking a queued message's upload.
-  `web/src/lib/blockStream.test.ts` and `web/src/lib/blocks.test.ts` cover the
-  non-blocking card, `web/src/pages/ChatPage.composer.test.tsx` the composer,
+  covers Cancel on the server. `web/src/lib/codexAsyncQuestionReply.test.ts`
+  covers the answer-only transcript, `web/src/lib/blockStream.test.ts` and
+  `web/src/lib/blocks.test.ts` the non-blocking card,
+  `web/src/pages/ChatPage.composer.test.tsx` the composer,
   `web/src/pages/ChatPage.indicators.test.tsx` the working indicator's terminal
   guidance, and `web/src/components/chat/chatBubbleParts.test.tsx` Retry. No
   test drives a real Codex CLI, the browser, Inbox, or a child thread.
