@@ -7633,6 +7633,9 @@ async def _post_user_message(
             else source_id or _source_id(params, item)
         ),
         native_input_receipt=receipt,
+        delivery_attempt_id=(
+            client_message_id if receipt is None and isinstance(client_message_id, str) else None
+        ),
     )
 
 
@@ -8265,6 +8268,7 @@ async def _post_external_item(
     message_id: str | None = None,
     source_id: str | None = None,
     native_input_receipt: _JsonObject | None = None,
+    delivery_attempt_id: str | None = None,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -8280,6 +8284,8 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :param message_id: Optional live-preview stream finalized by this item.
     :param source_id: Stable native source id for server-side idempotency.
+    :param native_input_receipt: Validated identity and content for a spilled input.
+    :param delivery_attempt_id: Native client ID identifying an ordinary web input.
     :returns: Whether the item was accepted by the server.
     """
     data: _JsonObject = {
@@ -8293,6 +8299,8 @@ async def _post_external_item(
         data["source_id"] = _bounded_source_id(source_id)
     if native_input_receipt is not None:
         data["native_input_receipt"] = native_input_receipt
+    if delivery_attempt_id is not None:
+        data["delivery_attempt_id"] = delivery_attempt_id
     event_type = (
         NATIVE_INPUT_RECEIPT_EVENT
         if native_input_receipt is not None

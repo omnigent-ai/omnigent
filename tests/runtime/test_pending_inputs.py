@@ -53,6 +53,33 @@ def test_unknown_delivery_stage_is_observable_without_overwriting_state(
     assert record.attributes["pending_id"] == pending_id
 
 
+@pytest.mark.parametrize("hold", [False, True])
+@pytest.mark.parametrize("identical_text", [False, True])
+def test_native_delivery_receipt_resolves_only_its_input(hold: bool, identical_text: bool) -> None:
+    """An out-of-order receipt preserves earlier inputs and supports persist rollback."""
+    first = pending_inputs.record("conv", [_text_block("earlier")])
+    second = pending_inputs.record(
+        "conv",
+        [_text_block("earlier")]
+        if identical_text
+        else [{"type": "input_file", "file_id": "file_current"}],
+    )
+    attempt = pending_inputs.delivery_attributes_for("conv", second)["delivery_attempt_id"]
+    drained = pending_inputs.resolve_delivery_attempt("conv", None, attempt, hold=hold)
+    assert drained is not None and drained.pending_id == second
+    assert pending_inputs.pending_ids("conv") == [first]
+    assert pending_inputs.resolve_delivery_attempt("conv", None, attempt, hold=hold) is None
+    if hold:
+        pending_inputs.restore("conv", drained)
+        assert pending_inputs.pending_ids("conv") == [first, second]
+        resolved = pending_inputs.resolve_delivery_attempt("conv", None, attempt)
+        assert resolved is not None
+        assert resolved.pending_id == drained.pending_id
+        assert resolved.content == drained.content
+        assert resolved.delivery_attempt_id == drained.delivery_attempt_id
+    assert pending_inputs.pending_ids("conv") == [first]
+
+
 @pytest.mark.parametrize("hold", [True, False])
 @pytest.mark.parametrize("interrupted", [True, False])
 def test_delivery_identity_and_original_enqueue_time_survive_retry_and_restore(
@@ -1222,6 +1249,7 @@ def test_stable_receipt_fallback_requires_restored_input_without_current_attempt
     identity = pending_inputs.delivery_attributes_for("conv", own)
     attempt = "b" * 32 if attempt_present else None
     if restored:
+        assert pending_inputs.resolve_delivery_attempt("conv", None, attempt) is None
         held = pending_inputs.resolve_delivery_attempt(
             "conv", own, attempt, stable_id=stable_id, hold=True
         )
@@ -1247,14 +1275,15 @@ def test_stable_receipt_fallback_requires_restored_input_without_current_attempt
 
 @pytest.mark.parametrize("operation", ["release", "restore"])
 @pytest.mark.parametrize("replacement_held", [False, True])
+@pytest.mark.parametrize("client_id_only", [False, True])
 def test_old_append_cannot_release_or_unhold_a_replacement_attempt(
-    operation: str, replacement_held: bool
+    operation: str, replacement_held: bool, client_id_only: bool
 ) -> None:
     stable_id = "c" * 32
     own = pending_inputs.record("conv", [_text_block("original")], stable_id=stable_id)
     attempt = pending_inputs.delivery_attributes_for("conv", own)["delivery_attempt_id"]
     old = pending_inputs.resolve_delivery_attempt(
-        "conv", own, attempt, stable_id=stable_id, hold=True
+        "conv", None if client_id_only else own, attempt, stable_id=stable_id, hold=True
     )
     assert old is not None
     pending_inputs.resolve("conv", own, delivery_attempt_id=attempt)
@@ -1279,12 +1308,15 @@ def test_old_append_cannot_release_or_unhold_a_replacement_attempt(
 @pytest.mark.parametrize(
     "replacement_completed", [False, True], ids=["cancelled", "replacement-completed"]
 )
-def test_held_restore_does_not_resurrect_a_retired_attempt(replacement_completed: bool) -> None:
+@pytest.mark.parametrize("client_id_only", [False, True])
+def test_held_restore_does_not_resurrect_a_retired_attempt(
+    replacement_completed: bool, client_id_only: bool
+) -> None:
     stable_id = "c" * 32
     own = pending_inputs.record("conv", [_text_block("original")], stable_id=stable_id)
     attempt = pending_inputs.delivery_attributes_for("conv", own)["delivery_attempt_id"]
     held = pending_inputs.resolve_delivery_attempt(
-        "conv", own, attempt, stable_id=stable_id, hold=True
+        "conv", None if client_id_only else own, attempt, stable_id=stable_id, hold=True
     )
     assert held is not None and held.strict_restore
     pending_inputs.resolve("conv", own, delivery_attempt_id=attempt)

@@ -676,28 +676,43 @@ def resolve(
 
 def resolve_delivery_attempt(
     conversation_id: str,
-    pending_id: str,
+    pending_id: str | None,
     delivery_attempt_id: str | None,
     *,
     stable_id: str | None = None,
     hold: bool = False,
 ) -> DrainedInput | None:
-    """Resolve one receipt without using text or consuming older queued inputs."""
+    """Resolve a full receipt or native client ID without consuming older inputs."""
+    if pending_id is None and delivery_attempt_id is None:
+        return None
     identity = {
-        "pending_id": pending_id,
+        **({"pending_id": pending_id} if pending_id is not None else {}),
         **(
             {"delivery_attempt_id": delivery_attempt_id} if delivery_attempt_id is not None else {}
         ),
         **({"input_stable_id": stable_id} if stable_id is not None else {}),
     }
-    if input_attributes(identity) != identity:
+    if input_attributes(identity) != identity or not identity:
+        if pending_id is None:
+            return None
         raise ValueError("Invalid native input receipt identity")
     with _lock:
         _evict_stale_locked(conversation_id, _now())
         entries = _pending.get(conversation_id)
-        entry = entries.get(pending_id) if entries is not None else None
+        if pending_id is None:
+            entry = next(
+                (
+                    candidate
+                    for candidate in (entries or {}).values()
+                    if not candidate.held and candidate.delivery_attempt_id == delivery_attempt_id
+                ),
+                None,
+            )
+        else:
+            entry = entries.get(pending_id) if entries is not None else None
         if entry is None:
             return None
+        pending_id = entry.pending_id
         restored_match = (
             entry.restored
             and entry.delivery_attempt_id is None

@@ -200,6 +200,7 @@ async def test_post_user_message_mirrors_a_spilled_paste_as_sent(
         return
     [(_url, body)] = client.posts
     assert body["type"] == "external_native_input_receipt"
+    assert "delivery_attempt_id" not in body["data"]
     assert body["data"]["item_data"]["content"] == [
         {"type": "input_text", "text": "what failed?"},
         {"type": "input_text", "text": paste},
