@@ -6,8 +6,8 @@ the work goes. Each entry has a kind:
 * ``plan``: the workflow graph the session follows. The newest one is the
   session's current plan; its version is its place among the session's plans.
 * ``status``: where one plan step stands, ``started``, ``done``,
-  ``needs_input`` (waiting for the user), ``blocked`` or ``failed``. The newest
-  status for a step is its current one.
+  ``needs_input`` (waiting for the user) or ``failed``. The newest status for a
+  step is its current one.
 * ``note``: Markdown the agent keeps for itself and for people, first line
   first.
 * ``dispatch``, ``dispatch_result`` and ``plan_status``: written by Omnigent,
@@ -36,7 +36,7 @@ JOURNAL_KINDS: tuple[str, ...] = (
 # The kinds an agent writes through its tools; Omnigent writes the rest.
 AGENT_KINDS: frozenset[str] = frozenset({"status", "note", "plan"})
 
-STEP_STATUSES: tuple[str, ...] = ("started", "done", "needs_input", "blocked", "failed")
+STEP_STATUSES: tuple[str, ...] = ("started", "done", "needs_input", "failed")
 # A step ID is short and stable, e.g. "propose"; it is stored in a column.
 STEP_ID_MAX_CHARS = 64
 _STEP_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")

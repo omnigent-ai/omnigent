@@ -205,14 +205,14 @@ class SysJournalWriteStatusTool(Tool):
             "Record where a plan step stands; the newest status is the step's current one. "
             "'started' when you begin a step yourself, or resume it; 'done' when it achieved "
             "its goal (only done lets later steps start); 'needs_input' when it waits for "
-            "the user (an approval, a decision, or a go-ahead they asked for): write it, "
-            "then ask them with your question tool so it reaches their Inbox; 'blocked' when "
-            "something outside the session stops it, such as CI being down; 'failed' when "
-            "its own work failed. text says why in a few words, and is required except for "
+            "the user: an approval, a decision, a go-ahead they asked for, or how to get "
+            "past something you can't clear yourself, such as CI being down. Write it, then "
+            "ask them with your question tool so it reaches their Inbox; 'failed' when its "
+            "own work failed. text says why in a few words, and is required except for "
             "started. Writing started on a done step reopens it. started and done need "
             "every step this one depends on to be done first; otherwise the write fails "
-            "with step_not_ready, naming them. A user stopping you is neither failed nor "
-            "blocked: leave the step started."
+            "with step_not_ready, naming them. A user stopping you isn't a failure: leave "
+            "the step started."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -231,7 +231,8 @@ class SysJournalWriteStatusTool(Tool):
                     "type": "string",
                     "maxLength": STATUS_TEXT_MAX_CHARS,
                     "description": (
-                        "Why, e.g. 'p95 430 ms', 'CI is down' or 'Approve the deploy to prod?'."
+                        "Why, e.g. 'p95 430 ms', 'Approve the deploy to prod?' or "
+                        "'CI is down: retry later, or skip the check?'."
                     ),
                 },
             },

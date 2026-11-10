@@ -36,8 +36,8 @@ agent can't run workflows and stop.
 - Write `done` when the step achieved its goal. Only `done` lets later steps
   start.
 - Keep going while any step is ready or started. Don't end your turn until
-  everything left is done, failed, blocked, waiting for the user, or waits on
-  one of those, unless the user or your instructions say to stop sooner.
+  everything left is done, failed, waiting for the user, or waits on one of
+  those, unless the user or your instructions say to stop sooner.
 - When a step needs the user (an approval or a decision), first finish the
   ready steps that don't depend on the answer, since asking pauses your turn.
   Then write `needs_input` on the step saying what you need, such as "Approve
@@ -48,15 +48,22 @@ agent can't run workflows and stop.
 - If the user asks you to stop and wait for them, write `needs_input` on every
   ready step, with text like "Paused at your request", then ask once whether
   to go on.
-- Write `blocked` when something outside the session stops a step, such as CI
-  being down or another team's review, and `failed` when its own work failed.
-  The text says why in a few words.
+- When something you can't clear yourself stops a step, such as CI being down
+  or a review you're waiting on, the user decides how to go on. If it may clear
+  by itself, such as a flaky check, retry once first. Then write `needs_input`
+  on the step saying what's in the way, and ask, offering the ways forward you
+  see (retry later, a workaround, or dropping the step) with your
+  recommendation.
+- In a run no one is watching, such as an automation's, don't ask: write
+  `needs_input` with the options and your recommendation, in a note if they
+  need more room, and go on with the steps that don't depend on it.
+- Write `failed` when a step's own work failed. The text says why in a few
+  words.
 - If the user stops you, leave the step you were on `started`; the Tasks tab
-  shows it as stopped while you're idle. A stop isn't the step failing and
-  doesn't block later steps, so don't write `failed` or `blocked` for it. Write
-  a note if it helps to say what's left.
-- When you resume, check your `blocked` and `needs_input` steps first, and
-  write a new status for any that can go ahead.
+  shows it as stopped while you're idle. A stop isn't the step failing, so
+  don't write `failed` for it. Write a note if it helps to say what's left.
+- When you resume, check your `needs_input` steps first, and write a new status
+  for any that can go ahead.
 - Replan with `sys_journal_write_plan` whenever the goal grows or changes. Keep
   step IDs stable across replans, so finished steps keep their status; give a
   step a new ID only when its work changes. Keep the plan's name while the

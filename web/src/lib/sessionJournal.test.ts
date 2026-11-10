@@ -53,7 +53,6 @@ describe("stepStatusLabel", () => {
 
   it("labels finished statuses whatever the session does", () => {
     expect(stepStatusLabel("done", 0, true, now)).toBe("Done");
-    expect(stepStatusLabel("blocked", 0, false, now)).toBe("Blocked");
     expect(stepStatusLabel("failed", 0, false, now)).toBe("Failed");
   });
 });
@@ -112,11 +111,10 @@ describe("stepProgress", () => {
     expect(isRestart(failed, [first])).toBe(false);
     expect(isRestart(status(3, "a", "started"), [first, failed])).toBe(true);
     expect(isRestart(status(4, "b", "started"), [first, failed])).toBe(false);
-    // Starting again after waiting for the user, a block or a stop resumes the attempt.
+    // Starting again after waiting for the user or a stop resumes the attempt.
     expect(isRestart(status(3, "a", "started"), [first, status(2, "a", "needs_input")])).toBe(
       false,
     );
-    expect(isRestart(status(3, "a", "started"), [first, status(2, "a", "blocked")])).toBe(false);
     expect(isRestart(status(3, "a", "started"), [first])).toBe(false);
     expect(isRestart(status(3, "a", "started"), [first, status(2, "a", "done")])).toBe(true);
   });
@@ -145,7 +143,6 @@ describe("stepProgress", () => {
       stopped: 1,
       needs_input: 0,
       done: 2,
-      blocked: 0,
       failed: 0,
     });
   });
@@ -156,11 +153,11 @@ describe("stepProgress", () => {
     expect(planName(null)).toBeNull();
   });
 
-  it("counts failed steps as finished, and blocked or stopped ones as not", () => {
+  it("counts failed steps as finished, and waiting or stopped ones as not", () => {
     const written = [
       status(1, "a", "done"),
       status(2, "b", "failed"),
-      status(3, "c", "blocked"),
+      status(3, "c", "needs_input"),
       status(4, "d", "started"),
     ];
     const progress = stepProgress(planSteps(plan(0, ["a"], ["b"], ["c"], ["d"])), written, false);
@@ -184,7 +181,7 @@ describe("stepProgress", () => {
     const named = stepsWithoutPlan([
       status(0, "a", "started"),
       status(1, "a", "done"),
-      status(2, "b", "blocked"),
+      status(2, "b", "needs_input"),
     ]);
     expect(named.map((step) => [step.id, step.name])).toEqual([
       ["a", "a"],
@@ -207,9 +204,8 @@ describe("pausedLabel", () => {
     );
   });
 
-  it("says nothing once only waits for the user or blocks are left", () => {
+  it("says nothing once only tasks waiting for the user are left", () => {
     expect(label([chain, status(1, "a", "done"), status(2, "b", "needs_input")])).toBeNull();
-    expect(label([chain, status(1, "a", "done"), status(2, "b", "blocked")])).toBeNull();
     expect(label([chain, status(1, "a", "done"), status(2, "b", "done")])).toBeNull();
   });
 });
@@ -289,12 +285,6 @@ describe("taskPreviewText", () => {
       true,
     );
     expect(taskPreviewText(asking)).toBe("Waiting for you: approve");
-    const blocked = stepProgress(
-      planSteps(plan(0, ["ship"])),
-      [status(1, "ship", "blocked")],
-      false,
-    );
-    expect(taskPreviewText(blocked)).toBe("Blocked: ship");
     // A task left started while the session is idle says so.
     const stopped = stepProgress(
       planSteps(plan(0, ["deploy"])),

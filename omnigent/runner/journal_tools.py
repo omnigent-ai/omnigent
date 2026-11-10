@@ -48,7 +48,6 @@ _STATUS_GLYPHS = {
     "started": "▶",
     "done": "✅",
     "needs_input": "✋",
-    "blocked": "🚧",
     "failed": "❌",
 }
 # What a server answers for a path it has no route for, unlike a route's own

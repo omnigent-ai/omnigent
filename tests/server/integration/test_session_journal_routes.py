@@ -334,7 +334,8 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
     early = await run("sys_journal_write_status", {"status": "started", "step": "ship"})
     assert early["error"].startswith("step_not_ready: ship waits on nightly, not done yet")
     await run(
-        "sys_journal_write_status", {"status": "blocked", "step": "nightly", "text": "CI is down"}
+        "sys_journal_write_status",
+        {"status": "needs_input", "step": "nightly", "text": "CI is down: retry later?"},
     )
 
     read = await run("sys_journal_read", {})
@@ -344,7 +345,7 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
         "status [nightly] ▶ started",
         "note [nightly]: Retry the flaky e2e first\n    then bump the image",
         'plan v2 "Green nightly, then ship" (agent): added ship',
-        "status [nightly] 🚧 blocked: CI is down",
+        "status [nightly] ✋ needs_input: CI is down: retry later?",
     ]
     assert lines[0].startswith("#0 ") and read["page"] == {"has_more": False, "next_cursor": None}
 
