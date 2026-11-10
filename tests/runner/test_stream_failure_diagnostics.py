@@ -520,7 +520,10 @@ async def test_oversized_pane_snapshot_is_bounded(tmp_path: Path) -> None:
 
 
 def _required_terminal_exit(
-    session_was_idle: bool, expected_close: bool = False, closed_outside_omnigent: bool = False
+    session_was_idle: bool,
+    expected_close: bool = False,
+    closed_outside_omnigent: bool = False,
+    session_was_waiting: bool = False,
 ) -> TerminalExitEvent:
     """Build the exit the registry publishes when the session's Claude pane dies."""
     return TerminalExitEvent(
@@ -534,9 +537,23 @@ def _required_terminal_exit(
         cwd="/work",
         last_output="Waiting for the API key helper...\n",
         session_was_idle=session_was_idle,
+        session_was_waiting=session_was_waiting,
         expected_close=expected_close,
         closed_outside_omnigent=closed_outside_omnigent,
     )
+
+
+def _session_statuses(conv_id: str) -> list[dict[str, Any]]:
+    """Drain and return every ``session.status`` event published for *conv_id*."""
+    from omnigent.runner.app import _session_event_queues_ref
+
+    queue = _session_event_queues_ref.get(conv_id)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        item = queue.get_nowait()
+        if isinstance(item, dict) and item.get("type") == "session.status":
+            statuses.append(item)
+    return statuses
 
 
 def _failed_statuses(conv_id: str) -> list[dict[str, Any]]:
@@ -649,6 +666,44 @@ async def test_stream_drop_after_required_terminal_exit_reports_the_exit(
     ]
     assert len(ended) == 1, caplog.text
     assert ended[0].attributes["exception_type"] == "ReadError"
+
+
+@pytest.mark.asyncio
+async def test_stream_drop_after_required_terminal_exit_during_a_background_agent_hold(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pane that dies while its finished turn waits on a background agent settles idle.
+
+    The server keeps ``waiting`` and the agent list until a status edge ends them,
+    and once the pane is gone the exit handler is the only thing left to send one.
+    The release that follows may still sever a stream, which must not turn this
+    clean exit into a failure.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    _session_event_queues_ref.pop(_CONV_ID, None)
+    publish: dict[str, Callable[[TerminalExitEvent], None]] = {}
+    app = _make_app(
+        cause="ReadError(ClosedResourceError())",
+        before_drop=lambda: publish["exit"](
+            _required_terminal_exit(session_was_idle=True, session_was_waiting=True)
+        ),
+    )
+    publish["exit"] = app.state.session_resource_registry._terminal_exit_publisher
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            events = await _streamed_events(app, _CONV_ID)
+        statuses = [s["status"] for s in _session_statuses(_CONV_ID)]
+    finally:
+        _session_event_queues_ref.pop(_CONV_ID, None)
+
+    assert [e for e in events if e.get("type") == "response.failed"] == [], events
+    assert "idle" in statuses, statuses
+    assert "failed" not in statuses, statuses
+    assert _CONV_ID not in app.state.required_terminal_exit_errors
+    assert [
+        r for r in caplog.records if getattr(r, "event_name", None) == "harness_stream_failed"
+    ] == []
 
 
 @pytest.mark.asyncio

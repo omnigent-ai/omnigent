@@ -523,8 +523,10 @@ export interface ClientTaskCancel {
  *
  * `launching` means a task/session exists but has not emitted a concrete
  * harness-start signal. `waiting` arrives when the parent agent loop parks
- * on background tools / sub-agents. The session snapshot's `status` never
- * reports `waiting`; it is live-only.
+ * on background tools / sub-agents, or when a claude-native turn ends with a
+ * background agent still running (then `backgroundAgents` names them). The
+ * session snapshot's wire status stays `running` for that claude-native case,
+ * with `background_agents` set; the API adapter turns that pair into `waiting`.
  */
 export interface SessionStatusEvent {
   type: "session_status";
@@ -538,6 +540,11 @@ export interface SessionStatusEvent {
    * absent when the edge carries no detail.
    */
   backgroundTasks?: BackgroundTaskInfo[];
+  /**
+   * Background agents a finished claude-native turn left running, on its
+   * `waiting` edge. Absent on every other edge.
+   */
+  backgroundAgents?: BackgroundTaskInfo[];
   /**
    * Short phrase naming what a still-`running` session is parked on, e.g.
    * "permission prompt". Terminal-backed agents can block on a dialog the
