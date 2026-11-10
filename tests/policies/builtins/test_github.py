@@ -32,7 +32,7 @@ from omnigent.policies.builtins._shell import (
     split_command_segments,
 )
 from omnigent.policies.builtins.github import _DEFAULT_SHELL_TOOLS as _github_default_shell_tools
-from omnigent.policies.builtins.github import github_policy
+from omnigent.policies.builtins.github import _normalize_repo, github_policy
 from omnigent.policies.builtins.orchestration import _SHELL_TOOLS as _orchestration_shell_tools
 from omnigent.policies.builtins.working_dir import (
     _DEFAULT_SHELL_TOOLS as _working_dir_default_shell_tools,
@@ -1293,3 +1293,113 @@ def test_registry_validates_factory_params() -> None:
     err_unknown = validate_factory_params(_HANDLER, {"bogus": 1})
     assert err_unknown is not None and "bogus" in err_unknown
     assert validate_factory_params(_HANDLER, {"read_all": "yes"}) is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Write targets — repository authority comes from the command's target operand
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _target_action(
+    command: str, *, restrict_branches: bool = True, allow_destructive: bool = False
+) -> str:
+    """Return the decision for *command* under an ``example/allowed`` write allowlist."""
+    policy = github_policy(
+        write_repos=["example/allowed"],
+        write_branches=["main"] if restrict_branches else None,
+        allow_destructive=allow_destructive,
+    )
+    return _action(policy(_sh(command)))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://elsewhere.example/github.com/example/allowed",
+        "https://github.com.elsewhere.example/example/allowed",
+        "https://lookalike-github.com/example/allowed",
+        "https://example.com/?next=https://github.com/example/allowed",
+    ],
+)
+def test_repository_url_with_foreign_host_is_not_github(url: str) -> None:
+    """Only a URL whose host is exactly ``github.com`` yields a repository."""
+    assert _normalize_repo(url) == ""
+    assert _target_action(f"git push {url} main") == "ASK"
+
+
+def test_repository_url_is_normalized_for_github_host() -> None:
+    assert _normalize_repo("https://github.com/Example/Allowed/pull/1") == "example/allowed"
+    assert _normalize_repo("git@github.com:Example/Allowed.git") == "example/allowed"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push https://github.com/example/allowed/../other main",
+        "git push https://github.com/example/allowed/extra main",
+        "git push https://github.com/example/allowed/pull/1 main",
+        "gh pr merge https://github.com/example/allowed/../other/pull/1",
+    ],
+)
+def test_repository_url_with_extra_path_segments_is_not_trusted(command: str) -> None:
+    assert _target_action(command) == "ASK"
+
+
+def test_gh_write_uses_only_an_explicit_target() -> None:
+    assert (
+        _target_action("gh pr create --body https://github.com/example/allowed --base main")
+        == "ASK"
+    )
+    assert (
+        _target_action("gh pr create -R example/other --body https://github.com/example/allowed")
+        == "DENY"
+    )
+    assert _target_action("gh pr create -R example/allowed --base main") == "ALLOW"
+    assert _target_action("gh -R example/allowed pr create --base main") == "ALLOW"
+    assert _target_action("gh -R example/other pr create --base main") == "DENY"
+    assert _target_action("gh --unknown-global pr create -R example/allowed") == "ASK"
+    assert _target_action("gh pr merge https://github.com/example/allowed/pull/1") == "ALLOW"
+    assert _target_action("gh repo create example/allowed") == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        (
+            "gh api -X POST repos/example/other/issues -f body=https://github.com/example/allowed",
+            "DENY",
+        ),
+        (
+            "gh api -X POST repos/example/allowed/issues -f body=https://github.com/example/other",
+            "ALLOW",
+        ),
+        ("gh api -f body=repos/example/allowed/issues -X POST repos/example/other/issues", "DENY"),
+        (
+            "gh api -H X-Trace:repos/example/allowed/issues -X POST repos/example/other/issues",
+            "DENY",
+        ),
+        ("gh api --unknown-flag repos/example/allowed/issues -X POST", "ASK"),
+        ("gh api -X POST -- repos/example/allowed/issues", "ALLOW"),
+        ("gh api -X FOO repos/example/other/issues", "ASK"),
+        ("gh api --method=POST repos/example/other/issues", "DENY"),
+        ("gh api https://api.github.com/repos/example/allowed/issues -X POST", "ALLOW"),
+        ("gh api -X POST https://elsewhere.example/repos/example/allowed/issues", "ASK"),
+        (
+            "gh api -R example/allowed -X POST https://elsewhere.example/repos/example/allowed/issues",
+            "ASK",
+        ),
+        ("gh api -R example/allowed graphql -X POST", "ASK"),
+        ("gh api repos/example/other/issues -XGET -XPOST", "DENY"),
+        ("gh api repos/example/other/issues --input=body.json", "DENY"),
+        ("gh api -X POST repos/example/allowed/../other/issues", "ASK"),
+        ("gh api -X POST repos/example/allowed/issues --hostname other.example", "ASK"),
+    ],
+)
+def test_gh_api_repository_comes_from_the_endpoint(command: str, expected: str) -> None:
+    assert _target_action(command) == expected
+
+
+def test_gh_api_delete_is_destructive() -> None:
+    command = "gh api -X DELETE repos/example/allowed/issues/1"
+    assert _target_action(command) == "DENY"
+    assert _target_action(command, allow_destructive=True) == "ALLOW"
