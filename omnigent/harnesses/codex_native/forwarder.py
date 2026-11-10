@@ -6808,6 +6808,17 @@ async def _send_codex_async_question_reply_once(
     start_state = read_bridge_state(tracked_bridge_dir) if tracked_bridge_dir is not None else None
     if start_state is not None and start_state.thread_id != thread_id:
         start_state = None
+    if start_state is not None and start_state.active_turn_id:
+        # Steer a turn that started before this re-read, not the rejected one.
+        await codex_client.request(
+            "turn/steer",
+            {
+                "threadId": thread_id,
+                "expectedTurnId": start_state.active_turn_id,
+                "input": input_items,
+            },
+        )
+        return
     # A turn started meanwhile absorbs this input instead of starting another.
     response = await codex_client.request(
         "turn/start",

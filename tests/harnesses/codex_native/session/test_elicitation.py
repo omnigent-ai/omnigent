@@ -1114,40 +1114,57 @@ def test_forwarder_starts_turn_for_codex_async_question_answer_when_idle(
     assert state.active_turn_id == "turn_reply"
 
 
-def test_forwarder_keeps_turn_started_while_codex_async_question_turn_start_is_pending(
+@pytest.mark.parametrize(
+    ("stale_turn_id", "expected_requests"),
+    [
+        (None, [("turn/start", None)]),
+        ("turn_123", [("turn/steer", "turn_123"), ("turn/steer", "turn_real")]),
+    ],
+    ids=["during_turn_start", "before_recovery_reread"],
+)
+def test_forwarder_keeps_turn_started_while_codex_async_question_answer_is_pending(
     tmp_path: Path,
+    stale_turn_id: str | None,
+    expected_requests: list[tuple[str, str | None]],
 ) -> None:
     """
-    A turn that starts before Codex acknowledges the answer's ``turn/start`` stays tracked.
+    A turn that starts while the answer is being delivered stays tracked.
 
-    Codex folds the answer into that turn and acknowledges a turn id that never
-    starts. Recording the acknowledged id would keep the bridge busy after the
-    real turn completes.
+    Codex folds a ``turn/start`` into that turn and acknowledges a turn id that
+    never starts, so the answer must steer it. Tracking any other turn would
+    keep the bridge busy after the real turn completes.
     """
-    _write_forwarder_bridge(tmp_path, active_turn_id=None)
+    _write_forwarder_bridge(tmp_path, active_turn_id=stale_turn_id)
     fake_client = _FakeCodexAppServerClient()
-    start_sent = asyncio.Event()
+    delivery_sent = asyncio.Event()
     real_turn_started = asyncio.Event()
     tracked_turn_ids: list[str | None] = []
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
-        Acknowledge ``turn/start`` only after another turn has started.
+        Answer the first delivery request only after another turn has started.
 
         :param method: JSON-RPC method.
         :param params: JSON-RPC params.
         :returns: JSON-RPC response envelope.
+        :raises CodexAppServerResponseError: For a steer of the stale turn.
         """
         fake_client.requests.append((method, params))
-        start_sent.set()
+        if params.get("expectedTurnId") == "turn_real":
+            return {"result": {}}
+        delivery_sent.set()
         await real_turn_started.wait()
+        if method == "turn/steer":
+            raise CodexAppServerResponseError(
+                {"code": -32600, "message": "no active turn to steer"}
+            )
         return {"result": {"turn": {"id": "turn_reply"}}}
 
     fake_client.request = fake_request  # type: ignore[method-assign]
 
     async def run_real_turn(client: httpx.AsyncClient, context: dict[str, Any]) -> None:
         """
-        Start a turn while the answer's ``turn/start`` is pending, then complete it.
+        Start a turn while the first delivery request is pending, then complete it.
 
         :param client: Forwarder HTTP client.
         :param context: Forwarder event-handling context.
@@ -1168,7 +1185,7 @@ def test_forwarder_keeps_turn_started_while_codex_async_question_turn_start_is_p
                 codex_client=fake_client,  # type: ignore[arg-type]
             )
 
-        await asyncio.wait_for(start_sent.wait(), timeout=30.0)
+        await asyncio.wait_for(delivery_sent.wait(), timeout=30.0)
         await handle(_started_event("turn_real"))
         real_turn_started.set()
         await asyncio.wait_for(context["elicitation_tracker"].drain(), timeout=30.0)
@@ -1183,7 +1200,9 @@ def test_forwarder_keeps_turn_started_while_codex_async_question_turn_start_is_p
         while_delivering=run_real_turn,
     )
 
-    assert [method for method, _params in fake_client.requests] == ["turn/start"]
+    assert [
+        (method, params.get("expectedTurnId")) for method, params in fake_client.requests
+    ] == expected_requests
     assert tracked_turn_ids == ["turn_real", None]
 
 
