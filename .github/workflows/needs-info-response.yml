@@ -14,6 +14,11 @@ concurrency:
 
 jobs:
   retriage:
+    # A called workflow cannot exceed this grant; it mirrors priority onto PRs.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     if: >-
       !endsWith(github.event.sender.login, '[bot]') &&
       !github.event.issue.pull_request &&
@@ -22,6 +27,7 @@ jobs:
       contains(github.event.issue.labels.*.name, 'needs-info')
     uses: ./.github/workflows/issue-prioritization-v2.yml
     with:
+      pipeline: needs-info-response
       issue_number: ${{ github.event.issue.number }}
       # Re-check live state inside the called workflow. The expiry worker may
       # close the issue after this webhook payload was created.

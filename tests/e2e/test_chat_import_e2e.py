@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -11,6 +12,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from tests.e2e.conftest import configure_mock_llm
 
 
 def _write_jsonl_import_fixture(home: Path, harness: str) -> str:
@@ -141,62 +144,66 @@ def _write_jsonl_import_fixture(home: Path, harness: str) -> str:
     return f"-repo:{session_id}" if harness == "qwen" else session_id
 
 
-def _write_opencode_cli_fixture(home: Path) -> tuple[Path, str]:
-    """Write a fake public OpenCode CLI and return its bin dir plus session id."""
-    session_id = "ses_import_e2e"
-    listing = [
-        {
-            "id": session_id,
-            "title": "OpenCode import",
-            "updated": 1784247215390,
-            "created": 1784247214912,
-            "directory": "/repo",
-        }
-    ]
-    export = {
-        "info": {"id": session_id, "directory": "/repo", "version": "1.17.18"},
-        "messages": [
-            {
-                "info": {"id": "msg_user", "role": "user"},
-                "parts": [{"type": "text", "text": "inspect TODO.md"}],
-            },
-            {
-                "info": {"id": "msg_assistant", "role": "assistant"},
-                "parts": [
-                    {
-                        "type": "tool",
-                        "callID": "call_1",
-                        "tool": "bash",
-                        "state": {
-                            "status": "completed",
-                            "input": {"command": "rg TODO"},
-                            "output": "TODO.md:1:item",
-                        },
-                    },
-                    {"type": "text", "text": "Done."},
-                ],
-            },
-        ],
-    }
-    bin_dir = home / "bin"
-    executable = bin_dir / "opencode"
-    bin_dir.mkdir(parents=True)
-    executable.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json\n"
-        "import sys\n"
-        f"listing = {listing!r}\n"
-        f"export = {export!r}\n"
-        "if sys.argv[1:3] == ['session', 'list']:\n"
-        "    print(json.dumps(listing))\n"
-        f"elif sys.argv[1:] == ['export', '{session_id}', '--pure']:\n"
-        "    print(json.dumps(export))\n"
-        "else:\n"
-        "    raise SystemExit(2)\n",
-        encoding="utf-8",
+def _write_opencode_store(root: Path, mock_url: str) -> tuple[Path, str, Path]:
+    """Create a real OpenCode 2.x store holding one titled session with a finished turn.
+
+    OpenCode only persists messages from a turn that runs, so ``opencode serve``
+    answers one prompt from the scripted mock model.
+    """
+    from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
+    from omnigent.harnesses.opencode_native.bridge import (
+        opencode_db_path_for_bridge_dir,
+        xdg_config_home_for_bridge_dir,
     )
-    executable.chmod(0o755)
-    return bin_dir, session_id
+    from omnigent.harnesses.opencode_native.forwarder import _history_message_settled
+    from omnigent.harnesses.opencode_native.provider import (
+        OpenCodeGatewayResolution,
+        build_opencode_config,
+        write_opencode_provider_config,
+    )
+
+    bridge = root / "opencode-bridge"
+    workspace = root / "repo"
+    workspace.mkdir(parents=True)
+    gateway = OpenCodeGatewayResolution(
+        base_url=f"{mock_url}/v1",
+        api_key="mock-key",
+        model_id="opencode-import",
+        provider_id="mock",
+    )
+    config = build_opencode_config(
+        model=None, gateway=gateway, mcp_servers={}, plugin_paths=[], instructions=None
+    )
+    write_opencode_provider_config(xdg_config_home_for_bridge_dir(bridge), config)
+    configure_mock_llm(mock_url, [{"text": "Found one TODO."}], match="inspect TODO.md")
+
+    async def _build() -> str:
+        server = OpenCodeNativeServer(bridge_dir=bridge, workspace=workspace)
+        await server.start()
+        try:
+            client = server.client()
+            try:
+                session = await client.create_session(
+                    title="OpenCode import", directory=str(workspace)
+                )
+                await client.prompt(session.id, text="inspect TODO.md")
+                deadline = asyncio.get_running_loop().time() + 60
+                while asyncio.get_running_loop().time() < deadline:
+                    messages = await client.list_messages(session.id)
+                    if any(
+                        message.get("type") == "assistant" and _history_message_settled(message)
+                        for message in messages
+                    ):
+                        return session.id
+                    await asyncio.sleep(0.5)
+                raise AssertionError(f"OpenCode never finished the seeding turn: {messages}")
+            finally:
+                await client.aclose()
+        finally:
+            await server.close()
+
+    session_id = asyncio.run(_build())
+    return opencode_db_path_for_bridge_dir(bridge), session_id, workspace
 
 
 def _write_force_import_fixture(home: Path, harness: str, text: str) -> str:
@@ -617,17 +624,23 @@ def test_cli_imports_jsonl_harness_chat_end_to_end(
     assert item_data[1]["model"] == f"{harness}-native-ui"
 
 
-def test_cli_imports_opencode_export_end_to_end(
+def test_cli_imports_opencode_store_end_to_end(
     live_server: str,
+    mock_llm_server_url: str | None,
     tmp_path: Path,
 ) -> None:
-    """The real CLI discovers and imports OpenCode's public JSON export."""
-    bin_dir, source_session_id = _write_opencode_cli_fixture(tmp_path)
+    """The real CLI finds and imports a session from a real OpenCode 2.x store."""
+    from tests.e2e._opencode_native_helpers import require_opencode
+
+    if mock_llm_server_url is None:
+        pytest.skip("seeding the OpenCode store needs the scripted mock model")
+    require_opencode()
+    store, source_session_id, workspace = _write_opencode_store(tmp_path, mock_llm_server_url)
     env = os.environ.copy()
     env.update(
         {
             "HOME": str(tmp_path),
-            "PATH": f"{bin_dir}{os.pathsep}{env.get('PATH', '')}",
+            "OPENCODE_DB": str(store),
             "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
             "OMNIGENT_DATA_DIR": str(tmp_path / "omnigent-data"),
         }
@@ -649,12 +662,12 @@ def test_cli_imports_opencode_export_end_to_end(
         check=True,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=120,
         env=env,
     )
 
     match = re.search(
-        rf"Imported 4 item\(s\) from {source_session_id} into \S+/c/(\S+)",
+        rf"Imported \d+ item\(s\) from {source_session_id} into \S+/c/(\S+)",
         result.stdout,
     )
     assert match is not None, result.stdout
@@ -667,18 +680,22 @@ def test_cli_imports_opencode_export_end_to_end(
     session.raise_for_status()
     session_data = session.json()
     assert session_data["external_session_id"] == source_session_id
-    assert session_data["workspace"] == "/repo"
-    assert session_data["title"] == "inspect TODO.md"
+    assert session_data["workspace"] == str(workspace)
+    assert session_data["title"] == "OpenCode import"
     items = httpx.get(
         f"{live_server}/v1/sessions/{imported_session_id}/items",
         timeout=10,
     )
     items.raise_for_status()
-    item_data = items.json()["data"]
-    assert [item["type"] for item in item_data] == [
-        "message",
-        "function_call",
-        "function_call_output",
-        "message",
+    messages = [
+        "".join(block.get("text", "") for block in item.get("content") or [])
+        for item in items.json()["data"]
+        if item["type"] == "message" and item.get("role") == "user"
     ]
-    assert item_data[1]["model"] == "opencode-native-ui"
+    assert messages == ["inspect TODO.md"]
+    assert any(
+        item["type"] == "message"
+        and item.get("role") == "assistant"
+        and "Found one TODO." in json.dumps(item.get("content"))
+        for item in items.json()["data"]
+    ), items.json()["data"]

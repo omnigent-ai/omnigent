@@ -4,7 +4,7 @@ Guarded hazard: after a Codex (codex-native) session runs a turn to
 completion, ``/compact`` from the web composer can silently do nothing — no
 "Compacting conversation…" spinner, no "Conversation compacted" marker, no
 error. The compact POST 200s: the server forwards the control to the runner,
-whose ``_inject_codex_compact`` (``omnigent/runner/app.py``) types
+whose ``_inject_codex_slash_command`` (``omnigent/runner/native_controls.py``) types
 ``/compact`` into the Codex TUI's tmux pane and presses Enter. Codex's
 slash-command popup renders asynchronously, so an Enter sent back-to-back
 with the typed command is swallowed by the still-opening popup and the

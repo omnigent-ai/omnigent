@@ -65,6 +65,7 @@ def test_repl_cancel_re_arms_for_next_turn(
     try:
         child.expect(r"❯ ", timeout=_BOOT_TIMEOUT)
         submit_prompt(child, _LONG_PROMPT)
+        child.expect("working", timeout=_INITIAL_RUNNING_BUDGET)
         # A spinner can precede runner startup; wait for the model request itself.
         with httpx.Client(base_url=mock_llm_server_url, timeout=5.0, trust_env=False) as mock:
             poll_until(

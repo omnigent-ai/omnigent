@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -653,6 +654,104 @@ async def test_call_tool_network_error_raises() -> None:
     error_msg = str(exc_info.value)
     assert "github__search" in error_msg, "Tool name must appear in the error message"
     assert "conv_test" in error_msg, "Session id must appear in the error message"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_id", ["00000000-0000-4000-8000-000000000001", "private-header"])
+async def test_call_tool_http_failure_keeps_operation_evidence_without_replaying(
+    caplog: pytest.LogCaptureFixture, request_id: str
+) -> None:
+    response = httpx.Response(
+        504,
+        text="private-response-body",
+        headers={"x-request-id": request_id, "authorization": "private-credential"},
+    )
+    transport = _StubTransport([response])
+    manager = _make_manager(transport)
+
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="504"):
+        await manager.call_tool(None, "sys_os_shell", {"command": "private-shell-command"})
+
+    assert len(transport.calls) == 1
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "mcp_proxy_call_failed"
+    ]
+    attrs = record.attributes
+    assert attrs["operation_id"] == transport.calls[0].body["params"][MCP_OPERATION_ID_PARAM]
+    assert attrs["jsonrpc_request_id"] == 1
+    assert attrs["failure_phase"] == "http_status"
+    assert attrs["http_status"] == 504
+    assert attrs["exception_type"] == "HTTPStatusError"
+    assert attrs["proxy_route"] == "session"
+    assert attrs["phase_elapsed_ms"] >= 0
+    assert attrs.get("upstream_request_id") == (
+        request_id if request_id != "private-header" else None
+    )
+    assert "private-" not in record.getMessage() + json.dumps(attrs)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_failed_diagnostics_preserves_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner import proxy_mcp_manager
+
+    def broken_sink(*args: Any, **kwargs: Any) -> None:
+        raise ValueError("logging unavailable")
+
+    monkeypatch.setattr(proxy_mcp_manager._logger, "warning", broken_sink)
+    transport = _StubTransport([httpx.Response(504)])
+    manager = _make_manager(transport)
+
+    with pytest.raises(RuntimeError, match="504") as failure:
+        await manager.call_tool(None, "sys_os_shell", {})
+
+    assert isinstance(failure.value.__cause__, httpx.HTTPStatusError)
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained", [True, False])
+async def test_call_tool_server_reattach_failure_keeps_operation_evidence(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, retained: bool
+) -> None:
+    from omnigent.runner import proxy_mcp_manager
+
+    monkeypatch.setattr(proxy_mcp_manager, "_SERVER_RECONNECT_WAIT_S", 0.0)
+    request_id = "00000000-0000-4000-8000-000000000001"
+    response = _json_resp({"error": {"code": RUNNER_MCP_EXECUTION_DETACHED_CODE}})
+    response.headers["x-request-id"] = request_id
+    transport = _StubTransport([response])
+    registry = McpExecutionRegistry() if retained else None
+    pending_approvals.reset_for_tests()
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+            manager = ProxyMcpManager(
+                session_id="conv_test", ap_client=client, execution_registry=registry
+            )
+            expected = "no replacement" if retained else "without a reserved"
+            with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match=expected):
+                await manager.call_tool(None, "sys_os_write", {"content": "private-file-content"})
+    finally:
+        pending_approvals.reset_for_tests()
+
+    assert len(transport.calls) == 1
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "mcp_proxy_call_failed"
+    ]
+    attrs = record.attributes
+    assert attrs["operation_id"] == transport.calls[0].body["params"][MCP_OPERATION_ID_PARAM]
+    assert attrs["failure_phase"] == "server_reattach"
+    assert attrs["exception_type"] == ("TimeoutError" if retained else "none")
+    assert attrs["reattach_trigger"] == "detached_response"
+    assert attrs["http_status"] == 200
+    assert attrs["upstream_request_id"] == request_id
+    assert attrs["operation_retained"] is retained
+    assert attrs["server_generation"] == attrs["observed_server_generation"] == 0
+    assert attrs["phase_elapsed_ms"] >= 0
+    assert "private-" not in record.getMessage() + json.dumps(attrs)
+    if registry is not None:
+        assert not registry.has_operation("conv_test", attrs["operation_id"])
 
 
 # ── dispatch timeout nesting ────────────────────────────────────────────────

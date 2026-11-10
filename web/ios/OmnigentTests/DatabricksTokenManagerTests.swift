@@ -130,7 +130,8 @@ final class DatabricksTokenManagerTests: XCTestCase {
 
   func testTransientErrorsAndMalformedResponsesRetainCredentials() async throws {
     for error in [
-      DatabricksOAuthError.networkUnavailable, .tokenExchangeFailed, .invalidTokenResponse,
+      DatabricksOAuthError.networkUnavailable(DatabricksTransportFailure(URLError(.timedOut))),
+      .tokenExchangeFailed, .invalidTokenResponse,
     ] {
       let store = MemoryDatabricksCredentialStore()
       let scope = try credentialScope()
@@ -339,7 +340,7 @@ private actor RefreshStub: DatabricksTokenRefreshing {
 
   init(
     response: Result<DatabricksOAuthTokens, Error> = .failure(
-      DatabricksOAuthError.networkUnavailable)
+      DatabricksOAuthError.networkUnavailable(DatabricksTransportFailure(URLError(.timedOut))))
   ) {
     self.response = response
     onRequest = nil

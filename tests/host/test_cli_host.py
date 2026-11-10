@@ -347,6 +347,134 @@ def test_host_enable_subcommand_installs_user_service(
     assert "Enabled the Omnigent host user service for local" in result.output
 
 
+def _record_for(target: str) -> cli_module._HostDaemonRecord:
+    """Build a live-looking daemon record for ``target``."""
+    return cli_module._HostDaemonRecord(
+        pid=4242,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=None,
+        started_at=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "listings", "waits"),
+    [
+        pytest.param([], [2, 1, 0], True, id="waits-for-running-turns"),
+        pytest.param(["--force"], [2], False, id="force-replaces-now"),
+        pytest.param([], [None], False, id="unreadable-listing-does-not-block"),
+    ],
+)
+def test_host_enable_lets_running_turns_finish_before_replacing_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+    listings: list[int | None],
+    waits: bool,
+) -> None:
+    """Re-enabling the service replaces a live daemon only once its turns finish."""
+    from omnigent.host.service import HostService
+
+    target = "https://server.example.com"
+    events: list[str] = []
+    remaining = list(listings)
+
+    def _sessions(
+        record: cli_module._HostDaemonRecord, *, connected_only: bool = False
+    ) -> cli_module._DaemonSessionsResult:
+        assert record.target == target
+        assert connected_only is True
+        running = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        events.append(f"list:{running}")
+        if running is None:
+            return cli_module._DaemonSessionsResult(base_url=target, sessions=[], error="boom")
+        sessions = [{"id": f"conv_{index}", "status": "running"} for index in range(running)]
+        return cli_module._DaemonSessionsResult(
+            base_url=target,
+            sessions=[*sessions, {"id": "conv_idle", "status": "idle"}],
+            error=None,
+        )
+
+    def _terminate(record: cli_module._HostDaemonRecord, *, force: bool) -> str:
+        assert force is False
+        events.append("terminate")
+        return cli_module._STOP_TERMINATED
+
+    def _enable(server_url: str | None, *, environment: dict[str, str]) -> HostService:
+        del environment
+        events.append("enable")
+        service_path = tmp_path / "omnigent-host.service"
+        return HostService(kind="systemd_user", path=service_path, label=service_path.name)
+
+    monkeypatch.setattr("omnigent.cli._resolve_host_server", lambda server: target)
+    monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli._find_daemon_record", _record_for)
+    monkeypatch.setattr("omnigent.cli._daemon_owner_is_live", lambda record: True)
+    monkeypatch.setattr("omnigent.cli._sessions_for_daemon", _sessions)
+    monkeypatch.setattr("omnigent.cli._terminate_daemon", _terminate)
+    monkeypatch.setattr("omnigent.cli._UPGRADE_DRAIN_POLL_S", 0.0)
+    monkeypatch.setattr(
+        "omnigent.cli._build_host_daemon_env",
+        lambda *, server_url: {"HOME": str(tmp_path)},
+    )
+    monkeypatch.setattr("omnigent.host.service.enable_user_host_service", _enable)
+
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", target, *args])
+
+    assert result.exit_code == 0, result.output
+    if waits:
+        assert events == ["list:2", "list:1", "list:0", "terminate", "enable"]
+        assert "Waiting for 2 running session(s) to finish" in result.output
+        assert "--force to replace the host now" in result.output
+        assert "1 session(s) still running" in result.output
+    elif args == ["--force"]:
+        assert events == ["terminate", "enable"]
+    else:
+        assert events == ["list:None", "terminate", "enable"]
+        assert "Waiting for" not in result.output
+
+
+def test_host_enable_does_not_wait_on_a_dead_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead daemon's stale running rows can't finish, so enable replaces it at once."""
+    from omnigent.host.service import HostService
+
+    target = "https://server.example.com"
+    terminated: list[str] = []
+    monkeypatch.setattr("omnigent.cli._resolve_host_server", lambda server: target)
+    monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli._find_daemon_record", _record_for)
+    monkeypatch.setattr("omnigent.cli._daemon_owner_is_live", lambda record: False)
+    monkeypatch.setattr(
+        "omnigent.cli._sessions_for_daemon",
+        lambda record, *, connected_only=False: pytest.fail("listed a dead daemon's sessions"),
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._terminate_daemon",
+        lambda record, *, force: terminated.append(record.target) or cli_module._STOP_TERMINATED,
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._build_host_daemon_env",
+        lambda *, server_url: {"HOME": str(tmp_path)},
+    )
+    service_path = tmp_path / "omnigent-host.service"
+    monkeypatch.setattr(
+        "omnigent.host.service.enable_user_host_service",
+        lambda server_url, *, environment: HostService(
+            kind="systemd_user", path=service_path, label=service_path.name
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", target])
+
+    assert result.exit_code == 0, result.output
+    assert terminated == [target]
+
+
 def test_host_disable_subcommand_removes_user_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1291,6 +1419,7 @@ def _seed_same_workspace_daemon(
     *,
     vanity_org_id: str = "1",
     age_s: int = 0,
+    legacy: bool = False,
 ) -> None:
     """
     Record a live daemon on the workspace host and log both URLs in.
@@ -1301,6 +1430,7 @@ def _seed_same_workspace_daemon(
         ``"1"`` for the daemon's own workspace.
     :param age_s: How long ago the daemon started, e.g. ``60``. ``0`` is
         within the startup grace, so its host status isn't checked.
+    :param legacy: Omit the routing pin to represent an older running host.
     """
     from omnigent.cli_auth import store_databricks_auth
 
@@ -1323,6 +1453,7 @@ def _seed_same_workspace_daemon(
             log_path=str(tmp_path / "existing.log"),
             started_at=int(time.time()) - age_s,
             host_id="a" * 32,
+            org_pin=None if legacy else f"{_WORKSPACE_API}?o=1",
         )
     )
 
@@ -1499,12 +1630,14 @@ def _same_workspace_sibling(*, age_s: int = 60) -> cli_module._HostDaemonRecord:
         (_HOST_REJECTED, _HOST_ONLINE, None),
     ],
 )
+@pytest.mark.parametrize("legacy", [False, True])
 def test_host_background_reuses_same_workspace_daemon_only_when_online(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     via_requested_url: cli_module._HostHttpResult,
     via_own_url: cli_module._HostHttpResult,
     refusal: str | None,
+    legacy: bool,
 ) -> None:
     """
     A same-workspace daemon whose host is offline is neither reused nor joined.
@@ -1517,7 +1650,7 @@ def test_host_background_reuses_same_workspace_daemon_only_when_online(
     monkeypatch.setattr(
         "omnigent.cli._pid_alive", lambda checked: checked in {4242, _SAME_WORKSPACE_PID}
     )
-    _seed_same_workspace_daemon(monkeypatch, tmp_path, age_s=60)
+    _seed_same_workspace_daemon(monkeypatch, tmp_path, age_s=60, legacy=legacy)
     _stub_host_status_by_url(
         monkeypatch, {_VANITY_API: via_requested_url, _WORKSPACE_API: via_own_url}
     )
@@ -1899,6 +2032,7 @@ def _seed_yielding_spawn(
                 started_at=int(time.time()),
                 host_id="a" * 32,
                 workspace_id="1",
+                org_pin=f"{winner_target}?o=1",
             )
         )
 
@@ -2030,6 +2164,7 @@ def test_ensure_host_daemon_reports_a_config_change_when_another_url_serves(
                 started_at=int(time.time()),
                 host_id="a" * 32,
                 workspace_id="1",
+                org_pin=f"{_WORKSPACE_API}?o=1",
             )
         )
         monkeypatch.setattr(
@@ -2217,6 +2352,15 @@ def test_start_hosts_on_explicit_server(
         ),
     ],
 )
+@pytest.mark.parametrize(
+    ("desktop_args", "desktop_env", "expected_desktop"),
+    [
+        pytest.param([], None, False, id="browser"),
+        pytest.param(["--open-in-desktop"], None, True, id="desktop-flag"),
+        pytest.param([], "1", True, id="desktop-env"),
+        pytest.param(["--open-in-desktop"], "0", True, id="desktop-flag-overrides-env"),
+    ],
+)
 def test_host_web_ui_open_gates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2225,6 +2369,9 @@ def test_host_web_ui_open_gates(
     no_open_env: str | None,
     config_content: str | None,
     expected_opened: list[str],
+    desktop_args: list[str],
+    desktop_env: str | None,
+    expected_desktop: bool,
 ) -> None:
     """Open the host web UI only when interactive and enabled."""
     if config_content is not None:
@@ -2232,7 +2379,7 @@ def test_host_web_ui_open_gates(
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: is_tty)
-    opened: list[str] = []
+    opened: list[tuple[str, bool]] = []
 
     with (
         patch(
@@ -2242,15 +2389,20 @@ def test_host_web_ui_open_gates(
         patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
         patch(
             "omnigent.conversation_browser.open_conversation_url",
-            lambda url: opened.append(url) or True,
+            lambda url, *, desktop: opened.append((url, desktop)) or True,
         ),
     ):
         result = CliRunner().invoke(
-            cli, ["host", *extra_args], env={"OMNIGENT_HOST_NO_OPEN": no_open_env}
+            cli,
+            ["host", *extra_args, *desktop_args],
+            env={
+                "OMNIGENT_HOST_NO_OPEN": no_open_env,
+                "OMNIGENT_HOST_OPEN_IN_DESKTOP": desktop_env,
+            },
         )
 
     assert result.exit_code == 0, result.output
-    assert opened == expected_opened
+    assert opened == [(url, expected_desktop) for url in expected_opened]
 
 
 @pytest.mark.parametrize("no_open", [False, True])
@@ -2270,7 +2422,7 @@ def test_host_remote_web_ui_open_preference(
         patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
         patch(
             "omnigent.conversation_browser.open_conversation_url",
-            lambda url: opened.append(url) or True,
+            lambda url, **_: opened.append(url) or True,
         ),
     ):
         result = CliRunner().invoke(
@@ -2301,6 +2453,15 @@ def test_host_remote_web_ui_open_preference(
         pytest.param(["--no-open"], "0", [], id="flag-overrides-env"),
     ],
 )
+@pytest.mark.parametrize(
+    ("desktop_args", "desktop_env", "expected_desktop"),
+    [
+        pytest.param([], None, False, id="browser"),
+        pytest.param(["--open-in-desktop"], None, True, id="desktop-flag"),
+        pytest.param([], "1", True, id="desktop-env"),
+        pytest.param(["--open-in-desktop"], "0", True, id="desktop-flag-overrides-env"),
+    ],
+)
 def test_background_host_web_ui_open_preference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2308,19 +2469,27 @@ def test_background_host_web_ui_open_preference(
     extra_args: list[str],
     no_open_env: str | None,
     expected_opened: list[str],
+    desktop_args: list[str],
+    desktop_env: str | None,
+    expected_desktop: bool,
 ) -> None:
     """Both background entry points honor the flag and environment preference."""
     _patch_background_host_spawn(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
-    opened: list[str] = []
+    opened: list[tuple[str, bool]] = []
 
     with patch(
         "omnigent.conversation_browser.open_conversation_url",
-        lambda url: opened.append(url) or True,
+        lambda url, *, desktop: opened.append((url, desktop)) or True,
     ):
         result = CliRunner().invoke(
-            cli, [*command, *extra_args], env={"OMNIGENT_HOST_NO_OPEN": no_open_env}
+            cli,
+            [*command, *extra_args, *desktop_args],
+            env={
+                "OMNIGENT_HOST_NO_OPEN": no_open_env,
+                "OMNIGENT_HOST_OPEN_IN_DESKTOP": desktop_env,
+            },
         )
 
     assert result.exit_code == 0, result.output
-    assert opened == expected_opened
+    assert opened == [(url, expected_desktop) for url in expected_opened]

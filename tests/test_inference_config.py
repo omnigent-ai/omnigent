@@ -12,6 +12,7 @@ import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inference_config import (
+    ModelNotAllowedError,
     binding_for_harness,
     inference_config_scope,
     inference_revision,
@@ -130,8 +131,11 @@ def test_singleton_allowlist_remains_restricted_and_keeps_literal_id() -> None:
     )
     assert resolve_bound_model(config, "codex", None) == model
     assert resolve_bound_model(config, "codex", model) == model
-    with pytest.raises(OmnigentError, match="configured model list"):
+    with pytest.raises(ModelNotAllowedError, match="configured model list") as rejected:
         resolve_bound_model(config, "codex", "model-a")
+    assert rejected.value.code == ErrorCode.INVALID_INPUT
+    assert rejected.value.http_status == 400
+    assert rejected.value.allowed_models == (model,)
     provider = resolve_bound_provider(config, "codex")
     assert provider is not None
     assert set(provider.families["openai"].models.values()) == {model}

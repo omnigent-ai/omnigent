@@ -1,3 +1,6 @@
+vi.mock("@/lib/fetchSessionHostId", () => ({
+  fetchSessionHostId: vi.fn().mockResolvedValue("local-host"),
+}));
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
@@ -12,7 +15,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
-import { useCallback, useState } from "react";
+import { useCallback, useContext, useLayoutEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -22,17 +25,21 @@ import {
   Routes,
   useLocation,
   useNavigate,
+  useParams,
   useSearchParams,
 } from "react-router-dom";
 import { setEmbedRoot } from "@/lib/host";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
-import { useFileViewer } from "./FileViewerContext";
+import { FileViewerContext, useFileViewer } from "./FileViewerContext";
+import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { AGENT_BROWSER_TAB_ID } from "@/hooks/useBrowserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/hooks/useBrowserTabs";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
+import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
@@ -71,6 +78,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
   useDeleteTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
+  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), launch: vi.fn(), isPending: false })),
 }));
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -194,7 +202,7 @@ vi.mock("./FileViewer", () => ({
   }: {
     open: boolean;
     path: string;
-    position?: { line: number; column?: number };
+    position?: { line: number; column?: number; endLine?: number };
     onClose: () => void;
     frameless?: boolean;
   }) => (
@@ -204,6 +212,7 @@ vi.mock("./FileViewer", () => ({
       data-path={path}
       data-line={position?.line}
       data-column={position?.column}
+      data-end-line={position?.endLine}
     >
       <button type="button" aria-label="file-viewer: close" onClick={onClose}>
         close
@@ -233,8 +242,16 @@ vi.mock("./SubagentsPanel", () => ({
 // The real WorkspacePanel mounts a rail xterm for an open shell tab; stub the
 // low-level view to a marker echoing the attached terminal id.
 vi.mock("@/components/blocks/TerminalView", () => ({
-  TerminalView: ({ terminalId }: { terminalId: string }) => (
-    <div data-testid="terminal-view-stub">{terminalId}</div>
+  TerminalView: ({
+    terminalId,
+    focusOnConnect,
+  }: {
+    terminalId: string;
+    focusOnConnect?: boolean;
+  }) => (
+    <div data-testid="terminal-view-stub" data-focus-on-connect={String(focusOnConnect)}>
+      {terminalId}
+    </div>
   ),
 }));
 vi.mock("./FilesPanelDrawer", () => ({
@@ -266,7 +283,12 @@ vi.mock("./TerminalsPanel", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
-import { useTerminals, useDeleteTerminal } from "@/hooks/useTerminals";
+import {
+  useCreateTerminal,
+  useTerminals,
+  useDeleteTerminal,
+  type TerminalLaunchCallbacks,
+} from "@/hooks/useTerminals";
 
 const useConvMock = vi.mocked(useConversations);
 const useTerminalsMock = vi.mocked(useTerminals);
@@ -295,7 +317,8 @@ const useHostsMock = vi.mocked(useHosts);
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
 import { forkSession, getSessionSlim } from "@/lib/sessionsApi";
-import type { Session } from "@/lib/types";
+import type { Session, SessionStatus } from "@/lib/types";
+import type { Conversation } from "@/hooks/useConversations";
 import { toast } from "sonner";
 
 const useSessionAgentMock = vi.mocked(useSessionAgent);
@@ -407,6 +430,21 @@ function LocationDisplay() {
  * what AppShell keys the /settings sidebar pin off, so the tests need a real
  * router transition rather than a re-render.
  */
+/** A file viewer holding unsaved edits: file navigation waits until "allow leaving". */
+function DirtyFileViewerProbe() {
+  const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
+  const [allowLeaving, setAllowLeaving] = useState<(() => void) | null>(null);
+  useLayoutEffect(
+    () => registerNavigationGuard?.((_path, _options, navigate) => setAllowLeaving(() => navigate)),
+    [registerNavigationGuard],
+  );
+  return allowLeaving ? (
+    <button type="button" onClick={allowLeaving}>
+      allow leaving
+    </button>
+  ) : null;
+}
+
 function NavProbe() {
   const navigate = useNavigate();
   return (
@@ -436,6 +474,26 @@ function PathDisplay() {
  * test can exercise the conversation-switch effect (AppShell stays mounted,
  * only the :conversationId route param changes) without a full remount.
  */
+const railOpenState = () =>
+  document.querySelector('aside[aria-label="Workspace"]')?.getAttribute("data-state") ?? "none";
+
+/** Records `snapshot` (the rail's open state by default) in each session's first commit. */
+function RailFirstFrameProbe({
+  frames,
+  to,
+  snapshot = railOpenState,
+}: {
+  frames: string[];
+  to: string;
+  snapshot?: () => string;
+}) {
+  const { conversationId } = useParams();
+  useLayoutEffect(() => {
+    frames.push(`${conversationId}:${snapshot()}`);
+  }, [conversationId, frames]); // eslint-disable-line react-hooks/exhaustive-deps
+  return <SessionNavButton to={to} />;
+}
+
 function SessionNavButton({ to }: { to: string }) {
   const navigate = useNavigate();
   return (
@@ -524,11 +582,17 @@ function sessionShellTree(
 function renderShell(
   path: string,
   info?: ServerInfo,
-  options: { rerenderable?: boolean; sessionNavTo?: string } = {},
+  options: {
+    rerenderable?: boolean;
+    sessionNavTo?: string;
+    dirtyFileViewer?: boolean;
+    seedQueryClient?: (client: QueryClient) => void;
+  } = {},
 ) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  options.seedQueryClient?.(qc);
   const tree = shellTree(
     qc,
     path,
@@ -550,6 +614,7 @@ function renderShell(
             <ForkDialogProbe />
             <NavProbe />
             {options.sessionNavTo && <SessionNavButton to={options.sessionNavTo} />}
+            {options.dirtyFileViewer && <DirtyFileViewerProbe />}
             <LocationDisplay />
           </>
         }
@@ -723,6 +788,8 @@ beforeEach(() => {
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
   useChatStore.setState({
+    conversationId: null,
+    loadingConversation: false,
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
@@ -788,11 +855,12 @@ describe("AppShell header", () => {
   });
 
   it.each([
-    { title: "Off-window owner session", archived: false },
-    { title: null, archived: true },
+    { title: "Off-window owner session", archived: false, sibling: false },
+    { title: null, archived: true, sibling: false },
+    { title: "Archived sibling", archived: true, sibling: true },
   ])(
     "shows owner actions for an off-window session ($title, archived=$archived)",
-    ({ title, archived }) => {
+    ({ title, archived, sibling }) => {
       mockConversations([]);
       useSessionMock.mockReturnValue({
         session: {
@@ -804,6 +872,7 @@ describe("AppShell header", () => {
           createdAt: 1_700_000_000,
           title,
           archived,
+          family: sibling ? { id: "family", representative_id: "other", pinned: false } : undefined,
           labels: {},
           items: [],
           pendingElicitations: [],
@@ -824,6 +893,135 @@ describe("AppShell header", () => {
       expect(
         screen.getByRole("menuitem", { name: archived ? "Unarchive" : "Archive" }),
       ).toBeInTheDocument();
+      if (sibling) expect(screen.queryByTestId("header-move-to-project")).toBeNull();
+      else expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
+    },
+  );
+
+  it.each<{
+    source: string;
+    snapshot: SessionStatus;
+    backgroundTasks?: number;
+    bound: SessionStatus | null;
+    row: Partial<Conversation> | null;
+    asks: boolean;
+  }>([
+    { source: "the bound live store", snapshot: "idle", bound: "running", row: null, asks: true },
+    {
+      source: "the snapshot before binding",
+      snapshot: "waiting",
+      bound: null,
+      row: null,
+      asks: true,
+    },
+    {
+      source: "the snapshot while the bind loads",
+      snapshot: "running",
+      bound: "idle",
+      row: null,
+      asks: true,
+    },
+    {
+      source: "the streamed row's goal-driven background work",
+      snapshot: "idle",
+      bound: "idle",
+      row: { status: "idle", background_work_running: true },
+      asks: true,
+    },
+    {
+      source: "the streamed row's pending approval",
+      snapshot: "idle",
+      bound: "idle",
+      row: { status: "idle", pending_elicitations_count: 1 },
+      asks: true,
+    },
+    {
+      source: "the streamed row over a stale snapshot",
+      snapshot: "running",
+      bound: "idle",
+      row: { status: "idle", pending_elicitations_count: 0, background_work_running: false },
+      asks: false,
+    },
+    {
+      // A row fetched by id has no background flag until the stream settles it.
+      source: "the snapshot's background tasks under a fetched row",
+      snapshot: "idle",
+      backgroundTasks: 1,
+      bound: null,
+      row: { status: "idle", pending_elicitations_count: 0 },
+      asks: true,
+    },
+  ])(
+    "archive confirmation for an off-window session follows $source",
+    async ({ snapshot, backgroundTasks = 0, bound, row, asks }) => {
+      const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) =>
+        Response.json({ id: "conv_off_window", archived: true }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      onTestFinished(() => {
+        vi.unstubAllGlobals();
+      });
+      const archiveRequests = () =>
+        fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH");
+      mockConversations([]);
+      useChatStore.setState({
+        conversationId: bound === null ? "conv_other" : "conv_off_window",
+        sessionStatus: bound ?? "idle",
+        // A bound store without a streamed row may still be hydrating.
+        loadingConversation: bound !== null && row === null,
+      });
+      useSessionMock.mockReturnValue({
+        session: sessionSnapshot({
+          id: "conv_off_window",
+          agentId: "ag_owner",
+          agentName: "developer",
+          status: snapshot,
+          createdAt: 1_700_000_000,
+          title: "Off-window owner session",
+          archived: false,
+          backgroundTaskCount: backgroundTasks,
+          // A stale snapshot still lists an approval the streamed row reports resolved.
+          pendingElicitations: snapshot === "running" && row ? [{ id: "elicit_resolved" }] : [],
+        }),
+        isLoading: false,
+        error: null,
+      });
+
+      renderShell("/c/conv_off_window", undefined, {
+        // The open-session row the session-updates stream keeps current.
+        seedQueryClient: (client) => {
+          if (!row) return;
+          client.setQueryData(["conversation-backfill", "conv_off_window"], {
+            id: "conv_off_window",
+            object: "conversation",
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            labels: {},
+            permission_level: 4,
+            ...row,
+          });
+        },
+      });
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+        button: 0,
+        ctrlKey: false,
+      });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+
+      if (!asks) {
+        expect(await screen.findByText("home")).toBeInTheDocument();
+        expect(screen.queryByTestId("archive-running-dialog")).toBeNull();
+        await waitFor(() => expect(archiveRequests()).toHaveLength(1));
+        const [url, init] = archiveRequests()[0];
+        expect(String(url)).toContain("/v1/sessions/conv_off_window");
+        expect(JSON.parse(String(init?.body))).toEqual({ archived: true });
+        return;
+      }
+      const dialog = await screen.findByRole("dialog", { name: "Archive running session?" });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(screen.queryByTestId("archive-running-dialog")).toBeNull());
+      expect(screen.queryByText("home")).toBeNull();
+      expect(archiveRequests()).toHaveLength(0);
     },
   );
 
@@ -1949,7 +2147,7 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 
-  it("reflects the docked sidebar's open state on the app shell for CSS to key off", () => {
+  it("reflects the docked sidebar state and width on the app shell", () => {
     // The maximized rail's traffic-light clearance (index.css) must drop when
     // the sidebar is reopened over it — the sidebar then covers the window
     // corner, so there are no lights to clear. That CSS keys off
@@ -1964,11 +2162,14 @@ describe("Workspace rail maximize", () => {
     // `:not([data-sidebar-open])` matches and the clearance still applies.
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
     expect(shell?.hasAttribute("data-sidebar-open")).toBe(false);
+    expect((shell as HTMLElement).style.getPropertyValue("--app-sidebar-width")).toBe("0px");
 
-    // Reopen the sidebar: the attribute appears, dropping the clearance.
+    // Reopen the sidebar: the attribute appears, dropping the clearance, and
+    // the background reservation expands to the live sidebar width.
     fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(shell).toHaveAttribute("data-sidebar-open", "true");
+    expect((shell as HTMLElement).style.getPropertyValue("--app-sidebar-width")).toBe("320px");
   });
 
   it.each([
@@ -2153,6 +2354,150 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" }).className).not.toContain(
       "md:absolute",
     );
+  });
+});
+
+describe("Sidebar across the md breakpoint", () => {
+  // Resizable viewport: matchMedia answers the md queries from `width` and
+  // fires change listeners for the queries a resize flips.
+  function mockViewportWidth(initialWidth: number) {
+    let width = initialWidth;
+    const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+    const matches = (query: string) => {
+      if (query === "(min-width: 768px)") return width >= 768;
+      if (query === "(max-width: 767.98px)") return width < 768;
+      return false;
+    };
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: matches(query),
+      addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+        if (!listeners.has(query)) listeners.set(query, new Set());
+        listeners.get(query)?.add(listener);
+      },
+      removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+        listeners.get(query)?.delete(listener);
+      },
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+    return (nextWidth: number) =>
+      act(() => {
+        const before = new Map([...listeners.keys()].map((query) => [query, matches(query)]));
+        width = nextWidth;
+        for (const [query, queryListeners] of listeners) {
+          const event = { matches: matches(query), media: query } as MediaQueryListEvent;
+          if (before.get(query) === event.matches) continue;
+          for (const listener of queryListeners) {
+            if (typeof listener === "function") listener(event);
+            else listener.handleEvent(event);
+          }
+        }
+      });
+  }
+
+  it("leaves the session without closing a selected file in a responsive-hidden rail", () => {
+    const resize = mockViewportWidth(1280);
+    let sendCommand: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits: boolean;
+    }) => void = () => {};
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      onDesktopCommand: (callback: typeof sendCommand) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
+    });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+      resetDesktopCommandsForTests();
+    });
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc?file=README.md");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+
+    resize(740);
+    act(() => sendCommand({ command: "close", browserViewId: null, closingQuits: false }));
+    expect(screen.getByText("home", { exact: true })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_abc").openFiles).toContain("README.md");
+  });
+
+  it("closes an open sidebar when the window narrows and reopens it on widening", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+    resize(740);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("keeps a sidebar the user closed closed across the breakpoint", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(740);
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+  });
+
+  it("keeps a drawer the user closed while narrow closed on widening", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    resize(740);
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+  });
+
+  it("restores the open sidebar after leaving settings entered while narrow", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    resize(740);
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    resize(1280);
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("does not open a drawer when leaving settings while narrow", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+    fireEvent.click(screen.getByTestId("nav-settings"));
+
+    resize(740);
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("keeps the settings menu open when the window narrows on /settings", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([]);
+    renderShell("/settings");
+
+    resize(740);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 });
 
@@ -2826,7 +3171,7 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
   });
 
-  it("focuses the tab strip without replacing its selected soft tab", async () => {
+  it("toggles the rail in one press and picks its fixed tabs by number from anywhere", async () => {
     writeWorkspacePanelDefault("collapsed");
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -2837,37 +3182,51 @@ describe("Right workspace card visibility", () => {
     renderShell("/c/conv_hotkey");
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
 
     const filesTab = await screen.findByRole("tab", { name: "Files" });
     await waitFor(() => expect(filesTab).toHaveFocus());
-    fireEvent.keyDown(filesTab, { key: "2" });
+    // The rail is still sliding in from past the window edge, so focus must not scroll.
+    expect(focus.mock.contexts.at(-1)).toBe(filesTab);
+    expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+    focus.mockRestore();
+    // Alt+2 here (⌃2 on macOS) shows the second fixed tab, wherever focus is.
+    screen.getByRole("button", { name: "Collapse right panel" }).focus();
+    fireEvent.keyDown(document.activeElement!, { code: "Digit2", key: "2", altKey: true });
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
-    const fileTab = screen.getByTitle("README.md");
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
-    expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
 
+    // With focus outside the rail, the hotkey still closes the rail on screen.
     screen.getByRole("button", { name: "Collapse right panel" }).focus();
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
+    // Reopening keeps the selected file tab.
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
-    await waitFor(() => expect(fileTab).toHaveFocus());
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
-    expect(filesTab).toHaveAttribute("aria-selected", "false");
-
-    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
-    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
   });
 
-  it("reveals a collapsed workspace when the Browser hotkey opens a tab", async () => {
+  it("reveals a collapsed workspace when New Browser Tab opens a tab", async () => {
     writeWorkspacePanelDefault("collapsed");
+    let sendCommand: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits: boolean;
+    }) => void = () => {};
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
       setBadgeCount: vi.fn(),
+      onDesktopCommand: (callback: typeof sendCommand) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
     });
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -2879,7 +3238,9 @@ describe("Right workspace card visibility", () => {
       renderShell("/c/conv_browser_hotkey");
       expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
-      fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
+      act(() =>
+        sendCommand({ command: "new-browser-tab", browserViewId: null, closingQuits: false }),
+      );
 
       expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
         "aria-selected",
@@ -2889,14 +3250,25 @@ describe("Right workspace card visibility", () => {
     } finally {
       cleanup();
       vi.unstubAllGlobals();
+      resetDesktopCommandsForTests();
     }
   });
 
   it("reveals a Browser tab over an open Terminal panel", async () => {
+    let sendCommand: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits: boolean;
+    }) => void = () => {};
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
       setBadgeCount: vi.fn(),
+      onDesktopCommand: (callback: typeof sendCommand) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
     });
     sessionStorage.setItem(
       "omnigent.web.panel-key:conv_browser_terminal",
@@ -2913,7 +3285,9 @@ describe("Right workspace card visibility", () => {
       expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
       expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
-      fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
+      act(() =>
+        sendCommand({ command: "new-browser-tab", browserViewId: null, closingQuits: false }),
+      );
 
       expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
       expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
@@ -2921,6 +3295,58 @@ describe("Right workspace card visibility", () => {
         "true",
       );
       expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+      resetDesktopCommandsForTests();
+    }
+  });
+
+  it("persists a link's new browser tab when its session changes before navigation accepts", async () => {
+    const accepted = deferredRequest<{ ok: boolean }>();
+    const browserOpenOrNavigate = vi.fn().mockReturnValue(accepted.promise);
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate,
+      setBadgeCount: vi.fn(),
+    });
+    writeOpenLinksInApp(true);
+    writeSessionWorkspaceState("conv_from", {
+      rightRailTab: "browser",
+      openBrowsers: [AGENT_BROWSER_TAB_ID],
+      selectedBrowserId: AGENT_BROWSER_TAB_ID,
+    });
+    mockConversations([
+      { id: "conv_from", permission_level: null },
+      { id: "conv_to", permission_level: null },
+    ]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    try {
+      render(sessionShellTree(queryClient, "/c/conv_from", <SessionNavButton to="/c/conv_to" />));
+      expect(maybeOpenLinkInApp("conv_from", "https://example.com/page")).toBe(true);
+      fireEvent.click(screen.getByTestId("nav-session"));
+      await act(async () => accepted.resolve({ ok: true }));
+
+      const saved = readSessionWorkspaceState("conv_from");
+      expect(saved.selectedBrowserId).toEqual(expect.any(String));
+      expect(saved.selectedBrowserId).not.toBe(AGENT_BROWSER_TAB_ID);
+      expect(saved.openBrowsers).toEqual([AGENT_BROWSER_TAB_ID, saved.selectedBrowserId]);
+      expect(browserOpenOrNavigate).toHaveBeenCalledWith(
+        browserViewId("conv_from", saved.selectedBrowserId!),
+        "https://example.com/page",
+        undefined,
+        { agent: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
+      );
+      expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
+      expect(readSessionWorkspaceState("conv_to").openBrowsers ?? []).toEqual([]);
+
+      cleanup();
+      renderShell("/c/conv_from");
+      expect(screen.getByRole("tab", { name: "Browser 2" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
     } finally {
       cleanup();
       vi.unstubAllGlobals();
@@ -2957,7 +3383,7 @@ describe("Right workspace card visibility", () => {
     await waitFor(() => expect(screen.getByTitle("README.md")).toHaveFocus());
   });
 
-  it("focuses the workspace toolbar when its selected fixed tab is hidden", async () => {
+  it("focuses the workspace toolbar on reopen when its selected fixed tab is hidden", async () => {
     writeSessionWorkspaceState("conv_compact_workspace", {
       open: true,
       rightRailTab: "changes",
@@ -2972,6 +3398,9 @@ describe("Right workspace card visibility", () => {
     const selected = screen.getByRole("tab", { name: /changes/i });
     Object.defineProperty(selected, "checkVisibility", { value: () => false });
 
+    // The rail on screen closes; reopening focuses its toolbar, since the selected tab is hidden.
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
 
     await waitFor(() =>
@@ -3367,6 +3796,138 @@ describe("Right workspace card visibility", () => {
     }
   });
 
+  it.each([
+    ["open", "closed"],
+    ["closed", "open"],
+  ] as const)(
+    "shows the incoming session's rail state in its first frame (%s to %s)",
+    (from, to) => {
+      writeSessionWorkspaceState("conv_from", { open: from === "open" });
+      writeSessionWorkspaceState("conv_to", { open: to === "open" });
+      mockConversations([
+        { id: "conv_from", permission_level: null },
+        { id: "conv_to", permission_level: null },
+      ]);
+      const frames: string[] = [];
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        sessionShellTree(
+          qc,
+          "/c/conv_from",
+          <RailFirstFrameProbe frames={frames} to="/c/conv_to" />,
+        ),
+      );
+      fireEvent.click(screen.getByTestId("nav-session"));
+      expect(frames).toEqual([`conv_from:${from}`, `conv_to:${to}`]);
+    },
+  );
+
+  it("shows the incoming session's rail tab and file in its first frame", () => {
+    writeSessionWorkspaceState("conv_from", {
+      open: true,
+      rightRailTab: "files",
+      openFiles: ["a.ts"],
+      selectedFilePath: "a.ts",
+    });
+    writeSessionWorkspaceState("conv_to", { open: true, rightRailTab: "changes" });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_from", permission_level: null },
+      { id: "conv_to", permission_level: null },
+    ]);
+    const frames: string[] = [];
+    const railSelection = () => {
+      const tab = document.querySelector('[role="tab"][aria-selected="true"]')?.textContent;
+      const file = document.querySelector('[aria-current="true"][title]')?.getAttribute("title");
+      return `${tab ?? "none"},${file ?? "none"}`;
+    };
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        qc,
+        "/c/conv_from",
+        <RailFirstFrameProbe frames={frames} to="/c/conv_to" snapshot={railSelection} />,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(frames).toEqual(["conv_from:none,a.ts", "conv_to:Changes,none"]);
+  });
+
+  it("shows the incoming session's Chat/TUI view in its first frame", () => {
+    mockConversations([
+      { id: "conv_from", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+      { id: "conv_to", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    sessionStorage.setItem("omnigent.web.panel-key:conv_from", "terminal:terminal_claude_main");
+    sessionStorage.setItem("omnigent.web.panel-key:conv_to", "__chat__");
+    const frames: string[] = [];
+    const view = () => screen.getByTestId("view-probe").getAttribute("data-view") ?? "none";
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        qc,
+        "/c/conv_from",
+        <>
+          <TerminalFirstViewProbe />
+          <RailFirstFrameProbe frames={frames} to="/c/conv_to" snapshot={view} />
+        </>,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(frames).toEqual(["conv_from:terminal", "conv_to:chat"]);
+  });
+
+  it("does not carry the outgoing session's shell focus intent to a restored shell", async () => {
+    writeSessionWorkspaceState("conv_from", { open: true, openFiles: ["a.ts"] });
+    writeSessionWorkspaceState("conv_to", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_main",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_from", permission_level: 4 },
+      { id: "conv_to", permission_level: 4 },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    const frames: string[] = [];
+    const shellFocus = () =>
+      document
+        .querySelector('[data-testid="terminal-view-stub"]')
+        ?.getAttribute("data-focus-on-connect") ?? "none";
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        qc,
+        "/c/conv_from",
+        <RailFirstFrameProbe frames={frames} to="/c/conv_to" snapshot={shellFocus} />,
+      ),
+    );
+    // Focus the shell in the outgoing session, then move its slot to a file.
+    fireEvent.click(screen.getByTitle("main · u-1"));
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveAttribute(
+      "data-focus-on-connect",
+      "true",
+    );
+    fireEvent.click(screen.getByTitle("a.ts"));
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(frames).toEqual(["conv_from:none", "conv_to:false"]);
+  });
+
   it("uses the default when navigating from Agents to a child in another tree", () => {
     localStorage.setItem("omnigent:default-workspace-tab", "changes");
     writeSessionWorkspaceState("conv_from", { rightRailTab: "subagents" });
@@ -3700,6 +4261,7 @@ describe("AppShell URL sync — file param", () => {
   it("restores the file viewer from the ?file= URL param on load", () => {
     // A shared link like /c/conv_abc?file=README.md should open the viewer
     // immediately, without the user having to click the file in the panel.
+    writeSessionWorkspaceState("conv_abc", { openFiles: ["a.ts"] });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
 
     renderShell("/c/conv_abc?file=README.md");
@@ -3708,6 +4270,11 @@ describe("AppShell URL sync — file param", () => {
     expect(screen.queryByTestId("file-viewer")).toBeNull();
     expect(pushPanel).toHaveAttribute("data-state", "open");
     expect(pushPanel).toHaveAttribute("data-path", "README.md");
+    // The linked file is merged into the remembered tabs and saved on mount.
+    expect(readSessionWorkspaceState("conv_abc")).toMatchObject({
+      openFiles: ["a.ts", "README.md"],
+      selectedFilePath: "README.md",
+    });
   });
 
   it("restores the file viewer into the desktop rail on a ?file= reload", () => {
@@ -4261,8 +4828,8 @@ describe("Mobile session menu", () => {
 
 describe("AppShell clone/fork action", () => {
   it.each([false, true])(
-    "resolves a scoped recovery source's own restrictions under a blocked parent (child blocked=%s)",
-    (childBlocked) => {
+    "opens a scoped recovery under a managed parent (child managed=%s)",
+    (childManaged) => {
       const parent = sessionSnapshot({
         id: "conv_parent",
         labels: { "omnigent.host_type": "managed" },
@@ -4271,7 +4838,7 @@ describe("AppShell clone/fork action", () => {
         id: "conv_side_child",
         workspace: "/missing/child",
         hostId: "host_a",
-        labels: childBlocked ? { "omnigent.host_type": "managed" } : {},
+        labels: childManaged ? { "omnigent.host_type": "managed" } : {},
       });
       mockConversations([{ id: "conv_parent", permission_level: 4 }]);
       useSessionMock.mockImplementation((sessionId) => ({
@@ -4296,17 +4863,9 @@ describe("AppShell clone/fork action", () => {
       fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
 
       expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
-      if (childBlocked) {
-        expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
-          "Forking this sandbox session is not supported yet.",
-        );
-        expect(screen.queryByTestId("workspace-path-input")).not.toBeInTheDocument();
-        expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
-      } else {
-        expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
-        expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
-        expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
-      }
+      expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
       expect(forkSessionMock).not.toHaveBeenCalled();
     },
   );
@@ -4343,7 +4902,7 @@ describe("AppShell clone/fork action", () => {
     );
   });
 
-  it("blocks direct current-session fork openers for an unsupported managed session", () => {
+  it("opens direct current-session fork openers for a managed session", () => {
     mockConversations([{ id: "conv_managed", permission_level: 4 }]);
     useSessionMock.mockReturnValue({
       session: sessionSnapshot({
@@ -4355,7 +4914,63 @@ describe("AppShell clone/fork action", () => {
     });
     renderShell("/c/conv_managed");
     fireEvent.click(screen.getByTestId("fork-probe-open"));
-    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Fork from this response/ })).toBeVisible();
+    expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+  });
+
+  it("offers directory recovery for an Arclet session onto a connected host", () => {
+    mockConversations([{ id: "conv_arclet", permission_level: 4 }]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({
+        id: "conv_arclet",
+        workspace: "/missing/repo",
+        hostId: "host_arclet",
+        labels: { "omnigent.host_type": "managed" },
+      }),
+      isLoading: false,
+      error: null,
+    });
+    const hosts = [
+      {
+        host_id: "host_arclet",
+        name: "Arclet",
+        owner: "owner",
+        status: "online",
+        sandbox_provider: "arclet",
+      },
+      { host_id: "host_laptop", name: "Laptop", owner: "owner", status: "online" },
+    ];
+    // Pickers never see server-managed sandbox hosts, as in fetchHosts.
+    useHostsMock.mockImplementation(
+      (options) =>
+        ({
+          data: options?.includeSandbox ? hosts : hosts.filter((h) => !h.sandbox_provider),
+        }) as ReturnType<typeof useHosts>,
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        client,
+        "/c/conv_arclet",
+        <ConversationScopeContext.Provider value="conv_arclet">
+          <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+        </ConversationScopeContext.Provider>,
+      ),
+    );
+
+    const recover = screen.getByRole("button", { name: "Continue in another directory…" });
+    expect(recover).toBeEnabled();
+    fireEvent.click(recover);
+    expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
+    expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+    const hostSelect = screen.getByTestId("fork-session-host-select");
+    fireEvent.pointerDown(hostSelect, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostSelect);
+    // Recovery continues in an existing directory, so it offers connected hosts only.
+    expect(screen.getByTestId("fork-session-host-option-host_laptop")).toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-host-option-host_arclet")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-sandbox-option")).not.toBeInTheDocument();
+    expect(forkSessionMock).not.toHaveBeenCalled();
   });
 
   it("exposes canFork to a read-only collaborator on a top-level session", () => {
@@ -5289,6 +5904,15 @@ describe("file navigation request precedence", () => {
         <button type="button" onClick={() => openFile?.("AGENTS.md", { line: 200, column: 3 })}>
           Cite AGENTS
         </button>
+        <button
+          type="button"
+          onClick={() => openFile?.("AGENTS.md", { line: 10, column: 2, endLine: 14 })}
+        >
+          Cite AGENTS range
+        </button>
+        <button type="button" onClick={() => openFile?.("AGENTS.md", { line: 10, endLine: 10 })}>
+          Cite AGENTS empty range
+        </button>
       </>
     );
   }
@@ -5374,15 +5998,59 @@ describe("file navigation request precedence", () => {
     expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-line");
   });
 
+  it("carries a cited line range through the URL and drops it for a single-line citation", () => {
+    renderNavigationShell();
+    fireEvent.click(screen.getByRole("button", { name: "Cite AGENTS range" }));
+    const viewer = screen.getByTestId("file-viewer-inline");
+    expect(viewer).toHaveAttribute("data-line", "10");
+    expect(viewer).toHaveAttribute("data-end-line", "14");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("endLine=14");
+
+    fireEvent.click(screen.getByRole("button", { name: "Cite AGENTS" }));
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-end-line");
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("endLine=");
+  });
+
+  it("drops an end line that does not follow the cited line", () => {
+    renderNavigationShell();
+    fireEvent.click(screen.getByRole("button", { name: "Cite AGENTS empty range" }));
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-line", "10");
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-end-line");
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("endLine=");
+  });
+
+  it("opens an initial URL range citation and ignores an end before its start or without a start line", () => {
+    const { unmount } = renderNavigationShell(
+      reactRouterRouting,
+      "?file=README.md&line=100&endLine=104",
+    );
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-end-line", "104");
+    unmount();
+
+    const { unmount: unmountBackwards } = renderNavigationShell(
+      reactRouterRouting,
+      "?file=README.md&line=100&endLine=90",
+    );
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-line", "100");
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-end-line");
+    unmountBackwards();
+
+    renderNavigationShell(reactRouterRouting, "?file=README.md&endLine=104");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-line");
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-end-line");
+  });
+
   it("closing the active file clears both coordinates before selecting its neighbor", () => {
     renderNavigationShell();
     fireEvent.click(screen.getByRole("button", { name: "Cite README" }));
-    fireEvent.click(screen.getByRole("button", { name: "Cite AGENTS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cite AGENTS range" }));
     fireEvent.click(screen.getByRole("button", { name: "Close AGENTS.md" }));
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
     expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-line");
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("line=");
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("column=");
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("endLine=");
   });
 });
 
@@ -5465,7 +6133,7 @@ describe("AppShell design-mode submission", () => {
   }
 
   it.each([
-    { preference: null, busy: true, backlog: false, queued: true },
+    { preference: null, busy: true, backlog: false, queued: false },
     { preference: "false", busy: true, backlog: false, queued: true },
     { preference: "true", busy: true, backlog: false, queued: false },
     { preference: "true", busy: true, backlog: true, queued: true },
@@ -5536,6 +6204,7 @@ describe("AppShell design-mode submission", () => {
   });
 
   it("preserves queued instructions when always-steer is enabled mid-session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     submitInstruction("First change");
     localStorage.setItem("omnigent:always-steer", "true");
@@ -5550,6 +6219,7 @@ describe("AppShell design-mode submission", () => {
 
   // User-opened tabs submit with their `browser-tab:` view ID, not the session ID.
   it("sends a submission from a user-opened tab in the current session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     submitInstruction("Use a week picker.", "browser-tab:conv_design:tab-two");
     expect(send).not.toHaveBeenCalled();
@@ -5590,6 +6260,7 @@ describe("AppShell design-mode submission", () => {
   });
 
   it("rejects a late pointer submission after switching to another session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     chat.conversationId = "conv_other";
     submitInstruction();
@@ -5646,5 +6317,123 @@ describe("new-session browser shortcut", () => {
     fireEvent.keyDown(composer, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
     expect(screen.getByText("New session route")).toBeInTheDocument();
     setEmbedRoot(null);
+  });
+});
+
+describe("AppShell desktop Close", () => {
+  type CommandListener = (event: {
+    command: string;
+    browserViewId: string | null;
+    closingQuits: boolean;
+  }) => void;
+  let sendCommand: CommandListener = () => {};
+
+  beforeEach(() => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      onDesktopCommand: (callback: CommandListener) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    resetDesktopCommandsForTests();
+  });
+
+  it("opens New Terminal over an open file only once its viewer allows it", () => {
+    const createShell = vi.fn();
+    vi.mocked(useCreateTerminal).mockReturnValue({
+      launch: createShell,
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    mockConversations([{ id: "conv_shell", permission_level: null }]);
+    renderShell("/c/conv_shell", undefined, { dirtyFileViewer: true });
+    act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
+    expect(createShell).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(createShell).toHaveBeenCalledWith("zsh", expect.anything());
+  });
+
+  it("restores the open file when a shell opened early fails to create", () => {
+    const shell = { id: "terminal_zsh_u-fail1", name: "zsh", session: "u-fail1", running: true };
+    let callbacks: TerminalLaunchCallbacks = {};
+    vi.mocked(useCreateTerminal).mockReturnValue({
+      launch: (_name: string, next: TerminalLaunchCallbacks) => {
+        callbacks = next;
+      },
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    writeSessionWorkspaceState("conv_shell_fail", {
+      open: true,
+      openFiles: ["a.ts", "b.ts"],
+      selectedFilePath: "b.ts",
+    });
+    mockConversations([{ id: "conv_shell_fail", permission_level: null }]);
+    renderShell("/c/conv_shell_fail");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+
+    act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
+    act(() => callbacks.onOpen?.(shell));
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+
+    act(() => callbacks.onError?.(new Error("launch failed"), shell));
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+  });
+
+  it("keeps a newer selection when a shell opened early fails to create", () => {
+    const shell = { id: "terminal_zsh_u-fail2", name: "zsh", session: "u-fail2", running: true };
+    let callbacks: TerminalLaunchCallbacks = {};
+    vi.mocked(useCreateTerminal).mockReturnValue({
+      launch: (_name: string, next: TerminalLaunchCallbacks) => {
+        callbacks = next;
+      },
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    writeSessionWorkspaceState("conv_shell_moved", {
+      open: true,
+      openFiles: ["a.ts", "b.ts"],
+      selectedFilePath: "b.ts",
+    });
+    mockConversations([{ id: "conv_shell_moved", permission_level: null }]);
+    renderShell("/c/conv_shell_moved");
+
+    act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
+    act(() => callbacks.onOpen?.(shell));
+    // The user moves on to another file before the create fails.
+    fireEvent.click(screen.getByTitle("a.ts"));
+    act(() => callbacks.onError?.(new Error("launch failed"), shell));
+
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "a.ts");
+  });
+
+  it("leaves the session once an open file's viewer allows dropping its unsaved edits", () => {
+    mockConversations([{ id: "conv_close", permission_level: null }]);
+    renderShell("/c/conv_close", undefined, { dirtyFileViewer: true });
+    act(() => sendCommand({ command: "close", browserViewId: null, closingQuits: false }));
+    expect(screen.queryByText("home")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(screen.getByText("home")).toBeInTheDocument();
   });
 });

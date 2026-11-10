@@ -32,6 +32,13 @@ _CAPABILITIES = ProviderCapabilities(
     label_editing=True,
     merging=True,
     reviewer_editing=True,
+    comment_posting=True,
+    review_threads=True,
+    review_thread_replies=True,
+    review_thread_creation=True,
+    details_editing=True,
+    attachment_uploads=True,
+    commit_history=True,
 )
 
 
@@ -81,6 +88,62 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._gh_installed()
+
+    def pinned_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Fetch a patch whose revisions match the displayed review conversations."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_patch_at_revision(
+            root, reference, head_sha=head_sha, base_sha=base_sha
+        )
+
+    def pinned_changed_files(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """List changed files whose revisions match the displayed patch."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_changed_files_at_revision(
+            root, reference, head_sha=head_sha, base_sha=base_sha
+        )
+
+    def review_threads(
+        self, root: str, reference: PullRequestRef, *, after: str, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Read the first or a subsequent review-thread page."""
+        from omnigent.runner import github_review_threads
+
+        return github_review_threads.read_threads(
+            root, reference, after=after, head_sha=head_sha, base_sha=base_sha
+        )
+
+    def review_thread_comments(
+        self, root: str, reference: PullRequestRef, *, thread_id: str, after: str
+    ) -> dict[str, Any]:
+        """Load another page in a published thread."""
+        from omnigent.runner import github_review_threads
+
+        return github_review_threads.read_comments(
+            root, reference, thread_id=thread_id, after=after
+        )
+
+    def reply_to_review_thread(
+        self, root: str, reference: PullRequestRef, *, thread_id: str, body: str
+    ) -> dict[str, Any]:
+        """Publish a reply immediately to its original review conversation."""
+        from omnigent.runner import github_review_threads
+
+        return github_review_threads.reply(root, reference, thread_id=thread_id, body=body)
+
+    def create_review_thread(
+        self, root: str, reference: PullRequestRef, *, body: str, anchor: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Publish a new line conversation as a submitted comment review."""
+        from omnigent.runner import github_review_threads
+
+        return github_review_threads.create_thread(root, reference, body=body, anchor=anchor)
 
     def pr_title(
         self, root: str, reference: PullRequestRef, deadline: float
@@ -137,6 +200,20 @@ class GitHubPullRequests:
             head_sha=head_sha,
             base_sha=base_sha,
         )
+
+    def commits(self, root: str, reference: PullRequestRef, *, head_sha: str) -> dict[str, Any]:
+        """List the PR's commits at ``head_sha``, oldest first."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_commits(root, reference, head_sha=head_sha)
+
+    def commit_diff(
+        self, root: str, reference: PullRequestRef, *, commit_sha: str
+    ) -> dict[str, Any]:
+        """Return one commit's patch from GitHub's commit diff media type."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_commit_patch(root, reference, commit_sha=commit_sha)
 
     def set_preference(
         self,
@@ -210,6 +287,41 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._edit_reviewers(root, reference, add=add, remove=remove)
+
+    def create_comment(self, root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+        """Post through GitHub's issue comments API as the selected account."""
+        from omnigent.runner import github_resource
+
+        return github_resource._create_comment(root, reference, body=body)
+
+    def edit_details(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        title: str | None,
+        body: str | None,
+    ) -> dict[str, Any]:
+        """Update the title and description through GitHub's pull requests API."""
+        from omnigent.runner import github_resource
+
+        return github_resource._edit_details(root, reference, title=title, body=body)
+
+    def upload_attachment(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        name: str,
+        content_type: str,
+        content: bytes,
+    ) -> dict[str, Any]:
+        """Upload through GitHub's user attachments endpoint, as ``gh --attach`` does."""
+        from omnigent.runner import github_resource
+
+        return github_resource._upload_attachment(
+            root, reference, name=name, content_type=content_type, content=content
+        )
 
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``gh pr`` or ``gh api`` segment."""

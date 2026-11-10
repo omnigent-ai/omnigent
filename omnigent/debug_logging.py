@@ -7,8 +7,8 @@ Delta table through the ZeroBus REST ingest endpoint, so a whole session's logs
 can be queried in one place (see the Omnigent Debuggability Plan, OMNI-4198).
 
 By default, the sink is enabled only when the ``OMNIGENT_DEBUG_LOG_*``
-environment variables are present -- the internal ``omni`` config CLI sets them
-for internal users, so the feature is off by default for OSS users and
+environment variables are present -- the ``omni`` config CLI sets them
+for managed deployments, so the feature is off by default for OSS users and
 customers. Integrations can instead provide their own batch-send function.
 Delivery is best-effort and fully non-blocking: records are queued and flushed
 by a daemon thread, and any failure drops rows rather than disrupting the
@@ -37,6 +37,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -75,6 +76,9 @@ _session_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_session_id"
 
 _runner_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_runner_id", default=None)
 _request_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_request_id", default=None)
+_log_attributes_var: ContextVar[dict[str, object] | None] = ContextVar(
+    "omnigent_debug_attributes", default=None
+)
 
 
 # Ambient lifecycle phase for the code currently executing. Set with
@@ -349,6 +353,16 @@ def current_session_id() -> str | None:
 
 
 @contextlib.contextmanager
+def log_attributes_scope(**attributes: object) -> Iterator[None]:
+    """Add correlation fields to logs in this task and its children; explicit fields win."""
+    token = _log_attributes_var.set({**(_log_attributes_var.get() or {}), **attributes})
+    try:
+        yield
+    finally:
+        _log_attributes_var.reset(token)
+
+
+@contextlib.contextmanager
 def phase_scope(phase: ErrorPhase) -> Iterator[None]:
     """Mark *phase* as active for the block, restoring the prior value on exit.
 
@@ -494,8 +508,8 @@ def publish_origin_identity(server_url: str) -> str | None:
 
     Host and CLI processes call this at startup, before anything they log or
     spawn. The id comes from the URL's ``?o=`` or the stored login record, else
-    a one-time unauthenticated probe whose result is stored in that record, the
-    way an explicit ``?o=`` already is.
+    a one-time unauthenticated probe. Attribution never changes saved login
+    details; only an authenticated command may persist a workspace selector.
 
     :param server_url: The server API base, e.g.
         ``"https://example.databricks.com/api/2.0/omnigent"``.
@@ -503,16 +517,12 @@ def publish_origin_identity(server_url: str) -> str | None:
         non-Databricks server or when it cannot be resolved.
     """
     try:
-        from omnigent.cli_auth import store_databricks_org_id
         from omnigent.util.server_url import ServerUrl
 
         resolved = ServerUrl.from_api_base(server_url)
         workspace_id = resolved.org_id
         if workspace_id is None and resolved.is_workspace_hosted:
             workspace_id = _probe_workspace_id(resolved.api_base)
-            if workspace_id:
-                with contextlib.suppress(OSError):
-                    store_databricks_org_id(resolved.api_base, workspace_id)
         if workspace_id:
             os.environ[ORIGIN_WORKSPACE_ID_ENV_VAR] = workspace_id
         return workspace_id
@@ -557,6 +567,47 @@ def debug_event(
     return extra
 
 
+class StageTimings:
+    """Split one operation's wall time into named, back-to-back stages.
+
+    Each :meth:`mark` closes the stage that ran since the previous mark (or
+    since construction), so a long function records its stages without
+    re-indenting them into ``with`` blocks::
+
+        timings = StageTimings()
+        await fetch_config()
+        timings.mark("config")
+        await spawn_tmux()
+        timings.mark("tmux_launch")
+        _logger.info("launched", extra=debug_event("launched", **timings.attributes()))
+
+    :param clock: Monotonic clock returning seconds, e.g. :func:`time.monotonic`.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._started_at = clock()
+        self._last = self._started_at
+        self._stages: dict[str, float] = {}
+
+    def mark(self, stage: str) -> None:
+        """Close *stage*; a repeated name adds to its earlier time.
+
+        :param stage: Short stage name, e.g. ``"catalog"``.
+        """
+        now = self._clock()
+        self._stages[stage] = self._stages.get(stage, 0.0) + (now - self._last)
+        self._last = now
+
+    def attributes(self) -> dict[str, Any]:
+        """Return ``{"<stage>_ms": ..., "total_ms": ...}`` rounded to milliseconds.
+
+        Typed ``Any`` so it unpacks into :func:`debug_event` attributes.
+        """
+        stages = {f"{name}_ms": round(seconds * 1000) for name, seconds in self._stages.items()}
+        return {**stages, "total_ms": round((self._clock() - self._started_at) * 1000)}
+
+
 def _stack_trace(record: logging.LogRecord) -> str | None:
     if record.exc_info:
         return "".join(traceback.format_exception(*record.exc_info))
@@ -565,12 +616,13 @@ def _stack_trace(record: logging.LogRecord) -> str | None:
 
 def _attributes(record: logging.LogRecord, source: str) -> dict[str, str]:
     raw = getattr(record, "attributes", None)
+    combined = {**(_log_attributes_var.get() or {}), **(raw if isinstance(raw, dict) else {})}
     attrs: dict[str, str] = {}
-    if isinstance(raw, dict):
+    if combined:
         # The target column is MAP<STRING,STRING>; coerce values, redact them,
         # and drop nulls. Event attributes share the same privacy boundary as
         # messages.
-        attrs = {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
+        attrs = {str(k): redact_log_text(str(v)) for k, v in combined.items() if v is not None}
     for key, value in (
         ("request_id", getattr(record, "request_id", None) or _request_id_var.get()),
         (
@@ -1428,7 +1480,7 @@ def debug_sink_enabled() -> bool:
 
     A cheap gate for opt-in, table-only logging (e.g. the SSE-event stream):
     callers skip building records entirely when the sink is off, so the feature
-    adds no cost for OSS / non-internal users who never enabled it.
+    adds no cost for OSS users who never enabled it.
     """
     # Intentionally lock-free: a single global-object read is atomic under the
     # GIL, and this is a best-effort gate — a stale read only mis-times one

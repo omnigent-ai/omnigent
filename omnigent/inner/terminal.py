@@ -36,7 +36,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native import owner_claim
 from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import strip_runner_auth_secrets
-from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
+from omnigent.util.tmux_compat import tmux_unavailable_reason
 
 if TYPE_CHECKING:
     from omnigent.terminals.program_status import ProgramStatusReader
@@ -330,6 +330,9 @@ _EXIT_STATUS_POLL_SECONDS = 0.01
 _PANE_EXIT_STATUS_FORMAT = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}"
 # Avoid adding probe pressure while the host cannot start another process.
 _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS = 1.0
+# A watcher whose last capture is older than this has stalled or stopped, so its
+# view of the screen no longer says whether the pane is producing output.
+_SCREEN_WATCH_STALE_SECONDS = 10.0
 
 # Process creation can fail temporarily while the host is under resource
 # pressure. Only those errno values leave terminal liveness unknown; permanent
@@ -379,6 +382,16 @@ def _tmux_process_start_error(cmd: list[str], exc: OSError) -> RuntimeError:
         return _TmuxProcessStartError(detail)
     return RuntimeError(detail)
 
+
+# has-session stderr when tmux answered but the session no longer exists, or when
+# the socket is still there but its server is gone (``kill-server``, ``killall tmux``).
+_TMUX_SESSION_KILLED_MARKERS = (
+    "no current target",
+    "can't find session",
+    "session not found",
+    "no such session",
+    "no server running on",
+)
 
 # Unrecognized failures leave liveness unknown and are retried.
 _TMUX_TARGET_GONE_STDERR_MARKERS = (
@@ -827,25 +840,9 @@ class TmuxUnavailableError(OmnigentError, RuntimeError):
 
 def _require_supported_tmux() -> None:
     """Fail before terminal setup when tmux is missing, unknown, or too old."""
-    tmux = shutil.which("tmux")
-    if tmux is None:
-        raise TmuxUnavailableError(
-            "tmux is not installed or not on PATH. Native terminals need tmux "
-            f"{MIN_TMUX_VERSION_HINT} or newer: install it (macOS: `brew install tmux`), "
-            "or restart the Omnigent host from a shell where `tmux -V` works."
-        )
-    version = tmux_version(tmux)
-    if version is None:
-        raise TmuxUnavailableError(
-            "Could not determine the installed tmux version; managed terminals require "
-            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
-        )
-    if version < MIN_TMUX_VERSION:
-        detected = f"{version[0]}.{version[1]}"
-        raise TmuxUnavailableError(
-            f"tmux {detected} is too old; managed terminals require "
-            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
-        )
+    reason = tmux_unavailable_reason()
+    if reason is not None:
+        raise TmuxUnavailableError(reason)
 
 
 def _process_alive(pid: int) -> bool:
@@ -1153,6 +1150,11 @@ class TerminalInstance:
     _last_pane_snapshot: str | None = field(default=None, repr=False)
     _last_exit_snapshot: str | None = field(default=None, repr=False)
     _last_capture_at: float | None = field(default=None, repr=False)
+    # Monotonic stamps from the threaded idle watcher: when it started, its
+    # latest capture, and the latest capture that agent output changed.
+    _screen_watch_started_at: float | None = field(default=None, repr=False)
+    _screen_watched_at: float | None = field(default=None, repr=False)
+    _screen_changed_at: float | None = field(default=None, repr=False)
     _probe_failures: deque[dict[str, object]] = field(
         default_factory=lambda: deque(maxlen=2 * _IDLE_EXIT_FAILURE_THRESHOLD),
         init=False,
@@ -1214,6 +1216,33 @@ class TerminalInstance:
             ``False`` when none was ever observed.
         """
         return time.monotonic() - self._last_client_interaction_at < window_s
+
+    def screen_changed_within(self, window_s: float) -> bool | None:
+        """
+        Whether agent output changed the screen in the last *window_s* seconds.
+
+        tmux's ``window_activity`` advances on any output, including title
+        updates and repaints that leave the screen as it was, so an idle TUI
+        with a title spinner reads as busy forever. The native pane reaper
+        reads the idle watcher's own screen diff instead when it can.
+
+        :param window_s: Recency window in seconds, e.g. ``120.0``.
+        :returns: ``None`` when the watcher has not watched for the whole window
+            or its last capture is stale, so the caller must fall back to tmux's
+            clock; otherwise whether the screen changed within the window.
+        """
+        now = time.monotonic()
+        started_at = self._screen_watch_started_at
+        watched_at = self._screen_watched_at
+        if (
+            started_at is None
+            or watched_at is None
+            or now - started_at < window_s
+            or now - watched_at > _SCREEN_WATCH_STALE_SECONDS
+        ):
+            return None
+        changed_at = self._screen_changed_at
+        return changed_at is not None and now - changed_at < window_s
 
     def last_pane_text(self) -> str | None:
         """Return the last visible pane text captured for diagnostics.
@@ -1464,6 +1493,17 @@ class TerminalInstance:
     def last_exit_signal(self) -> str | None:
         """Return tmux's observed signal, without attributing who sent it."""
         return self._last_exit_signal
+
+    def session_killed_by_tmux(self) -> bool:
+        """Whether tmux reported this terminal's session, or its whole server, gone.
+
+        With ``keep_alive_after_exit`` an inner-CLI exit leaves a dead pane, so a
+        missing session or server means a tmux kill command (or a killed tmux) ended it.
+        """
+        error = (self._last_session_probe_error or "").lower()
+        return self.keep_alive_after_exit and any(
+            marker in error for marker in _TMUX_SESSION_KILLED_MARKERS
+        )
 
     def _remember_exit_status(self, fields: str) -> None:
         """Record the exit code from a ``#{pane_dead} #{pane_dead_status}`` row.
@@ -2280,6 +2320,7 @@ class TerminalInstance:
         interval = poll_interval_s if poll_interval_s is not None else _IDLE_POLL_INTERVAL_SECONDS
         consecutive_capture_failures = 0
         self._probe_failures.clear()
+        self._screen_watch_started_at = time.monotonic()
         while True:
             # ``Event.wait`` doubles as the poll-interval sleep, so
             # ``stop_event.set()`` from :meth:`close` returns within
@@ -2358,6 +2399,12 @@ class TerminalInstance:
                 time.monotonic() - self._last_client_interaction_at
             ) < _CLIENT_INTERACTION_WINDOW_SECONDS
             idle_fired = detector.tick(snapshot, suppress_activity=suppress)
+            # The change stamp lands first, so a reader never pairs a fresh capture
+            # with the previous change time.
+            watched_at = time.monotonic()
+            if detector.changed_this_tick:
+                self._screen_changed_at = watched_at
+            self._screen_watched_at = watched_at
             # Activity edge first: a tick can both change the pane and
             # (much later) cross the idle threshold, but never both in
             # the same tick — a change resets the idle timer.

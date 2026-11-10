@@ -414,6 +414,7 @@ def _to_agent_object(
     policies: list[PolicySummary] = []
     skills: list[SkillSummary] = []
     terminals: list[str] = []
+    loads_user_settings = True
     # Harness/kind for the UI; None until the spec loads (mirrors the
     # GET /v1/agents catalog so both endpoints report it consistently).
     harness: str | None = None
@@ -444,6 +445,7 @@ def _to_agent_object(
                 for s in loaded.spec.skills
                 if s.user_invocable
             ]
+            loads_user_settings = loaded.spec.loads_user_settings
             from omnigent.mcp_selection import selected_mcp_spec
 
             mcp_servers = [
@@ -497,4 +499,5 @@ def _to_agent_object(
         policies=policies,
         skills=skills,
         terminals=terminals,
+        loads_user_settings=loads_user_settings,
     )
