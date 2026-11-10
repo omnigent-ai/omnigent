@@ -1095,10 +1095,12 @@ export async function fetchRewindPrompts(
 export interface RewindAttachment {
   /** The prompt's content block type. */
   type: "input_file" | "input_image";
-  /** The rewound session's copy of the file, e.g. "file_abc"; absent for an inline image. */
+  /** The rewound session's copy of the file, e.g. "file_abc"; absent for an inline attachment. */
   fileId?: string;
   /** An image the prompt carried inline, as a `data:image/...` URI, with no stored file. */
   imageUrl?: string;
+  /** A document the prompt carried inline, as a base64 `data:` URI, with no stored file. */
+  fileData?: string;
   /** The attachment's name, e.g. "diagram.png". */
   filename: string;
 }
@@ -1132,6 +1134,7 @@ export async function rewindSession(
       type: RewindAttachment["type"];
       file_id?: string | null;
       image_url?: string | null;
+      file_data?: string | null;
       filename: string;
     }[];
   }>(res);
@@ -1142,6 +1145,7 @@ export async function rewindSession(
       type: attachment.type,
       ...(attachment.file_id ? { fileId: attachment.file_id } : {}),
       ...(attachment.image_url ? { imageUrl: attachment.image_url } : {}),
+      ...(attachment.file_data ? { fileData: attachment.file_data } : {}),
       filename: attachment.filename,
     })),
   };

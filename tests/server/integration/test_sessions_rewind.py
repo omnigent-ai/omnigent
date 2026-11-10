@@ -334,17 +334,39 @@ _INLINE_PNG = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
 )
+_INLINE_PDF = "data:application/pdf;base64,JVBERi0xLjQK"
+_INLINE_TEXT = "data:text/plain;charset=utf-8;base64,cGFyc2VyIG5vdGVz"
 
 
-@pytest.mark.parametrize("text", ["Look at this", None], ids=["text-and-image", "image-only"])
-async def test_rewind_returns_an_inline_image_from_the_prompt(
+@pytest.mark.parametrize("text", ["Look at this", None], ids=["with-text", "attachment-only"])
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [
+        (
+            {"type": "input_image", "image_url": _INLINE_PNG, "filename": "pasted.png"},
+            {"type": "input_image", "image_url": _INLINE_PNG, "filename": "pasted.png"},
+        ),
+        (
+            {"type": "input_file", "file_data": _INLINE_PDF, "filename": "spec.pdf"},
+            {"type": "input_file", "file_data": _INLINE_PDF, "filename": "spec.pdf"},
+        ),
+        (
+            {"type": "input_file", "file_data": _INLINE_TEXT},
+            {"type": "input_file", "file_data": _INLINE_TEXT, "filename": "document"},
+        ),
+    ],
+    ids=["image", "pdf", "unnamed-text"],
+)
+async def test_rewind_returns_an_inline_attachment_from_the_prompt(
     client: httpx.AsyncClient,
     db_uri: str,
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
     text: str | None,
+    block: dict[str, Any],
+    expected: dict[str, Any],
 ) -> None:
-    """An image the prompt carries inline, with no stored file, comes back too.
+    """An image or document the prompt carries inline, with no stored file, comes back too.
 
     The client rebuilds the composer attachment from the data URI and uploads
     it on send like any other attachment.
@@ -352,9 +374,7 @@ async def test_rewind_returns_an_inline_image_from_the_prompt(
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
     source_id = await create_placed_session(client, store)
-    content: list[dict[str, Any]] = [
-        {"type": "input_image", "image_url": _INLINE_PNG, "filename": "pasted.png"}
-    ]
+    content: list[dict[str, Any]] = [block]
     if text is not None:
         content.append({"type": "input_text", "text": text})
     [prompt] = store.append(
@@ -373,12 +393,7 @@ async def test_rewind_returns_an_inline_image_from_the_prompt(
     assert resp.status_code == 200, resp.text
     assert resp.json()["prompt"] == (text or "")
     assert resp.json()["attachments"] == [
-        {
-            "type": "input_image",
-            "file_id": None,
-            "image_url": _INLINE_PNG,
-            "filename": "pasted.png",
-        }
+        {"file_id": None, "image_url": None, "file_data": None, **expected}
     ]
 
 

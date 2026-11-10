@@ -11017,8 +11017,20 @@
         "type": "object"
       },
       "SessionRewindAttachment": {
-        "description": "A file the chosen `/rewind` prompt attached, as the rewound session holds it.\n\nExactly one of *file_id* and *image_url* is set.",
+        "description": "A file the chosen `/rewind` prompt attached, as the rewound session holds it.\n\nExactly one of *file_id*, *image_url* and *file_data* is set.",
         "properties": {
+          "file_data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A document the prompt carried inline instead of as a stored file, as a base64 `data:` URI, e.g. `\"data:application/pdf;base64,...\"`; uploaded on send like *image_url*.",
+            "title": "File Data"
+          },
           "file_id": {
             "anyOf": [
               {

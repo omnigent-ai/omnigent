@@ -315,6 +315,10 @@ _REWIND_HARNESSES = frozenset({"claude-sdk", "claude-native"})
 
 # An image a prompt carries inline rather than as a stored file.
 _INLINE_IMAGE_URL = re.compile(r"^data:image/[\w.+-]+;base64,", re.IGNORECASE)
+# A document a prompt carries inline as ``input_file.file_data``, e.g. a PDF.
+_INLINE_FILE_DATA = re.compile(
+    r"^data:[\w.+-]+/[\w.+-]+(;[\w.+-]+=[^;,]*)*;base64,", re.IGNORECASE
+)
 
 # Continues a claude-sdk session in a fresh session on ``/clear`` once the
 # release callback has freed its client; returns the new session's id.
@@ -6235,8 +6239,8 @@ def register_core_routes(
         """
         Return the files *content* attached, as the fork's copies of them.
 
-        An image carried inline as a ``data:image/...`` URI, with no stored
-        file, comes back as that URI for the client to upload on send.
+        An image or document carried inline as a ``data:`` URI, with no
+        stored file, comes back as that URI for the client to upload on send.
         Attachments whose file the fork holds no copy of are left out.
 
         :param fork_id: The fork continuing the rewound session.
@@ -6249,15 +6253,19 @@ def register_core_routes(
             if block_type not in ("input_file", "input_image"):
                 continue
             if not isinstance(file_id, str):
-                image_url, filename = part.get("image_url"), part.get("filename")
-                if block_type == "input_image" and _INLINE_IMAGE_URL.match(
-                    image_url if isinstance(image_url, str) else ""
-                ):
+                is_image = block_type == "input_image"
+                inline = part.get("image_url" if is_image else "file_data")
+                pattern = _INLINE_IMAGE_URL if is_image else _INLINE_FILE_DATA
+                filename = part.get("filename")
+                if isinstance(inline, str) and pattern.match(inline):
                     attachments.append(
                         SessionRewindAttachment(
-                            type="input_image",
-                            image_url=image_url,
-                            filename=filename if isinstance(filename, str) else "image",
+                            type=block_type,
+                            image_url=inline if is_image else None,
+                            file_data=None if is_image else inline,
+                            filename=filename
+                            if isinstance(filename, str)
+                            else ("image" if is_image else "document"),
                         )
                     )
                 continue

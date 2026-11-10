@@ -3166,7 +3166,7 @@ class SessionRewindAttachment(BaseModel):
     """
     A file the chosen ``/rewind`` prompt attached, as the rewound session holds it.
 
-    Exactly one of *file_id* and *image_url* is set.
+    Exactly one of *file_id*, *image_url* and *file_data* is set.
 
     :param type: The prompt's content block type, ``"input_file"`` or
         ``"input_image"``.
@@ -3175,12 +3175,17 @@ class SessionRewindAttachment(BaseModel):
     :param image_url: An image the prompt carried inline instead of as a stored
         file, as a ``data:image/...`` URI (e.g. from a session imported from
         another harness); the client uploads it on send like any attachment.
+    :param file_data: A document the prompt carried inline instead of as a
+        stored file, as a base64 ``data:`` URI, e.g.
+        ``"data:application/pdf;base64,..."``; uploaded on send like
+        *image_url*.
     :param filename: The attachment's name, e.g. ``"diagram.png"``.
     """
 
     type: Literal["input_file", "input_image"]
     file_id: str | None = None
     image_url: str | None = None
+    file_data: str | None = None
     filename: str
 
 
