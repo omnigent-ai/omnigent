@@ -2537,6 +2537,9 @@ module.exports = function (pi) {
     agentRunning = false;
     setOmnigentStatus(config, ctx, "idle");
     activeResponseId = null;
+    // Accepted prompts that Pi never consumed (discarded queue, extension
+    // commands) must not hide a later prompt consumed without ``input``.
+    if (!ctx?.hasPendingMessages?.()) unconsumedMirroredPrompts.length = 0;
     // Last-chance usage capture from the agent loop's final message set, in
     // case neither ``message_end`` nor ``turn_end`` carried usage for some
     // call. ``event.messages`` may hold the whole conversation; the
@@ -2688,23 +2691,15 @@ module.exports = function (pi) {
     await postToolResult(event, currentResponseId());
   });
 
-  pi.on("input", async (event, ctx) => {
-    rememberContext(ctx);
-    setOmnigentStatus(config, ctx, "running");
-    const text = event && typeof event.text === "string" ? event.text : "";
-    if (!text) return;
-    await pendingSettingsChange;
-    // Route TUI input once. Stop after a final decision or failure so later
-    // prompts do not repeatedly wait for an unreachable server.
-    if (!turnRoutingDone && event.source !== "extension" && !text.startsWith("/")) {
-      const decision = await routeTurn(config, text, modelReference(ctx && ctx.model));
-      if (!decision || decision.terminal || decision.action === "route") {
-        turnRoutingDone = true;
-      }
-      if (decision && decision.action === "route" && decision.model) {
-        await applyModelChange(pi, config, ctx, decision.model);
-      }
-    }
+  // Prompts mirrored from ``input`` that Pi has not consumed yet. Pi fires
+  // ``input`` when it accepts a prompt, including queued steers and
+  // follow-ups, so Chat shows the prompt right away. ``message_start`` then
+  // skips these so an accepted prompt appears once, while a prompt that
+  // reaches Pi without an ``input`` callback is still mirrored.
+  const unconsumedMirroredPrompts = [];
+  const UNCONSUMED_MIRRORED_PROMPTS_CAP = 64;
+
+  function mirrorUserPrompt(text) {
     const responseId = newResponseId("user");
     history.enqueue(
       {
@@ -2717,6 +2712,49 @@ module.exports = function (pi) {
       },
       `pi:user:${responseId}`,
     );
+  }
+
+  pi.on("input", async (event, ctx) => {
+    rememberContext(ctx);
+    setOmnigentStatus(config, ctx, "running");
+    const text = event && typeof event.text === "string" ? event.text : "";
+    if (!text) return;
+    // Mirror before any await: Pi runs the prompt even when this handler
+    // fails later, so a settings or routing failure must not drop it from Chat.
+    mirrorUserPrompt(text);
+    unconsumedMirroredPrompts.push(text);
+    if (unconsumedMirroredPrompts.length > UNCONSUMED_MIRRORED_PROMPTS_CAP) {
+      unconsumedMirroredPrompts.shift();
+    }
+    await pendingSettingsChange;
+    // Route TUI input once. Stop after a final decision or failure so later
+    // prompts do not repeatedly wait for an unreachable server.
+    if (!turnRoutingDone && event.source !== "extension" && !text.startsWith("/")) {
+      const decision = await routeTurn(config, text, modelReference(ctx && ctx.model));
+      if (!decision || decision.terminal || decision.action === "route") {
+        turnRoutingDone = true;
+      }
+      if (decision && decision.action === "route" && decision.model) {
+        await applyModelChange(pi, config, ctx, decision.model);
+      }
+    }
+  });
+
+  pi.on("message_start", async (event, ctx) => {
+    const message = event ? event.message : undefined;
+    if (messageRole(message) !== "user") return;
+    rememberContext(ctx);
+    const text = textFromMessage(message);
+    if (!text) return;
+    // Pi expands skill commands and prompt templates after ``input``, so the
+    // consumed text can differ from the accepted one; the oldest unconsumed
+    // prompt is then the one being consumed.
+    const index = unconsumedMirroredPrompts.indexOf(text);
+    if (index !== -1 || unconsumedMirroredPrompts.length) {
+      unconsumedMirroredPrompts.splice(index === -1 ? 0 : index, 1);
+      return;
+    }
+    mirrorUserPrompt(text);
   });
 
   pi.on("message_end", async (event, ctx) => {
