@@ -5851,9 +5851,7 @@ async def _run_managed_wake(
 
         Without it the wake shows the single ``"provisioning"`` band that
         ``_kick_managed_wake`` seeded for its whole duration, even while the host
-        is already re-execing. resume_managed_host may invoke this from the
-        worker thread its ``start_host`` runs on; ``_publish_sandbox_status`` is
-        thread-safe.
+        is already re-execing. resume_managed_host invokes this on the event loop.
 
         :param stage: The stage just entered, e.g. ``"starting"``.
         :param details: What the user needs to do, for ``"action_required"``.

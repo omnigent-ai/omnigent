@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel
 
+from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
 from omnigent.onboarding.sandboxes.base import (
@@ -76,6 +77,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import Host, HostStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -4342,19 +4344,12 @@ async def test_cancelled_wake_keeps_lock_through_host_start_without_stages(
     import omnigent.server.managed_hosts as managed
 
     host_store = HostStore(db_uri)
-
+    register = _registering_host(host_store)
     register_on_start = True
-
-    def _register(invocation: HostStartInvocation) -> None:
-        host_store.upsert_on_connect(
-            host_id=invocation.host_id,
-            name=invocation.host_name,
-            user_id=_OWNER,
-        )
 
     def _register_on_start(invocation: HostStartInvocation) -> None:
         if register_on_start:
-            _register(invocation)
+            register(invocation)
 
     fake = _IsloFakeLauncher(on_host_start=_register_on_start, can_resume=True)
     config = _injected_config(fake)
@@ -4389,15 +4384,10 @@ async def test_cancelled_wake_keeps_lock_through_host_start_without_stages(
             await asyncio.wait_for(resume_lock.acquire(), timeout=0.2)
     finally:
         workspace_unblocked.set()
-
-    async def _second_host_start() -> None:
-        while len(fake.host_starts) < 2:
-            await asyncio.sleep(0.01)
-
-    await asyncio.wait_for(_second_host_start(), timeout=5)
+    await poll_until_async(lambda: len(fake.host_starts) == 2, timeout_s=5)
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(resume_lock.acquire(), timeout=0.2)
-    _register(fake.host_starts[-1])
+    register(fake.host_starts[-1])
     await asyncio.wait_for(retry, timeout=5)
     assert fake.resumed == ["sb-fake-1"]
     assert len(fake.host_starts) == 2
@@ -4405,48 +4395,192 @@ async def test_cancelled_wake_keeps_lock_through_host_start_without_stages(
     assert stages == []
 
 
-async def test_wake_cancelled_while_rearming_starts_no_host(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("preserves_host", "claim"),
+    [(False, "rearm_managed_host"), (True, "claim_managed_host_resume")],
+)
+async def test_wake_cancelled_while_claiming_starts_nothing_further(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, preserves_host: bool, claim: str
 ) -> None:
-    """A wake cancelled while re-arming its launch token returns without starting a host."""
+    """A wake cancelled while claiming its generation starts no provider resume or host."""
     import omnigent.server.managed_hosts as managed
 
     host_store = HostStore(db_uri)
-
-    def _register(invocation: HostStartInvocation) -> None:
-        host_store.upsert_on_connect(
-            host_id=invocation.host_id,
-            name=invocation.host_name,
-            user_id=_OWNER,
-        )
-
-    fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
+    register = _registering_host(host_store)
+    fake: FakeSandboxLauncher = (
+        _LambdaFakeLauncher(on_host_start=register)
+        if preserves_host
+        else _IsloFakeLauncher(on_host_start=register, can_resume=True)
+    )
     config = _injected_config(fake)
     first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
     host_store.set_offline(first.host_id)
-    rearm_entered = threading.Event()
-    rearm_unblocked = threading.Event()
-    rearm = host_store.rearm_managed_host
+    claim_entered = threading.Event()
+    claim_unblocked = threading.Event()
+    claim_generation = getattr(host_store, claim)
 
-    def _stalled_rearm(*args: Any, **kwargs: Any) -> Any:
-        rearm_entered.set()
-        rearm_unblocked.wait(timeout=30)
-        return rearm(*args, **kwargs)
+    def _stalled_claim(*args: Any, **kwargs: Any) -> Any:
+        claim_entered.set()
+        claim_unblocked.wait(timeout=30)
+        return claim_generation(*args, **kwargs)
 
-    monkeypatch.setattr(host_store, "rearm_managed_host", _stalled_rearm)
+    monkeypatch.setattr(host_store, claim, _stalled_claim)
     wake = asyncio.create_task(resume_managed_host(first.host_id, host_store, config))
     try:
-        assert await asyncio.to_thread(rearm_entered.wait, 30)
+        assert await asyncio.to_thread(claim_entered.wait, 30)
         wake.cancel()
         with pytest.raises(asyncio.CancelledError):
             await wake
     finally:
-        rearm_unblocked.set()
+        claim_unblocked.set()
     resume_lock = managed._resume_locks[first.host_id]
     await asyncio.wait_for(resume_lock.acquire(), timeout=5)
     resume_lock.release()
-    assert fake.resumed == ["sb-fake-1"]
+    # The preserving path claims before resuming; the re-arm path claims after it.
+    assert fake.resumed == ([] if preserves_host else ["sb-fake-1"])
     assert len(fake.host_starts) == 1
+
+
+async def test_stage_entered_before_a_wake_is_abandoned_cannot_follow_its_failure(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage the launcher reported before its caller gave up never lands after the failure."""
+    import omnigent.server.managed_hosts as managed
+
+    host_store = HostStore(db_uri)
+    register = _registering_host(host_store)
+    host_start_unblocked = threading.Event()
+    stall_host_start = False
+
+    def _register_when_unblocked(invocation: HostStartInvocation) -> None:
+        if stall_host_start:
+            host_start_unblocked.wait(timeout=30)
+        register(invocation)
+
+    fake = _IsloFakeLauncher(on_host_start=_register_when_unblocked, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+    stall_host_start = True
+    monkeypatch.setattr(managed, "_ONLINE_POLL_INTERVAL_S", 0.01)
+    loop_thread = threading.get_ident()
+    observer_entered = threading.Event()
+    observer_unblocked = threading.Event()
+    stages: list[str] = []
+
+    def _slow_observer(stage: str, details: str | None = None) -> None:
+        # A publish begun off the loop can still be running when the caller settles.
+        if threading.get_ident() != loop_thread:
+            observer_entered.set()
+            observer_unblocked.wait(timeout=30)
+        stages.append(stage)
+
+    wake = asyncio.create_task(
+        resume_managed_host(first.host_id, host_store, config, on_stage=_slow_observer)
+    )
+    try:
+        await poll_until_async(lambda: observer_entered.is_set() or "starting" in stages)
+        wake.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wake
+        stages.append("failed")
+    finally:
+        observer_unblocked.set()
+        host_start_unblocked.set()
+    resume_lock = managed._resume_locks[first.host_id]
+    await asyncio.wait_for(resume_lock.acquire(), timeout=5)
+    resume_lock.release()
+    assert stages == ["starting", "failed"]
+
+
+async def test_stage_queued_as_a_wake_is_abandoned_is_dropped(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage still queued for the loop when its caller settles the failure is dropped."""
+    import omnigent.server.managed_hosts as managed
+
+    host_store = HostStore(db_uri)
+    register = _registering_host(host_store)
+    host_start_entered = threading.Event()
+    host_start_unblocked = threading.Event()
+    stall_host_start = False
+
+    def _register_when_unblocked(invocation: HostStartInvocation) -> None:
+        if stall_host_start:
+            host_start_entered.set()
+            host_start_unblocked.wait(timeout=30)
+        register(invocation)
+
+    fake = _IsloFakeLauncher(on_host_start=_register_when_unblocked, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+    stall_host_start = True
+    monkeypatch.setattr(managed, "_ONLINE_POLL_INTERVAL_S", 0.01)
+    workspace_entered = threading.Event()
+    workspace_unblocked = threading.Event()
+    prepare_workspace = fake.prepare_workspace
+
+    def _stalled_prepare_workspace(sandbox_id: str, **kwargs: Any) -> str:
+        workspace_entered.set()
+        workspace_unblocked.wait(timeout=30)
+        return prepare_workspace(sandbox_id, **kwargs)
+
+    monkeypatch.setattr(fake, "prepare_workspace", _stalled_prepare_workspace)
+    stages: list[str] = []
+
+    async def _wake_then_settle() -> None:
+        try:
+            await resume_managed_host(first.host_id, host_store, config, on_stage=stages.append)
+        except asyncio.CancelledError:
+            stages.append("failed")
+            raise
+
+    wake = asyncio.create_task(_wake_then_settle())
+    try:
+        assert await asyncio.to_thread(workspace_entered.wait, 30)
+        wake.cancel()
+        workspace_unblocked.set()
+        # Hold the loop until the "starting" stage is queued behind the cancellation.
+        assert host_start_entered.wait(timeout=30)
+        with pytest.raises(asyncio.CancelledError):
+            await wake
+    finally:
+        workspace_unblocked.set()
+        host_start_unblocked.set()
+    resume_lock = managed._resume_locks[first.host_id]
+    await asyncio.wait_for(resume_lock.acquire(), timeout=5)
+    resume_lock.release()
+    assert stages == ["failed"]
+
+
+async def test_forced_wake_ignores_another_workspaces_wake_of_a_colliding_host_id(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wake completed in another workspace for the same host id cannot skip a forced wake."""
+    import omnigent.server.managed_hosts as managed
+
+    host_store = HostStore(db_uri)
+    fake = _IsloFakeLauncher(on_host_start=_registering_host(host_store), can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    monkeypatch.setattr(managed, "_ONLINE_POLL_INTERVAL_S", 0.01)
+    resume_lock = managed._resume_locks.setdefault(first.host_id, asyncio.Lock())
+    await resume_lock.acquire()
+    try:
+        wake = asyncio.create_task(
+            resume_managed_host(first.host_id, host_store, config, force=True)
+        )
+        # Let the forced wake record its baseline and queue behind the held lock.
+        for _ in range(3):
+            await asyncio.sleep(0)
+        with workspace_scope(current_workspace_id() + 1):
+            managed._completed_wakes[first.host_id] = 1
+    finally:
+        resume_lock.release()
+    await asyncio.wait_for(wake, timeout=5)
+    assert fake.resumed == ["sb-fake-1"]
+    assert len(fake.host_starts) == 2
 
 
 async def test_resume_threads_agent_name_to_classifying_start_host(db_uri: str) -> None:
