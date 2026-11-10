@@ -1246,22 +1246,54 @@ class CodexNativeExecutor(Executor):
         *,
         goal_objective: str | None = None,
     ) -> tuple[CodexNativeBridgeState | None, dict[str, int], list[dict[str, object]]]:
+        """Keep the original input and owner while its local cache waits for capacity."""
         generations = _input_interrupt_generations(self._bridge_dir)
         observed = read_bridge_state(self._bridge_dir)
-        try:
-            input_items: list[dict[str, object]] = (
-                [{"type": "text", "text": goal_objective}]
-                if goal_objective is not None
-                else await asyncio.to_thread(
-                    _content_to_input_items,
-                    content,
-                    self._bridge_dir,
+        storage_wait = False
+        while True:
+            if storage_wait:
+                self._require_prepared_input_owner(observed, generations)
+                failure = read_bridge_startup_failure(self._bridge_dir)
+                if failure is not None:
+                    raise _CodexNativeInputUndelivered(failure, preserve_session=True)
+            try:
+                try:
+                    input_items: list[dict[str, object]] = (
+                        [{"type": "text", "text": goal_objective}]
+                        if goal_objective is not None
+                        else await asyncio.to_thread(
+                            _content_to_input_items,
+                            content,
+                            self._bridge_dir,
+                            session_id=self._request_session_id,
+                        )
+                    )
+                finally:
+                    self._require_prepared_input_owner(observed, generations)
+            except OSError as exc:
+                if exc.errno not in _DISK_FULL_ERRNOS:
+                    raise
+                if not storage_wait:
+                    storage_wait = True
+                    log_input_event(
+                        _logger,
+                        "codex_native_storage_wait",
+                        session_id=self._request_session_id,
+                        stage="input_preparation",
+                        outcome="waiting",
+                        os_errno=exc.errno,
+                    )
+                await asyncio.sleep(_BRIDGE_STATE_SLOW_POLL_SECONDS)
+                continue
+            if storage_wait:
+                log_input_event(
+                    _logger,
+                    "codex_native_storage_wait",
                     session_id=self._request_session_id,
+                    stage="input_preparation",
+                    outcome="recovered",
                 )
-            )
-        finally:
-            self._require_prepared_input_owner(observed, generations)
-        return observed, generations, input_items
+            return observed, generations, input_items
 
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """
@@ -2004,6 +2036,7 @@ def _content_to_input_items(
             bridge_dir,
             input_receipt=current_native_input_receipt(),
             cache_files=cache_files,
+            raise_storage_errors=True,
         )
         items = _SpilledInputItems(items, message_id, tuple((start, end) for start, end in ranges))
     return items
@@ -2056,11 +2089,13 @@ def _collect_input_items(
                 items.append(
                     {
                         "type": "text",
-                        "text": attachment_reference_line(block, bridge_dir),
+                        "text": attachment_reference_line(
+                            block, bridge_dir, raise_storage_errors=True
+                        ),
                     }
                 )
             elif block_type == "input_image":
-                path = materialize_attachment(block, bridge_dir)
+                path = materialize_attachment(block, bridge_dir, raise_storage_errors=True)
                 if path is not None:
                     items.append({"type": "localImage", "path": str(path)})
                 else:
@@ -2113,9 +2148,9 @@ def _spill_oversized_text(
         ):
             break
         path = (
-            materialize_attachment(entry.block, bridge_dir)
+            materialize_attachment(entry.block, bridge_dir, raise_storage_errors=True)
             if entry.block is not None
-            else materialize_text(entry.text, bridge_dir)
+            else materialize_text(entry.text, bridge_dir, raise_storage_errors=True)
         )
         if path is None:
             if entry.kind == "file":
@@ -2203,7 +2238,7 @@ def _file_block_to_input_item(
     :returns: A Codex ``text`` input item referencing the file, or a visible
         could-not-load marker item when the file failed to materialize.
     """
-    path = materialize_attachment(block, bridge_dir)
+    path = materialize_attachment(block, bridge_dir, raise_storage_errors=True)
     if path is not None:
         return _attached_file_item(path)
     return {"type": "text", "text": unresolved_attachment_marker(block)}
