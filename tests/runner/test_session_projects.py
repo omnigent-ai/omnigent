@@ -16,6 +16,7 @@ FAMILY_MEMBER = "c" * 32
 SUB_AGENT = "d" * 32
 PARENT = "e" * 32
 PROJECT_ID = "f" * 32
+READ_SHARED = "0" * 32
 CHECKED_INFO = {"session_move_source_checks": True}
 
 
@@ -77,6 +78,10 @@ async def test_move_isolates_failures_and_sends_the_source_header():
             raise httpx.ConnectError("connection reset")
         if request.method == "GET" and path.endswith(SUB_AGENT):
             return httpx.Response(200, json={"id": SUB_AGENT, "parent_session_id": PARENT})
+        if request.method == "GET" and path.endswith(READ_SHARED):
+            # Already in the target project, so only the owner check keeps it from "unchanged".
+            shared = {"id": READ_SHARED, "project_id": PROJECT_ID, "permission_level": 1}
+            return httpx.Response(200, json=shared)
         if request.method == "GET":
             return httpx.Response(200, json={"id": path.rsplit("/", 1)[-1], "labels": {}})
         patched.append(request)
@@ -90,7 +95,14 @@ async def test_move_isolates_failures_and_sends_the_source_header():
         result = json.loads(
             await execute_session_move(
                 {
-                    "session_ids": [FAILING, SUB_AGENT, FAMILY_MEMBER, SOURCE, hyphenated_source],
+                    "session_ids": [
+                        FAILING,
+                        SUB_AGENT,
+                        FAMILY_MEMBER,
+                        READ_SHARED,
+                        SOURCE,
+                        hyphenated_source,
+                    ],
                     "project": " Q3 ",
                 },
                 client,
@@ -98,16 +110,18 @@ async def test_move_isolates_failures_and_sends_the_source_header():
             )
         )
     statuses = [(r["status"], r.get("error", "")) for r in result["results"]]
-    assert len(statuses) == 4, "two spellings of one session move it once"
+    assert len(statuses) == 5, "two spellings of one session move it once"
     assert statuses[0][0] == "error" and "could not be read" in statuses[0][1]
     assert statuses[1] == (
         "error",
         f"sub-agent sessions follow their parent; move {PARENT} instead",
     )
     assert statuses[2][0] == "error" and "moves with its family" in statuses[2][1]
-    assert statuses[3] == ("moved", "")
+    assert statuses[3] == ("error", "only the session's owner can move it between projects")
+    assert statuses[4] == ("moved", "")
     assert result["project"] == "Q3" and result["project_created"] is False
     assert all(r.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE for r in patched)
+    assert not [r for r in patched if r.url.path.endswith(READ_SHARED)]
     assert json.loads(patched[-1].content) == {
         "project_id": PROJECT_ID,
         "labels": {"omni_project": ""},
@@ -180,6 +194,7 @@ async def test_list_pages_projects_and_sessions_until_the_last_page():
         )
     assert seen["sessions"][0]["project"] == "" and seen["sessions"][0]["limit"] == "200"
     assert seen["sessions"][0]["visibility"] == "mine" and seen["sessions"][0]["kind"] == "default"
+    assert seen["sessions"][0]["sort_by"] == "updated_at"
     assert seen["projects"][0]["limit"] == "200" and "after" not in seen["projects"][0]
     assert first["projects"] == [{"name": "First", "id": "1" * 32}]
     assert first["sessions"][0] == {

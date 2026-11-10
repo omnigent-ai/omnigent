@@ -1,5 +1,6 @@
 """List projects and file the owner's existing sessions into them via the session APIs."""
 
+import asyncio
 import json
 from typing import Any
 
@@ -7,6 +8,7 @@ import httpx
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.session_requests import normalize_session_id
+from omnigent.server.auth import LEVEL_OWNER
 from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
 from omnigent.tools.builtins.session_projects import (
     MAX_LISTED_SESSIONS,
@@ -16,6 +18,7 @@ from omnigent.tools.builtins.session_projects import (
 
 _DEFAULT_LISTED_SESSIONS = 50
 _SNAPSHOT_PARAMS = {"include_items": "false", "include_liveness": "false"}
+_CONCURRENT_NAME_READS = 8
 
 
 async def resolve_project_id(
@@ -71,12 +74,17 @@ def _same_session(left: str | None, right: str | None) -> bool:
 async def _project_names(
     client: httpx.AsyncClient, project_ids: set[str], known: dict[str, str]
 ) -> dict[str, str]:
-    """Add the names of *project_ids* missing from *known*, one owned-project read each."""
+    """Add the names of *project_ids* missing from *known*, reading each owned project."""
     names = dict(known)
-    for project_id in sorted(project_ids - names.keys()):
-        response = await client.get(f"/v1/projects/{project_id}", timeout=30.0)
+    gate = asyncio.Semaphore(_CONCURRENT_NAME_READS)
+
+    async def read(project_id: str) -> None:
+        async with gate:
+            response = await client.get(f"/v1/projects/{project_id}", timeout=30.0)
         if not response.is_error:
             names[project_id] = str(response.json().get("name") or project_id)
+
+    await asyncio.gather(*(read(project_id) for project_id in project_ids - names.keys()))
     return names
 
 
@@ -214,6 +222,10 @@ async def _movable_snapshot(
         current = snapshot.json()
     except (httpx.HTTPError, ValueError) as exc:
         return None, f"session could not be read: {exc}"
+    level = current.get("permission_level")
+    # Filing is owner-gated; refuse here so a readable foreign session is never "unchanged".
+    if isinstance(level, int) and level < LEVEL_OWNER:
+        return None, "only the session's owner can move it between projects"
     parent = current.get("parent_session_id")
     if parent:
         return None, f"sub-agent sessions follow their parent; move {parent} instead"

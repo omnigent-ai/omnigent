@@ -81,8 +81,9 @@ MCP independent creation.
   representative; each refusal names the session to move instead, and each
   session gets its own result. An edit-shared caller cannot move sessions or
   create a project through the move, while listing stays an ordinary owner
-  read. Moves refuse to run against a server that does not advertise
-  `session_move_source_checks` in `/v1/info`. `tool_groups.projects: false` drops both tools. Covered by
+  read. A session shared with the caller but owned by someone else is refused,
+  even when it is already in the target project. Moves refuse to run against a
+  server that does not advertise `session_move_source_checks` in `/v1/info`. `tool_groups.projects: false` drops both tools. Covered by
   `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_bulk_move_running_sessions`
   and the browser journeys in
   `tests/e2e_ui/sessions/test_agent_moves_sessions_to_project.py`.
@@ -109,6 +110,10 @@ MCP independent creation.
 - In a session's Chat, ask the agent to list your projects and file some
   sessions, including itself, into an existing or new project. The sidebar folders
   update while the agent keeps running.
+- In a native Claude Code session's Chat or agent terminal, ask the same; the
+  relay exposes `mcp__omnigent__sys_project_list` and
+  `mcp__omnigent__sys_session_move`, and the session lands in its folder
+  mid-turn (`test_native_claude_moves_itself_into_a_project`, nightly).
 - Use the existing Share dialog to share the sender or receiver, then repeat.
   A read-only share of the sender keeps both tools working; an edit share
   refuses them.

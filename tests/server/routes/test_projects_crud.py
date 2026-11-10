@@ -137,14 +137,20 @@ async def test_list_projects_pages_in_creation_order(
         "/v1/projects", params={"limit": 2, "after": page["last_id"]}, headers=_as_user(ALICE)
     )
     assert rest.json()["has_more"] is False
-    paged = [p["name"] for p in page["data"] + rest.json()["data"]]
+    paged = page["data"] + rest.json()["data"]
+    assert sorted(p["name"] for p in paged) == ["First", "Second", "Third"]
     # Projects created in the same second fall back to id order.
-    assert sorted(paged) == ["First", "Second", "Third"]
+    keyset = sorted(paged, key=lambda p: (p["created_at"], p["id"]))
+    assert [p["id"] for p in paged] == [p["id"] for p in keyset]
 
     foreign = await multi_user_client.get(
         "/v1/projects", params={"after": bob.json()["id"]}, headers=_as_user(ALICE)
     )
     assert foreign.status_code == 400
+    unknown = await multi_user_client.get(
+        "/v1/projects", params={"after": "0" * 32}, headers=_as_user(ALICE)
+    )
+    assert unknown.status_code == 400
     oversized = await multi_user_client.get(
         "/v1/projects", params={"limit": 201}, headers=_as_user(ALICE)
     )

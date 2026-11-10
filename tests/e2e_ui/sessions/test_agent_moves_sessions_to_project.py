@@ -66,7 +66,9 @@ class FilingJourney:
 
 
 def _project_ids_named(base_url: str, names: set[str]) -> list[str]:
-    projects = httpx.get(f"{base_url}/v1/projects", timeout=10.0).json()["data"]
+    response = httpx.get(f"{base_url}/v1/projects", timeout=10.0)
+    response.raise_for_status()
+    projects = response.json()["data"]
     return [project["id"] for project in projects if project["name"] in names]
 
 
@@ -107,8 +109,9 @@ def filing_journey(
         unfiled = {}
         for label in ("changelog draft", "flaky test triage"):
             title = f"{label} {uniq}"
-            unfiled[_seed_session(live_server, title=title)] = title
-        session_ids.extend(unfiled)
+            seeded_id = _seed_session(live_server, title=title)
+            session_ids.append(seeded_id)
+            unfiled[seeded_id] = title
         agent_title = f"project filer {uniq}"
         agent_session_id = _create_bundled_session(
             live_server, runner_id, _AGENT_YAML.format(model=model)
@@ -177,6 +180,9 @@ def test_agent_moves_existing_sessions_into_projects(
     for title in [*journey.unfiled.values(), journey.agent_title]:
         expect(sessions_section.get_by_text(title, exact=True)).to_be_visible(timeout=30_000)
     expect(_folder(page, journey.new_project)).to_have_count(0)
+    # Project folders start collapsed in a fresh browser; the move must not open this one.
+    folder_toggle = page.get_by_role("button", name=journey.existing_project, exact=True)
+    expect(folder_toggle).to_have_attribute("aria-expanded", "false")
     _hold(page)
 
     composer = page.get_by_label("Message the agent")
@@ -207,10 +213,8 @@ def test_agent_moves_existing_sessions_into_projects(
         expect(sessions_section.get_by_text(title, exact=True)).to_have_count(
             0, timeout=_LIVE_UPDATE_TIMEOUT_MS
         )
-    # A folder that was collapsed before the move stays collapsed; open it as a user would.
-    folder_toggle = page.get_by_role("button", name=journey.existing_project, exact=True)
-    if folder_toggle.get_attribute("aria-expanded") != "true":
-        folder_toggle.click()
+    expect(folder_toggle).to_have_attribute("aria-expanded", "false")
+    folder_toggle.click()
     existing_folder = _folder(page, journey.existing_project)
     for title in journey.unfiled.values():
         expect(existing_folder.get_by_text(title, exact=True)).to_be_visible(

@@ -11,7 +11,7 @@ from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import LEVEL_EDIT
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -319,6 +319,15 @@ async def test_project_move_refuses_sessions_per_session(auth_client, peers, db_
     assert moved["results"][-1]["status"] == "moved"
     assert store.get_conversation(others["id"]).project_id is None
     assert store.get_conversation(family_member["id"]).project_id is None
+
+    read_shared = await _create_session_as(auth_client, "", "bob")
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("alice")
+    permissions.grant("alice", read_shared["id"], LEVEL_READ)
+    unfile = await _project_tool(
+        auth_client, source, "sys_session_move", session_ids=[read_shared["id"]], project=""
+    )
+    assert "only the session's owner" in unfile["results"][0]["error"], unfile
 
     family = await _project_tool(
         auth_client, source, "sys_session_move", session_ids=[target["id"]], project="Triage"
