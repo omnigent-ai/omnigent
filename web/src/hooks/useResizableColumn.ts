@@ -17,7 +17,7 @@ export function useResizableColumn(
   const width = Math.max(minWidth, Math.min(maxWidth, preferredWidth));
   const widthRef = useRef(width);
   widthRef.current = width;
-  const dragging = useRef(false);
+  const dragging = useRef<{ startX: number; moved: boolean } | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
   const minRef = useRef(minWidth);
   const maxRef = useRef(maxWidth);
@@ -45,7 +45,7 @@ export function useResizableColumn(
 
   const onMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
-    dragging.current = true;
+    dragging.current = { startX: e.clientX, moved: false };
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
   }, []);
@@ -62,15 +62,17 @@ export function useResizableColumn(
   useEffect(() => {
     function onMouseMove(e: MouseEvent) {
       if (!dragging.current || !containerRef.current) return;
+      if (!dragging.current.moved && e.clientX === dragging.current.startX) return;
+      dragging.current.moved = true;
       const left = containerRef.current.getBoundingClientRect().left;
       resize(e.clientX - left);
     }
     function onMouseUp() {
       if (!dragging.current) return;
-      dragging.current = false;
+      if (dragging.current.moved) persistWidth(widthRef.current);
+      dragging.current = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
-      persistWidth(widthRef.current);
     }
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
@@ -78,7 +80,7 @@ export function useResizableColumn(
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
       if (dragging.current) {
-        dragging.current = false;
+        dragging.current = null;
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
       }

@@ -1005,6 +1005,9 @@ function FileRowItem({
             if (showOpenInTab && hasCommandModifier(event)) onFileSelect(path, true);
             else onFileSelect(path);
           }}
+          onMouseDown={(event) => {
+            if (showOpenInTab && event.button === 1 && !isDeleted) event.preventDefault();
+          }}
           onAuxClick={(event) => {
             if (showOpenInTab && event.button === 1 && !isDeleted) {
               event.preventDefault();

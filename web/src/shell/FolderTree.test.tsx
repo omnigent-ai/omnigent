@@ -112,7 +112,10 @@ describe("FolderTree file opening", () => {
       expect(onFileSelect).toHaveBeenLastCalledWith("README.md");
 
       onFileSelect.mockClear();
+      expect(fireEvent.mouseDown(row, { button: 0 })).toBe(true);
+      expect(fireEvent.mouseDown(row, { button: 2 })).toBe(true);
       fireEvent(row, new MouseEvent("auxclick", { bubbles: true, button: 2 }));
+      expect(fireEvent.mouseDown(row, { button: 1 })).toBe(false);
       expect(onFileSelect).not.toHaveBeenCalled();
       fireEvent(row, new MouseEvent("auxclick", { bubbles: true, button: 1 }));
       expect(onFileSelect.mock.calls).toEqual([["README.md", true]]);
@@ -133,6 +136,7 @@ describe("FolderTree file opening", () => {
     fireEvent.click(row, { metaKey: isMacPlatform(), ctrlKey: !isMacPlatform() });
     expect(onFileSelect.mock.calls).toEqual([["README.md"]]);
     onFileSelect.mockClear();
+    expect(fireEvent.mouseDown(row, { button: 1 })).toBe(true);
     fireEvent(row, new MouseEvent("auxclick", { bubbles: true, button: 1 }));
     expect(fireEvent.contextMenu(row)).toBe(true);
     expect(screen.queryByRole("menuitem", { name: "Open in new tab" })).toBeNull();
@@ -156,6 +160,7 @@ describe("FolderTree file opening", () => {
     });
     const row = screen.getByRole("button", { name: /^README\.md/ });
     expect(row).toBeDisabled();
+    expect(fireEvent.mouseDown(row, { button: 1 })).toBe(true);
     fireEvent.click(row);
     fireEvent.click(row, { metaKey: isMacPlatform(), ctrlKey: !isMacPlatform() });
     fireEvent(row, new MouseEvent("auxclick", { bubbles: true, button: 1 }));

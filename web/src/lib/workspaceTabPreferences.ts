@@ -26,6 +26,8 @@ export function writeAlwaysOpenFilesInTab(enabled: boolean): void {
   alwaysOpenFilesInTab.write(enabled ? "true" : "false");
 }
 
+export const notifyAlwaysOpenFilesInTabChanged = alwaysOpenFilesInTab.notifyChanged;
+
 export function useAlwaysOpenFilesInTab(): boolean {
   return alwaysOpenFilesInTab.use() === "true";
 }

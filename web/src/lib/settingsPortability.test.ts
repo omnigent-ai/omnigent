@@ -22,16 +22,19 @@ import {
   SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
   useSessionRowQuickActions,
 } from "./sessionRowQuickActionsPreferences";
-import { applyImportedSettings, collectSettings } from "./settingsPortability";
+import { applyImportedSettings, collectSettings, readSettingsFile } from "./settingsPortability";
 import {
   type SessionWorkspaceState,
   readSessionWorkspaceState,
   writeSessionWorkspaceState,
 } from "./sessionWorkspaceState";
 import {
+  ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readInitialWorkspaceTab,
   readPinnedWorkspaceTabs,
+  useAlwaysOpenFilesInTab,
+  writeAlwaysOpenFilesInTab,
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
 } from "./workspaceTabPreferences";
@@ -155,6 +158,26 @@ it("updates a mounted final-answer fold reader on import", () => {
       version: 1,
       settings: { [FOLD_ASSISTANT_NARRATION_STORAGE_KEY]: "true" },
     });
+  });
+  expect(result.current).toBe(true);
+});
+
+it("round-trips file-opening preferences and updates mounted readers when imported or omitted", async () => {
+  writeAlwaysOpenFilesInTab(true);
+  const exported = collectSettings()!;
+  expect(exported.settings[ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY]).toBe("true");
+  const imported = await readSettingsFile(new File([JSON.stringify(exported)], "settings.json"));
+  const { result } = renderHook(() => useAlwaysOpenFilesInTab());
+  expect(result.current).toBe(true);
+
+  act(() => {
+    applyImportedSettings({ version: 1, settings: {} });
+  });
+  expect(localStorage.getItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY)).toBeNull();
+  expect(result.current).toBe(false);
+
+  act(() => {
+    applyImportedSettings(imported);
   });
   expect(result.current).toBe(true);
 });

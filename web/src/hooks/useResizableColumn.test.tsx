@@ -95,21 +95,35 @@ describe("useResizableColumn", () => {
     expect(result.current.width).toBe(250);
   });
 
-  it("clamps to changing bounds without losing the preferred width", () => {
-    localStorage.setItem(storageKey, "340");
-    const { result, rerender } = renderHook(
-      ({ min, max }) => useResizableColumn(260, min, max, storageKey),
-      { initialProps: { min: 200, max: 400 } },
-    );
-    rerender({ min: 200, max: 240 });
-    expect(result.current.width).toBe(240);
-    expect(result.current.handleProps["aria-valuemax"]).toBe(240);
-    expect(localStorage.getItem(storageKey)).toBe("340");
-    rerender({ min: 200, max: 400 });
-    expect(result.current.width).toBe(340);
-    rerender({ min: 360, max: 400 });
-    expect(result.current.width).toBe(360);
-  });
+  it.each([false, true])(
+    "keeps the preferred width after a clamped click (vertical movement=%s)",
+    (verticalMovement) => {
+      localStorage.setItem(storageKey, "340");
+      const { result, rerender } = renderHook(
+        ({ min, max }) => useResizableColumn(260, min, max, storageKey),
+        { initialProps: { min: 200, max: 400 } },
+      );
+      rerender({ min: 200, max: 240 });
+      expect(result.current.width).toBe(240);
+      expect(result.current.handleProps["aria-valuemax"]).toBe(240);
+      const container = document.createElement("div");
+      vi.spyOn(container, "getBoundingClientRect").mockReturnValue({ left: 100 } as DOMRect);
+      result.current.containerRef.current = container;
+      act(() => {
+        result.current.handleProps.onMouseDown({
+          clientX: 340,
+          preventDefault: vi.fn(),
+        } as unknown as React.MouseEvent);
+        if (verticalMovement) fireEvent.mouseMove(window, { clientX: 340, clientY: 100 });
+        fireEvent.mouseUp(window);
+      });
+      expect(localStorage.getItem(storageKey)).toBe("340");
+      rerender({ min: 200, max: 400 });
+      expect(result.current.width).toBe(340);
+      rerender({ min: 360, max: 400 });
+      expect(result.current.width).toBe(360);
+    },
+  );
 
   it("allows resizing when storage is unavailable and cleans up an interrupted drag", () => {
     vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
