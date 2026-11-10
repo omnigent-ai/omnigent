@@ -370,6 +370,10 @@ SANDBOX_LOG_CAPTURE_TIMEOUT_S = 15.0
 # genuinely slow launch.
 MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 120
 
+# Deadline for an in-place wake to bring its host back. It ends just before the
+# rendezvous, so a request parked on a stuck wake reports the wake's failure.
+MANAGED_WAKE_TIMEOUT_S = MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S - 15
+
 # Server-internal sandbox lifecycle labels — currently the repository a relaunch
 # re-clones. A client seed would forge that reconstruction, so session
 # create/patch reject any client label here, closing future keys by default.
@@ -4737,6 +4741,8 @@ def host_sandbox_is_running(
 # a resume still holding it; one idle Lock per host woken is negligible.
 # custom-lint: disable-next=workspace-scoped-cache -- host_id lock; collision only serializes
 _resume_locks: dict[str, asyncio.Lock] = {}
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_abandoned_wakes: set[asyncio.Task[None]] = set()
 
 
 async def resume_managed_host(
@@ -4773,7 +4779,10 @@ async def resume_managed_host(
     lock and re-check liveness under it, so only the first wakes the host.
 
     Unlike a launch, a failed wake does NOT tear the sandbox down — the volume
-    + workspace are the user's and must survive for a retry.
+    + workspace are the user's and must survive for a retry. A wake that does
+    not finish within :data:`MANAGED_WAKE_TIMEOUT_S` fails; a provider call
+    cannot be cancelled, so it keeps the host's lock until that call returns
+    and then stops without starting the host.
 
     :param host_id: The session's bound host id, e.g. ``"host_a1b2c3d4..."``.
     :param host_store: Persistent host registrations (cross-replica liveness).
@@ -4797,7 +4806,8 @@ async def resume_managed_host(
         first launch (see :func:`host_slice_key_enabled`).
     :raises SandboxGoneError: When the sandbox generation definitively no
         longer exists, allowing the caller to create a fresh one.
-    :raises HTTPException: 502 when the resume or host restart otherwise fails.
+    :raises HTTPException: 502 when the resume or host restart otherwise fails,
+        or 504 when the wake times out.
     """
     if config is None:
         return
@@ -4805,9 +4815,75 @@ async def resume_managed_host(
     # registry alone. Cheap gate before taking the lock.
     if not force and await asyncio.to_thread(host_store.is_online, host_id):
         return
+    abandoned = asyncio.Event()
+
+    def _report_stage(stage: str, details: str | None = None) -> None:
+        # A timed-out wake must not reopen the progress surface it already failed.
+        if on_stage is None or abandoned.is_set():
+            return
+        if details is None:
+            on_stage(stage)
+        else:
+            on_stage(stage, details)
+
+    wake = asyncio.create_task(
+        _wake_managed_host(
+            host_id,
+            host_store,
+            config,
+            repos=repos,
+            force=force,
+            on_stage=None if on_stage is None else _report_stage,
+            agent_name=agent_name,
+            slice_key_enabled=slice_key_enabled,
+            abandoned=abandoned,
+        )
+    )
+    try:
+        await asyncio.wait({wake}, timeout=MANAGED_WAKE_TIMEOUT_S)
+    except asyncio.CancelledError:
+        wake.cancel()
+        raise
+    if wake.done():
+        wake.result()
+        return
+    abandoned.set()
+    _abandoned_wakes.add(wake)
+    wake.add_done_callback(partial(_finish_abandoned_wake, host_id))
+    raise HTTPException(
+        status_code=504,
+        detail=(
+            f"managed host wake timed out after {MANAGED_WAKE_TIMEOUT_S}s; "
+            "the sandbox may be unreachable"
+        ),
+    )
+
+
+def _finish_abandoned_wake(host_id: str, wake: asyncio.Task[None]) -> None:
+    """Release a timed-out wake once its provider call returns, logging any failure."""
+    _abandoned_wakes.discard(wake)
+    if not wake.cancelled() and (exc := wake.exception()) is not None:
+        _logger.warning("Timed-out wake of managed host %s failed", host_id, exc_info=exc)
+
+
+async def _wake_managed_host(
+    host_id: str,
+    host_store: HostStore,
+    config: ManagedSandboxDeployment,
+    *,
+    repos: Sequence[RepoWorkspace],
+    force: bool,
+    on_stage: SandboxStageObserver | None,
+    agent_name: str | None,
+    slice_key_enabled: bool,
+    abandoned: asyncio.Event,
+) -> None:
+    """Run :func:`resume_managed_host` under the host's lock until it is *abandoned*."""
     # Single-flight per host (see _resume_locks).
     resume_lock = _resume_locks.setdefault(host_id, asyncio.Lock())
     async with resume_lock:
+        if abandoned.is_set():
+            return
         # Re-check under the lock: a concurrent waker may have brought the host
         # online while we waited.
         if not force and await asyncio.to_thread(host_store.is_online, host_id):
@@ -4837,10 +4913,14 @@ async def resume_managed_host(
         )
         try:
             await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+            if abandoned.is_set():
+                return
             if launcher.capabilities.resume_preserves_host:
                 await _resume_preserving_host(launcher, host, host_store, sandbox_id=sandbox_id)
                 return
             await asyncio.to_thread(launcher.resume, sandbox_id)
+            if abandoned.is_set():
+                return
             token = secrets.token_urlsafe(32)
             armed = await asyncio.to_thread(
                 host_store.rearm_managed_host,
@@ -4867,6 +4947,8 @@ async def resume_managed_host(
                 on_stage=on_stage,
                 agent_name=agent_name,
             )
+            if abandoned.is_set():
+                return
             await _wait_for_host_online(host_store, host.host_id)
         except SandboxGoneError:
             raise

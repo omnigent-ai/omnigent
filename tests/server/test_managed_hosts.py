@@ -4332,6 +4332,51 @@ async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
     assert "starting" in stages
 
 
+async def test_timed_out_wake_fails_and_stops_reporting_stages(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wake past its deadline fails, and its late host start publishes no stage."""
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+    workspace_unblocked = threading.Event()
+    prepare_workspace = fake.prepare_workspace
+
+    def _stalled_prepare_workspace(sandbox_id: str, **kwargs: Any) -> str:
+        workspace_unblocked.wait(timeout=30)
+        return prepare_workspace(sandbox_id, **kwargs)
+
+    monkeypatch.setattr(fake, "prepare_workspace", _stalled_prepare_workspace)
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_WAKE_TIMEOUT_S", 0.2)
+    stages: list[str] = []
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await resume_managed_host(first.host_id, host_store, config, on_stage=stages.append)
+        assert exc.value.status_code == 504
+        assert "wake timed out" in exc.value.detail
+    finally:
+        workspace_unblocked.set()
+
+    import omnigent.server.managed_hosts as managed
+
+    resume_lock = managed._resume_locks[first.host_id]
+    await asyncio.wait_for(resume_lock.acquire(), timeout=5)
+    resume_lock.release()
+    assert fake.resumed == ["sb-fake-1"]
+    assert len(fake.host_starts) == 2
+    assert stages == []
+
+
 async def test_resume_threads_agent_name_to_classifying_start_host(db_uri: str) -> None:
     """
     A wake re-stamps the runner's classifier.

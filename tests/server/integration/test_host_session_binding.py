@@ -1677,6 +1677,90 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     assert stages[-1] == ("failed", "managed runner did not connect after launch")
 
 
+async def test_resume_reports_a_stuck_managed_wake_as_failed(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each Resume of a sandbox whose provider never answers fails with the wake's reason."""
+    import threading
+
+    from omnigent.server import managed_hosts
+    from omnigent.server.routes import sessions as sessions_module
+
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="7c3f0d2a91b84e6f8a5d1c0b9e2f4a63",
+        name="managed-unreachable-islo",
+        user_id=RESERVED_USER_LOCAL,
+        token="tok-unreachable-islo",
+        provider="islo",
+        sandbox_id="sb-unreachable-islo",
+        token_expires_at=9_999_999_999,
+    )
+    conv = conv_store.create_conversation(
+        agent_id=None, host_id=host.host_id, workspace="/root/workspace"
+    )
+    fake = FakeSandboxLauncher(can_resume=True)
+    fake.provider = "islo"  # type: ignore[misc]
+    provider_unblocked = threading.Event()
+    resume_calls: list[str] = []
+
+    def _unreachable_resume(sandbox_id: str) -> None:
+        resume_calls.append(sandbox_id)
+        provider_unblocked.wait(timeout=30)
+
+    monkeypatch.setattr(fake, "resume", _unreachable_resume)
+    monkeypatch.setattr(managed_hosts, "MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(managed_hosts, "MANAGED_WAKE_TIMEOUT_S", 0.5, raising=False)
+    stages: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        sessions_module,
+        "_publish_sandbox_status",
+        lambda _sid, stage, error=None, **_kwargs: stages.append((stage, error)),
+    )
+    app_state = SimpleNamespace(
+        host_store=host_store,
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://managed-test.example.com",
+                launcher_factory=lambda: fake,
+                token_ttl_s=3600,
+                provider="islo",
+            )
+        ),
+        managed_launches=ManagedLaunchTracker(),
+        host_registry=SimpleNamespace(get=lambda _host_id: None),
+    )
+
+    try:
+        for _attempt in range(2):
+            with pytest.raises(OmnigentError) as exc:
+                await sessions_module._maybe_relaunch_managed_sandbox(
+                    session_id=conv.id,
+                    conv=conv,
+                    app_state=app_state,
+                    conversation_store=conv_store,
+                )
+            assert exc.value.code == ErrorCode.RUNNER_UNAVAILABLE
+            assert "still provisioning" not in exc.value.message
+            assert "managed host wake timed out" in exc.value.message
+            assert stages[-1][0] == "failed"
+        assert [stage for stage, _error in stages].count("provisioning") == 2
+        # The retry waits for the stuck provider call instead of overlapping it.
+        assert resume_calls == ["sb-unreachable-islo"]
+    finally:
+        provider_unblocked.set()
+
+    # Once the provider returns, the abandoned wake stops without restarting the host.
+    resume_lock = managed_hosts._resume_locks[host.host_id]
+    await asyncio.wait_for(resume_lock.acquire(), timeout=5)
+    resume_lock.release()
+    assert resume_calls == ["sb-unreachable-islo"]
+    assert fake.host_starts == []
+    assert host_store.resolve_launch_token(host.host_id, "tok-unreachable-islo") is not None
+
+
 @pytest.mark.parametrize("replaced", [False, True])
 @pytest.mark.parametrize("started_sandbox_id", [None, "microvm-real"])
 async def test_managed_launch_fails_when_runner_never_connects(
