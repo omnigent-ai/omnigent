@@ -248,7 +248,7 @@ describe("browser permission popover", () => {
       contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, true);
       await wait();
       assert.equal(h.windows.length, 1);
-      for (const hide of [() => h.controller.dismiss(h.parent), () => h.parent.emit("minimize")]) {
+      const hideThenReturn = async (hide) => {
         visible = false;
         hide();
         await wait();
@@ -257,7 +257,9 @@ describe("browser permission popover", () => {
         visible = true;
         await wait();
         assert.equal(h.windows.length, shown + 1, "the pane is back while the request waits");
-      }
+      };
+      await hideThenReturn(() => h.controller.dismiss(h.parent));
+      await hideThenReturn(() => h.parent.emit("minimize"));
       h.windows.at(-1).emit("blur");
       await wait();
       await wait();

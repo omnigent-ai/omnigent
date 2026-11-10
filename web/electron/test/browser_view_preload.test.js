@@ -48,9 +48,7 @@ function loadObserver({ report } = {}) {
     realm,
   );
   const pending = () =>
-    sent
-      .filter(({ channel }) => channel === PENDING_CHANNEL)
-      .map(({ args }) => args[0]);
+    sent.filter(({ channel }) => channel === PENDING_CHANNEL).map(({ args }) => args[0]);
   return { realm, pending };
 }
 
