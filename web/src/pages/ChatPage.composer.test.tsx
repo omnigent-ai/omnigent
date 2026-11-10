@@ -4452,6 +4452,27 @@ describe("Composer MCP status command", () => {
     );
     expect(screen.queryByTestId("mcp-live-status-wiki")).toBeNull();
     expect(screen.queryByTestId("mcp-reconnect-search")).toBeNull();
+
+    // A refused reconnect whose follow-up status read failed still shows the refusal.
+    liveMcpQueryMock.mockReturnValue({
+      data: { live: false, reason: "unavailable", servers: [] },
+      isError: false,
+    });
+    liveMcpReconnectMock.mockReturnValue({
+      reconnect,
+      reconnectingName: null,
+      error: { name: "plugin:tools:search", message: "token expired" },
+      clearError: vi.fn(),
+    });
+    rerender(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [agent] })} />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("mcp-live-status-search")).toBeNull();
+    expect(screen.getByTestId("mcp-reconnect-error")).toHaveTextContent(
+      "Reconnecting plugin:tools:search failed: token expired",
+    );
   });
 
   it("notes why a claude-sdk session shows no live state", () => {

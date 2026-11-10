@@ -414,7 +414,13 @@ function McpServerRows({
   reconnectingName,
   reconnectError,
 }: McpServerRowsProps) {
-  if (!servers?.length && !status) {
+  // With live status unavailable no row carries the harness's name, so the
+  // refusal shows for the panel rather than being lost.
+  const unmatchedReconnectError =
+    reconnectError && !servers?.some((server) => server.liveName === reconnectError.name)
+      ? reconnectError
+      : null;
+  if (!servers?.length && !status && !unmatchedReconnectError) {
     return (
       <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
         No MCP servers enabled for this session.
@@ -501,6 +507,15 @@ function McpServerRows({
           </div>
         );
       })}
+      {unmatchedReconnectError && (
+        <div
+          role="alert"
+          data-testid="mcp-reconnect-error"
+          className="break-words px-2 py-1 text-xs leading-4 text-destructive"
+        >
+          Reconnecting {unmatchedReconnectError.name} failed: {unmatchedReconnectError.message}
+        </div>
+      )}
       {status && (
         <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
           {status}

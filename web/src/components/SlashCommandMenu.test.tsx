@@ -629,6 +629,18 @@ describe("/mcp panel connection state", () => {
       }),
     );
     expect(within(screen.getByTestId("mcp-server-row-search")).queryByRole("alert")).toBeNull();
+    expect(screen.queryByTestId("mcp-reconnect-error")).toBeNull();
+
+    // With live status unavailable no row carries the name, so the panel shows the refusal.
+    rerender(
+      panel({
+        mcpServers: rows.map((row) => ({ ...row, live: undefined, liveName: undefined })),
+        mcpReconnectError: { name: "plugin:tools:search", message: "token expired" },
+      }),
+    );
+    expect(screen.getByTestId("mcp-reconnect-error")).toHaveTextContent(
+      "Reconnecting plugin:tools:search failed: token expired",
+    );
   });
 
   it("offers no Reconnect to a read-only viewer", () => {
