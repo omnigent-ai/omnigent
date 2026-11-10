@@ -72,6 +72,9 @@ from omnigent.harnesses.codex_native.elicitation import (
 )
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native._native_forwarder_health import (
+    NativeSubagentActivity,
+)
+from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
 from omnigent.native._native_forwarder_health import (
@@ -602,6 +605,7 @@ class _CodexForwarderState:
         ``thread/resume`` requests.
     :param subagents_by_thread: Maps Codex child thread ids to Omnigent child
         session ids, e.g. ``{"thread_child": "conv_child"}``.
+    :param child_activity: Connection-owned child liveness for the pane reaper.
     :param pending_child_threads: Codex child thread ids announced by
         ``thread/started`` but not yet mapped to AP child sessions,
         mapped to their spawning parent thread id when known, e.g.
@@ -728,6 +732,7 @@ class _CodexForwarderState:
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
+    child_activity: NativeSubagentActivity | None = None
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     lineage_checked_threads: set[str] = field(default_factory=set)
@@ -955,6 +960,8 @@ class _CodexForwarderState:
         :param session_id: Omnigent child session id, e.g. ``"conv_child"``.
         :returns: None.
         """
+        if thread_id not in self.subagents_by_thread and self.child_activity is not None:
+            self.child_activity.discover(thread_id)
         self.subagents_by_thread[thread_id] = session_id
         self.pending_child_threads.pop(thread_id, None)
 
@@ -1033,6 +1040,8 @@ class _CodexForwarderState:
         :returns: None.
         """
         self.parent_session_id = session_id
+        if self.child_activity is not None:
+            self.child_activity.move(session_id)
         self.pending_child_threads.clear()
         self.lineage_checked_threads.clear()
         # The new thread has its own goal and terminals, read when it is
@@ -1100,6 +1109,8 @@ class _CodexForwarderState:
             self.usage_source_threads[thread_id] = parent_thread_id
         if thread_id not in self.subagents_by_thread:
             self.pending_child_threads[thread_id] = parent_thread_id
+            if self.child_activity is not None:
+                self.child_activity.discover(thread_id)
 
     def is_pending_child_thread(
         self,
@@ -1120,6 +1131,22 @@ class _CodexForwarderState:
         if recorded_parent_thread_id is None:
             return thread_id in self.pending_child_threads
         return recorded_parent_thread_id == parent_thread_id
+
+    def tracks_child_activity(self, thread_id: str | None) -> bool:
+        """
+        Return whether a thread's lifecycle events feed the child activity tracker.
+
+        Parent rotation clears pending discovery, so a child the tracker already
+        observes keeps reporting its turns even if it never registered.
+
+        :param thread_id: Codex thread id from the event, e.g. ``"thread_child"``.
+        :returns: ``True`` for a pending or tracker-observed child thread.
+        """
+        if thread_id is None:
+            return False
+        if thread_id in self.pending_child_threads:
+            return True
+        return self.child_activity is not None and self.child_activity.tracks(thread_id)
 
     def needs_child_thread_backfill(self, thread_id: str) -> bool:
         """
@@ -2661,6 +2688,7 @@ async def supervise_forwarder(
             parent_session_id=session_id,
             codex_client=client,
             child_usage_baseline_dir=bridge_dir,
+            child_activity=NativeSubagentActivity(session_id),
         )
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
@@ -2770,6 +2798,8 @@ async def supervise_forwarder(
             stream_error = exc
             raise
         finally:
+            if forwarder_state.child_activity is not None:
+                forwarder_state.child_activity.close()
             # Stop producers before draining their output while the HTTP client is open.
             background_tasks = [subscribe_task, side_chat_task]
             if mcp_settle_timer is not None:
@@ -3733,6 +3763,10 @@ async def _handle_event(
     route_session_id, is_child = _resolve_event_session(
         params, method, expected_thread_id, forwarder_state, fallback_session_id=session_id
     )
+    if forwarder_state is not None and (
+        is_child or forwarder_state.tracks_child_activity(_thread_id_from_params(params))
+    ):
+        _note_child_activity_event(forwarder_state, method, params)
     if route_session_id is None:
         return
     event_state = forwarder_state
@@ -3877,6 +3911,29 @@ async def _handle_event(
             bridge_dir=event_bridge_dir,
             file_observer_bridge_dir=bridge_dir,
         )
+
+
+def _note_child_activity_event(
+    state: _CodexForwarderState, method: str, params: _JsonObject
+) -> None:
+    """Keep native child liveness independent of transcript upload success."""
+    activity = state.child_activity
+    thread_id = _thread_id_from_params(params)
+    if activity is None or thread_id is None:
+        return
+    turn_id = _turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(params)
+    if method == "turn/started":
+        activity.note(thread_id, active=True, turn_id=turn_id)
+    elif method in {"turn/completed", "turn/failed"} and turn_id is not None:
+        activity.note(thread_id, active=False, turn_id=turn_id)
+    elif method == "error" and params.get("willRetry") is not True:
+        if turn_id is not None and _terminal_error_from_notification(params) is not None:
+            activity.note(thread_id, active=False, turn_id=turn_id)
+    elif method == _CODEX_THREAD_STATUS_CHANGED_METHOD:
+        status = params.get("status")
+        kind = status.get("type") if isinstance(status, dict) else None
+        if kind in {"active", "idle"}:
+            activity.note(thread_id, active=kind == "active")
 
 
 def _resolve_event_session(
@@ -7299,6 +7356,21 @@ async def _apply_child_resume(
         )
     finally:
         await child_elicitation_tracker.close()
+    if forwarder_state.child_activity is not None:
+        result = response.get("result")
+        thread = result.get("thread") if isinstance(result, dict) else None
+        turns = thread.get("turns") if isinstance(thread, dict) else None
+        if isinstance(turns, list) and turns and isinstance(turns[-1], dict):
+            turn = turns[-1]
+            status = _omnigent_status_from_resume_turn(turn)
+            if status == "running":
+                forwarder_state.child_activity.note(
+                    child_thread_id, active=True, turn_id=_turn_id_from_payload(turn)
+                )
+            elif status is not None:
+                forwarder_state.child_activity.note(
+                    child_thread_id, active=False, turn_id=_turn_id_from_payload(turn)
+                )
     forwarder_state.note_child_thread_subscribed(child_thread_id)
 
 
@@ -7405,12 +7477,16 @@ async def _post_collab_agent_statuses(
     for thread_id, state in states.items():
         if not isinstance(thread_id, str) or not isinstance(state, dict):
             continue
-        child_session_id = forwarder_state.session_for_child_thread(thread_id)
-        if child_session_id is None:
-            continue
         ap_status = _omnigent_status_from_collab_state(state)
-        if ap_status is not None:
-            await _post_status(client, child_session_id, ap_status)
+        # Liveness follows the snapshot even before the child has an AP session.
+        if ap_status is not None and forwarder_state.child_activity is not None:
+            forwarder_state.child_activity.note(
+                thread_id, active=ap_status == "running", authoritative=False
+            )
+        child_session_id = forwarder_state.session_for_child_thread(thread_id)
+        if child_session_id is None or ap_status is None:
+            continue
+        await _post_status(client, child_session_id, ap_status)
 
 
 def _omnigent_status_from_collab_state(state: _JsonObject) -> str | None:
