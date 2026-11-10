@@ -139,7 +139,8 @@ implements them separately, so a fix for one harness does not reach the others.
 - `codex-async-questions`: a Codex `request_user_input_async` question shows a
   card in Chat and Inbox that leaves the composer usable. The answer reaches
   Codex's current or next turn; a terminal answer closes the card, and Cancel
-  dismisses it without stopping Codex.
+  dismisses it without stopping Codex. A server whose `/v1/info` lacks
+  `codex_nonblocking_decline` shows no card, so answer in the terminal.
 - `codex-plan-mode`: Codex starts in, or switches to, its own Plan mode from the
   composer's Plan row; see `plan-mode` in [composer.md](./composer.md).
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's

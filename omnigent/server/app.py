@@ -324,6 +324,9 @@ class ServerInfoResponse(BaseModel):
     # A claude-sdk ``clear`` continues in a new session; older servers only clear native
     # sessions, so clients treat absent as unsupported.
     session_claude_sdk_clear: bool = False
+    # Declining a non-blocking Codex question card leaves the turn running; older
+    # servers interrupt Codex, so the forwarder keeps those questions in the terminal.
+    codex_nonblocking_decline: bool = False
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
@@ -3710,6 +3713,7 @@ def create_app(
                 and artifact_store is not None,
                 "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
                 "session_claude_sdk_clear": True,
+                "codex_nonblocking_decline": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
                 "filesystem_attachments": {

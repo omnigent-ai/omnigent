@@ -2336,6 +2336,8 @@ class _CodexElicitationTaskTracker:
         self._unanswered_async_questions: dict[str, asyncio.Task[None]] = {}
         # Items whose web answer is being sent; an answer Codex echoes removes them.
         self._delivering_async_questions: set[str] = set()
+        # Whether ``GET /v1/info`` advertised async question cards; ``None`` until read.
+        self._server_shows_async_question_cards: bool | None = None
 
     def start(
         self,
@@ -2625,6 +2627,8 @@ class _CodexElicitationTaskTracker:
         item_id = question.item_id
         delivery_round = 0
         try:
+            if not await self._async_question_cards_supported(client):
+                return
             while True:
                 result = await _codex_elicitation_hook_result(
                     client,
@@ -2679,6 +2683,34 @@ class _CodexElicitationTaskTracker:
         finally:
             self._unanswered_async_questions.pop(item_id, None)
             self._delivering_async_questions.discard(item_id)
+
+    async def _async_question_cards_supported(self, client: httpx.AsyncClient) -> bool:
+        """
+        Report whether the Omnigent server can show async question cards.
+
+        Older servers treat a declined card as an interrupt and can match the
+        answer echo to a queued web message, so the question stays terminal-only.
+        An unreadable ``/v1/info`` counts as unsupported and is read again later.
+
+        :param client: HTTP client pointed at the Omnigent server.
+        :returns: ``True`` when ``GET /v1/info`` reports
+            ``codex_nonblocking_decline: true``.
+        """
+        if self._server_shows_async_question_cards is None:
+            try:
+                info = await client.get("/v1/info")
+                info.raise_for_status()
+                payload = info.json()
+            except (httpx.HTTPError, ValueError):
+                _logger.warning(
+                    "Codex forwarder could not read server info; question stays in the terminal",
+                    exc_info=True,
+                )
+                return False
+            self._server_shows_async_question_cards = (
+                isinstance(payload, dict) and payload.get("codex_nonblocking_decline") is True
+            )
+        return self._server_shows_async_question_cards
 
     def _discard_done(self, task: asyncio.Task[None]) -> None:
         """

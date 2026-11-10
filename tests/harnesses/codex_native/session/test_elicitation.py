@@ -769,6 +769,35 @@ _TUI_ASYNC_QUESTION_REPLY = (
     '"questionItemId":"[\\"request_user_input_async\\",\\"call-async-1\\",0]"}]\n'
     "</send_user_message_question_reply>"
 )
+# ``GET /v1/info`` body of a server that shows non-blocking async question cards.
+_ASYNC_QUESTION_CARD_SERVER_INFO: dict[str, Any] = {"codex_nonblocking_decline": True}
+
+
+def _serve_with_server_info(
+    handler: Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]],
+    server_info: dict[str, Any] = _ASYNC_QUESTION_CARD_SERVER_INFO,
+) -> httpx.MockTransport:
+    """
+    Answer ``GET /v1/info`` with ``server_info`` and other requests with ``handler``.
+
+    :param handler: Mock handler for the forwarder's other Omnigent requests.
+    :param server_info: ``GET /v1/info`` response body.
+    :returns: Mock transport for the forwarder's HTTP client.
+    """
+
+    async def serve(request: httpx.Request) -> httpx.Response:
+        """
+        Route one forwarder request.
+
+        :param request: HTTP request sent by the forwarder.
+        :returns: Server info or the ``handler`` response.
+        """
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=server_info)
+        response = handler(request)
+        return response if isinstance(response, httpx.Response) else await response
+
+    return httpx.MockTransport(serve)
 
 
 def _async_question_event() -> dict[str, Any]:
@@ -823,6 +852,7 @@ def _answer_async_question(
     hook_responses: list[httpx.Response],
     *,
     while_delivering: Callable[[httpx.AsyncClient, dict[str, Any]], Awaitable[None]] | None = None,
+    server_info: dict[str, Any] = _ASYNC_QUESTION_CARD_SERVER_INFO,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Drive one async question whose Omnigent hook returns ``hook_responses``.
@@ -833,6 +863,7 @@ def _answer_async_question(
         the question card is shown.
     :param while_delivering: Step run with the HTTP client and forwarder
         context after the question is handled, before waiting for delivery.
+    :param server_info: ``GET /v1/info`` response body.
     :returns: Elicitation hook bodies and the other session events posted.
     """
     hook_bodies: list[dict[str, Any]] = []
@@ -859,7 +890,7 @@ def _answer_async_question(
         """
         async with httpx.AsyncClient(
             base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
+            transport=_serve_with_server_info(handler, server_info),
         ) as client:
             context = _forwarder_context(client, bridge_dir)
             await codex_native_forwarder._handle_event(
@@ -955,7 +986,7 @@ def test_forwarder_publishes_codex_async_question_and_steers_answer(
         """
         async with httpx.AsyncClient(
             base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
+            transport=_serve_with_server_info(handler),
         ) as client:
             context = _forwarder_context(client, tmp_path)
             for event in (
@@ -1191,6 +1222,28 @@ def test_forwarder_sends_nothing_for_unanswered_codex_async_question(
     assert fake_client.requests == []
 
 
+def test_forwarder_keeps_codex_async_question_in_terminal_for_older_server(
+    tmp_path: Path,
+) -> None:
+    """
+    A server without ``codex_nonblocking_decline`` gets no async question card.
+
+    Such a server interrupts Codex when the card is declined, so the question
+    stays answerable only in the native terminal.
+    """
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    fake_client = _FakeCodexAppServerClient()
+
+    hook_bodies, posted_events = _answer_async_question(
+        tmp_path, fake_client, [], server_info={"session_claude_sdk_clear": True}
+    )
+
+    assert hook_bodies == []
+    assert fake_client.requests == []
+    # Only Codex's question message reaches the transcript.
+    assert [event["type"] for event in posted_events] == ["external_conversation_item"]
+
+
 @pytest.mark.parametrize(
     ("reply_text", "answer_text"),
     [
@@ -1257,7 +1310,7 @@ def test_forwarder_clears_codex_async_question_answered_in_native_tui(
         """
         async with httpx.AsyncClient(
             base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
+            transport=_serve_with_server_info(handler),
         ) as client:
             context = _forwarder_context(client, tmp_path)
             for event in (
@@ -1698,7 +1751,7 @@ def test_forwarder_reopens_codex_async_question_card_when_answer_is_undelivered(
         """
         async with httpx.AsyncClient(
             base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
+            transport=_serve_with_server_info(handler),
         ) as client:
             context = _forwarder_context(client, tmp_path)
             await codex_native_forwarder._handle_event(
