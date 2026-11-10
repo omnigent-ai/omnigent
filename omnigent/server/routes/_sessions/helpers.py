@@ -248,6 +248,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _read_explicit_unread,
     _read_last_seen,
     _session_active_response_cache,
+    _session_background_agents_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
@@ -5060,6 +5061,7 @@ def _publish_status(
     failure_intake: Mapping[str, str] | None = None,
     disconnect_evidence: Mapping[str, str] | None = None,
     turn_completed: bool = False,
+    background_agents: list[BackgroundTaskInfo] | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -5100,6 +5102,9 @@ def _publish_status(
     :param turn_completed: Whether an ``"idle"`` edge reports a turn the harness
         confirmed finished (e.g. claude-native's ``Stop`` hook), which clears a
         sticky ``failed`` like a ``running`` edge would.
+    :param background_agents: Background agents a finished claude-native turn
+        left running, on its ``"waiting"`` edge. Kept for snapshots until the
+        next non-``waiting`` edge; ignored on every other status.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -5128,6 +5133,13 @@ def _publish_status(
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
     _set_blocked_on(session_id, blocked_on)
+    # Only a ``waiting`` edge names background agents; any other edge ends that wait.
+    if status != "waiting":
+        background_agents = None
+    if background_agents:
+        _session_background_agents_cache[session_id] = background_agents
+    else:
+        _session_background_agents_cache.pop(session_id, None)
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
@@ -5234,6 +5246,7 @@ def _publish_status(
         error=error,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        background_agents=background_agents or None,
         blocked_on=blocked_on,
     )
     payload = event.model_dump()
@@ -5246,6 +5259,8 @@ def _publish_status(
     # its detail when the count clears).
     if not background_tasks:
         payload.pop("background_tasks", None)
+    if not background_agents:
+        payload.pop("background_agents", None)
     if blocked_on is None:
         payload.pop("blocked_on", None)
     session_stream.publish(session_id, payload)
