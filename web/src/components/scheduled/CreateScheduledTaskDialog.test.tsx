@@ -38,6 +38,7 @@ import type { AutomationSourceSession } from "@/lib/automationFromSession";
 import { MemoryRouter } from "react-router-dom";
 import {
   emptyTriggerFields,
+  isTaskSessionTriggerPrompt,
   readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
@@ -3122,6 +3123,23 @@ describe("automation trigger type", () => {
     },
   );
 
+  it("keeps the task session choice when switching integrations", async () => {
+    render(dialog());
+    await choose("Jira");
+    fireEvent.click(screen.getByRole("switch", { name: "Start a new session for each match" }));
+    await choose("Slack");
+    expect(
+      screen.getByRole("switch", { name: "Start a new session for each match" }),
+    ).not.toBeChecked();
+    type("task-trigger-scope", "support");
+    type("task-trigger-instructions", "Answer the question.");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(isTaskSessionTriggerPrompt(mutateAsync.mock.calls[0][0].prompt)).toBe(true);
+    await choose("Schedule");
+    expect(screen.queryByTestId("task-trigger-session-mode-field")).not.toBeInTheDocument();
+  });
+
   // This full draft round-trip needs extra time with coverage on shared CI runners.
   it("restores schedule and source drafts without carrying conditions between integrations", async () => {
     async function chooseTimezone(zone: string) {
@@ -3365,6 +3383,37 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     await submittedPrompt();
     expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
+  });
+
+  it("starts a session per match unless Advanced sends every match to one task session", async () => {
+    renderTrigger("jira");
+    fillJira();
+    const toggle = screen.getByRole("switch", { name: "Start a new session for each match" });
+    expect(toggle).toBeChecked();
+    expect(screen.getByLabelText("Instructions for each session")).toHaveValue("Triage it.");
+    expect(screen.getByTestId("task-trigger-preview")).not.toHaveTextContent("task session");
+    expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent(
+      "Matching items start sessions automatically.",
+    );
+
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(screen.getByTestId("task-trigger-session-mode-field")).toHaveTextContent(
+      "Every match goes to one task session, started on the first match, so it keeps its context across matches.",
+    );
+    expect(screen.getByLabelText("Instructions for the task session")).toHaveValue("Triage it.");
+    expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent("One task session");
+    expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent(
+      "Matching items go to the task session automatically.",
+    );
+    type("task-name-input", "Ticket triage");
+
+    const prompt = await submittedPrompt();
+    expect(isTaskSessionTriggerPrompt(prompt)).toBe(true);
+    expect(prompt).toContain('title "Ticket triage"');
+    expect(prompt).toContain("Instructions for the task session:\nTriage it.\n");
+    // The polling session still continues; only matches share one task session.
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ sessionMode: "continue" });
   });
 
   it("replaces the prompt with a trigger builder, runs hourly and keeps one session", async () => {
@@ -3929,6 +3978,41 @@ describe("editing template prompts", () => {
       model: "",
       effort: "",
     });
+  });
+
+  it("edits a task session template's worker settings without offering the mode again", async () => {
+    const shared = renderTriggerPrompt(
+      "jira",
+      { ...emptyTriggerFields("jira"), scope: "ENG", instructions: "Triage the ticket." },
+      {
+        placement: "same_host",
+        sessionLink: "https://example.test/c/CONVERSATION_ID",
+        taskSessionMode: "continue",
+        taskSessionTitle: "Ticket triage",
+      },
+    );
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          prompt: shared,
+          sessionMode: "continue",
+          sessionId: "poller",
+        })}
+      />,
+    );
+    expect(screen.queryByTestId("task-trigger-session-mode-field")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-session-mode-trigger")).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByTestId("task-worker-agent-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Claude Code" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { prompt } = updateMutateAsync.mock.calls[0][0].input;
+    expect(prompt).toBe(
+      shared.replace("agent_id set to your agent ID", 'agent_id "ag_claude_native"'),
+    );
+    expect(isTaskSessionTriggerPrompt(prompt)).toBe(true);
   });
 
   it.each(["Your prompt", "System prompt"])(

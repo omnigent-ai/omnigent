@@ -40,6 +40,13 @@ to customize.
 - `link-posting`: a checkbox below the trigger controls posting the session link
   back to Jira, Slack, GitHub, Linear, or PagerDuty (as an incident note). Sessions
   start whether it is checked or not.
+- `task-session`: when creating a trigger, Advanced shows **Start a new session for
+  each match**, on by default. Turning it off sends every match to one task session,
+  titled after the automation and started on the first match; later matches arrive
+  there as messages from the polling session. The instructions field becomes
+  Instructions for the task session, and Advanced's summary shows One task session.
+  The choice is saved in the prompt, survives switching integrations, and isn't
+  offered on edit. Archiving the task session makes the next match start a new one.
 - `prompt-editing`: the detail page and edit dialog show Your prompt first. System
   prompt starts collapsed, expands into a read-only preview, and requires Edit
   system prompt to change it. Done editing system prompt returns to the read-only
