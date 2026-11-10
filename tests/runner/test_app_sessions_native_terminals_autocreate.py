@@ -219,6 +219,8 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
         ("raw", None, []),
         ("resolved", None, []),
         ("resolved-replace", None, []),
+        ("sdk-missing-replace", None, []),
+        ("resolved-sdk-empty-replace", None, []),
     ],
 )
 async def test_auto_create_pi_terminal_launches_required_terminal(
@@ -313,15 +315,25 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     published: list[dict[str, Any]] = []
 
     instructions = "  Follow the authored role. π\nKeep this whitespace.  "
+    reject_replace = instruction_spec in ("sdk-missing-replace", "resolved-sdk-empty-replace")
+    authored_instructions: str | None = instructions
+    if instruction_spec == "sdk-missing-replace":
+        authored_instructions = None
+    elif instruction_spec in ("empty", "resolved-sdk-empty-replace"):
+        authored_instructions = "   "
     agent_spec = None
     if instruction_spec != "missing":
         agent_spec = AgentSpec(
             spec_version=1,
             name="pi",
-            executor=ExecutorSpec(),
-            instructions=instructions if instruction_spec != "empty" else "   ",
+            executor=(
+                ExecutorSpec(type="omnigent", config={"harness": "pi"})
+                if reject_replace
+                else ExecutorSpec()
+            ),
+            instructions=authored_instructions,
         )
-        if instruction_spec == "resolved-replace":
+        if instruction_spec.endswith("replace"):
             agent_spec.executor.config.update(context_files=False, system_prompt_mode="replace")
         if instruction_spec.startswith("resolved"):
             agent_spec = ResolvedSpec(spec=agent_spec, workdir=tmp_path)
@@ -330,13 +342,24 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     instructions_path = bridge_dir / "agent_instructions.md"
     instructions_path.write_text("Stale role")
 
-    await _auto_create_pi_terminal(
-        _PI_SESSION_ID,
-        _FakeResourceRegistry(),  # type: ignore[arg-type]
-        lambda _sid, evt: published.append(evt),
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-        agent_spec=agent_spec,
-    )
+    with (
+        pytest.raises(
+            ValueError, match="system_prompt_mode='replace' requires non-empty instructions"
+        )
+        if reject_replace
+        else contextlib.nullcontext()
+    ):
+        await _auto_create_pi_terminal(
+            _PI_SESSION_ID,
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, evt: published.append(evt),
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+            agent_spec=agent_spec,
+        )
+    if reject_replace:
+        assert not captured
+        assert instructions_path.read_text() == "Stale role"
+        return
 
     # Required lifecycle (parity with claude-native), correct terminal identity.
     assert captured["terminal_name"] == "pi"

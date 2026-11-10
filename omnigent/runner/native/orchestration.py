@@ -2811,6 +2811,7 @@ async def _auto_create_pi_terminal(
     from omnigent.harnesses.pi_native.main import resolve_pi_executable
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.runner._entry import _make_auth_token_factory
+    from omnigent.runtime.prompt import raw_author_instructions
 
     launch_config = await _pi_native_launch_config(
         session_id=session_id,
@@ -2895,14 +2896,16 @@ async def _auto_create_pi_terminal(
         workspace=launch_config.workspace,
         server_client=server_client,
     )
-    startup_instructions = _native_startup_instructions_from_spec(agent_spec)
-    instructions_path = write_agent_instructions(bridge_dir, startup_instructions)
     pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     context_files = True
     system_prompt_mode = "append"
     if pi_spec is not None:
         context_files = pi_spec.executor.config.get("context_files", True)
         system_prompt_mode = pi_spec.executor.config.get("system_prompt_mode", "append")
+        if system_prompt_mode == "replace" and raw_author_instructions(pi_spec) is None:
+            raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
+    startup_instructions = _native_startup_instructions_from_spec(agent_spec)
+    instructions_path = write_agent_instructions(bridge_dir, startup_instructions)
     provider_args: list[str] = []
     pi_env_unset = pi_native_env_unset(os.environ)
     pi_env = {
