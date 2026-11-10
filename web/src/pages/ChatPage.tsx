@@ -109,6 +109,7 @@ import {
   isStaleTempConvId,
   isTempConvId,
   joinReturnedParts,
+  keptDraft,
   restoredDraftTracker,
   retryConversationLoad,
   type ChatState,
@@ -3406,7 +3407,7 @@ function ComposerImpl(
     const parts = restoredSendDraft.returnedParts ?? [];
     const unread = joinReturnedParts(parts);
     if (unread.text !== "" || unread.files.length > 0) {
-      const kept = parts.find((part) => part.tempId === undefined)?.draft;
+      const kept = keptDraft(parts);
       if (parts.some((part) => part.tempId !== undefined)) {
         pendingFailedSendRestore.current = { draft };
         useChatStore.setState({

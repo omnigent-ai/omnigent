@@ -23331,6 +23331,48 @@ describe("a send cut off by a reload", () => {
     }
   });
 
+  it("keeps no reload record for a steer Stop returns before its POST starts", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+      status: "streaming",
+    });
+    const aborts: (() => void)[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const event = url.endsWith("/conv_existing/events") ? JSON.parse(String(init?.body)) : null;
+      if (event?.type === "message") {
+        return new Promise<Response>((_, reject) => {
+          aborts.push(() => reject(new TypeError("Failed to fetch")));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const earlier = useChatStore.getState().send("change of plan", "agent_xyz");
+    await vi.waitFor(() => expect(aborts).toHaveLength(1));
+    // Waits behind the earlier send, so it has no reload record when Stop runs.
+    const waiting = useChatStore.getState().send("and this", "agent_xyz");
+    useChatStore.getState().stop();
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "change of plan\n\nand this",
+    });
+    window.dispatchEvent(new Event("pagehide"));
+    try {
+      aborts[0]!();
+      await earlier;
+      await vi.waitFor(() => expect(aborts).toHaveLength(2));
+      expect(peekUnsentSend("conv_existing")).toBeNull();
+      aborts[1]!();
+      await waiting;
+      expect(peekUnsentSend("conv_existing")).toBeNull();
+    } finally {
+      window.dispatchEvent(new Event("pageshow"));
+    }
+  });
+
   it("hands an unanswered send back to the composer on the next load", async () => {
     // The server held the POST for a sandbox wake and the tab reloaded meanwhile.
     seedSession("conv_reload", []);

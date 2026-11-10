@@ -2914,8 +2914,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
       // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
       // tells the single-user `local` viewer apart from one not yet resolved.
+      // A send Stop already returned is carried by the composer's draft instead.
       const senderId = getCurrentUserId();
-      if (!compacts && sentOnScreen && senderId !== null && text.trim()) {
+      if (
+        !compacts &&
+        sentOnScreen &&
+        senderId !== null &&
+        text.trim() &&
+        !stopReturnedSends.has(tempId)
+      ) {
         rememberUnsentSend(sessionId, {
           stableId,
           text,
@@ -8197,7 +8204,7 @@ export function joinReturnedParts(parts: readonly ReturnedPart[]): {
 }
 
 /** The draft waiting for the composer that Stop added steers to, if any. */
-function keptDraft(parts: readonly ReturnedPart[]) {
+export function keptDraft(parts: readonly ReturnedPart[]) {
   return parts.find((part) => part.tempId === undefined)?.draft;
 }
 
