@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.db_models import INBOX_ITEMS_PER_SESSION
 from omnigent.stores.inbox_item_store import (
@@ -88,6 +89,40 @@ def test_session_cap_is_enforced_in_the_insert(store: SqlAlchemyInboxItemStore) 
     store.create(_new(dedupe_key="v1:other-session", source_session_id="f" * 32))
 
 
+def test_replacing_an_expired_item_in_a_full_session_reports_the_cap(
+    store: SqlAlchemyInboxItemStore,
+) -> None:
+    expired = store.create(_new(dedupe_key="v1:k", expires_at=1))
+    for n in range(INBOX_ITEMS_PER_SESSION - 1):
+        store.create(_new(dedupe_key=f"v1:{n}"))
+
+    # The expired item permits a fresh one; the cap, not a duplicate, refuses it.
+    with pytest.raises(InboxSessionCapError):
+        store.create(_new(dedupe_key="v1:k"), retire_item_id=expired.id)
+
+
+def test_a_lost_slot_is_retried_when_replacing_an_expired_item(
+    store: SqlAlchemyInboxItemStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expired = store.create(_new(dedupe_key="v1:k", expires_at=1))
+    real_insert = store._insert
+    calls = {"n": 0}
+
+    def lose_the_first_slot(item: NewInboxItem, retire: str | None) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # What a concurrent post taking the chosen slot looks like on PostgreSQL/MySQL.
+            raise IntegrityError("INSERT", {}, Exception("duplicate session slot"))
+        return real_insert(item, retire)
+
+    monkeypatch.setattr(store, "_insert", lose_the_first_slot)
+
+    fresh = store.create(_new(dedupe_key="v1:k"), retire_item_id=expired.id)
+
+    assert fresh.id != expired.id
+    assert calls["n"] == 2
+
+
 def test_oversized_text_is_rejected(store: SqlAlchemyInboxItemStore) -> None:
     incompressible = "".join(chr(0x4E00 + (n * 7919) % 20000) for n in range(9000))
 
@@ -96,6 +131,20 @@ def test_oversized_text_is_rejected(store: SqlAlchemyInboxItemStore) -> None:
     created = store.create(_new())
     with pytest.raises(InboxItemTooLargeError):
         store.update(created.id, "alice", feedback_text=incompressible, now=1)
+
+
+def test_create_refreshes_expired_collision_after_stale_preflight(
+    store: SqlAlchemyInboxItemStore,
+) -> None:
+    """A post whose duplicate check missed a newer expired same-key item replaces it."""
+    winner = store.create(_new(expires_at=1))
+
+    replacement = store.create(_new(source_session_id="b" * 32))
+
+    assert replacement.dedupe_key == "v1:aaa"
+    retired = store.get(winner.id, "alice")
+    assert retired is not None
+    assert retired.dedupe_key == f"v1:aaa#{winner.id}"
 
 
 def test_retiring_an_expired_item_frees_its_key(store: SqlAlchemyInboxItemStore) -> None:
@@ -159,3 +208,58 @@ def test_update_stamps_read_and_acted_times(store: SqlAlchemyInboxItemStore) -> 
     assert (acted.state, acted.resolution, acted.resolution_action) == ("done", "action_taken", 0)
     assert (acted.read_at, acted.acted_at, acted.feedback_text) == (100, 200, "thanks")
     assert store.get(created.id, "alice") == acted
+
+
+def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) -> None:
+    import re
+
+    from sqlalchemy import event, insert
+
+    from omnigent.db.db_models import SqlInboxItem
+
+    if store._engine.dialect.name != "mysql":
+        pytest.skip("MySQL execution-plan regression")
+    rows = [
+        {
+            "workspace_id": 0,
+            "id": f"{index:032x}",
+            "user_id": "plan-owner",
+            "source_session_id": f"{index // 10:032x}",
+            "session_slot": index % 10,
+            "agent_id": "a" * 32,
+            "kind": 1,
+            "title": "t",
+            "body_md": "b",
+            "links": "[]",
+            "actions": "[]",
+            "topic": "t",
+            "dedupe_key": f"v1:{index}",
+            "state": 1 + index % 2,
+            "resolution": 0,
+            "created_at": index // 10,
+        }
+        for index in range(10_000)
+    ]
+    with store._engine.begin() as connection:
+        connection.execute(insert(SqlInboxItem), rows)
+        connection.exec_driver_sql("ANALYZE TABLE inbox_items").all()
+    plans: list[str] = []
+
+    def explain(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT inbox_items."):
+            plans.append(
+                conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, parameters).scalar_one()
+            )
+
+    event.listen(store._engine, "before_cursor_execute", explain)
+    try:
+        store.list_for_user("plan-owner", after=(100, f"{1005:032x}"), limit=50)
+        store.list_for_user(
+            "plan-owner", states=frozenset({"unread"}), after=(100, f"{1005:032x}"), limit=50
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", explain)
+    for plan in plans:
+        # Rows each step actually read; the planner's estimates are not bounded.
+        examined = [int(n) for n in re.findall(r"actual time=[\d.]+\.\.[\d.]+ rows=(\d+)", plan)]
+        assert max(examined) <= 200, plan
