@@ -793,12 +793,14 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().conversationLoadError).toBeNull();
     expect(useChatStore.getState().blocks).toHaveLength(1);
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
+    expect(useChatStore.getState().loadingSessionUsage).toBe(true);
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
 
     finishUsage(usage("conv_usage", 3.5));
     await tick();
 
     expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+    expect(useChatStore.getState().loadingSessionUsage).toBe(false);
     expect(useChatStore.getState().sessionUsageByModel).toEqual({
       "model-a": {
         inputTokens: 100,
@@ -866,6 +868,7 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().conversationLoadError).toBeNull();
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    expect(useChatStore.getState().loadingSessionUsage).toBe(false);
     expect(readUsage).toHaveBeenCalledOnce();
   });
 
@@ -1174,19 +1177,28 @@ describe("chatStore — lazy subtree usage", () => {
     const pending = new Promise<Response>((resolve) => {
       finishUsage = resolve;
     });
-    const readUsage = vi.fn().mockReturnValueOnce(pending).mockReturnValue(usage("conv_usage", 8));
+    let finishReplacement!: (response: Response) => void;
+    const replacement = new Promise<Response>((resolve) => {
+      finishReplacement = resolve;
+    });
+    const readUsage = vi.fn().mockReturnValueOnce(pending).mockReturnValue(replacement);
     routeUsage("conv_usage", readUsage);
     await useChatStore.getState().switchTo("conv_usage");
     releaseConversation("conv_usage");
     await useChatStore.getState().switchTo("conv_other");
     await useChatStore.getState().switchTo("conv_usage");
     await tick();
-    expect(useChatStore.getState().sessionCostUsd).toBe(8);
+    expect(useChatStore.getState().loadingSessionUsage).toBe(true);
 
     finishUsage(usage("conv_usage", 3.5));
     await tick();
 
+    expect(useChatStore.getState().loadingSessionUsage).toBe(true);
+    expect(useChatStore.getState().sessionCostUsd).toBeNull();
+    finishReplacement(usage("conv_usage", 8));
+    await tick();
     expect(useChatStore.getState().sessionCostUsd).toBe(8);
+    expect(useChatStore.getState().loadingSessionUsage).toBe(false);
   });
 
   it.each([undefined, true])(

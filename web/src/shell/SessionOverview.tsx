@@ -1,12 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { ChartNoAxesColumnIcon, XIcon } from "lucide-react";
+import { ChartNoAxesColumnIcon, ChevronDownIcon, ChevronRightIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { ModelUsageBreakdown } from "@/components/ModelUsageBreakdown";
 import { RunningDot } from "@/components/RunningDot";
-import { useChildSessions } from "@/hooks/useChildSessions";
+import { useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { formatSessionCostUsd, formatTokenCount } from "@/lib/formatCost";
@@ -19,6 +20,116 @@ import { useOpenSubagentInPanel } from "./subagentPanelOpener";
 import { SubagentCost } from "./SubagentCost";
 
 const HIDDEN_STORAGE_KEY = "omnigent:session-overview-hidden";
+
+function UsageValue({
+  value,
+  loading,
+  label,
+}: {
+  value: string | null;
+  loading: boolean;
+  label: string;
+}) {
+  if (value !== null) return value;
+  if (loading) return <Spinner className="size-3.5" aria-label={`Loading ${label}`} />;
+  return "Unavailable";
+}
+
+function OverviewSubagent({
+  child,
+  onNavigate,
+}: {
+  child: ChildSessionInfo;
+  onNavigate?: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const openInPanel = useOpenSubagentInPanel();
+  const location = useLocation();
+  const label = childPrimaryLabel(child);
+  const status = childStatus(child);
+  return (
+    <li>
+      <div className="flex items-center gap-1">
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          className="shrink-0 max-md:size-11"
+          aria-expanded={expanded}
+          aria-label={`${expanded ? "Hide" : "Show"} nested costs for ${label}`}
+          onClick={() => setExpanded(!expanded)}
+        >
+          {expanded ? (
+            <ChevronDownIcon className="size-3.5" />
+          ) : (
+            <ChevronRightIcon className="size-3.5" />
+          )}
+        </Button>
+        <Link
+          to={{ pathname: `/c/${child.id}`, search: sessionNavigationSearch(location.search) }}
+          onClick={(event) => {
+            openInPanel(child.id, event);
+            onNavigate?.();
+          }}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-md p-1 hover:bg-accent focus-visible:outline-ring"
+        >
+          {status.activity === "working" ? (
+            <RunningDot />
+          ) : (
+            <span
+              className={`size-2 shrink-0 rounded-full ${status.activity === "awaiting" ? "bg-warning" : activityDotClassName(status.activity)}`}
+            />
+          )}
+          <span className="min-w-0 flex-1">
+            <span className="block truncate" title={label}>
+              {label}
+            </span>
+            <span className="block text-xs text-muted-foreground">{status.label}</span>
+          </span>
+          <SubagentCost costUsd={child.own_cost_usd} />
+        </Link>
+      </div>
+      {expanded && (
+        <div className="ml-2 border-l border-border/50 pl-2 pt-2">
+          <OverviewSubagents sessionId={child.id} onNavigate={onNavigate} />
+        </div>
+      )}
+    </li>
+  );
+}
+
+function OverviewSubagents({
+  sessionId,
+  onNavigate,
+}: {
+  sessionId: string;
+  onNavigate?: () => void;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  // Nested queries mount only when expanded; closing a branch stops its polling.
+  const { children, isLoading, error } = useChildSessions(sessionId, 10_000);
+  if (isLoading && children.length === 0) return <Spinner aria-label="Loading subagent costs" />;
+  return (
+    <>
+      {error && <p className="text-muted-foreground">Couldn’t refresh subagents.</p>}
+      {!error && children.length === 0 && <p className="text-muted-foreground">No subagents yet</p>}
+      <ul className="space-y-2">
+        {(showAll ? children : children.slice(0, 5)).map((child) => (
+          <OverviewSubagent key={child.id} child={child} onNavigate={onNavigate} />
+        ))}
+      </ul>
+      {children.length > 5 && (
+        <Button
+          variant="link"
+          size="sm"
+          className="h-auto p-0 text-xs"
+          onClick={() => setShowAll(!showAll)}
+        >
+          {showAll ? "Show fewer subagents" : `Show all ${children.length} subagents`}
+        </Button>
+      )}
+    </>
+  );
+}
 
 interface OverviewContentProps {
   sessionId: string;
@@ -40,15 +151,12 @@ function OverviewContent({
   onOpenChanges,
   onOpenAgents,
   onNavigate,
-}: OverviewContentProps) {
+  usageLoading,
+}: OverviewContentProps & { usageLoading: boolean }) {
   const cost = useChatStore((s) => (s.conversationId === sessionId ? s.sessionCostUsd : null));
   const usage = useChatStore((s) =>
     s.conversationId === sessionId ? s.sessionUsageByModel : null,
   );
-  // Only mounted while the overview is visible; the query pauses in background tabs.
-  const { children, isLoading, error } = useChildSessions(sessionId, 10_000);
-  const openInPanel = useOpenSubagentInPanel();
-  const location = useLocation();
   const models = Object.values(usage ?? {});
   const tokens =
     models.length > 0 && models.every((model) => model.totalTokens != null)
@@ -73,14 +181,22 @@ function OverviewContent({
         <div className="flex items-baseline justify-between gap-3">
           <span>Session total</span>
           <span className="font-medium tabular-nums">
-            {cost == null ? "Unavailable" : formatSessionCostUsd(cost)}
+            <UsageValue
+              value={cost === null ? null : formatSessionCostUsd(cost)}
+              loading={usageLoading}
+              label="session cost"
+            />
           </span>
         </div>
         <p className="text-xs text-muted-foreground">Includes subagents</p>
         <div className="flex justify-between gap-3">
           <span>Tokens</span>
           <span className="tabular-nums">
-            {tokens == null ? "Unavailable" : formatTokenCount(tokens)}
+            <UsageValue
+              value={tokens === null ? null : formatTokenCount(tokens)}
+              loading={usageLoading}
+              label="tokens"
+            />
           </span>
         </div>
         {usage && models.length > 0 && (
@@ -89,48 +205,8 @@ function OverviewContent({
       </section>
       <section className="space-y-2 py-4">
         <h3 className="font-medium">Subagents</h3>
-        {isLoading && children.length === 0 ? (
-          <p className="text-muted-foreground">Loading…</p>
-        ) : error ? (
-          <p className="text-muted-foreground">Couldn’t refresh subagents.</p>
-        ) : (
-          children.length === 0 && <p className="text-muted-foreground">No subagents yet</p>
-        )}
-        <ul className="space-y-2">
-          {children.slice(0, 5).map((child) => {
-            const status = childStatus(child);
-            return (
-              <li key={child.id}>
-                <Link
-                  to={{
-                    pathname: `/c/${child.id}`,
-                    search: sessionNavigationSearch(location.search),
-                  }}
-                  onClick={(event) => {
-                    openInPanel(child.id, event);
-                    onNavigate?.();
-                  }}
-                  className="flex items-center gap-2 rounded-md p-1 hover:bg-accent focus-visible:outline-ring"
-                >
-                  {status.activity === "working" ? (
-                    <RunningDot />
-                  ) : (
-                    <span
-                      className={`size-2 shrink-0 rounded-full ${status.activity === "awaiting" ? "bg-warning" : activityDotClassName(status.activity)}`}
-                    />
-                  )}
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate" title={childPrimaryLabel(child)}>
-                      {childPrimaryLabel(child)}
-                    </span>
-                    <span className="block text-xs text-muted-foreground">{status.label}</span>
-                  </span>
-                  <SubagentCost costUsd={child.own_cost_usd} />
-                </Link>
-              </li>
-            );
-          })}
-        </ul>
+        <p className="text-xs text-muted-foreground">Each agent’s own cost</p>
+        <OverviewSubagents sessionId={sessionId} onNavigate={onNavigate} />
         <Button
           variant="link"
           size="sm"
@@ -223,6 +299,11 @@ export function SessionOverview({
   const cost = useChatStore((s) =>
     s.conversationId === contentProps.sessionId ? s.sessionCostUsd : null,
   );
+  const usageLoading = useChatStore(
+    (s) =>
+      s.conversationId !== contentProps.sessionId || s.loadingConversation || s.loadingSessionUsage,
+  );
+  const costLabel = cost === null ? "unavailable" : formatSessionCostUsd(cost);
   const canDock = dockAllowed && !mobile && hasRoom;
   const docked = canDock && !hidden;
 
@@ -260,15 +341,27 @@ export function SessionOverview({
       variant="ghost"
       size="sm"
       className="shrink-0 gap-1.5 px-2 text-muted-foreground max-md:min-h-11"
-      aria-label={`Session overview, cost ${cost == null ? "unavailable" : formatSessionCostUsd(cost)}`}
+      aria-label={`Session overview, cost ${cost === null && usageLoading ? "loading" : costLabel}`}
       aria-expanded={docked || overlayOpen}
       title="Session overview"
     >
       <ChartNoAxesColumnIcon className="size-4" />
-      <span className="tabular-nums">{cost == null ? "—" : formatSessionCostUsd(cost)}</span>
+      <span className="tabular-nums">
+        <UsageValue
+          value={cost === null ? null : costLabel}
+          loading={usageLoading}
+          label="session cost"
+        />
+      </span>
     </Button>
   );
-  const content = <OverviewContent {...contentProps} onNavigate={() => setOverlayOpen(false)} />;
+  const content = (
+    <OverviewContent
+      {...contentProps}
+      usageLoading={usageLoading}
+      onNavigate={() => setOverlayOpen(false)}
+    />
+  );
   return (
     <>
       {mobile ? (

@@ -102,6 +102,8 @@ beforeEach(() => {
   };
   useChatStore.setState({
     conversationId: "session",
+    loadingConversation: false,
+    loadingSessionUsage: false,
     sessionCostUsd: 1.25,
     sessionUsageByModel: { "model-a": usage, "model-b": usage },
   });
@@ -117,13 +119,55 @@ afterEach(() => {
 
 describe("Session overview", () => {
   it.each([
-    { isLoading: true, error: null, message: "Loading…" },
+    { isLoading: true, error: null, message: "Loading subagent costs" },
     { isLoading: false, error: null, message: "No subagents yet" },
     { isLoading: false, error: new Error("offline"), message: "Couldn’t refresh subagents." },
   ])("shows the subagent state: $message", ({ isLoading, error, message }) => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading, error });
     render(<SessionOverview {...props} />, { wrapper: Wrapper });
-    expect(screen.getByText(message)).toBeInTheDocument();
+    expect(
+      isLoading ? screen.getByRole("status", { name: message }) : screen.getByText(message),
+    ).toBeInTheDocument();
+  });
+
+  it("reveals every subagent cost and loads nested breakdowns only while expanded", () => {
+    const children = Array.from({ length: 6 }, (_, index) => ({
+      id: `child-${index + 1}`,
+      task_summary: `Agent ${index + 1}`,
+      own_cost_usd: index + 1,
+      busy: false,
+    }));
+    useChildSessionsMock.mockImplementation((id: string) => ({
+      children:
+        id === "session"
+          ? children
+          : [{ id: "grandchild", task_summary: "Nested agent", own_cost_usd: 0.5, busy: false }],
+      isLoading: false,
+      error: null,
+    }));
+    useChatStore.setState({ sessionCostUsd: 21.5 });
+    const view = render(<SessionOverview {...props} />, { wrapper: Wrapper });
+    expect(screen.queryByText("Agent 6")).toBeNull();
+    expect(useChildSessionsMock.mock.calls.map(([id]) => id)).not.toContain("child-1");
+    fireEvent.click(screen.getByRole("button", { name: "Show all 6 subagents" }));
+    expect(screen.getByText("$6.00")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show nested costs for Agent 1" }));
+    expect(useChildSessionsMock).toHaveBeenCalledWith("child-1", 10_000);
+    expect(screen.getByRole("link", { name: /Nested agent/ })).toHaveAttribute(
+      "href",
+      "/c/grandchild",
+    );
+    expect(screen.getByText("$0.50")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("link", { name: /Agent 1/ })).getByText("$1.00"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide nested costs for Agent 1" }));
+    useChildSessionsMock.mockClear();
+    view.rerender(<SessionOverview {...props} />);
+    expect(screen.queryByText("Nested agent")).toBeNull();
+    expect(useChildSessionsMock.mock.calls.map(([id]) => id)).not.toContain("child-1");
   });
 
   it("shows authoritative spend, cumulative tokens and partial workspace counts with working links", () => {
@@ -205,7 +249,10 @@ describe("Session overview", () => {
     view.rerender(<SessionOverview {...props} sessionId="next" title="Next session" />);
     expect(screen.queryByText("$1.25")).toBeNull();
     expect(screen.queryByText("2K")).toBeNull();
-    expect(screen.getAllByText("Unavailable")).toHaveLength(2);
+    expect(screen.queryByText("Unavailable")).toBeNull();
+    const card = within(screen.getByRole("complementary", { name: "Session overview" }));
+    expect(card.getByRole("status", { name: "Loading session cost" })).toBeInTheDocument();
+    expect(card.getByRole("status", { name: "Loading tokens" })).toBeInTheDocument();
     act(() =>
       useChatStore.setState({
         conversationId: "next",
@@ -214,6 +261,34 @@ describe("Session overview", () => {
       }),
     );
     expect(screen.getByRole("button", { name: /cost \$0.00/ })).toBeInTheDocument();
+  });
+
+  it("shows loading usage until the independent request finishes without priced data", () => {
+    useChatStore.setState({
+      sessionCostUsd: null,
+      sessionUsageByModel: null,
+      loadingSessionUsage: true,
+    });
+    render(<SessionOverview {...props} />, { wrapper: Wrapper });
+    const card = within(screen.getByRole("complementary", { name: "Session overview" }));
+    expect(
+      screen.getByRole("button", { name: "Session overview, cost loading" }),
+    ).toBeInTheDocument();
+    expect(card.getAllByRole("status")).toHaveLength(2);
+    expect(screen.queryByText("Unavailable")).toBeNull();
+
+    act(() => useChatStore.setState({ loadingSessionUsage: false }));
+    expect(card.queryByRole("status")).toBeNull();
+    expect(card.getAllByText("Unavailable")).toHaveLength(2);
+  });
+
+  it("keeps known usage visible while refreshing", () => {
+    useChatStore.setState({ loadingSessionUsage: true });
+    render(<SessionOverview {...props} />, { wrapper: Wrapper });
+    const card = within(screen.getByRole("complementary", { name: "Session overview" }));
+    expect(card.getByText("$1.25")).toBeInTheDocument();
+    expect(card.getByText("2K")).toBeInTheDocument();
+    expect(card.queryByRole("status")).toBeNull();
   });
 
   it("shows failed changes as unavailable and omits the section without file access", () => {

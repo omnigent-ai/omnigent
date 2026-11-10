@@ -1039,6 +1039,8 @@ export interface ConversationState {
    * ``null`` while unknown or unpriced, never a misleading ``$0.00``.
    */
   sessionCostUsd: number | null;
+  /** True while the independent subtree-usage request is in flight. */
+  loadingSessionUsage: boolean;
   /**
    * Per-model usage breakdown over the active session's subtree (itself +
    * sub-agents), keyed by raw harness model id. Hydrated separately on
@@ -2237,6 +2239,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   contextWindow: null,
   tokensUsed: null,
   sessionCostUsd: null,
+  loadingSessionUsage: false,
   sessionUsageByModel: null,
   gitBranch: null,
   todos: [],
@@ -4263,7 +4266,7 @@ function abortConversationStream(entry: ConversationEntry): void {
   const { abortController } = entry.getState();
   if (abortController === null) return;
   abortController.abort();
-  entry.setState({ abortController: null });
+  entry.setState({ abortController: null, loadingSessionUsage: false });
 }
 
 /** A conversation's state if it is still live, else `null`. */
@@ -5172,7 +5175,7 @@ async function bindStream(
     releaseOwnedStreamSlot(id, controller);
     return;
   }
-  set({ abortController: controller });
+  set({ abortController: controller, loadingSessionUsage: false });
 
   // Opening a conversation URL with no session list loaded yet leaves the
   // session→host map empty, so the SSE stream
@@ -5535,6 +5538,7 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     return;
   }
   sessionUsageHydrations.add(controller);
+  entry.setState({ loadingSessionUsage: true });
   const revisionsBeforeFetch = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
   try {
     const usage = await getSessionUsage(id, { signal: controller.signal });
@@ -5562,6 +5566,12 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     // Usage is optional display data; retain known totals or leave them unknown.
   } finally {
     sessionUsageHydrations.delete(controller);
+    if (
+      conversationRegistry.peek(id) === entry &&
+      entry.getState().abortController === controller
+    ) {
+      entry.setState({ loadingSessionUsage: false });
+    }
   }
 }
 
@@ -6883,7 +6893,7 @@ export async function startStreamPump(
     if (statusReconcileTimer !== null) window.clearInterval(statusReconcileTimer);
     clearCatchupTimers();
     if (get().abortController === controller) {
-      set({ abortController: null });
+      set({ abortController: null, loadingSessionUsage: false });
     }
   }
   /* eslint-enable no-await-in-loop */
