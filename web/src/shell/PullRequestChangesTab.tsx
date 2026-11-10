@@ -64,9 +64,7 @@ import {
   buildSearchCorpus,
   changedFilesFromPatch,
   filterChangedPaths,
-  findMatches,
   firstMatchAtOrBelow,
-  MATCH_LIMIT,
   pullRequestFileUrl,
   pullRequestRepoUrl,
   refreshedMatchIndex,
@@ -76,6 +74,7 @@ import {
 } from "./pullRequestReview";
 import { useChangesViewState, type FindState } from "./useChangesViewState";
 import { useCommitViewState } from "./useCommitViewState";
+import { useFindSearch } from "./useFindSearch";
 
 /** Index of the match a step moves to; with none active, the first or last by direction. */
 function stepTarget(activeIndex: number, direction: 1 | -1, length: number): number {
@@ -906,14 +905,8 @@ export function PullRequestChangesTab({
       files.filter((file) => !shown.has(file.path)),
     );
   }, [findOpen, filesByPath, files, visiblePaths]);
-  const search = useMemo(
-    () => findMatches(searchCorpus, deferredQuery, { matchCase, regex, limit: MATCH_LIMIT }),
-    [searchCorpus, deferredQuery, matchCase, regex],
-  );
-  const hiddenSearch = useMemo(
-    () => findMatches(hiddenCorpus, deferredQuery, { matchCase, regex, limit: MATCH_LIMIT }),
-    [hiddenCorpus, deferredQuery, matchCase, regex],
-  );
+  const search = useFindSearch(searchCorpus, deferredQuery, { matchCase, regex });
+  const hiddenSearch = useFindSearch(hiddenCorpus, deferredQuery, { matchCase, regex });
   const { matches } = search;
   // The match shown after the last render. A refresh measures from it, so repeated refreshes
   // follow the occurrence the reader is on rather than the original target.
@@ -927,6 +920,8 @@ export function PullRequestChangesTab({
       : -1;
   const activeMatch = activeIndex >= 0 ? matches[activeIndex] : null;
   useEffect(() => {
+    // A rerunning regex keeps the reader's occurrence, which the refreshed result is measured from.
+    if (search.searching) return;
     shownMatch.current =
       findTarget && activeMatch ? { target: findTarget, shown: activeMatch } : null;
   });
@@ -954,11 +949,22 @@ export function PullRequestChangesTab({
   // Seed the match when the bar opens or its query changes: the first at or below the
   // viewport top. A path match also scrolls its header, as stepping to it does.
   useEffect(() => {
-    if (!findOpen || findTarget || !matches.length || deferredQuery !== query) return;
+    if (!findOpen || findTarget || !matches.length || deferredQuery !== query || search.searching) {
+      return;
+    }
     const seeded = matches[firstMatchAtOrBelow(matches, visiblePaths, activePath)];
     setFindTarget(seeded);
     if (seeded.target.kind === "path") setPendingReveal({ path: seeded.target.path });
-  }, [findOpen, findTarget, matches, visiblePaths, activePath, deferredQuery, query]);
+  }, [
+    findOpen,
+    findTarget,
+    matches,
+    visiblePaths,
+    activePath,
+    deferredQuery,
+    query,
+    search.searching,
+  ]);
 
   // The active match's file opens even if the reader collapsed it earlier.
   useEffect(() => {
@@ -966,8 +972,8 @@ export function PullRequestChangesTab({
   }, [activeFilePath, findTarget, revealPane, commitsView]);
 
   const stepMatch = (direction: 1 | -1) => {
-    // Matches for a query still being searched would navigate the previous results.
-    if (!matches.length || deferredQuery !== query) return;
+    // Matches for a query or corpus still being searched would navigate the previous results.
+    if (!matches.length || deferredQuery !== query || search.searching) return;
     // With no active match yet, the first step lands on the first or last match by direction.
     const next = matches[stepTarget(activeIndex, direction, matches.length)];
     // A fresh object, so stepping to the sole match again is a new reveal request.
@@ -1240,8 +1246,12 @@ export function PullRequestChangesTab({
                 total={matches.length}
                 truncated={search.truncated}
                 invalid={search.invalid}
+                tooSlow={search.tooSlow}
+                failed={search.failed}
+                searching={search.searching}
                 hiddenCount={hiddenSearch.matches.length}
                 hiddenTruncated={hiddenSearch.truncated}
+                hiddenUnsearched={hiddenSearch.tooSlow || hiddenSearch.failed}
                 onOpen={() => view.setFind({ open: true })}
                 onClose={closeFind}
                 onQueryChange={(next) => changeFind({ query: next })}

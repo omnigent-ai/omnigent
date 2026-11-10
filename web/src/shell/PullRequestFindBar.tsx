@@ -17,9 +17,17 @@ export interface PullRequestFindBarProps {
   /** The visible matches hit the search cap. */
   truncated: boolean;
   invalid: boolean;
+  /** The regular expression is still running, so there are no matches to show yet. */
+  searching: boolean;
+  /** The regular expression ran past its matching budget. */
+  tooSlow: boolean;
+  /** The regular expression could not run: its worker failed or never started. */
+  failed: boolean;
   /** Matches in files the filters hide. */
   hiddenCount: number;
   hiddenTruncated: boolean;
+  /** The hidden files' regular expression timed out or failed, so their matches are unknown. */
+  hiddenUnsearched: boolean;
   onOpen: () => void;
   onClose: () => void;
   onQueryChange: (query: string) => void;
@@ -59,18 +67,28 @@ function OptionToggle({
 function findStatus({
   query,
   invalid,
+  searching,
+  tooSlow,
+  failed,
   total,
   position,
   truncated,
 }: {
   query: string;
   invalid: boolean;
+  searching: boolean;
+  tooSlow: boolean;
+  failed: boolean;
   total: number;
   position: number;
   truncated: boolean;
 }): string {
   if (!query.trim()) return "";
+  // Searching comes first, so a pending search never shows an earlier search's failure.
+  if (searching) return "Searching…";
   if (invalid) return "Invalid";
+  if (tooSlow) return "Pattern too slow";
+  if (failed) return "Search failed";
   if (total === 0) return "No results";
   const count = `${total}${truncated ? "+" : ""}`;
   // Position is 0 for the moment between a query change and the viewport seeding its match.
@@ -84,8 +102,12 @@ export function PullRequestFindBar({
   total,
   truncated,
   invalid,
+  searching,
+  tooSlow,
+  failed,
   hiddenCount,
   hiddenTruncated,
+  hiddenUnsearched,
   onOpen,
   onClose,
   onQueryChange,
@@ -129,7 +151,19 @@ export function PullRequestFindBar({
     );
   }
 
-  const status = findStatus({ query, invalid, total, position, truncated });
+  const status = findStatus({
+    query,
+    invalid,
+    searching,
+    tooSlow,
+    failed,
+    total,
+    position,
+    truncated,
+  });
+  const hiddenHint = hiddenUnsearched
+    ? "Hidden files not searched"
+    : `+${hiddenCount}${hiddenTruncated ? "+" : ""} in hidden files`;
 
   return (
     <div className="flex min-w-0 flex-1 items-center gap-1.5 text-ui">
@@ -158,10 +192,9 @@ export function PullRequestFindBar({
       <span role="status" className="shrink-0 whitespace-nowrap text-xs text-muted-foreground">
         {status}
       </span>
-      {hiddenCount > 0 && (
+      {(hiddenUnsearched || hiddenCount > 0) && (
         <span className="flex shrink-0 items-center gap-1 whitespace-nowrap text-xs text-muted-foreground">
-          +{hiddenCount}
-          {hiddenTruncated ? "+" : ""} in hidden files
+          {hiddenHint}
           <button type="button" className="text-foreground underline" onClick={onShowHidden}>
             Show
           </button>
@@ -184,7 +217,7 @@ export function PullRequestFindBar({
       <IconButton
         label="Previous match"
         onClick={() => onStep(-1)}
-        disabled={total === 0}
+        disabled={total === 0 || searching}
         className="size-5 text-muted-foreground"
       >
         <ChevronUpIcon className="size-3.5" />
@@ -192,7 +225,7 @@ export function PullRequestFindBar({
       <IconButton
         label="Next match"
         onClick={() => onStep(1)}
-        disabled={total === 0}
+        disabled={total === 0 || searching}
         className="size-5 text-muted-foreground"
       >
         <ChevronDownIcon className="size-3.5" />

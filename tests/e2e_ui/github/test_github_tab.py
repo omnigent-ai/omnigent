@@ -1275,6 +1275,58 @@ def test_changes_find_reveals_collapsed_and_filtered(
     page.screenshot(path=str(tmp_path / f"find-{entry}-reopened.png"))
 
 
+# The long line gives "(a+)+$" enough backtracking to outlast the find budget in a browser.
+_BACKTRACKING_FIND_PATCH = (
+    "diff --git a/src/app/main.py b/src/app/main.py\n"
+    "index e69de29..4b825dc 100644\n"
+    "--- a/src/app/main.py\n"
+    "+++ b/src/app/main.py\n"
+    "@@ -1,1 +1,3 @@\n"
+    " line1\n"
+    "+added line\n"
+    f"+{'a' * 40}!\n"
+)
+
+
+def test_changes_find_regex_over_budget_reports_too_slow(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A regex over the find budget reports "Pattern too slow"; plain find still works.
+
+    The matcher runs in a worker, so the page keeps answering while the pattern runs.
+    """
+    base_url, session_id = seeded_session
+    _stub_github(page, pr_count=2)
+    page.route(
+        re.compile(r"/resources/github/diff(?:\?|$)"),
+        lambda route: route.fulfill(json={**_PR_DIFF, "patch": _BACKTRACKING_FIND_PATCH}),
+    )
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    panel = page.get_by_role("complementary", name="Workspace")
+    panel.get_by_role("tab", name="Pull Requests").click()
+    panel.get_by_role(
+        "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
+    ).click()
+    panel.get_by_role("tablist", name="Pull request", exact=True).get_by_role(
+        "tab", name="Changes", exact=False
+    ).click()
+
+    panel.get_by_role("button", name="Find in changes", exact=True).click()
+    find = panel.get_by_role("textbox", name="Find in changes", exact=True)
+    panel.get_by_role("button", name="Regular expression", exact=True).click()
+    # A benign pattern first, so a worker that never runs can't pass for a timeout.
+    find.fill("added\\s+line")
+    expect(panel.get_by_text("1 of 1", exact=True)).to_be_visible()
+    find.fill("(a+)+$")
+    expect(panel.get_by_text("Pattern too slow", exact=True)).to_be_visible(timeout=10_000)
+
+    panel.get_by_role("button", name="Regular expression", exact=True).click()
+    find.fill("added")
+    expect(panel.get_by_text("1 of 1", exact=True)).to_be_visible()
+
+
 # README.md's hunk, so its viewed mark has a patch to be checked against.
 _README_PATCH = (
     "diff --git a/README.md b/README.md\n"

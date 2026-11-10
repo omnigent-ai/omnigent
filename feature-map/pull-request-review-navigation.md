@@ -36,7 +36,7 @@ and a changed file is flagged.
 - `head-reset`: A new head keeps each file's mark while its hunks are unchanged. A
   file whose hunks changed loses its mark, shows **Changed since viewed** until you
   mark it on the new head, and opens for review. A notice reads `New commits since
-  you last viewed — changed files lost their viewed marks.` while a listed file has
+you last viewed — changed files lost their viewed marks.` while a listed file has
   changed, until **Dismiss** or until every changed file is marked. A file that can't
   be compared (binary, pure rename, missing from the fetched diff, or cut short) loses
   its mark without a badge or notice.
@@ -161,8 +161,10 @@ Component coverage for these helpers and views lives in
 - **Cmd+F is scoped to the Changes tab.** It opens the in-tab bar with focus anywhere
   in the tab, including review comment boxes. On macOS only Cmd+F counts; Ctrl+F still
   moves the caret there. Outside the tab, the browser's own find runs.
-- **Regex find runs on the page's main thread.** A pathological pattern can freeze
-  the Changes tab until it finishes. Known follow-up, not yet fixed.
+- **Regex find runs in a worker with a one-second matching budget.** It shows
+  "Searching…" until the result lands. "Pattern too slow" means matching ran past the
+  budget; "Search failed" means the worker could not run. Plain find stays synchronous.
+  When hidden files time out or fail, the hint reads "Hidden files not searched".
 - **Highlights need the browser's CSS highlight API.** Without it, the match's row
   still centres but is not painted. Highlight painting was checked only in Chromium.
 - **Find's reveal ends with a collapse.** Collapsing a file that find opened keeps it

@@ -21,6 +21,7 @@ import {
   type PullRequestIdentity,
 } from "@/lib/pullRequestViewed";
 import type * as SonnerModule from "sonner";
+import type * as PatternSearchModule from "./pullRequestPatternSearch";
 import { PullRequestChangesTab } from "./PullRequestChangesTab";
 import { useChangesViewState } from "./useChangesViewState";
 
@@ -40,6 +41,10 @@ const mocks = vi.hoisted(() => ({
   commitsUnavailable: false,
   /** The PR's server lacks the commit routes. */
   commitsUnsupported: false,
+  /** Forced regex outcome for any search whose corpus holds a file at this path. */
+  patternOutcomeByPath: new Map<string, "tooSlow" | "failed">(),
+  /** When set, regex searches wait on it, so a test can observe the pending state. */
+  patternGate: null as Promise<void> | null,
   /** A saved review draft, anchored to one file's line, as the composer hook reports it. */
   draftAnchor: null as null | {
     path: string;
@@ -54,12 +59,47 @@ vi.mock("sonner", async (importOriginal) => ({
   ...(await importOriginal<typeof SonnerModule>()),
   toast,
 }));
+// jsdom has no workers, so the regex matcher runs in-process here.
+vi.mock("./pullRequestPatternSearch", async (importOriginal) => {
+  const { findMatches } = await import("./pullRequestReview");
+  return {
+    ...(await importOriginal<typeof PatternSearchModule>()),
+    searchPatternInWorker: async (
+      corpus: Parameters<typeof findMatches>[0],
+      query: string,
+      options: Parameters<typeof findMatches>[2],
+    ) => {
+      if (mocks.patternGate) await mocks.patternGate;
+      const forced = corpus
+        .map((target) => mocks.patternOutcomeByPath.get(target.path))
+        .find((outcome) => outcome !== undefined);
+      if (forced === "tooSlow") {
+        return { matches: [], truncated: false, invalid: false, tooSlow: true, failed: false };
+      }
+      if (forced === "failed") {
+        return { matches: [], truncated: false, invalid: false, tooSlow: false, failed: true };
+      }
+      return { ...findMatches(corpus, query, options), tooSlow: false, failed: false };
+    },
+  };
+});
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => mocks.mobile }));
 vi.mock("@/lib/clipboard", async (importOriginal) => ({
   ...(await importOriginal<typeof ClipboardModule>()),
   copyText: mocks.copyText,
 }));
+// The query cache returns the same data object until it changes; a new object per render would
+// make every find corpus look new, so the commit diff keeps its identity per patch.
+const commitDiffCache = new Map<string, { patch: string | undefined; data: object }>();
+function commitDiffData(sha: string): object {
+  const patch = mocks.commitPatches.get(sha);
+  const cached = commitDiffCache.get(sha);
+  if (cached && cached.patch === patch) return cached.data;
+  const data = { object: "session.github.pr_diff", patch };
+  commitDiffCache.set(sha, { patch, data });
+  return data;
+}
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   ...(await importOriginal<typeof UsePullRequestsModule>()),
   // The saved draft belongs to one file, so the anchor is returned for that path only.
@@ -84,9 +124,7 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   }),
   usePullRequestCommitsUnsupported: () => mocks.commitsUnsupported,
   usePullRequestCommitDiff: (_conversationId: string, _prUrl: string, sha: string | null) => ({
-    data: sha
-      ? { object: "session.github.pr_diff", patch: mocks.commitPatches.get(sha) }
-      : undefined,
+    data: sha ? commitDiffData(sha) : undefined,
     isLoading: false,
     error: mocks.commitDiffError,
   }),
@@ -214,6 +252,17 @@ function openFind(query: string) {
   fireEvent.click(screen.getByRole("button", { name: "Find in changes" }));
   fireEvent.change(findInput(), { target: { value: query } });
 }
+/** Holds the regex searches that start from now on until the returned release is called. */
+function holdRegexSearches(): () => Promise<void> {
+  let release!: () => void;
+  mocks.patternGate = new Promise<void>((done) => {
+    release = done;
+  });
+  return async () => {
+    await act(async () => release());
+    mocks.patternGate = null;
+  };
+}
 const diffOf = (path: string) => document.querySelector<HTMLElement>(`[data-path="${path}"]`);
 const rowOf = (path: string, line: number) =>
   diffOf(path)?.querySelector<HTMLElement>(`[data-line="${line}"]`) ?? null;
@@ -226,6 +275,8 @@ const sectionHeader = (path: string, expanded: boolean) =>
 
 describe("PullRequestChangesTab", () => {
   afterEach(() => {
+    mocks.patternOutcomeByPath.clear();
+    mocks.patternGate = null;
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -419,14 +470,149 @@ describe("PullRequestChangesTab", () => {
     expect(screen.getByText("7 of 7")).toBeInTheDocument();
   });
 
-  it("reports no results and an invalid pattern", () => {
+  it("reports no results and an invalid pattern", async () => {
     renderTab({ conversationId: "find-invalid" });
     openFind("zzz");
     expect(screen.getByText("No results")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
     fireEvent.change(findInput(), { target: { value: "(" } });
-    expect(screen.getByText("Invalid")).toBeInTheDocument();
+    expect(await screen.findByText("Invalid")).toBeInTheDocument();
+  });
+
+  it("reports a pattern that exceeds its time budget, and plain find keeps working", async () => {
+    mocks.patternOutcomeByPath.set("b.ts", "tooSlow");
+    renderTab({ conversationId: "find-too-slow" });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+
+    expect(await screen.findByText("Pattern too slow")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Next match" })).toBeDisabled();
+
+    mocks.patternOutcomeByPath.clear();
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+  });
+
+  it("reports a search whose worker could not run", async () => {
+    mocks.patternOutcomeByPath.set("b.ts", "failed");
+    renderTab({ conversationId: "find-failed" });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+
+    expect(await screen.findByText("Search failed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Next match" })).toBeDisabled();
+  });
+
+  it("shows Searching until a regex search settles, then its count", async () => {
+    const release = holdRegexSearches();
+    renderTab({ conversationId: "find-searching" });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+
+    expect(await screen.findByText("Searching…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Next match" })).toBeDisabled();
+
+    await release();
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+  });
+
+  it("follows the shown match across regex refreshes while the search reruns", async () => {
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    const { rerender } = renderTab({
+      conversationId: "find-regex-refresh",
+      patch: A + addedFile("b.ts", ["needle top", "gamma", "needle here"]) + C,
+    });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    expect(await screen.findByText("1 of 3")).toBeInTheDocument();
+    fireEvent.keyDown(findInput(), { key: "Enter" });
+    expect(screen.getByText("2 of 3")).toBeInTheDocument();
+
+    // The shown occurrence moves from line 3 to line 6 while the refreshed search runs.
+    const release = holdRegexSearches();
+    rerender(A + addedFile("b.ts", ["x1", "x2", "x3", "x4", "gamma", "needle here"]) + C);
+    expect(await screen.findByText("Searching…")).toBeInTheDocument();
+    await release();
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+    expect(scroll.mock.contexts).toContain(rowOf("b.ts", 6));
+
+    // A new occurrence at line 1 is nearer the original target (line 3) than the shown one
+    // (line 6); the shown occurrence must still win.
+    const releaseAgain = holdRegexSearches();
+    rerender(
+      A + addedFile("b.ts", ["needle top", "x2", "x3", "x4", "x5", "gamma", "needle here"]) + C,
+    );
+    expect(await screen.findByText("Searching…")).toBeInTheDocument();
+    await releaseAgain();
+    expect(await screen.findByText("2 of 3")).toBeInTheDocument();
+  });
+
+  it("does not move the match while a regex search runs, from the buttons or the find input", async () => {
+    const { rerender } = renderTab({ conversationId: "find-pending-step" });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+    fireEvent.keyDown(findInput(), { key: "Enter" });
+    expect(screen.getByText("2 of 2")).toBeInTheDocument();
+
+    const release = holdRegexSearches();
+    rerender(A + addedFile("b.ts", ["gamma", "needle here", "needle again"]) + C);
+    expect(await screen.findByText("Searching…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Next match" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Previous match" })).toBeDisabled();
+    fireEvent.keyDown(findInput(), { key: "Enter" });
+    fireEvent.keyDown(findInput(), { key: "Enter", shiftKey: true });
+
+    await release();
+    expect(await screen.findByText("3 of 3")).toBeInTheDocument();
+  });
+
+  it("does not show Pattern too slow while a replacement search runs", async () => {
+    mocks.patternOutcomeByPath.set("b.ts", "tooSlow");
+    const { rerender } = renderTab({ conversationId: "find-stale-too-slow" });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    expect(await screen.findByText("Pattern too slow")).toBeInTheDocument();
+
+    mocks.patternOutcomeByPath.clear();
+    const release = holdRegexSearches();
+    rerender(A + addedFile("b.ts", ["gamma", "x", "needle here"]) + C);
+
+    expect(await screen.findByText("Searching…")).toBeInTheDocument();
+    expect(screen.queryByText("Pattern too slow")).toBeNull();
+    await release();
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+  });
+
+  it("counts hidden matches once their regex search finishes", async () => {
+    renderTab({ conversationId: "find-hidden-regex" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+      target: { value: "a.ts" },
+    });
+    openFind("needle");
+    const release = holdRegexSearches();
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+
+    expect(await screen.findByText("Searching…")).toBeInTheDocument();
+    expect(screen.queryByText(/in hidden files|Hidden files not searched/)).toBeNull();
+
+    await release();
+    expect(await screen.findByText("+2 in hidden files")).toBeInTheDocument();
+    expect(screen.getByText("No results")).toBeInTheDocument();
+  });
+
+  it("says hidden files were not searched when their regex search times out", async () => {
+    mocks.patternOutcomeByPath.set("b.ts", "tooSlow");
+    renderTab({ conversationId: "find-hidden-too-slow" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+      target: { value: "a.ts" },
+    });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+
+    expect(await screen.findByText("Hidden files not searched")).toBeInTheDocument();
+    expect(screen.getByText("No results")).toBeInTheDocument();
   });
 
   it("closes on Escape, returns focus to the trigger, and reopens on the shortcut", () => {
@@ -442,7 +628,7 @@ describe("PullRequestChangesTab", () => {
     expect(findInput()).toHaveFocus();
   });
 
-  it("applies Match case and regular expressions", () => {
+  it("applies Match case and regular expressions", async () => {
     renderTab({ conversationId: "find-options" });
     openFind("NEEDLE");
     expect(screen.getByText("1 of 2")).toBeInTheDocument();
@@ -452,7 +638,7 @@ describe("PullRequestChangesTab", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
     fireEvent.change(findInput(), { target: { value: "needle (here|at)" } });
-    expect(screen.getByText("1 of 2")).toBeInTheDocument();
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
   });
 
   it("re-reveals and re-centres a sole match on explicit navigation", () => {
@@ -1743,5 +1929,36 @@ describe("PullRequestChangesTab commits", () => {
     expect(screen.getByText("Deleted in this commit")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /Open in/ })).toHaveAttribute("data-disabled");
     expect(screen.queryByRole("link", { name: /Open in/ })).toBeNull();
+  });
+
+  it("seeds a regex match from the new commit's results after a direct switch between commits", async () => {
+    // Commit A's only match is at line 100; commit B's are at lines 1 and 99.
+    const fillers = (count: number) =>
+      Array.from({ length: count }, (_, index) => `filler ${index}`);
+    mocks.commitPatches.set(SHA_A, addedFile("x.ts", [...fillers(99), "needle"]));
+    mocks.commitPatches.set(
+      SHA_B,
+      addedFile("x.ts", ["needle top", ...fillers(97), "needle here"]),
+    );
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    renderTab({
+      conversationId: "commits-regex-switch",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    expect(await screen.findByText("1 of 1")).toBeInTheDocument();
+
+    const release = holdRegexSearches();
+    fireEvent.click(screen.getByRole("button", { name: "Next commit" }));
+    expect(await screen.findByText("Searching…")).toBeInTheDocument();
+    await release();
+
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+    expect(scroll.mock.contexts).toContain(rowOf("x.ts", 1));
   });
 });
