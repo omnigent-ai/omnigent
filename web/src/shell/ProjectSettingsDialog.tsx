@@ -125,7 +125,8 @@ export function ProjectSettingsDialog({
   // sandbox hosts — mirror the composer's gate so we don't offer a target that
   // can only fail on create.
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
-  const sandboxProvider = info !== "loading" ? info.sandbox_provider : null;
+  const sandboxProvider =
+    stored?.sandbox_provider ?? (info !== "loading" ? info.sandbox_provider : null);
 
   // Draft fields. Seeded from the stored config each time the dialog opens (or
   // the fetched config arrives); local until saved.
@@ -218,15 +219,18 @@ export function ProjectSettingsDialog({
     const config: ProjectConfig = {
       ...(savedAgentId === (seeded.agent_id ?? null) ? seeded : (stored ?? {})),
     };
-    if (hostId !== NONE) config.host_id = hostId;
-    else delete config.host_id;
-    // A workspace is host-relative and only meaningful with a concrete host —
-    // don't persist a stale path from a since-cleared host, and drop it for the
-    // sandbox (a sandbox create provisions its own workspace and ignores this).
-    const ws =
-      hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
-    if (ws) config.workspace = ws;
-    else delete config.workspace;
+    if (!stored?.repository) {
+      if (hostId !== NONE) config.host_id = hostId;
+      else delete config.host_id;
+      if (hostId !== SANDBOX_HOST_CHOICE) delete config.sandbox_provider;
+      // A workspace is host-relative and only meaningful with a concrete host —
+      // don't persist a stale path from a since-cleared host, and drop it for the
+      // sandbox (a sandbox create provisions its own workspace and ignores this).
+      const ws =
+        hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
+      if (ws) config.workspace = ws;
+      else delete config.workspace;
+    }
     if (savedAgentId) config.agent_id = savedAgentId;
     else delete config.agent_id;
     // Store the worktree choice only when it overrides the user-global default;
@@ -406,19 +410,25 @@ export function ProjectSettingsDialog({
           )}
         </DialogHeader>
         <form onSubmit={onSubmit} className="flex flex-col gap-4">
+          {stored?.repository && (
+            <p className="text-sm text-muted-foreground">
+              The repository workspace is saved with this project. Choose a different target when
+              starting a session.
+            </p>
+          )}
           <Field label="Host" hint="Where new sessions run by default">
             <Select
               value={hostId}
               onValueChange={setHostId}
               onOpenChange={onDropdownOpenChange}
-              disabled={isLoading}
+              disabled={isLoading || stored?.repository !== undefined}
             >
               <SelectTrigger className="w-full" data-testid="project-settings-host">
                 <SelectValue placeholder="No default" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value={NONE}>No default</SelectItem>
-                {managedSandboxesEnabled && (
+                {(managedSandboxesEnabled || stored?.host_id === SANDBOX_HOST_CHOICE) && (
                   <SelectItem value={SANDBOX_HOST_CHOICE}>
                     {sandboxOptionLabel(sandboxProvider)}
                   </SelectItem>
@@ -469,7 +479,7 @@ export function ProjectSettingsDialog({
                   type="button"
                   onClick={() => setWorkspaceOpen(true)}
                   aria-expanded={workspaceOpen}
-                  disabled={isLoading}
+                  disabled={isLoading || stored?.repository !== undefined}
                   className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
@@ -499,7 +509,7 @@ export function ProjectSettingsDialog({
                 placeholder="/path/to/repo"
                 value={workspace}
                 onChange={(e) => setWorkspace(e.target.value)}
-                disabled={isLoading}
+                disabled={isLoading || stored?.repository !== undefined}
               />
             )}
           </Field>

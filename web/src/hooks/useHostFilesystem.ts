@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { apiErrorFromResponse } from "@/lib/sessionsApi";
 
 /**
  * One entry in a directory listing returned by the host
@@ -375,6 +376,52 @@ export function useCreateHostDirectory() {
     mutationFn: ({ hostId, path }: { hostId: string; path: string }) =>
       createHostDirectory(hostId, path),
     onSuccess: (_createdPath, { hostId }) => {
+      void queryClient.invalidateQueries({ queryKey: ["host-filesystem", hostId] });
+    },
+  });
+}
+
+/** Clone once; a lost response must never automatically retry a filesystem write. */
+export async function cloneHostRepository(
+  hostId: string,
+  repository: { url: string; branch?: string; path: string },
+): Promise<string> {
+  const response = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/repositories/clone`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(repository),
+    },
+  );
+  if (!response.ok) throw await apiErrorFromResponse(response);
+  const body: unknown = await response.json().catch(() => null);
+  if (
+    body === null ||
+    typeof body !== "object" ||
+    !("path" in body) ||
+    typeof body.path !== "string" ||
+    body.path.trim() === ""
+  ) {
+    throw new Error("Host returned no checkout path. Check the clone destination before retrying.");
+  }
+  return body.path;
+}
+
+export function useCloneHostRepository() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      hostId,
+      ...repository
+    }: {
+      hostId: string;
+      url: string;
+      branch?: string;
+      path: string;
+    }) => cloneHostRepository(hostId, repository),
+    retry: false,
+    onSuccess: (_path, { hostId }) => {
       void queryClient.invalidateQueries({ queryKey: ["host-filesystem", hostId] });
     },
   });

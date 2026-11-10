@@ -14,6 +14,8 @@ from omnigent.host.frames import (
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     SERVER_CAP_TMUX_READINESS,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -3042,3 +3044,21 @@ def test_enablement_fields_survive_inventory_allow_list():
     assert decoded.mcp_servers[0]["enabled"] == "false"
     assert decoded.mcp_servers[0]["locked"] == "true"
     assert "command" not in decoded.mcp_servers[0]
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostCloneRepositoryFrame(
+            "clone", "https://git.example.com/team/sample.git", "~/sample", "release"
+        ),
+        HostCloneRepositoryResultFrame("clone", "ok", "/home/example/sample"),
+        HostCloneRepositoryResultFrame(
+            "clone", "failed", error="Clone failed", error_code="clone_failed"
+        ),
+    ],
+)
+def test_clone_repository_frame_roundtrip(
+    frame: HostCloneRepositoryFrame | HostCloneRepositoryResultFrame,
+) -> None:
+    assert decode_host_frame(encode_host_frame(frame)) == frame

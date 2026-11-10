@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { FALLBACK_SERVER_INFO, sandboxRepositoryCapabilities } from "@/lib/capabilities";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
@@ -22,16 +22,32 @@ const REPOSITORIES: GithubRepo[] = ["api", "web"].map((name) => ({
   pushed_at: null,
 }));
 
-function renderPicker(initialSelections: LastSandboxRepo[] = [], maxRepos = 10) {
+function renderPicker(
+  initialSelections: LastSandboxRepo[] = [],
+  maxRepos = 10,
+  options: {
+    single?: boolean;
+    catalog?: { name: string; url: string }[];
+    urlInput?: boolean;
+    branchSelection?: boolean;
+  } = {},
+) {
   const onChange = vi.fn();
   const onPendingUrlChange = vi.fn();
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  function Harness({ limit }: { limit: number }) {
+  function Harness({
+    limit,
+    capabilities = options,
+  }: {
+    limit: number;
+    capabilities?: typeof options;
+  }) {
     const [selections, setSelections] = useState(initialSelections);
     const [pendingUrl, setPendingUrl] = useState("");
     return (
       <QueryClientProvider client={client}>
         <SandboxRepositoryPicker
+          {...capabilities}
           selections={selections}
           onChange={(next) => {
             setSelections(next);
@@ -54,6 +70,8 @@ function renderPicker(initialSelections: LastSandboxRepo[] = [], maxRepos = 10) 
     onChange,
     onPendingUrlChange,
     setLimit: (limit: number) => result.rerender(<Harness limit={limit} />),
+    setCapabilities: (capabilities: typeof options) =>
+      result.rerender(<Harness limit={maxRepos} capabilities={capabilities} />),
   };
 }
 
@@ -77,7 +95,7 @@ describe("SandboxRepositoryPicker", () => {
       { url: "git@GitHub.com:Org/API", branch: "feature/orders" },
     ]);
     await screen.findByRole("combobox", { name: "Branch for org/api" });
-    fireEvent.click(screen.getByRole("combobox", { name: "GitHub repository" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "Repository" }));
     expect(screen.queryByRole("option", { name: /org\/api/ })).toBeNull();
     fireEvent.click(screen.getByRole("option", { name: /org\/web/ }));
     expect(onChange).toHaveBeenLastCalledWith([
@@ -239,7 +257,7 @@ describe("SandboxRepositoryPicker", () => {
     fireEvent.change(input, { target: { value: "https://git.example.com/org/my+repo" } });
     expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
     expect(input).toHaveAccessibleDescription(
-      "Enter an HTTPS or SSH URL ending in a repository name.",
+      "Enter a valid HTTPS or SSH repository URL without credentials.",
     );
     fireEvent.change(input, {
       target: { value: `https://git.example.com/org/${"r".repeat(256)}` },
@@ -269,5 +287,188 @@ describe("SandboxRepositoryPicker", () => {
     expect(onChange).toHaveBeenLastCalledWith([
       { url: "https://git.example.com/org/repo", branch: "release" },
     ]);
+  });
+  it("single mode consumes typed URLs without Add and keeps branch errors visible", () => {
+    const { onChange } = renderPicker([], 1, { single: true, branchSelection: false });
+    const input = screen.getByRole("combobox", { name: "Repository URL" });
+    fireEvent.change(input, { target: { value: "https://git.example.com/team/sample.git" } });
+    expect(onChange).toHaveBeenLastCalledWith([
+      { url: "https://git.example.com/team/sample.git", branch: "" },
+    ]);
+    expect(screen.queryByRole("button", { name: "Add" })).toBeNull();
+    expect(screen.queryByLabelText("Branch (optional)")).toBeNull();
+    fireEvent.change(input, { target: { value: "" } });
+    expect(onChange).toHaveBeenLastCalledWith([]);
+  });
+
+  it("offers catalog selections without URL or branch entry for restricted providers", () => {
+    const catalog = [{ name: "Sample", url: "https://git.example.com/team/sample.git" }];
+    const { onChange } = renderPicker([], 10, { catalog, urlInput: false, branchSelection: false });
+    expect(screen.queryByRole("textbox", { name: "Repository URL" })).toBeNull();
+    fireEvent.click(screen.getByRole("combobox", { name: "Repository" }));
+    fireEvent.click(screen.getByRole("option", { name: "Sample" }));
+    expect(onChange).toHaveBeenLastCalledWith([{ url: catalog[0].url, branch: "" }]);
+    expect(screen.queryByRole("textbox", { name: "Branch for Sample" })).toBeNull();
+    expect(fetchGithubRepos).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Remove Sample" }));
+    expect(onChange).toHaveBeenLastCalledWith([]);
+  });
+
+  it("single mode offers only catalog choices and can clear its selection", () => {
+    const catalog = [{ name: "Sample", url: "https://git.example.com/team/sample.git" }];
+    const { onChange } = renderPicker([], 1, {
+      single: true,
+      catalog,
+      urlInput: false,
+      branchSelection: false,
+    });
+    expect(screen.queryByLabelText("Repository URL")).toBeNull();
+    expect(screen.queryByPlaceholderText(/paste a URL/)).toBeNull();
+    const select = screen.getByRole("combobox", { name: "Repository (optional)" });
+    fireEvent.change(select, { target: { value: catalog[0].url } });
+    expect(onChange).toHaveBeenLastCalledWith([{ url: catalog[0].url, branch: "" }]);
+    expect(screen.queryByLabelText("Branch (optional)")).toBeNull();
+    fireEvent.change(select, { target: { value: "" } });
+    expect(onChange).toHaveBeenLastCalledWith([]);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("selects distinct repositories with the same display name by keyboard", async () => {
+    const catalog = [
+      { name: "org/api", url: "https://git.example.com/team/first.git" },
+      { name: "org/api", url: "https://git.example.com/team/second.git" },
+    ];
+    const { onChange } = renderPicker([], 10, { catalog });
+    await waitFor(() => expect(fetchGithubRepos).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("combobox", { name: "Repository" }));
+    const search = screen.getByPlaceholderText("Search repositories…");
+    fireEvent.change(search, { target: { value: "org/api" } });
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(3));
+    expect(screen.getAllByRole("option", { selected: true })).toHaveLength(1);
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getAllByRole("option", { selected: true })).toHaveLength(1);
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onChange).toHaveBeenLastCalledWith([{ url: catalog[1].url, branch: "" }]);
+  });
+
+  it("retains a single selection through loading and a catalog-only target switch", () => {
+    const selection = { url: "https://git.example.com/team/custom.git", branch: "release" };
+    const { onChange, setCapabilities } = renderPicker([selection], 1, { single: true });
+    setCapabilities({ single: true, ...sandboxRepositoryCapabilities("loading", "example") });
+    expect(screen.getByRole("combobox", { name: "Repository (optional)" })).toHaveValue(
+      selection.url,
+    );
+    const branch = screen.getByLabelText("Branch (optional)");
+    expect(branch).toHaveValue(selection.branch);
+    expect(branch).toHaveAttribute("aria-invalid", "true");
+    expect(branch).toHaveAccessibleDescription(/Clear the branch/);
+    expect(onChange).not.toHaveBeenCalled();
+    setCapabilities({ single: true, urlInput: true, branchSelection: true });
+    expect(screen.getByLabelText("Repository URL")).toHaveValue(selection.url);
+    expect(screen.getByLabelText("Branch (optional)")).toHaveValue(selection.branch);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(onChange).not.toHaveBeenCalled();
+    const catalog = [{ name: "Sample", url: "https://git.example.com/team/sample.git" }];
+    setCapabilities({ single: true, catalog, urlInput: false, branchSelection: false });
+    fireEvent.change(screen.getByLabelText("Branch (optional)"), { target: { value: "" } });
+    const select = screen.getByRole("combobox", { name: "Repository (optional)" });
+    expect(select).toHaveValue(selection.url);
+    expect(select).toHaveAccessibleDescription(/unavailable on this target/);
+    fireEvent.change(select, { target: { value: catalog[0].url } });
+    expect(onChange).toHaveBeenLastCalledWith([{ url: catalog[0].url, branch: "" }]);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("retains unsupported selections and branches until explicitly corrected", () => {
+    renderPicker([{ url: "https://git.example.com/team/custom.git", branch: "release" }], 10, {
+      catalog: [{ name: "Sample", url: "https://git.example.com/team/sample.git" }],
+      urlInput: false,
+      branchSelection: false,
+    });
+    const branch = screen.getByRole("textbox", { name: "Branch for custom" });
+    expect(branch).toHaveValue("release");
+    expect(branch).toHaveAccessibleDescription(/Clear the branch/);
+    fireEvent.change(branch, { target: { value: "" } });
+    expect(screen.getByText(/This repository is unavailable on this target/)).toBeVisible();
+    expect(screen.queryByRole("textbox", { name: "Branch for custom" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Remove custom" }));
+    expect(screen.queryByText(/This repository is unavailable on this target/)).toBeNull();
+  });
+
+  it("deduplicates catalog and connected suggestions in multi mode", async () => {
+    renderPicker([], 10, { catalog: [{ name: "API", url: "git@github.com:org/api" }] });
+    await waitFor(() => expect(fetchGithubRepos).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("combobox", { name: "Repository" }));
+    await screen.findByRole("option", { name: /org\/web/ });
+    expect(screen.getAllByRole("option")).toHaveLength(2);
+    const connectedSuggestion = screen.getByRole("option", { name: /org\/api/ });
+    expect(connectedSuggestion).toBeVisible();
+    expect(within(connectedSuggestion).getByLabelText("Private repository")).toBeVisible();
+  });
+
+  it("single mode deduplicates catalog and connected suggestions and retains unsupported branches", async () => {
+    renderPicker([{ url: REPOSITORIES[0].clone_url!, branch: "release" }], 1, {
+      single: true,
+      branchSelection: false,
+      catalog: [{ name: "API", url: "git@github.com:org/api" }],
+    });
+    await waitFor(() => expect(document.querySelectorAll("datalist option")).toHaveLength(2));
+    expect(document.querySelector("datalist")).toHaveTextContent("org/api");
+    const branch = screen.getByLabelText("Branch (optional)");
+    expect(branch).toHaveValue("release");
+    expect(branch).toHaveAttribute("aria-invalid", "true");
+    expect(branch).toHaveAccessibleDescription(/Clear the branch/);
+    expect(screen.getByLabelText("Repository URL")).not.toHaveAttribute("aria-describedby");
+    expect(screen.getByRole("alert")).toHaveTextContent("Clear the branch");
+    fireEvent.change(screen.getByLabelText("Branch (optional)"), { target: { value: "" } });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("single mode describes an invalid branch on its branch field", () => {
+    const { onChange } = renderPicker(
+      [{ url: "https://git.example.com/team/sample.git", branch: "bad branch" }],
+      1,
+      {
+        single: true,
+      },
+    );
+    const branch = screen.getByLabelText("Branch (optional)");
+    expect(branch).toHaveAttribute("aria-invalid", "true");
+    expect(branch).toHaveAccessibleDescription(
+      "Enter a valid branch name, or leave blank for the default branch.",
+    );
+    const url = screen.getByLabelText("Repository URL");
+    expect(url).toHaveAttribute("aria-invalid", "false");
+    expect(url).not.toHaveAttribute("aria-describedby");
+    fireEvent.change(branch, { target: { value: "main" } });
+    fireEvent.change(url, { target: { value: "invalid" } });
+    expect(url).toHaveAttribute("aria-invalid", "true");
+    expect(url).toHaveAccessibleDescription(/valid HTTPS or SSH repository URL/);
+    expect(branch).not.toHaveAttribute("aria-describedby");
+    fireEvent.change(url, { target: { value: "" } });
+    expect(url).toHaveAccessibleDescription("Choose a repository for this branch.");
+    expect(branch).not.toHaveAttribute("aria-describedby");
+    expect(onChange).toHaveBeenLastCalledWith([{ url: "", branch: "main" }]);
+    fireEvent.change(branch, { target: { value: "" } });
+    expect(onChange).toHaveBeenLastCalledWith([]);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("leaves URL entry usable if listing fails and rejects unavailable catalog-only URLs", async () => {
+    vi.mocked(fetchGithubRepos).mockRejectedValue(new Error("unavailable"));
+    const view = renderPicker([], 1, { single: true });
+    expect(
+      await screen.findByText("Couldn't load repositories. You can still paste a URL."),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox", { name: "Repository URL" }), {
+      target: { value: "https://git.example.com/team/sample.git" },
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+    view.unmount();
+    renderPicker([{ url: "https://git.example.com/team/sample.git", branch: "" }], 1, {
+      single: true,
+      urlInput: false,
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("unavailable on this target");
   });
 });

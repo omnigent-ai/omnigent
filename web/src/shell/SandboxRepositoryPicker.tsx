@@ -15,14 +15,21 @@ import { cn } from "@/lib/utils";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import {
+  INVALID_BRANCH_MESSAGE,
   SANDBOX_WORKSPACE_LENGTH_MESSAGE,
   deriveRepoName,
+  repositoryIdentity,
+  repositorySelectionError,
   isValidSandboxBranch,
-  isValidSandboxRepoUrl,
   isValidSandboxWorkspaceLength,
 } from "@/lib/sandboxRepositories";
 
-const INVALID_BRANCH_MESSAGE = "Enter a valid branch name, or leave blank for the default branch.";
+interface RepositorySuggestion {
+  name: string;
+  url: string;
+  private?: boolean;
+}
+const EMPTY_CATALOG: RepositorySuggestion[] = [];
 
 const COMBOBOX_TRIGGER_CLASS =
   "flex w-full items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors hover:border-ring/60 focus-visible:border-ring";
@@ -31,24 +38,13 @@ function repoCloneUrl(repo: GithubRepo): string {
   return repo.clone_url ?? `https://github.com/${repo.full_name}.git`;
 }
 
-function repoIdentity(url: string): string {
-  const normalized = url
-    .trim()
-    .replace(/^git@([^:]+):/, "https://$1/")
-    .replace(/\/+$/, "");
-  const identity = /^https:\/\/github\.com\//i.test(normalized)
-    ? normalized.toLowerCase()
-    : normalized;
-  return identity.replace(/\.git$/, "");
-}
-
 function SandboxRepoCombobox({
   repos,
   onSelect,
   testIdPrefix,
 }: {
-  repos: GithubRepo[];
-  onSelect: (repo: GithubRepo) => void;
+  repos: RepositorySuggestion[];
+  onSelect: (repo: RepositorySuggestion) => void;
   testIdPrefix: string;
 }): ReactNode {
   const [open, setOpen] = useState(false);
@@ -59,7 +55,7 @@ function SandboxRepoCombobox({
           type="button"
           role="combobox"
           aria-expanded={open}
-          aria-label="GitHub repository"
+          aria-label="Repository"
           className={cn("mobile-touch-target", COMBOBOX_TRIGGER_CLASS)}
           data-testid={`${testIdPrefix}-select`}
         >
@@ -79,15 +75,16 @@ function SandboxRepoCombobox({
             <CommandGroup>
               {repos.map((repo) => (
                 <CommandItem
-                  key={repo.full_name}
+                  key={repositoryIdentity(repo.url)}
                   className="mobile-touch-target"
-                  value={repo.full_name}
+                  value={repositoryIdentity(repo.url)}
+                  keywords={[repo.name]}
                   onSelect={() => {
                     onSelect(repo);
                     setOpen(false);
                   }}
                 >
-                  <span className="truncate">{repo.full_name}</span>
+                  <span className="truncate">{repo.name}</span>
                   {repo.private && (
                     <LockIcon
                       className="size-3 shrink-0 opacity-60"
@@ -237,6 +234,10 @@ function SandboxRepoBranchSelect({
 }
 
 interface SandboxRepositoryPickerProps {
+  single?: boolean;
+  catalog?: { name: string; url: string }[];
+  urlInput?: boolean;
+  branchSelection?: boolean;
   selections: LastSandboxRepo[];
   onChange: (selections: LastSandboxRepo[], editedBranchUrl?: string) => void;
   branchNotes?: Readonly<Record<string, string>>;
@@ -251,6 +252,10 @@ interface SandboxRepositoryPickerProps {
 export function SandboxRepositoryPicker({
   selections,
   onChange,
+  single = false,
+  catalog = EMPTY_CATALOG,
+  urlInput = true,
+  branchSelection = true,
   branchNotes,
   maxRepos,
   enabled = true,
@@ -266,7 +271,10 @@ export function SandboxRepositoryPicker({
     onPendingUrlChange?.(url);
   };
   const githubEnabled =
-    enabled && info !== "loading" && (info.enabled_connections ?? []).includes("github");
+    enabled &&
+    urlInput &&
+    info !== "loading" &&
+    (info.enabled_connections ?? []).includes("github");
   const { data, isError } = useQuery({
     queryKey: ["github-repos"],
     queryFn: fetchGithubRepos,
@@ -275,26 +283,37 @@ export function SandboxRepositoryPicker({
   });
   const connected = githubEnabled && data?.connected;
   const repos = connected ? data.repos : [];
-  const selectedUrls = new Set(selections.map((selection) => repoIdentity(selection.url)));
-  const unselectedRepos = repos.filter(
-    (repo) => !selectedUrls.has(repoIdentity(repoCloneUrl(repo))),
+  const suggestions = [
+    ...new Map(
+      [
+        ...catalog,
+        ...repos.map((repo) => ({
+          name: repo.full_name,
+          url: repoCloneUrl(repo),
+          private: repo.private,
+        })),
+      ].map((repo) => [repositoryIdentity(repo.url), repo]),
+    ).values(),
+  ];
+  const selectedUrls = new Set(selections.map((selection) => repositoryIdentity(selection.url)));
+  const unselectedRepos = suggestions.filter(
+    (repo) => !selectedUrls.has(repositoryIdentity(repo.url)),
   );
-  const duplicateUrl = inputUrl.trim() !== "" && selectedUrls.has(repoIdentity(inputUrl));
+  const duplicateUrl = inputUrl.trim() !== "" && selectedUrls.has(repositoryIdentity(inputUrl));
   const urlError = (() => {
     if (inputUrl.trim() === "") return null;
     if (duplicateUrl) return "This repository is already selected. Clear this URL to continue.";
-    if (!isValidSandboxWorkspaceLength(inputUrl, "")) return SANDBOX_WORKSPACE_LENGTH_MESSAGE;
-    if (!isValidSandboxRepoUrl(inputUrl))
-      return "Enter an HTTPS or SSH URL ending in a repository name.";
-    return null;
+    return repositorySelectionError(
+      { url: inputUrl, branch: "" },
+      { catalog, urlInput, branchSelection },
+    );
   })();
   const canAdd = inputUrl.trim() !== "" && urlError === null && selections.length < maxRepos;
   const addRepo = (url: string): void => {
     if (
       selections.length >= maxRepos ||
-      selectedUrls.has(repoIdentity(url)) ||
-      !isValidSandboxRepoUrl(url) ||
-      !isValidSandboxWorkspaceLength(url, "")
+      selectedUrls.has(repositoryIdentity(url)) ||
+      repositorySelectionError({ url, branch: "" }, { catalog, urlInput, branchSelection }) !== null
     )
       return;
     onChange([...selections, { url: url.trim(), branch: "" }]);
@@ -310,6 +329,99 @@ export function SandboxRepositoryPicker({
       selections[index]?.url,
     );
   };
+  if (single) {
+    const selection = selections[0] ?? { url: "", branch: "" };
+    const updateSelection = (next: LastSandboxRepo): void =>
+      onChange(next.url.trim() === "" && next.branch.trim() === "" ? [] : [next]);
+    const error = repositorySelectionError(selection, { catalog, urlInput, branchSelection });
+    const branchError =
+      error !== null &&
+      selection.branch.trim() !== "" &&
+      (!branchSelection ||
+        (selection.url.trim() !== "" &&
+          error !==
+            repositorySelectionError(
+              { ...selection, branch: "" },
+              { catalog, urlInput, branchSelection },
+            )));
+    const selectedSuggestion = suggestions.find(
+      (repo) => repositoryIdentity(repo.url) === repositoryIdentity(selection.url),
+    );
+    return (
+      <div className="flex min-w-0 flex-col gap-2" data-testid={`${testIdPrefix}-picker`}>
+        <label htmlFor={`${testIdPrefix}-input`} className="text-sm font-medium">
+          Repository (optional)
+        </label>
+        {urlInput ? (
+          <>
+            <input
+              id={`${testIdPrefix}-input`}
+              list={`${testIdPrefix}-suggestions`}
+              value={selection.url}
+              onChange={(event) => updateSelection({ ...selection, url: event.target.value })}
+              aria-label="Repository URL"
+              aria-invalid={error !== null && !branchError}
+              aria-describedby={error && !branchError ? `${testIdPrefix}-error` : undefined}
+              placeholder="Select a repository or paste a URL"
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+            <datalist id={`${testIdPrefix}-suggestions`}>
+              {suggestions.map((repo) => (
+                <option key={repositoryIdentity(repo.url)} value={repo.url}>
+                  {repo.name}
+                </option>
+              ))}
+            </datalist>
+          </>
+        ) : (
+          <select
+            id={`${testIdPrefix}-input`}
+            value={selectedSuggestion?.url ?? selection.url}
+            onChange={(event) => updateSelection({ ...selection, url: event.target.value })}
+            aria-invalid={error !== null && !branchError}
+            aria-describedby={error && !branchError ? `${testIdPrefix}-error` : undefined}
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          >
+            <option value="">No repository</option>
+            {selection.url !== "" && !selectedSuggestion && (
+              <option value={selection.url}>{selection.url} (unavailable)</option>
+            )}
+            {suggestions.map((repo) => (
+              <option key={repositoryIdentity(repo.url)} value={repo.url}>
+                {repo.name}
+              </option>
+            ))}
+          </select>
+        )}
+        {githubEnabled && isError && (
+          <p className="text-xs text-muted-foreground">
+            Couldn't load repositories. You can still paste a URL.
+          </p>
+        )}
+        {((selection.url.trim() !== "" && branchSelection) || selection.branch !== "") && (
+          <>
+            <label htmlFor={`${testIdPrefix}-branch`} className="text-sm font-medium">
+              Branch (optional)
+            </label>
+            <input
+              id={`${testIdPrefix}-branch`}
+              value={selection.branch}
+              onChange={(event) => updateSelection({ ...selection, branch: event.target.value })}
+              aria-invalid={branchError || undefined}
+              aria-describedby={branchError ? `${testIdPrefix}-error` : undefined}
+              placeholder="Default branch"
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+          </>
+        )}
+        {error && (
+          <p id={`${testIdPrefix}-error`} className="text-xs text-destructive" role="alert">
+            {error}
+          </p>
+        )}
+      </div>
+    );
+  }
   const repositoryOccurrences = new Map<string, number>();
   return (
     <div className="flex min-w-0 flex-col gap-2" data-testid={`${testIdPrefix}-picker`}>
@@ -324,17 +436,15 @@ export function SandboxRepositoryPicker({
         const occurrence = repositoryOccurrences.get(selection.url) ?? 0;
         repositoryOccurrences.set(selection.url, occurrence + 1);
         const repo = repos.find(
-          (item) => repoIdentity(repoCloneUrl(item)) === repoIdentity(selection.url),
+          (item) => repositoryIdentity(repoCloneUrl(item)) === repositoryIdentity(selection.url),
         );
-        const name = repo?.full_name ?? deriveRepoName(selection.url) ?? selection.url;
-        const invalidBranch = !isValidSandboxBranch(selection.branch);
-        const workspaceTooLong = !isValidSandboxWorkspaceLength(selection.url, selection.branch);
-        const invalid = invalidBranch || workspaceTooLong;
-        const note = (() => {
-          if (invalidBranch) return INVALID_BRANCH_MESSAGE;
-          if (workspaceTooLong) return SANDBOX_WORKSPACE_LENGTH_MESSAGE;
-          return branchNotes?.[selection.url];
-        })();
+        const suggestion = suggestions.find(
+          (item) => repositoryIdentity(item.url) === repositoryIdentity(selection.url),
+        );
+        const name = suggestion?.name ?? deriveRepoName(selection.url) ?? selection.url;
+        const error = repositorySelectionError(selection, { catalog, urlInput, branchSelection });
+        const invalid = error !== null;
+        const note = error ?? branchNotes?.[selection.url];
         const descriptionId = note ? `${testIdPrefix}-branch-note-${index}` : undefined;
         return (
           <div
@@ -349,31 +459,33 @@ export function SandboxRepositoryPicker({
               >
                 {name}
               </span>
-              <div className="col-span-2 row-start-2 min-w-0 sm:w-40 sm:max-w-[55%] sm:shrink-0">
-                {repo ? (
-                  <SandboxRepoBranchSelect
-                    repo={repo}
-                    url={selection.url}
-                    value={selection.branch}
-                    onChange={(branch) => setBranch(index, branch)}
-                    enabled={githubEnabled}
-                    testIdPrefix={testIdPrefix}
-                    descriptionId={descriptionId}
-                    invalid={invalid}
-                  />
-                ) : (
-                  <input
-                    type="text"
-                    value={selection.branch}
-                    onChange={(event) => setBranch(index, event.target.value)}
-                    placeholder="Default branch"
-                    aria-label={`Branch for ${name}`}
-                    aria-describedby={descriptionId}
-                    aria-invalid={invalid || undefined}
-                    className="w-full rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
-                  />
-                )}
-              </div>
+              {(branchSelection || selection.branch !== "") && (
+                <div className="col-span-2 row-start-2 min-w-0 sm:w-40 sm:max-w-[55%] sm:shrink-0">
+                  {repo && branchSelection ? (
+                    <SandboxRepoBranchSelect
+                      repo={repo}
+                      url={selection.url}
+                      value={selection.branch}
+                      onChange={(branch) => setBranch(index, branch)}
+                      enabled={githubEnabled}
+                      testIdPrefix={testIdPrefix}
+                      descriptionId={descriptionId}
+                      invalid={invalid}
+                    />
+                  ) : (
+                    <input
+                      type="text"
+                      value={selection.branch}
+                      onChange={(event) => setBranch(index, event.target.value)}
+                      placeholder="Default branch"
+                      aria-label={`Branch for ${name}`}
+                      aria-describedby={descriptionId}
+                      aria-invalid={invalid || undefined}
+                      className="w-full rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                    />
+                  )}
+                </div>
+              )}
               <button
                 type="button"
                 onClick={() => onChange(selections.filter((_, row) => row !== index))}
@@ -398,14 +510,14 @@ export function SandboxRepositoryPicker({
       {(selections.length < maxRepos || inputUrl.trim() !== "") && (
         <>
           {selections.length > 0 && <div className="my-0.5 border-t border-border" />}
-          {connected && selections.length < maxRepos && (
+          {(connected || catalog.length > 0) && selections.length < maxRepos && (
             <>
               <SandboxRepoCombobox
                 repos={unselectedRepos}
-                onSelect={(repo) => addRepo(repoCloneUrl(repo))}
+                onSelect={(repo) => addRepo(repo.url)}
                 testIdPrefix={testIdPrefix}
               />
-              {data.truncated && (
+              {connected && data.truncated && (
                 <p
                   className="text-xs text-muted-foreground"
                   data-testid={`${testIdPrefix}-truncated`}
@@ -414,7 +526,9 @@ export function SandboxRepositoryPicker({
                   below.
                 </p>
               )}
-              <p className="text-xs text-muted-foreground">or paste a repository URL:</p>
+              {urlInput && (
+                <p className="text-xs text-muted-foreground">or paste a repository URL:</p>
+              )}
             </>
           )}
           {githubEnabled && isError && !connected && (
@@ -422,36 +536,38 @@ export function SandboxRepositoryPicker({
               Couldn't load your GitHub repositories. Paste a repository URL below.
             </p>
           )}
-          <div className="flex items-center gap-2">
-            <input
-              id={`${testIdPrefix}-input`}
-              type="text"
-              value={inputUrl}
-              onChange={(event) => updatePendingUrl(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  addInput();
-                }
-              }}
-              placeholder="https://github.com/org/repo"
-              aria-label="Repository URL"
-              aria-invalid={urlError !== null}
-              aria-describedby={urlError ? `${testIdPrefix}-input-error` : undefined}
-              className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
-              data-testid={`${testIdPrefix}-input`}
-            />
-            <button
-              type="button"
-              disabled={!canAdd}
-              onClick={addInput}
-              className="flex shrink-0 items-center gap-1 rounded-md border border-input px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
-              data-testid={`${testIdPrefix}-add`}
-            >
-              <PlusIcon className="size-3.5" />
-              Add
-            </button>
-          </div>
+          {(urlInput || inputUrl.trim() !== "") && (
+            <div className="flex items-center gap-2">
+              <input
+                id={`${testIdPrefix}-input`}
+                type="text"
+                value={inputUrl}
+                onChange={(event) => updatePendingUrl(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    addInput();
+                  }
+                }}
+                placeholder="https://github.com/org/repo"
+                aria-label="Repository URL"
+                aria-invalid={urlError !== null}
+                aria-describedby={urlError ? `${testIdPrefix}-input-error` : undefined}
+                className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
+                data-testid={`${testIdPrefix}-input`}
+              />
+              <button
+                type="button"
+                disabled={!canAdd}
+                onClick={addInput}
+                className="flex shrink-0 items-center gap-1 rounded-md border border-input px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
+                data-testid={`${testIdPrefix}-add`}
+              >
+                <PlusIcon className="size-3.5" />
+                Add
+              </button>
+            </div>
+          )}
           {urlError && (
             <p id={`${testIdPrefix}-input-error`} className="text-xs text-destructive">
               {urlError}

@@ -650,3 +650,68 @@ async def test_order_endpoints_enforce_owner_and_announce_changes(
         assert alice_events == [{"type": "projects_changed"}] * 2
         await asyncio.sleep(0.05)
         assert bob_events == []
+
+
+async def test_repository_config_is_normalized_and_preserved(
+    project_client: httpx.AsyncClient,
+) -> None:
+    assert (await project_client.get("/v1/info")).json()["project_repository_creation"] is True
+    config = {
+        "host_id": "__sandbox__",
+        "sandbox_provider": " provider ",
+        "repository": {"url": " https://git.example.com/team/sample.git ", "branch": " release "},
+        "extension": {"keep": True},
+    }
+    created = await project_client.post(
+        "/v1/projects", json={"name": "Repository", "config": config}
+    )
+    assert created.status_code == 200, created.text
+    config["sandbox_provider"] = "provider"
+    config["repository"] = {"url": "https://git.example.com/team/sample.git", "branch": "release"}
+    assert created.json()["config"] == config
+    project_id = created.json()["id"]
+    fetched = await project_client.get(f"/v1/projects/{project_id}")
+    assert fetched.json()["config"] == config
+    renamed = await project_client.patch(f"/v1/projects/{project_id}", json={"name": "Renamed"})
+    assert renamed.json()["config"] == config
+    cleared = await project_client.patch(
+        f"/v1/projects/{project_id}", json={"config": {"repository": None, "extension": True}}
+    )
+    assert cleared.json()["config"] == {"extension": True}
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        *[
+            {"repository": repository}
+            for repository in [
+                "invalid",
+                {},
+                {"url": ""},
+                {"url": "https://user:secret@git.example.com/team/sample.git"},
+                {"url": "https://git.example.com/team/sample.git#main"},
+                {"url": "https://git.example.com/team?secret/value/sample.git"},
+                {"url": "https://git.example.com/team/sample.git", "branch": None},
+                {"url": "https://git.example.com/team/sample.git", "token": "secret"},
+            ]
+        ],
+        {"host_id": "connected-host", "sandbox_provider": "provider"},
+        {
+            "host_id": "__sandbox__",
+            "repository": {"url": "https://git.example.com/team/sample.git"},
+            "workspace": "/workspace/sample",
+        },
+    ],
+)
+async def test_repository_config_rejected_on_create_and_update(
+    project_client: httpx.AsyncClient, config: dict[str, object]
+) -> None:
+    created = (await project_client.post("/v1/projects", json={"name": "Existing"})).json()
+    for method, url, body in [
+        ("POST", "/v1/projects", {"name": "Invalid", "config": config}),
+        ("PATCH", f"/v1/projects/{created['id']}", {"config": config}),
+    ]:
+        response = await project_client.request(method, url, json=body)
+        assert response.status_code == 400, response.text
+        assert "secret" not in response.text

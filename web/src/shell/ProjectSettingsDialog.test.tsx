@@ -138,11 +138,35 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).toHaveBeenCalledWith("p_1", { use_worktree: true });
   });
 
-  it("preserves the project icon when saving settings", async () => {
+  it.each([
+    { mode: "linked sandbox", linked: true, hostChoice: null, savedHost: "__sandbox__" },
+    { mode: "unchanged empty sandbox", linked: false, hostChoice: null, savedHost: "__sandbox__" },
+    {
+      mode: "empty sandbox switched to a host",
+      linked: false,
+      hostChoice: "Laptop",
+      savedHost: "h1",
+    },
+    {
+      mode: "empty sandbox with no host",
+      linked: false,
+      hostChoice: "No default",
+      savedHost: null,
+    },
+  ])("saves consistent defaults for a $mode project", async ({ linked, hostChoice, savedHost }) => {
+    const association = linked
+      ? { repository: { url: "https://git.example.com/team/sample.git" } }
+      : {};
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
-      config: { icon: "🔥", use_worktree: true },
+      config: {
+        icon: "🔥",
+        use_worktree: true,
+        ...association,
+        host_id: "__sandbox__",
+        sandbox_provider: "example",
+      },
     });
     renderDialog();
     await waitFor(() =>
@@ -152,10 +176,21 @@ describe("ProjectSettingsDialog", () => {
       ),
     );
 
+    if (linked) {
+      expect(screen.getByTestId("project-settings-host")).toBeDisabled();
+      expect(screen.getByTestId("project-settings-workspace")).toBeDisabled();
+    }
+    if (hostChoice) await pickSelectOption("project-settings-host", hostChoice);
     fireEvent.click(screen.getByTestId("project-settings-save"));
 
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", { icon: "🔥", use_worktree: true }),
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        icon: "🔥",
+        use_worktree: true,
+        ...association,
+        ...(savedHost ? { host_id: savedHost } : {}),
+        ...(savedHost === "__sandbox__" ? { sandbox_provider: "example" } : {}),
+      }),
     );
   });
 

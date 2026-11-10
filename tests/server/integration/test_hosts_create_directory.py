@@ -21,6 +21,9 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.host.frames import (
+    CAP_CLONE_REPOSITORY,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostHelloFrame,
@@ -34,6 +37,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import websocket_scope as _websocket_scope
 
 # Same liveness-race flake guard as test_hosts_filesystem.py: the mock
@@ -59,6 +63,7 @@ def _hello_text(name: str = _HOST_NAME) -> str:
             version="0.1.0-test",
             frame_protocol_version=1,
             name=name,
+            capabilities=[CAP_CLONE_REPOSITORY],
         )
     )
 
@@ -137,6 +142,23 @@ async def mkdir_setup(
             if not isinstance(text, str):
                 continue
             frame = decode_host_frame(text)
+            if isinstance(frame, HostCloneRepositoryFrame):
+                reply = replies.get(frame.path, {})
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostCloneRepositoryResultFrame(
+                                request_id=frame.request_id,
+                                status=reply.get("status", "ok"),
+                                path=reply.get("path", frame.path),
+                                error=reply.get("error"),
+                                error_code=reply.get("error_code"),
+                            )
+                        ),
+                    }
+                )
+                continue
             if not isinstance(frame, HostCreateDirFrame):
                 continue
             reply = replies.get(frame.path)
@@ -319,3 +341,99 @@ async def test_create_directory_windows_drive_path_accepted(
         )
     assert resp.status_code == 200, resp.text
     assert resp.json()["path"] == r"C:\Users\alice\work\fresh"
+
+
+@pytest.mark.parametrize(
+    "reply,expected_status,expected_code",
+    [
+        ({"path": "/home/example/sample"}, 200, None),
+        (
+            {
+                "status": "failed",
+                "error_code": "clone_destination_conflict",
+                "error": "Destination exists",
+            },
+            409,
+            "clone_destination_conflict",
+        ),
+        (
+            {"status": "failed", "error_code": "clone_failed", "error": "Clone failed"},
+            502,
+            "clone_failed",
+        ),
+        (
+            {"status": "failed", "error_code": "clone_timeout", "error": "Clone stopped"},
+            504,
+            "clone_timeout",
+        ),
+    ],
+)
+async def test_clone_repository_tunnel_contract(
+    mkdir_setup, reply, expected_status, expected_code
+) -> None:
+    app, registry, _comm, replies, _drain = mkdir_setup
+    replies["~/sample"] = reply
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/hosts/{_HOST_ID}/repositories/clone",
+            json={"url": "https://git.example.com/team/sample.git", "path": "~/sample"},
+        )
+        hosts = (await client.get("/v1/hosts")).json()["hosts"]
+        detail = await client.get(f"/v1/hosts/{_HOST_ID}?include=capabilities")
+    assert response.status_code == expected_status, response.text
+    assert hosts[0]["clone_repository_supported"] is True
+    assert detail.status_code == 200
+    assert detail.json()["clone_repository_supported"] is True
+    if expected_code:
+        assert response.json()["error"]["code"] == expected_code
+    else:
+        assert response.json() == {"object": "repository", "path": "/home/example/sample"}
+    assert not registry.get(_HOST_ID).pending_clones
+
+
+async def test_clone_repository_old_host_gets_no_frame(mkdir_setup) -> None:
+    app, registry, _comm, _replies, _drain = mkdir_setup
+    registry.get(_HOST_ID).hello.capabilities.clear()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        detail = await client.get(f"/v1/hosts/{_HOST_ID}?include=capabilities")
+        response = await client.post(
+            f"/v1/hosts/{_HOST_ID}/repositories/clone",
+            json={"url": "https://git.example.com/team/sample.git", "path": "~/sample"},
+        )
+    assert detail.status_code == 200
+    assert detail.json()["clone_repository_supported"] is False
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "clone_unsupported"
+    assert not registry.get(_HOST_ID).pending_clones
+
+
+@pytest.mark.parametrize("disconnect", [False, True])
+async def test_clone_repository_uncertain_transport(mkdir_setup, monkeypatch, disconnect) -> None:
+    app, registry, _comm, _replies, drain = mkdir_setup
+    drain.cancel()
+    with suppress(asyncio.CancelledError):
+        await drain
+    conn = registry.get(_HOST_ID)
+    monkeypatch.setattr("omnigent.server.routes.hosts._CLONE_REPOSITORY_TIMEOUT_S", 0.05)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        pending = asyncio.create_task(
+            client.post(
+                f"/v1/hosts/{_HOST_ID}/repositories/clone",
+                json={"url": "https://git.example.com/team/sample.git", "path": "~/sample"},
+            )
+        )
+        try:
+            if disconnect:
+                await poll_until_async(
+                    lambda: conn.pending_clones or pending.done(), timeout_s=2, interval_s=0.001
+                )
+                assert conn.pending_clones, "clone request finished before registering its RPC"
+                registry.deregister(_HOST_ID)
+            response = await pending
+        finally:
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+    assert response.status_code == (502 if disconnect else 504)
+    assert response.json()["error"]["code"] == "clone_transport_error"
+    assert not conn.pending_clones

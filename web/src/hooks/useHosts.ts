@@ -36,6 +36,7 @@ export interface Host {
   harness_accounts_supported?: boolean;
   /** Whether this connected host supports the interactive login/logout routes. */
   harness_login_supported?: boolean;
+  clone_repository_supported?: boolean;
   /**
    * Whether each harness family's launch on this host resolves an
    * AI-Gateway-backed inference config, e.g. `{"claude-native": true,

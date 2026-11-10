@@ -13,6 +13,7 @@ import type { HostFilesystemEntry } from "./useHostFilesystem";
 import {
   buildHostFilesystemUrl,
   createHostDirectory,
+  cloneHostRepository,
   shouldRetryHostFilesystem,
   useHostFilesystem,
 } from "./useHostFilesystem";
@@ -280,5 +281,62 @@ describe("createHostDirectory", () => {
     await expect(createHostDirectory("host_abc", "/Users/me/dup")).rejects.toThrow(
       "directory already exists",
     );
+  });
+});
+
+describe("cloneHostRepository", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("sends split repository fields and returns the host's absolute checkout path", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ object: "repository", path: "/work/sample" })),
+      );
+    vi.stubGlobal("fetch", fetch);
+    const request = {
+      url: "https://git.example.com/team/sample.git",
+      branch: "release",
+      path: "~/sample",
+    };
+    expect(await cloneHostRepository("host example", request)).toBe("/work/sample");
+    expect(fetch).toHaveBeenCalledWith(
+      "/v1/hosts/host%20example/repositories/clone",
+      expect.objectContaining({ method: "POST", body: JSON.stringify(request) }),
+    );
+  });
+  it("preserves the stable error code without retrying an uncertain write", async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: { code: "clone_transport_error", message: "Clone result is unknown" },
+        }),
+        { status: 502 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetch);
+    await expect(
+      cloneHostRepository("host_1", {
+        url: "https://git.example.com/team/sample.git",
+        path: "~/sample",
+      }),
+    ).rejects.toMatchObject({ code: "clone_transport_error", status: 502 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    "",
+    "not JSON",
+    ...[null, {}, { path: null }, { path: 3 }, { path: "" }, { path: "  " }].map((body) =>
+      JSON.stringify(body),
+    ),
+  ])("rejects a successful response without a checkout path (%j)", async (body) => {
+    const fetch = vi.fn().mockResolvedValue(new Response(body));
+    vi.stubGlobal("fetch", fetch);
+    await expect(
+      cloneHostRepository("host_1", {
+        url: "https://git.example.com/team/sample.git",
+        path: "~/sample",
+      }),
+    ).rejects.toThrow("Check the clone destination before retrying");
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

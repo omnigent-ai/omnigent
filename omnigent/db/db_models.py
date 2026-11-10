@@ -32,6 +32,7 @@ from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
+from omnigent.util.labels import LABEL_VALUE_MAX_LEN as LABEL_VALUE_MAX_LEN
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
@@ -1061,12 +1062,6 @@ class SqlConversationItem(ConversationBase):
         ),
         CheckConstraint("status IN (1, 2, 3, 4)", name="ck_conversation_items_status"),
     )
-
-
-# Width of the ``conversation_labels.value`` column. Exported so the store
-# (and the session-status error-label path) can clamp values to fit instead
-# of letting an over-length write raise ``DataError`` on PostgreSQL.
-LABEL_VALUE_MAX_LEN = 256
 
 
 class SqlConversationLabel(ConversationBase):

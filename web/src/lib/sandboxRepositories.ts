@@ -21,15 +21,53 @@ export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
  */
 export function isValidSandboxRepoUrl(url: string): boolean {
   const t = url.trim();
-  const validForm =
-    /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || /^git@[^\s#:@]+:[^\s#@]+$/.test(t);
+  if (
+    t.includes("?") ||
+    Array.from(t).some(
+      (character) => character.charCodeAt(0) < 0x20 || character.charCodeAt(0) === 0x7f,
+    )
+  )
+    return false;
+  const sshMatch = /^git@(\[[^\s#@[\]]+\]|[^\s#:@/\\[\]]+):([^\s#@]+)$/.exec(t);
+  const validForm = /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || sshMatch !== null;
   const name = validForm ? deriveRepoName(t) : null;
-  return name !== null && name !== "." && name !== ".." && /^[A-Za-z0-9._-]+$/.test(name);
+  if (name === null || name === "." || name === ".." || !/^[A-Za-z0-9._-]+$/.test(name))
+    return false;
+  let hostname: string;
+  if (t.startsWith("https://")) {
+    try {
+      const parsed = new URL(t);
+      if (parsed.hostname.startsWith("[")) return true;
+    } catch {
+      return false;
+    }
+    const authority = t.slice("https://".length).split("/")[0];
+    hostname = authority.split(":")[0];
+  } else {
+    hostname = sshMatch![1];
+    if (hostname.startsWith("[")) {
+      try {
+        return new URL(`https://${hostname}/`).hostname.startsWith("[");
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+  return (
+    hostname.length <= 253 &&
+    hostname
+      .replace(/\.$/, "")
+      .split(".")
+      .every((label) => /^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$/.test(label))
+  );
 }
 
 // Each composed repository is stored in a label capped by server LABEL_VALUE_MAX_LEN.
 export const MAX_SANDBOX_WORKSPACE_LENGTH = 256;
 export const SANDBOX_WORKSPACE_LENGTH_MESSAGE = `Repository URL and branch must be at most ${MAX_SANDBOX_WORKSPACE_LENGTH} characters together.`;
+export const INVALID_BRANCH_MESSAGE =
+  "Enter a valid branch name, or leave blank for the default branch.";
 
 /** Count Unicode code points to match the server's limit after input trimming. */
 export function isValidSandboxWorkspaceLength(url: string, branch: string): boolean {
@@ -46,14 +84,20 @@ export function isValidSandboxBranch(branch: string): boolean {
     !/^[0-9a-f]{40}$/.test(value) &&
     !Array.from(value).some(
       (character) =>
-        character.charCodeAt(0) < 0x20 || /\s/.test(character) || "~^:?*[\\#".includes(character),
+        character.charCodeAt(0) < 0x20 ||
+        character.charCodeAt(0) === 0x7f ||
+        /\s/.test(character) ||
+        "~^:?*[\\#".includes(character),
     ) &&
     !value.startsWith("-") &&
     !value.startsWith("/") &&
     !value.endsWith("/") &&
     !value.endsWith(".") &&
     !value.includes("..") &&
-    !value.includes("@{")
+    !value.includes("@{") &&
+    !value.includes("//") &&
+    value !== "@" &&
+    value.split("/").every((part) => !part.startsWith(".") && !part.endsWith(".lock"))
   );
 }
 
@@ -135,4 +179,45 @@ export function deriveRepoName(url: string): string | null {
   const last = t.split(/[/:]/).pop() ?? "";
   const name = last.endsWith(".git") ? last.slice(0, -4) : last;
   return name === "" ? null : name;
+}
+
+export function repositoryIdentity(url: string): string {
+  const normalized = url
+    .trim()
+    .replace(/^git@(\[[^\]]+\]|[^:]+):/, "https://$1/")
+    .replace(/\/+$/, "");
+  const identity = /^https:\/\/github\.com\//i.test(normalized)
+    ? normalized.toLowerCase()
+    : normalized;
+  return identity.replace(/\.git$/, "");
+}
+
+/** Validate a saved or drafted choice against the selected target, without dropping it. */
+export function repositorySelectionError(
+  selection: { url: string; branch?: string },
+  capabilities: {
+    catalog: { name: string; url: string }[];
+    urlInput: boolean;
+    branchSelection: boolean;
+  },
+): string | null {
+  const branch = selection.branch ?? "";
+  if (branch.trim() !== "" && !capabilities.branchSelection)
+    return "This target uses the default branch. Clear the branch or choose another target.";
+  if (selection.url.trim() === "")
+    return branch.trim() === "" ? null : "Choose a repository for this branch.";
+  if (!isValidSandboxRepoUrl(selection.url))
+    return "Enter a valid HTTPS or SSH repository URL without credentials.";
+  if (!isValidSandboxBranch(branch)) return INVALID_BRANCH_MESSAGE;
+  if (!isValidSandboxWorkspaceLength(selection.url, branch))
+    return SANDBOX_WORKSPACE_LENGTH_MESSAGE;
+  if (
+    !capabilities.urlInput &&
+    !capabilities.catalog.some(
+      (repo) => repositoryIdentity(repo.url) === repositoryIdentity(selection.url),
+    )
+  ) {
+    return "This repository is unavailable on this target. Choose a listed repository or another target.";
+  }
+  return null;
 }

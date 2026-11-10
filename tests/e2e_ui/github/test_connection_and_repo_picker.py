@@ -143,7 +143,7 @@ def test_github_repository_and_branch_picker(
     # Tap just inside the bottom edge; positions exclude the 1px border.
     chip.click(position={"x": 22, "y": 42} if native_kind else None)
     expect(page.get_by_role("dialog")).to_have_attribute("data-side", "top")
-    page.get_by_role("combobox", name="GitHub repository", exact=True).click()
+    page.get_by_role("combobox", name="Repository", exact=True).click()
     page.get_by_placeholder("Search repositories…").fill("hello")
     page.get_by_role("option", name="octocat/hello", exact=True).click()
     page.get_by_role("combobox", name="Branch for octocat/hello", exact=True).click()

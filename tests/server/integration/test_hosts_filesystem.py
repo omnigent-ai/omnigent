@@ -369,24 +369,41 @@ async def test_host_skills_requires_directory(
 @pytest.mark.parametrize(
     "host_state,status", [("missing", 404), ("offline", 409), ("other_replica", 400)]
 )
-async def test_host_skills_requires_connected_host(
+@pytest.mark.parametrize("route", ["skills", "clone", "capabilities"])
+async def test_host_routes_require_connected_host(
     fs_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
     host_state: str,
     status: int,
+    route: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("omnigent.server.routes._host_launch._deployment_is_sharded", lambda: True)
     app, registry, host_store, _conv_store = fs_app
+    monkeypatch.setattr(
+        registry, "send_text", lambda *args: pytest.fail("no host may receive a frame")
+    )
     if host_state != "missing":
         host_store.upsert_on_connect(_HOST_ID, "test-host", "local")
         if host_state == "offline":
             host_store.set_offline(_HOST_ID)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get(
-            "/v1/skills",
-            params={"host_id": _HOST_ID, "harness": "claude-native", "path": "~"},
-        )
+        if route == "skills":
+            response = await client.get(
+                "/v1/skills",
+                params={"host_id": _HOST_ID, "harness": "claude-native", "path": "~"},
+            )
+        elif route == "capabilities":
+            response = await client.get(f"/v1/hosts/{_HOST_ID}?include=capabilities")
+        else:
+            response = await client.post(
+                f"/v1/hosts/{_HOST_ID}/repositories/clone",
+                json={"url": "https://git.example.com/team/sample.git", "path": "~/sample"},
+            )
     assert response.status_code == status, response.text
+    if host_state != "missing":
+        assert response.json()["error"]["code"] == (
+            "wrong_replica" if host_state == "other_replica" else "conflict"
+        )
     assert registry.get(_HOST_ID) is None
 
 

@@ -49,6 +49,8 @@ from omnigent.host.frames import (
     SERVER_CAP_TMUX_READINESS,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -12194,3 +12196,22 @@ async def test_mcp_activation_launch_frame_to_runner_environment(activation):
     assert (RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR in env) is (
         activation is not None
     )
+
+
+async def test_dispatch_clone_keeps_orphan_reaper_paused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Git worker owns its exit status until it sends the checkout path."""
+    host = _make_host_process()
+    expected = HostCloneRepositoryResultFrame("clone", "ok", "/home/example/sample")
+
+    def git_worker(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResultFrame:
+        assert host._owned_subprocess_ops == 1
+        return expected
+
+    monkeypatch.setattr("omnigent.host.connect.clone_repository", git_worker)
+    tunnel = _FakeTunnel()
+    await host._dispatch_host_frame(
+        tunnel,
+        HostCloneRepositoryFrame("clone", "https://git.example.com/team/sample.git", "~/sample"),
+    )
+    assert decode_host_frame(tunnel.sent[-1]) == expected
+    assert host._owned_subprocess_ops == 0

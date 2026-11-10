@@ -76,14 +76,30 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `project-session-defaults`: Project settings store a default agent and, for
   Claude Code, Codex, and Pi, a default model and reasoning effort; the
   new-session composer opened in that project (`/?project=<name>`) starts with
-  them. The Fork dialog and CLI, API, and scheduled creates don't apply model
-  or effort. States: no default, a Codex
+  them. A project created with a repository also supplies its execution target,
+  sandbox provider, repository, and optional branch. An untouched draft waits
+  for these defaults even after leaving and returning while config loads;
+  explicitly clearing a repository stays cleared for that launch. Switching
+  projects uses the new project's defaults; projects without a repository start
+  with none. Updated project placement applies independently of repository edits
+  in the current draft. The Fork dialog and CLI, API, and
+  scheduled creates don't apply model or effort. States: no default, a Codex
   effort the pinned model lacks (or, with no project model, the remembered
   model lacks), an explicit composer pick, remembered Smart Routing, another
   agent chosen, and a configured agent that picker curation
   (`restrict_to_agent_names`, see `native-harnesses.md`) does not offer, which
   New Chat reports as unavailable until the user picks an offered agent while
   project settings keeps storing it.
+- `project-repository-creation`: **New project** → **Workspace** offers **Run on**
+  and an optional folder or repository. A connected host clones the repository
+  into a new directory before saving the project; a sandbox saves the choice
+  and prepares it when a session starts. Catalog-only providers offer listed
+  repositories; URL and branch fields appear only when supported. The selected
+  connected target is saved even without a workspace. States: empty project,
+  existing folder, new folder, repository clone/save pending (edits and dismissal
+  locked), failed clone, successful clone followed by failed save, unavailable
+  target, and an unsupported retained repository or branch. Project settings
+  preserve repository links and do not offer editing or relinking them.
 - `config-cycle-hotkeys`: Ctrl+Alt+M cycles models and Ctrl+Alt+E cycles effort
   in both composers (Ctrl on every platform). The relevant menu briefly opens
   with the selected choice highlighted, preserving draft and input focus. In an
@@ -406,6 +422,18 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Open a project's actions menu in the sidebar → **Project settings**, pick
   Claude Code, Codex, or Pi as the agent, then set **Model** and **Effort**.
   Click **New session in project** and check the pill shows both.
+- Choose **New project** beside **Projects**, expand **Workspace**, and choose
+  a connected host under **Run on**. Create without a folder or repository;
+  open **New session in project** and confirm the target is retained.
+- In **New project**, choose **Repository**, enter an accessible repository URL,
+  optional branch, and a new **Clone into** path. During creation, confirm the
+  modal remains locked until cloning and saving finish. If the result is unknown,
+  inspect the destination before retrying; use **Folder** if the checkout exists.
+- Create a sandbox project with a listed or supported custom repository, then
+  open **New session in project** and confirm its provider, repository and branch.
+  Remove the repository, leave and return to the composer, and confirm it stays
+  cleared. With config loading, leave an untouched composer and return; the
+  project's repository should appear when loading finishes.
 - Attach files or type `/` before the first send.
 - For a managed sandbox, submit a prompt and close the browser once the session
   URL appears, while provisioning is still in progress. Reopen that URL after
@@ -580,7 +608,14 @@ Other connection providers alone do not enable the managed MCP picker.
   (real host and Claude CLI against the mock model),
   `tests/e2e_ui/sessions/test_project_settings_model_default.py::test_project_settings_model_and_effort_defaults_round_trip`;
   ladder and precedence cases in `web/src/shell/ProjectSettingsDialog.test.tsx`
-  and `web/src/shell/NewChatDialog.projectPrefill.test.tsx`.
+  and `web/src/shell/NewChatDialog.projectPrefill.test.tsx`; repository/provider
+  defaults and explicit clears across JSON and multipart creation are covered
+  by the latter and `web/src/shell/NewChatDialog.projectCreate.test.tsx`.
+- **`project-repository-creation`:** `web/src/shell/NewProjectButton.test.tsx`
+  covers target persistence, clone/save locking, errors and retry correction;
+  `web/src/shell/SandboxRepositoryPicker.test.tsx` covers catalog restrictions,
+  retained choices and URL/branch editing. Host cloning and sandbox preparation
+  require the corresponding connected host or provider for manual verification.
 - **`effort-picker`, SDK in-session composer:**
   `tests/e2e_ui/chat/test_sdk_effort_dial.py::test_claude_sdk_session_offers_the_effort_dial`
   covers selection, persistence and reload. The stale-catalog cases in
