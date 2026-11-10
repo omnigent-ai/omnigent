@@ -99,6 +99,20 @@ def test_synthesize_env_key_openrouter_uses_vendor_endpoint_and_chat_wire() -> N
     assert openai_block["api_key_ref"] == "env:OPENROUTER_API_KEY"
 
 
+def test_synthesize_env_key_atlascloud_uses_vendor_endpoint_and_chat_wire() -> None:
+    """A detected Atlas key routes to its OpenAI-compatible chat endpoint."""
+    det = DetectedProvider(
+        name="atlascloud", kind="key", family=OPENAI_FAMILY, source="$ATLASCLOUD_API_KEY"
+    )
+
+    entries = synthesize_detected_entries([det])
+
+    openai_block = entries["atlascloud"]["openai"]
+    assert openai_block["base_url"] == "https://api.atlascloud.ai/v1"
+    assert openai_block["wire_api"] == "chat"
+    assert openai_block["api_key_ref"] == "env:ATLASCLOUD_API_KEY"
+
+
 def test_synthesize_env_key_openai_honors_openai_base_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
