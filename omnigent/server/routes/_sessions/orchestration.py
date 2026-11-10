@@ -243,6 +243,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_tasks_cache,
     _session_blocked_on_cache,
     _session_mcp_startup_cache,
+    _session_recovery_tokens,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
@@ -4163,32 +4164,46 @@ async def _publish_runner_recovered_status_impl(
     """
     if _session_status_cache.get(session_id) != "failed":
         return
-    # A passive reconnect must distinguish a benign runner disconnect
-    # from a real task failure: both land the cache on "failed", but only
-    # the disconnect persists a ``runner_disconnected`` label. The
-    # reconnect proves the runner is reachable again, which invalidates a
-    # disconnect failure but says nothing about a genuine task error —
-    # leave that one alone. Explicit rebinds skip this guard.
-    if require_disconnect_code:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
-        if last_error is None or last_error.get("code") != "runner_disconnected":
+    token = object()
+    _session_recovery_tokens[session_id] = token
+    relay = _runner_relay_tasks.get(session_id)
+    handoffs = session_live_state.handoff_count(session_id)
+    try:
+        if require_disconnect_code:
+            conv = await asyncio.wrap_future(
+                session_live_state.submit(
+                    "runner_recovery_snapshot", conversation_store.get_conversation, session_id
+                )
+            )
+            last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
+            if last_error is None or last_error.get("code") != "runner_disconnected":
+                return
+        # A newer status/cause can return to "failed" while the read waits.
+        # Compare ownership rather than the status string alone.
+        if (
+            _session_recovery_tokens.get(session_id) is not token
+            or _runner_relay_tasks.get(session_id) is not relay
+            or session_live_state.handoff_count(session_id) != handoffs
+        ):
             return
-    _session_status_cache[session_id] = "idle"
-    session_live_state.persist_live_status(session_id, "idle")
-    event = SessionStatusEvent(
-        type="session.status",
-        conversation_id=session_id,
-        status="idle",
-        error=None,
-    )
-    session_stream.publish(session_id, event.model_dump())
-    if require_disconnect_code:
-        # Only a passive reconnect can show the same turn resuming on its own.
-        disconnect_outcome.note_disconnect_failure_cleared(
-            session_id, failure_code="runner_disconnected"
+        _session_status_cache[session_id] = "idle"
+        session_live_state.persist_live_status(session_id, "idle")
+        event = SessionStatusEvent(
+            type="session.status",
+            conversation_id=session_id,
+            status="idle",
+            error=None,
         )
-    await _persist_session_status_error_labels(session_id, None, conversation_store)
+        session_stream.publish(session_id, event.model_dump())
+        if require_disconnect_code:
+            # Only a passive reconnect can show the same turn resuming on its own.
+            disconnect_outcome.note_disconnect_failure_cleared(
+                session_id, failure_code="runner_disconnected"
+            )
+        await _persist_session_status_error_labels(session_id, None, conversation_store)
+    finally:
+        if _session_recovery_tokens.get(session_id) is token:
+            _session_recovery_tokens.pop(session_id, None)
 
 
 _RUNNER_OFFLINE_RETRY_DELAYS_S = (0.5, 1.0)
