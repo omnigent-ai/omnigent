@@ -170,11 +170,12 @@ Component coverage for these helpers and views lives in
 - **Open uses the list's revision, not the newest head.** A commit pushed while you
   read does not change the link until the list reloads. The link goes to the file
   without a line anchor.
-- **Open and viewed need a pinned list.** GitLab and Azure DevOps lists do not report
-  their revision, so **Open in** shows `Revision unknown`, and the Viewed checkbox,
-  progress row and Hide viewed are all hidden. A workspace-branch list (no pull
-  request selected) behaves the same way. Real GitLab and Azure DevOps pull requests
-  have not been exercised; these results come from the code paths.
+- **Open and viewed need a pinned list.** GitHub, GitLab and Azure DevOps lists report
+  the revision they show, so **Open in** and the Viewed checkbox work for each. A
+  workspace-branch list (no pull request selected) reports no revision, so **Open in**
+  shows `Revision unknown`, and the Viewed checkbox, progress row and Hide viewed are
+  all hidden. Real GitLab and Azure DevOps pull requests have not been exercised; these
+  results come from the code paths.
 - **Viewed marks are browser-local.** They do not sync to GitHub or other browsers.
   They are separate for each Omnigent server, signed-in user and pull request, and
   clearing site data removes them. If the browser refuses storage, your changes stay in
@@ -201,8 +202,7 @@ Component coverage for these helpers and views lives in
   conversation reveal a conversation on a file the path filter or Hide viewed hides,
   clearing that filter first and showing `Filter cleared to show <file>`. Other
   conversations on hidden files stay hidden with their files.
-- **Known rough edges.** Marking a file while Hide viewed is on removes it from the
-  list and drops keyboard focus. Marks made in another tab on the same head show as
+- **Known rough edges.** Marks made in another tab on the same head show as
   checked but do not collapse the file until the Changes view remounts (for example
   after a reload) or the head changes.
 - **Commits need GitHub and a current server.** GitLab and Azure DevOps show Changes

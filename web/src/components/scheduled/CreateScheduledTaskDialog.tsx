@@ -43,6 +43,7 @@ import {
 import {
   combineTriggerPrompt,
   emptyTriggerFields,
+  isTaskSessionTriggerPrompt,
   isTriggerPrompt,
   readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
@@ -55,6 +56,7 @@ import {
   triggerServiceName,
   updateTriggerWorkerSettings,
   type TriggerFields,
+  type TriggerTaskSessionMode,
   type TriggerWorkerSettings,
   type TriggerSource,
   type WorkerPlacement,
@@ -499,6 +501,9 @@ export function CreateScheduledTaskDialog({
   const [triggerFields, setTriggerFields] = useState<TriggerFields>(() =>
     emptyTriggerFields("jira"),
   );
+  // Like the model and effort overrides, this Advanced choice outlives switching trigger types.
+  const [triggerTaskSessionMode, setTriggerTaskSessionMode] =
+    useState<TriggerTaskSessionMode>("new");
   // Kept while a trigger edit watches another source, so switching back restores the saved prompt.
   const [sourceSwitch, setSourceSwitch] = useState<{
     source: TriggerSource;
@@ -543,6 +548,10 @@ export function CreateScheduledTaskDialog({
       setTriggerType(sourceSession ? "schedule" : (initialTrigger ?? "schedule"));
       resetMenus();
       setAdvancedOpen(false);
+      // A source switch keeps the saved trigger's task-session choice.
+      setTriggerTaskSessionMode(
+        editingTask && isTaskSessionTriggerPrompt(editingTask.prompt) ? "continue" : "new",
+      );
       setSystemPromptOpen(false);
       setEditingSystemPrompt(false);
       const parts = splitTriggerPrompt(editingTask?.prompt ?? initialPrompt ?? "");
@@ -918,6 +927,8 @@ export function CreateScheduledTaskDialog({
                 model: supportsModel && pickedModel !== "" ? pickedModel : undefined,
                 effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
               }),
+          taskSessionMode: triggerTaskSessionMode,
+          taskSessionTitle: name,
         })
       : "";
   const effectivePrompt =
@@ -925,6 +936,10 @@ export function CreateScheduledTaskDialog({
   const triggerMode =
     trigger !== null ||
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
+  const sendsToTaskSession =
+    trigger !== null
+      ? triggerTaskSessionMode === "continue"
+      : isTaskSessionTriggerPrompt(editingTask?.prompt ?? effectivePrompt);
   const pollingBlockedReason =
     editingWorkerSettings && reusesExistingSession ? null : harnessSettings.blockedReason;
   const recurrenceValid =
@@ -963,6 +978,7 @@ export function CreateScheduledTaskDialog({
     summarySettings.permissions.find((option) => option.value === summaryPermission)?.label ??
       summaryPermission,
     !triggerMode && schedule.end ? "End limit" : null,
+    trigger !== null && triggerTaskSessionMode === "continue" ? "One task session" : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -1108,6 +1124,7 @@ export function CreateScheduledTaskDialog({
     setPickedProjectId(null);
     setTrigger(null);
     setTriggerFields(emptyTriggerFields("jira"));
+    setTriggerTaskSessionMode("new");
     setError(null);
     setScheduleUnsupported(false);
   }
@@ -1322,6 +1339,7 @@ export function CreateScheduledTaskDialog({
                   Saving replaces the {triggerServiceName(editingTriggerSource)} trigger. The next
                   run starts a new polling session that watches{" "}
                   {triggerServiceName(editedTriggerSource)}.
+                  {sendsToTaskSession && " Its first match starts a new task session."}
                 </p>
               )}
             </TriggerTypeSelect>
@@ -1352,6 +1370,7 @@ export function CreateScheduledTaskDialog({
                     toolsProvided={
                       sandboxMode && info !== "loading" && info.sandbox_provider === "arclet"
                     }
+                    taskSessionMode={triggerTaskSessionMode}
                     renderedPrompt={renderedTemplatePrompt}
                     onEditAsPrompt={() => {
                       const parts = splitTriggerPrompt(renderedTemplatePrompt);
@@ -1612,8 +1631,10 @@ export function CreateScheduledTaskDialog({
                 {!triggerMode && recurrenceFields}
                 {triggerMode && !scheduleInvalid && (
                   <p className="text-sm text-muted-foreground" data-testid="task-trigger-cadence">
-                    Checks for new matches: {describeSchedule(buildRRule(schedule))}. Matching items
-                    start sessions automatically.
+                    Checks for new matches: {describeSchedule(buildRRule(schedule))}.{" "}
+                    {sendsToTaskSession
+                      ? "Matching items go to the task session automatically."
+                      : "Matching items start sessions automatically."}
                   </p>
                 )}
                 {triggerMode && scheduleInvalid && (
@@ -1671,6 +1692,34 @@ export function CreateScheduledTaskDialog({
                     </span>
                   </CollapsibleTrigger>
                   <CollapsibleContent className="space-y-4 pt-4" data-testid="task-advanced-fields">
+                    {trigger !== null && editingTask === null && (
+                      <div
+                        className="flex flex-col gap-2 rounded-xl border border-border p-4"
+                        data-testid="task-trigger-session-mode-field"
+                      >
+                        <div className="flex items-center justify-between gap-4">
+                          <Label htmlFor="task-trigger-session-mode">
+                            Start a new session for each match
+                          </Label>
+                          <Switch
+                            id="task-trigger-session-mode"
+                            checked={triggerTaskSessionMode === "new"}
+                            onCheckedChange={(checked) =>
+                              setTriggerTaskSessionMode(checked ? "new" : "continue")
+                            }
+                            data-testid="task-trigger-session-mode"
+                            componentId="tasks.scheduled.trigger_session_mode"
+                          />
+                        </div>
+                        {triggerTaskSessionMode === "continue" && (
+                          <p className="text-sm text-muted-foreground">
+                            Every match goes to one task session, started on the first match, so it
+                            keeps its context across matches. Archiving it starts a new one on the
+                            next match.
+                          </p>
+                        )}
+                      </div>
+                    )}
                     <div className="space-y-4 rounded-xl border border-border p-4">
                       {sandboxMode && sandboxRepoCatalog.length > 0 && (
                         <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-2 [&>p]:col-span-2">
@@ -1872,6 +1921,7 @@ export function CreateScheduledTaskDialog({
                         <TriggerWorkerSettingsFields
                           value={workerSettings}
                           settings={workerHarnessSettings}
+                          taskSession={sendsToTaskSession}
                           disabled={curationPending}
                           onSelectOpenChange={handleSelectOpenChange}
                           onChange={handleWorkerSettingsChange}
@@ -1933,12 +1983,14 @@ export function CreateScheduledTaskDialog({
                                     {editingTemplateTrigger && (
                                       <>
                                         {" "}
-                                        Trigger automations reuse a polling session even though each
-                                        match starts a new worker. To change the model or harness
-                                        for future workers, edit the worker creation instructions in
-                                        the {systemPrompt === null
-                                          ? "prompt"
-                                          : "system prompt"}.{" "}
+                                        {sendsToTaskSession
+                                          ? "Trigger automations reuse a polling session, which sends each match to its task session."
+                                          : "Trigger automations reuse a polling session even though each match starts a new worker."}{" "}
+                                        To change the model or harness for future workers, edit the
+                                        worker creation instructions in the{" "}
+                                        {systemPrompt === null ? "prompt" : "system prompt"}.{" "}
+                                        {sendsToTaskSession &&
+                                          "The current task session keeps its settings; archive it so the next match starts one with the new settings. "}
                                         <button
                                           type="button"
                                           className="underline underline-offset-2"

@@ -679,19 +679,36 @@ export function PullRequestChangesTab({
       return { ...prev, owned };
     });
   }, []);
+  // Hide viewed can remove the file just marked, and with it the focused box. Focus then moves to
+  // the next shown file's Viewed box, or to Hide viewed when no file follows.
+  const viewedRowRef = useRef<HTMLDivElement>(null);
+  const [focusAfterHide, setFocusAfterHide] = useState<{ nextPath: string | null } | null>(null);
+  useEffect(() => {
+    if (!focusAfterHide) return;
+    const nextBox = focusAfterHide.nextPath
+      ? scrollRef.current?.querySelector<HTMLElement>(
+          `[role="checkbox"][aria-label="${CSS.escape(`Viewed ${focusAfterHide.nextPath}`)}"]`,
+        )
+      : null;
+    (nextBox ?? viewedRowRef.current?.querySelector<HTMLElement>('[role="checkbox"]'))?.focus();
+  }, [focusAfterHide]);
   // Marking a file collapses it; unmarking leaves its current state alone.
   const toggleViewed = useCallback(
     (path: string) => {
       const markViewed = !viewedFiles.viewed.has(path);
       viewedFiles.setMany([path], markViewed);
       if (!markViewed) return;
+      if (view.hideViewed && reviewing) {
+        const index = visibleFiles.findIndex((file) => file.path === path);
+        setFocusAfterHide({ nextPath: visibleFiles[index + 1]?.path ?? null });
+      }
       if (!collapsedPaths.has(path)) {
         setSeed((prev) => ({ ...prev, owned: new Set(prev.owned).add(path) }));
       }
       clearReveal(path);
       setCollapsedPaths((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
     },
-    [viewedFiles, clearReveal, collapsedPaths],
+    [viewedFiles, clearReveal, collapsedPaths, view.hideViewed, reviewing, visibleFiles],
   );
 
   // Fixed id keeps repeated failures from stacking toasts.
@@ -1262,6 +1279,7 @@ export function PullRequestChangesTab({
                 mobile={mobile}
                 hideViewed={view.hideViewed}
                 onHideViewedChange={view.setHideViewed}
+                rowRef={viewedRowRef}
               />
             ) : undefined
           }

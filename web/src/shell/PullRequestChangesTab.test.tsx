@@ -718,6 +718,30 @@ describe("PullRequestChangesTab viewed files", () => {
     expect(isListed("a.ts")).toBe(true);
   });
 
+  it("moves focus to the next shown file's Viewed box when Hide viewed removes the file just marked", () => {
+    render(viewedTab({ conversationId: "viewed-focus-next" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    // The reader's click focuses the box before the file it marks disappears.
+    viewedBox("a.ts").focus();
+    fireEvent.click(viewedBox("a.ts"));
+
+    expect(isListed("a.ts")).toBe(false);
+    expect(viewedBox("b.ts")).toHaveFocus();
+  });
+
+  it("moves focus to Hide viewed when the file just marked was the last one shown", () => {
+    render(viewedTab({ conversationId: "viewed-focus-last" }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    viewedBox("b.ts").focus();
+    fireEvent.click(viewedBox("b.ts"));
+
+    expect(screen.getByText("All 2 files viewed")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Hide viewed" })).toHaveFocus();
+  });
+
   it("resets a changed file's mark on a new head and shows a dismissible notice", () => {
     const { rerender } = render(
       viewedTab({ conversationId: "viewed-head", head: "head1", patch: twoFilePatch("new") }),

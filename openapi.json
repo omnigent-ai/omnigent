@@ -6633,6 +6633,11 @@
             "title": "Session Fork Workspaces",
             "type": "boolean"
           },
+          "session_list_scoped_archives": {
+            "default": true,
+            "title": "Session List Scoped Archives",
+            "type": "boolean"
+          },
           "session_pull_requests": {
             "default": false,
             "title": "Session Pull Requests",
@@ -17066,7 +17071,7 @@
             }
           },
           {
-            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions; with `project`, only owned sessions are returned so first-class project names resolve within the caller's projects. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour.",
+            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions; with `project`, only owned sessions are returned so first-class project names resolve within the caller's projects. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour. `include_archived` adds archived rows to `\"mine\"`, `\"shared\"` and `\"all\"`.",
             "in": "query",
             "name": "visibility",
             "required": false,

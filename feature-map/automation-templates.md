@@ -40,6 +40,13 @@ to customize.
 - `link-posting`: a checkbox below the trigger controls posting the session link
   back to Jira, Slack, GitHub, Linear, or PagerDuty (as an incident note). Sessions
   start whether it is checked or not.
+- `task-session`: when creating a trigger, Advanced shows **Start a new session for
+  each match**, on by default. Turning it off sends every match to one task session,
+  titled after the automation and started on the first match; later matches arrive
+  there as messages from the polling session. The instructions field becomes
+  Instructions for the task session, and Advanced's summary shows One task session.
+  The choice is saved in the prompt, survives switching integrations, and isn't
+  offered on edit. Archiving the task session makes the next match start a new one.
 - `prompt-editing`: the detail page and edit dialog show Your prompt first. System
   prompt starts collapsed, expands into a read-only preview, and requires Edit
   system prompt to change it. Done editing system prompt returns to the read-only
@@ -59,12 +66,13 @@ to customize.
   bounded read-only preview when expanded; use Edit automation to change it.
 - `source-switching`: editing a recognized trigger whose worker settings can be
   read shows Trigger type with the five integrations (not Schedule). Picking another one opens that integration's
-  form with the instructions, Harness for matching sessions, and worker placement
-  carried over and empty conditions; a default name follows the source, a custom
+  form with the instructions, Harness for matching sessions, worker placement, and
+  the task-session choice carried over and empty conditions; a default name follows the source, a custom
   name is kept. Each integration's draft, including an Edit as prompt draft,
   comes back unchanged when switching back and forth, and switching back to the
   saved source restores its prompt. A note warns that saving replaces the old trigger, and the
-  save always starts a new polling session (the reset checkbox is locked on).
+  save always starts a new polling session (the reset checkbox is locked on); a
+  task-session trigger's first match after that starts a new task session.
 - `default-project`: new automations select Omnigent Automation. Saving reuses or
   creates that project; canceling creates nothing. The project picker can choose
   another project or remove the default. Editing preserves the saved project.
@@ -161,7 +169,8 @@ to customize.
   by default; use Trigger type to select an integration and reveal its conditions
   and session instructions. Returning to Schedule restores the schedule draft.
   Choose Run on, Agent, and session mode above Repeat. Expand Advanced to change
-  model, effort, permissions, or an ending. With `automations_v2` on a server
+  model, effort, permissions, or an ending; for an integration trigger it also has
+  **Start a new session for each match**. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
