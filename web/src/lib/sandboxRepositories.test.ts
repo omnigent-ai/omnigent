@@ -146,7 +146,7 @@ describe("repositorySelectionError", () => {
     [{ url: "", branch: "" }, null],
     [{ url: "https://git.example.com/team/sample.git", branch: "release" }, null],
     [{ url: "https://user:secret@git.example.com/team/sample.git" }, "without credentials"],
-    [{ url: "https://git.example.com/team/sample.git#release" }, "without credentials"],
+    [{ url: "https://git.example.com/team/sample.git#release" }, "enter the branch separately"],
     [{ url: "https://git.example.com/team/sample.git", branch: "bad branch" }, "valid branch"],
     [{ url: "https://git.example.com/team/sample.git", branch: "b".repeat(256) }, "256 characters"],
     [{ url: "", branch: "release" }, "Choose a repository"],

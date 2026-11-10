@@ -392,6 +392,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Choose **New project** beside **Projects**, expand **Workspace**, and choose
   a connected host under **Run on**. Create without a folder or repository;
   open **New session in project** and confirm the target is retained.
+- From **Canvas**, open **New project** for the selected session. Expand
+  **Workspace** and confirm **Run on** defaults to that session's usable host or
+  offered sandbox provider, ahead of remembered choices.
 - In **New project**, choose **Repository**, enter an accessible repository URL,
   optional branch, and a new **Clone into** path. During creation, confirm the
   modal remains locked until cloning and saving finish. If the result is unknown,

@@ -415,7 +415,7 @@ export function SandboxRepositoryPicker({
           </>
         )}
         {error && (
-          <p id={`${testIdPrefix}-error`} className="text-xs text-destructive" role="alert">
+          <p id={`${testIdPrefix}-error`} className="text-xs text-destructive" aria-live="polite">
             {error}
           </p>
         )}

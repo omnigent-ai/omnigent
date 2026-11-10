@@ -185,10 +185,8 @@ function locationStep(
   if (state.phase !== "location") return null;
   const { hosts, selectedHostId, config } = inputs;
 
-  // A stored sandbox default: select the sandbox (gated on the server still
-  // offering it), unless the user already picked a host / the sandbox. The
-  // sandbox sentinel is never a real host id, so it's handled before the
-  // online-host lookup below. Mirrors the composer's last-choice sandbox path.
+  // Repository projects retain unavailable sandbox targets for submit validation.
+  // Other sandbox defaults require availability. Explicit placement wins.
   if (config?.hostId === SANDBOX_HOST_CHOICE) {
     if (
       (inputs.managedSandboxesEnabled || config.repository !== undefined) &&
@@ -204,9 +202,8 @@ function locationStep(
   // The online check needs the host list — wait for it.
   if (hosts === undefined) return null;
 
-  // Seed the configured host only when it's online (silently dropped
-  // otherwise, so an offline default can't set up a create that only fails),
-  // and only when the user hasn't already picked a different host / the sandbox.
+  // Repository projects keep the configured host and path paired, even offline.
+  // Other host defaults apply only online. Explicit placement wins.
   const configHostOnline =
     config?.hostId != null &&
     hosts.some((h) => h.host_id === config.hostId && h.status === "online");
@@ -218,9 +215,8 @@ function locationStep(
   // A configured workspace seeds the field even when the config host is
   // offline (or config names no host) — dropping the hint would let a
   // generic recent path fill in, which can belong to another project.
-  // Deliberate tradeoff: the generic default then fills selectedHostId with a
-  // DIFFERENT host, so host and workspace can diverge (a path that may not
-  // exist there) — accepted over losing the project's workspace hint. Only
+  // Without a repository, the generic default can select a different host,
+  // whose filesystem might not have this path. Only
   // a sandbox pick or an explicit switch to a different host suppresses it.
   // Without one, the composer's home-fallback fills the field. Any opt-in
   // worktree (config.useWorktree) is handled by a dedicated post-settle

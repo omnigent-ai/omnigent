@@ -641,10 +641,10 @@ async def test_repository_config_is_normalized_and_preserved(
 
 
 @pytest.mark.parametrize(
-    "config",
+    "config,expected_config",
     [
         *[
-            {"repository": repository}
+            ({"repository": repository}, None)
             for repository in [
                 "invalid",
                 {},
@@ -656,22 +656,51 @@ async def test_repository_config_is_normalized_and_preserved(
                 {"url": "https://git.example.com/team/sample.git", "token": "secret"},
             ]
         ],
-        {"host_id": "connected-host", "sandbox_provider": "provider"},
-        {
-            "host_id": "__sandbox__",
-            "repository": {"url": "https://git.example.com/team/sample.git"},
-            "workspace": "/workspace/sample",
-        },
+        ({"host_id": "__sandbox__", "sandbox_provider": None}, None),
+        ({"host_id": "__sandbox__", "sandbox_provider": " "}, None),
+        (
+            {
+                "host_id": "__sandbox__",
+                "repository": {"url": "https://git.example.com/team/sample.git"},
+                "workspace": "/workspace/sample",
+            },
+            None,
+        ),
+        (
+            {"host_id": "connected-host", "sandbox_provider": "provider", "extension": True},
+            {"host_id": "connected-host", "extension": True},
+        ),
+        ({"sandbox_provider": "provider", "extension": True}, {"extension": True}),
     ],
 )
-async def test_repository_config_rejected_on_create_and_update(
-    project_client: httpx.AsyncClient, config: dict[str, object]
+async def test_repository_config_validated_on_create_and_update(
+    project_client: httpx.AsyncClient,
+    config: dict[str, object],
+    expected_config: dict[str, object] | None,
 ) -> None:
-    created = (await project_client.post("/v1/projects", json={"name": "Existing"})).json()
+    created = (
+        await project_client.post(
+            "/v1/projects",
+            json={
+                "name": "Existing",
+                "config": {
+                    "host_id": "__sandbox__",
+                    "sandbox_provider": "provider",
+                    "extension": True,
+                },
+            },
+        )
+    ).json()
     for method, url, body in [
-        ("POST", "/v1/projects", {"name": "Invalid", "config": config}),
+        ("POST", "/v1/projects", {"name": "Configured", "config": config}),
         ("PATCH", f"/v1/projects/{created['id']}", {"config": config}),
     ]:
         response = await project_client.request(method, url, json=body)
-        assert response.status_code == 400, response.text
-        assert "secret" not in response.text
+        if expected_config is None:
+            assert response.status_code == 400, response.text
+            assert "secret" not in response.text
+        else:
+            assert response.status_code == 200, response.text
+            assert response.json()["config"] == expected_config
+            saved = await project_client.get(f"/v1/projects/{response.json()['id']}")
+            assert saved.json()["config"] == expected_config

@@ -44,12 +44,12 @@ def _normalize_config(config: dict[str, Any]) -> dict[str, Any]:
                 config.pop("repository")
             else:
                 config["repository"] = normalize_repository(config["repository"])
-        if "sandbox_provider" in config:
+        if config.get("host_id") != "__sandbox__":
+            config.pop("sandbox_provider", None)
+        elif "sandbox_provider" in config:
             provider = config["sandbox_provider"]
             if not isinstance(provider, str) or not provider.strip():
                 raise ValueError("sandbox_provider must be a nonempty string")
-            if config.get("host_id") != "__sandbox__":
-                raise ValueError("sandbox_provider requires a sandbox project target")
             config["sandbox_provider"] = provider.strip()
         if (
             config.get("repository")

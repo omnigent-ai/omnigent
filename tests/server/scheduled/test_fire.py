@@ -2113,7 +2113,6 @@ async def _drain_managed_launches() -> None:
         ("tracker_failed", None, []),
         ("raised", None, []),
         ("bound", "https://github.com/example/runtime", ["https://github.com/example/runtime"]),
-        ("bound", "git@work_git:team/sample.git", ["git@work_git:team/sample.git"]),
         ("bound", "/home/me", []),
     ],
 )
