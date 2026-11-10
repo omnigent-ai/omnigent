@@ -239,6 +239,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _runner_status_probe_inflight,
     _RunnerStatusProbeBackoff,
     _session_active_response_cache,
+    _session_background_agents_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
@@ -275,6 +276,7 @@ from omnigent.server.routes._sessions.helpers import (
     _delete_stored_session_bundle_after_failure,
     _derive_terminal_launch_args_from_spec,
     _devin_subagent_labels_from_body,
+    _drop_claude_launch_args_from_another_host,
     _emit_server_routing_decision,
     _error_item_from_sse,
     _extract_claude_native_runner_failure,
@@ -316,6 +318,7 @@ from omnigent.server.routes._sessions.helpers import (
     _NativeTerminalEnsureOutcome,
     _owner_from_grants,
     _owns_host_runner,
+    _parse_background_tasks,
     _parse_external_conversation_item,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
@@ -1423,6 +1426,7 @@ def _build_session_response(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     side_chat_sealed: bool = False,
+    background_agents: list[BackgroundTaskInfo] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1442,6 +1446,9 @@ def _build_session_response(
         when none are tracked.
     :param background_tasks: Per-shell detail for that tally, so a reload can
         restore it. ``None`` when none are tracked.
+    :param background_agents: Background agents a finished claude-native turn
+        left running while its session waits on them (the snapshot *status*
+        still reads ``"running"``). ``None`` otherwise.
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
@@ -1537,6 +1544,7 @@ def _build_session_response(
         agent_id=conv.agent_id,
         agent_name=agent_name,
         status=status,
+        background_agents=background_agents or None,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
         created_at=conv.created_at,
@@ -4669,6 +4677,7 @@ async def _run_managed_launch(
             session_id,
             user_id=owner,
             host_id=relaunch_host.host_id if relaunch_host is not None else None,
+            bind_host=False,
         )
         if profile is not None:
             sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
@@ -4679,9 +4688,19 @@ async def _run_managed_launch(
                     sandbox_config, None, unprofiled_host=relaunch_host
                 )
             else:
-                await asyncio.to_thread(
-                    sandbox_profiles.require_selection, provider, user_id=owner
+                # A launch without a create-time selection (a scheduled fresh sandbox)
+                # takes the provider's default, saved like an explicit selection.
+                default = await asyncio.to_thread(
+                    sandbox_profiles.default_selection, provider, user_id=owner
                 )
+                if default is None:
+                    await asyncio.to_thread(
+                        sandbox_profiles.require_selection, provider, user_id=owner
+                    )
+                else:
+                    await asyncio.to_thread(sandbox_profiles.bind_session, session_id, default)
+                    sandbox_config = deployment_with_sandbox_profile(sandbox_config, default)
+                    provider = default["provider"]
     except (OmnigentError, HTTPException) as exc:
         reason = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
         tracker.fail(session_id, reason)
@@ -4748,6 +4767,7 @@ async def _run_managed_launch(
             tunnel_registry=tunnel_registry,
             relaunch_host=relaunch_host,
             sandbox_profiles=sandbox_profiles,
+            sandbox_profile=profile,
         )
 
 
@@ -4763,6 +4783,7 @@ async def _bind_and_launch_managed_runner(
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
     sandbox_profiles: Any = None,
+    sandbox_profile: dict[str, Any] | None = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -4799,20 +4820,21 @@ async def _bind_and_launch_managed_runner(
     from omnigent.server.managed_hosts import terminate_managed_host
 
     def persist_binding() -> Conversation:
-        snapshot = (
+        snapshot = sandbox_profile or (
             sandbox_profiles.get_session_snapshot(session_id)
             if sandbox_profiles is not None
             else None
         )
         if snapshot is None:
-            return conversation_store.set_host_id(session_id, managed.host_id, managed.workspace)
-        conversation_store.bind_profiled_host(
-            session_id, managed.host_id, managed.workspace, snapshot
-        )
-        conv = conversation_store.get_conversation(session_id)
-        if conv is None:
-            raise ConversationNotFoundError(f"conversation {session_id!r} does not exist")
-        return conv
+            conv = conversation_store.set_host_id(session_id, managed.host_id, managed.workspace)
+        else:
+            conversation_store.bind_profiled_host(
+                session_id, managed.host_id, managed.workspace, snapshot
+            )
+            conv = conversation_store.get_conversation(session_id)
+            if conv is None:
+                raise ConversationNotFoundError(f"conversation {session_id!r} does not exist")
+        return _drop_claude_launch_args_from_another_host(conversation_store, conv)
 
     bind = asyncio.create_task(asyncio.to_thread(persist_binding))
 
@@ -8693,14 +8715,17 @@ def set_relay_host_offline_probe(probe: Callable[[str, str], Awaitable[bool]] | 
     _relay_turn_held_for_host = probe
 
 
-async def _host_row_offline(host_store: HostStore | None, host_id: str) -> bool | None:
+async def _host_row_offline(
+    host_store: HostStore | None, host_id: str, *, updated_since: float | None = None
+) -> bool | None:
     """
     Report whether a user-run host's row shows it offline on every replica.
 
     :param host_store: Persistent host registrations, or ``None`` without hosts.
     :param host_id: The host to check.
-    :returns: ``True`` for a stale non-sandbox host; ``False`` when it is live,
-        managed, or missing; ``None`` when its row can't be read.
+    :param updated_since: Optional oldest host observation eligible for recovery.
+    :returns: ``True`` for a stale non-sandbox host within the optional window;
+        ``False`` when live, managed, missing or too old; ``None`` when unreadable.
     """
     if host_store is None:
         return False
@@ -8709,7 +8734,12 @@ async def _host_row_offline(host_store: HostStore | None, host_id: str) -> bool 
     except Exception:  # noqa: BLE001 — an unreadable row proves nothing
         _logger.warning("Host lookup failed for host=%s", host_id, exc_info=True)
         return None
-    return host is not None and host.sandbox_provider is None and not host_is_live(host)
+    return (
+        host is not None
+        and host.sandbox_provider is None
+        and not host_is_live(host)
+        and (updated_since is None or host.updated_at >= updated_since)
+    )
 
 
 class _RelayTransportLost(Exception):
@@ -9646,6 +9676,9 @@ async def _relay_runner_stream_once(
                                     raw_blocked_on
                                     if isinstance(raw_blocked_on, str) and raw_blocked_on
                                     else None
+                                ),
+                                background_agents=_parse_background_tasks(
+                                    event.get("background_agents")
                                 ),
                             )
                         if status == "running":
@@ -14085,12 +14118,22 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    # A claude-native turn waiting on its background agent keeps the collapsed
+    # ``running`` status: released headless ``-p`` clients stop polling on any
+    # other value and would return before the agent's result. The agents ride
+    # alongside, and clients that know the field read the session as waiting.
+    background_agents = (
+        _session_background_agents_cache.get(session_id)
+        if status == "running" and _session_status_cache.get(session_id) == "waiting"
+        else None
+    )
     response = _build_session_response(
         conv,
         items,
         status,
         permission_level,
         side_chat_sealed=await _codex_side_chat_fork_sealed(conv, conv_store),
+        background_agents=background_agents,
         background_task_count=_session_background_task_count_cache.get(session_id),
         background_tasks=_session_background_tasks_cache.get(session_id),
         llm_model=llm_model,

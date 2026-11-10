@@ -1788,6 +1788,69 @@ async def test_relay_completion_idle_clears_only_a_disconnect_failure(
 
 
 @pytest.mark.asyncio
+async def test_relay_forwards_the_background_agents_a_waiting_edge_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Claude turn waiting on its background agent keeps the agents for the stream and snapshot.
+
+    The next edge (here the agent finishing) drops them.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    agent = {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"}
+    edges = [
+        {"type": "session.status", "status": "waiting", "background_agents": [agent, "junk"]},
+        {"type": "session.status", "status": "idle"},
+    ]
+    fake_runner = _ScriptedThenDropRunnerClient(
+        [f"data: {json.dumps(edge)}\n\n" for edge in edges], gate
+    )
+    store = _RecordingLabelStore(live_status="idle")
+    session_id = "a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2"
+    sessions_module._session_status_cache[session_id] = "idle"
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_background_agent",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        gate.set()
+
+        waiting = await collector.next_event()
+        assert waiting["status"] == "waiting"
+        assert waiting["background_agents"] == [{**agent, "command": None}]
+        settled = await collector.next_event()
+        assert settled["status"] == "idle"
+        assert "background_agents" not in settled
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        assert sessions_module._session_background_agents_cache.get(session_id) is None
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_background_agents_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("server_status", ["idle", "failed", "running"])
 @pytest.mark.parametrize("blocked_on", ["terminal prompt", None], ids=["raise", "clear"])
 async def test_relay_applies_an_inferred_reason_only_to_a_running_turn(

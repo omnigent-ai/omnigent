@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iter
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
@@ -69,6 +70,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -5385,28 +5387,32 @@ async def _handle_terminal_turn_boundary_inner(
         params,
         forwarder_state=forwarder_state,
     )
-    if delta_coalescer is not None:
-        await delta_coalescer.flush()
-    # Safety net: if a compaction was reported in progress but Codex never
-    # emitted a completion signal we recognize (e.g. a protocol-spelling
-    # drift), force the spinner closed at the turn boundary so it can't hang.
-    if forwarder_state is not None and forwarder_state.compaction_status_posted == "in_progress":
-        await _post_compaction_status(
-            client, session_id, "completed", forwarder_state=forwarder_state
+    with _turn_status_publication_scope(session_id, terminal.edge, phase="before_status"):
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        # Safety net: if a compaction was reported in progress but Codex never
+        # emitted a completion signal we recognize (e.g. a protocol-spelling
+        # drift), force the spinner closed at the turn boundary so it can't hang.
+        if (
+            forwarder_state is not None
+            and forwarder_state.compaction_status_posted == "in_progress"
+        ):
+            await _post_compaction_status(
+                client, session_id, "completed", forwarder_state=forwarder_state
+            )
+        await _maybe_persist_interrupted_partial_text(
+            client,
+            session_id=session_id,
+            method=method,
+            params=params,
+            forwarder_state=forwarder_state,
         )
-    await _maybe_persist_interrupted_partial_text(
-        client,
-        session_id=session_id,
-        method=method,
-        params=params,
-        forwarder_state=forwarder_state,
-    )
-    await _flush_turn_diff(
-        client,
-        session_id=session_id,
-        params=params,
-        forwarder_state=forwarder_state,
-    )
+        await _flush_turn_diff(
+            client,
+            session_id=session_id,
+            params=params,
+            forwarder_state=forwarder_state,
+        )
     terminal_turn_id = _terminal_turn_id_from_params(params)
     if forwarder_state is not None and terminal_turn_id is not None:
         forwarder_state.forget_user_message_copies(terminal_turn_id)
@@ -9004,16 +9010,49 @@ async def _post_turn_status_edge(
             output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
         elif output == _CODEX_OUTPUT_LIMIT_ERROR:
             output = f"{output}\n\n{_CODEX_OUTPUT_LIMIT_HINT}"
-    await _post_status(
-        client,
-        session_id,
-        edge.status,
-        response_id=response_id,
-        output=output,
-        reauth_required=reauth_required,
-        compaction_model=edge.compaction_model,
-        selected_model=edge.selected_model,
-    )
+    with _turn_status_publication_scope(session_id, edge, phase="status_post"):
+        await _post_status(
+            client,
+            session_id,
+            edge.status,
+            response_id=response_id,
+            output=output,
+            reauth_required=reauth_required,
+            compaction_model=edge.compaction_model,
+            selected_model=edge.selected_model,
+        )
+
+
+@contextlib.contextmanager
+def _turn_status_publication_scope(
+    session_id: str,
+    edge: _CodexTurnStatusEdge | None,
+    *,
+    phase: Literal["before_status", "status_post"],
+) -> Iterator[None]:
+    """Record exceptions before or during a derived turn status publication."""
+    try:
+        yield
+    except Exception as exc:
+        if edge is not None:
+            _logger.warning(
+                "Codex turn status publication failed: status=%s phase=%s",
+                edge.status,
+                phase,
+                extra=debug_event(
+                    "codex_turn_status_publication_failed",
+                    session_id=session_id,
+                    turn_id=edge.turn_id,
+                    intended_status=edge.status,
+                    protocol_source=edge.source[:128],
+                    delivery_phase=phase,
+                    exception_type=type(exc).__name__,
+                    exception_cause_type=(
+                        type(exc.__cause__).__name__ if exc.__cause__ is not None else None
+                    ),
+                ),
+            )
+        raise
 
 
 async def _post_external_elicitation_resolved(
@@ -9883,41 +9922,71 @@ async def _post_session_event(
     :returns: The final HTTP response, or ``None`` (see
         :func:`_post_session_event_inner`).
     """
-    result = await _post_session_event_inner(
-        client,
-        session_id,
-        event_type=event_type,
-        data=data,
-        max_attempts=max_attempts,
-        timeout=timeout,
-    )
+    try:
+        result = await _post_session_event_inner(
+            client,
+            session_id,
+            event_type=event_type,
+            data=data,
+            max_attempts=max_attempts,
+            timeout=timeout,
+        )
+    except DatabricksAuthError as exc:
+        # An earlier retry may have reached the server before credentials failed.
+        if event_type in _DEAD_LETTER_EVENT_TYPES:
+            _record_failed_session_event(
+                session_id,
+                event_type=event_type,
+                data=data,
+                result=_PostResult(
+                    response=None,
+                    delivered_ambiguous=True,
+                    transport_error=type(exc).__name__,
+                ),
+                reason="credential resolution failed before acknowledgement",
+            )
+        raise
     response = result.response
     if response is not None and response.status_code < 400:
         _note_forward_success()
     else:
-        _note_forward_failure(event_type, result, session_id)
-        dl_dir = _dead_letter_dir.get()
-        if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
-            http_status = response.status_code if response is not None else None
-            if result.rejection_reason is not None:
-                reason = result.rejection_reason
-            elif response is not None:
-                reason = f"http {response.status_code}"
-            elif result.delivered_ambiguous:
-                reason = "ambiguous transport failure (may already be committed)"
-            else:
-                reason = "proven-undelivered transport failure after retries"
-            append_dead_letter(
-                dl_dir,
-                session_id=session_id,
-                event_type=event_type,
-                payload=data,
-                reason=reason,
-                delivered_ambiguous=result.delivered_ambiguous,
-                http_status=http_status,
-                transport_error=result.transport_error,
-            )
+        _record_failed_session_event(session_id, event_type=event_type, data=data, result=result)
     return response
+
+
+def _record_failed_session_event(
+    session_id: str,
+    *,
+    event_type: str,
+    data: _JsonObject,
+    result: _PostResult,
+    reason: str | None = None,
+) -> None:
+    """Track failed mirroring and retain durable payloads for conservative replay."""
+    _note_forward_failure(event_type, result, session_id)
+    dl_dir = _dead_letter_dir.get()
+    if event_type not in _DEAD_LETTER_EVENT_TYPES or dl_dir is None:
+        return
+    response = result.response
+    if reason is None:
+        if result.rejection_reason is not None:
+            reason = result.rejection_reason
+        elif response is not None:
+            reason = f"http {response.status_code}"
+        elif result.delivered_ambiguous:
+            reason = "ambiguous transport failure (may already be committed)"
+        else:
+            reason = "proven-undelivered transport failure after retries"
+    append_dead_letter(
+        dl_dir,
+        session_id=session_id,
+        event_type=event_type,
+        payload=data,
+        reason=reason,
+        delivered_ambiguous=result.delivered_ambiguous,
+        http_status=response.status_code if response is not None else None,
+        transport_error=result.transport_error,
+    )
 
 
 async def _post_session_event_inner(

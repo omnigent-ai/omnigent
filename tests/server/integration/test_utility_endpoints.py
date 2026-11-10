@@ -115,6 +115,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_worktrees"] is True
     # Gates the palette's grouped session search; older servers omit it.
     assert data["session_search_scope"] is True
+    # Lets sys_session_list scope archive-inclusive listings server-side.
+    assert data["session_list_scoped_archives"] is True
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["scheduled_task_subhour"] is True

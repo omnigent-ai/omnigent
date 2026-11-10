@@ -102,7 +102,7 @@ import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
-import type { PendingInput, SessionStatus } from "@/lib/types";
+import type { BackgroundTaskInfo, PendingInput, SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
   type TranscriptScrollbarDragDetail,
@@ -489,6 +489,30 @@ export function isBackgroundTasksOnly(
 }
 
 /**
+ * Waiting only on background agents a FINISHED claude-native turn left running.
+ * The turn is over, so this replaces the shimmer; a dialog or a new local send
+ * wins.
+ */
+export function isBackgroundAgentsOnly(
+  sessionStatus: SessionStatus,
+  agents: readonly BackgroundTaskInfo[],
+  blockedOn: string | null,
+  localSending: boolean,
+): boolean {
+  return sessionStatus === "waiting" && agents.length > 0 && !blockedOn && !localSending;
+}
+
+/**
+ * What the session still waits on, e.g. "Background agent running: Audit the
+ * auth flow", or "2 background agents running" when there are several.
+ */
+export function backgroundAgentsLabel(agents: readonly BackgroundTaskInfo[]): string {
+  if (agents.length !== 1) return `${agents.length} background agents running`;
+  const description = agents[0]?.description?.trim();
+  return description ? `Background agent running: ${description}` : "Background agent running";
+}
+
+/**
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
  * a local send in flight.
  */
@@ -545,6 +569,9 @@ export function WorkingIndicator() {
   const scopedConversationId = useContext(ConversationScopeContext);
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
+  const rootBackgroundAgents = useChatStore((s) => s.backgroundAgents);
+  const rootSessionStatus = useChatStore((s) => s.sessionStatus);
+  const rootLocalSending = useChatStore((s) => s.status === "streaming");
   const rootBlockedOn = useChatStore((s) => s.blockedOn);
   const rootHasOwnPendingElicitation = useChatStore((s) =>
     hasPendingOwnElicitation(s.blocks, s.conversationId),
@@ -560,6 +587,35 @@ export function WorkingIndicator() {
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
   const tick = useWorkingLabelTick();
+  const backgroundAgents = scopedConversationId
+    ? scopedState.backgroundAgents
+    : rootBackgroundAgents;
+  const waitsOnBackgroundAgents = isBackgroundAgentsOnly(
+    scopedConversationId ? scopedState.sessionStatus : rootSessionStatus,
+    backgroundAgents,
+    blockedOn,
+    scopedConversationId ? scopedState.status === "streaming" : rootLocalSending,
+  );
+  if (waitsOnBackgroundAgents) {
+    // The turn ended and the composer is free, but the session isn't idle:
+    // name the agent it still waits on rather than shimmering "Working…".
+    const label = backgroundAgentsLabel(backgroundAgents);
+    return (
+      <>
+        <span role="status" aria-live="polite" className="sr-only">
+          {label}
+        </span>
+        <Message from="assistant" data-testid="background-agents-indicator" aria-hidden="true">
+          <MessageContent>
+            <div className="flex min-w-0 items-center gap-1.5 py-0.5 text-muted-foreground">
+              <RunningDot className="size-3.5 shrink-0" />
+              <span className="truncate text-sm font-mono">{label}</span>
+            </div>
+          </MessageContent>
+        </Message>
+      </>
+    );
+  }
   // Background shells outliving a finished turn keep the session in progress,
   // but the agent isn't thinking: show a plain spinner instead of the shimmer.
   // The main composer's pill announces the count; side chats have no pill.

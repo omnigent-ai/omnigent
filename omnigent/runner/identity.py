@@ -57,6 +57,9 @@ RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR = (
 # JSON-encoded ordered shell inventory discovered by the host daemon. The
 # runner uses this exact snapshot for native wrapper terminal declarations.
 RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"
+# Comma-separated names of the variables the launching CLI forwarded to this
+# runner, so env filters further down admit them to harness processes.
+RUNNER_SESSION_ENV_NAMES_ENV_VAR = "OMNIGENT_RUNNER_SESSION_ENV_NAMES"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,
