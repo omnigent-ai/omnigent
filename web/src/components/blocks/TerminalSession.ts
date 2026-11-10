@@ -141,13 +141,23 @@ export function openTerminalLink(
     const target = withBasePath(sameOriginSessionPath);
     const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     if (target !== currentPath) {
-      window.history.pushState(null, "", target);
+      window.history.pushState(nextRouterHistoryState(), "", target);
       window.dispatchEvent(new PopStateEvent("popstate", { state: window.history.state }));
     }
     return;
   }
   if (!parseHttpUrl(uri)) return;
   window.open(uri, "_blank", "noopener,noreferrer");
+}
+
+/**
+ * A history entry in React Router's format, one past the current one, so the router
+ * (and Back's first-entry boundary) still know where this entry sits.
+ */
+function nextRouterHistoryState(): { usr: null; key: string; idx: number } | null {
+  const index = (window.history.state as { idx?: unknown } | null)?.idx;
+  if (typeof index !== "number") return null;
+  return { usr: null, key: Math.random().toString(36).slice(2, 10), idx: index + 1 };
 }
 
 function sameOriginSessionLink(uri: string): string | null {

@@ -13,6 +13,22 @@ PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
     },
     "codex-native": {
         "default": [],
+        "ask-for-approval": [
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "on-request",
+            "-c",
+            'approvals_reviewer="user"',
+        ],
+        "approve-for-me": [
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "on-request",
+            "-c",
+            'approvals_reviewer="auto_review"',
+        ],
         "full-access": ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
         "read-only": ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
         "bypass": [],
@@ -32,3 +48,21 @@ PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
         "dangerous": ["--permission-mode", "dangerous"],
     },
 }
+
+# Shared by every rejection of an automation's permission_mode.
+AGENT_DEFAULT_PERMISSION_MODE_HINT = "JSON null (not the string 'null') for the agent default"
+
+# Modes that skip the approval prompt (``dontAsk`` denies instead, by rules the server
+# cannot see). An automation runs in one only when the task itself selects it, never
+# through an agent default or a reused session's live mode.
+APPROVAL_SKIPPING_PERMISSION_MODES: frozenset[str] = frozenset(
+    {
+        "bypassPermissions",  # claude-native, claude-sdk, acp
+        "dontAsk",  # claude-native
+        "full-access",  # codex-native
+        "bypass",  # codex-native
+        "yolo",  # cursor-native
+        "skip",  # antigravity-native
+        "dangerous",  # devin-native
+    }
+)

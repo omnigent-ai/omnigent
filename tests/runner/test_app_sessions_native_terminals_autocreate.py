@@ -400,6 +400,8 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     import omnigent.harnesses.pi_native.main as pi_native
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_PI_ENV_UNSET", "SYNTH_EXCLUDED")
+    monkeypatch.setenv("SYNTH_EXCLUDED", "sentinel-excluded")
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
     monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
 
@@ -415,15 +417,17 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     monkeypatch.setattr(
         pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: provider
     )
-    # Avoid touching the real Pi settings/models writer; the launch env is not
-    # under test here — the credential-warning surfacing is.
-    monkeypatch.setattr(
-        pi_native_credentials,
-        "pi_native_provider_launch",
-        lambda _agent_dir, _provider, _effort=None, **_kwargs: (
-            pi_native_credentials.PiNativeLaunch(env={}, args=[])
-        ),
-    )
+    # Avoid touching the real Pi settings/models writer; record the env it is
+    # given to provision the agent dir.
+    provision_envs: list[dict[str, str]] = []
+
+    def _fake_provider_launch(
+        _agent_dir: Path, _provider: Any, _effort: str | None = None, **kwargs: Any
+    ) -> Any:
+        provision_envs.append(kwargs["pi_env"])
+        return pi_native_credentials.PiNativeLaunch(env={}, args=[])
+
+    monkeypatch.setattr(pi_native_credentials, "pi_native_provider_launch", _fake_provider_launch)
 
     async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
         return _PiNativeLaunchConfig(
@@ -474,6 +478,11 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     assert data["item_type"] == "error"
     assert data["item_data"]["code"] == "pi_credentials_unresolved"
     assert "databricks auth login" in data["item_data"]["message"]
+    # The agent dir is provisioned against the env the Pi terminal will get.
+    [provision_env] = provision_envs
+    assert "SYNTH_EXCLUDED" not in provision_env
+    assert pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR in provision_env
+    assert provision_env["RUNNER_SERVER_URL"] == "http://127.0.0.1:8000"
 
 
 @pytest.mark.asyncio
@@ -2495,6 +2504,60 @@ async def test_auto_create_claude_terminal_inherits_agent_sandbox(
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_subscription_ignores_inherited_api_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured subscription reaches the hosted terminal without ambient API auth."""
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    (config_home / "config.yaml").write_text(
+        "providers:\n  claude:\n    kind: subscription\n    cli: claude\n    default: true\n"
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    for name in (
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_GATEWAY",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.setenv(name, "synthetic-inherited-credential")
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridge")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
+    )
+    captured: dict[str, Any] = {}
+    model = "claude-sonnet-4-6"
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude",
+        executor=ExecutorSpec(model=model, config={"harness": "claude-native"}),
+    )
+
+    await _auto_create_claude_terminal(
+        "conv_subscription_credentials",
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),
+        agent_spec=agent_spec,
+        auth_token_factory=lambda: None,
+    )
+
+    spec = captured["spec"]
+    assert {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"} <= set(spec.env_unset)
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in spec.env_unset
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in spec.env
+    assert "apiKeyHelper" not in _load_claude_invocation_settings(spec.args)
+    assert "ANTHROPIC_CUSTOM_MODEL_OPTION" not in spec.env
+    assert spec.args[spec.args.index("--model") + 1] == model
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2530,6 +2593,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         "auth:\n  type: databricks\n  profile: test-profile\n"
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.delenv("API_TIMEOUT_MS", raising=False)
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
@@ -2588,6 +2652,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_ENV_FILE": claude_tool_env_file(),
+        "API_TIMEOUT_MS": "120000",
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     assert spec.command == "claude"

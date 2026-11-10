@@ -1,10 +1,29 @@
 import userEvent from "@testing-library/user-event";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
+import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import type { AnyBlock } from "@/lib/blocks";
 import { setEmbedRoot } from "@/lib/host";
+import { useChatStore } from "@/store/chatStore";
 import { MermaidPreview } from "@/shell/MermaidPreview";
 import { Reasoning, ReasoningContent } from "./reasoning";
-import { Message, MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
+import {
+  hasOpenCodeFence,
+  Message,
+  MessageAction,
+  MessageActions,
+  MessageContent,
+  MessageResponse,
+} from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -283,6 +302,158 @@ describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
   );
 });
 
+describe("a streaming Mermaid fence", () => {
+  const open = "Flow:\n\n```mermaid\nflowchart LR\n  Alpha --> Beta\n";
+  const closed = `${open}\`\`\`\n\nDone.`;
+  const originalGetBBox = Object.getOwnPropertyDescriptor(SVGElement.prototype, "getBBox");
+
+  beforeEach(() => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    // jsdom has no SVG layout; keep the real Mermaid renderer and supply its measurements.
+    Object.defineProperty(SVGElement.prototype, "getBBox", {
+      configurable: true,
+      value: () => ({ x: 0, y: 0, width: 100, height: 40 }),
+    });
+  });
+
+  afterEach(() => {
+    if (originalGetBBox) Object.defineProperty(SVGElement.prototype, "getBBox", originalGetBBox);
+    else delete (SVGElement.prototype as { getBBox?: unknown }).getBBox;
+  });
+
+  it("shows its source until the fence closes and the diagram has drawn", async () => {
+    const { container, rerender } = render(<MessageResponse isStreaming>{open}</MessageResponse>);
+    const source = () => container.querySelector('[data-streamdown="code-block"]');
+    expect(source()).toHaveTextContent("Alpha --> Beta");
+    expect(container.querySelector(".chat-mermaid")).toBeNull();
+
+    rerender(<MessageResponse isStreaming>{closed}</MessageResponse>);
+    expect(source()).toHaveTextContent("Alpha --> Beta");
+    expect(container.querySelector(".chat-mermaid")).toHaveClass("invisible");
+
+    await waitFor(() => expect(source()).toBeNull(), { timeout: 10_000 });
+    expect(container.querySelector('svg[id^="mermaid-"]')).toHaveTextContent("Alpha");
+    expect(container.querySelector(".chat-mermaid")).not.toHaveClass("invisible");
+  }, 15_000);
+
+  it("shows its source when the fence's language arrives after the fence opens", () => {
+    const { container, rerender } = render(
+      <MessageResponse isStreaming>{"Flow:\n\n```mer"}</MessageResponse>,
+    );
+    rerender(<MessageResponse isStreaming>{open}</MessageResponse>);
+
+    expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent(
+      "Alpha --> Beta",
+    );
+    expect(container.querySelector(".chat-mermaid")).toBeNull();
+  });
+
+  it("shows the source of a fence that arrives closed until the diagram has drawn", async () => {
+    const { container } = render(<MessageResponse isStreaming>{closed}</MessageResponse>);
+    const source = () => container.querySelector('[data-streamdown="code-block"]');
+    expect(source()).toHaveTextContent("Alpha --> Beta");
+    expect(container.querySelector(".chat-mermaid")).toHaveClass("invisible");
+
+    await waitFor(() => expect(source()).toBeNull(), { timeout: 10_000 });
+    expect(container.querySelector('svg[id^="mermaid-"]')).toHaveTextContent("Alpha");
+  }, 15_000);
+
+  it("draws an unclosed fence once the text stops streaming", async () => {
+    const { container, rerender } = render(<MessageResponse isStreaming>{open}</MessageResponse>);
+    rerender(<MessageResponse>{open}</MessageResponse>);
+
+    await waitFor(
+      () => expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull(),
+      {
+        timeout: 10_000,
+      },
+    );
+    expect(container.querySelector('svg[id^="mermaid-"]')).toHaveTextContent("Alpha");
+  }, 15_000);
+
+  it("replaces the source of a streamed fence that can't draw with the error card", async () => {
+    const invalid = "```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: once; twice\n";
+    const { container, rerender } = render(
+      <MessageResponse isStreaming>{invalid}</MessageResponse>,
+    );
+    rerender(<MessageResponse isStreaming>{`${invalid}    A=>B: again\n\`\`\``}</MessageResponse>);
+
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    await waitFor(() =>
+      expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull(),
+    );
+    expect(card).toBeVisible();
+    expect(container.querySelector(".chat-mermaid")).not.toHaveClass("invisible");
+  }, 15_000);
+
+  it("draws a fence that never streamed without showing its source", () => {
+    const { container } = render(<MessageResponse>{closed}</MessageResponse>);
+
+    expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull();
+    expect(container.querySelector(".chat-mermaid")).not.toHaveClass("invisible");
+  });
+
+  it.each([
+    ["an open fence", "```mermaid\nA", true],
+    ["a closed fence", "```mermaid\nA\n```", false],
+    ["a shorter closer", "````\nA\n```", true],
+    ["a longer closer", "```\nA\n````", false],
+    ["a closer of the other character", "~~~\nA\n```", true],
+    ["a fence-like line with text after it", "```mermaid\nA\n```not-a-closer", true],
+    ["a closer with trailing spaces", "```\nA\n```  \r", false],
+    ["a fence indented four spaces", "    ```\nA", false],
+    ["a tab-indented fence-like line inside a fence", "```mermaid\nA\n\t```", true],
+    ["prose", "No code here.", false],
+  ])("hasOpenCodeFence: %s", (_case, text, isOpen) => {
+    expect(hasOpenCodeFence(text)).toBe(isOpen);
+  });
+});
+
+it("leaves Escape to the fullscreen diagram while a question waits", async () => {
+  vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+  const originalGetBBox = Object.getOwnPropertyDescriptor(SVGElement.prototype, "getBBox");
+  Object.defineProperty(SVGElement.prototype, "getBBox", {
+    configurable: true,
+    value: () => ({ x: 0, y: 0, width: 100, height: 40 }),
+  });
+  const onReject = vi.fn();
+  try {
+    render(
+      <>
+        <MessageResponse>{"```mermaid\nflowchart LR\n  Alpha --> Beta\n```"}</MessageResponse>
+        <AskUserQuestionForm
+          elicitationId="elic_pick"
+          questions={[
+            { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+          ]}
+          onSubmit={vi.fn()}
+          onReject={onReject}
+          keyboardActive
+        />
+      </>,
+    );
+    await waitFor(() => expect(document.querySelector('svg[id^="mermaid-"]')).not.toBeNull(), {
+      timeout: 10_000,
+    });
+    fireEvent.click(screen.getByTitle("View fullscreen"));
+    expect(screen.getByTitle("Exit fullscreen")).toBeInTheDocument();
+    // Focus stays on the page, outside the overlay.
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+
+    // Also when focus was tabbed back into the question behind the overlay.
+    fireEvent.click(screen.getByTitle("View fullscreen"));
+    const custom = screen.getByTestId("ask-user-question-custom-input");
+    custom.focus();
+    fireEvent.keyDown(custom, { key: "Escape" });
+    expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+    expect(onReject).not.toHaveBeenCalled();
+  } finally {
+    if (originalGetBBox) Object.defineProperty(SVGElement.prototype, "getBBox", originalGetBBox);
+    else delete (SVGElement.prototype as { getBBox?: unknown }).getBBox;
+  }
+}, 15_000);
+
 it("preserves ordinary code fences in reasoning", () => {
   const { container } = render(
     <Reasoning open>
@@ -320,6 +491,26 @@ describe("MessageResponse table fullscreen", () => {
     expect(screen.getByRole("dialog", { name: "View fullscreen" })).toBeInTheDocument();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "View fullscreen" })).toBeNull();
+  });
+
+  it("closes the fullscreen table with Escape without declining a pending approval", async () => {
+    const { submitApproval } = useChatStore.getState();
+    const submit = vi.fn();
+    useChatStore.setState({
+      blocks: [{ type: "elicitation", elicitationId: "elic_1", status: "pending" }] as AnyBlock[],
+      submitApproval: submit,
+    });
+    try {
+      renderHook(() => useApproveHotkey());
+      render(<MessageResponse>{tableMarkdown}</MessageResponse>);
+      // Opening fullscreen leaves focus on the page, outside the overlay.
+      fireEvent.click(await screen.findByRole("button", { name: "View fullscreen" }));
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      expect(screen.queryByRole("dialog", { name: "View fullscreen" })).toBeNull();
+      expect(submit).not.toHaveBeenCalled();
+    } finally {
+      useChatStore.setState({ blocks: [], submitApproval });
+    }
   });
 });
 
