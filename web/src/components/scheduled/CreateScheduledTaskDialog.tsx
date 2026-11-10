@@ -52,6 +52,7 @@ import {
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ComposerHarnessTrigger } from "@/components/composer/ComposerControls";
+import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
 import {
   TriggerWorkerHarnessField,
@@ -329,6 +330,8 @@ export function CreateScheduledTaskDialog({
   // Radix reports as "interact outside" is absorbed. See `guardDialogDismiss`.
   const selectOpenCountRef = useRef(0);
   const selectClosedAtRef = useRef(0);
+  const nestedMenuOpenCountRef = useRef(0);
+  const nestedMenuClosedAtRef = useRef(0);
   const [workspaceBrowserOpen, setWorkspaceBrowserOpen] = useState(false);
   function handleSelectOpenChange(isOpen: boolean) {
     if (isOpen) {
@@ -337,6 +340,14 @@ export function CreateScheduledTaskDialog({
       selectOpenCountRef.current = Math.max(0, selectOpenCountRef.current - 1);
       selectClosedAtRef.current = Date.now();
     }
+  }
+  function handleNestedMenuOpenChange(isOpen: boolean) {
+    nestedMenuOpenCountRef.current = Math.max(
+      0,
+      nestedMenuOpenCountRef.current + (isOpen ? 1 : -1),
+    );
+    if (!isOpen) nestedMenuClosedAtRef.current = Date.now();
+    handleSelectOpenChange(isOpen);
   }
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   function changeAgentMenuOpen(next: boolean) {
@@ -379,6 +390,8 @@ export function CreateScheduledTaskDialog({
     setEndingMenuOpen(false);
     setWorkspaceMenuOpen(false);
     selectOpenCountRef.current = 0;
+    nestedMenuOpenCountRef.current = 0;
+    nestedMenuClosedAtRef.current = 0;
     selectClosedAtRef.current = 0;
   }
   /** preventDefault the Dialog's outside-dismiss ONLY for the narrow nested-Select
@@ -402,6 +415,21 @@ export function CreateScheduledTaskDialog({
     ) {
       event.preventDefault();
     }
+  }
+  function keepParentPopoverOpenForNestedMenu(event: {
+    target: EventTarget | null;
+    preventDefault: () => void;
+  }) {
+    if (
+      nestedMenuOpenCountRef.current > 0 ||
+      Date.now() - nestedMenuClosedAtRef.current < 150 ||
+      isInsidePopper(event.target)
+    ) {
+      event.preventDefault();
+    }
+  }
+  function keepParentPopoverOpenOnFocus(event: { preventDefault: () => void }) {
+    event.preventDefault();
   }
   // Pinned host/workspace. "" = none: a new task waits for a pick (it starts on
   // the first online host), and an older unpinned task keeps resolving its host
@@ -865,8 +893,10 @@ export function CreateScheduledTaskDialog({
       return;
     }
     if (!recurrenceValid || scheduleUnsupported || unsupportedByScheduler) {
+      setEndingMenuOpen(false);
       setScheduleMenuOpen(true);
     } else if (endingInvalid) {
+      setScheduleMenuOpen(false);
       setEndingMenuOpen(true);
     }
   }, [
@@ -1258,7 +1288,7 @@ export function CreateScheduledTaskDialog({
               onSession={fromSession ? setSourceSnapshot : undefined}
             />
           )}
-          <TooltipProvider>
+          <TooltipProvider skipDelayDuration={0}>
             <ScheduleFields
               timezone={timezone}
               onTimezoneChange={setTimezone}
@@ -1271,7 +1301,7 @@ export function CreateScheduledTaskDialog({
               allowPastEnd={allowPastEnd}
               onChange={setSchedule}
               onRecurrenceSelect={() => setScheduleUnsupported(false)}
-              onSelectOpenChange={handleSelectOpenChange}
+              onSelectOpenChange={handleNestedMenuOpenChange}
               embedded
             >
               {({ recurrenceFields, endingFields }) => (
@@ -1304,6 +1334,7 @@ export function CreateScheduledTaskDialog({
                             <TooltipContent>Trigger type</TooltipContent>
                           </Tooltip>
                           <SelectContent position="popper" align="start">
+                            <PickerSectionHeader>Trigger type</PickerSectionHeader>
                             {AUTOMATION_TRIGGER_TYPES.map((type) => (
                               <SelectItem
                                 key={type}
@@ -1335,10 +1366,14 @@ export function CreateScheduledTaskDialog({
                           </Tooltip>
                           <PopoverContent
                             align="end"
-                            className="menu-surface w-[min(28rem,calc(100vw-2rem))] gap-0 p-0"
-                            onPointerDownOutside={guardDialogDismiss}
-                            onInteractOutside={guardDialogDismiss}
+                            className="menu-surface w-[max(var(--radix-popover-trigger-width),20rem)] max-w-[calc(100vw-2rem)] gap-0 p-0 ring-0"
+                            onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
+                            onFocusOutside={keepParentPopoverOpenOnFocus}
+                            onInteractOutside={keepParentPopoverOpenForNestedMenu}
                           >
+                            <PickerSectionHeader className="px-5 pt-3 pb-2">
+                              Schedule
+                            </PickerSectionHeader>
                             {!triggerMode && recurrenceFields}
                             {triggerMode && !scheduleInvalid && (
                               <p
@@ -1397,7 +1432,7 @@ export function CreateScheduledTaskDialog({
                         source={trigger}
                         fields={triggerFields}
                         onChange={setTriggerFields}
-                        onSelectOpenChange={handleSelectOpenChange}
+                        onSelectOpenChange={handleNestedMenuOpenChange}
                         // Managed sandboxes provide their agents' integration tools.
                         toolsProvided={
                           sandboxMode &&
@@ -1532,6 +1567,7 @@ export function CreateScheduledTaskDialog({
                             <TooltipContent>Run on</TooltipContent>
                           </Tooltip>
                           <SelectContent position="popper" align="end">
+                            <PickerSectionHeader>Run on</PickerSectionHeader>
                             {(managedSandboxesEnabled || sandboxMode) && (
                               <SelectItem
                                 value={SANDBOX_HOST}
@@ -1619,6 +1655,7 @@ export function CreateScheduledTaskDialog({
                               <TooltipContent>Permissions</TooltipContent>
                             </Tooltip>
                             <SelectContent position="popper" align="end">
+                              <PickerSectionHeader>Permissions</PickerSectionHeader>
                               <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
                               {permissionOptions.map((option) => (
                                 <SelectItem key={option.value} value={option.value}>
@@ -1727,10 +1764,14 @@ export function CreateScheduledTaskDialog({
                                 </PopoverTrigger>
                                 <PopoverContent
                                   align="end"
-                                  className="menu-surface w-[min(28rem,calc(100vw-2rem))] gap-0 p-0"
-                                  onPointerDownOutside={guardDialogDismiss}
-                                  onInteractOutside={guardDialogDismiss}
+                                  className="menu-surface w-[max(var(--radix-popover-trigger-width),20rem)] max-w-[calc(100vw-2rem)] gap-0 p-0 ring-0"
+                                  onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
+                                  onFocusOutside={keepParentPopoverOpenOnFocus}
+                                  onInteractOutside={keepParentPopoverOpenForNestedMenu}
                                 >
+                                  <PickerSectionHeader className="px-5 pt-3 pb-2">
+                                    Schedule
+                                  </PickerSectionHeader>
                                   {!triggerMode && recurrenceFields}
                                   {triggerMode && !scheduleInvalid && (
                                     <p
@@ -1795,8 +1836,9 @@ export function CreateScheduledTaskDialog({
                                 <PopoverContent
                                   align="end"
                                   className="menu-surface w-[min(28rem,calc(100vw-2rem))] gap-0 p-0"
-                                  onPointerDownOutside={guardDialogDismiss}
-                                  onInteractOutside={guardDialogDismiss}
+                                  onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
+                                  onFocusOutside={keepParentPopoverOpenOnFocus}
+                                  onInteractOutside={keepParentPopoverOpenForNestedMenu}
                                 >
                                   {endingFields}
                                 </PopoverContent>
@@ -1864,8 +1906,6 @@ export function CreateScheduledTaskDialog({
                                   <PopoverContent
                                     align="end"
                                     className="menu-surface w-[min(26rem,calc(100vw-2rem))] p-3"
-                                    onPointerDownOutside={guardDialogDismiss}
-                                    onInteractOutside={guardDialogDismiss}
                                   >
                                     <Button
                                       type="button"

@@ -369,6 +369,16 @@ function closeTopLevelPopovers() {
   }
 }
 
+function selectSchedulePreset(label: string) {
+  openAutomationSection("Schedule");
+  fireEvent.click(screen.getByRole("radio", { name: label }));
+}
+
+function openTopLevelPopover(testId: string) {
+  const trigger = screen.getByTestId(testId);
+  if (trigger.getAttribute("aria-expanded") === "false") fireEvent.click(trigger);
+}
+
 function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } = {}) {
   const view = renderBase(ui, {
     wrapper: ({ children }) => (
@@ -578,17 +588,19 @@ describe("prompt-first automation setup", () => {
     expect(screen.queryByRole("button", { name: "Context" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Controls" })).not.toBeInTheDocument();
     expect(title).toBeVisible();
-    expect(title).toHaveAttribute("placeholder", "Automation title");
+    expect(title).toHaveAttribute("placeholder", "Name your automation");
     expect(title).toHaveClass("font-heading", "text-[1.25em]");
     expect(screen.queryByLabelText("Name")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Frequency")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Schedule ends")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByTestId("task-schedule-trigger"));
+    const scheduleTrigger = screen.getByTestId("task-schedule-trigger");
+    fireEvent.click(scheduleTrigger);
     expect(screen.getByLabelText("Frequency")).toBeVisible();
     expect(screen.getByLabelText("Time", { exact: true })).toBeVisible();
     expect(screen.getByLabelText("Timezone", { exact: true })).toBeVisible();
-    fireEvent.click(screen.getByTestId("task-schedule-trigger"));
+    await userEvent.click(instructions);
+    await waitFor(() => expect(scheduleTrigger).toHaveAttribute("aria-expanded", "false"));
     fireEvent.click(screen.getByTestId("task-ending-trigger"));
     expect(screen.getByLabelText("Schedule ends")).toBeVisible();
     fireEvent.click(screen.getByTestId("task-ending-trigger"));
@@ -619,7 +631,7 @@ describe("prompt-first automation setup", () => {
     async function expectTooltip(testId: string, label: string) {
       const trigger = screen.getByTestId(testId);
       fireEvent.pointerMove(trigger.parentElement!, { pointerType: "mouse" });
-      expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
+      expect(await screen.findByRole("tooltip", {}, { timeout: 2000 })).toHaveTextContent(label);
       fireEvent.keyDown(trigger, { key: "Escape" });
       await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
     }
@@ -744,7 +756,7 @@ describe("prompt-first automation setup", () => {
     expect(scheduleSection).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     fireEvent.change(screen.getByLabelText("Time"), { target: { value: "10:00" } });
-    expect(scheduleSection).toHaveAttribute("aria-expanded", "true");
+    expect(scheduleSection).toHaveAttribute("aria-expanded", "false");
     expect(endingControl).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByLabelText("End date")).toBeVisible();
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
@@ -756,7 +768,7 @@ describe("prompt-first automation setup", () => {
     expect(screen.getByLabelText("End date")).toBeVisible();
   });
 
-  it("edits time directly and opens only the timezone dropdown", async () => {
+  it("offers scrolling hour and minute choices while keeping direct time entry", async () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
     openAutomationSection("Schedule");
     const timeField = screen.getByLabelText("Time", { exact: true });
@@ -769,14 +781,24 @@ describe("prompt-first automation setup", () => {
     expect(timeField).toHaveClass("text-ui");
     expect(screen.queryByTestId("schedule-time-picker-trigger")).not.toBeInTheDocument();
     await userEvent.click(screen.getByLabelText("Time", { exact: true }));
-    expect(screen.queryByTestId("schedule-time-picker")).not.toBeInTheDocument();
+    const timePicker = screen.getByTestId("schedule-time-picker");
+    const hours = within(timePicker).getByRole("listbox", { name: "Hours" });
+    const minutes = within(timePicker).getByRole("listbox", { name: "Minutes" });
+    expect(within(hours).getByRole("option", { name: "09" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(minutes).getByRole("option", { name: "00" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await userEvent.click(within(hours).getByRole("option", { name: "17" }));
+    await userEvent.click(within(minutes).getByRole("option", { name: "37" }));
+    expect(timeField).toHaveValue("05:37 PM");
     expect(screen.queryByLabelText("Search timezones")).not.toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Time", { exact: true }), {
-      target: { value: "5:37 PM" },
-    });
     await userEvent.click(screen.getByLabelText("Timezone", { exact: true }));
     fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: "Singapore" } });
-    await userEvent.click(await screen.findByRole("option", { name: "Asia/Singapore" }));
+    await userEvent.click(await screen.findByRole("menuitemradio", { name: "Asia/Singapore" }));
     expect(screen.getByLabelText("Time", { exact: true })).toHaveValue("05:37 PM");
     expect(screen.getByLabelText("Timezone", { exact: true })).toHaveTextContent("Asia/Singapore");
     expect(screen.queryByTestId("schedule-time-picker")).not.toBeInTheDocument();
@@ -1188,7 +1210,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     );
     expect(screen.getByTestId("schedule-time")).toHaveValue("05:07 PM");
     await userEvent.click(screen.getByLabelText("Time", { exact: true }));
-    expect(screen.queryByTestId("schedule-time-picker")).not.toBeInTheDocument();
+    expect(screen.getByTestId("schedule-time-picker")).toBeVisible();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=7");
@@ -1275,16 +1297,17 @@ describe("CreateScheduledTaskDialog edit mode", () => {
         />,
       );
       expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
-      expect(screen.getByLabelText("Frequency")).toHaveTextContent("Choose frequency");
+      expect(screen.getByLabelText("Frequency")).toBeVisible();
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      openTopLevelPopover("task-ending-trigger");
       fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
       fireEvent.click(await screen.findByRole("option", { name: "After" }));
       fireEvent.change(screen.getByLabelText("Occurrences"), { target: { value: "3" } });
       expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
       expect(updateMutateAsync).not.toHaveBeenCalled();
-      fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: frequency }));
+      openAutomationSection("Schedule");
+      selectSchedulePreset(frequency);
       if (frequency === "Custom schedule") {
         expect(screen.queryByRole("alert")).not.toBeInTheDocument();
         fireEvent.change(screen.getByLabelText("Repeat every"), { target: { value: "2" } });
@@ -1685,6 +1708,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(screen.getByRole("option", { name: /desktop/ }));
 
     // Omitting the workspace would keep the saved one, so the form keeps showing it.
+    openAutomationSection("Context");
     expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
     expect(screen.getByTestId("task-workspace-browse")).toBeDisabled();
     expect(screen.getByText("Connect your host to select a workspace.")).toBeInTheDocument();
@@ -1747,9 +1771,8 @@ describe("CreateScheduledTaskDialog submit", () => {
     const time = screen.getByLabelText("Time", { exact: true });
     await userEvent.click(time);
     expect(time).toHaveFocus();
-    expect(screen.queryByTestId("schedule-time-picker")).not.toBeInTheDocument();
-    await userEvent.clear(time);
-    await userEvent.type(time, "17:07");
+    expect(screen.getByTestId("schedule-time-picker")).toBeVisible();
+    fireEvent.change(time, { target: { value: "17:07" } });
     fireEvent.blur(time);
     expect(time).toHaveValue("05:07 PM");
 
@@ -1767,14 +1790,13 @@ describe("CreateScheduledTaskDialog submit", () => {
     renderDialog();
     fireEvent.change(screen.getByLabelText("Automation title"), { target: { value: "T" } });
     fireEvent.change(screen.getByLabelText("Instructions"), { target: { value: "P" } });
-    fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Custom schedule" }));
+    selectSchedulePreset("Custom schedule");
     fireEvent.keyDown(screen.getByLabelText("Repeat unit"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: frequency }));
     const time = screen.getByLabelText("Time", { exact: true });
     await userEvent.click(time);
     expect(screen.queryByRole("button", { name: "Apply" })).not.toBeInTheDocument();
-    expect(screen.queryByTestId("schedule-time-picker")).not.toBeInTheDocument();
+    expect(screen.getByTestId("schedule-time-picker")).toBeVisible();
     if (frequency === "Daily") {
       for (const value of ["", "25:99"]) {
         fireEvent.change(time, { target: { value } });
@@ -1839,8 +1861,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
-    fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Every hour" }));
+    selectSchedulePreset("Every hour");
     const minute = screen.getByRole("spinbutton", { name: "Minute of the hour" });
     expect(minute).toHaveValue(0);
     expect(minute).toHaveAttribute("min", "0");
@@ -1873,8 +1894,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     async (preset) => {
       renderDialog();
       fireEvent.change(screen.getByTestId("schedule-time"), { target: { value: "invalid" } });
-      fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: preset }));
+      selectSchedulePreset(preset);
       if (preset === "Custom schedule") {
         fireEvent.keyDown(screen.getByLabelText("Repeat unit"), { key: "Enter" });
         fireEvent.click(await screen.findByRole("option", { name: "Hourly" }));
@@ -1916,13 +1936,12 @@ describe("CreateScheduledTaskDialog submit", () => {
       fireEvent.change(screen.getByLabelText("Search timezones"), {
         target: { value: "Singapore" },
       });
-      await userEvent.click(await screen.findByRole("option", { name: "Asia/Singapore" }));
+      await userEvent.click(await screen.findByRole("menuitemradio", { name: "Asia/Singapore" }));
       expect(screen.queryByLabelText("Search timezones")).not.toBeInTheDocument();
       expect(screen.getByLabelText("Timezone", { exact: true })).toHaveTextContent(
         "Asia/Singapore",
       );
-      fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: "Interval" }));
+      selectSchedulePreset("Interval");
       expect(screen.queryByLabelText("Repeat unit")).not.toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Apply" })).not.toBeInTheDocument();
       const interval = screen.getByLabelText("Repeat every");
@@ -1939,10 +1958,8 @@ describe("CreateScheduledTaskDialog submit", () => {
       expect(interval).not.toHaveAttribute("aria-describedby");
       expect(screen.getByLabelText("Frequency")).toHaveTextContent("Interval");
       expect(screen.getByLabelText("Repeat every")).toHaveValue(minimum + 5);
-      fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: "Every day" }));
-      fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: "Interval" }));
+      selectSchedulePreset("Every day");
+      selectSchedulePreset("Interval");
       expect(screen.getByLabelText("Repeat every")).toHaveValue(minimum + 5);
       expect(screen.queryByTestId("custom-schedule-trigger")).not.toBeInTheDocument();
       expect(screen.queryByLabelText("Timezone", { exact: true })).not.toBeInTheDocument();
@@ -1957,8 +1974,9 @@ describe("CreateScheduledTaskDialog submit", () => {
 
   it("offers recurring presets and a visual custom schedule", async () => {
     renderDialog();
-    fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
-    const options = (await screen.findAllByRole("option")).map((option) => option.textContent);
+    const options = within(screen.getByTestId("schedule-preset-options"))
+      .getAllByRole("radio")
+      .map((option) => option.textContent);
     expect(options).toEqual([
       "Interval",
       "Every hour",
@@ -1967,7 +1985,7 @@ describe("CreateScheduledTaskDialog submit", () => {
       "Every week",
       "Custom schedule",
     ]);
-    fireEvent.click(screen.getByRole("option", { name: "Custom schedule" }));
+    selectSchedulePreset("Custom schedule");
     expect(screen.getByLabelText("Repeat every")).toHaveValue(1);
     fireEvent.keyDown(screen.getByLabelText("Repeat unit"), { key: "Enter" });
     expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual([
@@ -1981,8 +1999,7 @@ describe("CreateScheduledTaskDialog submit", () => {
 
   it("applies custom weekdays, validates intervals and submits the selected timezone and end count", async () => {
     renderDialog();
-    fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Custom schedule" }));
+    selectSchedulePreset("Custom schedule");
     fireEvent.change(screen.getByLabelText("Repeat every"), { target: { value: "0" } });
     expect(screen.getByTestId("schedule-error")).toHaveTextContent("at least 1");
     fireEvent.change(screen.getByLabelText("Repeat every"), { target: { value: "2" } });
@@ -2000,11 +2017,12 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(recurrenceSummary).not.toContain("Select schedule");
     await userEvent.click(screen.getByLabelText("Timezone"));
     fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: "Singapore" } });
-    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(1));
-    await userEvent.click(screen.getByRole("option", { name: "Asia/Singapore" }));
+    await waitFor(() => expect(screen.getAllByRole("menuitemradio")).toHaveLength(1));
+    await userEvent.click(screen.getByRole("menuitemradio", { name: "Asia/Singapore" }));
     await waitFor(() =>
       expect(screen.getByLabelText("Timezone")).toHaveTextContent("Asia/Singapore"),
     );
+    openTopLevelPopover("task-ending-trigger");
     fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "After" }));
     fireEvent.change(screen.getByLabelText("Occurrences"), { target: { value: "1" } });
@@ -2014,10 +2032,14 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(occurrences).toHaveAttribute("aria-invalid", "true");
     expect(occurrences).toHaveAccessibleDescription(endingError.textContent!);
     expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
+    openAutomationSection("Schedule");
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent(recurrenceSummary!);
+    openTopLevelPopover("task-ending-trigger");
     fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "On date" }));
+    openAutomationSection("Schedule");
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent(recurrenceSummary!);
+    openTopLevelPopover("task-ending-trigger");
     fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "After" }));
     fireEvent.change(screen.getByLabelText("Occurrences"), { target: { value: "6" } });
@@ -2037,8 +2059,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     const view = render(
       <CreateScheduledTaskDialog open onOpenChange={onOpenChange} editingTask={task} />,
     );
-    fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Custom schedule" }));
+    selectSchedulePreset("Custom schedule");
     fireEvent.change(screen.getByLabelText("Repeat every"), { target: { value: "3" } });
     expect(screen.getByLabelText("Frequency")).toHaveTextContent("Custom schedule");
     expect(screen.queryByRole("button", { name: "Apply" })).not.toBeInTheDocument();
@@ -2069,11 +2090,9 @@ describe("CreateScheduledTaskDialog submit", () => {
       target: { value: "Updated prompt" },
     });
     expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
-    fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Every hour" }));
+    selectSchedulePreset("Every hour");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Every day" }));
+    selectSchedulePreset("Every day");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
@@ -2100,7 +2119,9 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.getByLabelText("Repeat every")).toHaveValue(2);
     expect(screen.getByLabelText("Month")).toHaveTextContent("June");
     expect(screen.getByLabelText("Timezone")).toHaveTextContent("Asia/Singapore");
+    openTopLevelPopover("task-ending-trigger");
     expect(screen.getByLabelText("Occurrences")).toHaveValue(4);
+    openAutomationSection("Schedule");
     fireEvent.keyDown(screen.getByLabelText("Month"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "July" }));
     for (const label of ["Month", "Repeat unit"]) {
@@ -2141,16 +2162,31 @@ describe("CreateScheduledTaskDialog submit", () => {
           editingTask={scheduledTask({ rrule, timezone: "Asia/Singapore" })}
         />,
       );
+      const minutely = rrule.includes("MINUTELY");
+      if (!minutely) {
+        expect(screen.getByLabelText("Time")).not.toHaveAttribute("aria-invalid");
+        expect(
+          within(screen.getByTestId("schedule-fields")).getByLabelText("Timezone"),
+        ).toHaveTextContent("Asia/Singapore");
+      }
+      openTopLevelPopover("task-ending-trigger");
       fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
       fireEvent.click(await screen.findByRole("option", { name: "On date" }));
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-      const minutely = rrule.includes("MINUTELY");
-      if (!minutely) expect(screen.getByLabelText("Time")).not.toHaveAttribute("aria-invalid");
-      expect(
-        within(
-          screen.getByTestId(minutely ? "schedule-ending-fields" : "schedule-fields"),
-        ).getByLabelText("Timezone"),
-      ).toHaveTextContent("Asia/Singapore");
+      if (minutely) {
+        expect(
+          within(screen.getByTestId("schedule-ending-fields")).getByLabelText("Timezone"),
+        ).toHaveTextContent("Asia/Singapore");
+      }
+      async function chooseTimezone(search: string, option: string) {
+        if (!minutely) openAutomationSection("Schedule");
+        await userEvent.click(screen.getByLabelText("Timezone"));
+        fireEvent.change(screen.getByLabelText("Search timezones"), {
+          target: { value: search },
+        });
+        await userEvent.click(await screen.findByRole("menuitemradio", { name: option }));
+        if (!minutely) openTopLevelPopover("task-ending-trigger");
+      }
       for (const value of ["0002-06-10", "0020-06-10", "0203-06-10"]) {
         fireEvent.change(screen.getByLabelText("End date"), { target: { value } });
         expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
@@ -2159,30 +2195,18 @@ describe("CreateScheduledTaskDialog submit", () => {
         expect(dateField).toHaveAccessibleDescription("Choose an end date in the future.");
         expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
       }
-      await userEvent.click(screen.getByLabelText("Timezone"));
-      fireEvent.change(screen.getByLabelText("Search timezones"), {
-        target: { value: "New_York" },
-      });
-      await userEvent.click(await screen.findByRole("option", { name: "America/New York" }));
+      await chooseTimezone("New_York", "America/New York");
       fireEvent.change(screen.getByLabelText("End date"), { target: { value: "9999-12-31" } });
       expect(screen.getByLabelText("End date")).toHaveValue("9999-12-31");
       expect(screen.getByTestId("schedule-ending-error")).toHaveTextContent(
         "This end date is unavailable in this timezone",
       );
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-      await userEvent.click(screen.getByLabelText("Timezone"));
-      fireEvent.change(screen.getByLabelText("Search timezones"), {
-        target: { value: "Singapore" },
-      });
-      await userEvent.click(await screen.findByRole("option", { name: "Asia/Singapore" }));
+      await chooseTimezone("Singapore", "Asia/Singapore");
       expect(screen.getByLabelText("End date")).toHaveValue("9999-12-31");
       expect(screen.queryByTestId("schedule-ending-error")).not.toBeInTheDocument();
       fireEvent.change(screen.getByLabelText("End date"), { target: { value: "2027-06-10" } });
-      await userEvent.click(screen.getByLabelText("Timezone"));
-      fireEvent.change(screen.getByLabelText("Search timezones"), {
-        target: { value: "New_York" },
-      });
-      await userEvent.click(await screen.findByRole("option", { name: "America/New York" }));
+      await chooseTimezone("New_York", "America/New York");
       expect(screen.getByLabelText("End date")).toHaveValue("2027-06-10");
       expect(screen.getByLabelText("End date")).not.toHaveAttribute("aria-invalid");
       expect(screen.getByLabelText("End date")).not.toHaveAttribute("aria-describedby");
@@ -3249,6 +3273,7 @@ describe("CreateScheduledTaskDialog session mode", () => {
       );
       const submit = screen.getByTestId("create-scheduled-task-submit");
       if (trigger) {
+        openAutomationSection("Schedule");
         expect(screen.queryByTestId("custom-schedule-trigger")).toBeNull();
         expect(screen.queryByTestId("schedule-preset-trigger")).toBeNull();
         if (supported) {
@@ -3258,6 +3283,7 @@ describe("CreateScheduledTaskDialog session mode", () => {
           const editor = screen.getByRole("textbox", { name: "System prompt" });
           fireEvent.change(editor, { target: { value: "Custom polling instructions." } });
           expect(screen.queryByTestId("schedule-preset-trigger")).toBeNull();
+          openAutomationSection("Schedule");
           expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent("Every 10 minutes");
         } else {
           expect(submit).toBeDisabled();
@@ -3289,8 +3315,7 @@ describe("CreateScheduledTaskDialog session mode", () => {
         fireEvent.click(submit);
         expect(updateMutateAsync).not.toHaveBeenCalled();
       }
-      fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: "Custom schedule" }));
+      selectSchedulePreset("Custom schedule");
       fireEvent.keyDown(screen.getByTestId("custom-freq-trigger"), { key: "Enter" });
       const minutes = await screen.findByRole("option", { name: "Minutely" });
       expect(minutes).not.toHaveAttribute("aria-disabled", "true");
@@ -3314,8 +3339,7 @@ describe("CreateScheduledTaskDialog session mode", () => {
         features: { automations_v2: true },
         scheduled_task_subhour: supported,
       });
-      fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: "Custom schedule" }));
+      selectSchedulePreset("Custom schedule");
       fireEvent.keyDown(screen.getByTestId("custom-freq-trigger"), { key: "Enter" });
       await screen.findByRole("option", { name: "Hourly" });
       expect(screen.queryByRole("option", { name: "Minutely" }) !== null).toBe(supported);
@@ -3346,8 +3370,13 @@ describe("automation trigger type", () => {
   }
 
   async function choose(label: string, testId = "task-trigger-type") {
+    if (testId === "schedule-preset-trigger") {
+      selectSchedulePreset(label);
+      return;
+    }
     fireEvent.keyDown(screen.getByTestId(testId), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: label }));
+    if (testId === "task-trigger-type") openAutomationSection("Schedule");
   }
 
   function type(testId: string, value: string) {
@@ -3390,7 +3419,9 @@ describe("automation trigger type", () => {
     async function chooseTimezone(zone: string) {
       await userEvent.click(screen.getByLabelText("Timezone", { exact: true }));
       fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: zone } });
-      await userEvent.click(await screen.findByRole("option", { name: zone.replaceAll("_", " ") }));
+      await userEvent.click(
+        await screen.findByRole("menuitemradio", { name: zone.replaceAll("_", " ") }),
+      );
     }
 
     render(dialog());
@@ -4616,14 +4647,13 @@ describe("scheduler capabilities", () => {
           <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
         </CapabilitiesProvider>,
       );
-      fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-      expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual([
-        "Every hour",
-        "Every day",
-        "Every weekday",
-        "Every week",
-      ]);
-      fireEvent.click(screen.getByRole("option", { name: "Every hour" }));
+      expect(
+        within(screen.getByLabelText("Frequency"))
+          .getAllByRole("radio")
+          .map((option) => option.textContent),
+      ).toEqual(["Every hour", "Every day", "Every weekday", "Every week"]);
+      selectSchedulePreset("Every hour");
+      openTopLevelPopover("task-ending-trigger");
       fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
       expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual([
         "Never",
@@ -4673,13 +4703,11 @@ describe("scheduler capabilities", () => {
       expect(updateMutateAsync).not.toHaveBeenCalled();
       for (const [index, kind] of replacements.entries()) {
         if (kind === "custom") {
-          fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
-          expect(screen.getByRole("option", { name: "Custom schedule" })).toHaveAttribute(
-            "aria-disabled",
-            "true",
-          );
-          fireEvent.click(screen.getByRole("option", { name: "Every day" }));
+          openAutomationSection("Schedule");
+          expect(screen.getByRole("radio", { name: "Custom schedule" })).toBeDisabled();
+          selectSchedulePreset("Every day");
         } else {
+          openTopLevelPopover("task-ending-trigger");
           expect(screen.getByLabelText("Occurrences")).toHaveValue(3);
           expect(screen.getByLabelText("Occurrences")).toBeDisabled();
           fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
@@ -5325,11 +5353,13 @@ describe("automation random worktree", () => {
         fireEvent.click(screen.getByTestId("task-workspace-browse"));
         fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
       }
+      openAutomationSection("Context");
       expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
       if (transition === "host-roundtrip" || transition === "sandbox-roundtrip") {
         if (transition === "sandbox-roundtrip") gitWorkspace.available = true;
         fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
         fireEvent.click(screen.getByRole("option", { name: "laptop" }));
+        openAutomationSection("Context");
         if (transition === "sandbox-roundtrip") {
           expect(screen.getByRole("checkbox", { name: "Random worktree" })).toBeChecked();
         } else {
@@ -5409,6 +5439,7 @@ describe("automation random worktree", () => {
         })}
       />,
     );
+    openAutomationSection("Context");
     expect(screen.getByText(`Random worktree is enabled. ${message}`)).toBeInTheDocument();
     expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Turn off random worktree" }));
@@ -5453,10 +5484,12 @@ describe("automation random worktree", () => {
       />
     );
     const { rerender } = render(dialog());
+    openAutomationSection("Context");
     expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
     expect(screen.queryByText(/Creates a fresh randomly named worktree/)).not.toBeInTheDocument();
     gitWorkspace.available = true;
     rerender(dialog());
+    openAutomationSection("Context");
     const checkbox = screen.getByRole("checkbox", { name: "Random worktree" });
     expect(checkbox).toBeEnabled();
     expect(checkbox).toHaveAttribute("aria-checked", baseBranch === null ? "false" : "true");
@@ -5482,6 +5515,7 @@ describe("automation random worktree", () => {
         })}
       />,
     );
+    openAutomationSection("Context");
     const checkbox = screen.getByRole("checkbox", { name: "Random worktree" });
     expect(checkbox).toHaveAttribute("aria-checked", baseBranch === null ? "false" : "true");
     if (bound) expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
