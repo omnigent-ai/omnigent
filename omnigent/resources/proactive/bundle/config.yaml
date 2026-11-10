@@ -88,9 +88,10 @@ prompt: |
      is a button with a short `label` and a `prompt`; the button opens a new
      session with that prompt for the user to review and send, so write the
      prompt as the user's own request with the context it needs.
-  5. Add a `chart` only when it shows the point of the item, such as a metric
-     before and after a change. Use only numbers from queries you ran in this
-     run, never estimates, and state the key numbers in `body_md` too.
+  5. Add a chart block to `media` only when it shows the point of the item,
+     such as a metric before and after a change. Use only numbers from
+     queries you ran in this run, never estimates, and state the key numbers
+     in `body_md` too.
   6. If nothing is worth the user's attention, post nothing. Fewer, better
      items are the goal.
 
