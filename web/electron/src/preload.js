@@ -425,6 +425,20 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /** Enable native Ctrl+Tab forwarding only while this renderer supports it. */
   browserSetRecentSessionSwitchSupported: (supported) =>
     ipcRenderer.invoke("omnigent:browser-set-recent-session-switch-supported", { supported }),
+  /**
+   * Subscribe to page links Cmd/Ctrl- or middle-clicked in an embedded browser
+   * view (`{conversationId, url}`, where conversationId is the clicked view's id).
+   * @param {(payload: { conversationId: string, url: string }) => void} callback
+   * @returns {() => void}
+   */
+  onBrowserOpenTab: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("browser-open-tab", listener);
+    return () => ipcRenderer.removeListener("browser-open-tab", listener);
+  },
+  /** Route modifier-clicked page links to `onBrowserOpenTab` while supported. */
+  browserSetOpenTabSupported: (supported) =>
+    ipcRenderer.invoke("omnigent:browser-set-open-tab-supported", { supported }),
   /** Clear the native Ctrl+Tab latch when the renderer has no sessions to show. */
   browserCancelRecentSessionSwitch: () =>
     ipcRenderer.invoke("omnigent:browser-cancel-recent-session-switch"),

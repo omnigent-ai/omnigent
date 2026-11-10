@@ -70,7 +70,7 @@ from omnigent.models.codex_model_vocabulary import (
     EXTENDED_MODEL_EFFORTS,
     EXTENDED_MODEL_INPUT_MODALITIES,
 )
-from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
+from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.repo_scope import repo_scope_dirs
@@ -5288,28 +5288,20 @@ class CodexExecutor(Executor):
         session_key = _session_key(messages)
         state = self._session_states.setdefault(session_key, _CodexSessionState())
         # cfg.model (per-request /model override) wins over the spec default.
-        # An unresolved default comes from the active provider catalog.
-        # On the cli-config path (model_provider_override set) the codex binary
-        # owns its own model list via its config.toml — omnigent does not pass a
-        # model override to thread/create, letting the binary use its configured
-        # default. Passing an unresolvable alias (e.g. gpt-5.6) would cause the
-        # binary to call UC and get a validation error.
+        # On the cli-config path (model_provider_override set) and on codex's
+        # own login (ChatGPT account / API key), codex owns its model list, so
+        # an unset model reaches thread/start as null and codex starts on its
+        # own configured or catalog default.
         model = cfg.model or self._model_override
         if self._model_provider_override is not None:
             model = None
-        elif model is None:
-            if self._gateway_uses_databricks_profile:
-                resolution = await run_sync_on_thread(
-                    model_catalog.resolve_catalog_model,
-                    "databricks",
-                    family="openai",
-                )
-                model = resolution.model_id
-            else:
-                # Codex's own login (ChatGPT account / API key), where codex is
-                # the vocabulary authority: the bundled OpenAI catalog's newest
-                # row is a bare family alias its backend rejects.
-                model = CODEX_DEFAULT_MODEL
+        elif model is None and self._gateway_uses_databricks_profile:
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "databricks",
+                family="openai",
+            )
+            model = resolution.model_id
         effective_cwd = (
             self._cwd or (self._os_env_spec.cwd if self._os_env_spec else None) or os.getcwd()
         )
