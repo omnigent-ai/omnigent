@@ -504,8 +504,9 @@ export function CreateScheduledTaskDialog({
   const editSourceDrafts = useRef<Partial<Record<TriggerSource, EditSourceDraft>>>({});
   const [switchedWorkerSettings, setSwitchedWorkerSettings] =
     useState<TriggerWorkerSettings | null>(null);
-  const [switchedWorkerPlacement, setSwitchedWorkerPlacement] =
-    useState<WorkerPlacement | null>(null);
+  const [switchedWorkerPlacement, setSwitchedWorkerPlacement] = useState<WorkerPlacement | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
   const defaultTriggerSchedule = useMemo(
