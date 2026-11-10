@@ -1482,9 +1482,13 @@ def materialize_codex_provider_config(
             providers[provider_name] = tomlkit.inline_table()
         provider_config = providers[provider_name]
         name = effective_provider.get("name")
-        # Codex validates names when persisting hook trust, even for inherited providers.
+        # Hook-trust writes validate inactive providers too, without CLI name overlays.
         if isinstance(provider_config, MutableMapping) and isinstance(name, str) and name.strip():
-            provider_config.setdefault("name", name)
+            configured_name = provider_config.get("name")
+            if "name" not in provider_config or (
+                isinstance(configured_name, str) and not configured_name.strip()
+            ):
+                provider_config["name"] = name
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
