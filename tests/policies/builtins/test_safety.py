@@ -926,11 +926,12 @@ def test_ask_on_scheduled_task_change_denies_missing_arguments() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [("prompt", value) for value in [None, "", " \n\t", 1, ["instructions"]]]
-    + [("permission_mode", value) for value in ["", " \n\t", 1, ["auto"]]],
+    + [("permission_mode", value) for value in ["", " \n\t", 1, ["auto"], "null", " NULL "]],
 )
 def test_scheduled_task_approval_denies_invalid_review_values(
     action: str, field: str, value: object
 ) -> None:
+    """The string "null" is refused before approval, with the hint the runner gives."""
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
     result = ask_on_scheduled_task_change(
@@ -948,7 +949,14 @@ def test_scheduled_task_approval_denies_invalid_review_values(
         }
     )
     assert result["result"] == "DENY"
-    assert f"{field} must be a non-empty string" in result["reason"]
+    expected = {
+        "prompt": "prompt must be a non-empty string",
+        "permission_mode": (
+            "permission_mode must be a mode name, "
+            "or JSON null (not the string 'null') for the agent default"
+        ),
+    }[field]
+    assert expected in result["reason"]
 
 
 @pytest.mark.parametrize(

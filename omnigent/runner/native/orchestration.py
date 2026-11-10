@@ -83,6 +83,7 @@ from omnigent.native.native_coding_agents import (
 from omnigent.native.native_dispatch import resolve_hook
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
+from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -2903,6 +2904,7 @@ async def _auto_create_pi_terminal(
         context_files = pi_spec.executor.config.get("context_files", True)
         system_prompt_mode = pi_spec.executor.config.get("system_prompt_mode", "append")
     provider_args: list[str] = []
+    pi_env_unset = pi_native_env_unset(os.environ)
     pi_env = {
         PI_NATIVE_CONFIG_ENV_VAR: str(config),
         "OMNIGENT_PI_NATIVE_BRIDGE_DIR": str(bridge_dir),
@@ -2951,6 +2953,9 @@ async def _auto_create_pi_terminal(
                 selection=spec_model,
                 global_agent_dir=global_pi_agent_dir(workspace=launch_config.workspace),
                 client_surface=resource_registry.client_surface(session_id),
+                pi_env=terminal_pane_environment(
+                    inherit_env=True, env=pi_env, env_unset=pi_env_unset
+                ),
             )
             pi_env.update(launch.env)
             provider_args.extend(launch.args)
@@ -3018,7 +3023,7 @@ async def _auto_create_pi_terminal(
             # the picker with entries that bypass the managed models.json
             # provider — and Pi needs no credential env (its auth rides the
             # managed apiKey). Empty list = no scrubbing.
-            env_unset=pi_native_env_unset(os.environ),
+            env_unset=pi_env_unset,
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
@@ -5802,6 +5807,7 @@ async def _auto_create_codex_terminal(
     # Keep it off the runner loop so heartbeats and other sessions can progress.
     app_server = await asyncio.to_thread(
         build_codex_native_server,
+        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
         session_id=session_id,
         socket_path=socket_path,
         codex_home=codex_home,
@@ -9827,6 +9833,7 @@ async def _auto_create_claude_terminal(
         _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
     claude_args = augment_claude_args(
         base_claude_args,
+        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
         bridge_dir=bridge_dir,
         workspace=Path(workspace),
         ap_server_url=server_url,
@@ -9851,8 +9858,8 @@ async def _auto_create_claude_terminal(
 
     # Apply the per-harness startup command/args override from config
     # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
-    # downstream integration can wrap this managed-host launch — e.g. Databricks'
-    # ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
+    # downstream integration can wrap this managed-host launch — e.g. a wrapper
+    # such as ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
     # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
     # appended above, so the ``--`` stays first). Identity by default. This is
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
