@@ -3746,10 +3746,21 @@ def test_run_turn_error_after_submit_is_not_marked_undelivered(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "submission", ["turn/start", "turn/steer", "live-steer", "before-send", "binding-change"]
+    "submission",
+    [
+        "turn/start",
+        "turn/steer",
+        "live-steer",
+        "before-send",
+        "binding-change",
+        "initialize-timeout",
+        "draining-initialize-timeout",
+        "live-initialize-timeout",
+        "live-draining-initialize-timeout",
+    ],
 )
 async def test_transport_failure_keeps_native_work_running(
-    tmp_path: Path, submission: str
+    tmp_path: Path, submission: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed submission cannot interrupt existing work or resend accepted input."""
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -3758,16 +3769,26 @@ async def test_transport_failure_keeps_native_work_running(
 
     method = "turn/start" if submission in {"turn/start", "binding-change"} else "turn/steer"
     requests: list[str] = []
-    native_running = submission == "before-send"
+    initialize_timeout = submission.endswith("initialize-timeout")
+    native_running = submission == "before-send" or initialize_timeout
+    initialize_requests = 0
+    if initialize_timeout:
+        monkeypatch.setattr(codex_native_executor, "_DELIVERY_RPC_TIMEOUT_SECONDS", 1.0)
 
     async def handle(websocket: ServerConnection) -> None:
-        nonlocal native_running
+        nonlocal native_running, initialize_requests
         async for raw in websocket:
             request = json.loads(raw)
             rpc_method = request["method"]
             if "id" not in request:
                 continue
             requests.append(rpc_method)
+            if rpc_method == "initialize":
+                initialize_requests += 1
+                held_connection = 2 if "draining-initialize-timeout" in submission else 1
+                if initialize_timeout and initialize_requests == held_connection:
+                    await websocket.wait_closed()
+                    return
             if submission == "before-send" and requests == ["initialize"]:
                 websocket.transport.abort()
                 return
@@ -3785,6 +3806,19 @@ async def test_transport_failure_keeps_native_work_running(
                 )
                 native_running = True
             if rpc_method == method:
+                if "draining-initialize-timeout" in submission:
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "id": request["id"],
+                                "error": {
+                                    "code": -32600,
+                                    "message": "Server is draining; retry after reconnecting",
+                                },
+                            }
+                        )
+                    )
+                    continue
                 native_running = True
                 state = read_bridge_state(tmp_path)
                 assert state is not None
@@ -3814,7 +3848,14 @@ async def test_transport_failure_keeps_native_work_running(
         ctx = TurnContext(
             response_id="resp_delivery", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
         )
-        if submission == "live-steer":
+        if submission in {"live-initialize-timeout", "live-draining-initialize-timeout"}:
+            assert (
+                await asyncio.wait_for(
+                    executor.enqueue_session_message("main", "keep working"), timeout=5
+                )
+                is False
+            )
+        elif submission == "live-steer":
             ctx._push_injection(request.model_copy(update={"injection_id": "inj_delivery"}))
             watcher = asyncio.create_task(adapter._watch_injections(ctx, executor))
             try:
@@ -3830,7 +3871,7 @@ async def test_transport_failure_keeps_native_work_running(
                 await asyncio.wait_for(adapter.run_turn(request, ctx), timeout=5)
             if adapter._abandoned_executor_cleanup is not None:
                 await adapter._abandoned_executor_cleanup
-            if submission == "before-send":
+            if submission == "before-send" or initialize_timeout:
                 assert str(caught.value) == CODEX_APP_SERVER_STOPPED.message
                 assert caught.value.undelivered is True
             elif submission == "binding-change":
@@ -3840,11 +3881,14 @@ async def test_transport_failure_keeps_native_work_running(
                 assert "may already be running" in str(caught.value)
 
         assert requests.count(method) == (
-            0 if submission in {"before-send", "binding-change"} else 1
+            0
+            if submission
+            in {"before-send", "binding-change", "initialize-timeout", "live-initialize-timeout"}
+            else 1
         )
         assert "turn/interrupt" not in requests
         assert native_running
-        if submission != "live-steer":
+        if not submission.startswith("live-"):
             assert adapter._executor is executor
 
         # Explicit user Stop still owns cancellation of the native turn.

@@ -1181,6 +1181,10 @@ Cross-harness journeys:
   Both use real loopback WebSockets with a controlled peer.
   `tests/harnesses/codex_native/test_codex_native_app_server_event_stream.py` adds multiple waiting
   consumers and reconnecting the same client to receive fresh events.
+  `tests/inner/test_codex_native_executor.py::test_transport_failure_keeps_native_work_running`
+  bounds native message initialization and a refused-delivery reconnect to 30
+  seconds. A stalled handshake keeps unsent input and existing native work;
+  these loopback checks cover ordinary messages and live steering.
 - **`disconnect`, Codex startup consumers (component tests):**
   `tests/harnesses/codex_native/session/test_subscription.py::test_wait_for_thread_started_fails_when_stream_ends`
   checks the CLI error with a fake client;
