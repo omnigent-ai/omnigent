@@ -154,6 +154,8 @@ export function NewProjectButton({
     : { catalog: [], urlInput: true, branchSelection: true };
   const repositoryMode = repositoryCreation && (sandboxSelected || workspaceMode === "repository");
   const selectedHost = hosts.find((host) => host.host_id === dialogHostId);
+  const hostFilesystemAvailable =
+    dialogHostId !== null && (!repositoryCreation || selectedHost?.status === "online");
   const initialTarget = () => {
     if (
       contextHost?.sandbox_provider &&
@@ -167,7 +169,7 @@ export function NewProjectButton({
     const remembered = readLastHostChoice();
     if (repositoryCreation && remembered === SANDBOX_HOST_CHOICE && providers.length) {
       const provider = readLastSandboxProvider();
-      return sandboxHostChoice(provider ?? providers[0]);
+      return sandboxHostChoice(providers.includes(provider) ? provider : providers[0]);
     }
     if (repositoryCreation && remembered && remembered !== SANDBOX_HOST_CHOICE) return remembered;
     return (
@@ -192,7 +194,10 @@ export function NewProjectButton({
     createProject.isPending ||
     createDirectory.isPending ||
     cloneRepository.isPending;
-  const folderCreationDisabled = isPending || (!hostsLoading && dialogHostId === null);
+  const folderCreationDisabled =
+    isPending ||
+    (!hostsLoading && dialogHostId === null) ||
+    (repositoryCreation && !hostFilesystemAvailable);
 
   useEffect(() => {
     if (open && !targetEdited.current && targetChoice === null && hostId !== null) {
@@ -247,6 +252,10 @@ export function NewProjectButton({
       }
       if (dialogHostId === null) {
         setSubmitError("Connect a host before creating a working directory.");
+        return;
+      }
+      if (!hostFilesystemAvailable) {
+        setSubmitError("Reconnect the selected host or choose another target.");
         return;
       }
       if (createdWorkspace?.hostId === dialogHostId && createdWorkspace.projectName === trimmed) {
@@ -327,6 +336,8 @@ export function NewProjectButton({
     if (sandboxSelected) {
       config.host_id = SANDBOX_HOST_CHOICE;
       if (sandboxProvider) config.sandbox_provider = sandboxProvider;
+    } else if (repositoryCreation && dialogHostId !== null) {
+      config.host_id = dialogHostId;
     }
     if (icon) config.icon = icon;
     if (selectedWorkspace) {
@@ -583,7 +594,7 @@ export function NewProjectButton({
                           type="button"
                           variant="outline"
                           onClick={() => setWorkspacePickerOpen(true)}
-                          disabled={dialogHostId === null}
+                          disabled={!hostFilesystemAvailable}
                         >
                           Browse
                         </Button>
@@ -628,7 +639,7 @@ export function NewProjectButton({
                         : workspace?.path || "Not selected"
                     }`}
                     onClick={() => setWorkspacePickerOpen(true)}
-                    disabled={createWorkspaceFolder || dialogHostId === null || isPending}
+                    disabled={createWorkspaceFolder || !hostFilesystemAvailable || isPending}
                     className="flex h-10 w-full items-center justify-between gap-3 rounded-lg border border-input bg-transparent px-3 text-ui outline-none transition-colors hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     <span className="flex min-w-0 items-center gap-2">
@@ -645,7 +656,7 @@ export function NewProjectButton({
                 </>
               )}
               <WorkspacePickerDialog
-                open={workspacePickerOpen}
+                open={workspacePickerOpen && hostFilesystemAvailable}
                 onOpenChange={setWorkspacePickerOpen}
                 hostId={dialogHostId}
                 initialPath={repositoryMode ? undefined : workspace?.path}

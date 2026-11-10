@@ -28,7 +28,7 @@ export function isValidSandboxRepoUrl(url: string): boolean {
     )
   )
     return false;
-  const sshMatch = /^git@(\[[^\s#@[\]]+\]|[^\s#:@[\]]+):([^\s#@]+)$/.exec(t);
+  const sshMatch = /^git@(\[[^\s#@[\]]+\]|[^\s#:@/\\[\]]+):([^\s#@]+)$/.exec(t);
   const validForm = /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || sshMatch !== null;
   const name = validForm ? deriveRepoName(t) : null;
   if (name === null || name === "." || name === ".." || !/^[A-Za-z0-9._-]+$/.test(name))
@@ -52,6 +52,7 @@ export function isValidSandboxRepoUrl(url: string): boolean {
         return false;
       }
     }
+    return true;
   }
   return (
     hostname.length <= 253 &&

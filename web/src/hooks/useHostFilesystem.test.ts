@@ -322,18 +322,21 @@ describe("cloneHostRepository", () => {
     ).rejects.toMatchObject({ code: "clone_transport_error", status: 502 });
     expect(fetch).toHaveBeenCalledTimes(1);
   });
-  it.each([null, {}, { path: null }, { path: 3 }, { path: "" }, { path: "  " }])(
-    "rejects a successful response without a checkout path (%j)",
-    async (body) => {
-      const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(body)));
-      vi.stubGlobal("fetch", fetch);
-      await expect(
-        cloneHostRepository("host_1", {
-          url: "https://git.example.com/team/sample.git",
-          path: "~/sample",
-        }),
-      ).rejects.toThrow("Check the clone destination before retrying");
-      expect(fetch).toHaveBeenCalledTimes(1);
-    },
-  );
+  it.each([
+    "",
+    "not JSON",
+    ...[null, {}, { path: null }, { path: 3 }, { path: "" }, { path: "  " }].map((body) =>
+      JSON.stringify(body),
+    ),
+  ])("rejects a successful response without a checkout path (%j)", async (body) => {
+    const fetch = vi.fn().mockResolvedValue(new Response(body));
+    vi.stubGlobal("fetch", fetch);
+    await expect(
+      cloneHostRepository("host_1", {
+        url: "https://git.example.com/team/sample.git",
+        path: "~/sample",
+      }),
+    ).rejects.toThrow("Check the clone destination before retrying");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
 });

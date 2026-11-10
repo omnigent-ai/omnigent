@@ -36,7 +36,9 @@ describe("isValidSandboxRepoUrl host validation", () => {
   it.each([
     "https://bad..example.com/team/sample.git",
     "https://-bad.example.com/team/sample.git",
-    "git@bad_.example.com:team/sample.git",
+    "git@host/path:team/sample.git",
+    "git@host\\path:team/sample.git",
+    "git@host]:team/sample.git",
     "https://git.example.com:bad/team/sample.git",
     "https://git.example.com:65536/team/sample.git",
     "https://[invalid]/team/sample.git",
@@ -59,6 +61,11 @@ describe("isValidSandboxRepoUrl host validation", () => {
     "git@[2001:db8::1]:team/sample.git",
     "git@[::1]:sample.git",
     "git@[::ffff:192.0.2.1]:sample.git",
+    "git@work_git:team/sample.git",
+    "git@bad_.example.com:team/sample.git",
+    "git@café:team/sample.git",
+    "git@-host:team/sample.git",
+    `git@${"a".repeat(64)}:team/sample.git`,
   ])("accepts supported authorities (%s)", (url) => {
     expect(isValidSandboxRepoUrl(url)).toBe(true);
   });

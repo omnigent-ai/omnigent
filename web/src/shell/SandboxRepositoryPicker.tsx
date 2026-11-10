@@ -21,7 +21,6 @@ import {
   repositoryIdentity,
   repositorySelectionError,
   isValidSandboxBranch,
-  isValidSandboxRepoUrl,
   isValidSandboxWorkspaceLength,
 } from "@/lib/sandboxRepositories";
 
@@ -303,9 +302,6 @@ export function SandboxRepositoryPicker({
   const urlError = (() => {
     if (inputUrl.trim() === "") return null;
     if (duplicateUrl) return "This repository is already selected. Clear this URL to continue.";
-    if (!isValidSandboxWorkspaceLength(inputUrl, "")) return SANDBOX_WORKSPACE_LENGTH_MESSAGE;
-    if (!isValidSandboxRepoUrl(inputUrl))
-      return "Enter an HTTPS or SSH URL ending in a repository name.";
     return repositorySelectionError(
       { url: inputUrl, branch: "" },
       { catalog, urlInput, branchSelection },
@@ -334,6 +330,8 @@ export function SandboxRepositoryPicker({
   };
   if (single) {
     const selection = selections[0] ?? { url: "", branch: "" };
+    const updateSelection = (next: LastSandboxRepo): void =>
+      onChange(next.url.trim() === "" && next.branch.trim() === "" ? [] : [next]);
     const error = repositorySelectionError(selection, { catalog, urlInput, branchSelection });
     const branchError =
       error !== null &&
@@ -359,7 +357,7 @@ export function SandboxRepositoryPicker({
               id={`${testIdPrefix}-input`}
               list={`${testIdPrefix}-suggestions`}
               value={selection.url}
-              onChange={(event) => onChange([{ ...selection, url: event.target.value }])}
+              onChange={(event) => updateSelection({ ...selection, url: event.target.value })}
               aria-label="Repository URL"
               aria-invalid={error !== null && !branchError}
               aria-describedby={error && !branchError ? `${testIdPrefix}-error` : undefined}
@@ -378,7 +376,7 @@ export function SandboxRepositoryPicker({
           <select
             id={`${testIdPrefix}-input`}
             value={selectedSuggestion?.url ?? selection.url}
-            onChange={(event) => onChange([{ ...selection, url: event.target.value }])}
+            onChange={(event) => updateSelection({ ...selection, url: event.target.value })}
             aria-invalid={error !== null && !branchError}
             aria-describedby={error && !branchError ? `${testIdPrefix}-error` : undefined}
             className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
@@ -407,7 +405,7 @@ export function SandboxRepositoryPicker({
             <input
               id={`${testIdPrefix}-branch`}
               value={selection.branch}
-              onChange={(event) => onChange([{ ...selection, branch: event.target.value }])}
+              onChange={(event) => updateSelection({ ...selection, branch: event.target.value })}
               aria-invalid={branchError || undefined}
               aria-describedby={branchError ? `${testIdPrefix}-error` : undefined}
               placeholder="Default branch"

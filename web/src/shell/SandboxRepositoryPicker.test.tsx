@@ -257,7 +257,7 @@ describe("SandboxRepositoryPicker", () => {
     fireEvent.change(input, { target: { value: "https://git.example.com/org/my+repo" } });
     expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
     expect(input).toHaveAccessibleDescription(
-      "Enter an HTTPS or SSH URL ending in a repository name.",
+      "Enter a valid HTTPS or SSH repository URL without credentials.",
     );
     fireEvent.change(input, {
       target: { value: `https://git.example.com/org/${"r".repeat(256)}` },
@@ -297,6 +297,8 @@ describe("SandboxRepositoryPicker", () => {
     ]);
     expect(screen.queryByRole("button", { name: "Add" })).toBeNull();
     expect(screen.queryByLabelText("Branch (optional)")).toBeNull();
+    fireEvent.change(input, { target: { value: "" } });
+    expect(onChange).toHaveBeenLastCalledWith([]);
   });
 
   it("offers catalog selections without URL or branch entry for restricted providers", () => {
@@ -327,7 +329,7 @@ describe("SandboxRepositoryPicker", () => {
     expect(onChange).toHaveBeenLastCalledWith([{ url: catalog[0].url, branch: "" }]);
     expect(screen.queryByLabelText("Branch (optional)")).toBeNull();
     fireEvent.change(select, { target: { value: "" } });
-    expect(onChange).toHaveBeenLastCalledWith([{ url: "", branch: "" }]);
+    expect(onChange).toHaveBeenLastCalledWith([]);
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
@@ -405,9 +407,13 @@ describe("SandboxRepositoryPicker", () => {
   });
 
   it("single mode describes an invalid branch on its branch field", () => {
-    renderPicker([{ url: "https://git.example.com/team/sample.git", branch: "bad branch" }], 1, {
-      single: true,
-    });
+    const { onChange } = renderPicker(
+      [{ url: "https://git.example.com/team/sample.git", branch: "bad branch" }],
+      1,
+      {
+        single: true,
+      },
+    );
     const branch = screen.getByLabelText("Branch (optional)");
     expect(branch).toHaveAttribute("aria-invalid", "true");
     expect(branch).toHaveAccessibleDescription(
@@ -424,6 +430,10 @@ describe("SandboxRepositoryPicker", () => {
     fireEvent.change(url, { target: { value: "" } });
     expect(url).toHaveAccessibleDescription("Choose a repository for this branch.");
     expect(branch).not.toHaveAttribute("aria-describedby");
+    expect(onChange).toHaveBeenLastCalledWith([{ url: "", branch: "main" }]);
+    fireEvent.change(branch, { target: { value: "" } });
+    expect(onChange).toHaveBeenLastCalledWith([]);
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("leaves URL entry usable if listing fails and rejects unavailable catalog-only URLs", async () => {
