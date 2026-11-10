@@ -89,20 +89,20 @@ export function useEditSentMessage({
       showToast(COMPOSER_UNAVAILABLE);
       return;
     }
-    const load = ++loadRef.current;
+    const loadId = ++loadRef.current;
     loadedRef.current = true;
     loadingRef.current = true;
     latest.loadText(message.text);
     recoverMessageAttachments(message.sessionId, message.content)
       .then(({ files, missing }) => {
         const current = latestRef.current;
-        if (load !== loadRef.current || current.target !== latest.target) return;
+        if (loadId !== loadRef.current || current.target !== latest.target) return;
         loadingRef.current = false;
         notifyMissingAttachments(missing);
         if (files.length > 0) current.addFiles(files);
       })
       .catch(() => {
-        if (load !== loadRef.current) return;
+        if (loadId !== loadRef.current) return;
         loadingRef.current = false;
         showToast("Couldn't load that message's attachments.");
       });
