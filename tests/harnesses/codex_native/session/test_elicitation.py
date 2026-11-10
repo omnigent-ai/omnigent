@@ -1248,19 +1248,54 @@ def test_forwarder_keeps_codex_async_question_in_terminal_for_older_server(
     A server without ``codex_nonblocking_decline`` gets no async question card.
 
     Such a server interrupts Codex when the card is declined, so the question
-    stays answerable only in the native terminal.
+    stays answerable only in the native terminal. That answer is mirrored raw
+    and unflagged, because such a server would match its plain text to a
+    queued web message.
     """
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
 
+    async def answer_in_terminal(client: httpx.AsyncClient, context: dict[str, Any]) -> None:
+        """
+        Answer the question in the Codex TUI after its card was skipped.
+
+        :param client: HTTP client for Omnigent posts.
+        :param context: Forwarder context from ``_forwarder_context``.
+        :returns: None.
+        """
+        await asyncio.wait_for(context["elicitation_tracker"].drain(), timeout=30.0)
+        await codex_native_forwarder._handle_event(
+            client,
+            **context,
+            event=_tui_reply_event(_TUI_ASYNC_QUESTION_REPLY),
+            codex_client=fake_client,  # type: ignore[arg-type]
+        )
+
     hook_bodies, posted_events = _answer_async_question(
-        tmp_path, fake_client, [], server_info={"session_claude_sdk_clear": True}
+        tmp_path,
+        fake_client,
+        [],
+        while_delivering=answer_in_terminal,
+        server_info={"session_claude_sdk_clear": True},
     )
 
     assert hook_bodies == []
     assert fake_client.requests == []
-    # Only Codex's question message reaches the transcript.
-    assert [event["type"] for event in posted_events] == ["external_conversation_item"]
+    assert [
+        (
+            event["data"]["item_data"].get("role"),
+            event["data"]["item_data"]["content"],
+            event["data"].get("agent_message_candidate"),
+        )
+        for event in posted_events
+    ] == [
+        (
+            "assistant",
+            [{"type": "output_text", "text": "Which option do you choose?\n- Alpha\n- Beta"}],
+            None,
+        ),
+        ("user", [{"type": "input_text", "text": _TUI_ASYNC_QUESTION_REPLY}], None),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1516,6 +1551,46 @@ def test_forwarder_retries_undelivered_codex_async_question_answer(
     assert state.active_turn_id == final_turn_id
     assert len(hook_bodies) == 1
     assert _undelivered_answer_notices(posted_events) == []
+
+
+@pytest.mark.parametrize(
+    "shell_markers",
+    [
+        {"active_turn_id": "turn_shell", "active_shell_turn_id": "turn_shell"},
+        {"active_turn_id": None, "pending_shell_command_id": "shell_command_1"},
+    ],
+    ids=["shell_turn_running", "shell_command_pending"],
+)
+def test_forwarder_holds_codex_async_question_answer_during_shell_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shell_markers: dict[str, Any],
+) -> None:
+    """
+    An answer is not sent while a shell command runs, which would drop it.
+
+    When the shell command outlasts the retries, the card reopens.
+
+    :param shell_markers: Bridge fields of the running shell command.
+    """
+    monkeypatch.setattr(
+        codex_native_forwarder, "_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S", (0.0, 0.0, 0.0)
+    )
+    _write_forwarder_bridge(tmp_path, **shell_markers)
+    fake_client = _FakeCodexAppServerClient()
+
+    hook_bodies, posted_events = _answer_async_question(
+        tmp_path,
+        fake_client,
+        [
+            httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}}),
+            httpx.Response(200, json={"answers": {}}),
+        ],
+    )
+
+    assert fake_client.requests == []
+    assert len(_undelivered_answer_notices(posted_events)) == 1
+    assert [body["id"] for body in hook_bodies] == ["async_question:call-async-1"] * 2
 
 
 @pytest.mark.parametrize(

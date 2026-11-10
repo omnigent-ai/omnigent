@@ -2441,9 +2441,14 @@ class _CodexElicitationTaskTracker:
         """
         Item ids of the async questions Codex asked on this connection.
 
+        Empty until the server advertises async question cards: an older server
+        would match a plain answer to a queued web message, so replies stay raw.
+
         :returns: ``agentMessage`` item ids, e.g. ``{"call_abc"}``.
         """
-        return self._started_async_questions
+        if self._server_shows_async_question_cards:
+            return self._started_async_questions
+        return ()
 
     def note_async_questions_answered(self, params: _JsonObject) -> list[asyncio.Task[None]]:
         """
@@ -6751,6 +6756,9 @@ async def _send_codex_async_question_reply(
     """
     Deliver an async question reply, retrying a refused or failed send.
 
+    An attempt made while a shell command runs sends nothing and waits for the
+    next retry.
+
     :param codex_client: Connected Codex app-server client.
     :param bridge_dir: Parent native Codex bridge directory, or ``None`` for
         a child thread, whose only known turn is the asking one.
@@ -6771,6 +6779,15 @@ async def _send_codex_async_question_reply(
             state = read_bridge_state(bridge_dir) if bridge_dir is not None else None
             if state is not None and state.thread_id != question.thread_id:
                 state = None
+            if state is not None and (
+                state.pending_shell_command_id or state.active_shell_turn_id
+            ):
+                # A standalone shell turn accepts steered input without processing it.
+                _logger.info(
+                    "Codex async question answer waits for a shell command: item=%s",
+                    question.item_id,
+                )
+                continue
             async with asyncio.timeout(_CODEX_ASYNC_QUESTION_SEND_TIMEOUT_S):
                 await _send_codex_async_question_reply_once(
                     codex_client, bridge_dir=bridge_dir, state=state, question=question, text=text
