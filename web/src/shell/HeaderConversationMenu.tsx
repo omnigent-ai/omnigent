@@ -10,6 +10,7 @@ import {
   ArchiveIcon,
   ArchiveRestoreIcon,
   ChevronLeftIcon,
+  ClockPlusIcon,
   DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
@@ -66,7 +67,15 @@ import {
   useRenameConversation,
   useStopAndDeleteConversation,
   useTogglePinnedConversation,
+  useAutomationsEnabled,
 } from "@/hooks/useConversations";
+import { CreateAutomationFromSessionDialog } from "@/components/scheduled/CreateAutomationFromSessionDialog";
+import { AutomationSourceDeleteNotice } from "@/components/scheduled/AutomationSourceDeleteNotice";
+import {
+  canCreateAutomationFromSession,
+  automationDeletedWith,
+  useDeleteSourceAutomations,
+} from "@/lib/automationFromSession";
 import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -146,6 +155,17 @@ export function HeaderConversationMenu({
   const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(false);
+  const [automationOpen, setAutomationOpen] = useState(false);
+  const automationsEnabled = useAutomationsEnabled();
+  // This menu is only offered to the session's owner (see ChatHeader).
+  const canCreateAutomation = canCreateAutomationFromSession({
+    info,
+    automationsEnabled,
+    conversation,
+    isOwner: true,
+  });
+  const automationSourceOf = automationDeletedWith(info, conversation);
+  const deleteSourceAutomations = useDeleteSourceAutomations();
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
   const isArchived = conversation.archived === true;
@@ -176,6 +196,7 @@ export function HeaderConversationMenu({
     setRenameTitle(conversation.title ?? "");
     setDeleteOpen(false);
     setDeleteBranch(false);
+    setAutomationOpen(false);
   }, [conversation.id, conversation.title]);
 
   useEffect(() => {
@@ -224,10 +245,16 @@ export function HeaderConversationMenu({
     setRenameOpen(false);
   };
 
-  const confirmDelete = () => {
+  const confirmDelete = async () => {
     setDeleteOpen(false);
     setDeleteBranch(false);
-    navigate("/", { replace: true });
+    // "Delete both": the automation first, so no run starts from a missing session.
+    if (automationSourceOf === null) {
+      navigate("/", { replace: true });
+    } else if (!(await deleteSourceAutomations([automationSourceOf], [conversation.id]))) {
+      toast.error("Couldn't delete the automation, so the session was kept");
+      return;
+    }
     deleteConversation.mutate({
       id: conversation.id,
       deleteBranch: gitBranch !== null && deleteBranch,
@@ -388,6 +415,16 @@ export function HeaderConversationMenu({
         <MailIcon className="size-3.5" />
         Mark as unread
       </DropdownMenuItem>
+      {canCreateAutomation && (
+        <DropdownMenuItem
+          data-testid="header-create-automation"
+          className={itemClass}
+          onSelect={() => setAutomationOpen(true)}
+        >
+          <ClockPlusIcon className="size-3.5" />
+          Create automation
+        </DropdownMenuItem>
+      )}
       {/* Move to project is also reachable on desktop via the breadcrumb's
           folder tag (HeaderProjectTag); on mobile the native shells hide the
           breadcrumb, so this menu is the sole entry point. */}
@@ -519,6 +556,13 @@ export function HeaderConversationMenu({
       </DropdownMenu>
 
       {archiveWorktreePrompt.dialog}
+      {automationOpen && (
+        <CreateAutomationFromSessionDialog
+          conversation={conversation}
+          open
+          onOpenChange={setAutomationOpen}
+        />
+      )}
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent>
           <form onSubmit={submitRename}>
@@ -568,12 +612,23 @@ export function HeaderConversationMenu({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete conversation?</DialogTitle>
+            <DialogTitle>
+              {automationSourceOf !== null ? "Delete session and automation?" : "Delete session?"}
+            </DialogTitle>
             <DialogDescription>
               <span className="font-medium break-all">{label}</span> and all of its history will be
               removed. This cannot be undone.
             </DialogDescription>
           </DialogHeader>
+          {automationSourceOf !== null && (
+            <AutomationSourceDeleteNotice
+              taskId={automationSourceOf}
+              onNavigate={() => {
+                setDeleteOpen(false);
+                setDeleteBranch(false);
+              }}
+            />
+          )}
           {gitBranch !== null && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
               <p className="text-sm text-muted-foreground">
@@ -610,10 +665,10 @@ export function HeaderConversationMenu({
             <Button
               type="button"
               variant="destructive"
-              onClick={confirmDelete}
+              onClick={() => void confirmDelete()}
               disabled={deleteConversation.isPending}
             >
-              Delete
+              {automationSourceOf !== null ? "Delete both" : "Delete"}
             </Button>
           </DialogFooter>
         </DialogContent>
