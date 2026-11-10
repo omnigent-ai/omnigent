@@ -417,17 +417,117 @@ def test_snapshot_cannot_cross_workspace_boundaries(
 
 
 @pytest.mark.parametrize("allowed", [False, True])
+@pytest.mark.parametrize("binding", ["missing-host", "unbound", "bound", "other-host"])
 def test_unprofiled_managed_host_cannot_bypass_required_selection(
-    catalog: SandboxProfileCatalog, profiles: _Profiles, allowed: bool
+    catalog: SandboxProfileCatalog, profiles: _Profiles, allowed: bool, binding: str
 ) -> None:
     session_id, host_id = uuid.uuid4().hex, uuid.uuid4().hex
     if not allowed:
         profiles.allowed.clear()
-    with workspace_scope(41), pytest.raises(HTTPException) as denied:
-        _require(catalog, session_id, host_id, sandbox_provider="company", user_id=_ALICE)
-    assert denied.value.status_code == 422
-    assert catalog.get_session_snapshot(session_id) is None
-    assert catalog.get_host_snapshot(host_id) is None
+    with workspace_scope(41):
+        if binding != "missing-host":
+            catalog._host_store.register_managed_host(
+                host_id=host_id,
+                name="legacy",
+                user_id=_ALICE,
+                token="test-token",
+                provider="company",
+                sandbox_id="legacy-sandbox",
+                token_expires_at=2_000_000_000,
+            )
+        catalog._store.conversations.create_conversation(
+            conversation_id=session_id,
+            host_id=host_id
+            if binding == "bound"
+            else uuid.uuid4().hex
+            if binding == "other-host"
+            else None,
+            workspace="/workspace",
+        )
+        if binding == "bound":
+            catalog.require_session_host(session_id, host_id, user_id=_ALICE)
+        else:
+            with pytest.raises(HTTPException) as denied:
+                catalog.require_session_host(
+                    session_id, host_id, sandbox_provider="company", user_id=_ALICE
+                )
+            assert denied.value.status_code == 422
+        assert catalog.get_session_snapshot(session_id) is None
+        assert catalog.get_host_snapshot(host_id) is None
+        assert profiles.selections == []
+
+
+@pytest.mark.parametrize("saved_profile", [False, True])
+@pytest.mark.parametrize(
+    ("result", "status"),
+    [
+        (None, None),
+        ([], 409),
+        (object(), 503),
+        (SandboxProfileAccessDenied(_SECRET), 403),
+        (TimeoutError(_SECRET), 503),
+    ],
+    ids=["legacy", "empty", "malformed", "denied", "timeout"],
+)
+def test_controller_lookup_never_downgrades_saved_profiles(
+    catalog, profiles, monkeypatch, saved_profile, result, status
+):
+    host_id = uuid.uuid4().hex
+    with workspace_scope(41):
+        snapshot = catalog.resolve("build", user_id=_ALICE)
+        catalog._host_store.register_managed_host(
+            host_id=host_id,
+            name="legacy",
+            user_id=_ALICE,
+            token="test-token",
+            provider="company",
+            sandbox_id="legacy-sandbox",
+            token_expires_at=2_000_000_000,
+        )
+        source = catalog._store.conversations.create_conversation(
+            host_id=host_id, workspace="/workspace"
+        )
+        if saved_profile:
+            catalog.bind_session(source.id, snapshot)
+        target = catalog._store.conversations.create_conversation(
+            host_id=host_id, workspace="/workspace"
+        )
+        profiles.selections.clear()
+
+        def lookup(self, context):
+            assert context.sandbox_id == "legacy-sandbox"
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        monkeypatch.setattr(_Provider, "supports_sandbox_profile_lookup", True)
+        monkeypatch.setattr(_Provider, "list_profiles", lookup)
+        expected_status = 409 if saved_profile and result is None else status
+        if expected_status is None:
+            catalog.require_session_host(target.id, host_id, user_id=_ALICE)
+        else:
+            with pytest.raises(HTTPException) as denied:
+                catalog.require_session_host(target.id, host_id, user_id=_ALICE)
+            assert denied.value.status_code == expected_status
+            assert _SECRET not in str(denied.value.detail)
+        assert catalog.get_session_snapshot(target.id) is None
+        assert catalog.get_session_snapshot(source.id) == (snapshot if saved_profile else None)
+        assert profiles.selections == []
+
+
+@pytest.mark.parametrize("host_id", [None, "other-host", "legacy-host"])
+async def test_legacy_launch_permission_is_host_scoped(catalog, profiles, host_id):
+    from omnigent.server.managed_hosts import _select_launch_profile
+
+    launcher = _Provider(profiles)
+    entry = replace(catalog._deployment.default, unprofiled_host_id="legacy-host")
+    if host_id == "legacy-host":
+        await _select_launch_profile(launcher, entry, _ALICE, host_id=host_id)
+    else:
+        with pytest.raises(HTTPException) as denied:
+            await _select_launch_profile(launcher, entry, _ALICE, host_id=host_id)
+        assert denied.value.status_code == 422
+    assert profiles.selections == []
 
 
 def test_host_reuse_checks_saved_identity_and_current_access(

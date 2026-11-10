@@ -2151,7 +2151,7 @@ describe("ForkSessionDialog", () => {
             hostId: "host_1",
             labels: {
               "omnigent.host_type": "managed",
-              [SANDBOX_REPO_LABEL_KEY]: "https://github.com/databricks-eng/universe",
+              [SANDBOX_REPO_LABEL_KEY]: "https://github.com/example-org/monorepo",
             },
           },
           isLoading: false,
@@ -2181,7 +2181,7 @@ describe("ForkSessionDialog", () => {
         expect(screen.getByTestId("fork-session-host-option-host_1")).toBeInTheDocument();
         fireEvent.click(screen.getByTestId(row));
         if (provider) {
-          expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
+          expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("monorepo");
         } else {
           expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Same sandbox");
           expect(screen.queryByTestId("fork-session-sandbox-repo-row")).not.toBeInTheDocument();
@@ -2199,7 +2199,7 @@ describe("ForkSessionDialog", () => {
           upToResponseId: undefined,
           config: {},
           sandbox: provider
-            ? { provider, workspaces: ["https://github.com/databricks-eng/universe"] }
+            ? { provider, workspaces: ["https://github.com/example-org/monorepo"] }
             : undefined,
         });
         if (provider) {

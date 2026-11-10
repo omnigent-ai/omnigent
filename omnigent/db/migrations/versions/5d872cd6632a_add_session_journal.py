@@ -1,7 +1,7 @@
 """Add each session's append-only journal.
 
 Revision ID: 5d872cd6632a
-Revises: f1c7a9e2b406
+Revises: 1ad1db53f99d
 
 ``session_journal_entries`` holds what a session's agent plans and records:
 plans, step statuses, notes and, later, the work it sends to other sessions.
@@ -28,7 +28,7 @@ schema revision the build does not know.
 
 Rollback: stop the servers, downgrade with a build that includes this
 migration (``OMNIGENT_DB_URL=<uri> alembic -c omnigent/db/alembic.ini
-downgrade f1c7a9e2b406``), then start the older build. Downgrade drops both
+downgrade 1ad1db53f99d``), then start the older build. Downgrade drops both
 tables and every journal entry.
 """
 
@@ -40,7 +40,7 @@ from alembic import op
 from omnigent.db.db_models import Uuid16
 
 revision: str = "5d872cd6632a"
-down_revision: str | None = "f1c7a9e2b406"
+down_revision: str | None = "1ad1db53f99d"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 

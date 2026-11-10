@@ -1,6 +1,5 @@
 // What each harness on a user-connected host already brings to Omnigent: login
-// state, user-level skills, plugins, and MCP servers. Read-only; nothing here
-// changes the host's configuration.
+// state, user-level skills, plugins, and MCP servers.
 
 import { skipToken, useQueries, useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
@@ -33,6 +32,8 @@ export interface InventoryMcpServer {
   /** Plugin that bundles the server, e.g. ``"figma"``. */
   plugin?: string;
   sourceId?: string;
+  enabled?: boolean | null;
+  locked?: boolean;
 }
 
 export interface InventorySkill {
@@ -94,6 +95,8 @@ export interface HostMcpServer {
   scope: "user";
   /** Pinned for every user on the host by an organization; not the user's to edit. */
   managed?: boolean;
+  enabled?: boolean | null;
+  locked?: boolean;
   plugin?: string | null;
   source_id?: string | null;
   url_host?: string | null;
@@ -101,6 +104,10 @@ export interface HostMcpServer {
   auth_status?: "connected" | "sign_in_required" | null;
   /** Where to finish signing in; only present with `sign_in_required`. */
   sign_in_url?: string | null;
+}
+
+export function hostMcpServersQueryKey(hostId: string | null | undefined) {
+  return ["host-mcp-servers", hostId] as const;
 }
 
 async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<HostMcpServer[]> {
@@ -194,6 +201,8 @@ export function buildInventoryContext(
         detail: detail || undefined,
         plugin: server.plugin ?? undefined,
         sourceId: server.source_id ?? undefined,
+        enabled: server.enabled,
+        locked: server.locked,
       });
     }
     for (const [name, skills] of plugins) {
@@ -211,7 +220,7 @@ export function useHostMcpServers(
   refetchInterval: (servers: HostMcpServer[] | undefined) => number | false = () => false,
 ) {
   return useQuery({
-    queryKey: ["host-mcp-servers", hostId],
+    queryKey: hostMcpServersQueryKey(hostId),
     queryFn:
       enabled && hostId !== null ? ({ signal }) => fetchMcpServers(hostId, signal) : skipToken,
     staleTime: 30_000,
@@ -285,7 +294,7 @@ export function useHarnessInventory(
     }),
   });
   const mcpQuery = useQuery({
-    queryKey: ["host-mcp-servers", host?.host_id],
+    queryKey: hostMcpServersQueryKey(host?.host_id),
     queryFn: online ? ({ signal }) => fetchMcpServers(host.host_id, signal) : skipToken,
     staleTime: 30_000,
     retry,

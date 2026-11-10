@@ -71,6 +71,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
@@ -99,7 +100,10 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
 )
 from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
-from omnigent.server.routes._sessions.helpers import _announce_session_added
+from omnigent.server.routes._sessions.helpers import (
+    _announce_session_added,
+    _session_status_from_cache,
+)
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentity,
     FireIdentityRevoked,
@@ -111,6 +115,15 @@ from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
 )
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
+from omnigent.server.scheduled.source_session import (
+    SourceCopyIncompleteError,
+    SourceHistoryUnsupportedError,
+    carries_native_history,
+    copy_session,
+    last_finished_response_id,
+    run_copy_dropped_label_keys,
+    run_prompt_text,
+)
 from omnigent.server.scheduled.telemetry import (
     current_fire_stage,
     fire_stage,
@@ -723,6 +736,20 @@ async def _run_fire_for_task(
         )
         return
 
+    if task.source_session_id is not None:
+        start_fire_stage("session_validation", session_id=task.source_session_id)
+        problem = await _source_session_problem(deps, task)
+        if problem is not None:
+            reason, error_code = problem
+            _logger.warning(
+                "scheduled fire: task %s cannot start from its source session: %s", task.id, reason
+            )
+            await recorder.finish("failed", error=reason, error_code=error_code)
+            if error_code == "source_session_missing":
+                # Every later run would fail the same way.
+                await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="paused")
+            return
+
     dispatch = fire_dispatch.managed if managed else fire_dispatch.connected
     preflight = None if managed else fire_dispatch.connected_preflight
 
@@ -905,6 +932,30 @@ async def _disable_for_deleted_owner(
         error=f"owner {task.user_id!r} registration is no longer active; task disabled",
         error_code="owner_deleted",
     )
+
+
+async def _source_session_problem(deps: FireDeps, task: ScheduledTask) -> tuple[str, str] | None:
+    """Why a run can't start from the task's source session, with an error code, or ``None``."""
+    assert task.source_session_id is not None  # guarded by the caller
+    conv = await asyncio.to_thread(
+        deps.conversation_store.get_conversation, task.source_session_id
+    )
+    if conv is None:
+        return (
+            "the session this automation starts from was deleted, so the automation is paused",
+            "source_session_missing",
+        )
+    if deps.permission_store is not None and not await asyncio.to_thread(
+        deps.permission_store.check_access,
+        task.user_id or RESERVED_USER_LOCAL,
+        conv.id,
+        LEVEL_OWNER,
+    ):
+        return (
+            "the automation's owner no longer owns the session it starts from",
+            "source_session_incompatible",
+        )
+    return None
 
 
 async def _release_deleted_session(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
@@ -1344,6 +1395,18 @@ async def _discard_session(deps: FireDeps, conv: Conversation) -> None:
                     reason="scheduled-unused-session",
                     expected_root_fingerprint=fingerprint,
                 )
+        # A run's copy has file rows; blobs its source still uses stay.
+        if deps.file_store is not None:
+            orphaned = await asyncio.to_thread(deps.file_store.delete_all_for_session, conv.id)
+            if deps.artifact_store is not None:
+                for blob_key in orphaned:
+                    try:
+                        await asyncio.to_thread(deps.artifact_store.delete, blob_key)
+                    except Exception:
+                        # A blob that won't delete must not keep the session.
+                        _logger.warning(
+                            "scheduled fire: could not delete blob %s", blob_key, exc_info=True
+                        )
         await deps.conversation_store.delete_conversation(conv.id)
     except Exception:
         _logger.exception("scheduled fire: could not delete the unused session %s", conv.id)
@@ -1786,17 +1849,27 @@ async def _create_session_resources(
         labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(worktree.worktree_path)
     conv: Conversation | None = None
     try:
-        conv = await asyncio.to_thread(
-            deps.conversation_store.create_conversation,
-            agent_id=task.agent_id,
-            title=_scheduled_session_title(task),
-            host_id=task.host_id,
-            workspace=workspace,
-            git_branch=worktree.branch if worktree else None,
-            terminal_launch_args=launch_args,
-            labels=labels,
-            project_id=await _fire_project_id(deps, task),
-        )
+        if task.source_session_id is not None:
+            conv = await _copy_source_session_for_run(
+                deps,
+                task,
+                labels=labels,
+                launch_args=launch_args,
+                workspace=workspace,
+                git_branch=worktree.branch if worktree else None,
+            )
+        else:
+            conv = await asyncio.to_thread(
+                deps.conversation_store.create_conversation,
+                agent_id=task.agent_id,
+                title=_scheduled_session_title(task),
+                host_id=task.host_id,
+                workspace=workspace,
+                git_branch=worktree.branch if worktree else None,
+                terminal_launch_args=launch_args,
+                labels=labels,
+                project_id=await _fire_project_id(deps, task),
+            )
         reasoning_effort = task.reasoning_effort
         if reasoning_effort is None:
             reasoning_effort = await _spec_reasoning_effort(deps, task)
@@ -1834,6 +1907,117 @@ async def _create_session_resources(
                 reason="scheduled-create-rollback",
             )
         raise
+
+
+async def _copy_source_session_for_run(
+    deps: FireDeps,
+    task: ScheduledTask,
+    *,
+    labels: dict[str, str],
+    launch_args: list[str] | None,
+    workspace: str | None,
+    git_branch: str | None,
+) -> Conversation:
+    """Start a run's session as a copy of the task's source session.
+
+    The copy takes the task's agent, permission launch args and project, and
+    rebuilds any native transcript from its own copied items. A connected-host
+    run binds the resolved host and workspace; a sandbox run stays hostless
+    until its managed launch binds one.
+    """
+    assert task.source_session_id is not None  # guarded by the caller
+    agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+    if agent is None:
+        raise _CannotLaunchScheduledFire(
+            "the automation's agent no longer exists", error_code="source_session_incompatible"
+        )
+    try:
+        carry = await asyncio.to_thread(carries_native_history, agent)
+    except SourceHistoryUnsupportedError as exc:
+        raise _CannotLaunchScheduledFire(
+            str(exc), error_code="source_session_incompatible"
+        ) from exc
+    source = await asyncio.to_thread(
+        deps.conversation_store.get_conversation, task.source_session_id
+    )
+    # Its owner can chat in the source too; a turn still running stays out of the run.
+    running = (
+        source is not None
+        and _session_status_from_cache(source.id, source.live_status) == "running"
+    )
+    up_to = await asyncio.to_thread(
+        last_finished_response_id,
+        deps.conversation_store,
+        task.source_session_id,
+        running=running,
+    )
+    if up_to is None:
+        # A cutoff of None copies everything, a turn still running included.
+        raise _CannotLaunchScheduledFire(
+            "no finished reply was found in the session this automation starts from",
+            error_code="source_session_incompatible",
+        )
+    from omnigent.server.routes.sessions.routes_core import _require_attachment_compatible_history
+
+    try:
+        # The source can gain attachments after Create; the run's agent must open them.
+        await asyncio.to_thread(
+            _require_attachment_compatible_history,
+            task.source_session_id,
+            agent,
+            deps.conversation_store,
+            deps.file_store,
+            up_to_response_id=up_to,
+        )
+    except OmnigentError as exc:
+        raise _CannotLaunchScheduledFire(
+            exc.message, error_code="source_session_incompatible"
+        ) from exc
+    agent_changed = source is not None and source.agent_id != task.agent_id
+    dropped = run_copy_dropped_label_keys(
+        source.labels if source is not None else {}, agent_changed=agent_changed
+    )
+    project_id = await _fire_project_id(deps, task)
+    try:
+        conv = await asyncio.to_thread(
+            copy_session,
+            conversation_store=deps.conversation_store,
+            file_store=deps.file_store,
+            artifact_store=deps.artifact_store,
+            source_id=task.source_session_id,
+            title=_scheduled_session_title(task),
+            agent_id=task.agent_id,
+            created_by=task.user_id or RESERVED_USER_LOCAL,
+            project_id=project_id,
+            carry_history_into_native=carry,
+            labels=labels,
+            dropped_label_keys=dropped,
+            up_to_response_id=up_to,
+            copy_model_settings=False,
+            # The copy's provider binding belongs to its agent; another agent resolves its own.
+            copy_inference_snapshot=not agent_changed,
+            terminal_launch_args=launch_args,
+            override_terminal_launch_args=True,
+        )
+    except HTTPException as exc:
+        # The deployment's attachment policy refuses a file the session holds.
+        raise _CannotLaunchScheduledFire(
+            str(exc.detail), error_code="source_session_incompatible"
+        ) from exc
+    except SourceCopyIncompleteError as exc:
+        # The run never receives this copy, so its cleanup can't delete it.
+        await _discard_session(deps, exc.copy)
+        raise
+    if task.host_id is not None:
+        try:
+            conv = await asyncio.to_thread(
+                deps.conversation_store.set_host_id, conv.id, task.host_id, workspace, git_branch
+            )
+        except Exception:
+            # The caller never receives this session, so its cleanup can't delete it.
+            await _discard_session(deps, conv)
+            raise
+    return conv
 
 
 _COST_BUDGET_HANDLER = "omnigent.policies.builtins.cost.cost_budget"
@@ -2328,7 +2512,7 @@ async def _send_prompt(
         result = await _dispatch_session_event_to_runner(
             conv.id,
             conv,
-            _prompt_event(task.prompt),
+            _prompt_event(run_prompt_text(task)),
             deps.conversation_store,
             runner_client,
             agent_name=None,
@@ -2367,7 +2551,7 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
         # No browser preference applies to a fire; keep the server default.
         await deps.startup_inputs.enqueue(
             conv.id,
-            _prompt_event(task.prompt),
+            _prompt_event(run_prompt_text(task)),
             user_id=task.user_id or RESERVED_USER_LOCAL,
             headers=Headers({BACKGROUND_SESSION_TITLES_HEADER: "on"}),
         )

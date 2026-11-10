@@ -1312,10 +1312,16 @@ def create_hosts_router(
                         host_type="external",
                     )
 
-            if (
-                host_profile is None
-                and target.conv.family_id is not None
-                and flags.enabled(Feature.SIBLING_SESSIONS)
+            legacy_continuation = (
+                profile_catalog is not None
+                and target.conv.host_id == target.host.host_id
+                and target.host.sandbox_provider is not None
+                and target.host.sandbox_provider
+                in profile_catalog.managed_providers(target.host.sandbox_provider)
+            )
+            if host_profile is None and (
+                legacy_continuation
+                or (target.conv.family_id is not None and flags.enabled(Feature.SIBLING_SESSIONS))
             ):
                 # Capture the binding after any preceding launch has finished.
                 profile_binding = await asyncio.to_thread(
@@ -1479,6 +1485,7 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                mcp_disabled_servers_active_harnesses=host_registry.mcp_disabled_servers_active_harnesses(),
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
                     if target.conv.inference_snapshot

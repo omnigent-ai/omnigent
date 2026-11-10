@@ -36,55 +36,55 @@ of the agent YAML.
 
 ## Common top-level fields
 
-| Field          | Required?   | Purpose                                                                                           |
-| -------------- | ----------- | ------------------------------------------------------------------------------------------------- |
-| `name`         | Recommended | Stable identifier shown in sessions and logs.                                                     |
-| `prompt`       | Usually     | Inline agent-owned system instructions.                                                           |
-| `instructions` | Optional    | Inline instructions or a path to an instructions file. If set, it takes precedence over `prompt`. |
-| `executor`     | Recommended | Harness, model, and auth settings.                                                                |
-| `tools`        | Optional    | MCP tools, Python function tools, sub-agents, handoffs, or inherited tools.                       |
-| `policies`     | Optional    | Guardrails that inspect requests, responses, tool calls, or tool results.                         |
-| `params`       | Optional    | Typed user parameters available to tools/skills.                                                  |
-| `os_env`       | Optional    | Enables local OS tools such as file reads, writes, edits, and shell commands.                     |
-| `terminals`    | Optional    | Named interactive terminal environments the agent can launch.                                     |
-| `async`        | Optional    | Whether async work tools are exposed. Defaults to `true`.                                         |
-| `cancellable`  | Optional    | Whether the session can be cancelled. Defaults to `true`.                                         |
-| `timers`       | Optional    | Whether timer tools are exposed. Defaults to `false`.                                             |
-| `tool_groups`  | Optional    | Opt out of framework-owned tool groups the agent cannot use. Every group defaults to `true`.      |
+| Field | Required? | Purpose |
+| --- | --- | --- |
+| `name` | Recommended | Stable identifier shown in sessions and logs. |
+| `prompt` | Usually | Inline agent-owned system instructions. |
+| `instructions` | Optional | Inline instructions or a path to an instructions file. If set, it takes precedence over `prompt`. |
+| `executor` | Recommended | Harness, model, and auth settings. |
+| `tools` | Optional | MCP tools, Python function tools, sub-agents, handoffs, or inherited tools. |
+| `policies` | Optional | Guardrails that inspect requests, responses, tool calls, or tool results. |
+| `params` | Optional | Typed user parameters available to tools/skills. |
+| `os_env` | Optional | Enables local OS tools such as file reads, writes, edits, and shell commands. |
+| `terminals` | Optional | Named interactive terminal environments the agent can launch. |
+| `async` | Optional | Whether async work tools are exposed. Defaults to `true`. |
+| `cancellable` | Optional | Whether the session can be cancelled. Defaults to `true`. |
+| `timers` | Optional | Whether timer tools are exposed. Defaults to `false`. |
+| `tool_groups` | Optional | Opt out of framework-owned tool groups the agent cannot use. Every group defaults to `true`. |
 
 ## Executor
 
 ```yaml
 executor:
-  harness: claude-sdk # see the harness id list below
+  harness: claude-sdk        # see the harness id list below
   model: databricks-claude-opus-4-7
-  reasoning_effort: high # optional spec default: low | medium | high | xhigh (harness-dependent)
+  reasoning_effort: high     # optional spec default: low | medium | high | xhigh (harness-dependent)
   auth:
     type: databricks
-    profile: oss # Databricks profile for model routing
+    profile: oss             # Databricks profile for model routing
 ```
 
 Canonical `executor.harness` ids:
 
-| Family           | Headless / SDK                    | Native TUI           |
-| ---------------- | --------------------------------- | -------------------- |
-| Claude Code      | `claude-sdk`                      | `claude-native`      |
-| Codex            | `codex`                           | `codex-native`       |
-| Cursor           | `cursor`                          | `cursor-native`      |
-| OpenCode         | —                                 | `opencode-native`    |
-| Goose            | `goose`                           | `goose-native`       |
-| Kiro             | —                                 | `kiro-native`        |
-| Antigravity      | `antigravity`                     | `antigravity-native` |
-| GitHub Copilot   | `copilot`                         | —                    |
-| Devin            | —                                 | `devin-native`       |
-| Qwen Code        | `qwen`                            | `qwen-native`        |
-| Kimi Code        | `kimi`                            | `kimi-native`        |
-| Hermes           | `hermes`                          | `hermes-native`      |
-| Pi               | `pi`                              | `pi-native`          |
-| Grok Build       | `grok`                            | —                    |
-| Jcode            | `jcode`                           | —                    |
-| OpenAI           | `openai-agents`, `open-responses` | —                    |
-| Custom ACP agent | `acp:<slug>`                      | —                    |
+| Family | Headless / SDK | Native TUI |
+|---|---|---|
+| Claude Code | `claude-sdk` | `claude-native` |
+| Codex | `codex` | `codex-native` |
+| Cursor | `cursor` | `cursor-native` |
+| OpenCode | — | `opencode-native` |
+| Goose | `goose` | `goose-native` |
+| Kiro | — | `kiro-native` |
+| Antigravity | `antigravity` | `antigravity-native` |
+| GitHub Copilot | `copilot` | — |
+| Devin | — | `devin-native` |
+| Qwen Code | `qwen` | `qwen-native` |
+| Kimi Code | `kimi` | `kimi-native` |
+| Hermes | `hermes` | `hermes-native` |
+| Pi | `pi` | `pi-native` |
+| Grok Build | `grok` | — |
+| Jcode | `jcode` | — |
+| OpenAI | `openai-agents`, `open-responses` | — |
+| Custom ACP agent | `acp:<slug>` | — |
 
 Aliases such as `claude`, `opencode`, `devin`, `agy`, `github-copilot`,
 `kimi-code`, `qwen-code`, `grok-build` and `native-goose` resolve to these ids.
@@ -129,11 +129,11 @@ gateways and Databricks profiles configured through `omni setup`.
 
 ```yaml
 executor:
-  harness: antigravity # aliases: agy, google-antigravity (native: antigravity-native, agy-native)
+  harness: antigravity         # aliases: agy, google-antigravity (native: antigravity-native, agy-native)
   model: gemini-3.5-flash
   auth:
     type: api_key
-    api_key: ${GEMINI_API_KEY} # or ANTIGRAVITY_API_KEY
+    api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
 ### Pi context files
@@ -277,11 +277,11 @@ not accepted by Copilot.
 
 ```yaml
 executor:
-  harness: copilot # alias: github-copilot
-  model: claude-haiku-4.5 # a Copilot model id; omit for auto-select
+  harness: copilot             # alias: github-copilot
+  model: claude-haiku-4.5      # a Copilot model id; omit for auto-select
   auth:
     type: api_key
-    api_key: ${GH_TOKEN} # a GitHub token with Copilot access
+    api_key: ${GH_TOKEN}       # a GitHub token with Copilot access
 ```
 
 To route through OpenRouter / a gateway, declare a key/gateway provider in
@@ -299,7 +299,7 @@ and authenticate once with `kimi login` (OAuth or a Moonshot API key).
 
 ```yaml
 executor:
-  harness: kimi # alias: kimi-code
+  harness: kimi               # alias: kimi-code
   model: kimi-k2-turbo
 ```
 
@@ -325,8 +325,8 @@ OpenCode credential. See the [OpenCode harness guide](opencode-native.md).
 
 ```yaml
 executor:
-  harness: opencode-native # aliases: opencode, native-opencode
-  model: anthropic/<model-id> # optional; OpenCode's provider/model form
+  harness: opencode-native     # aliases: opencode, native-opencode
+  model: anthropic/<model-id>  # optional; OpenCode's provider/model form
 ```
 
 ### Goose
@@ -341,8 +341,8 @@ credential.
 
 ```yaml
 executor:
-  harness: goose # native: goose-native (alias: native-goose)
-  model: <model-id> # optional; forwarded as GOOSE_MODEL
+  harness: goose               # native: goose-native (alias: native-goose)
+  model: <model-id>            # optional; forwarded as GOOSE_MODEL
 ```
 
 The provider stays whatever `goose configure` selected unless
@@ -359,7 +359,7 @@ The provider stays whatever `goose configure` selected unless
 
 ```yaml
 executor:
-  harness: devin-native # aliases: devin, devin-acp, native-devin
+  harness: devin-native        # aliases: devin, devin-acp, native-devin
 ```
 
 ### Hermes
@@ -372,7 +372,7 @@ provider with `hermes model`; Omnigent stores no Hermes credential.
 
 ```yaml
 executor:
-  harness: hermes # native: hermes-native (alias: native-hermes)
+  harness: hermes              # native: hermes-native (alias: native-hermes)
   model: <provider>/<model-id> # optional; omit for Hermes' configured default
 ```
 
@@ -385,12 +385,12 @@ selection (`grok login --device-auth`, or a provider in `~/.jcode/config.toml`),
 so a `model` override is refused. When Omnigent's inference config binds
 `jcode` to an OpenAI-compatible Chat Completions provider, Omnigent writes a
 session-private Jcode config instead and forwards `model`. Jcode is not offered
-Omnigent's MCP tools. See the README's _Grok Build and Jcode_ section for install
+Omnigent's MCP tools. See the README's *Grok Build and Jcode* section for install
 steps.
 
 ```yaml
 executor:
-  harness: grok # or: jcode
+  harness: grok                # or: jcode
 ```
 
 ## Qwen Code
@@ -401,7 +401,7 @@ executor:
 
 ```yaml
 executor:
-  harness: qwen # aliases: qwen-code
+  harness: qwen                # aliases: qwen-code
   model: qwen/qwen-2.5-coder
 ```
 
@@ -658,15 +658,15 @@ os_env:
   sandbox:
     type: linux_bwrap
     egress_rules:
-      - "* pypi.org/**" # your other egress needs
-      - "* dbc-adb7b1a3-9097.cloud.databricks.com/**" # the proxied workspace
+      - "* pypi.org/**"                              # your other egress needs
+      - "* dbc-87654321-dcba.cloud.databricks.com/**"  # the proxied workspace
     credential_proxy:
       - type: databricks_cli
-        profiles: [dbc-adb7b1a3-9097, oss]
-        default: dbc-adb7b1a3-9097 # optional; sets DATABRICKS_CONFIG_PROFILE
+        profiles: [dbc-87654321-dcba, oss]
+        default: dbc-87654321-dcba   # optional; sets DATABRICKS_CONFIG_PROFILE
 ```
 
-Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
+Inside the sandbox, `databricks --profile dbc-87654321-dcba current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
 ### Git over SSH from a sandbox
@@ -899,7 +899,7 @@ environment variable (accepted values: `docker`, `podman`). The per-agent
 tools:
   sandbox:
     container_image: python:3.12-slim
-    container_runtime: podman # optional; defaults to docker (or OMNIGENT_CONTAINER_RUNTIME)
+    container_runtime: podman  # optional; defaults to docker (or OMNIGENT_CONTAINER_RUNTIME)
 ```
 
 ### Sub-agent tool
@@ -929,7 +929,7 @@ tools:
   coder:
     type: agent
     executor:
-      harness: cursor # Cursor model id (e.g. gpt-5, auto), not a databricks-* id
+      harness: cursor      # Cursor model id (e.g. gpt-5, auto), not a databricks-* id
       model: gpt-5
 ```
 
@@ -989,12 +989,12 @@ byte-bounded provider counts every advertised tool against its limit.
 
 ```yaml
 tool_groups:
-  browser: false # browser_navigate / _snapshot / _click / _type / _screenshot
-  scheduled_tasks: false # sys_scheduled_task_create / _list / _update / _delete
-  comments: false # list_comments / update_comment
-  policies: false # sys_add_policy / sys_policy_registry
-  agent_discovery: false # sys_agent_get / sys_agent_download / sys_agent_list
-  journal: false # sys_journal_read / _write_plan / _write_status / _write_note
+  browser: false          # browser_navigate / _snapshot / _click / _type / _screenshot
+  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete
+  comments: false         # list_comments / update_comment
+  policies: false         # sys_add_policy / sys_policy_registry
+  agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+  journal: false          # sys_journal_read / _write_plan / _write_status / _write_note
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values

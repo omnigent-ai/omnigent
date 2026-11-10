@@ -1679,7 +1679,7 @@ def test_codex_cli_config_default_pins_model_provider(config_home: Path) -> None
     assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
     assert "HARNESS_CODEX_GATEWAY_AUTH_COMMAND" not in env
     # No model pinned either — codex keeps its own default model against
-    # the pinned provider (matching how isaac configures it).
+    # the pinned provider (matching how a wrapper configures it).
     assert "HARNESS_CODEX_MODEL" not in env
 
 
@@ -1687,7 +1687,7 @@ def test_codex_subscription_default_pins_builtin_openai(config_home: Path) -> No
     """A codex ``subscription`` default pins the built-in ``openai`` provider.
 
     The executor bridges the user's ~/.codex/config.toml, whose custom
-    default model_provider (e.g. isaac's Databricks Unity Gateway) would
+    default model_provider (e.g. a Databricks Unity Gateway) would
     otherwise silently hijack a Subscription selection. Failure means
     "Subscription" stops meaning "ChatGPT login" on machines with a custom
     config.toml default.

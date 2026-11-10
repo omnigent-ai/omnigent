@@ -5879,6 +5879,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        copy_inference_snapshot: bool = True,
         override_model_override: str | None = None,
         override_model_override_set: bool = False,
         override_reasoning_effort: str | None = None,
@@ -5951,6 +5952,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param copy_inference_snapshot: When ``True`` (default), the fork
+            keeps the source's saved provider binding. When ``False``, it has
+            none and resolves its provider like a new session: used when the
+            fork binds another agent, whose provider may differ.
         :param override_model_override: Explicit ``model_override`` for the
             fork, applied only when ``override_model_override_set`` is
             ``True`` — then it supersedes the ``copy_model_settings`` copy
@@ -6065,6 +6070,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             cloned_agent_description=cloned_agent_description,
             copy_model_settings=copy_model_settings,
             copy_terminal_launch_args=copy_terminal_launch_args,
+            copy_inference_snapshot=copy_inference_snapshot,
             override_model_override=override_model_override,
             override_model_override_set=override_model_override_set,
             override_reasoning_effort=override_reasoning_effort,
@@ -6098,6 +6104,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        copy_inference_snapshot: bool = True,
         override_model_override: str | None = None,
         override_model_override_set: bool = False,
         override_reasoning_effort: str | None = None,
@@ -6135,9 +6142,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
             )
 
-        _validate_inference_snapshot(
-            source_meta_ref.inference_snapshot if source_meta_ref else None
-        )
+        if copy_inference_snapshot:
+            _validate_inference_snapshot(
+                source_meta_ref.inference_snapshot if source_meta_ref else None
+            )
 
         with self._conv_session("prepare_fork_conversation") as session:
             source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))
@@ -6603,7 +6611,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 kind=encoded_default_kind,
                 terminal_launch_args=source_terminal_args,
                 inference_snapshot=(
-                    source_meta_ref.inference_snapshot if source_meta_ref else None
+                    source_meta_ref.inference_snapshot
+                    if source_meta_ref and copy_inference_snapshot
+                    else None
                 ),
                 project_id=project_id,
                 side_chat_parent_id=side_chat_parent_id,
