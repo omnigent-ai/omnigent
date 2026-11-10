@@ -12,6 +12,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from importlib import import_module
 from itertools import batched, groupby
 from pathlib import Path
@@ -175,6 +176,7 @@ from omnigent.stores import (
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
+    SessionActivity,
     SessionConnectivity,
     runner_seen_is_fresh,
 )
@@ -194,6 +196,16 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _RECONNECT_BINDING_BATCH_SIZE = 128
+_HOST_HOLD_SNAPSHOT_BATCH_SIZE = 128
+
+
+@dataclass(frozen=True)
+class _HostOfflineHold:
+    """The outcome and turn ownership captured across one host-offline wait."""
+
+    outcome: str
+    mid_turn_sessions: frozenset[str]
+    session_owners: dict[str, tuple[object, int, str | None, str | None]]
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -276,6 +288,9 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True
+    # Scheduled tasks accept ``source_session_id``: each run starts from a copy
+    # of a session. Older servers reject it.
+    scheduled_task_source_sessions: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
     automation_trigger_poll_minutes: int = 10
@@ -1598,6 +1613,7 @@ def create_app(
         str | list[str] | Callable[[], str | list[str] | None] | None
     ) = None,
     harness_install: bool | Callable[[], bool] | None = None,
+    mcp_disabled_servers: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
@@ -1810,6 +1826,11 @@ def create_app(
         )
     else:
         app_harness_install = harness_install
+    app_mcp_disabled_servers = (
+        resolved_feature_flags.enabled(Feature.MCP_DISABLED_SERVERS)
+        if mcp_disabled_servers is None
+        else mcp_disabled_servers
+    )
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
     if automations_v2_enabled:
         if scheduled_task_store is None:
@@ -1853,7 +1874,7 @@ def create_app(
     # auth_provider wired in, and (c) account_store passed in.
     #
     # account_store is an EXPLICIT parameter (not constructed in
-    # here) so the internal hosted product can opt out of accounts
+    # here) so a hosted deployment can opt out of accounts
     # persistence entirely by passing None — even when it happens
     # to deploy with the accounts code on disk. Without this gate
     # the create_app factory would force every consumer to carry
@@ -1889,7 +1910,9 @@ def create_app(
         on_retire=shutdown_state.note_runner_tunnel_retired,
         on_work_dispatched=managed_host_keepalive.record_work_dispatched,
     )
-    host_registry = HostRegistry()
+    host_registry = HostRegistry(
+        mcp_disabled_servers=app_mcp_disabled_servers, feature_flags=resolved_feature_flags
+    )
     runner_router = RunnerRouter(
         registry=tunnel_registry,
         conversation_store=conversation_store,
@@ -2345,6 +2368,7 @@ def create_app(
     app.state.picker_curation = picker_curation
     app.state.feature_flags = resolved_feature_flags
     app.state.harness_install = app_harness_install
+    app.state.mcp_disabled_servers = app_mcp_disabled_servers
     app.state.automations = True if automations is None else automations
 
     def automations_available() -> bool:
@@ -3512,9 +3536,8 @@ def create_app(
         — when ``accounts_enabled`` is false, the SPA never
         registers ``/login``, ``/register``, ``/members`` and
         never renders the AccountMenu, so the bundle behaves
-        identically to a pre-PR-2008 build for header / OIDC
-        deploys (in particular, the internal hosted product that
-        syncs from this repo).
+        identically to a build without accounts for header / OIDC
+        deploys (in particular, hosted deployments).
 
         Authentication: this endpoint is intentionally UNAUTHED
         so the SPA can probe it before holding a session cookie.
@@ -3550,11 +3573,10 @@ def create_app(
         needs_setup = False
         if accounts_enabled and account_store is not None:
             needs_setup = not any(u.has_password for u in account_store.list_users())
-        # databricks_features gates the Databricks-deployment-only UI hints
-        # (the "Databricks Lakebox" connect tab). True only when the internal
-        # lakebox launcher module is present — it is excluded from the OSS
-        # export, so an OSS build reports False and the SPA shows the clean,
-        # provider-agnostic hints. find_spec is side-effect-free (no import).
+        # databricks_features gates the Databricks-only UI hints (the
+        # "Databricks Lakebox" connect tab). True only when the lakebox launcher
+        # module is present; otherwise the SPA shows the provider-agnostic hints.
+        # find_spec is side-effect-free (no import).
         import importlib.util
 
         databricks_features = (
@@ -4002,6 +4024,7 @@ def create_app(
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
                 artifact_store=artifact_store,
+                file_store=file_store,
                 project_store=project_store,
                 automations=app.state.automations,
                 liveness_lookup=_bulk_session_liveness,
@@ -4053,6 +4076,32 @@ def create_app(
         pending = _disconnect_grace_tasks.pop(runner_id, None)
         if pending is not None and not pending.done():
             pending.cancel()
+
+    def _held_session_owner(session_id: str) -> tuple[object, int, str | None, str | None]:
+        """Identify the local turn and relay observed when its host went offline."""
+        from omnigent.server.routes._sessions.common import (
+            _runner_relay_tasks,
+            _session_active_response_cache,
+            _session_status_cache,
+        )
+
+        relay = _runner_relay_tasks.get(session_id)
+        return (
+            relay,
+            relay.running_event_count if relay is not None else 0,
+            _session_status_cache.get(session_id),
+            _session_active_response_cache.get(session_id),
+        )
+
+    def _held_session_owner_changed(
+        session_id: str, owner: tuple[object, int, str | None, str | None]
+    ) -> bool:
+        """Preserve newer local work; ordinary relay teardown does not establish it."""
+        old_relay, old_count, old_status, old_response = owner
+        relay, count, status, response = _held_session_owner(session_id)
+        return (status, response) != (old_status, old_response) or (
+            relay is not None and (relay is not old_relay or count != old_count)
+        )
 
     async def _mark_disconnected_runner_failed(
         runner_id: str,
@@ -4167,12 +4216,13 @@ def create_app(
             message="Runner disconnected unexpectedly.",
         )
         hold_started = time.monotonic()
-        hold = None if idle_shutdown else await _hold_for_offline_host(runner_id, affected)
+        held = None if idle_shutdown else await _hold_for_offline_host(runner_id, affected)
+        hold = held.outcome if held is not None else None
         hold_s = None if hold is None else time.monotonic() - hold_started
         relaunch_host_id: str | None = None
         if hold in ("runner_reconnected", "server_shutdown"):
             return
-        if hold is not None:
+        if held is not None:
             # Sessions may have moved, stopped, or gone live elsewhere meanwhile.
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -4185,6 +4235,26 @@ def create_app(
                 for conv in affected:
                     _relinquish_session_live_state(conv.id)
                 return
+            from omnigent.server.routes._sessions.orchestration import (
+                _clear_departed_runner_background_work,
+            )
+
+            unsettled = []
+            for conv in affected:
+                owner = held.session_owners.get(conv.id)
+                if owner is not None and _held_session_owner_changed(conv.id, owner):
+                    continue
+                if (
+                    conv.id in held.mid_turn_sessions
+                    and conv.runner_id == runner_id
+                    and conv.live_status in ("idle", "failed")
+                ):
+                    # Another replica settled this turn while this replica kept its old cache.
+                    _relinquish_session_live_state(conv.id)
+                    _clear_departed_runner_background_work(conv, int(time.time()))
+                    continue
+                unsettled.append(conv)
+            affected = unsettled
             if hold == "expired":
                 error = ErrorDetail(
                     code="runner_disconnected",
@@ -4303,7 +4373,9 @@ def create_app(
                     "Relaunch after host return failed for session=%s", conv.id, exc_info=True
                 )
 
-    async def _hold_for_offline_host(runner_id: str, affected: "list[Conversation]") -> str | None:
+    async def _hold_for_offline_host(
+        runner_id: str, affected: "list[Conversation]"
+    ) -> _HostOfflineHold | None:
         """Wait for a runner whose user-run host dropped with it mid-turn.
 
         A laptop that sleeps or loses Wi-Fi takes its runner along and usually
@@ -4312,7 +4384,7 @@ def create_app(
         then the caller settles the turn before relaunching its runner.
         A crash report cancels this task and fails the turn as before.
 
-        :returns: ``None`` when nothing was held, else how the hold ended:
+        :returns: ``None`` when nothing was held, else its status snapshots and outcome:
             ``"runner_reconnected"``, ``"server_shutdown"``, ``"expired"``,
             or ``"host_back_without_runner"`` (the host returned without its runner).
         """
@@ -4337,6 +4409,27 @@ def create_app(
         loop = asyncio.get_running_loop()
         started = loop.time()
         deadline = started + HOST_OFFLINE_HOLD_S
+        owners = {conv.id: _held_session_owner(conv.id) for conv in held}
+        # Order the snapshot after local status writes so a later terminal row
+        # cannot merely be persistence lag behind this replica's running edge.
+        saved: dict[str, SessionActivity] = {}
+        for batch in batched(owners, _HOST_HOLD_SNAPSHOT_BATCH_SIZE):
+            snapshot = await asyncio.wrap_future(
+                session_live_state.submit(
+                    "runner_host_hold_snapshot",
+                    conversation_store.get_session_activity,
+                    list(batch),
+                )
+            )
+            saved.update(snapshot or {})
+        mid_turn_sessions = frozenset(
+            session_id
+            for session_id, activity in saved.items()
+            if activity.runner_id == runner_id
+            and activity.live_status in _MID_TURN_STATUSES
+            and session_id in owners
+            and not _held_session_owner_changed(session_id, owners[session_id])
+        )
         host_back_deadline: float | None = None
         outcome = "cancelled"
         for conv in held:
@@ -4398,7 +4491,7 @@ def create_app(
                         held_s=round(loop.time() - started, 3),
                     ),
                 )
-        return outcome
+        return _HostOfflineHold(outcome, mid_turn_sessions, owners)
 
     async def _relay_turn_held_for_host(runner_id: str, session_id: str) -> bool:
         """Whether this replica's disconnect task holds a lost relay's turn for its host."""
@@ -5036,7 +5129,13 @@ def create_app(
             tags=["hosts"],
         )
         app.include_router(
-            create_mcp_servers_router(host_registry, host_store, auth_provider=auth_provider),
+            create_mcp_servers_router(
+                host_registry,
+                host_store,
+                auth_provider=auth_provider,
+                mcp_disabled_servers=app_mcp_disabled_servers,
+                feature_flags=resolved_feature_flags,
+            ),
             prefix="/v1",
             tags=["hosts"],
         )

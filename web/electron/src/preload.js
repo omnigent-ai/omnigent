@@ -236,9 +236,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   controlHost: (action) => ipcRenderer.invoke("omnigent:host-control", action),
   /**
-   * Desktop feature gates the server can't know about — currently
+   * Desktop feature gates the server can't know about: currently
    * `{ databricksInternalFeatures }` from macOS Managed Preferences, scoped
-   * to the window's server (true only on Databricks-managed servers).
+   * to the window's server (true only on managed servers).
    * Resolves null off a connected server.
    */
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
@@ -262,11 +262,10 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
   /**
-   * Renew this machine's dbcert; Arca Companion copies
-   * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
+   * Renew this machine's dbcert. Resolves a `{ ok, error? }` result.
    */
   refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),
-  /** Check the laptop's dbcert without starting sign-in. */
+  /** Check this machine's dbcert without starting sign-in. */
   checkDbcert: () => ipcRenderer.invoke("omnigent:dbcert-check"),
 
   /**

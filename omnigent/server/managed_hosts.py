@@ -765,6 +765,8 @@ class ManagedSandboxConfig:
     )
     # Request-scoped reference; teardown must not depend on launch authorization.
     profile_selection: dict[str, Any] | None = None
+    # Internal continuation permission, scoped to one already-admitted legacy host.
+    unprofiled_host_id: str | None = None
     manages_profiles: bool = False
 
 
@@ -1366,18 +1368,34 @@ def _apply_keep_warm(
 
 
 def deployment_with_sandbox_profile(
-    deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
+    deployment: ManagedSandboxDeployment,
+    snapshot: dict[str, Any] | None,
+    *,
+    unprofiled_host: Host | None = None,
 ) -> ManagedSandboxDeployment:
-    """Pass a saved provider reference to fresh launcher instances."""
-    if snapshot is None:
+    """Carry the accepted profile or an admitted legacy host into its launcher."""
+    if snapshot is not None:
+        entry = deployment.for_provider(snapshot["provider"])
+    elif unprofiled_host is not None:
+        entry = deployment.recorded(unprofiled_host.sandbox_provider)
+    else:
         return deployment
-    entry = deployment.for_provider(snapshot["provider"])
     if entry is None:
         raise HTTPException(status_code=400, detail="The sandbox profile provider is unavailable")
     return replace(
         deployment,
         configs=tuple(
-            replace(config, profile_selection=snapshot) if config is entry else config
+            replace(
+                config,
+                profile_selection=snapshot,
+                unprofiled_host_id=(
+                    unprofiled_host.host_id
+                    if snapshot is None and unprofiled_host is not None
+                    else None
+                ),
+            )
+            if config is entry
+            else config
             for config in deployment.configs
         ),
     )
@@ -3930,6 +3948,7 @@ async def _select_launch_profile(
     owner: str,
     *,
     sandbox_id: str | None = None,
+    host_id: str | None = None,
 ) -> None:
     from omnigent.server.provider_sandbox_profiles import select_provider_profile
 
@@ -3940,7 +3959,9 @@ async def _select_launch_profile(
                 status_code=403, detail="Sandbox profile execution identity mismatch"
             )
         await asyncio.to_thread(select_provider_profile, launcher, snapshot, sandbox_id=sandbox_id)
-    elif getattr(launcher, "manages_profiles", False):
+    elif getattr(launcher, "manages_profiles", False) and not (
+        host_id is not None and entry.unprofiled_host_id == host_id
+    ):
         raise HTTPException(status_code=422, detail="Choose a sandbox profile for this provider")
 
 
@@ -4208,7 +4229,7 @@ async def _relaunch_managed_host(
     # Stay on the host's provider so the new generation is armed with ITS
     # token TTL, not the deployment default's.
     entry = config.recorded(host.sandbox_provider)
-    await _select_launch_profile(launcher, entry, host.user_id)
+    await _select_launch_profile(launcher, entry, host.user_id, host_id=host.host_id)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     # ponytail: one pending cleanup slot; drain recorded generations before replacing them.
     for sandbox_id in dict.fromkeys((host.terminating_sandbox_id, host.sandbox_id)):
@@ -4803,7 +4824,9 @@ async def resume_managed_host(
         # providers retain their filesystem and do not need workspace prep.
         workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
         entry = config.recorded(host.sandbox_provider)
-        await _select_launch_profile(launcher, entry, host.user_id, sandbox_id=host.sandbox_id)
+        await _select_launch_profile(
+            launcher, entry, host.user_id, sandbox_id=host.sandbox_id, host_id=host.host_id
+        )
         workspace_repos = _apply_git_clone_options(launcher, workspace_repos, entry.git_clone)
         sandbox_id = host.sandbox_id
         _logger.info(

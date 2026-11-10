@@ -25,6 +25,8 @@ def provider(monkeypatch: pytest.MonkeyPatch):
     reset_for_tests()
     monkeypatch.delenv("GITLAB_HOST", raising=False)
     monkeypatch.delenv("GLAB_HOST", raising=False)
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.delenv("GLAB_TOKEN", raising=False)
     yield
     reset_for_tests()
 
@@ -159,9 +161,17 @@ def ref() -> PullRequestRef:
     return PullRequestRef.from_url(URL)
 
 
-def test_workspace_fork_mr_keeps_target_identity_and_details(root: str, api: Mock) -> None:
+@pytest.mark.parametrize("use_token", [False, True])
+def test_workspace_fork_mr_keeps_target_identity_and_details(
+    root: str, api: Mock, monkeypatch: pytest.MonkeyPatch, use_token: bool
+) -> None:
+    if use_token:
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+        monkeypatch.setenv("GITLAB_TOKEN", "test-token")
     info = module.PULL_REQUESTS.workspace_info(root)
     assert info["provider"] == "gitlab" and info["auth"]["authenticated"]
+    assert (info["auth"]["cli"] is None) == use_token
+    assert module.PULL_REQUESTS.titles_available(root)
     assert info["branch"] == "feature"
     assert info["repo"]["name_with_owner"] == "team/sub/project"
     assert info["selected_pr_url"] == URL
@@ -275,6 +285,7 @@ def test_attached_mr_and_title_accept_project_path_case(
     [("fork", None, None), ("origin", "fork", None), ("origin", "origin", "fork")],
     ids=["push-u-fork", "push-default", "branch-push-override"],
 )
+@pytest.mark.parametrize("token_host", [None, "git.example.test:8443"])
 def test_fork_mr_discovery_follows_push_remote_precedence(
     root: str,
     api: Mock,
@@ -282,12 +293,19 @@ def test_fork_mr_discovery_follows_push_remote_precedence(
     tracking: str,
     push_default: str | None,
     push_remote: str | None,
+    token_host: str | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from omnigent.runner import pr_resource
 
+    if token_host:
+        monkeypatch.setenv("GITLAB_HOST", token_host)
+        monkeypatch.setenv("GITLAB_TOKEN", "test-token")
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+        mr["web_url"] = URL.replace("gitlab.com", token_host)
     for args in (
         ["remote", "set-url", "origin", "https://gitlab.com/team/sub/project.git"],
-        ["remote", "add", "fork", "https://gitlab.com/fork/sub/project.git"],
+        ["remote", "add", "fork", f"https://{token_host or 'gitlab.com'}/fork/sub/project.git"],
         ["config", "branch.feature.remote", tracking],
         ["config", "branch.feature.merge", "refs/heads/feature"],
     ):
@@ -308,7 +326,7 @@ def test_fork_mr_discovery_follows_push_remote_precedence(
     api.object.side_effect = response
     info = pr_resource.pr_info(root)
     assert info["pr"] is not None, info["warnings"]
-    assert info["pr"]["url"] == URL and not info["warnings"]
+    assert info["pr"]["url"] == mr["web_url"] and not info["warnings"]
     assert api.object.call_args_list[0].args == ("projects/fork%2Fsub%2Fproject",)
 
 
@@ -345,7 +363,13 @@ def test_no_oauth_or_cli_failure_hides_checkout(
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-def test_auth_failure_keeps_repo_context(root: str, api: Mock, explicit: bool) -> None:
+@pytest.mark.parametrize("use_token", [False, True])
+def test_auth_failure_keeps_repo_context(
+    root: str, api: Mock, monkeypatch: pytest.MonkeyPatch, explicit: bool, use_token: bool
+) -> None:
+    if use_token:
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+        monkeypatch.setenv("GITLAB_TOKEN", "test-token")
     api.object.side_effect = GitLabError("Access denied")
     info = (
         module.PULL_REQUESTS.reference_info(root, ref())
@@ -357,6 +381,7 @@ def test_auth_failure_keeps_repo_context(root: str, api: Mock, explicit: bool) -
         ref().repository if explicit else "fork/sub/project"
     )
     assert info["pr"] is None and not info["auth"]["authenticated"]
+    assert (info["auth"]["cli"] is None) == use_token
     assert info["auth"]["hint"] == "Access denied"
     assert info["warnings"] == ["Access denied"]
 
@@ -769,20 +794,34 @@ def test_generic_attach_failure_does_not_persist(
     assert SessionPrRegistry("gitlab-panel").list() == []
 
 
+@pytest.mark.parametrize("auth_source", ["glab", "GITLAB_HOST", "GLAB_HOST"])
+@pytest.mark.parametrize("ssh", [False, True])
 def test_private_port_remote_resolves_through_generic_panel(
-    root: str, api: Mock, mr: dict, monkeypatch: pytest.MonkeyPatch
+    root: str, api: Mock, mr: dict, monkeypatch: pytest.MonkeyPatch, auth_source: str, ssh: bool
 ) -> None:
     from omnigent.runner import pr_resource
 
     host = "git.example.test:8443"
-    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITLAB_HOSTS", host)
+    if auth_source == "glab":
+        monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITLAB_HOSTS", host)
+    else:
+        monkeypatch.setenv(auth_source, host)
+        monkeypatch.setenv("GITLAB_TOKEN", "test-token")
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+    remote = (
+        "git@git.example.test:fork/sub/project.git"
+        if ssh
+        else f"https://{host}/fork/sub/project.git"
+    )
     subprocess.run(
-        ["git", "-C", root, "remote", "set-url", "origin", f"https://{host}/fork/sub/project.git"],
+        ["git", "-C", root, "remote", "set-url", "origin", remote],
         check=True,
     )
     mr["web_url"] = URL.replace("gitlab.com", host)
     info = pr_resource.pr_info(root)
     assert info["provider"] == "gitlab" and info["pr"]["url"] == mr["web_url"]
+    assert info["auth"]["authenticated"]
+    assert (info["auth"]["cli"] is None) == (auth_source != "glab")
 
 
 @pytest.mark.parametrize(

@@ -5197,33 +5197,36 @@ def test_dispatch_trace_context_reaches_runner_but_not_daemon(
         assert DISPATCH_TRACESTATE_ENV_VAR not in daemon_env
 
 
-def test_build_runner_env_passthrough_survives_remote_daemon_hop(
+@pytest.mark.parametrize("server", [None, "https://server.example.test"])
+@pytest.mark.parametrize(
+    "credential_name", ["DATABRICKS_LINEAR_API_KEY", "GITLAB_TOKEN", "GLAB_TOKEN"]
+)
+def test_build_runner_env_passthrough_survives_daemon_hop(
     monkeypatch: pytest.MonkeyPatch,
+    server: str | None,
+    credential_name: str,
 ) -> None:
     """OMNIGENT_RUNNER_ENV_PASSTHROUGH forwards a named var through BOTH hops.
 
-    In ``--server`` mode the env crosses two strips: CLI→daemon
+    The env crosses two strips: CLI→daemon
     (``_build_host_daemon_env``) then daemon→runner (``_build_runner_env``). The
     control var must survive the first hop or the second never sees the names it
-    lists. A named var travels via the ``DATABRICKS_`` prefix on the first hop and
-    the passthrough on the second, so it must reach the runner; an unnamed secret
-    must not.
+    lists. Only a named credential must reach the runner.
     """
     from omnigent.cli import _build_host_daemon_env
 
     monkeypatch.setenv("PATH", "/usr/bin")
-    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "DATABRICKS_LINEAR_API_KEY")
-    monkeypatch.setenv("DATABRICKS_LINEAR_API_KEY", "lin-secret")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", credential_name)
+    monkeypatch.setenv(credential_name, "test-secret")
     monkeypatch.setenv("DATABRICKS_UNNAMED", "should-not-forward")
 
-    server = "https://example.databricksapps.com"
     daemon_env = _build_host_daemon_env(server_url=server)
     # The first hop must keep the control var (regression guard for the remote no-op).
-    assert daemon_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "DATABRICKS_LINEAR_API_KEY"
+    assert daemon_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == credential_name
 
     runner_env = _build_runner_env(
         daemon_env,
-        server_url=server,
+        server_url=server or "http://localhost:8000",
         runner_id="runner_abc",
         binding_token="tok",
         workspace="/ws",
@@ -5231,7 +5234,7 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     )
 
     # The named var reaches the runner; an unnamed one does not.
-    assert runner_env["DATABRICKS_LINEAR_API_KEY"] == "lin-secret"
+    assert runner_env[credential_name] == "test-secret"
     assert "DATABRICKS_UNNAMED" not in runner_env
 
 
@@ -5244,6 +5247,8 @@ def test_host_settings_survive_daemon_and_runner_hops(
     selectors = {
         "OMNIGENT_HOST_SANDBOX_BACKEND": "phoenix-kubernetes",
         "GLAB_CONFIG_DIR": str(tmp_path / "glab"),
+        "GITLAB_HOST": "git.example.test:8443",
+        "GLAB_HOST": "git.example.test:8443",
         "GH_CONFIG_DIR": str(tmp_path / "gh"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_CONFIG_DIRS": str(tmp_path / "system-config"),
@@ -5381,7 +5386,7 @@ def test_build_runner_env_propagates_disable_keyring() -> None:
     ``keychain:<name>`` refs. If the flag didn't reach the runner it would fall
     back to the OS keyring and fail with "no stored secret named …" for a key
     the CLI just saved — the headless / file-backend deploy case (and the exact
-    failure hit while dogfooding the first-run flow).
+    failure hit while trying the first-run flow).
     """
     base = {"PATH": "/usr/bin:/bin", "OMNIGENT_DISABLE_KEYRING": "1"}
     env = _build_runner_env(
@@ -7296,7 +7301,7 @@ async def test_connected_host_retries_auth_rejection_indefinitely(
 
     A host that already completed an upgrade proved its credentials and
     authorization are valid. A later 401/403 is almost always a dropped
-    VPN whose corporate proxy answers the upgrade before it reaches the
+    VPN whose proxy answers the upgrade before it reaches the
     server — killing the host would drop its live runners and force a
     manual ``omnigent host`` restart once the VPN reconnects. It must keep
     retrying past the fresh-host fatal threshold instead.
@@ -11926,3 +11931,132 @@ async def test_host_publishes_stored_workspace_at_startup(
 
     assert host._origin_workspace_id == "4242424242424242"
     assert os.environ[debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR] == "4242424242424242"
+
+
+@pytest.mark.parametrize(
+    "harness,plugin", [("claude", None), ("claude", "toolkit"), ("codex", None)]
+)
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_host_saves_mcp_preference_over_tunnel(
+    tmp_path, monkeypatch, harness, plugin, enabled
+):
+    from omnigent.host.frames import (
+        HostSetMcpServerEnabledFrame,
+        HostSetMcpServerEnabledResultFrame,
+    )
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.mcp_disabled_servers import ServerKey, is_disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    summary = {"name": "docs", "harness": harness, "transport": "stdio", "scope": "user"}
+    source_id = "a" * 64 if plugin else None
+    if plugin:
+        summary.update(plugin=plugin, source_id=source_id)
+    monkeypatch.setattr(
+        "omnigent.host.mcp_inventory.configured_mcp_servers",
+        lambda: [ConfiguredMcpServer(summary, {})],
+    )
+    host, ws = _make_host_process(), _RecordingWS()
+    frame = HostSetMcpServerEnabledFrame("save", harness, "docs", enabled, plugin, source_id)
+    host._start_frame_task(ws, encode_host_frame(frame))
+    await _drain_frame_tasks(host)
+    result = decode_host_frame(ws.sent[-1])
+    assert isinstance(result, HostSetMcpServerEnabledResultFrame)
+    assert result.status == "ok"
+    assert result.server["enabled"] == str(enabled).lower()
+    assert is_disabled(ServerKey(harness, "docs", plugin)) is not enabled
+
+
+@pytest.mark.parametrize(
+    "server,plugin,source_id,managed",
+    [
+        ("omnigent", None, None, False),
+        ("missing", None, None, False),
+        ("docs", None, None, True),
+        ("docs", None, "0" * 64, False),
+    ],
+)
+async def test_host_rejects_reserved_managed_or_stale_mcp(
+    tmp_path, monkeypatch, server, plugin, source_id, managed
+):
+    from omnigent.host.frames import HostSetMcpServerEnabledFrame
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.mcp_disabled_servers import FILENAME
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    summary = {"name": "docs", "harness": "claude", "transport": "stdio", "scope": "user"}
+    if managed:
+        summary["managed"] = "true"
+    monkeypatch.setattr(
+        "omnigent.host.mcp_inventory.configured_mcp_servers",
+        lambda: [ConfiguredMcpServer(summary, {})],
+    )
+    result = _make_host_process()._handle_set_mcp_server_enabled(
+        HostSetMcpServerEnabledFrame("save", "claude", server, False, plugin, source_id)
+    )
+    assert result.error_code == "invalid_server"
+    if managed:
+        assert result.error == "Managed MCP servers cannot be toggled"
+    assert not (tmp_path / FILENAME).exists()
+
+
+@pytest.mark.parametrize("stored", ["{broken", '{"version": 2, "disabled": []}'])
+async def test_host_reports_mcp_storage_failure_without_overwriting(tmp_path, monkeypatch, stored):
+    from omnigent.host.frames import (
+        HostSetMcpServerEnabledFrame,
+        HostSetMcpServerEnabledResultFrame,
+    )
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.mcp_disabled_servers import FILENAME
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    path = tmp_path / FILENAME
+    path.write_text(stored)
+    summary = {"name": "docs", "harness": "claude", "transport": "stdio", "scope": "user"}
+    monkeypatch.setattr(
+        "omnigent.host.mcp_inventory.configured_mcp_servers",
+        lambda: [ConfiguredMcpServer(summary, {})],
+    )
+    host, ws = _make_host_process(), _RecordingWS()
+    host._start_frame_task(
+        ws, encode_host_frame(HostSetMcpServerEnabledFrame("save", "claude", "docs", False))
+    )
+    await _drain_frame_tasks(host)
+    result = decode_host_frame(ws.sent[-1])
+    assert isinstance(result, HostSetMcpServerEnabledResultFrame)
+    assert result.status == "failed"
+    assert result.error_code == "io"
+    assert result.error == "Cannot update disabled MCP servers: io"
+    assert path.read_text() == stored
+
+
+@pytest.mark.parametrize("activation", [None, [], ["claude"], ["codex"], ["claude", "codex"]])
+async def test_mcp_activation_launch_frame_to_runner_environment(activation):
+    from omnigent.runner.identity import (
+        RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR,
+        runner_mcp_disabled_servers_active_harnesses,
+    )
+
+    frame = decode_host_frame(
+        encode_host_frame(
+            HostLaunchRunnerFrame(
+                "launch",
+                "binding",
+                "/repo",
+                mcp_disabled_servers_active_harnesses=activation,
+            )
+        )
+    )
+    env = _build_runner_env(
+        {RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR: '["codex"]'},
+        server_url="http://localhost",
+        runner_id="runner",
+        binding_token="binding",
+        workspace="/repo",
+        parent_pid=1,
+        mcp_disabled_servers_active_harnesses=frame.mcp_disabled_servers_active_harnesses,
+    )
+    assert runner_mcp_disabled_servers_active_harnesses(env) == activation
+    assert (RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR in env) is (
+        activation is not None
+    )

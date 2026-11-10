@@ -4674,11 +4674,14 @@ async def _run_managed_launch(
             sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
             provider = profile["provider"]
         elif sandbox_profiles is not None:
-            await asyncio.to_thread(
-                sandbox_profiles.require_selection,
-                relaunch_host.sandbox_provider if relaunch_host is not None else provider,
-                user_id=owner,
-            )
+            if relaunch_host is not None:
+                sandbox_config = deployment_with_sandbox_profile(
+                    sandbox_config, None, unprofiled_host=relaunch_host
+                )
+            else:
+                await asyncio.to_thread(
+                    sandbox_profiles.require_selection, provider, user_id=owner
+                )
     except (OmnigentError, HTTPException) as exc:
         reason = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
         tracker.fail(session_id, reason)
@@ -5859,6 +5862,7 @@ async def _run_managed_wake(
 
     try:
         profile = None
+        unprofiled_host = None
         if sandbox_profiles is not None:
             host = await asyncio.to_thread(host_store.get_host, host_id)
             if host is None:
@@ -5867,10 +5871,10 @@ async def _run_managed_wake(
                 sandbox_profiles, session_id, user_id=host.user_id, host_id=host_id
             )
             if profile is None:
-                await asyncio.to_thread(
-                    sandbox_profiles.require_selection, host.sandbox_provider, user_id=host.user_id
-                )
-        sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
+                unprofiled_host = host
+        sandbox_config = deployment_with_sandbox_profile(
+            sandbox_config, profile, unprofiled_host=unprofiled_host
+        )
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
         # Re-derived here rather than by the caller, matching the launch path:

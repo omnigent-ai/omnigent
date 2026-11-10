@@ -1086,6 +1086,7 @@ _CODEX_INTERNAL_ERROR_CODE = -32603
 
 #: JSON-RPC invalid-request code codex returns for protocol-level rejections.
 _CODEX_INVALID_REQUEST_CODE = -32600
+_CODEX_INVALID_PARAMS_CODE = -32602
 
 #: Substring in codex's ``-32603`` message when its thread-store cannot
 #: load/resume a thread's rollout — stable across the wrapper phrasings
@@ -1227,6 +1228,29 @@ def is_server_draining_error(error: CodexAppServerResponseError) -> bool:
         error.code == _CODEX_INVALID_REQUEST_CODE
         and error.message == "Server is draining; retry after reconnecting"
     )
+
+
+def input_too_large_limits(error: CodexAppServerResponseError) -> tuple[int, int] | None:
+    """Read the sizes when Codex refused turn input as too large to accept.
+
+    Codex validates ``turn/start`` and ``turn/steer`` input before submitting
+    it, answering ``-32602`` with ``data.input_error_code == "input_too_large"``,
+    so nothing reached the thread.
+
+    :param error: Structured JSON-RPC response error.
+    :returns: ``(actual_chars, max_chars)`` for that refusal, ``(0, 0)`` when it
+        omits the sizes, or ``None`` for any other error.
+    """
+    if error.code != _CODEX_INVALID_PARAMS_CODE:
+        return None
+    data = error.error.get("data") if isinstance(error.error, dict) else None
+    if not isinstance(data, dict) or data.get("input_error_code") != "input_too_large":
+        return None
+    actual = data.get("actual_chars")
+    limit = data.get("max_chars")
+    if isinstance(actual, int) and isinstance(limit, int):
+        return actual, limit
+    return 0, 0
 
 
 def is_compaction_steer_refusal(error: CodexAppServerResponseError) -> bool:
@@ -4159,6 +4183,7 @@ def build_codex_native_server(
     model_catalog_rows: list[_JsonObject] | None = None,
     reconcile_process_registry: bool = True,
     terminal_launch_args: Sequence[str] = (),
+    active_harnesses: Collection[str] | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -4270,6 +4295,7 @@ def build_codex_native_server(
     ):
         config_overrides.append(f"model={json.dumps(pinned_model)}")
     return CodexNativeAppServer(
+        active_harnesses=active_harnesses,
         codex_path=resolved_codex,
         socket_path=socket_path,
         codex_home=codex_home,
@@ -4709,8 +4735,8 @@ def _resolve_subscription_launch(
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     # Pin codex's built-in ``openai`` provider: the bridged config.toml may
-    # set a custom default ``model_provider`` (e.g. isaac's Databricks AI
-    # Gateway), which would silently hijack a Subscription selection. A
+    # set a custom default ``model_provider`` (e.g. a Databricks AI
+    # Gateway provider), which would silently hijack a Subscription selection. A
     # no-op when the user's config sets no custom default.
     subscription_overrides = ['model_provider="openai"']
     if _codex_login_usable():
@@ -4947,7 +4973,7 @@ def resolve_native_codex_launch(
     from omnigent.host.databricks_credential import api_key_auth_precludes_broker
 
     if entry is None and not api_key_auth_precludes_broker(spec):
-        # Use the managed host's Databricks broker only when no provider or
+        # Use the managed host's credential broker only when no provider or
         # explicit API-key auth selected a route. Host boot populated ucode
         # state so the model resolves to a served id.
         from omnigent.host.databricks_credential import (

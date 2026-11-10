@@ -45,9 +45,8 @@ if TYPE_CHECKING:
     from omnigent.onboarding.openclaw_config import OpenClawDiscovery, SourceKind
     from omnigent.onboarding.provider_config import ProviderEntry
 
-# _INTERNAL_BETA_DEFAULT_SERVER (Databricks Apps host) moved to
-# omnigent.onboarding.internal_beta (excluded from the OSS build); the
-# internal-beta setup branch and the sandbox CLI import it from there.
+# _INTERNAL_BETA_DEFAULT_SERVER lives in omnigent.onboarding.internal_beta;
+# the --internal-beta setup branch and the sandbox CLI import it from there.
 # Brand shown for an auto-configured CLI login in the credentials callout —
 # the product the login authenticates, not the CLI name (the codex CLI logs in
 # a ChatGPT subscription). Keyed by the ambient detection name; these are the
@@ -185,7 +184,7 @@ def _tmux_dependency_problem() -> str | None:
 def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     """Run Databricks setup against a temp config containing only our three profiles.
 
-    The temp file starts with just the canonical internal-beta profile
+    The temp file starts with just the canonical profile
     sections (see ``DEFAULT_PROFILES``) seeded from the original when they
     exist, so there is exactly one section per workspace host and
     ``databricks auth token --host X`` never hits the "multiple profiles
@@ -225,7 +224,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
             else:
                 os.environ[var] = prev
 
-    # Temp file contains only the canonical internal-beta profile sections
+    # Temp file contains only the canonical profile sections
     # (see DEFAULT_PROFILES), seeded from the original when they already
     # exist. Everything else is excluded so there is exactly one
     # section per workspace host and `databricks auth token --host X`
@@ -641,7 +640,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     # harness, the menu is scoped to that harness's surface.
     options = add_menu_options_for_family(family) if family is not None else add_menu_options()
     # A custom provider defined by the user's own ~/.codex/config.toml
-    # (e.g. isaac's Databricks Unity Gateway) that is not currently configured
+    # (e.g. a Databricks Unity Gateway) that is not currently configured
     # gets its own add option. This is the only way back after Remove —
     # removal dismisses the detection so it stops auto-adopting, and there
     # is nothing to type/paste here (the credential lives in that file).
