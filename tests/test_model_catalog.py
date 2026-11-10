@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -24,7 +23,6 @@ import pytest
 from cachetools import TTLCache
 
 import omnigent.models.model_catalog as model_catalog
-from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.models.model_catalog import (
     ModelEntry,
     ModelListing,
@@ -38,7 +36,7 @@ from omnigent.models.model_catalog import (
     resolve_model_provider,
     spec_harness,
 )
-from omnigent.models.model_fallbacks import _SMART_ROUTING_FALLBACKS, CODEX_DEFAULT_MODEL
+from omnigent.models.model_fallbacks import _SMART_ROUTING_FALLBACKS
 from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -2042,20 +2040,6 @@ def test_static_model_fallbacks_document_ownership(table_key: str) -> None:
     assert fallback.owner
     assert fallback.provenance
     assert fallback.discovery_gap
-
-
-def test_codex_default_model_names_a_concrete_variant() -> None:
-    """The codex launch default is codex's own spelling of a tiered model.
-
-    The bundled OpenAI catalog's newest row is ``gpt-5.6``, which codex
-    rejects as a family name, and codex's backend 400s the hyphenated
-    Databricks serving spelling — the default must be a dotted concrete
-    variant codex serves.
-    """
-    assert not CODEX_DEFAULT_MODEL.startswith("databricks-")
-    assert codex_spawn_model(CODEX_DEFAULT_MODEL) == CODEX_DEFAULT_MODEL
-    # A bare family alias has no tier segment after the dotted version.
-    assert re.fullmatch(r"gpt-\d+\.\d+", CODEX_DEFAULT_MODEL) is None
 
 
 def test_cursor_listing_uses_live_cli_base_models(

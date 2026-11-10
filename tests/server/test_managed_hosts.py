@@ -6720,6 +6720,60 @@ def test_parse_contributed_provider_builds_registry_backed_factory(
     assert launcher.config.namespace == "sandboxes"
 
 
+@pytest.mark.parametrize(
+    ("manages_profiles", "default_profile_id", "error"),
+    [
+        (True, "build", None),
+        (True, None, None),
+        (False, "build", "requires a provider that manages sandbox profiles"),
+        (True, "Build!", "must be a profile id"),
+        (True, 7, "must be a profile id"),
+    ],
+)
+def test_parse_default_profile_id(
+    contributed_acme_provider: None,
+    monkeypatch: pytest.MonkeyPatch,
+    manages_profiles: bool,
+    default_profile_id: object,
+    error: str | None,
+) -> None:
+    """`sandbox.default_profile_id` names a profile only for a profile-managing provider."""
+    from omnigent.onboarding.sandboxes import registry
+
+    metadata = registry.get_provider_metadata("acme")
+    assert metadata is not None
+    monkeypatch.setitem(
+        registry.plugin_state().providers,
+        "acme",
+        replace(metadata, manages_profiles=manages_profiles),
+    )
+    raw = {
+        "provider": "acme",
+        "server_url": "https://s.example.com",
+        "acme": {"namespace": "sandboxes"},
+        "default_profile_id": default_profile_id,
+    }
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            parse_sandbox_config(raw)
+        return
+    cfg = parse_sandbox_config(raw)
+    assert cfg is not None
+    assert cfg.default.default_profile_id == default_profile_id
+
+
+def test_default_profile_id_belongs_inside_a_provider_entry() -> None:
+    """Shared keys reach every listed provider, so a top-level default would mis-apply."""
+    with pytest.raises(ValueError, match=r"inside that provider's 'sandbox\.providers' entry"):
+        parse_sandbox_config(
+            {
+                "server_url": "https://s.example.com",
+                "default_profile_id": "build",
+                "providers": [{"provider": "kubernetes"}],
+            }
+        )
+
+
 def test_contributed_provider_config_is_validated(
     contributed_acme_provider: None,
 ) -> None:
