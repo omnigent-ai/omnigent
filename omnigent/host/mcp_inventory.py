@@ -220,8 +220,24 @@ def _cursor_servers(home: Path) -> list[ConfiguredMcpServer]:
     ]
 
 
+def _pi_servers(env: Mapping[str, str]) -> list[ConfiguredMcpServer]:
+    """``mcp.json`` in Pi's agent dir, which managed Pi sessions link into their own.
+
+    An entry with no ``command``, ``url`` or ``type`` only overrides a server Pi
+    defines elsewhere, so ``_summary`` leaves it out.
+    """
+    from omnigent.harnesses.pi_native.credentials import global_pi_agent_dir
+
+    data = _read_config(global_pi_agent_dir(env=env) / "mcp.json", "pi")
+    return [
+        ConfiguredMcpServer(summary, config)
+        for name, config in _servers_in(data).items()
+        if isinstance(config, Mapping) and (summary := _summary(name, config, "pi")) is not None
+    ]
+
+
 def configured_mcp_servers() -> list[ConfiguredMcpServer]:
-    """List user-level MCP servers across Claude, Codex, and Cursor on this host.
+    """List user-level MCP servers across Claude, Codex, Cursor, and Pi on this host.
 
     Each harness is read independently, so a missing or broken config for one
     never hides another's servers.
@@ -231,6 +247,7 @@ def configured_mcp_servers() -> list[ConfiguredMcpServer]:
         ("claude", lambda: _claude_servers(home, os.environ)),
         ("codex", _codex_servers),
         ("cursor", lambda: _cursor_servers(home)),
+        ("pi", lambda: _pi_servers(os.environ)),
     )
     out: list[ConfiguredMcpServer] = []
     for harness, read in readers:

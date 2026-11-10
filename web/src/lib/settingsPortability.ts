@@ -18,6 +18,10 @@ import {
   PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
 } from "./projectFolderPaginationPreferences";
 import {
+  notifySessionRowQuickActionsChanged,
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
+} from "./sessionRowQuickActionsPreferences";
+import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   notifyHiddenPickerAgentsChanged,
 } from "./pickerEntryVisibility";
@@ -49,6 +53,7 @@ const EXPORTABLE_KEYS = [
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
   PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
   PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
@@ -175,6 +180,7 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   notifyHiddenPickerAgentsChanged();
   notifyProjectFolderPaginationChanged();
   notifyFoldAssistantNarrationChanged();
+  notifySessionRowQuickActionsChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);

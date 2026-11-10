@@ -49,7 +49,13 @@ the header menu), and each place is a separate entry point.
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
   also delete the worktree (the branch is kept); Remember my choice saves the
-  answer, which Settings → Git can change later.
+  answer, which Settings → Git can change later. Archiving a session whose agent
+  is still working, waiting on an approval, or running background work first
+  asks to confirm, since archiving stops it; Cancel or Escape keeps the session.
+- `row-quick-actions`: sidebar rows show hover Pin and Archive buttons beside the
+  "…" menu. Settings → Appearance → Sidebar → Show Pin and Archive buttons on
+  session rows (on by default) turns them off, leaving both actions in the row
+  menu and right-click menu.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
@@ -378,6 +384,17 @@ The prompt explains that worktrees inside sandboxes or used by other sessions,
 including archived sessions, are retained.
 Dismissing it cancels the archive. Settings → Git → Worktrees holds the saved
 choice only when the server supports cleanup.
+
+**Archive running-session prompt:** archive a session whose agent is working or
+awaiting approval from the quick button, row menu, right-click menu,
+bulk selection, header menu, or desktop Session → Archive. "Archive running
+session?" (or, for bulk, how many of the selected sessions are running) offers
+Cancel and Archive; Archive continues to the worktree prompt when that applies.
+
+**Row quick actions setting:** Settings → Appearance → Sidebar → Show Pin and
+Archive buttons on session rows. Turning it off removes the hover buttons from
+every sidebar row; the session header never had them. On desktop the row menu's
+Pin item is shown only while the setting is off (mobile always shows it).
 
 **Archived view:** choose Display → Archived sessions in the sidebar filter
 menu, then filter by project.
@@ -716,6 +733,18 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_load_more_pages_through`
+- **`archive`, running-session prompt:** component coverage in
+  `web/src/shell/Sidebar.archive.test.tsx` (quick button, row menu, bulk
+  selection, chaining into the worktree prompt) and
+  `web/src/shell/HeaderConversationMenu.test.tsx` (header menu and desktop
+  Session → Archive); `web/src/shell/AppShell.test.tsx` covers a session opened
+  outside the loaded sidebar pages. Manually: send a message that keeps the agent busy, hover
+  its row, click Archive, and expect the dialog; Cancel leaves the row.
+- **`row-quick-actions`:** component coverage in
+  `web/src/shell/Sidebar.archive.test.tsx` and `web/src/pages/SettingsPage.test.tsx`
+  (Reset to defaults); export and import in `web/src/lib/settingsPortability.test.ts`.
+  Manually: turn the switch off and hover a row; only the "…" button appears,
+  and its menu lists Pin and Archive.
 - **`archive`, worktree prompt:**
   `tests/server/integration/test_sessions_archive.py::test_archive_stop_removes_worktree_when_requested`
   and
@@ -726,7 +755,8 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/shell/Sidebar.archive.test.tsx` and
   `web/src/shell/HeaderConversationMenu.test.tsx`. Manually: archive a
   worktree session from the row menu, bulk selection, and header menu, and
-  expect the dialog each time; a session without a worktree archives silently.
+  expect the dialog each time; an idle session without a worktree archives
+  silently.
 - **`unarchive`, header menu:**
   `tests/e2e_ui/sessions/test_archived_session_header_menu.py::test_archived_session_header_menu_offers_unarchive`.
 - **`unarchive`, open archived session's sidebar row:**
