@@ -26,7 +26,7 @@ from collections.abc import Iterable, Mapping
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.databricks_ai_gateway import CI_CONTEXT_ENV, ci_request_tags
-from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR, RUNNER_SESSION_ENV_NAMES_ENV_VAR
 
 # Desktop access requires an explicit grant outside the sandbox.
 DESKTOP_SESSION_ENV_VARS: frozenset[str] = frozenset(
@@ -113,12 +113,14 @@ def clean_agent_env(
         for an agent that authenticates from a variable outside its own family.
     :param source: Environment to filter. Defaults to ``os.environ``; injectable
         for tests.
-    :returns: A filtered copy; desktop-session variables require ``extra_allowed``.
+    :returns: A filtered copy that also keeps the variables the launching CLI
+        forwarded for this session; desktop-session variables require
+        ``extra_allowed``.
     """
     env_source = os.environ if source is None else source
     prefixes = BASE_ALLOW_PREFIXES + tuple(allow_prefixes)
     extra = set(extra_allowed)
-    exact = BASE_ALLOW_EXACT | set(allow_exact) | extra
+    exact = BASE_ALLOW_EXACT | set(allow_exact) | extra | forwarded_session_env_names(env_source)
     denied = set(deny_exact) | (DESKTOP_SESSION_ENV_VARS - extra)
     filtered = {
         key: value
@@ -128,6 +130,17 @@ def clean_agent_env(
     if CI_CONTEXT_ENV not in denied and (tags := ci_request_tags(env_source)):
         filtered[CI_CONTEXT_ENV] = json.dumps(tags, separators=(",", ":"))
     return filtered
+
+
+def forwarded_session_env_names(source: Mapping[str, str] | None = None) -> frozenset[str]:
+    """Names of the variables the launching CLI forwarded to this runner.
+
+    :param source: Runner environment to read. Defaults to ``os.environ``.
+    :returns: Forwarded names, never including Omnigent's own variables.
+    """
+    env = os.environ if source is None else source
+    names = env.get(RUNNER_SESSION_ENV_NAMES_ENV_VAR, "").split(",")
+    return frozenset(name for name in names if name and not name.upper().startswith("OMNIGENT"))
 
 
 def strip_desktop_session_env(env: Mapping[str, str]) -> dict[str, str]:
