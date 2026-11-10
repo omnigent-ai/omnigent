@@ -3314,6 +3314,10 @@ describe("automation trigger type", () => {
       expect(screen.queryByTestId("schedule-preset-trigger")).not.toBeInTheDocument();
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
       type("task-trigger-scope", "ES");
+      // Instructions that repeat the section heading must not drop the saved workers.
+      const instructions =
+        "Answer the question.\n\nInstructions for each session:\nInclude this heading.";
+      type("task-trigger-instructions", instructions);
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       const input = updateMutateAsync.mock.calls[0][0].input;
@@ -3321,12 +3325,10 @@ describe("automation trigger type", () => {
       expect(input.prompt).toContain('project = "ES"');
       expect(slackPrompt).toContain("support");
       expect(input.prompt).not.toContain("support");
-      expect(splitTriggerPrompt(input.prompt).userPrompt).toBe("Answer the question.");
-      expect(readTriggerWorkerSettings(input.prompt)).toEqual({
-        agentId: "ag_claude_native",
-        model: "opus",
-        effort: "",
-      });
+      expect(input.prompt).toContain(instructions);
+      expect(input.prompt).toMatch(
+        /call sys_session_create with agent_id "ag_claude_native", placement "same_host", title [^\n]+, model "opus", and a message/,
+      );
       expect(input).toMatchObject({ name: "Jira tickets", sessionId: null });
       expect(input.rrule).toBe("FREQ=MINUTELY;INTERVAL=30");
       expect(input).not.toHaveProperty("sessionMode");

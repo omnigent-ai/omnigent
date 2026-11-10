@@ -72,6 +72,9 @@ describe("saved trigger prompts", () => {
       expect(updated).toContain('agent_id "worker-agent", placement "same_host"');
       expect(updated).toContain('model "model-with-\\"quotes\\"", reasoning_effort "low"');
       expect(updated).toContain("Keep this custom instruction.");
+      expect(renderTriggerPrompt(source, fields(), { ...CTX, ...settings })).toBe(
+        updateTriggerWorkerSettings(renderTriggerPrompt(source, fields(), CTX), settings),
+      );
       expect(splitTriggerPrompt(updated).userPrompt).toBe(splitTriggerPrompt(original).userPrompt);
       expect(
         updateTriggerWorkerSettings(updated, { agentId: null, model: "old-model", effort: "high" }),

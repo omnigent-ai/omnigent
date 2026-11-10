@@ -85,6 +85,8 @@ export interface TriggerPromptContext {
    * ID, e.g. `https://omnigent.example.com/c/CONVERSATION_ID`.
    */
   sessionLink: string;
+  /** The workers' agent; workers otherwise use the polling session's agent. */
+  agentId?: string | null;
   /** The task's model override; workers otherwise use the agent's default. */
   model?: string;
   /** The task's reasoning effort override. */
@@ -1354,11 +1356,11 @@ export function renderTriggerPrompt(
   const initialLookback =
     initialLookbackMinutes === 60 ? "one hour" : `${initialLookbackMinutes} minutes`;
   const createArgs = [
-    "agent_id set to your agent ID",
+    `agent_id ${ctx.agentId ? JSON.stringify(ctx.agentId) : "set to your agent ID"}`,
     `placement "${ctx.placement}"`,
     `title ${text.title}`,
-    ...(ctx.model ? [`model "${ctx.model}"`] : []),
-    ...(ctx.effort ? [`reasoning_effort "${ctx.effort}"`] : []),
+    ...(ctx.model ? [`model ${JSON.stringify(ctx.model)}`] : []),
+    ...(ctx.effort ? [`reasoning_effort ${JSON.stringify(ctx.effort)}`] : []),
   ];
   const managerPostsLink = fields.linkBack && source !== "slack";
   const workerPostingInstructions =

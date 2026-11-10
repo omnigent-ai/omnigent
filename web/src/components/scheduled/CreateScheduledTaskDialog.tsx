@@ -499,8 +499,7 @@ export function CreateScheduledTaskDialog({
   const [triggerFields, setTriggerFields] = useState<TriggerFields>(() =>
     emptyTriggerFields("jira"),
   );
-  // Editing a trigger under another source: the source shown, the saved prompt editor to
-  // restore, each source's draft, and the worker settings carried into the new prompt.
+  // Kept while a trigger edit watches another source, so switching back restores the saved prompt.
   const [sourceSwitch, setSourceSwitch] = useState<{
     source: TriggerSource;
     savedPrompt: string;
@@ -908,17 +907,21 @@ export function CreateScheduledTaskDialog({
             schedule.preset === "custom" && schedule.customFreq === "minutely"
               ? schedule.interval
               : 60,
-          model: supportsModel && pickedModel !== "" ? pickedModel : undefined,
-          effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
+          // A switched edit keeps the saved workers' harness, model, and effort.
+          ...(workerSettings !== null
+            ? {
+                agentId: workerSettings.agentId,
+                model: workerSettings.model || undefined,
+                effort: workerSettings.effort || undefined,
+              }
+            : {
+                model: supportsModel && pickedModel !== "" ? pickedModel : undefined,
+                effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
+              }),
         })
       : "";
-  const renderedTriggerPrompt =
-    workerSettings !== null && renderedTemplatePrompt !== ""
-      ? (updateTriggerWorkerSettings(renderedTemplatePrompt, workerSettings) ??
-        renderedTemplatePrompt)
-      : renderedTemplatePrompt;
   const effectivePrompt =
-    trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
+    trigger !== null ? renderedTemplatePrompt : combineTriggerPrompt(prompt, systemPrompt);
   const triggerMode =
     trigger !== null ||
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
@@ -1349,9 +1352,9 @@ export function CreateScheduledTaskDialog({
                     toolsProvided={
                       sandboxMode && info !== "loading" && info.sandbox_provider === "arclet"
                     }
-                    renderedPrompt={renderedTriggerPrompt}
+                    renderedPrompt={renderedTemplatePrompt}
                     onEditAsPrompt={() => {
-                      const parts = splitTriggerPrompt(renderedTriggerPrompt);
+                      const parts = splitTriggerPrompt(renderedTemplatePrompt);
                       setPrompt(parts.userPrompt);
                       setSystemPrompt(parts.systemPrompt);
                       setSystemPromptOpen(false);
