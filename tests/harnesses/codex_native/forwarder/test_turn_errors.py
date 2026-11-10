@@ -6,6 +6,7 @@ Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -22,6 +23,7 @@ from omnigent.harnesses.codex_native.bridge import (
     record_certificate_failure,
     write_bridge_state,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from tests.harnesses.codex_native.forwarder._support import (
     _deliver_to_parent,
     _RecordingClient,
@@ -1088,7 +1090,9 @@ async def test_provider_token_command_failure_posts_without_codex_login_hint(
 
 
 @pytest.mark.asyncio
-async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
+async def test_post_turn_status_edge_clean_idle_has_no_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A normal idle edge (no error) posts status only — the success path."""
     client = _RecordingClient()
     edge = fwd._CodexTurnStatusEdge(status="idle", turn_id="turn_123", source="turn/completed")
@@ -1101,6 +1105,85 @@ async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
     assert data["status"] == "idle"
     assert "output" not in data
     assert "reauth_required" not in data
+    assert not any(
+        getattr(record, "event_name", None) == "codex_turn_status_publication_failed"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_phase", ["before_status", "status_post", "after_status", "stale", "cancelled"]
+)
+async def test_terminal_status_publication_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_phase: str,
+) -> None:
+    """A failed terminal publication names its edge without changing fault propagation."""
+    client = _RecordingClient()
+    active_turn = "newer_turn" if failure_phase == "stale" else "turn_123"
+    _seed_active_turn(tmp_path, active_turn)
+    cause = ValueError("private-cause-detail")
+    failure = (
+        asyncio.CancelledError("private-cancellation-detail")
+        if failure_phase == "cancelled"
+        else DatabricksAuthError("private-auth-detail")
+    )
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        raise failure from cause
+
+    if failure_phase in {"before_status", "stale"}:
+        monkeypatch.setattr(fwd, "_flush_turn_diff", fail)
+    elif failure_phase in {"status_post", "cancelled"}:
+        monkeypatch.setattr(client, "post", fail)
+    else:
+        monkeypatch.setattr(
+            fwd._CodexElicitationTaskTracker, "resolve_by_terminal_turn_event", fail
+        )
+
+    with pytest.raises(type(failure)) as caught:
+        await _deliver_to_parent(
+            client,
+            tmp_path,
+            fwd._CodexForwarderState(),
+            _turn_completed("turn_123", "completed"),
+        )
+
+    assert caught.value is failure
+    assert caught.value.__cause__ is cause
+    bridge = read_bridge_state(tmp_path)
+    assert bridge is not None
+    assert bridge.active_turn_id == ("newer_turn" if failure_phase == "stale" else None)
+    assert client.posts == (
+        [_status_post({"status": "idle", "response_id": "codex_turn_123"})]
+        if failure_phase == "after_status"
+        else []
+    )
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_turn_status_publication_failed"
+    ]
+    if failure_phase not in {"before_status", "status_post"}:
+        assert records == []
+        return
+    (record,) = records
+    assert record.levelno == logging.WARNING
+    assert record.session_id == "conv_x"
+    assert record.turn_id == "turn_123"
+    assert record.attributes == {
+        "intended_status": "idle",
+        "protocol_source": "turn/completed",
+        "delivery_phase": failure_phase,
+        "exception_type": "DatabricksAuthError",
+        "exception_cause_type": "ValueError",
+    }
+    assert record.exc_info is None
+    assert "private-" not in caplog.text
+    assert "private-" not in json.dumps(record.attributes)
 
 
 _CERTIFICATE_LINE = (

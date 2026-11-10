@@ -465,6 +465,7 @@ async def test_info_includes_server_version(
     # is a frozen build-time snapshot that can drift from VERSION in a stale
     # editable or "source"-placeholder install.
     assert body["server_version"] == VERSION
+    assert body.get("comment_anchor_metadata", False) is False
 
 
 def _branding_png(color: tuple[int, int, int, int]) -> bytes:
@@ -3067,3 +3068,31 @@ def test_picker_restriction_warning_names_the_agents_new_chat_cannot_offer(
         assert text in caplog.text
     for text in absent:
         assert text not in caplog.text
+
+
+@pytest.mark.parametrize("mode", ["snapshot", "off", "on"])
+async def test_mcp_launch_gate_and_hidden_info(db_uri, runtime_init, tmp_path, monkeypatch, mode):
+    monkeypatch.setenv(
+        "OMNIGENT_FEATURES",
+        "mcp_disabled_servers,mcp_disabled_servers_claude,mcp_disabled_servers_codex",
+    )
+    gate = {
+        "snapshot": None,
+        "off": False,
+        "on": True,
+    }[mode]
+    app = _build_branding_app(db_uri, tmp_path, f"mcp-{mode}", mcp_disabled_servers=gate)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        info = (await client.get("/v1/info")).json()
+    assert "mcp_disabled_servers_enabled" not in info
+    assert not any(name.startswith("mcp_disabled_servers") for name in info["features"])
+    activation = app.state.host_registry.mcp_disabled_servers_active_harnesses
+    first, second = activation(), activation()
+    enabled = ["claude", "codex"]
+    assert (first, second) == {
+        "snapshot": (enabled, enabled),
+        "off": (None, None),
+        "on": (enabled, enabled),
+    }[mode]
