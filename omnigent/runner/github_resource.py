@@ -319,6 +319,19 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     return rc == 0, []
 
 
+def _gh_signed_in_to_host(root: str, host: str) -> bool:
+    """Whether ``gh`` reports a login on ``host``.
+
+    Some setups sign ``gh`` in to an enterprise host only when a command names that host,
+    so a host missing from the global listing is asked about directly.
+    """
+    _, accounts = _list_accounts(root)
+    if host in {account.get("host") for account in accounts}:
+        return True
+    rc, _, _ = _gh(["auth", "status", "-h", host], cwd=root)
+    return rc == 0
+
+
 def _resolved_base_nwo(root: str) -> str | None:
     """Return the gh-resolved base repo ``owner/repo`` for the checkout, or ``None``.
 
@@ -1106,10 +1119,8 @@ def _pr_token(root: str, reference: PullRequestRef) -> str | None:
 
 
 def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:
-    if reference.host != "github.com":
-        _, accounts = _list_accounts(root)
-        if reference.host not in {account.get("host") for account in accounts}:
-            return None
+    if reference.host != "github.com" and not _gh_signed_in_to_host(root, reference.host):
+        return None
     return _gh_pr_view(
         [str(reference.number), "-R", _repo_argument(reference)],
         fields,
@@ -1664,10 +1675,8 @@ def _pr_commit_patch(root: str, reference: PullRequestRef, *, commit_sha: str) -
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:
-    if reference.host != "github.com":
-        _, accounts = _list_accounts(root)
-        if reference.host not in {account.get("host") for account in accounts}:
-            raise ValueError("Sign in to this GitHub host with gh before viewing its PRs")
+    if reference.host != "github.com" and not _gh_signed_in_to_host(root, reference.host):
+        raise ValueError("Sign in to this GitHub host with gh before viewing its PRs")
     return ["--hostname", reference.host]
 
 
