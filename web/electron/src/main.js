@@ -39,7 +39,7 @@ const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
 const { registerFolderChooser } = require("./folderChooser");
-const { ICON_PNG, pagePath, preloadPath } = require("./paths");
+const { ICON_PNG, pagePath, preloadPath } = require("./paths.ts");
 const { withTestOverrides } = require("./testOverrides");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -47,7 +47,7 @@ const { pathToFileURL } = require("node:url");
 const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
-const { isLoopbackPreviewUrl } = require("./browserUrlPolicy");
+const { isLoopbackPreviewUrl } = require("./browserUrlPolicy.ts");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -65,14 +65,18 @@ const {
   PRE_MANIFEST_BASELINE,
   parseManifestAuth,
   sanitizeServerName,
-} = withTestOverrides("url", require("./url"));
-const { parseOmnigentDeepLink, chooseDeepLinkStrategy, acceptCliDeepLink } = require("./deepLink");
+} = withTestOverrides("url", require("./url.ts"));
+const {
+  parseOmnigentDeepLink,
+  chooseDeepLinkStrategy,
+  acceptCliDeepLink,
+} = require("./deepLink.ts");
 const {
   parseServerLabels,
   serverLabel,
   labeledWorkspace,
   withConnectLabel,
-} = require("./server_labels");
+} = require("./server_labels.ts");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
 const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner");
@@ -86,8 +90,8 @@ const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
-const { isDeveloperModeEnabled } = require("./developer_mode");
-const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
+const { isDeveloperModeEnabled } = require("./developer_mode.ts");
+const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences.ts");
 const {
   excludingManagedServers,
   getDatabricksInternalFeaturesEnabled,
@@ -121,20 +125,24 @@ const {
   SESSION_REJECTED,
   IP_ACL_BLOCKED,
 } = require("./databricks-auth");
-const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
+const {
+  decideWindowOpen,
+  stripCrossOriginOpenerHeaders,
+  WEB_SCHEMES,
+} = require("./popupPolicy.ts");
 const {
   SETTINGS_PATH,
   focusedConnectedWindow,
   aboutMenuItem,
   macApplicationMenu,
   settingsMenuItem,
-} = require("./settingsNavigation");
+} = require("./settingsNavigation.ts");
 const { createQuitConfirmation } = require("./quitConfirmation");
 const { acceleratorLabel, createGlobalShowShortcut } = require("./globalShowShortcut");
 const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
-} = require("./desktopCommands");
+} = require("./desktopCommands.ts");
 const omnigentCli = withTestOverrides("omnigent_cli", require("./omnigent_cli"));
 
 const serverManager = require("./server_manager");
@@ -6129,7 +6137,7 @@ if (!gotLock) {
     // resolves the user's full PATH; we merge it into process.env so every
     // subsequent spawn/execFile call inherits it. Runs before resolvedCliPath()
     // (a PATH consumer) and any host spawn, so the ordering guarantee is implicit.
-    const { resolveLoginShellPath, mergePath } = require("./loginShellPath");
+    const { resolveLoginShellPath, mergePath } = require("./loginShellPath.ts");
     const loginPath = resolveLoginShellPath();
     if (loginPath) {
       process.env.PATH = mergePath(process.env.PATH, loginPath);

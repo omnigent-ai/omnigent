@@ -534,9 +534,9 @@
         <button type="button" id="cli-modal-close" class="modal-close">Done</button>
       </div>
     </div>
-    <script src="../src/url.js"></script>
+    <script src="../app/setupPageUrl.js"></script>
     <script>
-      // Shared URL helpers (electron/src/url.js), exposed as window.omnigentUrl
+      // Shared URL helpers (electron/src/url.ts), exposed as window.omnigentUrl
       // — the same module the main process uses, so the two never drift.
       const { isPlainHttpRemote, serverDisplayLabel } = window.omnigentUrl;
       // Uses the Electron preload bridge (electron/src/preload.js).

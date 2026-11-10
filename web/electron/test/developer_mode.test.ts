@@ -1,8 +1,6 @@
-"use strict";
-
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { DEVELOPER_MODE_KEY, isDeveloperModeEnabled } = require("../src/developer_mode");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { DEVELOPER_MODE_KEY, isDeveloperModeEnabled } from "../src/developer_mode.ts";
 
 describe("developer mode", () => {
   it("is always enabled for development builds", () => {
@@ -17,7 +15,7 @@ describe("developer mode", () => {
   });
 
   it("reads the packaged macOS opt-in as a boolean user default", () => {
-    const calls = [];
+    const calls: unknown[][] = [];
     const enabled = isDeveloperModeEnabled({
       isPackaged: true,
       platform: "darwin",

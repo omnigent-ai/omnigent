@@ -357,6 +357,11 @@ jobs:
           pnpm install --frozen-lockfile --filter web
           pnpm --filter web run build
 
+      - name: Build Electron shell bundle
+        # tests/e2e_ui/desktop loads the setup page script from web/electron/app/.
+        # Vite resolves from web/node_modules, so Electron itself is not installed.
+        run: node web/electron/scripts/build.mjs
+
       # Native coding-agent harness enablement: the next steps let the
       # native render-parity tests boot a real Claude Code / Codex CLI. The
       # rest of the e2e-ui suite (openai-agents) ignores them.

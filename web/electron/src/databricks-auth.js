@@ -1,7 +1,7 @@
 // Databricks browser-auth lifecycle. Embedded SSO never participates in this mode.
 "use strict";
 
-const { isDatabricksOAuthServerUrl } = require("./url");
+const { isDatabricksOAuthServerUrl } = require("./url.ts");
 
 const DATABRICKS_BROWSER_AUTH_KEY = "DatabricksBrowserAuthEnabled";
 

@@ -2,13 +2,29 @@
 // Main enforces URL, DNS and connected-address checks so pages cannot expose
 // private hosts or privileged schemes through browser actions such as screenshots.
 
-"use strict";
+import dns from "node:dns";
 
-const dns = require("node:dns");
+/** A policy decision; `error` is shown to the agent. */
+export type NavigationVerdict = { ok: true } | { ok: false; error: string };
+
+/** Resolves a hostname to its IP addresses. */
+export type HostResolver = (hostname: string) => Promise<string[]>;
+
+export interface NavigationPolicyOptions {
+  /** Whether the context may open loopback preview hosts. */
+  allowLocalhost?: boolean;
+}
+
+export interface CheckAgentNavigationOptions extends NavigationPolicyOptions {
+  resolveHost?: HostResolver;
+}
+
+export type Ipv4Octets = [number, number, number, number];
+export type Ipv6Groups = [number, number, number, number, number, number, number, number];
 
 // Schemes a policy-enforced view may navigate to; everything else (file:, chrome:, data:,
 // javascript:, ...) is a privileged surface or code channel and is rejected.
-const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
+export const ALLOWED_SCHEMES: ReadonlySet<string> = new Set(["http:", "https:"]);
 
 // Exact loopback hosts an eligible context may open without an IP check; its
 // `*.localhost` subdomains must also connect to loopback (isAgentConnectionAllowed).
@@ -20,20 +36,18 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
  * WHATWG URL parser already canonicalizes obfuscated forms (`0x7f000001`,
  * `2130706433`) to dotted-decimal, so `host` here is dotted-quad or a name.
  *
- * @param {string} host
- * @returns {[number, number, number, number] | null}
  */
-function parseIpv4(host) {
+export function parseIpv4(host: string): Ipv4Octets | null {
   const parts = host.split(".");
   if (parts.length !== 4) return null;
-  const octets = [];
+  const octets: number[] = [];
   for (const part of parts) {
     if (!/^\d{1,3}$/.test(part)) return null;
     const n = Number(part);
     if (n < 0 || n > 255) return null;
     octets.push(n);
   }
-  return /** @type {[number,number,number,number]} */ (octets);
+  return octets as Ipv4Octets;
 }
 
 /**
@@ -43,10 +57,8 @@ function parseIpv4(host) {
  * web destinations: all of 192.0.0.0/24 (Python exempts the .9/.10 anycast
  * services), and on the IPv6 side ::/96, fec0::/10, 2001::/23 (including
  * Python's global exceptions), and 3fff::/20.
- *
- * @param {[number, number, number, number]} octets
  */
-function isBlockedIpv4(octets) {
+export function isBlockedIpv4(octets: Ipv4Octets): boolean {
   const [a, b, c] = octets;
   if (a === 0 || a === 10 || a === 127) return true; // "this host", RFC 1918, loopback
   if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 shared (CGNAT)
@@ -63,18 +75,15 @@ function isBlockedIpv4(octets) {
 /**
  * Parse an IPv6 address — bare or bracketed, with an optional dotted-quad tail
  * or zone ID — into eight 16-bit groups, or null if it is not one.
- *
- * @param {string} host
- * @returns {number[] | null}
  */
-function parseIpv6(host) {
+export function parseIpv6(host: string): Ipv6Groups | null {
   const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
-  const text = bare.split("%")[0];
+  const text = bare.split("%")[0]!;
   const halves = text.split("::");
   if (!text.includes(":") || halves.length > 2) return null;
-  const parseGroups = (part, allowIpv4Tail) => {
+  const parseGroups = (part: string, allowIpv4Tail: boolean): number[] | null => {
     if (part === "") return [];
-    const groups = [];
+    const groups: number[] = [];
     const pieces = part.split(":");
     for (const [i, piece] of pieces.entries()) {
       const ipv4 = allowIpv4Tail && i === pieces.length - 1 ? parseIpv4(piece) : null;
@@ -84,22 +93,22 @@ function parseIpv6(host) {
     }
     return groups;
   };
-  const head = parseGroups(halves[0], halves.length === 1);
-  const tail = halves.length === 2 ? parseGroups(halves[1], true) : [];
+  const head = parseGroups(halves[0]!, halves.length === 1);
+  const tail = halves.length === 2 ? parseGroups(halves[1]!, true) : [];
   if (!head || !tail) return null;
-  if (halves.length === 1) return head.length === 8 ? head : null;
+  if (halves.length === 1) return head.length === 8 ? (head as Ipv6Groups) : null;
   const zeros = 8 - head.length - tail.length;
-  return zeros >= 1 ? [...head, ...new Array(zeros).fill(0), ...tail] : null;
+  return zeros >= 1
+    ? ([...head, ...new Array<number>(zeros).fill(0), ...tail] as Ipv6Groups)
+    : null;
 }
 
 /**
  * True if the IPv6 groups are outside public unicast space. Transition forms
  * that carry an IPv4 destination (IPv4-mapped, NAT64) are judged by that IPv4,
  * since the URL parser serializes them in hex (`[::ffff:7f00:1]`).
- *
- * @param {number[]} groups
  */
-function isBlockedIpv6(groups) {
+export function isBlockedIpv6(groups: Ipv6Groups): boolean {
   const [g0, g1, g2, g3, g4, g5, g6, g7] = groups;
   const embeddedIpv4 = () => isBlockedIpv4([g6 >> 8, g6 & 0xff, g7 >> 8, g7 & 0xff]);
   const zeroThrough4 = g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0;
@@ -120,10 +129,8 @@ function isBlockedIpv6(groups) {
 /**
  * Canonical text for an IP address (IPv4-mapped IPv6 collapses to its IPv4),
  * or null if `address` is not one, so differently written forms compare equal.
- *
- * @param {string} address
  */
-function canonicalAddress(address) {
+function canonicalAddress(address: string): string | null {
   const ipv4 = parseIpv4(address);
   if (ipv4) return ipv4.join(".");
   const groups = parseIpv6(address);
@@ -135,7 +142,7 @@ function canonicalAddress(address) {
 }
 
 /** True if `host` is a dotted-quad IPv4 or an IPv6 literal. */
-function isIpLiteral(host) {
+function isIpLiteral(host: string): boolean {
   return parseIpv4(host) !== null || parseIpv6(host) !== null;
 }
 
@@ -143,10 +150,8 @@ function isIpLiteral(host) {
  * True if an IP address is not publicly routable. Anything that does not
  * parse as an IP counts as internal, so a malformed resolver or connection
  * address fails closed.
- *
- * @param {string} address
  */
-function isInternalAddress(address) {
+export function isInternalAddress(address: string): boolean {
   const ipv4 = parseIpv4(address);
   if (ipv4) return isBlockedIpv4(ipv4);
   const ipv6 = parseIpv6(address);
@@ -157,10 +162,8 @@ function isInternalAddress(address) {
  * True if the hostname is a loopback/internal name or IP literal we block.
  * `hostname` from the URL parser is lowercased, IPv4-canonicalized, and (for
  * IPv6) bracketed.
- *
- * @param {string} hostname
  */
-function isBlockedHostname(hostname) {
+export function isBlockedHostname(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/\.$/, "");
   if (host === "localhost" || host === "") return true;
   if (host.endsWith(".localhost")) return true; // *.localhost → loopback per spec
@@ -168,26 +171,26 @@ function isBlockedHostname(hostname) {
 }
 
 /** True for an RFC 6761 `*.localhost` subdomain without empty labels or a trailing dot. */
-function isLocalhostSubdomain(hostname) {
+export function isLocalhostSubdomain(hostname: string): boolean {
   if (!hostname.endsWith(".localhost")) return false;
   const labels = hostname.slice(0, -".localhost".length).split(".");
   return labels.every((label) => label !== "");
 }
 
 /** True for a host an eligible context may open as a loopback preview. */
-function isLoopbackName(hostname) {
+export function isLoopbackName(hostname: string): boolean {
   return LOOPBACK_HOSTS.has(hostname) || isLocalhostSubdomain(hostname);
 }
 
 /** True for an http(s) URL whose host is a loopback preview name, including `*.localhost`. */
-function isLoopbackPreviewUrl(url) {
+export function isLoopbackPreviewUrl(url: unknown): boolean {
   if (typeof url !== "string" || !URL.canParse(url)) return false;
   const { protocol, hostname } = new URL(url);
   return ALLOWED_SCHEMES.has(protocol) && isLoopbackName(hostname);
 }
 
 /** True if an IP address is in 127.0.0.0/8 or is ::1 (including IPv4-mapped forms). */
-function isLoopbackAddress(address) {
+export function isLoopbackAddress(address: string): boolean {
   const canonical = canonicalAddress(address);
   return canonical === "0:0:0:0:0:0:0:1" || (canonical?.startsWith("127.") ?? false);
 }
@@ -197,15 +200,15 @@ function isLoopbackAddress(address) {
  * for an http(s) URL to a non-internal host (or eligible loopback), else
  * `{ ok: false, error }`. Never throws — an unparseable URL is a rejection.
  * Judges the URL alone; `checkAgentNavigation` adds DNS resolution.
- *
- * @param {string} url
- * @returns {{ ok: true } | { ok: false, error: string }}
  */
-function isAgentNavigationAllowed(url, { allowLocalhost = false } = {}) {
+export function isAgentNavigationAllowed(
+  url: unknown,
+  { allowLocalhost = false }: NavigationPolicyOptions = {},
+): NavigationVerdict {
   if (typeof url !== "string" || url.trim() === "") {
     return { ok: false, error: "navigation blocked: empty url" };
   }
-  let parsed;
+  let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
@@ -233,11 +236,8 @@ function isAgentNavigationAllowed(url, { allowLocalhost = false } = {}) {
 /**
  * Resolve a hostname with the OS resolver. The desktop shell injects the
  * view's Chromium resolver instead, so the check sees what Chromium will use.
- *
- * @param {string} hostname
- * @returns {Promise<string[]>}
  */
-async function lookupHostAddresses(hostname) {
+export async function lookupHostAddresses(hostname: string): Promise<string[]> {
   const records = await dns.promises.lookup(hostname, { all: true });
   return records.map((record) => record.address);
 }
@@ -245,22 +245,19 @@ async function lookupHostAddresses(hostname) {
 /**
  * `isAgentNavigationAllowed` plus DNS: a hostname must resolve, and every
  * address it resolves to must be public. Resolution failure blocks.
- *
- * @param {string} url
- * @param {{ allowLocalhost?: boolean, resolveHost?: (hostname: string) => Promise<string[]> }} [options]
- * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
  */
-async function checkAgentNavigation(
-  url,
-  { allowLocalhost = false, resolveHost = lookupHostAddresses } = {},
-) {
+export async function checkAgentNavigation(
+  url: unknown,
+  { allowLocalhost = false, resolveHost = lookupHostAddresses }: CheckAgentNavigationOptions = {},
+): Promise<NavigationVerdict> {
   const verdict = isAgentNavigationAllowed(url, { allowLocalhost });
   if (!verdict.ok) return verdict;
-  const { hostname } = new URL(url);
+  // An allowed verdict means `url` is a parseable string.
+  const { hostname } = new URL(url as string);
   if ((allowLocalhost && isLoopbackName(hostname)) || isIpLiteral(hostname)) {
     return verdict;
   }
-  let addresses = [];
+  let addresses: string[] = [];
   try {
     addresses = await resolveHost(hostname);
   } catch {
@@ -281,13 +278,12 @@ async function checkAgentNavigation(
  * catches a DNS answer that changed after `checkAgentNavigation`. A missing
  * `ip` blocks: agent documents are always fetched from the network, so a
  * response without a connected address is not one we can vouch for.
- *
- * @param {string} url
- * @param {string | undefined} ip
- * @param {{ allowLocalhost?: boolean }} [options]
- * @returns {{ ok: true } | { ok: false, error: string }}
  */
-function isAgentConnectionAllowed(url, ip, { allowLocalhost = false } = {}) {
+export function isAgentConnectionAllowed(
+  url: string,
+  ip: string | undefined,
+  { allowLocalhost = false }: NavigationPolicyOptions = {},
+): NavigationVerdict {
   let hostname = "";
   try {
     hostname = new URL(url).hostname;
@@ -322,24 +318,21 @@ function isAgentConnectionAllowed(url, ip, { allowLocalhost = false } = {}) {
 /**
  * Proxy hosts listed in a PAC-style `resolveProxy` result, e.g.
  * "PROXY a.example:3128;SOCKS5 [::1]:1080;DIRECT" → ["a.example", "::1"].
- *
- * @param {string} pacResult
- * @returns {string[]}
  */
-function proxyHosts(pacResult) {
-  const hosts = [];
+export function proxyHosts(pacResult: string | null | undefined): string[] {
+  const hosts: string[] = [];
   for (const entry of String(pacResult ?? "").split(";")) {
     const match = /^\s*(?:PROXY|HTTPS|SOCKS|SOCKS4|SOCKS5|QUIC)\s+(\S+)\s*$/i.exec(entry);
     if (!match) continue; // DIRECT or malformed
-    const hostPort = match[1];
+    const hostPort = match[1]!;
     const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(hostPort);
-    hosts.push(bracketed ? bracketed[1] : hostPort.replace(/:\d+$/, ""));
+    hosts.push(bracketed ? bracketed[1]! : hostPort.replace(/:\d+$/, ""));
   }
   return hosts;
 }
 
 /** True if a PAC-style `resolveProxy` result lists only DIRECT entries. */
-function isDirectOnly(pacResult) {
+export function isDirectOnly(pacResult: string | null | undefined): boolean {
   const entries = String(pacResult ?? "")
     .split(";")
     .map((entry) => entry.trim())
@@ -355,40 +348,18 @@ function isDirectOnly(pacResult) {
  * used, so if an internal proxy with a DIRECT fallback is down and the
  * destination rebinds to that proxy's IP, a direct connection to another port
  * there is accepted. Failing closed would block agent browsing via such proxies.
- *
- * @param {string | undefined} ip
- * @param {string} pacResult
- * @param {(hostname: string) => Promise<string[]>} resolveHost
  */
-async function isProxyAddress(ip, pacResult, resolveHost) {
+export async function isProxyAddress(
+  ip: string | undefined,
+  pacResult: string | null | undefined,
+  resolveHost: HostResolver,
+): Promise<boolean> {
   const target = ip ? canonicalAddress(ip) : null;
   if (target === null) return false;
   const resolved = await Promise.all(
     proxyHosts(pacResult).map((host) =>
-      isIpLiteral(host) ? [host] : resolveHost(host).catch(() => []),
+      isIpLiteral(host) ? [host] : resolveHost(host).catch((): string[] => []),
     ),
   );
   return resolved.flat().some((address) => canonicalAddress(address) === target);
 }
-
-module.exports = {
-  isAgentNavigationAllowed,
-  checkAgentNavigation,
-  isAgentConnectionAllowed,
-  isProxyAddress,
-  isLoopbackPreviewUrl,
-  isDirectOnly,
-  isLocalhostSubdomain,
-  lookupHostAddresses,
-  // Exported for focused unit tests.
-  proxyHosts,
-  parseIpv4,
-  parseIpv6,
-  isBlockedIpv4,
-  isBlockedIpv6,
-  isInternalAddress,
-  isBlockedHostname,
-  isLoopbackName,
-  isLoopbackAddress,
-  ALLOWED_SCHEMES,
-};

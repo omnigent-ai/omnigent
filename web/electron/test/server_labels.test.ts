@@ -1,13 +1,11 @@
-"use strict";
-
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const {
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import {
   parseServerLabels,
   serverLabel,
   labeledWorkspace,
   withConnectLabel,
-} = require("../src/server_labels");
+} from "../src/server_labels.ts";
 
 const PICKED = "https://accounts.cloud.databricks.com/omnigent?o=123";
 const WORKSPACE = "https://dbc-1234.cloud.databricks.com";

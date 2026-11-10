@@ -101,7 +101,7 @@ function harness({ respond, follow, oldCookie = false, stored } = {}) {
         if (specifier === "electron") return { net };
         if (specifier === "./databricks-oauth")
           return {
-            isTrustedDatabricksOrigin: realRequire("./url").isDatabricksOAuthServerUrl,
+            isTrustedDatabricksOrigin: realRequire("./url.ts").isDatabricksOAuthServerUrl,
             runInteractiveLogin: async () => {
               calls.browser++;
               return { tokens: { access_token: "token" }, issuerOrigin: ORIGIN };

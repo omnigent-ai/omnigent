@@ -35,6 +35,7 @@
     "prebuild:win": "pnpm run build:overlay && pnpm run build:app"
   },
   "devDependencies": {
+    "@types/node": "^24.12.2",
     "electron": "^45.2.1",
     "electron-builder": "^26.0.0",
     "jsdom": "^29.1.1",
@@ -66,7 +67,6 @@
     "afterAllArtifactBuild": "build/afterAllArtifactBuild.js",
     "files": [
       "app/**/*",
-      "src/url.js",
       "about/**/*",
       "browser-permission/**/*",
       "workspace-picker/**/*",

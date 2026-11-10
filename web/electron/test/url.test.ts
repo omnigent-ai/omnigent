@@ -1,12 +1,12 @@
-// Tests for the shared desktop URL helpers (src/url.js), run with
+// Tests for the shared desktop URL helpers (src/url.ts), run with
 // `node --test` (no extra deps). Covers the scheme-defaulting that lets a
 // pasted workspace URL (including paths copied from the browser) connect, the
 // plain-http warning, and the workspace probe/expansion.
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const {
+import {
   defaultSchemeFor,
   normalizeUrl,
   normalizeRecentServers,
@@ -22,7 +22,7 @@ const {
   MAX_SERVER_NAME_LENGTH,
   parseManifestAuth,
   sanitizeServerName,
-} = require("../src/url");
+} from "../src/url.ts";
 
 describe("defaultSchemeFor", () => {
   it("defaults remote hosts to https", () => {
@@ -127,7 +127,7 @@ describe("normalizeUrl", () => {
   it("preserves the parser error when rejecting an invalid URL", () => {
     assert.throws(
       () => normalizeUrl("http://["),
-      (error) => {
+      (error: Error) => {
         assert.match(error.message, /invalid URL/);
         assert.ok(error.cause instanceof TypeError);
         return true;
@@ -295,10 +295,13 @@ describe("normalizeSavedServerUrl", () => {
  * Run `fn` with `globalThis.fetch` swapped for `stub` and `AbortSignal.timeout`
  * neutralized (no real timer), restoring both afterward.
  */
-async function withFetch(stub, fn) {
+async function withFetch(
+  stub: (url: string, init: RequestInit) => Promise<unknown>,
+  fn: () => Promise<void>,
+): Promise<void> {
   const realFetch = globalThis.fetch;
   const realTimeout = AbortSignal.timeout;
-  globalThis.fetch = stub;
+  globalThis.fetch = stub as unknown as typeof fetch;
   AbortSignal.timeout = () => new AbortController().signal;
   try {
     return await fn();
@@ -309,8 +312,8 @@ async function withFetch(stub, fn) {
 }
 
 /** A minimal Response stand-in exposing only `.headers.get`. */
-function fakeResponse(serverHeader) {
-  return { headers: { get: (name) => (name === "server" ? serverHeader : null) } };
+function fakeResponse(serverHeader: string | null) {
+  return { headers: { get: (name: string) => (name === "server" ? serverHeader : null) } };
 }
 
 describe("databricksWorkspaceUiUrl", () => {
@@ -351,7 +354,7 @@ describe("databricksWorkspaceUiUrl", () => {
 
 describe("expandDatabricksWorkspaceUrl", () => {
   it("normalizes a pasted workspace path and expands to the canonical UI mount", async () => {
-    const calls = [];
+    const calls: { url: string; method: string | undefined }[] = [];
     await withFetch(
       async (url, opts) => {
         calls.push({ url, method: opts.method });
@@ -454,10 +457,15 @@ describe("expandDatabricksWorkspaceUrl", () => {
 });
 
 /** A JSON Response stand-in for the manifest fetch. */
-function fakeJsonResponse(body, { ok = true, contentType = "application/json" } = {}) {
+function fakeJsonResponse(
+  body: unknown,
+  { ok = true, contentType = "application/json" }: { ok?: boolean; contentType?: string } = {},
+) {
   return {
     ok,
-    headers: { get: (name) => (name.toLowerCase() === "content-type" ? contentType : null) },
+    headers: {
+      get: (name: string) => (name.toLowerCase() === "content-type" ? contentType : null),
+    },
     json: async () => {
       if (typeof body === "string") throw new SyntaxError("Unexpected token");
       return body;
@@ -667,8 +675,8 @@ describe("parseManifestAuth", () => {
   });
 
   it("keeps only the real session cookie names", () => {
-    const auth = (cookie, url = "https://a.test") =>
-      parseManifestAuth({ mode: "oidc", session_cookie: cookie }, url).sessionCookie;
+    const auth = (cookie: unknown, url = "https://a.test") =>
+      parseManifestAuth({ mode: "oidc", session_cookie: cookie }, url)?.sessionCookie;
     assert.equal(auth("__Host-ap_session"), "__Host-ap_session");
     assert.equal(auth("ap_session", "http://localhost:8000"), "ap_session");
     assert.equal(auth("session_id"), null);
@@ -693,11 +701,13 @@ describe("sanitizeServerName", () => {
   it("never cuts a character in half when capping", () => {
     const flag = "\u{1F3F3}\u{FE0F}";
     const name = sanitizeServerName("a".repeat(MAX_SERVER_NAME_LENGTH - 1) + flag + "tail");
+    assert.ok(name);
     assert.ok(name.endsWith(flag), JSON.stringify(name));
   });
 
   it("caps the length by characters", () => {
     const name = sanitizeServerName("😀".repeat(MAX_SERVER_NAME_LENGTH + 10));
+    assert.ok(name);
     assert.equal(Array.from(name).length, MAX_SERVER_NAME_LENGTH);
   });
 

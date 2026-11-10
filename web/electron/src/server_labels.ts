@@ -1,5 +1,3 @@
-"use strict";
-
 /**
  * Server labels, persisted as settings.server_labels: workspace origin → the
  * server URL the user picked when Databricks sign-in moved to that workspace's
@@ -7,12 +5,9 @@
  * sign-in is stored; a label names it for display and, via labeledWorkspace,
  * lets a later Connect to the same pick find that sign-in.
  */
+export type ServerLabels = Record<string, string>;
 
-/**
- * @param {unknown} url
- * @returns {string | null}
- */
-function originOf(url) {
+function originOf(url: unknown): string | null {
   try {
     return new URL(String(url)).origin;
   } catch {
@@ -23,16 +18,15 @@ function originOf(url) {
 /**
  * The valid entries of a settings.server_labels value (hand-edited settings
  * may hold anything).
- *
- * @param {unknown} value
- * @returns {Record<string, string>}
  */
-function parseServerLabels(value) {
+export function parseServerLabels(value: unknown): ServerLabels {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(
     Object.entries(value).filter(
-      ([origin, url]) =>
-        originOf(origin) === origin && typeof url === "string" && originOf(url) !== null,
+      (entry): entry is [string, string] =>
+        originOf(entry[0]) === entry[0] &&
+        typeof entry[1] === "string" &&
+        originOf(entry[1]) !== null,
     ),
   );
 }
@@ -40,13 +34,11 @@ function parseServerLabels(value) {
 /**
  * The URL the user picked for `url`'s host, else null.
  *
- * @param {Record<string, string>} labels From parseServerLabels.
- * @param {unknown} url
- * @returns {string | null}
+ * @param labels From parseServerLabels.
  */
-function serverLabel(labels, url) {
+export function serverLabel(labels: ServerLabels, url: unknown): string | null {
   const origin = originOf(url);
-  return origin !== null && Object.hasOwn(labels, origin) ? labels[origin] : null;
+  return origin !== null && Object.hasOwn(labels, origin) ? labels[origin]! : null;
 }
 
 /**
@@ -54,12 +46,10 @@ function serverLabel(labels, url) {
  * null. Only a pick naming its workspace (`?o=<workspace id>`) matches: without
  * one, the account flow asks which workspace this window should open.
  *
- * @param {Record<string, string>} labels From parseServerLabels.
- * @param {unknown} url
- * @returns {string | null}
+ * @param labels From parseServerLabels.
  */
-function labeledWorkspace(labels, url) {
-  let entered;
+export function labeledWorkspace(labels: ServerLabels, url: unknown): string | null {
+  let entered: URL;
   try {
     entered = new URL(String(url));
   } catch {
@@ -85,20 +75,19 @@ function labeledWorkspace(labels, url) {
  * still in `recents`. Sign-in that moved hosts labels the connected host with
  * the pick; a direct connect to a host drops its label.
  *
- * @param {Record<string, string>} labels From parseServerLabels.
- * @param {string} picked
- * @param {string} connected
- * @param {unknown[]} recents
- * @returns {Record<string, string>}
+ * @param labels From parseServerLabels.
  */
-function withConnectLabel(labels, picked, connected, recents) {
+export function withConnectLabel(
+  labels: ServerLabels,
+  picked: string,
+  connected: string,
+  recents: readonly unknown[],
+): ServerLabels {
   const origin = originOf(connected);
   const listed = new Set(recents.map(originOf));
-  const next = Object.fromEntries(
+  const next: ServerLabels = Object.fromEntries(
     Object.entries(labels).filter(([host]) => host !== origin && listed.has(host)),
   );
   if (origin !== null && listed.has(origin) && originOf(picked) !== origin) next[origin] = picked;
   return next;
 }
-
-module.exports = { parseServerLabels, serverLabel, labeledWorkspace, withConnectLabel };

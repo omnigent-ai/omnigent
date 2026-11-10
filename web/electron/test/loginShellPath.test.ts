@@ -1,22 +1,22 @@
-// Tests for src/loginShellPath.js — the login-shell PATH resolver that patches
+// Tests for src/loginShellPath.ts — the login-shell PATH resolver that patches
 // process.env.PATH for GUI-launched Electron (see #1933). Run with `node --test`
 // (no extra deps). These exercise the REAL module: resolveLoginShellPath takes
 // execFileSync/os/env/platform as injectable deps, so we drive every outcome with
 // mocks and never spawn a shell. A source-guard at the end pins the main.js wiring
 // so it can't silently regress to a bare PATH replace.
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { readFileSync } = require("node:fs");
-const path = require("node:path");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
-const {
+import {
   resolveLoginShellPath,
   mergePath,
   extractPath,
   isLikelyLoginPath,
   stripAnsi,
-} = require("../src/loginShellPath");
+} from "../src/loginShellPath.ts";
 
 const START = "__OMNIGENT_PATH_START__";
 const END = "__OMNIGENT_PATH_END__";
@@ -75,8 +75,8 @@ describe("isLikelyLoginPath (fast-path skip)", () => {
 
 describe("resolveLoginShellPath", () => {
   it("resolves via an interactive+login shell using the passwd-DB shell", () => {
-    const calls = [];
-    const execFileSync = (shell, args) => {
+    const calls: { shell: string; args: readonly string[] }[] = [];
+    const execFileSync = (shell: string, args: readonly string[]) => {
       calls.push({ shell, args });
       return `${START}/opt/homebrew/bin:/usr/bin${END}`;
     };
@@ -88,8 +88,8 @@ describe("resolveLoginShellPath", () => {
     });
     assert.equal(result, "/opt/homebrew/bin:/usr/bin");
     // Uses os.userInfo().shell, not $SHELL, and runs interactive+login.
-    assert.equal(calls[0].shell, "/bin/zsh");
-    assert.equal(calls[0].args[0], "-ilc");
+    assert.equal(calls[0]?.shell, "/bin/zsh");
+    assert.equal(calls[0]?.args[0], "-ilc");
   });
 
   it("resolves when a stripped macOS GUI PATH includes /usr/local/bin", () => {
@@ -108,8 +108,8 @@ describe("resolveLoginShellPath", () => {
   });
 
   it("prefers $SHELL when the passwd DB has no shell", () => {
-    const calls = [];
-    const execFileSync = (shell) => {
+    const calls: string[] = [];
+    const execFileSync = (shell: string) => {
       calls.push(shell);
       return `${START}/x${END}`;
     };
@@ -153,8 +153,8 @@ describe("resolveLoginShellPath", () => {
   });
 
   it("falls through to the next shell when the first fails, and returns null if all fail", () => {
-    const tried = [];
-    const execFileSync = (shell) => {
+    const tried: string[] = [];
+    const execFileSync = (shell: string) => {
       tried.push(shell);
       throw new Error(`cannot spawn ${shell}`);
     };
@@ -172,7 +172,7 @@ describe("resolveLoginShellPath", () => {
 
   it("recovers a delimited PATH from err.stdout on non-zero exit", () => {
     const execFileSync = () => {
-      const err = new Error("shell exited 1");
+      const err: Error & { stdout?: string } = new Error("shell exited 1");
       err.stdout = `warning: something\n${START}/opt/homebrew/bin${END}`;
       throw err;
     };
@@ -206,7 +206,7 @@ describe("mergePath", () => {
 // test can't see main.js wiring, and a bare `process.env.PATH = _loginPath` would
 // silently drop app-injected dirs — so pin the call shape here.
 describe("main.js wiring", () => {
-  const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
+  const mainSource = readFileSync(path.join(import.meta.dirname, "../src/main.js"), "utf8");
   const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
   it("merges the login PATH rather than replacing it", () => {

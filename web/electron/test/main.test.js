@@ -41,7 +41,7 @@ async function until(condition, label, deadline = Date.now() + 1000) {
   await wait(2);
   await until(condition, label, deadline);
 }
-const urlHelpers = require("../src/url");
+const urlHelpers = require("../src/url.ts");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
@@ -469,7 +469,7 @@ function loadNavigationHarness({
         registerIpc() {},
       }),
     },
-    "./url": {
+    "./url.ts": {
       ...urlHelpers,
       normalizeUrl: normalizeServer,
       expandDatabricksWorkspaceUrl: expandWorkspace,
@@ -485,7 +485,7 @@ function loadNavigationHarness({
       getDatabricksInternalFeaturesEnabled: () => internalFeatures,
       getManagedServerNames: () => managedServerNames,
     },
-    "./deepLink": deepLinks ?? {
+    "./deepLink.ts": deepLinks ?? {
       parseOmnigentDeepLink: () => null,
       chooseDeepLinkStrategy: () => null,
     },
@@ -650,7 +650,7 @@ function loadNavigationHarness({
       },
     },
     "./session-expiry": require("../src/session-expiry"),
-    "./popupPolicy": {
+    "./popupPolicy.ts": {
       decideWindowOpen: () => ({ kind: "ignore" }),
       stripCrossOriginOpenerHeaders: () => {},
       WEB_SCHEMES: new Set(),
@@ -3533,7 +3533,7 @@ describe("CLI deep-link handoff", () => {
       const h = loadNavigationHarness({
         serverUrl: "http://localhost:6767/",
         deepLinks: {
-          ...require("../src/deepLink"),
+          ...require("../src/deepLink.ts"),
           acceptCliDeepLink: async (raw) => {
             acknowledgments.push(raw);
             return accepted;

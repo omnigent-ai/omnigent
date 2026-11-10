@@ -1,12 +1,10 @@
-"use strict";
-
-const assert = require("node:assert/strict");
-const { test } = require("node:test");
-const { DEV_DOMAIN, getDevUserDefault } = require("../src/dev_preferences");
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { DEV_DOMAIN, type ExecFileText, getDevUserDefault } from "../src/dev_preferences.ts";
 
 test("unpackaged preferences read the dev domain and preserve value types", () => {
-  const calls = [];
-  const exec = (binary, args, options) => {
+  const calls: [string, readonly string[]][] = [];
+  const exec: ExecFileText = (binary, args, options) => {
     calls.push([binary, args]);
     if (binary.endsWith("defaults")) return "<plist/>";
     assert.equal(options.input, "<plist/>");
@@ -19,7 +17,8 @@ test("unpackaged preferences read the dev domain and preserve value types", () =
 });
 
 test("missing or mistyped dev preferences fail closed", () => {
-  const exec = (binary) => (binary.endsWith("defaults") ? "<plist/>" : '{"DeveloperMode":"yes"}');
+  const exec: ExecFileText = (binary) =>
+    binary.endsWith("defaults") ? "<plist/>" : '{"DeveloperMode":"yes"}';
   assert.equal(getDevUserDefault("DeveloperMode", "boolean", { exec }), false);
   assert.equal(getDevUserDefault("serverUrls", "array", { exec }), null);
   assert.equal(getDevUserDefault("serverNames", "dictionary", { exec }), null);

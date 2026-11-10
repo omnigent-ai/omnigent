@@ -7,12 +7,14 @@ Databricks workspace URL now connects over https on the first click instead of
 tripping the unencrypted-http warning that the old http:// default produced.
 
 The setup page and the Electron main process share one module
-(``web/electron/src/url.js``), loaded here as ``window.omnigentUrl``, so the
+(``web/electron/src/url.ts``). The page loads its bundled copy,
+``web/electron/app/setupPageUrl.js``, as ``window.omnigentUrl``, so the
 same ``normalizeUrl`` the main process navigates with is also verified in the
 browser — coverage the web-only harness cannot otherwise reach.
 
 These tests drive only the static page plus that shared module; they do not need
-the ``live_server`` omnigent backend.
+the ``live_server`` omnigent backend. They need the bundle from
+``node web/electron/scripts/build.mjs``.
 """
 
 from __future__ import annotations
@@ -25,9 +27,11 @@ import pytest
 from playwright.sync_api import Page, expect
 
 # Repo-root-relative path to the Electron setup page. Loading it via file://
-# resolves the page's relative ``<script src="../src/url.js">`` against
-# web/electron/src/url.js, so window.omnigentUrl is the real shared module.
-_SETUP_PAGE = Path(__file__).resolve().parents[3] / "web" / "electron" / "setup" / "index.html"
+# resolves the page's relative ``<script src="../app/setupPageUrl.js">``
+# against the build output, which bundles the shared web/electron/src/url.ts.
+_ELECTRON_DIR = Path(__file__).resolve().parents[3] / "web" / "electron"
+_SETUP_PAGE = _ELECTRON_DIR / "setup" / "index.html"
+_SETUP_PAGE_SCRIPT = _ELECTRON_DIR / "app" / "setupPageUrl.js"
 
 # The setup page expects the Electron preload bridge (window.omnigentSetup),
 # which is absent in a plain browser. Stub it: reads feed page load, while
@@ -59,6 +63,11 @@ def _open_setup_page(
 
     :param page: Playwright page fixture.
     """
+    if not _SETUP_PAGE_SCRIPT.is_file():
+        pytest.fail(
+            f"{_SETUP_PAGE_SCRIPT} is missing; build it with "
+            "`node web/electron/scripts/build.mjs`."
+        )
     preload = _PRELOAD_STUB.replace(
         "__MANAGED_SERVERS__", json.dumps(list(managed_servers))
     ).replace("__RECENT_SERVERS__", json.dumps(list(recent_servers)))
@@ -185,9 +194,9 @@ def test_recent_server_connect_and_copy_actions_are_independent(page: Page) -> N
 
 
 def test_shared_url_module_defaults_scheme_in_browser(page: Page) -> None:
-    """The shared url.js (also used by the main process) defaults the scheme.
+    """The shared url.ts (also used by the main process) defaults the scheme.
 
-    The setup page loads ``web/electron/src/url.js`` as
+    The setup page loads the bundled ``web/electron/src/url.ts`` as
     ``window.omnigentUrl`` — the exact module the Electron main process uses to
     normalize the URL it navigates to. Exercising it here covers the
     main-process scheme logic the web-only e2e harness cannot otherwise reach.

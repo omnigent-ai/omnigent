@@ -202,7 +202,7 @@ function loadMainHarness({
       }),
     },
     "./localhost_cors": { registerLocalhostCors: () => {} },
-    "./url": {
+    "./url.ts": {
       normalizeUrl: (url) => url,
       expandDatabricksWorkspaceUrl: async (url) => url,
     },

@@ -29,6 +29,7 @@ import {
 } from "@/pages/onboarding/ServerSelectStep";
 import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
 import { CliInstallStep } from "@/pages/onboarding/CliInstallStep";
+import { isPlainHttpRemote } from "../../../electron/src/url.ts";
 
 /**
  * Outcome of a connect attempt. `error` → the connect was rejected and the
@@ -227,8 +228,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const shellPhase = useRef<ConnectPhase>("connecting");
   const confirmedHttpUrl = useRef<string | undefined>(undefined);
   const confirmServer = (url: string) => {
-    if (!globalThis.omnigentUrl.isPlainHttpRemote(url) || confirmedHttpUrl.current === url)
-      return true;
+    if (!isPlainHttpRemote(url) || confirmedHttpUrl.current === url) return true;
     if (
       !window.confirm(
         `The connection to ${new URL(url).host} uses unencrypted HTTP. ` +

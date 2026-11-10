@@ -12,14 +12,48 @@
 // server-determined and discovered by expandDatabricksWorkspaceUrl, exactly
 // as for a pasted workspace URL.
 
-"use strict";
+import { defaultSchemeFor } from "./url.ts";
 
-const { defaultSchemeFor } = require("./url");
+/** Where a deep link points: a server origin and an in-app path. */
+export interface OmnigentDeepLink {
+  origin: string;
+  path: string;
+}
+
+/** A live shell window, as deep-link routing sees it. */
+export interface DeepLinkWindowSnapshot {
+  origin: string | null;
+  currentOrigin: string | null;
+}
+
+/** Inputs to {@link chooseDeepLinkStrategy}. */
+export interface DeepLinkState {
+  /** The deep link's server origin. */
+  targetOrigin: string;
+  /** Live shell windows, in creation order. */
+  windows: readonly DeepLinkWindowSnapshot[];
+  /**
+   * Origins the user previously connected to (origins of `recent_servers` ∪
+   * {saved `server_url`}).
+   */
+  knownOrigins: readonly string[];
+  /**
+   * Index into `windows` of the currently focused shell window, if any
+   * (preferred when several windows are pinned to the target origin).
+   */
+  focusedIndex?: number | null;
+}
+
+export type DeepLinkStrategy =
+  | { strategy: "reuse-inplace"; windowIndex: number }
+  | { strategy: "reuse-reload"; windowIndex: number }
+  | { strategy: "open-known" }
+  | { strategy: "consent-unknown" };
 
 /**
  * Accepts the server root or a one-segment conversation route.
  */
-const DEEP_LINK_PATH_RE = /^\/$|^\/c\/[^/]+\/?$/;
+export const DEEP_LINK_PATH_RE = /^\/$|^\/c\/[^/]+\/?$/;
 
 /**
  * Parse an `omnigent://` deep link into a server origin + an in-app path.
@@ -30,13 +64,12 @@ const DEEP_LINK_PATH_RE = /^\/$|^\/c\/[^/]+\/?$/;
  * already emits for notification `navigatePath`, so the embedded
  * (workspace) build's `basenamedRouting` rebases it under the mount.
  *
- * @param {string} raw e.g. ``"omnigent://localhost:8000/c/conv_abc"``.
- * @returns {{ origin: string, path: string } | null} ``null`` for anything
- *   that isn't a valid `omnigent://.../c/<id>` or `omnigent://.../` link
- *   (wrong scheme, no host, other path, unparseable input).
+ * @param raw e.g. ``"omnigent://localhost:8000/c/conv_abc"``.
+ * @returns ``null`` for anything that isn't a valid `omnigent://.../c/<id>` or
+ *   `omnigent://.../` link (wrong scheme, no host, other path, unparseable input).
  */
-function parseOmnigentDeepLink(raw) {
-  let url;
+export function parseOmnigentDeepLink(raw: unknown): OmnigentDeepLink | null {
+  let url: URL;
   try {
     url = new URL(String(raw ?? ""));
   } catch {
@@ -56,7 +89,7 @@ function parseOmnigentDeepLink(raw) {
   // would make findKnownServerUrl/knownOrigins miss every known server and
   // force a wasteful network probe for already-connected workspaces.
   const scheme = defaultSchemeFor(url.host);
-  let origin;
+  let origin: string;
   try {
     origin = new URL(`${scheme}://${url.host}`).origin;
   } catch {
@@ -81,22 +114,8 @@ function parseOmnigentDeepLink(raw) {
  *   - `origin`: the origin the window is PINNED to (null = setup page);
  *   - `currentOrigin`: origin of the window's top-level page RIGHT NOW
  *     (may differ from `origin` mid-SSO redirect on a foreign IdP page).
- *
- * @param {Object} state
- * @param {string} state.targetOrigin The deep link's server origin.
- * @param {{origin: string | null, currentOrigin: string | null}[]} state.windows
- *   Live shell windows, in creation order.
- * @param {string[]} state.knownOrigins Origins the user previously connected
- *   to (origins of `recent_servers` ∪ {saved `server_url`}).
- * @param {number | null} [state.focusedIndex] Index into `windows` of the
- *   currently focused shell window, if any (preferred when several windows
- *   are pinned to the target origin).
- * @returns {{ strategy: "reuse-inplace", windowIndex: number }
- *   | { strategy: "reuse-reload", windowIndex: number }
- *   | { strategy: "open-known" }
- *   | { strategy: "consent-unknown" }}
  */
-function chooseDeepLinkStrategy(state) {
+export function chooseDeepLinkStrategy(state: DeepLinkState): DeepLinkStrategy {
   const { targetOrigin, windows, knownOrigins } = state;
   const focusedIndex = state.focusedIndex ?? null;
 
@@ -112,10 +131,10 @@ function chooseDeepLinkStrategy(state) {
     // focused one so a reload hits the window the user expects.
     const onOrigin = pinned.filter(({ w }) => w.currentOrigin === targetOrigin);
     if (onOrigin.length > 0) {
-      const pick = onOrigin.find(({ i }) => i === focusedIndex) ?? onOrigin[0];
+      const pick = onOrigin.find(({ i }) => i === focusedIndex) ?? onOrigin[0]!;
       return { strategy: "reuse-inplace", windowIndex: pick.i };
     }
-    const pick = pinned.find(({ i }) => i === focusedIndex) ?? pinned[0];
+    const pick = pinned.find(({ i }) => i === focusedIndex) ?? pinned[0]!;
     return { strategy: "reuse-reload", windowIndex: pick.i };
   }
 
@@ -130,15 +149,15 @@ function chooseDeepLinkStrategy(state) {
 /**
  * Claim a CLI navigation before its browser fallback deadline. Ordinary links
  * need no acknowledgment. The endpoint is always loopback, never a supplied URL.
- * @param {string} raw A parsed Omnigent deep link.
- * @returns {Promise<boolean>} Whether the desktop should handle the request.
+ * @param raw A parsed Omnigent deep link.
+ * @returns Whether the desktop should handle the request.
  */
-async function acceptCliDeepLink(raw) {
+export async function acceptCliDeepLink(raw: string): Promise<boolean> {
   if (!parseOmnigentDeepLink(raw)) return false;
   const acknowledgments = new URL(raw).searchParams.getAll("desktop_ack");
   if (acknowledgments.length === 0) return true;
   if (acknowledgments.length !== 1) return false;
-  const match = acknowledgments[0].match(/^([1-9][0-9]{0,4}):([a-f0-9]{64})$/);
+  const match = acknowledgments[0]!.match(/^([1-9][0-9]{0,4}):([a-f0-9]{64})$/);
   if (!match || Number(match[1]) > 65535) return false;
   try {
     const response = await fetch(`http://127.0.0.1:${match[1]}/desktop-open/${match[2]}`, {
@@ -152,10 +171,3 @@ async function acceptCliDeepLink(raw) {
     return false;
   }
 }
-
-module.exports = {
-  parseOmnigentDeepLink,
-  chooseDeepLinkStrategy,
-  acceptCliDeepLink,
-  DEEP_LINK_PATH_RE,
-};

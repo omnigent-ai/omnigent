@@ -1,6 +1,22 @@
-"use strict";
-const child_process = require("child_process");
-const osModule = require("os");
+import child_process from "child_process";
+import osModule from "os";
+
+/** The subset of `os` used to find the user's login shell. */
+export interface LoginShellOs {
+  userInfo: () => { shell?: string | null };
+}
+
+/** Injectable dependencies of {@link resolveLoginShellPath}. */
+export interface LoginShellPathDeps {
+  execFileSync?: (
+    file: string,
+    args: readonly string[],
+    options: { encoding: "utf8"; timeout: number; env: NodeJS.ProcessEnv },
+  ) => string;
+  os?: LoginShellOs;
+  env?: NodeJS.ProcessEnv;
+  platform?: string;
+}
 
 // Markers bracket the PATH value in the shell's stdout so a banner / MOTD /
 // version-manager greeting printed by an rc file can't corrupt what we parse.
@@ -15,15 +31,15 @@ const END = "__OMNIGENT_PATH_END__";
 const ESC = String.fromCharCode(27);
 const ANSI_RE = new RegExp(ESC + "(?:\\[[0-9;?]*[ -/]*[@-~]|[@-Z\\\\-_])", "g");
 
-function stripAnsi(value) {
+export function stripAnsi(value: string): string {
   return value.replace(ANSI_RE, "");
 }
 
 // Prefer the shell recorded in the passwd DB (reliable even when the process was
 // launched from a GUI, where $SHELL is typically unset — the whole premise of
 // this bug). Fall back to $SHELL, then the macOS default.
-function pickShell(os, env) {
-  let shell;
+function pickShell(os: LoginShellOs, env: NodeJS.ProcessEnv): string {
+  let shell: string | null | undefined;
   try {
     shell = os.userInfo().shell;
   } catch {
@@ -32,7 +48,7 @@ function pickShell(os, env) {
   return shell || env.SHELL || "/bin/zsh";
 }
 
-function extractPath(stdout) {
+export function extractPath(stdout: unknown): string | null {
   if (typeof stdout !== "string") return null;
   const start = stdout.indexOf(START);
   if (start === -1) return null;
@@ -46,7 +62,7 @@ function extractPath(stdout) {
 // On Apple Silicon, /opt/homebrew/bin only appears once a login shell has run,
 // so its presence lets terminal launches skip the shell spawn. Do not use
 // /usr/local/bin here: some stripped GUI PATHs already include it.
-function isLikelyLoginPath(env, platform) {
+export function isLikelyLoginPath(env: NodeJS.ProcessEnv, platform: string): boolean {
   if (platform !== "darwin") return false;
   return (env.PATH || "").split(":").some((dir) => dir === "/opt/homebrew/bin");
 }
@@ -66,11 +82,8 @@ function isLikelyLoginPath(env, platform) {
  *
  * Dependencies are injectable so the real module can be unit-tested without
  * spawning a shell.
- *
- * @param {{ execFileSync?: Function, os?: object, env?: object, platform?: string }} [deps]
- * @returns {string | null}
  */
-function resolveLoginShellPath(deps = {}) {
+export function resolveLoginShellPath(deps: LoginShellPathDeps = {}): string | null {
   const execFileSync = deps.execFileSync || child_process.execFileSync;
   const os = deps.os || osModule;
   const env = deps.env || process.env;
@@ -117,7 +130,7 @@ function resolveLoginShellPath(deps = {}) {
       // still have printed our delimited PATH before failing. execFileSync
       // attaches the captured stdout to the error, so try to recover it before
       // moving on to the next candidate shell.
-      const recovered = err && extractPath(err.stdout);
+      const recovered = err ? extractPath((err as { stdout?: unknown }).stdout) : null;
       if (recovered) return recovered;
     }
   }
@@ -129,14 +142,10 @@ function resolveLoginShellPath(deps = {}) {
  * Preserves any directory the current process had that the login shell lacks
  * (rare, but e.g. an app-injected dir), so this is a real merge rather than a
  * replace.
- *
- * @param {string} currentPath
- * @param {string} loginPath
- * @returns {string}
  */
-function mergePath(currentPath, loginPath) {
-  const seen = new Set();
-  const out = [];
+export function mergePath(currentPath: string, loginPath: string): string {
+  const seen = new Set<string>();
+  const out: string[] = [];
   for (const part of [loginPath, currentPath]) {
     if (!part) continue;
     for (const dir of part.split(":")) {
@@ -148,12 +157,3 @@ function mergePath(currentPath, loginPath) {
   }
   return out.join(":");
 }
-
-module.exports = {
-  resolveLoginShellPath,
-  mergePath,
-  // Exported for unit tests.
-  extractPath,
-  isLikelyLoginPath,
-  stripAnsi,
-};

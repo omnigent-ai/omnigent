@@ -4,7 +4,7 @@
 
 "use strict";
 
-const { databricksWorkspaceUiUrl } = require("./url");
+const { databricksWorkspaceUiUrl } = require("./url.ts");
 
 const MAX_ROOT_BOUNCES = 1;
 

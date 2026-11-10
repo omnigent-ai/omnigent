@@ -17,7 +17,35 @@
 // Runs in the main process (the gate holds regardless of caller); pure +
 // dep-free so `node --test` can exercise it without Electron.
 
-"use strict";
+/** Fields from Electron's setWindowOpenHandler. */
+export interface WindowOpenDetails {
+  url: string;
+  disposition?: string;
+  features?: string;
+}
+
+/** The opener window as the window-open policy sees it. */
+export interface WindowOpenContext {
+  /** The opener window's current top-level origin. */
+  openerOrigin: string | null;
+  /** The opener window's pinned origin. */
+  pinnedOrigin: string | null;
+  /** Raw settings.json `popup_allowed_origins` (unvalidated; non-arrays are ignored). */
+  extraPopupOrigins?: unknown;
+}
+
+/**
+ * popup → hardened child window; external → shell.openExternal;
+ * protocol-consent → consent dialog; ignore → unparseable URL.
+ */
+export type WindowOpenDecision =
+  | { kind: "popup" }
+  | { kind: "external" }
+  | { kind: "protocol-consent"; scheme: string }
+  | { kind: "ignore" };
+
+/** Response headers from Electron's webRequest, keyed by header name. */
+export type ResponseHeaders = Record<string, string[]>;
 
 /**
  * Schemes that open externally with no confirmation: they land in the
@@ -26,14 +54,14 @@
  * page-controlled arguments — and `shell.openExternal`, unlike a browser,
  * shows no prompt of its own — so it goes through a consent dialog first.
  */
-const WEB_SCHEMES = new Set(["http:", "https:", "mailto:"]);
+export const WEB_SCHEMES: ReadonlySet<string> = new Set(["http:", "https:", "mailto:"]);
 
 /**
  * Origins of the OAuth authorization endpoints behind the workspace's
  * managed connections (mirrors what the workspace UI actually opens).
  * Private deployments extend via settings.json `popup_allowed_origins`.
  */
-const OAUTH_POPUP_ORIGINS = new Set([
+export const OAUTH_POPUP_ORIGINS: ReadonlySet<string> = new Set([
   "https://github.com", // GitHub (system.ai.github)
   "https://accounts.google.com", // Google Drive / Gmail / Calendar / GA4 / Ads
   "https://slack.com", // Slack (system.ai.slack — MCP authorize lives on slack.com, not mcp.slack.com)
@@ -49,20 +77,12 @@ const SIZE_FEATURE_RE = /(^|,)\s*(width|height)\s*=/i;
 
 /**
  * Decide what to do with a page-initiated window.open / target=_blank.
- *
- * @param {{url: string, disposition?: string, features?: string}} details
- *   Fields from Electron's setWindowOpenHandler.
- * @param {{openerOrigin: string | null, pinnedOrigin: string | null,
- *   extraPopupOrigins?: unknown}} context The opener window's current
- *   top-level origin, its pinned origin, and the raw settings.json
- *   `popup_allowed_origins` value (unvalidated — non-arrays are ignored).
- * @returns {{kind: "popup"} | {kind: "external"}
- *   | {kind: "protocol-consent", scheme: string} | {kind: "ignore"}}
- *   popup → hardened child window; external → shell.openExternal;
- *   protocol-consent → consent dialog; ignore → unparseable URL.
  */
-function decideWindowOpen(details, context) {
-  let parsed;
+export function decideWindowOpen(
+  details: WindowOpenDetails,
+  context: WindowOpenContext,
+): WindowOpenDecision {
+  let parsed: URL;
   try {
     parsed = new URL(details.url);
   } catch {
@@ -81,7 +101,7 @@ function decideWindowOpen(details, context) {
     return { kind: "popup" };
   }
   const extra = context.extraPopupOrigins;
-  if (Array.isArray(extra) && extra.includes(parsed.origin)) {
+  if (Array.isArray(extra) && (extra as unknown[]).includes(parsed.origin)) {
     return { kind: "popup" };
   }
   return { kind: "external" };
@@ -104,14 +124,14 @@ const OPENER_SEVERING_HEADERS = new Set([
 /**
  * Strip opener-severing headers from a webRequest response-headers object.
  *
- * @param {Record<string, string[]> | undefined} responseHeaders
- * @returns {Record<string, string[]> | null} Copy without COOP headers, or
- *   null when there was nothing to strip.
+ * @returns Copy without COOP headers, or null when there was nothing to strip.
  */
-function stripCrossOriginOpenerHeaders(responseHeaders) {
+export function stripCrossOriginOpenerHeaders(
+  responseHeaders: ResponseHeaders | undefined,
+): ResponseHeaders | null {
   if (!responseHeaders) return null;
   let found = false;
-  const stripped = {};
+  const stripped: ResponseHeaders = {};
   for (const [key, value] of Object.entries(responseHeaders)) {
     if (OPENER_SEVERING_HEADERS.has(key.toLowerCase())) {
       found = true;
@@ -121,11 +141,3 @@ function stripCrossOriginOpenerHeaders(responseHeaders) {
   }
   return found ? stripped : null;
 }
-
-module.exports = {
-  decideWindowOpen,
-  stripCrossOriginOpenerHeaders,
-  WEB_SCHEMES,
-  // Exported for focused unit tests.
-  OAUTH_POPUP_ORIGINS,
-};
