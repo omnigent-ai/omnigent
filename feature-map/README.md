@@ -129,8 +129,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   Changes tab's path filter, find in the fetched patch, copy and open actions, and
   browser-local viewed marks with progress and hide-viewed.
 
-- [Session orchestration](./session-orchestration.md) covers private-owner
-  messaging, top-level worker creation, polling results and sharing restrictions.
+- [Session orchestration](./session-orchestration.md) covers owner-controlled
+  messaging, sibling worker creation, polling results and sharing restrictions.
 
 - [Workspace content search](./workspace-content-search.md) covers runner-backed
   text search, result navigation and its release flag.

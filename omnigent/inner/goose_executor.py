@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner import _proc
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -1084,6 +1085,10 @@ class GooseExecutor(Executor):
         self._reset_process_state()
         return True
 
+    def preserves_empty_initiating_message(self) -> bool:
+        """Keep the initiating item identity even when its ACP prompt is empty."""
+        return True
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -1113,6 +1118,9 @@ class GooseExecutor(Executor):
         # a reset) holds no prior context. Captured before we flip the latch
         # below so we know whether to replay history into this turn.
         fresh_session = not self._system_prompt_sent
+
+        candidate_id = messages[-1].get("input_item_id") if messages else None
+        input_item_id = candidate_id if isinstance(candidate_id, str) else None
 
         # Build the prompt payload from the most recent user message.
         user_text = ""
@@ -1181,7 +1189,11 @@ class GooseExecutor(Executor):
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "method": _AGENT_METHOD_SESSION_PROMPT,
-                "params": {"sessionId": session_id, "prompt": prompt_blocks},
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": prompt_blocks,
+                    "_meta": {_META_INPUT_ITEM_ID: input_item_id},
+                },
             }
         )
 

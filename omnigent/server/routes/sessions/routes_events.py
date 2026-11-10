@@ -69,6 +69,7 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
     diagnose_codex_provider_auth_failure,
+    turn_error_display_message,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -2686,7 +2687,7 @@ def register_events_routes(
                         classified_code = CODEX_COMPACTION_MODEL_FAILED
                 status_error = ErrorDetail(
                     code=classified_code,
-                    message=output.strip(),
+                    message=turn_error_display_message(classified_code, output.strip()),
                     title=diagnosis.title if diagnosis else None,
                     cause=diagnosis.cause if diagnosis else None,
                     remediation=diagnosis.remediation if diagnosis else None,
@@ -4192,6 +4193,7 @@ def register_events_routes(
                 delete_branch=True,
                 host_registry=getattr(request.app.state, "host_registry", None),
                 reason="session-delete",
+                host_store=getattr(request.app.state, "host_store", None),
                 expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
                 conversation_store=conversation_store,
                 exclude_conversation_id=conv.id,

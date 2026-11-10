@@ -242,8 +242,16 @@ vi.mock("./SubagentsPanel", () => ({
 // The real WorkspacePanel mounts a rail xterm for an open shell tab; stub the
 // low-level view to a marker echoing the attached terminal id.
 vi.mock("@/components/blocks/TerminalView", () => ({
-  TerminalView: ({ terminalId }: { terminalId: string }) => (
-    <div data-testid="terminal-view-stub">{terminalId}</div>
+  TerminalView: ({
+    terminalId,
+    focusOnConnect,
+  }: {
+    terminalId: string;
+    focusOnConnect?: boolean;
+  }) => (
+    <div data-testid="terminal-view-stub" data-focus-on-connect={String(focusOnConnect)}>
+      {terminalId}
+    </div>
   ),
 }));
 vi.mock("./FilesPanelDrawer", () => ({
@@ -309,7 +317,8 @@ const useHostsMock = vi.mocked(useHosts);
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
 import { forkSession, getSessionSlim } from "@/lib/sessionsApi";
-import type { Session } from "@/lib/types";
+import type { Session, SessionStatus } from "@/lib/types";
+import type { Conversation } from "@/hooks/useConversations";
 import { toast } from "sonner";
 
 const useSessionAgentMock = vi.mocked(useSessionAgent);
@@ -465,13 +474,23 @@ function PathDisplay() {
  * test can exercise the conversation-switch effect (AppShell stays mounted,
  * only the :conversationId route param changes) without a full remount.
  */
-/** Records the rail's state in the first commit of each session, before paint. */
-function RailFirstFrameProbe({ frames, to }: { frames: string[]; to: string }) {
+const railOpenState = () =>
+  document.querySelector('aside[aria-label="Workspace"]')?.getAttribute("data-state") ?? "none";
+
+/** Records `snapshot` (the rail's open state by default) in each session's first commit. */
+function RailFirstFrameProbe({
+  frames,
+  to,
+  snapshot = railOpenState,
+}: {
+  frames: string[];
+  to: string;
+  snapshot?: () => string;
+}) {
   const { conversationId } = useParams();
   useLayoutEffect(() => {
-    const rail = document.querySelector('aside[aria-label="Workspace"]');
-    frames.push(`${conversationId}:${rail?.getAttribute("data-state") ?? "none"}`);
-  }, [conversationId, frames]);
+    frames.push(`${conversationId}:${snapshot()}`);
+  }, [conversationId, frames]); // eslint-disable-line react-hooks/exhaustive-deps
   return <SessionNavButton to={to} />;
 }
 
@@ -563,11 +582,17 @@ function sessionShellTree(
 function renderShell(
   path: string,
   info?: ServerInfo,
-  options: { rerenderable?: boolean; sessionNavTo?: string; dirtyFileViewer?: boolean } = {},
+  options: {
+    rerenderable?: boolean;
+    sessionNavTo?: string;
+    dirtyFileViewer?: boolean;
+    seedQueryClient?: (client: QueryClient) => void;
+  } = {},
 ) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  options.seedQueryClient?.(qc);
   const tree = shellTree(
     qc,
     path,
@@ -763,6 +788,8 @@ beforeEach(() => {
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
   useChatStore.setState({
+    conversationId: null,
+    loadingConversation: false,
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
@@ -828,11 +855,12 @@ describe("AppShell header", () => {
   });
 
   it.each([
-    { title: "Off-window owner session", archived: false },
-    { title: null, archived: true },
+    { title: "Off-window owner session", archived: false, sibling: false },
+    { title: null, archived: true, sibling: false },
+    { title: "Archived sibling", archived: true, sibling: true },
   ])(
     "shows owner actions for an off-window session ($title, archived=$archived)",
-    ({ title, archived }) => {
+    ({ title, archived, sibling }) => {
       mockConversations([]);
       useSessionMock.mockReturnValue({
         session: {
@@ -844,6 +872,7 @@ describe("AppShell header", () => {
           createdAt: 1_700_000_000,
           title,
           archived,
+          family: sibling ? { id: "family", representative_id: "other", pinned: false } : undefined,
           labels: {},
           items: [],
           pendingElicitations: [],
@@ -864,6 +893,135 @@ describe("AppShell header", () => {
       expect(
         screen.getByRole("menuitem", { name: archived ? "Unarchive" : "Archive" }),
       ).toBeInTheDocument();
+      if (sibling) expect(screen.queryByTestId("header-move-to-project")).toBeNull();
+      else expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
+    },
+  );
+
+  it.each<{
+    source: string;
+    snapshot: SessionStatus;
+    backgroundTasks?: number;
+    bound: SessionStatus | null;
+    row: Partial<Conversation> | null;
+    asks: boolean;
+  }>([
+    { source: "the bound live store", snapshot: "idle", bound: "running", row: null, asks: true },
+    {
+      source: "the snapshot before binding",
+      snapshot: "waiting",
+      bound: null,
+      row: null,
+      asks: true,
+    },
+    {
+      source: "the snapshot while the bind loads",
+      snapshot: "running",
+      bound: "idle",
+      row: null,
+      asks: true,
+    },
+    {
+      source: "the streamed row's goal-driven background work",
+      snapshot: "idle",
+      bound: "idle",
+      row: { status: "idle", background_work_running: true },
+      asks: true,
+    },
+    {
+      source: "the streamed row's pending approval",
+      snapshot: "idle",
+      bound: "idle",
+      row: { status: "idle", pending_elicitations_count: 1 },
+      asks: true,
+    },
+    {
+      source: "the streamed row over a stale snapshot",
+      snapshot: "running",
+      bound: "idle",
+      row: { status: "idle", pending_elicitations_count: 0, background_work_running: false },
+      asks: false,
+    },
+    {
+      // A row fetched by id has no background flag until the stream settles it.
+      source: "the snapshot's background tasks under a fetched row",
+      snapshot: "idle",
+      backgroundTasks: 1,
+      bound: null,
+      row: { status: "idle", pending_elicitations_count: 0 },
+      asks: true,
+    },
+  ])(
+    "archive confirmation for an off-window session follows $source",
+    async ({ snapshot, backgroundTasks = 0, bound, row, asks }) => {
+      const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) =>
+        Response.json({ id: "conv_off_window", archived: true }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      onTestFinished(() => {
+        vi.unstubAllGlobals();
+      });
+      const archiveRequests = () =>
+        fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH");
+      mockConversations([]);
+      useChatStore.setState({
+        conversationId: bound === null ? "conv_other" : "conv_off_window",
+        sessionStatus: bound ?? "idle",
+        // A bound store without a streamed row may still be hydrating.
+        loadingConversation: bound !== null && row === null,
+      });
+      useSessionMock.mockReturnValue({
+        session: sessionSnapshot({
+          id: "conv_off_window",
+          agentId: "ag_owner",
+          agentName: "developer",
+          status: snapshot,
+          createdAt: 1_700_000_000,
+          title: "Off-window owner session",
+          archived: false,
+          backgroundTaskCount: backgroundTasks,
+          // A stale snapshot still lists an approval the streamed row reports resolved.
+          pendingElicitations: snapshot === "running" && row ? [{ id: "elicit_resolved" }] : [],
+        }),
+        isLoading: false,
+        error: null,
+      });
+
+      renderShell("/c/conv_off_window", undefined, {
+        // The open-session row the session-updates stream keeps current.
+        seedQueryClient: (client) => {
+          if (!row) return;
+          client.setQueryData(["conversation-backfill", "conv_off_window"], {
+            id: "conv_off_window",
+            object: "conversation",
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            labels: {},
+            permission_level: 4,
+            ...row,
+          });
+        },
+      });
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+        button: 0,
+        ctrlKey: false,
+      });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+
+      if (!asks) {
+        expect(await screen.findByText("home")).toBeInTheDocument();
+        expect(screen.queryByTestId("archive-running-dialog")).toBeNull();
+        await waitFor(() => expect(archiveRequests()).toHaveLength(1));
+        const [url, init] = archiveRequests()[0];
+        expect(String(url)).toContain("/v1/sessions/conv_off_window");
+        expect(JSON.parse(String(init?.body))).toEqual({ archived: true });
+        return;
+      }
+      const dialog = await screen.findByRole("dialog", { name: "Archive running session?" });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(screen.queryByTestId("archive-running-dialog")).toBeNull());
+      expect(screen.queryByText("home")).toBeNull();
+      expect(archiveRequests()).toHaveLength(0);
     },
   );
 
@@ -3664,6 +3822,112 @@ describe("Right workspace card visibility", () => {
     },
   );
 
+  it("shows the incoming session's rail tab and file in its first frame", () => {
+    writeSessionWorkspaceState("conv_from", {
+      open: true,
+      rightRailTab: "files",
+      openFiles: ["a.ts"],
+      selectedFilePath: "a.ts",
+    });
+    writeSessionWorkspaceState("conv_to", { open: true, rightRailTab: "changes" });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_from", permission_level: null },
+      { id: "conv_to", permission_level: null },
+    ]);
+    const frames: string[] = [];
+    const railSelection = () => {
+      const tab = document.querySelector('[role="tab"][aria-selected="true"]')?.textContent;
+      const file = document.querySelector('[aria-current="true"][title]')?.getAttribute("title");
+      return `${tab ?? "none"},${file ?? "none"}`;
+    };
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        qc,
+        "/c/conv_from",
+        <RailFirstFrameProbe frames={frames} to="/c/conv_to" snapshot={railSelection} />,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(frames).toEqual(["conv_from:none,a.ts", "conv_to:Changes,none"]);
+  });
+
+  it("shows the incoming session's Chat/TUI view in its first frame", () => {
+    mockConversations([
+      { id: "conv_from", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+      { id: "conv_to", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    sessionStorage.setItem("omnigent.web.panel-key:conv_from", "terminal:terminal_claude_main");
+    sessionStorage.setItem("omnigent.web.panel-key:conv_to", "__chat__");
+    const frames: string[] = [];
+    const view = () => screen.getByTestId("view-probe").getAttribute("data-view") ?? "none";
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        qc,
+        "/c/conv_from",
+        <>
+          <TerminalFirstViewProbe />
+          <RailFirstFrameProbe frames={frames} to="/c/conv_to" snapshot={view} />
+        </>,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(frames).toEqual(["conv_from:terminal", "conv_to:chat"]);
+  });
+
+  it("does not carry the outgoing session's shell focus intent to a restored shell", async () => {
+    writeSessionWorkspaceState("conv_from", { open: true, openFiles: ["a.ts"] });
+    writeSessionWorkspaceState("conv_to", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_main",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_from", permission_level: 4 },
+      { id: "conv_to", permission_level: 4 },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    const frames: string[] = [];
+    const shellFocus = () =>
+      document
+        .querySelector('[data-testid="terminal-view-stub"]')
+        ?.getAttribute("data-focus-on-connect") ?? "none";
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        qc,
+        "/c/conv_from",
+        <RailFirstFrameProbe frames={frames} to="/c/conv_to" snapshot={shellFocus} />,
+      ),
+    );
+    // Focus the shell in the outgoing session, then move its slot to a file.
+    fireEvent.click(screen.getByTitle("main · u-1"));
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveAttribute(
+      "data-focus-on-connect",
+      "true",
+    );
+    fireEvent.click(screen.getByTitle("a.ts"));
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(frames).toEqual(["conv_from:none", "conv_to:false"]);
+  });
+
   it("uses the default when navigating from Agents to a child in another tree", () => {
     localStorage.setItem("omnigent:default-workspace-tab", "changes");
     writeSessionWorkspaceState("conv_from", { rightRailTab: "subagents" });
@@ -3997,6 +4261,7 @@ describe("AppShell URL sync — file param", () => {
   it("restores the file viewer from the ?file= URL param on load", () => {
     // A shared link like /c/conv_abc?file=README.md should open the viewer
     // immediately, without the user having to click the file in the panel.
+    writeSessionWorkspaceState("conv_abc", { openFiles: ["a.ts"] });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
 
     renderShell("/c/conv_abc?file=README.md");
@@ -4005,6 +4270,11 @@ describe("AppShell URL sync — file param", () => {
     expect(screen.queryByTestId("file-viewer")).toBeNull();
     expect(pushPanel).toHaveAttribute("data-state", "open");
     expect(pushPanel).toHaveAttribute("data-path", "README.md");
+    // The linked file is merged into the remembered tabs and saved on mount.
+    expect(readSessionWorkspaceState("conv_abc")).toMatchObject({
+      openFiles: ["a.ts", "README.md"],
+      selectedFilePath: "README.md",
+    });
   });
 
   it("restores the file viewer into the desktop rail on a ?file= reload", () => {
@@ -5262,8 +5532,8 @@ describe("AppShell share action", () => {
       expect(
         screen.getByText(/This session's working directory \(a home or root directory\)/),
       ).toBeInTheDocument();
-      expect(screen.getByText(/This Omnigent server allows read-only sharing/)).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /^add$/i })).toBeDisabled();
+      expect(screen.getByText(/Please be careful when sharing/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^grant$/i })).toBeInTheDocument();
     });
   });
 

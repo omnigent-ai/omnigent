@@ -16,7 +16,15 @@ import sqlite3
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
@@ -28,7 +36,6 @@ from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 from omnigent.models import model_catalog
-from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -85,6 +92,7 @@ from omnigent.harnesses.codex_native.timeouts import (
     APP_SERVER_READY_TIMEOUT_SECONDS as _APP_SERVER_READY_TIMEOUT_SECONDS,
 )
 from omnigent.inner import _proc
+from omnigent.inner._subprocess_lifecycle import subprocess_exited
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
@@ -1077,6 +1085,7 @@ _CODEX_INTERNAL_ERROR_CODE = -32603
 
 #: JSON-RPC invalid-request code codex returns for protocol-level rejections.
 _CODEX_INVALID_REQUEST_CODE = -32600
+_CODEX_INVALID_PARAMS_CODE = -32602
 
 #: Substring in codex's ``-32603`` message when its thread-store cannot
 #: load/resume a thread's rollout — stable across the wrapper phrasings
@@ -1155,12 +1164,92 @@ def codex_resume_current_model_provider(exc: BaseException) -> str | None:
     return current if isinstance(current, str) and current else None
 
 
+def codex_resume_unconfigured_model_provider(exc: BaseException) -> str | None:
+    """
+    Return the thread's provider when ``thread/resume`` refuses it as unconfigured.
+
+    Codex 0.166+ refuses a thread whose recorded provider has no
+    ``[model_providers.X]`` table, even when the resume names a configured
+    provider — e.g. a thread started under ``Databricks`` resumed after the
+    host switched to ``omnigent_databricks``.
+
+    :param exc: The exception raised by the resume request.
+    :returns: The thread's unconfigured provider, e.g. ``"Databricks"``, or
+        ``None`` for any other failure.
+    """
+    if not isinstance(exc, CodexAppServerResponseError) or exc.code != _CODEX_INVALID_REQUEST_CODE:
+        return None
+    data = exc.error.get("data") if isinstance(exc.error, dict) else None
+    if not isinstance(data, dict) or data.get("type") != "modelProviderNotConfigured":
+        return None
+    missing = data.get("modelProvider")
+    return missing if isinstance(missing, str) and missing else None
+
+
+def is_project_hooks_config_refusal(exc: BaseException) -> bool:
+    """Identify a project hooks path failure from Codex's pre-input config check."""
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == _CODEX_INVALID_REQUEST_CODE
+        and exc.message is not None
+        and exc.message.startswith(
+            "failed to load configuration: Failed to read project hooks config file "
+        )
+        and exc.message.endswith("/.codex/config.toml: Not a directory (os error 20)")
+    )
+
+
+async def _codex_effective_model_provider(client: CodexAppServerClient, cwd: Path) -> str | None:
+    """
+    Read the provider Codex runs for *cwd*, or ``None`` when it cannot be read.
+
+    :param client: Connected app-server client.
+    :param cwd: Working directory whose config layers apply.
+    :returns: The effective provider id, e.g. ``"omnigent_databricks"``.
+    """
+    try:
+        response = await asyncio.wait_for(
+            client.request("config/read", {"includeLayers": False, "cwd": str(cwd)}),
+            timeout=_MODEL_PROVIDER_READ_TIMEOUT_SECONDS,
+        )
+    except (CodexAppServerResponseError, OSError, TimeoutError):
+        _logger.warning("Could not read Codex's effective model provider", exc_info=True)
+        return None
+    result = response.get("result")
+    config = result.get("config") if isinstance(result, dict) else None
+    effective = config.get("model_provider") if isinstance(config, dict) else None
+    return effective if isinstance(effective, str) and effective else None
+
+
 def is_server_draining_error(error: CodexAppServerResponseError) -> bool:
     """Whether Codex explicitly refused this RPC before submitting its input."""
     return (
         error.code == _CODEX_INVALID_REQUEST_CODE
         and error.message == "Server is draining; retry after reconnecting"
     )
+
+
+def input_too_large_limits(error: CodexAppServerResponseError) -> tuple[int, int] | None:
+    """Read the sizes when Codex refused turn input as too large to accept.
+
+    Codex validates ``turn/start`` and ``turn/steer`` input before submitting
+    it, answering ``-32602`` with ``data.input_error_code == "input_too_large"``,
+    so nothing reached the thread.
+
+    :param error: Structured JSON-RPC response error.
+    :returns: ``(actual_chars, max_chars)`` for that refusal, ``(0, 0)`` when it
+        omits the sizes, or ``None`` for any other error.
+    """
+    if error.code != _CODEX_INVALID_PARAMS_CODE:
+        return None
+    data = error.error.get("data") if isinstance(error.error, dict) else None
+    if not isinstance(data, dict) or data.get("input_error_code") != "input_too_large":
+        return None
+    actual = data.get("actual_chars")
+    limit = data.get("max_chars")
+    if isinstance(actual, int) and isinstance(limit, int):
+        return actual, limit
+    return 0, 0
 
 
 def is_compaction_steer_refusal(error: CodexAppServerResponseError) -> bool:
@@ -1314,24 +1403,27 @@ class CodexAppServerClient:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CodexMessage] = loop.create_future()
         self._pending_requests[request_id] = future
+        rpc_identity = f"Codex app-server RPC: method={method} request_id={request_id}"
         try:
-            await self._ws.send(
-                json.dumps(
-                    {
-                        "id": request_id,
-                        "method": method,
-                        "params": params,
-                    }
+            try:
+                await self._ws.send(
+                    json.dumps(
+                        {
+                            "id": request_id,
+                            "method": method,
+                            "params": params,
+                        }
+                    )
                 )
-            )
+            except (OSError, ConnectionClosed) as send_error:
+                send_error.add_note(f"{rpc_identity} phase=send")
+                raise
             if self._reader_task is not None:
                 await asyncio.wait(
                     (future, self._reader_task), return_when=asyncio.FIRST_COMPLETED
                 )
                 if not future.done():
-                    raise ConnectionError(
-                        f"Codex app-server disconnected before responding to {method}"
-                    )
+                    raise self._disconnected_before_response(method, rpc_identity)
             response = await future
         finally:
             self._pending_requests.pop(request_id, None)
@@ -1339,7 +1431,7 @@ class CodexAppServerClient:
         error = response.get("error")
         if error:
             exc = CodexAppServerResponseError(error)
-            exc.add_note(f"Codex app-server RPC: method={method} request_id={request_id}")
+            exc.add_note(rpc_identity)
             raise exc
         if method in {"thread/start", "thread/resume"}:
             result = response.get("result")
@@ -1348,6 +1440,28 @@ class CodexAppServerClient:
             if isinstance(thread_id, str) and thread_id:
                 self._subscribed_thread_ids.add(thread_id)
         return response
+
+    def _disconnected_before_response(self, method: str, rpc_identity: str) -> ConnectionError:
+        """
+        Build the error for an RPC whose reader exited before its response.
+
+        The reader's own failure becomes the cause, and the note records the
+        websocket close code without addresses, close reasons or payloads.
+
+        :param method: App-server method, e.g. ``"turn/start"``.
+        :param rpc_identity: Method and request id note, e.g.
+            ``"Codex app-server RPC: method=turn/start request_id=2"``.
+        :returns: Connection error chained to the reader's failure, if any.
+        """
+        reader = self._reader_task
+        reader_error = (
+            reader.exception() if reader is not None and not reader.cancelled() else None
+        )
+        close_code = self._ws.close_code if self._ws is not None else None
+        error = ConnectionError(f"Codex app-server disconnected before responding to {method}")
+        error.__cause__ = reader_error
+        error.add_note(f"{rpc_identity} phase=response close_code={close_code}")
+        return error
 
     def is_subscribed_to_thread(self, thread_id: str) -> bool:
         """
@@ -1850,13 +1964,8 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
     A pinned model no visible row names (a hidden configured default is
     explicitly supported) marks NO default: crowning a different visible
     model would let the launch path pin a model the configuration never
-    selected. Without a pin, prefer Omnigent's launch default when visible;
-    otherwise keep Codex's own first default.
-    Rows are otherwise verbatim.
-
-    Codex's own ``isDefault`` is its built-in preference, which says nothing
-    about the model this session launched on, so a picker that trusted it
-    would name a model the pane is not running.
+    selected. Without a pin, keep Codex's own first default: that is the
+    model an unpinned Codex launch runs. Rows are otherwise verbatim.
 
     :param rows: Raw ``model/list`` rows.
     :param pinned_model: The model the session runs, or ``None``.
@@ -1865,24 +1974,14 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
     from omnigent.models.codex_model_vocabulary import comparable_model_id
 
     codex_default_index: int | None = None
-    omnigent_default_index: int | None = None
     pinned_index: int | None = None
     pinned_key = comparable_model_id(pinned_model) if pinned_model else None
-    omnigent_default_key = comparable_model_id(CODEX_DEFAULT_MODEL)
     marked: list[_JsonObject] = []
     for index, row in enumerate(rows):
         cleaned = {key: value for key, value in row.items() if key != "isDefault"}
         marked.append(cleaned)
         if codex_default_index is None and row.get("isDefault") is True:
             codex_default_index = index
-        if omnigent_default_index is None:
-            for spelling in (row.get("id"), row.get("model")):
-                if (
-                    isinstance(spelling, str)
-                    and comparable_model_id(spelling) == omnigent_default_key
-                ):
-                    omnigent_default_index = index
-                    break
         if pinned_index is None and pinned_key is not None:
             for spelling in (row.get("id"), row.get("model")):
                 if isinstance(spelling, str) and comparable_model_id(spelling) == pinned_key:
@@ -1892,8 +1991,6 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
         # The effective model is authoritative even when hidden from the
         # visible rows; never substitute a model the config did not select.
         default_index = pinned_index
-    elif omnigent_default_index is not None:
-        default_index = omnigent_default_index
     else:
         default_index = codex_default_index
     if default_index is not None:
@@ -1961,6 +2058,7 @@ async def prepare_codex_provider_config(
     cwd: Path,
     env: Mapping[str, str],
     retry_policy: RetryPolicy | None = None,
+    source_home: Path | None = None,
     client_surface: str | None = None,
     app_server_command: tuple[str, ...] = (),
 ) -> list[str]:
@@ -1970,7 +2068,11 @@ async def prepare_codex_provider_config(
     resolves inherited providers itself only when Omnigent didn't pick the provider.
     """
     overrides = materialize_codex_provider_config(
-        codex_home, config_overrides, retry_policy=retry_policy, client_surface=client_surface
+        codex_home,
+        config_overrides,
+        retry_policy=retry_policy,
+        source_home=source_home,
+        client_surface=client_surface,
     )
     if not _codex_may_inherit_provider(overrides, app_server_command):
         return overrides
@@ -2005,6 +2107,7 @@ async def prepare_codex_provider_config(
         codex_home,
         overrides,
         retry_policy=retry_policy,
+        source_home=source_home,
         client_surface=client_surface,
         effective_providers=providers,
     )
@@ -2069,7 +2172,7 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
     profile_host = _read_databrickscfg_host(launch.profile) if launch.profile is not None else None
     return fingerprint_of(
         "codex-native",
-        "isolated-picker-v4",
+        "isolated-picker-v5",
         _codex_config_identity(_codex_home_config_source_from_env()),
         (launch.profile, (profile_host or "").rstrip("/")) if launch.profile is not None else None,
         launch.model,
@@ -2464,6 +2567,7 @@ class CodexNativeAppServer:
     session_id: str | None = None
     writable_roots: tuple[str, ...] = ()
     app_server_command: tuple[str, ...] = ()
+    active_harnesses: Collection[str] | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
     # First TLS certificate failure the launcher printed; mirrored into the
     # bridge so the forwarder can fail a stuck turn with the cause.
@@ -2652,6 +2756,7 @@ class CodexNativeAppServer:
         self.config_overrides = await prepare_codex_provider_config(
             self.codex_home,
             self.config_overrides,
+            source_home=config_source,
             codex_path=self.codex_path,
             cwd=self.cwd,
             env=self.env,
@@ -2703,6 +2808,19 @@ class CodexNativeAppServer:
         effort_catalog_transport = self.listen_url or str(self.socket_path)
         _effort_catalog_cache.pop(effort_catalog_transport, None)
         _effort_catalog_misses.pop(effort_catalog_transport, None)
+        from omnigent.mcp_disabled_servers import (
+            RELAUNCH_WITHOUT_OVERRIDES_EVENT,
+            plan_codex_launch,
+        )
+
+        mcp_plan = plan_codex_launch(
+            self.config_overrides,
+            executor="codex-native",
+            active_harnesses=self.active_harnesses,
+            codex_home=self.codex_home,
+            cwd=self.cwd,
+        )
+        self.config_overrides = list(mcp_plan.config_overrides)
         await self._spawn_app_server_process(resolved_listen)
         # Ordering invariant: hooks.json is written before the spawn above,
         # and the trust handshake must complete before the first turn — codex
@@ -2719,7 +2837,25 @@ class CodexNativeAppServer:
         # outer guard so a cancellation mid-trust still tears down.
         try:
             try:
-                startup_client = await self._wait_until_ready()
+                try:
+                    startup_client = await self._wait_until_ready()
+                except Exception:
+                    fallback = mcp_plan.overrides_after_early_exit()
+                    if (
+                        fallback is None
+                        or self.proc is None
+                        or not await subprocess_exited(self.proc)
+                    ):
+                        raise
+                    _logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
+                    await self.close()
+                    self.certificate_failure = None
+                    clear_certificate_failure(self.bridge_dir)
+                    self.config_overrides = list(fallback)
+                    if resolved_listen.startswith("unix://"):
+                        self.socket_path.unlink(missing_ok=True)
+                    await self._spawn_app_server_process(resolved_listen)
+                    startup_client = await self._wait_until_ready()
             except CodexAppServerSilentStartTimeout as silent:
                 # A fresh app-server can stall before initialization; a second spawn
                 # can recover. Reuse the transport: callers captured the listen
@@ -4029,6 +4165,7 @@ def build_codex_native_server(
     model_catalog_rows: list[_JsonObject] | None = None,
     reconcile_process_registry: bool = True,
     terminal_launch_args: Sequence[str] = (),
+    active_harnesses: Collection[str] | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -4140,6 +4277,7 @@ def build_codex_native_server(
     ):
         config_overrides.append(f"model={json.dumps(pinned_model)}")
     return CodexNativeAppServer(
+        active_harnesses=active_harnesses,
         codex_path=resolved_codex,
         socket_path=socket_path,
         codex_home=codex_home,
@@ -4579,8 +4717,8 @@ def _resolve_subscription_launch(
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     # Pin codex's built-in ``openai`` provider: the bridged config.toml may
-    # set a custom default ``model_provider`` (e.g. isaac's Databricks AI
-    # Gateway), which would silently hijack a Subscription selection. A
+    # set a custom default ``model_provider`` (e.g. a Databricks AI
+    # Gateway provider), which would silently hijack a Subscription selection. A
     # no-op when the user's config sets no custom default.
     subscription_overrides = ['model_provider="openai"']
     if _codex_login_usable():
@@ -4817,7 +4955,7 @@ def resolve_native_codex_launch(
     from omnigent.host.databricks_credential import api_key_auth_precludes_broker
 
     if entry is None and not api_key_auth_precludes_broker(spec):
-        # Use the managed host's Databricks broker only when no provider or
+        # Use the managed host's credential broker only when no provider or
         # explicit API-key auth selected a route. Host boot populated ucode
         # state so the model resolves to a served id.
         from omnigent.host.databricks_credential import (
@@ -5203,7 +5341,8 @@ async def preload_codex_thread_for_resume(
     :param model_provider: Launch-selected provider to apply over persisted thread settings.
         None preserves Codex's default resume behavior.
     :param rollout_path: Thread rollout to restamp when Codex refuses the resume
-        because its effective provider differs, e.g. under a managed config.
+        because its effective provider differs, e.g. under a managed config, or
+        because the thread's recorded provider is no longer configured.
         None surfaces that refusal.
     :returns: The subscribed client when retained, otherwise None.
     :raises RuntimeError: If the app-server rejects the resume.
@@ -5260,8 +5399,19 @@ async def preload_codex_thread_for_resume(
         try:
             await client.request("thread/resume", resume_params)
         except CodexAppServerResponseError as exc:
+            if rollout_path is None:
+                raise
             current_provider = codex_resume_current_model_provider(exc)
-            if current_provider is None or rollout_path is None:
+            unconfigured_provider = codex_resume_unconfigured_model_provider(exc)
+            if unconfigured_provider is not None:
+                # The refusal names only the thread's missing provider; move the
+                # thread to the one this launch runs so the session stays resumable.
+                current_provider = model_provider or await _codex_effective_model_provider(
+                    client, effective_cwd
+                )
+                if current_provider == unconfigured_provider:
+                    current_provider = None
+            if current_provider is None:
                 raise
             _logger.warning(
                 "Codex resumes thread %s only under its effective provider %r "
