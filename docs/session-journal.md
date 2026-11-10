@@ -125,8 +125,8 @@ show only their name and state.
 ### Tasks in the chat
 
 The chat marks where each task starts and ends, in the same form as a
-sub-agent's start and end: "Started", "Completed", "Failed", "Blocked" or
-"Waiting for you on", then the task's name. Each plan the agent writes adds one
+sub-agent's start and end: "Started", "Completed", "Failed" or "Waiting for
+you on", then the task's name. Each plan the agent writes adds one
 line too, such as "Made a plan: Cut GET /orders p95 by 20% · 5 tasks" or
 "Updated the plan: added Pre-warm the pool, removed Overlap the check". Tasks
 from the agent's own list get Started and Completed.

@@ -90,10 +90,8 @@ describe("planChangeText", () => {
 
   it("leads a marker with what happened to the task", () => {
     expect(
-      ["started", "done", "failed", "blocked", "needs_input"].map((s) =>
-        taskMarkerLabel(s as never),
-      ),
-    ).toEqual(["Started", "Completed", "Failed", "Blocked", "Waiting for you on"]);
+      ["started", "done", "failed", "needs_input"].map((s) => taskMarkerLabel(s as never)),
+    ).toEqual(["Started", "Completed", "Failed", "Waiting for you on"]);
   });
 });
 

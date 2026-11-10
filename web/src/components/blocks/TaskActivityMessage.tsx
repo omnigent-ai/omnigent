@@ -35,9 +35,9 @@ export function ActivityNotice({ data }: { data: Record<string, unknown> }) {
 }
 
 /**
- * Where a task started, finished, failed, blocked or began waiting for the
- * user, or a change to the plan, in the sub-agent marker's form. The task's
- * name opens the Tasks tab at it while it's still a task there.
+ * Where a task started, finished, failed or began waiting for the user, or a
+ * change to the plan, in the sub-agent marker's form. The task's name opens
+ * the Tasks tab at it while it's still a task there.
  */
 export function TaskActivityMessage({ activity }: { activity: TaskActivity }) {
   const markers = useContext(TaskMarkersContext);

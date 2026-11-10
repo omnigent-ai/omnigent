@@ -1,7 +1,7 @@
 // Chat markers for a session's tasks, as the server writes them into the
-// transcript: where a task started, finished, failed, blocked or began waiting
-// for the user, and each change to the plan. They render like sub-agent markers
-// and link to the Tasks tab.
+// transcript: where a task started, finished, failed or began waiting for the
+// user, and each change to the plan. They render like sub-agent markers and link
+// to the Tasks tab.
 
 import { WAITING_FOR_YOU, type StepProgress, type StepStatus } from "@/lib/sessionJournal";
 
@@ -30,7 +30,7 @@ export type TaskActivity =
       removed: string[];
     };
 
-const STATUSES: readonly string[] = ["started", "done", "needs_input", "blocked", "failed"];
+const STATUSES: readonly string[] = ["started", "done", "needs_input", "failed"];
 const CHANGES: readonly string[] = ["made", "replaced", "renamed", "updated"];
 // Past this many names, a plan line counts them instead.
 const NAMES_IN_A_LINE = 3;
@@ -85,7 +85,6 @@ export function taskMarkerLabel(status: StepStatus): string {
     started: "Started",
     done: "Completed",
     failed: "Failed",
-    blocked: "Blocked",
     needs_input: `${WAITING_FOR_YOU} on`,
   }[status];
 }

@@ -24,7 +24,7 @@ from omnigent.stores import ConversationStore
 
 _logger = logging.getLogger(__name__)
 
-#: ``event_type`` of a task's marker: it started, finished, failed, blocked or waits for the user.
+#: ``event_type`` of a task's marker: it started, finished, failed or waits for the user.
 TASK_EVENT_TYPE = "session.journal.task"
 #: ``event_type`` of a plan-change line.
 PLAN_EVENT_TYPE = "session.journal.plan"
@@ -98,7 +98,7 @@ def todo_transitions(
 async def record_status_marker(
     store: ConversationStore, session_id: str, entry: JournalEntry, plan: JournalEntry | None
 ) -> None:
-    """Mark where a plan task started, finished, failed, blocked or began waiting for the user.
+    """Mark where a plan task started, finished, failed or began waiting for the user.
 
     :param entry: The status entry the journal accepted.
     :param plan: The plan it was written against, which names the task.
