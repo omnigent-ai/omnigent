@@ -245,7 +245,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   once they finish. Side chats,
   grid session panes, and writable sub-agent Workspace tabs edit into their own
   composer, where "@"-mentions return as attachment markers. Edit is hidden on
-  pending messages, other contributors' messages (shared session or not), and
+  messages still being sent, other contributors' messages (shared session or not), and
   read-only composers. An attachment that can't be recovered is skipped and
   named in a toast; inline images from imported transcripts are recovered.
 - `delivered-send-recovery`: a sent message stays out of the composer when its

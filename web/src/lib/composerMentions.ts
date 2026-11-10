@@ -405,9 +405,13 @@ export function recallSessionMentions(
 /**
  * Turn a sent message's relative file markers back into composer tokens and
  * return the tagged files. Absolute-path upload markers are dropped, as in
- * ``replaceSentMentions``; session markers are left for ``recallSessionMentions``.
+ * ``replaceSentMentions``; session markers are left for ``recallSessionMentions``,
+ * whose tokens go in ``taken`` so a file and a session never share one.
  */
-export function recallFileMentions(text: string): { text: string; files: MentionItem[] } {
+export function recallFileMentions(
+  text: string,
+  taken: readonly string[] = [],
+): { text: string; files: MentionItem[] } {
   const files: MentionItem[] = [];
   const recalled = text.replace(SENT_ATTACHED_RE, (_m, raw: string, trail: string) => {
     const path = raw.trim();
@@ -420,8 +424,13 @@ export function recallFileMentions(text: string): { text: string; files: Mention
           lineRange: { start: Number(range[2]), end: Number(range[3]) },
         }
       : { path: path.replace(/\/$/, ""), isDir: path.endsWith("/") };
-    if (!files.some((it) => mentionItemPath(it) === mentionItemPath(item))) files.push(item);
-    return fileMentionToken(item) + trail;
+    const known = files.find((it) => mentionItemPath(it) === mentionItemPath(item));
+    if (known) return fileMentionToken(known) + trail;
+    // A session tag recalled from the same message may own the plain token.
+    const token = newFileMentionToken(item, [...taken, ...files.map(fileMentionToken)]);
+    if (token !== fileMentionToken(item)) item.token = token;
+    files.push(item);
+    return token + trail;
   });
   return { text: recalled, files };
 }

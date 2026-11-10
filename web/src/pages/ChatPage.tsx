@@ -3880,7 +3880,8 @@ function ComposerImpl(
     applyDraft: (edited) => {
       setCommandError(null);
       dismissMention();
-      const recalled = recallFileMentions(edited.text);
+      const sessionTokens = recallSessionMentions(edited.text).sessions.map((it) => it.token!);
+      const recalled = recallFileMentions(edited.text, sessionTokens);
       loadIntoComposer(recalled.text, edited.files, { validateFiles: true });
       // After the load, which clears file mentions while restoring session mentions.
       setMentionedItems(recalled.files);

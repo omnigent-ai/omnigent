@@ -216,6 +216,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking } from "./ChatPage";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+import { withSessionMentionHint } from "@/lib/composerMentions";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -7180,6 +7181,25 @@ describe("Composer — editing a sent message", () => {
     expect(sentText).toContain("src/app.ts");
     expect(sentFiles?.map((file) => file.name)).toEqual(["notes.txt"]);
     expect(await sentFiles?.[0]?.text()).toBe("meeting notes");
+  });
+
+  it("keeps a file and a session with the same name as separate tags", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    renderWithTooltips(<Composer {...props} ref={ref} />);
+    const session = '[Session: "README.md" id=sess_readme subagent=no]';
+    const sent = withSessionMentionHint(`compare [Attached: README.md] with ${session}`, true);
+
+    act(() => ref.current?.editSentMessage({ sessionId: CONV, text: sent, content: [] }));
+
+    await waitFor(() =>
+      expect(textarea()).toHaveValue("compare @README.md (file) with @README.md"),
+    );
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    const [sentText] = vi.mocked(props.onSend).mock.calls[0]! as [string];
+    expect(sentText.match(/\[Attached(?: file)?: README\.md\]/g)).toHaveLength(1);
+    expect(sentText.split(session)).toHaveLength(2);
   });
 
   it("drops a recovered attachment this server no longer accepts and says why", async () => {

@@ -236,7 +236,6 @@ export function SideChatPane({
       const { accepted, errors } = validateAttachments(files, sideChatAttachmentPolicy);
       useChatStore.getState().updateSideChatComposer(childId, (current) => ({
         ...current,
-        // This composer has no mention picker, so mentions stay as their markers.
         text,
         files: accepted,
         quotes: [],

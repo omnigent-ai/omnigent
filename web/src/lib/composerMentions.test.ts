@@ -249,6 +249,13 @@ describe("recallFileMentions", () => {
     });
   });
 
+  it("gives a file a token no recalled session uses", () => {
+    expect(recallFileMentions("see [Attached: README.md]", ["@README.md"])).toEqual({
+      text: "see @README.md (file)",
+      files: [{ path: "README.md", isDir: false, token: "@README.md (file)" }],
+    });
+  });
+
   it("drops upload markers and leaves session markers alone", () => {
     const session = '[Session: "Fix CI" id=sess_1 subagent=no]';
     expect(recallFileMentions(`[Attached: /tmp/up.png]see ${session}`)).toEqual({
