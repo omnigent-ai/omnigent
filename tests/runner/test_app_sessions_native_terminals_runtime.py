@@ -2409,7 +2409,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["cancel", "ready", "rejected"])
+@pytest.mark.parametrize("outcome", ["cancel", "ready", "rejected", "expired"])
 async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2423,6 +2423,8 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
 
     notification_pool = DedicatedExecutor(max_workers=1, thread_name_prefix="test-bridge-notify")
     monkeypatch.setattr(runner_app_mod, "_BRIDGE_NOTIFICATIONS", notification_pool)
+    if outcome == "expired":
+        monkeypatch.setattr(claude_native_bridge, "TOOLS_CHANGED_READY_TIMEOUT_S", budget(2))
     session_id = uuid.uuid4().hex
     # claude-native pins the bridge tree under /tmp (see _ensure_secure_dir);
     # use the real per-user bridge dir like tests/runner/test_comment_relay.py
@@ -2547,6 +2549,10 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
                 with pytest.raises(asyncio.CancelledError):
                     await notification_task
                 connection.request.assert_not_called()
+            elif outcome == "expired":
+                await asyncio.wait_for(notification_task, budget(4))
+                connection.request.assert_not_called()
+                assert not (bridge_dir / "server.json").exists()
             else:
                 (bridge_dir / "server.json").write_text(
                     json.dumps({"token": "notification-token", "socket": "/unused.sock"})
