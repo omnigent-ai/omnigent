@@ -19,6 +19,8 @@ type ProjectPrefillPhase = "location" | "settled";
  */
 export interface ProjectPrefillConfig {
   hostId?: string;
+  repository?: { url: string; branch?: string };
+  sandboxProvider?: string;
   workspace?: string;
   agentId?: string;
   /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */
@@ -39,7 +41,7 @@ export interface ProjectPrefillConfig {
  * Overlay how a project's last session started on its stored defaults. The
  * started agent becomes `launchAgentId`; when it is the stored agent and the
  * start recorded its own harness options, those replace the stored model and
- * effort. A started host replaces the stored host and its working directory.
+ * effort. A started host replaces placement only for projects without a repository.
  */
 export function withProjectLaunchDefaults(
   config: ProjectPrefillConfig,
@@ -54,7 +56,7 @@ export function withProjectLaunchDefaults(
       merged.effort = undefined;
     }
   }
-  if (launch.hostId !== undefined) {
+  if (launch.hostId !== undefined && config.repository === undefined) {
     merged.hostId = launch.hostId;
     merged.workspace = launch.workspace;
   }
@@ -111,6 +113,7 @@ interface ProjectPrefillWrites {
   /** Select the managed sandbox as the target (config.hostId was the sandbox
    *  sentinel). Distinct from `hostId` — the sandbox is not a real host id. */
   selectSandbox?: boolean;
+  sandboxProvider?: string;
 }
 
 /**
@@ -187,8 +190,13 @@ function locationStep(
   // sandbox sentinel is never a real host id, so it's handled before the
   // online-host lookup below. Mirrors the composer's last-choice sandbox path.
   if (config?.hostId === SANDBOX_HOST_CHOICE) {
-    if (inputs.managedSandboxesEnabled && !inputs.sandboxSelected && selectedHostId === null) {
+    if (
+      (inputs.managedSandboxesEnabled || config.repository !== undefined) &&
+      !inputs.sandboxSelected &&
+      selectedHostId === null
+    ) {
       writes.selectSandbox = true;
+      writes.sandboxProvider = config.sandboxProvider;
     }
     return settled(state);
   }
@@ -203,7 +211,7 @@ function locationStep(
     config?.hostId != null &&
     hosts.some((h) => h.host_id === config.hostId && h.status === "online");
   const configHostUsable =
-    configHostOnline &&
+    (configHostOnline || (config?.repository !== undefined && config.hostId !== undefined)) &&
     !inputs.sandboxSelected &&
     (selectedHostId === null || selectedHostId === config!.hostId);
   if (configHostUsable) writes.hostId = config!.hostId;

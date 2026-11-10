@@ -22,6 +22,7 @@ from fastapi import APIRouter, Request
 
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.onboarding.sandboxes.repositories import normalize_repository
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.sessions import announce_projects_changed
@@ -32,6 +33,33 @@ from omnigent.server.schemas import (
     UpdateProjectRequest,
 )
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
+
+
+def _normalize_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate recognized project defaults while preserving extension keys."""
+    config = dict(config)
+    try:
+        if "repository" in config:
+            if config["repository"] is None:
+                config.pop("repository")
+            else:
+                config["repository"] = normalize_repository(config["repository"])
+        if "sandbox_provider" in config:
+            provider = config["sandbox_provider"]
+            if not isinstance(provider, str) or not provider.strip():
+                raise ValueError("sandbox_provider must be a nonempty string")
+            if config.get("host_id") != "__sandbox__":
+                raise ValueError("sandbox_provider requires a sandbox project target")
+            config["sandbox_provider"] = provider.strip()
+        if (
+            config.get("repository")
+            and config.get("host_id") == "__sandbox__"
+            and config.get("workspace")
+        ):
+            raise ValueError("sandbox projects cannot set a host workspace path")
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from None
+    return config
 
 
 def _to_response(project: Project) -> dict[str, Any]:
@@ -82,7 +110,7 @@ def create_projects_router(
             uuid.uuid4().hex,
             body.name,
             user_id,
-            body.config,
+            _normalize_config(body.config),
         )
         # Push the change to the owner's other connected clients so their
         # sidebars pick up the new folder without a reload.
@@ -170,7 +198,7 @@ def create_projects_router(
             project_id,
             user_id=user_id,
             name=body.name,
-            config=body.config,
+            config=_normalize_config(body.config) if body.config is not None else None,
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)

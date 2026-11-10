@@ -2157,6 +2157,12 @@ function ConversationList({
     () => (openSessionRow ? [...pagedConversations, openSessionRow] : pagedConversations),
     [pagedConversations, openSessionRow],
   );
+  const activeProjectSession =
+    allConversations.find((session) => session.id === activeId) ??
+    [...allConversations, ...pinnedConversations].find(
+      (session) => session.id === resolvedActiveId,
+    );
+  const projectContextHost = hosts.find((host) => host.host_id === activeProjectSession?.host_id);
   const groupOrder = useMemo<readonly string[]>(
     () =>
       view.grouping === "harness"
@@ -3276,6 +3282,7 @@ function ConversationList({
                           <>
                             <ProjectHeaderActions
                               hostId={defaultProjectHostId}
+                              contextHost={projectContextHost}
                               hostsLoading={hostsLoading}
                               onOrderChange={(manual) => {
                                 const ranks = new Map(
@@ -4000,6 +4007,7 @@ function SessionFilterMenu({
 
 function ProjectHeaderActions({
   hostId,
+  contextHost,
   hostsLoading,
   onOrderChange,
   manualOrder,
@@ -4014,6 +4022,7 @@ function ProjectHeaderActions({
   onEnterSelectionMode,
 }: {
   hostId: string | null;
+  contextHost?: Host;
   hostsLoading: boolean;
   onOrderChange: (manual: boolean) => void;
   manualOrder: boolean;
@@ -4038,7 +4047,12 @@ function ProjectHeaderActions({
 
   return (
     <div className="flex items-center gap-0.5">
-      <NewProjectButton onCreated={onProjectCreated} hostId={hostId} hostsLoading={hostsLoading} />
+      <NewProjectButton
+        onCreated={onProjectCreated}
+        hostId={hostId}
+        contextHost={contextHost}
+        hostsLoading={hostsLoading}
+      />
       {showMenu && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>

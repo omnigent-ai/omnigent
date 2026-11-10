@@ -66,9 +66,28 @@ async def resolve_project_session_create(
     # Nested agents inherit filing, while the composer or MCP chooses their placement.
     config = {} if getattr(body, "sibling_source_id", None) else project.config
     updates: dict[str, Any] = {}
-    for field in ("agent_id", "workspace", "git"):
+    default_fields = (
+        ("agent_id",)
+        if getattr(body, "host_type", None) == "managed" and config.get("repository")
+        else ("agent_id", "workspace", "git")
+    )
+    for field in default_fields:
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
+    if getattr(body, "host_type", None) == "managed":
+        if "sandbox_provider" not in fields_set and "sandbox_provider" in config:
+            updates["sandbox_provider"] = config["sandbox_provider"]
+        if not {"workspace", "workspaces"} & fields_set and config.get("repository"):
+            from omnigent.onboarding.sandboxes.repositories import normalize_repository
+
+            try:
+                repository = normalize_repository(config["repository"])
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from None
+            updates["workspaces"] = [
+                repository["url"]
+                + (f"#{repository['branch']}" if repository.get("branch") else "")
+            ]
     resolved_data = body.model_dump()
     resolved_data.update(updates)
     # Re-validate project hints because config is intentionally stored as

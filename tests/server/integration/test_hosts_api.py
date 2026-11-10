@@ -16,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    CAP_CLONE_REPOSITORY,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -1701,3 +1702,55 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
     assert received == [(_HOST_ID, "runner_x", "exited with code 1")]
     # The callback owns the event; the tunnel must not log a session-less duplicate.
     assert not [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]
+
+
+@pytest.mark.parametrize("user,status", [(None, 401), ("other@example.com", 403)])
+async def test_clone_repository_requires_host_owner(
+    multi_user_app, user: str | None, status: int
+) -> None:
+    app, registry, host_store, _conversations = multi_user_app
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    host_store.upsert_on_connect(_HOST_ID, "example-host", "owner@example.com")
+    _register_fake_host(registry, _HOST_ID, "owner@example.com")
+    conn = registry.get(_HOST_ID)
+    conn.hello.capabilities = [CAP_CLONE_REPOSITORY]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/hosts/{_HOST_ID}/repositories/clone",
+            headers={"x-test-user": user} if user else {},
+            json={"url": "https://git.example.com/team/sample.git", "path": "~/sample"},
+        )
+    assert response.status_code == status
+    assert conn.outbound_queue.empty()
+    assert not conn.pending_clones
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"url": {"token": "secret"}, "path": "~/sample"},
+        {
+            "url": "https://user:secret@git.example.com/team/sample.git",
+            "path": "~/sample",
+            "branch": ["secret"],
+        },
+        {"url": "https://user:secret@git.example.com/team/sample.git"},
+        ["secret"],
+    ],
+)
+async def test_clone_repository_shape_errors_do_not_echo_secrets(
+    host_api_app, body: object
+) -> None:
+    app, _registry, _host_store, _conversations = host_api_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/v1/hosts/{_HOST_ID}/repositories/clone", json=body)
+    assert response.status_code == 400
+    assert "secret" not in response.text
+    assert response.json()["error"]["code"] == "invalid_input"

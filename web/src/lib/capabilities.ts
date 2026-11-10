@@ -83,6 +83,7 @@ export function parseSiblingSessionDestinations(value: unknown): SiblingSessionD
 
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  project_repository_creation?: boolean;
   sibling_sessions?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
@@ -140,7 +141,8 @@ export interface ServerInfo {
    * UI-relevant capability flags per launch-capable provider, e.g.
    * ``{ agent_sandbox: { multi_repo: true } }``. The new-session repo picker
    * branches on these (multi-repo list vs single). A provider absent from the
-   * map, or the map absent entirely, defaults every flag off.
+   * map defaults ordinary repository URL/branch input on; catalogs restrict
+   * those inputs unless explicitly enabled. Other flags default off.
    */
   sandbox_provider_capabilities?: Record<
     string,
@@ -149,6 +151,8 @@ export interface ServerInfo {
       inference_models?: boolean;
       default_models?: boolean;
       repo_catalog?: { name: string; url: string }[];
+      repository_url_input?: boolean;
+      repository_branch_selection?: boolean;
     }
   >;
   /**
@@ -424,6 +428,7 @@ function parseBranding(raw: unknown): Branding | null {
 export const FALLBACK_SERVER_INFO: ServerInfo = {
   sibling_session_destinations: "any_host",
   session_bundle_workspaces: false,
+  project_repository_creation: false,
   accounts_enabled: false,
   // Fail to multi-user: a failed probe must not hide account/sharing chrome.
   single_user: false,
@@ -532,6 +537,14 @@ function parseSandboxProviderCapabilities(
           provider,
           {
             ...capabilities,
+            repository_url_input:
+              typeof capabilities.repository_url_input === "boolean"
+                ? capabilities.repository_url_input
+                : undefined,
+            repository_branch_selection:
+              typeof capabilities.repository_branch_selection === "boolean"
+                ? capabilities.repository_branch_selection
+                : undefined,
             repo_catalog: Array.isArray(capabilities.repo_catalog)
               ? capabilities.repo_catalog.filter(
                   (repo: unknown): repo is { name: string; url: string } =>
@@ -579,6 +592,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             data.sibling_session_destinations,
           ),
           session_bundle_workspaces: data.session_bundle_workspaces === true,
+          project_repository_creation: data.project_repository_creation === true,
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,
@@ -725,4 +739,21 @@ export function sandboxProviderOptions(info: ServerInfo): (string | null)[] {
   const offered = info.sandbox_providers;
   if (Array.isArray(offered) && offered.length > 0) return offered;
   return [info.sandbox_provider];
+}
+
+/** Catalog-only legacy providers do not accept custom URLs or branches. */
+export function sandboxRepositoryCapabilities(
+  info: ServerInfo | "loading",
+  provider: string | null,
+) {
+  const capabilities =
+    info !== "loading" && provider !== null
+      ? info.sandbox_provider_capabilities?.[provider]
+      : undefined;
+  const catalog = capabilities?.repo_catalog ?? [];
+  return {
+    catalog,
+    urlInput: capabilities?.repository_url_input ?? catalog.length === 0,
+    branchSelection: capabilities?.repository_branch_selection ?? catalog.length === 0,
+  };
 }

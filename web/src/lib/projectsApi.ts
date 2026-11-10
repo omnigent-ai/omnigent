@@ -16,12 +16,16 @@ import { apiErrorFromResponse } from "./sessionsApi";
 /**
  * Default session settings a project stores, pre-filled into the new-chat
  * composer. All fields optional — an unset key means "no default for this
- * slot". The vocabulary is client-owned; the server persists the object whole
- * and never acts on it, so adding a key here needs no backend change.
+ * slot". Recognized repository fields are validated by the server; other keys
+ * remain extensible defaults.
  */
 export interface ProjectConfig {
   /** Default host id, or the sandbox sentinel. */
   host_id?: string;
+  /** Repository linked when the project is created. */
+  repository?: { url: string; branch?: string };
+  /** Offered provider used for managed sessions. */
+  sandbox_provider?: string;
   /** Default working directory / repo path on that host. */
   workspace?: string;
   /** Default agent id for new sessions. */

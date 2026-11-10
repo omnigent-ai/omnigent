@@ -134,6 +134,7 @@ import {
   composeSandboxWorkspaces,
   deriveRepoName,
   isValidSandboxBranch,
+  repositorySelectionError,
   isValidSandboxRepoUrl,
   isValidSandboxWorkspaceLength,
 } from "@/lib/sandboxRepositories";
@@ -170,6 +171,7 @@ import {
   pickerCuration,
   sandboxOptionLabel,
   sandboxProviderOptions,
+  sandboxRepositoryCapabilities,
   sandboxProfilesEnabled,
 } from "@/lib/capabilities";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
@@ -2351,6 +2353,8 @@ function NewChatLandingContent({
     const stored: ProjectPrefillConfig = c
       ? {
           hostId: c.host_id,
+          repository: c.repository,
+          sandboxProvider: c.sandbox_provider,
           workspace: c.workspace,
           agentId: c.agent_id,
           useWorktree: c.use_worktree,
@@ -2710,7 +2714,8 @@ function NewChatLandingContent({
   // combobox derives its selection from each URL, so a remembered repo the
   // account can no longer access just shows unselected.
   const [sandboxRepoSelections, setSandboxRepoSelections] = useState<LastSandboxRepo[]>(
-    () => restoredDraft?.sandboxRepoSelections ?? readLastSandboxRepos(),
+    () =>
+      restoredDraft?.sandboxRepoSelections ?? (projectParam !== "" ? [] : readLastSandboxRepos()),
   );
   // Whether the launch provider clones several repos (server-declared per
   // provider via /v1/info). A single-repo provider caps the picker at one, so
@@ -2726,6 +2731,13 @@ function NewChatLandingContent({
     effectiveSandboxProvider !== null &&
     info.sandbox_provider_capabilities?.[effectiveSandboxProvider]?.multi_repo === true;
   const maxSandboxRepos = sandboxMultiRepo ? MAX_SANDBOX_REPOS : 1;
+  const repositorySeededRef = useRef(
+    landingDraft !== null && landingDraft.project === projectParam,
+  );
+  const repositoryPlacementEditedRef = useRef(
+    landingDraft !== null && landingDraft.project === projectParam,
+  );
+  const repositoryCapabilities = sandboxRepositoryCapabilities(info, effectiveSandboxProvider);
   const [pendingRepoUrl, setPendingRepoUrl] = useState("");
   const [sandboxRepoPopoverOpen, setSandboxRepoPopoverOpen] = useState(false);
   const sandboxRepoPopoverRef = useRef<HTMLDivElement>(null);
@@ -3064,22 +3076,26 @@ function NewChatLandingContent({
       seededConfigSigRef.current !== null &&
       prefillConfigSig !== seededConfigSigRef.current;
     if (!projectChanged && !configChanged) return;
-    setSandboxSelected(false);
-    setSandboxProfile(null);
-    setSelectedHostId(null);
+    const preservePlacement = !projectChanged && repositoryPlacementEditedRef.current;
+    if (!preservePlacement) {
+      setSandboxSelected(false);
+      setSandboxProvider(null);
+      setSandboxProfile(null);
+      setSelectedHostId(null);
+      repositorySeededRef.current = false;
+      repositoryPlacementEditedRef.current = false;
+      setWorkspace("");
+      setBranchName("");
+      setAutoSeededBranch("");
+      setSandboxRepoSelections([]);
+      setPendingRepoUrl("");
+      workspaceFromConfigRef.current = false;
+      seededHostRef.current = null;
+      worktreeSeededForRef.current = null;
+    }
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     agentExplicitlySelectedRef.current = false;
-    setWorkspace("");
-    setBranchName("");
-    setAutoSeededBranch("");
-    // Drafted sandbox repo fields are location state too — left in place they
-    // would clone the previous project's repo into this project's sandbox.
-    setSandboxRepoSelections([]);
-    setPendingRepoUrl("");
     agentFromConfigRef.current = false;
-    workspaceFromConfigRef.current = false;
-    seededHostRef.current = null;
-    worktreeSeededForRef.current = null;
     setPickerEdits(null);
     pickedOptionKeysRef.current.clear();
     seededConfigSigRef.current = prefillConfigSig;
@@ -5026,7 +5042,7 @@ function NewChatLandingContent({
     const { writes } = step;
     if (writes.selectSandbox) {
       setSandboxSelected(true);
-      setSandboxProvider(defaultSandboxProvider());
+      setSandboxProvider(writes.sandboxProvider ?? defaultSandboxProvider());
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
@@ -5069,6 +5085,23 @@ function NewChatLandingContent({
     projectLaunch,
     defaultSandboxProvider,
   ]);
+
+  useEffect(() => {
+    if (
+      prefill.project !== projectParam ||
+      !prefillSettled ||
+      prefillConfig === undefined ||
+      repositorySeededRef.current
+    )
+      return;
+    repositorySeededRef.current = true;
+    const repository = prefillConfig.repository;
+    setSandboxRepoSelections(
+      repository
+        ? [{ url: repository.url, branch: repository.branch ?? "" }]
+        : readLastSandboxRepos(),
+    );
+  }, [prefill.project, projectParam, prefillSettled, prefillConfig]);
 
   // Seed a fresh worktree branch once the workspace settles, from the effective
   // default (project `use_worktree` wins, else the user-global setting).
@@ -5121,7 +5154,12 @@ function NewChatLandingContent({
   const sandboxWorkspaceLengthsValid = sandboxRepoSelections.every((repo) =>
     isValidSandboxWorkspaceLength(repo.url, repo.branch),
   );
+  const sandboxRepositoryError =
+    sandboxRepoSelections
+      .map((repository) => repositorySelectionError(repository, repositoryCapabilities))
+      .find((error) => error !== null) ?? null;
   const sandboxRepoValid =
+    sandboxRepositoryError === null &&
     sandboxRepoSelections.every((repo) => isValidSandboxRepoUrl(repo.url)) &&
     sandboxBranchesValid &&
     sandboxWorkspaceLengthsValid &&
@@ -5484,6 +5522,15 @@ function NewChatLandingContent({
       };
     }
     if (sandboxSelected) {
+      if (!managedSandboxesEnabled || !sandboxProviderRows.includes(effectiveSandboxProvider)) {
+        return {
+          field: "other",
+          message: "This sandbox target is unavailable. Choose another target.",
+        };
+      }
+      if (sandboxRepositoryError !== null) {
+        return { field: "sandboxRepo", message: sandboxRepositoryError };
+      }
       if (sandboxRepoOverCap) {
         return {
           field: "sandboxRepo",
@@ -5714,6 +5761,7 @@ function NewChatLandingContent({
   };
 
   function selectHost(hostId: string) {
+    if (prefillConfig?.repository) repositoryPlacementEditedRef.current = true;
     // Persist the explicit pick even when it matches the current selection, so
     // clicking the auto-selected host still records it as the sticky default
     // for the next visit.
@@ -5737,6 +5785,7 @@ function NewChatLandingContent({
   }
 
   function selectSandbox(provider: string | null = null) {
+    if (prefillConfig?.repository) repositoryPlacementEditedRef.current = true;
     if (provider !== sandboxProvider) setSandboxProfile(null);
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
@@ -6813,11 +6862,20 @@ function NewChatLandingContent({
                   )}
                 </div>
                 <SandboxRepositoryPicker
+                  {...repositoryCapabilities}
                   selections={sandboxRepoSelections}
-                  onChange={setSandboxRepoSelections}
+                  onChange={(repositories) => {
+                    repositorySeededRef.current = true;
+                    repositoryPlacementEditedRef.current = true;
+                    setSandboxRepoSelections(repositories);
+                  }}
                   maxRepos={maxSandboxRepos}
                   pendingUrl={pendingRepoUrl}
-                  onPendingUrlChange={setPendingRepoUrl}
+                  onPendingUrlChange={(url) => {
+                    repositorySeededRef.current = true;
+                    repositoryPlacementEditedRef.current = true;
+                    setPendingRepoUrl(url);
+                  }}
                 />
                 <p className="text-sm text-muted-foreground">
                   {maxSandboxRepos > 1

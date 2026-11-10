@@ -116,6 +116,8 @@ class SandboxCapabilities:
     multi_repo: bool = False
     git_clone_options: bool = False
     resume_preserves_host: bool = False
+    repository_url_input: bool | None = None
+    repository_branch_selection: bool | None = None
 
 
 @dataclass(frozen=True)

@@ -313,3 +313,46 @@ describe("withProjectLaunchDefaults", () => {
     ).toEqual({ hostId: "host_2", workspace: "/repos/working-dir-b" });
   });
 });
+
+describe("repository project placement", () => {
+  it("keeps repository placement together instead of applying remembered location", () => {
+    const config = {
+      hostId: SANDBOX_HOST_CHOICE,
+      sandboxProvider: "example",
+      repository: { url: "https://git.example.com/team/sample.git" },
+    };
+    expect(withProjectLaunchDefaults(config, { hostId: "host_1", workspace: "/other" })).toEqual(
+      config,
+    );
+    const { writes } = runToDone(inputs({ config, managedSandboxesEnabled: true }));
+    expect(writes).toMatchObject({ selectSandbox: true, sandboxProvider: "example" });
+  });
+
+  it("retains unavailable repository targets instead of moving the path to another host", () => {
+    const { writes } = runToDone(
+      inputs({
+        config: {
+          hostId: "offline",
+          workspace: "/work/sample",
+          repository: { url: "https://git.example.com/team/sample.git" },
+        },
+      }),
+    );
+    expect(writes).toMatchObject({ hostId: "offline", workspace: "/work/sample" });
+  });
+
+  it("respects an explicit placement override", () => {
+    const { writes } = runToDone(
+      inputs({
+        selectedHostId: "host_2",
+        config: {
+          hostId: SANDBOX_HOST_CHOICE,
+          sandboxProvider: "example",
+          repository: { url: "https://git.example.com/team/sample.git" },
+        },
+      }),
+    );
+    expect(writes).not.toHaveProperty("selectSandbox");
+    expect(writes).not.toHaveProperty("sandboxProvider");
+  });
+});

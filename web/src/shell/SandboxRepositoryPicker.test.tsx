@@ -22,7 +22,16 @@ const REPOSITORIES: GithubRepo[] = ["api", "web"].map((name) => ({
   pushed_at: null,
 }));
 
-function renderPicker(initialSelections: LastSandboxRepo[] = [], maxRepos = 10) {
+function renderPicker(
+  initialSelections: LastSandboxRepo[] = [],
+  maxRepos = 10,
+  options: {
+    single?: boolean;
+    catalog?: { name: string; url: string }[];
+    urlInput?: boolean;
+    branchSelection?: boolean;
+  } = {},
+) {
   const onChange = vi.fn();
   const onPendingUrlChange = vi.fn();
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -32,6 +41,7 @@ function renderPicker(initialSelections: LastSandboxRepo[] = [], maxRepos = 10) 
     return (
       <QueryClientProvider client={client}>
         <SandboxRepositoryPicker
+          {...options}
           selections={selections}
           onChange={(next) => {
             setSelections(next);
@@ -77,7 +87,7 @@ describe("SandboxRepositoryPicker", () => {
       { url: "git@GitHub.com:Org/API", branch: "feature/orders" },
     ]);
     await screen.findByRole("combobox", { name: "Branch for org/api" });
-    fireEvent.click(screen.getByRole("combobox", { name: "GitHub repository" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "Repository" }));
     expect(screen.queryByRole("option", { name: /org\/api/ })).toBeNull();
     fireEvent.click(screen.getByRole("option", { name: /org\/web/ }));
     expect(onChange).toHaveBeenLastCalledWith([
@@ -269,5 +279,84 @@ describe("SandboxRepositoryPicker", () => {
     expect(onChange).toHaveBeenLastCalledWith([
       { url: "https://git.example.com/org/repo", branch: "release" },
     ]);
+  });
+  it("single mode consumes typed URLs without Add and keeps branch errors visible", () => {
+    const { onChange } = renderPicker([], 1, { single: true, branchSelection: false });
+    const input = screen.getByRole("combobox", { name: "Repository URL" });
+    fireEvent.change(input, { target: { value: "https://git.example.com/team/sample.git" } });
+    expect(onChange).toHaveBeenLastCalledWith([
+      { url: "https://git.example.com/team/sample.git", branch: "" },
+    ]);
+    expect(screen.queryByRole("button", { name: "Add" })).toBeNull();
+    expect(screen.queryByLabelText("Branch (optional)")).toBeNull();
+  });
+
+  it("offers catalog selections without URL or branch entry for restricted providers", () => {
+    const catalog = [{ name: "Sample", url: "https://git.example.com/team/sample.git" }];
+    const { onChange } = renderPicker([], 10, { catalog, urlInput: false, branchSelection: false });
+    expect(screen.queryByRole("textbox", { name: "Repository URL" })).toBeNull();
+    fireEvent.click(screen.getByRole("combobox", { name: "Repository" }));
+    fireEvent.click(screen.getByRole("option", { name: "Sample" }));
+    expect(onChange).toHaveBeenLastCalledWith([{ url: catalog[0].url, branch: "" }]);
+    expect(screen.queryByRole("textbox", { name: "Branch for Sample" })).toBeNull();
+    expect(fetchGithubRepos).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Remove Sample" }));
+    expect(onChange).toHaveBeenLastCalledWith([]);
+  });
+
+  it("retains unsupported selections and branches until explicitly corrected", () => {
+    renderPicker([{ url: "https://git.example.com/team/custom.git", branch: "release" }], 10, {
+      catalog: [{ name: "Sample", url: "https://git.example.com/team/sample.git" }],
+      urlInput: false,
+      branchSelection: false,
+    });
+    const branch = screen.getByRole("textbox", { name: "Branch for custom" });
+    expect(branch).toHaveValue("release");
+    expect(branch).toHaveAccessibleDescription(/Clear the branch/);
+    fireEvent.change(branch, { target: { value: "" } });
+    expect(screen.getByText(/This repository is unavailable on this target/)).toBeVisible();
+    expect(screen.queryByRole("textbox", { name: "Branch for custom" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Remove custom" }));
+    expect(screen.queryByText(/This repository is unavailable on this target/)).toBeNull();
+  });
+
+  it("deduplicates catalog and connected suggestions in multi mode", async () => {
+    renderPicker([], 10, { catalog: [{ name: "API", url: "git@github.com:org/api" }] });
+    await waitFor(() => expect(fetchGithubRepos).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("combobox", { name: "Repository" }));
+    await screen.findByRole("option", { name: /org\/web/ });
+    expect(screen.getAllByRole("option")).toHaveLength(2);
+    expect(screen.getByRole("option", { name: "API" })).toBeVisible();
+  });
+
+  it("single mode deduplicates catalog and connected suggestions and retains unsupported branches", async () => {
+    renderPicker([{ url: REPOSITORIES[0].clone_url!, branch: "release" }], 1, {
+      single: true,
+      branchSelection: false,
+      catalog: [{ name: "API", url: "git@github.com:org/api" }],
+    });
+    await waitFor(() => expect(document.querySelectorAll("datalist option")).toHaveLength(2));
+    expect(screen.getByLabelText("Branch (optional)")).toHaveValue("release");
+    expect(screen.getByRole("alert")).toHaveTextContent("Clear the branch");
+    fireEvent.change(screen.getByLabelText("Branch (optional)"), { target: { value: "" } });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("leaves URL entry usable if listing fails and rejects unavailable catalog-only URLs", async () => {
+    vi.mocked(fetchGithubRepos).mockRejectedValue(new Error("unavailable"));
+    const view = renderPicker([], 1, { single: true });
+    expect(
+      await screen.findByText("Couldn't load repositories. You can still paste a URL."),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox", { name: "Repository URL" }), {
+      target: { value: "https://git.example.com/team/sample.git" },
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+    view.unmount();
+    renderPicker([{ url: "https://git.example.com/team/sample.git", branch: "" }], 1, {
+      single: true,
+      urlInput: false,
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("unavailable on this target");
   });
 });

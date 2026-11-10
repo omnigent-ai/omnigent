@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import (
@@ -42,11 +42,13 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, harness_account_key
 from omnigent.host.frames import (
+    CAP_CLONE_REPOSITORY,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     CAP_REFRESH_HARNESSES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
     HostHarnessLoginCancelFrame,
@@ -62,11 +64,13 @@ from omnigent.host.frames import (
     optional_str_bool_map,
     workspace_missing_message,
 )
+from omnigent.host.git_clone import validate_clone_path
 from omnigent.onboarding.harness_install import (
     ui_credential_configurable_harnesses,
     ui_install_key,
     ui_installable_harnesses,
 )
+from omnigent.onboarding.sandboxes.repositories import normalize_repository
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
@@ -669,6 +673,36 @@ async def _proxy_detect_credentials(
         host_conn.pending_credential_detects.pop(request_id, None)
 
 
+class CloneRepositoryRequest(BaseModel):
+    """One credential-free repository and a new directory on the selected host."""
+
+    url: str
+    branch: str | None = None
+    path: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_safe_shape(cls, value: Any) -> Any:
+        # Pydantic's ordinary type errors echo input, which may contain a pasted secret.
+        if (
+            not isinstance(value, dict)
+            or not all(isinstance(value.get(key), str) for key in ("url", "path"))
+            or (value.get("branch") is not None and not isinstance(value["branch"], str))
+        ):
+            raise OmnigentError(
+                "Clone requires string url, path, and optional branch",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return value
+
+
+_CLONE_REPOSITORY_TIMEOUT_S = 420.0
+
+
+def _clone_error(code: str, message: str, status: int) -> JSONResponse:
+    return JSONResponse(status_code=status, content={"error": {"code": code, "message": message}})
+
+
 class CreateDirectoryRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/directories``.
 
@@ -926,6 +960,9 @@ def create_hosts_router(
                 # targets the server creates on demand, not
                 # user-connectable machines.
                 "sandbox_provider": host.sandbox_provider,
+                "clone_repository_supported": bool(
+                    conn is not None and CAP_CLONE_REPOSITORY in conn.hello.capabilities
+                ),
                 "configured_harnesses": host.configured_harnesses,
                 # Held in memory from the host's connect handshake, not the
                 # hosts row. ``None`` means this replica has no report yet —
@@ -989,6 +1026,9 @@ def create_hosts_router(
             # Same semantics as list_hosts: non-None marks a
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
+            "clone_repository_supported": bool(
+                conn is not None and CAP_CLONE_REPOSITORY in conn.hello.capabilities
+            ),
             "configured_harnesses": host.configured_harnesses,
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
@@ -1739,6 +1779,67 @@ def create_hosts_router(
             "data": result.get("entries", []),
             "has_more": bool(result.get("has_more", False)),
         }
+
+    @router.post("/hosts/{host_id}/repositories/clone", response_model=None)
+    async def clone_host_repository(
+        request: Request, host_id: str, body: CloneRepositoryRequest
+    ) -> dict[str, Any] | JSONResponse:
+        """Clone once on an owned, capable host; transport loss leaves an uncertain result."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            return _clone_error("not_found", "Host not found", 404)
+        if user_id is not None and host.user_id != user_id:
+            return _clone_error("forbidden", "Not your host", 403)
+        try:
+            repository = normalize_repository(
+                {"url": body.url, **({"branch": body.branch} if body.branch is not None else {})}
+            )
+            validate_clone_path(body.path)
+        except ValueError as exc:
+            return _clone_error("invalid_input", str(exc), 400)
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            return _clone_error("host_offline", "Host is not connected to this server", 409)
+        if CAP_CLONE_REPOSITORY not in conn.hello.capabilities:
+            return _clone_error("clone_unsupported", "Update this host to clone repositories", 409)
+        request_id = secrets.token_hex(8)
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        conn.pending_clones[request_id] = future
+        frame = HostCloneRepositoryFrame(
+            request_id=request_id,
+            url=repository["url"],
+            branch=repository.get("branch"),
+            path=body.path,
+        )
+        try:
+            host_registry.send_text(conn, encode_host_frame(frame))
+            result = await asyncio.wait_for(future, timeout=_CLONE_REPOSITORY_TIMEOUT_S)
+        except (ConnectionError, TimeoutError) as exc:
+            return _clone_error(
+                "clone_transport_error",
+                "The host connection was lost or timed out. The clone may still finish. "
+                "Check the destination on the host; use Folder mode "
+                "if it contains a complete checkout",
+                504 if isinstance(exc, TimeoutError) else 502,
+            )
+        finally:
+            conn.pending_clones.pop(request_id, None)
+        if result.get("status") != "ok":
+            code = result.get("error_code") or "clone_failed"
+            status = {
+                "invalid_input": 400,
+                "clone_destination_conflict": 409,
+                "clone_timeout": 504,
+            }.get(code, 502)
+            return _clone_error(code, result.get("error") or "Repository clone failed", status)
+        if not result.get("path"):
+            return _clone_error(
+                "clone_transport_error",
+                "Host returned no checkout path. Check the destination before retrying",
+                502,
+            )
+        return {"object": "repository", "path": result["path"]}
 
     @router.post("/hosts/{host_id}/directories")
     async def create_host_directory(

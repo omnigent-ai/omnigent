@@ -2339,7 +2339,12 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
     class _MultiRepoFake(FakeSandboxLauncher):
         @property
         def capabilities(self) -> Any:
-            return replace(super().capabilities, multi_repo=True)
+            return replace(
+                super().capabilities,
+                multi_repo=True,
+                repository_url_input=True,
+                repository_branch_selection=False,
+            )
 
     single = FakeSandboxLauncher()  # exec-model default → multi_repo False
     multi = _MultiRepoFake()
@@ -2361,7 +2366,11 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
     )
     assert deployment.provider_ui_capabilities() == {
         "single": {"multi_repo": False},
-        "multi": {"multi_repo": True},
+        "multi": {
+            "multi_repo": True,
+            "repository_url_input": True,
+            "repository_branch_selection": False,
+        },
     }
 
 

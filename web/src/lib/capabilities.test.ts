@@ -552,3 +552,37 @@ describe("resolveServerInfo scheduled_task_worktrees", () => {
     );
   });
 });
+
+describe("project repository capabilities", () => {
+  it.each([undefined, false, "true", true])(
+    "requires explicit server support (%s)",
+    async (value) => {
+      expect(
+        (await probe({ project_repository_creation: value })).project_repository_creation,
+      ).toBe(value === true);
+    },
+  );
+  it("keeps legacy catalog restrictions and honors explicit support", async () => {
+    const { sandboxRepositoryCapabilities } = await import("./capabilities");
+    const serverInfo = await probe({
+      sandbox_provider_capabilities: {
+        example: {
+          repo_catalog: [{ name: "sample", url: "https://git.example.com/team/sample.git" }],
+        },
+        custom: { repository_url_input: true, repository_branch_selection: false },
+      },
+    });
+    expect(sandboxRepositoryCapabilities(serverInfo, "example")).toMatchObject({
+      urlInput: false,
+      branchSelection: false,
+    });
+    expect(sandboxRepositoryCapabilities(serverInfo, "custom")).toMatchObject({
+      urlInput: true,
+      branchSelection: false,
+    });
+    expect(sandboxRepositoryCapabilities(serverInfo, "ordinary")).toMatchObject({
+      urlInput: true,
+      branchSelection: true,
+    });
+  });
+});

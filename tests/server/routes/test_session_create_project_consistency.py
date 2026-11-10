@@ -607,3 +607,56 @@ async def test_import_with_unowned_or_unknown_project_is_404(
         )
         assert response.status_code == 404, response.text
         assert "Project not found" in response.text
+
+
+@pytest.mark.parametrize("metadata", [False, True], ids=["json", "multipart"])
+@pytest.mark.parametrize(
+    "explicit,expected_repos,expected_provider",
+    [
+        ({}, ["https://git.example.com/team/sample.git#release"], "provider"),
+        ({"workspaces": []}, [], "provider"),
+        ({"workspace": None}, None, "provider"),
+        ({"workspaces": None}, None, "provider"),
+        ({"sandbox_provider": None}, ["https://git.example.com/team/sample.git#release"], None),
+        (
+            {
+                "sandbox_provider": "other",
+                "workspaces": ["https://git.example.com/team/other.git"],
+            },
+            ["https://git.example.com/team/other.git"],
+            "other",
+        ),
+        ({"sibling_source_id": "source"}, None, None),
+        ({"host_type": "external"}, None, None),
+    ],
+)
+async def test_managed_repository_project_defaults_respect_presence(
+    db_uri: str,
+    metadata: bool,
+    explicit: dict[str, object],
+    expected_repos: list[str] | None,
+    expected_provider: str | None,
+) -> None:
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    store = SqlAlchemyProjectStore(db_uri)
+    project = store.create(
+        "687b7cb7ac30abf4debfaa578d052ec6",
+        "Repository",
+        ALICE,
+        {
+            "host_id": "__sandbox__",
+            "sandbox_provider": "provider",
+            "repository": {"url": "https://git.example.com/team/sample.git", "branch": "release"},
+        },
+    )
+    values = {"project_id": project.id, "host_type": "managed", **explicit}
+    body = (
+        SessionCreateMetadata.model_validate(values)
+        if metadata
+        else ProjectSessionCreateRequest.model_validate({"agent_id": CUSTOM_AGENT_ID, **values})
+    )
+    resolved = await resolve_project_session_create(body=body, user_id=ALICE, project_store=store)
+    assert resolved.body.workspaces == expected_repos
+    assert resolved.body.sandbox_provider == expected_provider
+    assert resolved.body.workspace is None
