@@ -37,6 +37,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import websocket_scope as _websocket_scope
 
 # Same liveness-race flake guard as test_hosts_filesystem.py: the mock
@@ -415,11 +416,18 @@ async def test_clone_repository_uncertain_transport(mkdir_setup, monkeypatch, di
                 json={"url": "https://git.example.com/team/sample.git", "path": "~/sample"},
             )
         )
-        if disconnect:
-            while not conn.pending_clones:
-                await asyncio.sleep(0)
-            registry.deregister(_HOST_ID)
-        response = await pending
+        try:
+            if disconnect:
+                await poll_until_async(
+                    lambda: conn.pending_clones or pending.done(), timeout_s=2, interval_s=0.001
+                )
+                assert conn.pending_clones, "clone request finished before registering its RPC"
+                registry.deregister(_HOST_ID)
+            response = await pending
+        finally:
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
     assert response.status_code == (502 if disconnect else 504)
     assert response.json()["error"]["code"] == "clone_transport_error"
     assert not conn.pending_clones

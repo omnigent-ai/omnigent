@@ -147,6 +147,7 @@ from omnigent.host.frames import (
     parse_server_capabilities,
     workspace_missing_message,
 )
+from omnigent.host.git_clone import clone_repository
 from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
@@ -5956,8 +5957,6 @@ class HostProcess:
             list_result = await asyncio.to_thread(self._handle_list_dir, frame)
             await self._send_text(ws, self._encode_frame(list_result))
         elif isinstance(frame, HostCloneRepositoryFrame):
-            from omnigent.host.git_clone import clone_repository
-
             clone_result = await self._run_host_subprocess_in_thread(
                 lambda: clone_repository(frame)
             )

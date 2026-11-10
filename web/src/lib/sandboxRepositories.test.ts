@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isValidSandboxBranch,
+  repositoryIdentity,
   repositorySelectionError,
   isValidSandboxRepoUrl,
   isValidSandboxWorkspaceLength,
@@ -40,6 +41,14 @@ describe("isValidSandboxRepoUrl host validation", () => {
     "https://git.example.com:65536/team/sample.git",
     "https://[invalid]/team/sample.git",
     "https://é.example.com/team/sample.git",
+    "git@[2001:db8::1:team/sample.git",
+    "git@[2001:db8::1]team/sample.git",
+    "git@[2001:db8::1]:",
+    "git@[2001:db8::1]:/",
+    "git@[2001:db8::invalid]:team/sample.git",
+    "git@[git.example.com]:team/sample.git",
+    "git@[192.0.2.1]:team/sample.git",
+    "git@[fe80::1%interface]:team/sample.git",
   ])("rejects malformed hosts and ports (%s)", (url) => {
     expect(isValidSandboxRepoUrl(url)).toBe(false);
   });
@@ -47,8 +56,19 @@ describe("isValidSandboxRepoUrl host validation", () => {
     "https://git.example.com:8443/team/sample.git",
     "https://[::1]/team/sample.git",
     "https://git.example.com./team/sample.git",
+    "git@[2001:db8::1]:team/sample.git",
+    "git@[::1]:sample.git",
+    "git@[::ffff:192.0.2.1]:sample.git",
   ])("accepts supported authorities (%s)", (url) => {
     expect(isValidSandboxRepoUrl(url)).toBe(true);
+  });
+});
+
+describe("repositoryIdentity", () => {
+  it("matches bracketed SSH IPv6 URLs to HTTPS catalog entries", () => {
+    expect(repositoryIdentity("git@[2001:db8::1]:team/sample.git")).toBe(
+      repositoryIdentity("https://[2001:db8::1]/team/sample"),
+    );
   });
 });
 

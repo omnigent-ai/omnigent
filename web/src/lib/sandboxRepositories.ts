@@ -28,8 +28,8 @@ export function isValidSandboxRepoUrl(url: string): boolean {
     )
   )
     return false;
-  const validForm =
-    /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || /^git@[^\s#:@]+:[^\s#@]+$/.test(t);
+  const sshMatch = /^git@(\[[^\s#@[\]]+\]|[^\s#:@[\]]+):([^\s#@]+)$/.exec(t);
+  const validForm = /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || sshMatch !== null;
   const name = validForm ? deriveRepoName(t) : null;
   if (name === null || name === "." || name === ".." || !/^[A-Za-z0-9._-]+$/.test(name))
     return false;
@@ -44,7 +44,14 @@ export function isValidSandboxRepoUrl(url: string): boolean {
     const authority = t.slice("https://".length).split("/")[0];
     hostname = authority.split(":")[0];
   } else {
-    hostname = t.slice("git@".length).split(":")[0];
+    hostname = sshMatch![1];
+    if (hostname.startsWith("[")) {
+      try {
+        return new URL(`https://${hostname}/`).hostname.startsWith("[");
+      } catch {
+        return false;
+      }
+    }
   }
   return (
     hostname.length <= 253 &&
@@ -58,6 +65,8 @@ export function isValidSandboxRepoUrl(url: string): boolean {
 // Each composed repository is stored in a label capped by server LABEL_VALUE_MAX_LEN.
 export const MAX_SANDBOX_WORKSPACE_LENGTH = 256;
 export const SANDBOX_WORKSPACE_LENGTH_MESSAGE = `Repository URL and branch must be at most ${MAX_SANDBOX_WORKSPACE_LENGTH} characters together.`;
+export const INVALID_BRANCH_MESSAGE =
+  "Enter a valid branch name, or leave blank for the default branch.";
 
 /** Count Unicode code points to match the server's limit after input trimming. */
 export function isValidSandboxWorkspaceLength(url: string, branch: string): boolean {
@@ -174,7 +183,7 @@ export function deriveRepoName(url: string): string | null {
 export function repositoryIdentity(url: string): string {
   const normalized = url
     .trim()
-    .replace(/^git@([^:]+):/, "https://$1/")
+    .replace(/^git@(\[[^\]]+\]|[^:]+):/, "https://$1/")
     .replace(/\/+$/, "");
   const identity = /^https:\/\/github\.com\//i.test(normalized)
     ? normalized.toLowerCase()
@@ -198,8 +207,7 @@ export function repositorySelectionError(
     return branch.trim() === "" ? null : "Choose a repository for this branch.";
   if (!isValidSandboxRepoUrl(selection.url))
     return "Enter a valid HTTPS or SSH repository URL without credentials.";
-  if (!isValidSandboxBranch(branch))
-    return "Enter a valid branch name, or leave blank for the default branch.";
+  if (!isValidSandboxBranch(branch)) return INVALID_BRANCH_MESSAGE;
   if (!isValidSandboxWorkspaceLength(selection.url, branch))
     return SANDBOX_WORKSPACE_LENGTH_MESSAGE;
   if (

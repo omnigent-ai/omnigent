@@ -723,10 +723,9 @@ export function sandboxRepositoryCapabilities(
   info: ServerInfo | "loading",
   provider: string | null,
 ) {
+  if (info === "loading") return { catalog: [], urlInput: false, branchSelection: false };
   const capabilities =
-    info !== "loading" && provider !== null
-      ? info.sandbox_provider_capabilities?.[provider]
-      : undefined;
+    provider !== null ? info.sandbox_provider_capabilities?.[provider] : undefined;
   const catalog = capabilities?.repo_catalog ?? [];
   return {
     catalog,

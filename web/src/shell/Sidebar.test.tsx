@@ -24,7 +24,7 @@ import {
   within,
 } from "@testing-library/react";
 import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { GridSessionsProvider } from "@/grid/GridSessionsContext";
 import * as readStateHooks from "@/hooks/useUnseenConversations";
 import { getOmnigentServerIdentity } from "@/lib/host";
@@ -1645,11 +1645,12 @@ describe("Sidebar session list", () => {
     });
   });
 
-  it("shares one hosts observer across multiple ordinary session rows", () => {
+  it("shares one active hosts observer across multiple ordinary session rows", () => {
     const observerMounted = vi.fn();
-    useHostsMock.mockImplementation(() => {
+    useHostsMock.mockImplementation((options?: { enabled?: boolean; includeSandbox?: boolean }) => {
+      const initialOptions = useRef(options);
       useEffect(() => {
-        observerMounted();
+        observerMounted(initialOptions.current);
       }, []);
       return { data: [] };
     });
@@ -1664,8 +1665,10 @@ describe("Sidebar session list", () => {
     expect(screen.getByRole("link", { name: "conv_one" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "conv_two" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "conv_three" })).toBeInTheDocument();
-    expect(observerMounted).toHaveBeenCalledTimes(1);
-    expect(useHostsMock).toHaveBeenCalledWith({ includeSandbox: true });
+    expect(observerMounted.mock.calls.filter(([options]) => options?.enabled !== false)).toEqual([
+      [{ includeSandbox: true }],
+    ]);
+    expect(useHostsMock).toHaveBeenCalledWith({ enabled: false });
   });
 
   it.each([

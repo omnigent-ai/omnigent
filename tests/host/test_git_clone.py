@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shlex
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -90,6 +93,82 @@ def test_failed_clone_removes_only_owned_checkout(local_repository: Path, tmp_pa
     assert result.error_code == "clone_failed"
     assert not destination.exists()
     assert (local_repository / "README").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="The executable fixture uses a POSIX shebang")
+@pytest.mark.parametrize("setting", ["GIT_SSH_COMMAND", "GIT_SSH", "core.sshCommand"])
+def test_clone_preserves_host_ssh_configuration(
+    local_repository: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, setting: str
+) -> None:
+    record = tmp_path / "ssh.json"
+    executable = tmp_path / "custom ssh"
+    executable.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\nfrom pathlib import Path\n"
+        f"Path({str(record)!r}).write_text(json.dumps({{"
+        "'args': sys.argv[1:], 'stdin_is_tty': sys.stdin.isatty(), "
+        "'prompt': os.environ.get('GIT_TERMINAL_PROMPT'), "
+        "'askpass': os.environ.get('SSH_ASKPASS_REQUIRE')}))\nraise SystemExit(1)\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.delenv("GIT_SSH", raising=False)
+    monkeypatch.setenv("GIT_SSH_VARIANT", "ssh")
+    if setting == "core.sshCommand":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
+        monkeypatch.setenv("GIT_CONFIG_KEY_1", setting)
+        monkeypatch.setenv("GIT_CONFIG_VALUE_1", shlex.quote(str(executable)))
+    else:
+        monkeypatch.setenv(
+            setting, str(executable) if setting == "GIT_SSH" else shlex.quote(str(executable))
+        )
+
+    destination = tmp_path / "checkout"
+    result = clone_repository(
+        HostCloneRepositoryFrame("clone", "git@git.example.com:team/sample.git", str(destination))
+    )
+    assert result.error_code == "clone_failed"
+    invocation = json.loads(record.read_text())
+    assert "git@git.example.com" in invocation["args"]
+    assert "-oBatchMode=yes" not in invocation["args"]
+    assert invocation["stdin_is_tty"] is False
+    assert invocation["prompt"] == "0"
+    assert invocation["askpass"] == "never"
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("cleanup_allowed", [True, False])
+def test_failed_clone_cleans_readonly_objects_or_logs_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cleanup_allowed: bool,
+) -> None:
+    destination = tmp_path / "checkout"
+    original_popen = subprocess.Popen
+    original_unlink = os.unlink
+
+    def failed_clone(*args: object, **kwargs: object) -> subprocess.Popen:
+        git_object = destination / "object"
+        git_object.write_text("incomplete Git object")
+        git_object.chmod(stat.S_IRUSR)
+        return original_popen([sys.executable, "-c", "raise SystemExit(1)"], **kwargs)
+
+    def windows_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        # Model Windows' readonly attribute on POSIX, where readonly files are unlinkable.
+        if Path(path).name == "object" and (
+            not cleanup_allowed or not os.stat(path, dir_fd=dir_fd).st_mode & stat.S_IWUSR
+        ):
+            raise PermissionError("Cannot remove Git object")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr("omnigent.host.git_clone.subprocess.Popen", failed_clone)
+    monkeypatch.setattr("os.unlink", windows_unlink)
+    result = clone_repository(HostCloneRepositoryFrame("clone", REPOSITORY_URL, str(destination)))
+    assert result.error_code == "clone_failed"
+    assert destination.exists() is not cleanup_allowed
+    assert (
+        "Could not remove incomplete repository checkout" in caplog.text
+    ) is not cleanup_allowed
 
 
 def test_clone_expands_home_on_host(

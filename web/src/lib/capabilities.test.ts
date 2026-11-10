@@ -545,6 +545,15 @@ describe("resolveServerInfo scheduled_task_worktrees", () => {
 });
 
 describe("project repository capabilities", () => {
+  it("waits for repository capabilities before offering URL and branch entry", async () => {
+    const { sandboxRepositoryCapabilities } = await import("./capabilities");
+    expect(sandboxRepositoryCapabilities("loading", "example")).toEqual({
+      catalog: [],
+      urlInput: false,
+      branchSelection: false,
+    });
+  });
+
   it.each([undefined, false, "true", true])(
     "requires explicit server support (%s)",
     async (value) => {

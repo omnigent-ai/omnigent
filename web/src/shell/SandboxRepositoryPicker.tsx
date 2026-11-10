@@ -15,6 +15,7 @@ import { cn } from "@/lib/utils";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import {
+  INVALID_BRANCH_MESSAGE,
   SANDBOX_WORKSPACE_LENGTH_MESSAGE,
   deriveRepoName,
   repositoryIdentity,
@@ -24,7 +25,6 @@ import {
   isValidSandboxWorkspaceLength,
 } from "@/lib/sandboxRepositories";
 
-const INVALID_BRANCH_MESSAGE = "Enter a valid branch name, or leave blank for the default branch.";
 interface RepositorySuggestion {
   name: string;
   url: string;
@@ -286,12 +286,12 @@ export function SandboxRepositoryPicker({
   const suggestions = [
     ...new Map(
       [
+        ...catalog,
         ...repos.map((repo) => ({
           name: repo.full_name,
           url: repoCloneUrl(repo),
           private: repo.private,
         })),
-        ...catalog,
       ].map((repo) => [repositoryIdentity(repo.url), repo]),
     ).values(),
   ];
@@ -335,29 +335,65 @@ export function SandboxRepositoryPicker({
   if (single) {
     const selection = selections[0] ?? { url: "", branch: "" };
     const error = repositorySelectionError(selection, { catalog, urlInput, branchSelection });
+    const branchError =
+      error !== null &&
+      selection.branch.trim() !== "" &&
+      (!branchSelection ||
+        (selection.url.trim() !== "" &&
+          error !==
+            repositorySelectionError(
+              { ...selection, branch: "" },
+              { catalog, urlInput, branchSelection },
+            )));
+    const selectedSuggestion = suggestions.find(
+      (repo) => repositoryIdentity(repo.url) === repositoryIdentity(selection.url),
+    );
     return (
       <div className="flex min-w-0 flex-col gap-2" data-testid={`${testIdPrefix}-picker`}>
         <label htmlFor={`${testIdPrefix}-input`} className="text-sm font-medium">
           Repository (optional)
         </label>
-        <input
-          id={`${testIdPrefix}-input`}
-          list={`${testIdPrefix}-suggestions`}
-          value={selection.url}
-          onChange={(event) => onChange([{ ...selection, url: event.target.value }])}
-          aria-label="Repository URL"
-          aria-invalid={error !== null}
-          aria-describedby={error ? `${testIdPrefix}-error` : undefined}
-          placeholder="Select a repository or paste a URL"
-          className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-        />
-        <datalist id={`${testIdPrefix}-suggestions`}>
-          {suggestions.map((repo) => (
-            <option key={repositoryIdentity(repo.url)} value={repo.url}>
-              {repo.name}
-            </option>
-          ))}
-        </datalist>
+        {urlInput ? (
+          <>
+            <input
+              id={`${testIdPrefix}-input`}
+              list={`${testIdPrefix}-suggestions`}
+              value={selection.url}
+              onChange={(event) => onChange([{ ...selection, url: event.target.value }])}
+              aria-label="Repository URL"
+              aria-invalid={error !== null && !branchError}
+              aria-describedby={error && !branchError ? `${testIdPrefix}-error` : undefined}
+              placeholder="Select a repository or paste a URL"
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+            <datalist id={`${testIdPrefix}-suggestions`}>
+              {suggestions.map((repo) => (
+                <option key={repositoryIdentity(repo.url)} value={repo.url}>
+                  {repo.name}
+                </option>
+              ))}
+            </datalist>
+          </>
+        ) : (
+          <select
+            id={`${testIdPrefix}-input`}
+            value={selectedSuggestion?.url ?? selection.url}
+            onChange={(event) => onChange([{ ...selection, url: event.target.value }])}
+            aria-invalid={error !== null && !branchError}
+            aria-describedby={error && !branchError ? `${testIdPrefix}-error` : undefined}
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          >
+            <option value="">No repository</option>
+            {selection.url !== "" && !selectedSuggestion && (
+              <option value={selection.url}>{selection.url} (unavailable)</option>
+            )}
+            {suggestions.map((repo) => (
+              <option key={repositoryIdentity(repo.url)} value={repo.url}>
+                {repo.name}
+              </option>
+            ))}
+          </select>
+        )}
         {githubEnabled && isError && (
           <p className="text-xs text-muted-foreground">
             Couldn't load repositories. You can still paste a URL.
@@ -372,6 +408,8 @@ export function SandboxRepositoryPicker({
               id={`${testIdPrefix}-branch`}
               value={selection.branch}
               onChange={(event) => onChange([{ ...selection, branch: event.target.value }])}
+              aria-invalid={branchError || undefined}
+              aria-describedby={branchError ? `${testIdPrefix}-error` : undefined}
               placeholder="Default branch"
               className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
             />

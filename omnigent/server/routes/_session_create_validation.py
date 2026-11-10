@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.models.model_override import validate_model_override
+from omnigent.onboarding.sandboxes.repositories import normalize_repository
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_access
@@ -78,8 +79,6 @@ async def resolve_project_session_create(
         if "sandbox_provider" not in fields_set and "sandbox_provider" in config:
             updates["sandbox_provider"] = config["sandbox_provider"]
         if not {"workspace", "workspaces"} & fields_set and config.get("repository"):
-            from omnigent.onboarding.sandboxes.repositories import normalize_repository
-
             try:
                 repository = normalize_repository(config["repository"])
             except ValueError as exc:
