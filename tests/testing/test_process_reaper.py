@@ -43,17 +43,41 @@ def data_dir(tmp_path: Path) -> Path:
 def _spawn(code: str, *argv_markers: str, env: dict[str, str] | None = None) -> subprocess.Popen:
     """Spawn a disposable python child carrying attribution markers.
 
+    Returns only once the child's command line is readable, so a matcher
+    run immediately afterwards sees the markers (see :func:`_wait_for_argv`).
+
     :param code: Python source the child runs.
     :param argv_markers: Extra argv tokens (visible in its command line).
     :param env: Optional environment override for the child.
     :returns: The child process handle.
     """
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         [sys.executable, "-c", code, *argv_markers],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _wait_for_argv(proc)
+    return proc
+
+
+def _wait_for_argv(proc: subprocess.Popen, timeout: float = 10.0) -> None:
+    """Block until the kernel publishes *proc*'s command line.
+
+    ``Popen`` returns once the child has exec'd, but Linux releases the
+    parent before execve has laid the new argv out, so a ``/proc/<pid>/cmdline``
+    read in that window comes back empty and the matcher (correctly) skips
+    the process. Tests that inspect the child at once — e.g. with
+    ``psutil.pids`` patched down to just it — would otherwise race that window.
+
+    :param proc: The freshly spawned child.
+    :param timeout: Seconds before failing the test, e.g. ``10.0``.
+    """
+    deadline = time.monotonic() + timeout
+    while not psutil.Process(proc.pid).cmdline():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"child {proc.pid} never exposed its command line")
+        time.sleep(0.005)
 
 
 def _kill_quietly(proc: subprocess.Popen) -> None:
