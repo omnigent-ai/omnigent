@@ -225,7 +225,10 @@ function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => vo
 }
 
 /** Same as renderLanding, but with the managed-sandbox host option enabled. */
-function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
+function renderSandboxLanding(overrides: Partial<ServerInfo> = {}): {
+  rerender: (ui: ReactNode) => void;
+  unmount: () => void;
+} {
   const info: ServerInfo = {
     accounts_enabled: false,
     single_user: false,
@@ -244,6 +247,7 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
+    ...overrides,
   };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   function Wrapper({ children }: { children: ReactNode }) {
@@ -255,8 +259,8 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
       </QueryClientProvider>
     );
   }
-  const { rerender } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
-  return { rerender };
+  const { rerender, unmount } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return { rerender, unmount };
 }
 
 /** Render with Smart Routing enabled so a routing-eligible native agent can turn it on. */
@@ -317,6 +321,7 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
   fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
     target: { value: "hello" },
   });
+  await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
   fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
   await waitFor(() => expect(vi.mocked(authenticatedFetch)).toHaveBeenCalled());
   const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
@@ -1671,5 +1676,86 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();
+  });
+});
+
+describe("saved project repositories", () => {
+  const repository = { url: "https://git.example.com/team/sample.git", branch: "release" };
+  const config = { host_id: "__sandbox__", sandbox_provider: "example", repository };
+  const capabilities = { sandbox_providers: ["modal", "example"] };
+
+  it("waits for config, prefills the saved provider and repository ahead of remembered placement", async () => {
+    localStorage.setItem(
+      "omnigent:last-sandbox-repos",
+      JSON.stringify([{ url: "https://git.example.com/other/remembered.git", branch: "" }]),
+    );
+    writeProjectLaunchDefaults("proj_alpha", { hostId: "host_1", workspace: "/other" }, config);
+    setProjectConfig(undefined, true);
+    const { rerender } = renderSandboxLanding(capabilities);
+    setProjectConfig(config);
+    rerender(<NewChatLandingScreen />);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("sample"),
+    );
+    const body = await submitAndReadBody();
+    expect(body).toMatchObject({
+      host_type: "managed",
+      sandbox_provider: "example",
+      workspaces: [repository.url + "#release"],
+      workspace: null,
+      git: null,
+    });
+  });
+
+  it("keeps an explicit clear through rerenders and a restored draft", async () => {
+    setProjectConfig(config);
+    const first = renderSandboxLanding(capabilities);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("sample"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove sample" }));
+    first.unmount();
+    renderSandboxLanding(capabilities);
+    expect(screen.getByTestId("new-chat-landing-repo-chip")).not.toHaveTextContent("sample");
+    const body = await submitAndReadBody();
+    expect(body.workspaces).toEqual([]);
+    expect(body.sandbox_provider).toBe("example");
+  });
+
+  it("reseeds each project's repository without reusing the previous draft", async () => {
+    setProjectConfig(config);
+    const { rerender } = renderSandboxLanding(capabilities);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("sample"),
+    );
+    searchParams = new URLSearchParams("project=Beta");
+    setProjectConfig({ ...config, repository: { url: "https://git.example.com/team/beta.git" } });
+    rerender(<NewChatLandingScreen />);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("beta"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspaces).toEqual(["https://git.example.com/team/beta.git"]);
+    expect(body.project_id).toBe("proj_beta");
+  });
+  it("preserves an explicit clear when later project config and capabilities arrive", async () => {
+    setProjectConfig(config);
+    const { rerender } = renderSandboxLanding(capabilities);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("sample"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove sample" }));
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    setProjectConfig({
+      ...config,
+      repository: { url: "https://git.example.com/team/updated.git" },
+    });
+    rerender(<NewChatLandingScreen />);
+    expect(screen.getByTestId("new-chat-landing-repo-chip")).not.toHaveTextContent("updated");
+    const body = await submitAndReadBody();
+    expect(body.workspaces).toEqual([]);
+    expect(body.sandbox_provider).toBe("example");
   });
 });

@@ -194,6 +194,7 @@ def _fail_pending_mcp_servers(conn: HostConnection) -> None:
 def _fail_pending_worktrees(conn: HostConnection) -> None:
     """Fail worktree requests as soon as their host disappears."""
     for pending in (
+        conn.pending_clones,
         conn.pending_create_worktrees,
         conn.pending_remove_worktrees,
         conn.pending_list_worktrees,
@@ -527,6 +528,7 @@ class HostConnection:
     pending_list_worktrees: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_clones: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
     pending_create_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )

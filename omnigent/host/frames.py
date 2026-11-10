@@ -87,11 +87,13 @@ CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_HARNESS_ACCOUNTS = "harness_accounts"
 CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
+CAP_CLONE_REPOSITORY = "clone_repository"
 # The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
+    CAP_CLONE_REPOSITORY,
     CAP_CODEX_SIDE_CHAT,
     CAP_CODEX_PLAN_AT_LAUNCH,
     CAP_FILESYSTEM_ATTACHMENTS,
@@ -233,6 +235,8 @@ class HostFrameKind(str, Enum):
     REMOVE_WORKTREE_RESULT = "host.remove_worktree_result"
     LIST_WORKTREES = "host.list_worktrees"
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
+    CLONE_REPOSITORY = "host.clone_repository"
+    CLONE_REPOSITORY_RESULT = "host.clone_repository_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
     INSTALL_HARNESS = "host.install_harness"
@@ -822,6 +826,27 @@ class HostListWorktreesResultFrame:
     status: str
     worktrees: list[_JsonObject] | None = None
     error: str | None = None
+
+
+@dataclass
+class HostCloneRepositoryFrame:
+    """Server → host: clone into a new destination using the host's Git identity."""
+
+    request_id: str
+    url: str
+    path: str
+    branch: str | None = None
+
+
+@dataclass
+class HostCloneRepositoryResultFrame:
+    """Host → server: absolute checkout path or a safe, stable clone error."""
+
+    request_id: str
+    status: str
+    path: str | None = None
+    error: str | None = None
+    error_code: str | None = None
 
 
 @dataclass
@@ -1535,6 +1560,8 @@ HostFrame = (
     | HostRemoveWorktreeResultFrame
     | HostListWorktreesFrame
     | HostListWorktreesResultFrame
+    | HostCloneRepositoryFrame
+    | HostCloneRepositoryResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
     | HostInstallHarnessFrame
@@ -1831,6 +1858,27 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "status": frame.status,
                 "worktrees": frame.worktrees,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostCloneRepositoryFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CLONE_REPOSITORY.value,
+                "request_id": frame.request_id,
+                "url": frame.url,
+                "path": frame.path,
+                "branch": frame.branch,
+            }
+        )
+    if isinstance(frame, HostCloneRepositoryResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CLONE_REPOSITORY_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "path": frame.path,
+                "error": frame.error,
+                "error_code": frame.error_code,
             }
         )
     if isinstance(frame, HostCreateDirFrame):
@@ -2514,6 +2562,21 @@ def _decode_known_host_frame(
             return _decode_list_worktrees(msg)
         case HostFrameKind.LIST_WORKTREES_RESULT:
             return _decode_list_worktrees_result(msg)
+        case HostFrameKind.CLONE_REPOSITORY:
+            return HostCloneRepositoryFrame(
+                request_id=_required_str(msg, "request_id"),
+                url=_required_str(msg, "url"),
+                path=_required_str(msg, "path"),
+                branch=_optional_nullable_str(msg, "branch"),
+            )
+        case HostFrameKind.CLONE_REPOSITORY_RESULT:
+            return HostCloneRepositoryResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                path=_optional_nullable_str(msg, "path"),
+                error=_optional_nullable_str(msg, "error"),
+                error_code=_optional_nullable_str(msg, "error_code"),
+            )
         case HostFrameKind.CREATE_DIR:
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:

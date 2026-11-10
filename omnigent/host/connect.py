@@ -76,6 +76,7 @@ from omnigent.host.frames import (
     RUNNER_LOG_TAIL_HEADING,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -5954,6 +5955,13 @@ class HostProcess:
             # directories; keep the tunnel's event loop free meanwhile.
             list_result = await asyncio.to_thread(self._handle_list_dir, frame)
             await self._send_text(ws, self._encode_frame(list_result))
+        elif isinstance(frame, HostCloneRepositoryFrame):
+            from omnigent.host.git_clone import clone_repository
+
+            clone_result = await self._run_host_subprocess_in_thread(
+                lambda: clone_repository(frame)
+            )
+            await self._send_text(ws, self._encode_frame(clone_result))
         elif isinstance(frame, HostCreateDirFrame):
             create_dir_result = await asyncio.to_thread(self._handle_create_dir, frame)
             await self._send_text(ws, self._encode_frame(create_dir_result))

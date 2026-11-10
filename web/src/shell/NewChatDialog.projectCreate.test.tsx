@@ -983,3 +983,46 @@ describe("NewChatLandingScreen uploaded agent destinations", () => {
     },
   );
 });
+
+describe("repository project multipart launch", () => {
+  it.each([false, true])(
+    "sends the saved repository or an explicit clear (clear=%s)",
+    async (clear) => {
+      setProjectConfig({
+        host_id: SANDBOX_HOST_CHOICE,
+        sandbox_provider: "example",
+        repository: { url: "https://git.example.com/team/sample.git", branch: "release" },
+      });
+      vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new", agentId: "ag_pending" });
+      renderLanding({
+        session_bundle_workspaces: true,
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "example",
+      });
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("sample"),
+      );
+      if (clear) {
+        fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+        fireEvent.click(screen.getByRole("button", { name: "Remove sample" }));
+        fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+      }
+      fireEvent.click(screen.getByTestId("test-create-pending"));
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "hello" },
+      });
+      await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(createBundledSession).toHaveBeenCalled());
+      expect(vi.mocked(createBundledSession).mock.calls[0][1]).toMatchObject({
+        project_id: "proj_alpha",
+        host_type: "managed",
+        sandbox_provider: "example",
+        workspace: null,
+        git: null,
+        workspaces: clear ? [] : ["https://git.example.com/team/sample.git#release"],
+      });
+      expect(launchRunner).not.toHaveBeenCalled();
+    },
+  );
+});

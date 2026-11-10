@@ -158,8 +158,11 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
   const { sessions, loaded, loadingMore, networkConfirmed, error, refresh } = useCanvasSessions();
   const projectsQuery = useProjects();
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
-  const { data: hosts = [], isLoading: hostsLoading } = useHosts();
-  const defaultProjectHostId = hosts.find((host) => host.status === "online")?.host_id ?? null;
+  const { data: hosts = [], isLoading: hostsLoading } = useHosts({ includeSandbox: true });
+  const defaultProjectHostId =
+    hosts.find((host) => host.status === "online" && !host.sandbox_provider)?.host_id ?? null;
+  const selectedSession = sessions.find((session) => session.id === selectedSessionId);
+  const projectContextHost = hosts.find((host) => host.host_id === selectedSession?.host_id);
 
   const [nodes, setNodes] = useState<SessionCardNode[]>([]);
   // The URL names the canvas; without it, reopen the viewer's last selection
@@ -630,6 +633,7 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
         </div>
         <NewProjectButton
           hostId={defaultProjectHostId}
+          contextHost={projectContextHost}
           hostsLoading={hostsLoading}
           onCreated={(name) => {
             pendingProjectNameRef.current = name;

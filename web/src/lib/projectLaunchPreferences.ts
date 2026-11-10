@@ -55,7 +55,7 @@ export function projectConfigWithLaunch(
       merged.effort = launch.harnessOptions?.effort || undefined;
     }
   }
-  if (launch.hostId !== undefined) {
+  if (launch.hostId !== undefined && config.repository === undefined) {
     merged.host_id = launch.hostId;
     merged.workspace = launch.workspace;
   }

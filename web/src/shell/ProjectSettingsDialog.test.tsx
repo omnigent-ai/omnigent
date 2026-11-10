@@ -138,11 +138,17 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).toHaveBeenCalledWith("p_1", { use_worktree: true });
   });
 
-  it("preserves the project icon when saving settings", async () => {
+  it("preserves the project icon and repository association when saving settings", async () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
-      config: { icon: "🔥", use_worktree: true },
+      config: {
+        icon: "🔥",
+        use_worktree: true,
+        repository: { url: "https://git.example.com/team/sample.git" },
+        host_id: "__sandbox__",
+        sandbox_provider: "example",
+      },
     });
     renderDialog();
     await waitFor(() =>
@@ -152,10 +158,18 @@ describe("ProjectSettingsDialog", () => {
       ),
     );
 
+    expect(screen.getByTestId("project-settings-host")).toBeDisabled();
+    expect(screen.getByTestId("project-settings-workspace")).toBeDisabled();
     fireEvent.click(screen.getByTestId("project-settings-save"));
 
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", { icon: "🔥", use_worktree: true }),
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        icon: "🔥",
+        use_worktree: true,
+        repository: { url: "https://git.example.com/team/sample.git" },
+        host_id: "__sandbox__",
+        sandbox_provider: "example",
+      }),
     );
   });
 

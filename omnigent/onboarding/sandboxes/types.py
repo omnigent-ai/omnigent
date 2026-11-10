@@ -110,6 +110,8 @@ class SandboxCapabilities:
     snapshot_restore: bool = False
     multi_repo: bool = False
     git_clone_options: bool = False
+    repository_url_input: bool | None = None
+    repository_branch_selection: bool | None = None
 
 
 @dataclass(frozen=True)
