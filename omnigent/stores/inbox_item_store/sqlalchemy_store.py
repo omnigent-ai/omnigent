@@ -13,6 +13,7 @@ from sqlalchemy import ColumnElement, Select, and_, func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session
 
+from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import INBOX_ITEMS_PER_SESSION, SqlInboxItem, current_workspace_id
 from omnigent.db.enum_codecs import (
     decode_inbox_item_kind,
@@ -182,6 +183,7 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         )
 
         def write(session: Session) -> InboxItem:
+            require_active_account(session, item.user_id)
             taken = set(session.execute(used_slots).scalars())
             free = [slot for slot in range(INBOX_ITEMS_PER_SESSION) if slot not in taken]
             if not free:
@@ -323,6 +325,7 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         """See base class."""
 
         def write(session: Session) -> InboxItem | None:
+            require_active_account(session, user_id)
             row = self._owned_row(session, item_id, user_id, for_update=True)
             if row is None:
                 return None
