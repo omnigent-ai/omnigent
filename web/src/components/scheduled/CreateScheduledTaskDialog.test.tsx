@@ -3474,15 +3474,42 @@ describe("automation trigger type", () => {
       expect(input).toMatchObject({ sessionId: null });
     });
 
-    it("asks for instructions again when the saved prompt can't be split", async () => {
-      const unsplitPrompt = `${slackPrompt}\n\nInstructions for each session:\nAlso thank them.`;
-      expect(splitTriggerPrompt(unsplitPrompt).systemPrompt).toBeNull();
-      render(dialog({ editingTask: { ...slackTask, prompt: unsplitPrompt } }));
+    it.each([
+      ["can't be split", `${slackPrompt}\n\nInstructions for each session:\nAlso thank them.`],
+      [
+        "has a hand-edited worker call",
+        slackPrompt.replace('agent_id "ag_claude_native"', "agent_id chosen dynamically"),
+      ],
+    ])("doesn't offer a switch when the saved prompt %s", (_case, savedPrompt) => {
+      expect(readTriggerWorkerSettings(savedPrompt)).toBeNull();
+      render(dialog({ editingTask: { ...slackTask, prompt: savedPrompt } }));
+      expect(screen.queryByTestId("task-trigger-type")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-prompt-input")).toBeInTheDocument();
+    });
+
+    it("carries the saved workers when the prompt editor's worker call no longer parses", async () => {
+      const managedPrompt = slackPrompt.replace('placement "same_host"', 'placement "managed"');
+      render(dialog({ editingTask: { ...slackTask, prompt: managedPrompt } }));
+      fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+      const editor = screen.getByRole("textbox", { name: "System prompt" }) as HTMLTextAreaElement;
+      fireEvent.change(editor, {
+        target: {
+          value: editor.value.replace("call sys_session_create with", "start a session with"),
+        },
+      });
       await choose("Jira");
-      expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("");
-      expect(screen.getByTestId("task-trigger-type-note")).toHaveTextContent(
-        "The saved instructions can't be separated from the Slack rules, so enter them again.",
-      );
+      type("task-trigger-scope", "ES");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
+      expect(triggerPromptSource(prompt)).toBe("jira");
+      expect(readTriggerWorkerSettings(prompt)).toEqual({
+        agentId: "ag_claude_native",
+        model: "opus",
+        effort: "",
+      });
+      expect(readTriggerWorkerPlacement(prompt)).toBe("managed");
     });
   });
 });

@@ -297,11 +297,17 @@ export function CreateScheduledTaskDialog({
     editingTask.sessionMode === "continue" &&
     isTriggerPrompt(editingTask.prompt);
   // Temporary prompt edits must not expose controls that can rebind the poller.
-  const editingWorkerSettings =
-    editingTemplateTrigger && readTriggerWorkerSettings(editingTask.prompt) !== null;
-  const editingTriggerSource = editingTemplateTrigger
-    ? triggerPromptSource(editingTask.prompt)
+  const savedWorkerSettings = editingTemplateTrigger
+    ? readTriggerWorkerSettings(editingTask.prompt)
     : null;
+  const editingWorkerSettings = savedWorkerSettings !== null;
+  // A switch re-renders the workers, so it needs the saved worker settings to carry over.
+  const editingTriggerSource =
+    editingTask !== null && editingWorkerSettings ? triggerPromptSource(editingTask.prompt) : null;
+  const savedWorkerPlacement =
+    editingTask !== null && editingWorkerSettings
+      ? readTriggerWorkerPlacement(editingTask.prompt)
+      : null;
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -1064,8 +1070,9 @@ export function CreateScheduledTaskDialog({
     } else {
       setTrigger(next);
     }
-    setSwitchedWorkerSettings(workerSettings);
-    setSwitchedWorkerPlacement(workerPlacement);
+    // Fall back to the saved workers if the prompt editor's creation call no longer parses.
+    setSwitchedWorkerSettings(workerSettings ?? savedWorkerSettings);
+    setSwitchedWorkerPlacement(workerSettings !== null ? workerPlacement : savedWorkerPlacement);
     if (next === editingTriggerSource) {
       setStartNewSession(saved.savedStartNewSession);
       setSourceSwitch(null);
@@ -1311,10 +1318,6 @@ export function CreateScheduledTaskDialog({
                   Saving replaces the {triggerServiceName(editingTriggerSource)} trigger. The next
                   run starts a new polling session that watches{" "}
                   {triggerServiceName(editedTriggerSource)}.
-                  {sourceSwitch?.savedSystemPrompt === null &&
-                    ` The saved instructions can't be separated from the ${triggerServiceName(
-                      editingTriggerSource,
-                    )} rules, so enter them again.`}
                 </p>
               )}
             </TriggerTypeSelect>
