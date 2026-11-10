@@ -462,10 +462,16 @@ export async function updateScheduledTask(
  * settings but not its runs or continued session. Paused so the copy can't
  * fire alongside the original before the user reviews it.
  */
-export async function duplicateScheduledTask(id: string): Promise<ScheduledTask> {
-  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/duplicate`, {
-    method: "POST",
-  });
+export async function duplicateScheduledTask(
+  task: Pick<ScheduledTask, "id" | "hostId">,
+): Promise<ScheduledTask> {
+  // The server checks the copy's workspace over the pinned host's tunnel, so
+  // route to that host's replica rather than the selected one.
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(task.id)}/duplicate`,
+    { method: "POST" },
+    { hostId: task.hostId },
+  );
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
 }
 

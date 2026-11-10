@@ -6,12 +6,14 @@
 // vi.stubGlobal/unstubAllGlobals around it.
 
 import { setOmnigentHostConfig } from "./host";
+import { resolveModalHost, setSessionHost } from "./sessionHost";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ScheduledTaskApiError,
   createScheduledTask,
   deleteScheduledTask,
+  duplicateScheduledTask,
   getScheduledTask,
   listScheduledTaskRuns,
   listScheduledTasks,
@@ -75,6 +77,25 @@ describe("runScheduledTaskNow", () => {
       "/v1/scheduled-tasks/st_1/run",
       expect.objectContaining({ method: "POST" }),
     );
+  });
+});
+
+describe("duplicateScheduledTask", () => {
+  it.each([
+    ["host_a", "host_a"],
+    [null, "host_b"],
+  ])("routes a task on host %s to %s while host_b is selected", async (hostId, expected) => {
+    // The fetcher marks a sharded deployment; the user's sessions make host_b the modal host.
+    setOmnigentHostConfig({ analytics, fetcher: fetchMock });
+    setSessionHost("sess_b", "host_b");
+    resolveModalHost();
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, id: "st_2", state: "paused" }));
+    const copy = await duplicateScheduledTask({ id: "st_1", hostId });
+    expect(copy.id).toBe("st_2");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/scheduled-tasks/st_1/duplicate");
+    expect(init.method).toBe("POST");
+    expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toBe(expected);
   });
 });
 

@@ -355,7 +355,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
   }
 
   function handleDuplicate() {
-    duplicateMutation.mutate(task!.id, {
+    duplicateMutation.mutate(task!, {
       onSuccess: (copy) => {
         showToast(`Created "${copy.name}". It's paused until you resume it.`);
         navigate(`/tasks/${copy.id}`);

@@ -707,7 +707,10 @@ describe("row actions", () => {
     renderPage("/tasks", "", { ...TRIGGER_INFO, scheduled_task_duplicate: true });
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     fireEvent.click(screen.getByTestId("task-duplicate"));
-    expect(duplicateMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
+    expect(duplicateMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "st_1" }),
+      expect.any(Object),
+    );
     duplicateMutate.mock.calls[0][1].onSuccess(task({ id: "st_2", name: "copy name" }));
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining("copy name"));
   });

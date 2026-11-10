@@ -810,7 +810,10 @@ describe("header actions", () => {
       </CapabilitiesProvider>,
     );
     fireEvent.click(screen.getByTestId("task-detail-duplicate"));
-    expect(duplicateMutate).toHaveBeenCalledWith("st_1", expect.anything());
+    expect(duplicateMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "st_1" }),
+      expect.anything(),
+    );
     expect(navigate).toHaveBeenCalledWith("/tasks/st_2");
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining("nightly (copy)"));
   });

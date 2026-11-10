@@ -179,7 +179,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         : runNowMutation.isPending
           ? (runNowMutation.variables as string | undefined)
           : duplicateMutation.isPending
-            ? (duplicateMutation.variables as string | undefined)
+            ? duplicateMutation.variables?.id
             : undefined;
 
   function handlePauseToggle(task: ScheduledTask) {
@@ -211,7 +211,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   function handleDuplicate(task: ScheduledTask) {
-    duplicateMutation.mutate(task.id, {
+    duplicateMutation.mutate(task, {
       onSuccess: (copy) => {
         // Clear filters so the paused copy is visible in the list.
         setFilter("all");

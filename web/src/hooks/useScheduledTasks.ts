@@ -183,7 +183,7 @@ export function useCreateScheduledTask() {
 export function useDuplicateScheduledTask() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => duplicateScheduledTask(id),
+    mutationFn: (task: ScheduledTask) => duplicateScheduledTask(task),
     onSuccess: (copy) => {
       void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
       // A task started from a session gets a new session copy in the sidebar.
