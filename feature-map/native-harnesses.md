@@ -29,7 +29,10 @@ implements them separately, so a fix for one harness does not reach the others.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
-  an Omnigent session behind it.
+  an Omnigent session behind it. With `OMNIGENT_SESSION_ENV_PASSTHROUGH=NAME,...`
+  the named shell variables reach only the new runner that command launches; a
+  reused live runner keeps its launch values, and a later server-driven restart
+  starts without them.
 - `gateway-attribution`: Unity Gateway requests name the coding agent and the
   interface that created its session: desktop app, web UI, mobile, or CLI.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,

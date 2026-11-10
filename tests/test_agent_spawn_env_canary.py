@@ -222,6 +222,42 @@ def test_real_builders_pass_browser(monkeypatch):
         assert build().get("BROWSER") == "www-browser", harness
 
 
+def test_real_builders_pass_variables_forwarded_for_the_session(hostile_env, monkeypatch):
+    """Variables the launching shell forwarded to this runner reach every harness CLI."""
+    forwarded = {"ARCATERM_CAPABILITY": "capability-for-pane-1", "MACTERM_SOCKET": "/tmp/mt.sock"}
+    monkeypatch.setattr(
+        "os.environ",
+        {
+            **hostile_env,
+            **forwarded,
+            "OMNIGENT_RUNNER_SESSION_ENV_NAMES": "ARCATERM_CAPABILITY,MACTERM_SOCKET",
+        },
+    )
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert {name: env.get(name) for name in forwarded} == forwarded, harness
+        assert not (set(env) & CANARY_SECRETS.keys()), harness
+
+
+def test_forwarded_session_names_cannot_admit_runner_secrets_or_desktop_session():
+    """The forwarded-name list never re-admits runner auth, desktop or denied names."""
+    source = {
+        "OMNIGENT_RUNNER_SESSION_ENV_NAMES": (
+            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN,omnigent_runner_initial_auth_token,"
+            "XDG_RUNTIME_DIR,OPENAI_API_KEY,ARCATERM_CAPABILITY"
+        ),
+        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": "binding-secret",
+        "omnigent_runner_initial_auth_token": "initial-secret",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+        "OPENAI_API_KEY": "developer-key",
+        "ARCATERM_CAPABILITY": "capability-for-pane-1",
+    }
+
+    env = clean_agent_env(deny_exact=("OPENAI_API_KEY",), source=source)
+
+    assert env == {"ARCATERM_CAPABILITY": "capability-for-pane-1"}
+
+
 def test_real_builders_strip_desktop_session(monkeypatch):
     session_env = {
         "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",

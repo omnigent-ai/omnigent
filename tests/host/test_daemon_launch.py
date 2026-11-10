@@ -15,6 +15,7 @@ import click
 import httpx
 import pytest
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.host import daemon_launch
 from omnigent.host.daemon_launch import (
@@ -527,3 +528,24 @@ def test_launch_audit_context_is_bounded_and_contains_no_arguments() -> None:
             launch_audit_headers(host_id="host_b", fresh=False)["X-Omnigent-Launch-Command"]
             == "unknown"
         )
+@pytest.mark.skipif(IS_WINDOWS, reason="Session env forwarding is disabled on Windows")
+async def test_launch_warns_when_an_older_peer_leaves_forwarded_values_unconsumed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("OMNIGENT_SESSION_ENV_PASSTHROUGH", "ARCATERM_CAPABILITY")
+    monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-1")
+
+    def older_server(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"runner_id": "runner_from_older_server"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(older_server), base_url="http://test"
+    ) as client:
+        runner_id = await daemon_launch.launch_or_reuse_daemon_runner(
+            client, host_id="host_x", session_id="conv_x", workspace="/tmp", fresh=True
+        )
+
+    assert runner_id == "runner_from_older_server"
+    stderr = capsys.readouterr().err
+    assert "did not receive the OMNIGENT_SESSION_ENV_PASSTHROUGH variables" in stderr
+    assert "capability-for-pane-1" not in stderr
