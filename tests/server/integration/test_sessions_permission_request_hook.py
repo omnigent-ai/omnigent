@@ -3021,8 +3021,8 @@ async def test_codex_async_question_delivery_round_reopens_answered_card(
 
     The forwarder re-asks after Codex never received an answer. The same
     request replays the stored answer, so the round marks it as a new request
-    and the user answers the same card again, even when the question is
-    longer than the request preview the server compares.
+    and the user answers the same card again, even when a long question pushes
+    the round past the request preview.
     """
     agent = await create_test_agent(client, "test-codex-async-question-round")
     session_id = await _create_session(client, agent["id"])
@@ -3076,7 +3076,7 @@ async def test_codex_async_question_delivery_round_reopens_answered_card(
         assert resp.json() == {"answers": {"0": {"answers": ["Alpha"]}}}
 
         if delivery_round is not None:
-            params = {"deliveryRound": delivery_round, **params}
+            params = {**params, "deliveryRound": delivery_round}
         hook_task = asyncio.create_task(client.post(hook_url, json={**payload, "params": params}))
         if delivery_round is None:
             resp = await hook_task

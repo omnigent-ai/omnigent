@@ -631,6 +631,10 @@ def _codex_tool_request_user_input_params(
         extras["item_id"] = item_id
     if params.get("isBlocking") is False:
         extras["is_blocking"] = False
+    delivery_round = params.get("deliveryRound")
+    # A new round must change the request fingerprint, or the stored answer is replayed.
+    if isinstance(delivery_round, int) and not isinstance(delivery_round, bool):
+        extras["delivery_round"] = delivery_round
     return ElicitationRequestParams(
         mode="form",
         message="Codex needs input",

@@ -6492,8 +6492,8 @@ def _async_question_request_event(
         ],
     }
     if delivery_round:
-        # The server replays a stored answer to an unchanged request; listed
-        # first, the round survives its truncated request preview.
+        # The server replays a stored answer to an unchanged request. Older servers
+        # see the round only in the truncated request preview, so list it first.
         params = {"deliveryRound": delivery_round, **params}
     return {
         "id": question.request_id,
