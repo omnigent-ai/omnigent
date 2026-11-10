@@ -47,6 +47,8 @@ export interface TriggerCondition {
   field: string;
   operator: TriggerOperator;
   value: string;
+  /** The field a custom-field row compares, e.g. Jira's `ES Component` or `cf[10010]`. */
+  name?: string;
 }
 
 export interface TriggerFields {
@@ -99,6 +101,8 @@ export interface TriggerConditionField {
   /** Field-specific wording for an operator, e.g. Assignee's "is unassigned". */
   operatorLabels?: Partial<Record<TriggerOperator, string>>;
   placeholder: string;
+  /** Set when the row also names the field it compares, as a custom-field row does. */
+  namePlaceholder?: string;
 }
 
 /** How a row shows `operator` for `field`. */
@@ -212,6 +216,13 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         operators: ["is", "is_not", "empty", "not_empty"],
         operatorLabels: { empty: "is unassigned", not_empty: "is assigned" },
         placeholder: "me or email",
+      },
+      {
+        id: "custom_field",
+        label: "Custom field",
+        operators: ["is", "is_not", "empty", "not_empty"],
+        placeholder: "Backend",
+        namePlaceholder: "ES Component",
       },
       {
         id: "jql",
@@ -749,9 +760,17 @@ export function triggerFieldsComplete(fields: TriggerFields, source?: TriggerSou
     ) &&
     entries.length >= (isGroup ? 2 : 1) &&
     (isGroup || !singleValueScope(fields) || !fields.scope.includes(",")) &&
-    fields.conditions.every((c) => VALUELESS_OPERATORS.has(c.operator) || c.value.trim() !== "") &&
+    fields.conditions.every(triggerConditionFilledIn) &&
     instructions !== "" &&
     instructions.length <= MAX_INSTRUCTIONS_CHARS
+  );
+}
+
+/** Whether a row has its value, unless its operator takes none, and a custom field's name. */
+export function triggerConditionFilledIn(condition: TriggerCondition): boolean {
+  return (
+    (VALUELESS_OPERATORS.has(condition.operator) || condition.value.trim() !== "") &&
+    (condition.field !== "custom_field" || (condition.name ?? "").trim() !== "")
   );
 }
 
@@ -793,6 +812,16 @@ function jqlString(value: string): string {
   return `"${value.trim().replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+/**
+ * A custom field in JQL: a `cf[10010]` ID as typed, otherwise its quoted name.
+ * Quotes typed around the name are dropped so `"ES Component"` isn't quoted twice.
+ */
+function jiraCustomField(name: string): string {
+  const trimmed = name.trim();
+  if (/^cf\[\d+\]$/i.test(trimmed)) return trimmed;
+  return jqlString(/^".*"$/.test(trimmed) ? trimmed.slice(1, -1) : trimmed);
+}
+
 /** The JQL for a trigger's project and condition rows, without the time or ordering. */
 export function compileJiraJql(fields: TriggerFields): string {
   const projects = scopeList(fields.scope);
@@ -824,6 +853,15 @@ export function compileJiraJql(fields: TriggerFields): string {
         else if (c.operator === "not_empty") clauses.push("assignee is not EMPTY");
         else if (c.operator === "is") clauses.push(`assignee = ${who}`);
         else clauses.push(`(assignee is EMPTY OR assignee != ${who})`);
+        break;
+      }
+      case "custom_field": {
+        const key = jiraCustomField(c.name ?? "");
+        if (c.operator === "empty") clauses.push(`${key} is EMPTY`);
+        else if (c.operator === "not_empty") clauses.push(`${key} is not EMPTY`);
+        else if (c.operator === "is") clauses.push(`${key} = ${value}`);
+        // Like Component, `!=` alone would drop tickets that leave the field empty.
+        else clauses.push(`(${key} is EMPTY OR ${key} != ${value})`);
         break;
       }
       case "jql": {

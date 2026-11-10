@@ -246,6 +246,16 @@ describe("triggerFieldsComplete", () => {
       { conditions: [{ field: "assignee", operator: "empty", value: "" }] },
       true,
     ],
+    [
+      "a custom field with no name",
+      { conditions: [{ field: "custom_field", operator: "is", name: " ", value: "Backend" }] },
+      false,
+    ],
+    [
+      "a custom field that is empty",
+      { conditions: [{ field: "custom_field", operator: "empty", name: "Team", value: "" }] },
+      true,
+    ],
     ["empty instructions", { instructions: "" }, false],
     ["instructions at the cap", { instructions: "x".repeat(MAX_INSTRUCTIONS_CHARS) }, true],
     ["instructions over the cap", { instructions: "x".repeat(MAX_INSTRUCTIONS_CHARS + 1) }, false],
@@ -431,6 +441,39 @@ describe("compileJiraJql", () => {
         value: 'summary ~ "crash" OR priority = Highest ORDER BY created DESC',
       }),
     ).toBe('project = "ES" AND (summary ~ "crash" OR priority = Highest)');
+  });
+
+  it("compiles custom-field rows by quoted name or cf[] ID", () => {
+    const custom = (operator: TriggerCondition["operator"], name: string, value = "") =>
+      jql("ES", { field: "custom_field", operator, name, value });
+    expect(custom("is", "ES Component", "Backend")).toBe(
+      'project = "ES" AND "ES Component" = "Backend"',
+    );
+    expect(custom("is_not", "ES Component", "Docs")).toBe(
+      'project = "ES" AND ("ES Component" is EMPTY OR "ES Component" != "Docs")',
+    );
+    expect(custom("empty", "Team")).toBe('project = "ES" AND "Team" is EMPTY');
+    expect(custom("not_empty", "Team")).toBe('project = "ES" AND "Team" is not EMPTY');
+    expect(custom("is", " cf[10010] ", "Backend")).toBe('project = "ES" AND cf[10010] = "Backend"');
+    // Quotes copied from a JQL example aren't doubled.
+    expect(custom("is", '"ES Component"', "Backend")).toBe(
+      'project = "ES" AND "ES Component" = "Backend"',
+    );
+  });
+
+  it("escapes custom-field names and values so neither can end the clause", () => {
+    expect(
+      jql("ES", {
+        field: "custom_field",
+        operator: "is",
+        name: 'a" OR x = "1',
+        value: 'b\\" OR y = "2',
+      }),
+    ).toBe('project = "ES" AND "a\\" OR x = \\"1" = "b\\\\\\" OR y = \\"2"');
+    // Only a bare numeric ID skips quoting.
+    expect(
+      jql("ES", { field: "custom_field", operator: "is", name: "cf[1] OR x", value: "v" }),
+    ).toBe('project = "ES" AND "cf[1] OR x" = "v"');
   });
 });
 
