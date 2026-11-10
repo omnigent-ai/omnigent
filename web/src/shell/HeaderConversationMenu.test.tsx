@@ -407,6 +407,19 @@ describe("HeaderConversationMenu", () => {
     });
   });
 
+  it("asks before archiving a running session, and Cancel keeps it open", () => {
+    renderMenu({ conversation: { ...CONVERSATION, status: "running" } });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+    expect(screen.getByRole("dialog", { name: "Archive running session?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mocks.archive).not.toHaveBeenCalled();
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+  });
+
   it("offers Unarchive on an archived session and unarchives in place", () => {
     // An archived session reopened by URL must not be re-offered the action
     // that was already taken; the item flips like the sidebar row's menu.
@@ -874,17 +887,21 @@ describe("HeaderConversationMenu desktop menu commands", () => {
     await reportsPin(true);
   });
 
-  it("archives through the same worktree prompt as the menu item", () => {
-    renderMenu();
-    act(() => sendCommand({ command: "archive-session", browserViewId: null }));
-    expect(mocks.archive).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Yes, delete worktree" }));
-    expect(mocks.archive).toHaveBeenCalledWith({
-      id: "conv-1",
-      archived: true,
-      deleteWorktree: true,
-    });
-  });
+  it.each([
+    { status: "idle", worktreeChoice: "Yes, delete worktree", deleteWorktree: true },
+    { status: "running", worktreeChoice: "No, archive only", deleteWorktree: false },
+  ] as const)(
+    "archives a $status session through the menu item's prompts from Session → Archive",
+    ({ status, worktreeChoice, deleteWorktree }) => {
+      renderMenu({ conversation: { ...CONVERSATION, status } });
+      act(() => sendCommand({ command: "archive-session", browserViewId: null }));
+      if (status === "running") fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+      else expect(screen.queryByTestId("archive-running-dialog")).toBeNull();
+      expect(mocks.archive).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: worktreeChoice }));
+      expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true, deleteWorktree });
+    },
+  );
 
   it("shows the desktop chords on Pin, Archive and Fork", () => {
     renderMenu();
