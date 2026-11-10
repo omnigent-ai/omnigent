@@ -5285,6 +5285,17 @@ async def _execute_session_query_tool(
             ("sessions",),
             _session_list_filters(agent_name, include_archived, visibility),
         )
+        server_visibility = visibility
+        if isinstance(window, str) and include_archived and visibility == "mine":
+            # A listing negotiated with an older server continues in its wider scope.
+            widened_window = _discovery_list_window(
+                args,
+                tool_name,
+                ("sessions",),
+                _session_list_filters(agent_name, include_archived, visibility, "all"),
+            )
+            if not isinstance(widened_window, str):
+                window, server_visibility = widened_window, "all"
         if isinstance(window, str):
             return window
         limit, cursor_state, continued = window
@@ -5294,6 +5305,7 @@ async def _execute_session_query_tool(
             agent_name,
             include_archived=include_archived,
             visibility=visibility,
+            server_visibility=server_visibility if continued else None,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -6220,27 +6232,34 @@ def _project_agent_list(
 
 
 def _session_list_filters(
-    agent_name: object, include_archived: bool, visibility: str
+    agent_name: object,
+    include_archived: bool,
+    visibility: str,
+    server_visibility: str | None = None,
 ) -> _JsonObject:
     """
     The ``sys_session_list`` filters a continuation cursor is bound to.
 
-    ``include_archived`` is recorded only when set, so cursors issued before
-    the flag existed still match a call that omits it. ``visibility`` is
-    always recorded: older cursors continued a listing of every accessible
-    session, which the default no longer is.
+    ``include_archived`` is recorded only when set, and ``visibility`` only
+    when ``"mine"``, so cursors issued before either option existed still
+    continue the listing they started. A different ``server_visibility``
+    records the scope negotiated on the first page, reused for later pages.
 
     :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
     :param include_archived: Whether archived sessions are listed.
     :param visibility: ``"mine"`` or ``"all"``.
+    :param server_visibility: The scope sent to the server, e.g. ``"all"``.
     :returns: The filter mapping, e.g. ``{"agent_name": None, "visibility": "mine"}``.
     """
     filters: _JsonObject = {
-        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
-        "visibility": visibility,
+        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None
     }
+    if visibility != "all":
+        filters["visibility"] = visibility
     if include_archived:
         filters["include_archived"] = True
+    if server_visibility is not None and server_visibility != visibility:
+        filters["server_visibility"] = server_visibility
     return filters
 
 
@@ -6256,9 +6275,10 @@ async def _server_lists_owned_archives(server_client: httpx.AsyncClient) -> bool
     """
     try:
         info = await server_client.get("/v1/info", timeout=30.0)
-        return info.status_code < 400 and info.json().get("session_list_owned_archives") is True
+        body = info.json() if info.status_code < 400 else None
     except (httpx.HTTPError, ValueError):
         return False
+    return isinstance(body, dict) and body.get("session_list_owned_archives") is True
 
 
 async def _session_list_via_rest(
@@ -6268,6 +6288,7 @@ async def _session_list_via_rest(
     *,
     include_archived: bool = False,
     visibility: str = "mine",
+    server_visibility: str | None = None,
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -6291,6 +6312,8 @@ async def _session_list_via_rest(
     :param include_archived: Also list archived sessions in the global view.
     :param visibility: ``"mine"`` for owned sessions or ``"all"`` to also
         include sessions shared with the caller.
+    :param server_visibility: The scope a continued listing sends to the
+        server; ``None`` negotiates it with the server on the first page.
     :param limit: Optional maximum rows returned from the global sessions view. When
         omitted, the complete legacy result is preserved while it fits.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -6301,14 +6324,15 @@ async def _session_list_via_rest(
     if cursor_state["sessions"][0] == _DISCOVERY_END:
         sessions_page = _DiscoveryPage([], False)
     else:
-        server_visibility = visibility
-        if (
-            include_archived
-            and visibility == "mine"
-            and not await _server_lists_owned_archives(server_client)
-        ):
-            # Keep archived owned sessions listable on servers whose "mine" scope drops them.
-            server_visibility = "all"
+        if server_visibility is None:
+            server_visibility = visibility
+            if (
+                include_archived
+                and visibility == "mine"
+                and not await _server_lists_owned_archives(server_client)
+            ):
+                # Keep archived owned sessions listable on servers whose "mine" scope drops them.
+                server_visibility = "all"
         sessions_page = await _collect_global_sessions(
             server_client,
             agent_name,
@@ -6323,7 +6347,7 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters=_session_list_filters(agent_name, include_archived, visibility),
+        filters=_session_list_filters(agent_name, include_archived, visibility, server_visibility),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )

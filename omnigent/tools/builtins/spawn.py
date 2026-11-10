@@ -593,7 +593,9 @@ class SysSessionListTool(Tool):
                             "description": (
                                 "Optional: 'mine' (default) lists only sessions "
                                 "you own in 'sessions'; 'all' also lists "
-                                "sessions other users shared with you."
+                                "sessions other users shared with you. Servers "
+                                "older than this runner may include shared "
+                                "sessions in an include_archived listing."
                             ),
                         },
                         "limit": {

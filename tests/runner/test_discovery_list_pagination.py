@@ -470,35 +470,45 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
             return _server_page(request, rows)
         raise AssertionError(f"unexpected path {request.url.path}")
 
+    legacy_cursor = _encode_cursor_payload(
+        {
+            "v": 1,
+            "tool": "sys_session_list",
+            "filters": {"agent_name": None},
+            "sections": {"sessions": ["at", "conv_0099"]},
+        }
+    )
+
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
     ) as client:
-
-        async def call(args: dict[str, object]) -> dict[str, object]:
-            return json.loads(
-                await execute_tool(
-                    tool_name="sys_session_list",
-                    arguments=json.dumps(args),
-                    server_client=client,
-                    conversation_id="conv_caller",
-                )
-            )
-
-        first = await call({"limit": 100})
+        first = await _call_session(client, {"limit": 100})
         cursor = first["page"]["next_cursor"]
-        second = await call({"limit": 100, "cursor": cursor})
-        widened = await call({"limit": 100, "visibility": "all", "cursor": cursor})
-        shared = await call({"limit": 100, "visibility": "all"})
-        invalid = await call({"visibility": "shared"})
+        second = await _call_session(client, {"limit": 100, "cursor": cursor})
+        widened = await _call_session(
+            client, {"limit": 100, "visibility": "all", "cursor": cursor}
+        )
+        shared = await _call_session(client, {"limit": 100, "visibility": "all"})
+        shared_next = await _call_session(
+            client,
+            {"limit": 100, "visibility": "all", "cursor": shared["page"]["next_cursor"]},
+        )
+        legacy = await _call_session(
+            client, {"limit": 100, "visibility": "all", "cursor": legacy_cursor}
+        )
+        legacy_narrowed = await _call_session(client, {"limit": 100, "cursor": legacy_cursor})
 
     assert first["sessions"][0]["session_id"] == "conv_0000"
     assert second["sessions"][0]["session_id"] == "conv_0100"
     assert shared["sessions"][0]["session_id"] == "conv_0000"
-    assert received_afters == [None, "conv_0099", None]
-    assert received_visibilities == ["mine", "mine", "all"]
+    assert shared_next["sessions"][0]["session_id"] == "conv_0100"
+    # Cursors minted before ``visibility`` existed continue their ``all`` listing.
+    assert legacy["sessions"][0]["session_id"] == "conv_0100"
+    assert received_afters == [None, "conv_0099", None, "conv_0099", "conv_0099"]
+    assert received_visibilities == ["mine", "mine", "all", "all", "all"]
     # The cursor is bound to the visibility it was minted with.
     assert widened == {"error": "sys_session_list: cursor uses different filter arguments"}
-    assert invalid == {"error": "sys_session_list: 'visibility' must be one of ['all', 'mine']"}
+    assert legacy_narrowed == widened
 
 
 @pytest.mark.asyncio
@@ -507,18 +517,20 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     [
         (200, {"session_list_owned_archives": True}, "mine"),
         (200, {}, "all"),
+        (200, [], "all"),
         (404, {"detail": "Not Found"}, "all"),
     ],
-    ids=["owned-archives", "older-server", "unreadable-info"],
+    ids=["owned-archives", "older-server", "non-object-info", "unreadable-info"],
 )
 async def test_sys_session_list_include_archived_lists_archived_rows_on_every_page(
-    info_status: int, info_body: dict[str, object], expected_visibility: str
+    info_status: int, info_body: object, expected_visibility: str
 ) -> None:
     """An archive-inclusive listing reaches the server on each page and marks archived rows.
 
     Trigger automations find the workers they started through this listing, so
     archiving a worker must not hide it from the next page either. Servers whose
-    ``mine`` scope drops archived rows keep getting the earlier ``all`` query.
+    ``mine`` scope drops archived rows get the earlier ``all`` query for the
+    whole listing.
     """
     rows = [
         {
@@ -544,6 +556,8 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if request.url.path == "/v1/info":
             info_requests.append(request.url.path)
+            if len(info_requests) > 1:
+                return httpx.Response(503)
             return httpx.Response(info_status, json=info_body)
         if request.url.path == "/v1/sessions":
             received.append(
@@ -571,14 +585,25 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
         second = await call({"limit": 100, "include_archived": True, "cursor": cursor})
         mismatched = await call({"limit": 100, "cursor": cursor})
         default = await call({"limit": 100})
+        shared = await call({"limit": 100, "include_archived": True, "visibility": "all"})
+        await call(
+            {
+                "limit": 100,
+                "include_archived": True,
+                "visibility": "all",
+                "cursor": shared["page"]["next_cursor"],
+            }
+        )
 
     assert received == [
         ("true", expected_visibility),
         ("true", expected_visibility),
         (None, "mine"),
+        ("true", "all"),
+        ("true", "all"),
     ]
-    # Only archive-inclusive pages check the server's capability.
-    assert len(info_requests) == 2
+    # Only the first page of an owned archive listing checks the server's capability.
+    assert len(info_requests) == 1
     assert first["sessions"][0] == {
         "session_id": "conv_0000",
         "agent_name": "claude",
@@ -926,6 +951,11 @@ async def test_unusable_server_envelope_remains_retryable(
         ("sys_agent_list", {"limit": 0}, "'limit' must be an integer between 1 and 100"),
         ("sys_agent_list", {"limit": None}, "'limit' must be an integer between 1 and 100"),
         ("sys_session_list", {"cursor": "not-a-cursor"}, "invalid pagination cursor"),
+        (
+            "sys_session_list",
+            {"visibility": "shared"},
+            "'visibility' must be one of ['all', 'mine']",
+        ),
     ],
 )
 @pytest.mark.asyncio
