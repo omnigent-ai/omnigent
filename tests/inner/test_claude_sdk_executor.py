@@ -3964,6 +3964,158 @@ async def test_mcp_servers_signed_in_mid_session_reconnect_before_the_next_turn(
         close.assert_awaited_with(third)
 
 
+@pytest.mark.asyncio
+async def test_live_mcp_status_and_reconnect_for_the_mcp_panel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The /mcp panel reads and reconnects the running CLI's servers, never Omnigent's own."""
+    from omnigent.inner.claude_sdk_executor import _MCP_BUSY_COMPACT_MESSAGE, ClaudeSDKExecutor
+    from omnigent.inner.executor import (
+        LiveMcpHarnessNotRunning,
+        LiveMcpReconnectRefused,
+        LiveMcpServerStatus,
+        LiveMcpServerUnknown,
+    )
+
+    monkeypatch.setenv("OMNIGENT_MCP_AUTH_STATUS_FILE", str(tmp_path / "absent.json"))
+    live: dict[str, dict[str, object]] = {
+        "omnigent": {"status": "connected"},
+        "docs": {"status": "needs-auth", "scope": "user"},
+        "plugin:tools:search": {"status": "failed", "error": "HTTP 401"},
+        "wiki": {"status": "connected", "error": "", "scope": 7},
+    }
+    status_reply = "ok"
+    status_reads = 0
+    reconnects: list[str] = []
+    fake_sdk = _make_recovery_fake_sdk()
+
+    class _McpClient(fake_sdk.ClaudeSDKClient):
+        async def get_mcp_status(self) -> dict[str, object]:
+            nonlocal status_reads
+            status_reads += 1
+            if status_reply == "hang":
+                await asyncio.Event().wait()
+            servers: list[object] = [{"name": n, **fields} for n, fields in live.items()]
+            return {"mcpServers": [*servers, "malformed", {"status": "connected"}]}
+
+        async def reconnect_mcp_server(self, server_name: str) -> None:
+            reconnects.append(server_name)
+            if server_name == "docs":
+                # The SDK's form for the CLI's own error reply.
+                raise Exception("still unauthorized")
+            if server_name == "wiki":
+                raise RuntimeError("transport closed at /run/cli.sock")
+            live[server_name] = {"status": "connected"}
+
+    fake_sdk.ClaudeSDKClient = _McpClient
+    executor = ClaudeSDKExecutor()
+    assert executor.supports_live_mcp_control()
+    messages: list[dict[str, object]] = []
+
+    async def turn(text: str) -> _McpClient:
+        messages.append({"role": "user", "content": text, "session_id": "mcp"})
+        events = [event async for event in executor.run_turn(messages, [], "")]
+        assert any(isinstance(event, TurnComplete) for event in events)
+        messages.append({"role": "assistant", "content": f"answer to {text}"})
+        return executor._clients["mcp"].client
+
+    # Nothing is connected before the first turn starts the CLI.
+    assert await executor.live_mcp_statuses("mcp") is None
+    with pytest.raises(LiveMcpHarnessNotRunning):
+        await executor.reconnect_live_mcp_server("mcp", "docs")
+
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch.object(executor, "_force_close_client", new_callable=AsyncMock) as close,
+    ):
+        first = await turn("q0")
+        assert await executor.live_mcp_statuses("mcp") == [
+            LiveMcpServerStatus(name="docs", status="needs-auth", scope="user"),
+            LiveMcpServerStatus(name="plugin:tools:search", status="failed", error="HTTP 401"),
+            LiveMcpServerStatus(name="wiki", status="connected"),
+        ]
+
+        await executor.reconnect_live_mcp_server("mcp", "plugin:tools:search")
+        assert reconnects == ["plugin:tools:search"]
+        assert live["plugin:tools:search"] == {"status": "connected"}
+        # The CLI's refusal reaches the caller as one; other failures stay internal.
+        with pytest.raises(LiveMcpReconnectRefused, match="still unauthorized"):
+            await executor.reconnect_live_mcp_server("mcp", "docs")
+        with pytest.raises(RuntimeError) as transport_failure:
+            await executor.reconnect_live_mcp_server("mcp", "wiki")
+        assert not isinstance(transport_failure.value, LiveMcpReconnectRefused)
+        # Only a server the CLI reports can be reconnected; Omnigent's own is not listed.
+        for name in ("omnigent", "search"):
+            with pytest.raises(LiveMcpServerUnknown):
+                await executor.reconnect_live_mcp_server("mcp", name)
+        assert reconnects == ["plugin:tools:search", "docs", "wiki"]
+        assert await turn("q1") is first
+
+        # Control requests wait for one another instead of overlapping on the CLI.
+        state = executor._clients["mcp"]
+        async with state.mcp_control_lock:
+            waiting = asyncio.create_task(executor.live_mcp_statuses("mcp"))
+            await asyncio.sleep(0.01)
+            assert not waiting.done()
+        assert len(await waiting) == 3
+        # A reconnect that waited while a turn replaced the CLI does not reach the old one.
+        async with state.mcp_control_lock:
+            waiting_reconnect = asyncio.create_task(
+                executor.reconnect_live_mcp_server("mcp", "plugin:tools:search")
+            )
+            await asyncio.sleep(0.01)
+            executor._clients.pop("mcp")
+        with pytest.raises(LiveMcpHarnessNotRunning):
+            await waiting_reconnect
+        executor._clients["mcp"] = state
+        assert len(reconnects) == 3
+        # Timing out while still waiting leaves the CLI untouched, so the client stays.
+        monkeypatch.setattr("omnigent.inner.claude_sdk_executor._MCP_STATUS_TIMEOUT_SECONDS", 0.05)
+        async with state.mcp_control_lock:
+            with pytest.raises(TimeoutError):
+                await executor.live_mcp_statuses("mcp")
+        assert not state.mcp_control_timed_out
+        assert await turn("q1b") is first
+
+        # A panel request that times out leaves the CLI busy, so the next turn uses a new one.
+        status_reply = "hang"
+        with pytest.raises(TimeoutError):
+            await executor.live_mcp_statuses("mcp")
+        status_reply = "ok"
+        # Later panel requests fail fast instead of queueing behind the busy CLI.
+        reads_before = status_reads
+        with pytest.raises(TimeoutError):
+            await executor.live_mcp_statuses("mcp")
+        assert status_reads == reads_before
+        # The busy CLI would hold /compact, and a new one would have nothing to compact.
+        messages.append({"role": "user", "content": "/compact", "session_id": "mcp"})
+        events = [event async for event in executor.run_turn(messages, [], "")]
+        assert [event.message for event in events if isinstance(event, ExecutorError)] == [
+            _MCP_BUSY_COMPACT_MESSAGE
+        ]
+        messages.pop()
+        second = await turn("q2")
+        assert second is not first
+        close.assert_awaited_once_with(first)
+        assert "answer to q1" in second.prompts[-1]
+        assert await turn("q3") is second
+
+        # A turn that waited on a panel request which then timed out leaves the busy CLI alone.
+        status_reply = "hang"
+        reads_before = status_reads
+        panel = asyncio.create_task(executor.live_mcp_statuses("mcp"))
+        async with asyncio.timeout(5):
+            while status_reads == reads_before:
+                await asyncio.sleep(0)
+        third = await turn("q4")
+        with pytest.raises(TimeoutError):
+            await panel
+        assert third is not second
+        close.assert_awaited_with(second)
+        assert status_reads == reads_before + 1
+        assert len(reconnects) == 3
+
+
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
     """A relative ``os_env.cwd`` (notably the default ``"."``) resolves
     against ``OMNIGENT_RUNNER_WORKSPACE`` — not the daemon's process cwd

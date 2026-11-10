@@ -88,6 +88,8 @@ export interface TriggerPromptContext {
    * ID, e.g. `https://omnigent.example.com/c/CONVERSATION_ID`.
    */
   sessionLink: string;
+  /** The workers' agent; workers otherwise use the polling session's agent. */
+  agentId?: string | null;
   /** The task's model override; workers otherwise use the agent's default. */
   model?: string;
   /** The task's reasoning effort override. */
@@ -757,7 +759,12 @@ function taskSessionPromptOpening(source: TriggerSource): string {
  * record its template, so the edit form recognizes the prompt's opening line.
  */
 export function isTriggerPrompt(prompt: string): boolean {
-  return TRIGGER_SOURCES.some((source) => prompt.startsWith(triggerPromptOpening(source)));
+  return triggerPromptSource(prompt) !== null;
+}
+
+/** The service a rendered trigger prompt watches, from its opening line; null otherwise. */
+export function triggerPromptSource(prompt: string): TriggerSource | null {
+  return TRIGGER_SOURCES.find((source) => prompt.startsWith(triggerPromptOpening(source))) ?? null;
 }
 
 /** Whether a trigger prompt sends every match to one task session. */
@@ -1409,11 +1416,11 @@ export function renderTriggerPrompt(
       .trimEnd(),
   );
   const createArgs = [
-    "agent_id set to your agent ID",
+    `agent_id ${ctx.agentId ? JSON.stringify(ctx.agentId) : "set to your agent ID"}`,
     `placement "${ctx.placement}"`,
     `title ${shared ? taskSessionTitle : text.title}`,
-    ...(ctx.model ? [`model "${ctx.model}"`] : []),
-    ...(ctx.effort ? [`reasoning_effort "${ctx.effort}"`] : []),
+    ...(ctx.model ? [`model ${JSON.stringify(ctx.model)}`] : []),
+    ...(ctx.effort ? [`reasoning_effort ${JSON.stringify(ctx.effort)}`] : []),
   ];
   const managerPostsLink = fields.linkBack && source !== "slack";
   const workerPostingInstructions =

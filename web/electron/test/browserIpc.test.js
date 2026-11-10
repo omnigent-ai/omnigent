@@ -468,6 +468,7 @@ function makeRegistry(conversationId, webContents) {
   if (conversationId) entries.set(conversationId, { view: { webContents } });
   const suppressedCalls = []; // booleans passed to setSuppressed, in order
   const recentSessionSupportCalls = [];
+  const openTabSupportCalls = [];
   let recentSessionCancelCount = 0;
   return {
     get: (id) => entries.get(id) ?? null,
@@ -493,9 +494,14 @@ function makeRegistry(conversationId, webContents) {
       recentSessionSupportCalls.push(supported);
       return { ok: true };
     },
+    setOpenTabSupported: (supported) => {
+      openTabSupportCalls.push(supported);
+      return { ok: true };
+    },
     close: () => ({ ok: true, removed: true }),
     suppressedCalls,
     recentSessionSupportCalls,
+    openTabSupportCalls,
     recentSessionCancelCount: () => recentSessionCancelCount,
   };
 }
@@ -629,6 +635,7 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-focused-view",
       "omnigent:browser-set-suppressed",
       "omnigent:browser-set-recent-session-switch-supported",
+      "omnigent:browser-set-open-tab-supported",
       "omnigent:browser-cancel-recent-session-switch",
       "omnigent:browser-resize",
       "omnigent:browser-screenshot",
@@ -733,6 +740,26 @@ describe("browserIpc — recent-session cancellation", () => {
     assert.equal(supportResult.ok, false);
     assert.equal(registry.recentSessionCancelCount(), 0);
     assert.deepEqual(registry.recentSessionSupportCalls, []);
+  });
+});
+
+describe("browserIpc — modifier-click new tabs", () => {
+  it("tracks whether the trusted renderer opens requested tabs", async () => {
+    const { ipcMain, registry, event } = setup();
+    await ipcMain.invoke("omnigent:browser-set-open-tab-supported", event, { supported: true });
+    await ipcMain.invoke("omnigent:browser-set-open-tab-supported", event, {});
+
+    assert.deepEqual(registry.openTabSupportCalls, [true, false]);
+  });
+
+  it("rejects an unpinned sender", async () => {
+    const { ipcMain, registry, event } = setup({ pinned: false });
+    const result = await ipcMain.invoke("omnigent:browser-set-open-tab-supported", event, {
+      supported: true,
+    });
+
+    assert.equal(result.ok, false);
+    assert.deepEqual(registry.openTabSupportCalls, []);
   });
 });
 

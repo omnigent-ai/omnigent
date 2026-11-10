@@ -241,7 +241,10 @@ from omnigent.server.schemas import (
     SupersessionReason,
     UpdateSessionRequest,
 )
-from omnigent.server.session_orchestration import require_orchestration_source
+from omnigent.server.session_orchestration import (
+    require_named_source_private,
+    require_orchestration_source,
+)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -3175,6 +3178,16 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
+        if set_project:
+            # A session shared with edit access must not let collaborators
+            # refile the owner's other sessions through agent tools.
+            await asyncio.to_thread(
+                require_named_source_private,
+                request,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
@@ -4597,6 +4610,15 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             extra_labels[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
+        # The dialog's Claude mode pick becomes the fork's recorded mode, so a
+        # later bind to another host, which keeps only that mode, keeps the pick.
+        if (
+            override_launch_args is not None
+            and len(override_launch_args) == 2
+            and override_launch_args[0] == "--permission-mode"
+            and override_launch_args[1] in _CLAUDE_NATIVE_PERMISSION_MODES
+        ):
+            extra_labels[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = override_launch_args[1]
 
         # Side chats use the source for shared-runner routing and stay hidden
         # from the sidebar while appearing in the Workspace rail.
