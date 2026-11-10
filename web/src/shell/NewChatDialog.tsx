@@ -2091,7 +2091,8 @@ export function AgentHarnessPicker({
 // Drafts survive navigation within this page load, with one slot per source.
 // Successful creation clears only its slot; a page refresh starts clean.
 interface RepositoryOverride {
-  selections: LastSandboxRepo[];
+  // Missing selections follow defaults; an empty array explicitly clears them.
+  selections?: LastSandboxRepo[];
   pendingUrl: string;
 }
 
@@ -2700,7 +2701,7 @@ function NewChatLandingContent({
   }
   function setPendingRepoUrl(pendingUrl: string) {
     setRepositoryOverride((current) => ({
-      selections: current?.selections ?? defaultSandboxRepos,
+      ...current,
       pendingUrl,
     }));
   }

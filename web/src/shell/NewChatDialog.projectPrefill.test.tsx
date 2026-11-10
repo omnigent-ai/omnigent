@@ -1692,9 +1692,14 @@ describe("saved project repositories", () => {
     });
   });
 
-  it.each([false, true])(
-    "waits for config and prefills the saved provider and repository (restore draft=%s)",
-    async (restoreDraft) => {
+  it.each([
+    [false, ""],
+    [true, ""],
+    [false, "https://git.example.com/team/draft.git"],
+    [true, "https://git.example.com/team/draft.git"],
+  ] as const)(
+    "waits for config without treating pending text as a selection (restore draft=%s, pending=%s)",
+    async (restoreDraft, pendingUrl) => {
       localStorage.setItem(
         "omnigent:last-sandbox-repos",
         JSON.stringify([{ url: "https://git.example.com/other/remembered.git", branch: "" }]),
@@ -1702,6 +1707,15 @@ describe("saved project repositories", () => {
       writeProjectLaunchDefaults("proj_alpha", { hostId: "host_1", workspace: "/other" }, config);
       setProjectConfig(undefined, true);
       const first = renderSandboxLanding(capabilities);
+      if (pendingUrl) {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option-example"));
+        fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+        fireEvent.change(screen.getByRole("textbox", { name: "Repository URL" }), {
+          target: { value: pendingUrl },
+        });
+        fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+      }
       if (restoreDraft) first.unmount();
       setProjectConfig(config);
       if (restoreDraft) renderSandboxLanding(capabilities);
@@ -1709,6 +1723,13 @@ describe("saved project repositories", () => {
       await waitFor(() =>
         expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("sample"),
       );
+      if (pendingUrl) {
+        fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+        const input = screen.getByRole("textbox", { name: "Repository URL" });
+        expect(input).toHaveValue(pendingUrl);
+        fireEvent.change(input, { target: { value: "" } });
+        fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+      }
       const body = await submitAndReadBody();
       expect(body).toMatchObject({
         host_type: "managed",
@@ -1719,6 +1740,26 @@ describe("saved project repositories", () => {
       });
     },
   );
+
+  it("keeps following repository defaults after typing and erasing an unfinished URL", async () => {
+    setProjectConfig(config);
+    const { rerender } = renderSandboxLanding({
+      ...capabilities,
+      sandbox_provider_capabilities: { example: { multi_repo: true } },
+    });
+    fireEvent.click(await screen.findByTestId("new-chat-landing-repo-chip"));
+    const input = screen.getByRole("textbox", { name: "Repository URL" });
+    fireEvent.change(input, { target: { value: "https://git.example.com/team/draft.git" } });
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    const updatedRepository = { url: "https://git.example.com/team/updated.git" };
+    setProjectConfig({ ...config, repository: updatedRepository });
+    rerender(<NewChatLandingScreen />);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("updated"),
+    );
+    expect((await submitAndReadBody()).workspaces).toEqual([updatedRepository.url]);
+  });
 
   it("keeps an explicit clear through rerenders and a restored draft", async () => {
     setProjectConfig(config);
@@ -1822,10 +1863,10 @@ describe("saved project repositories", () => {
       });
       if (remount) renderSandboxLanding(capabilities);
       else first.rerender(<NewChatLandingScreen />);
-      expect(screen.getByTestId("new-chat-landing-repo-chip")).not.toHaveTextContent("updated");
       fireEvent.click(
         await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
       );
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).not.toHaveTextContent("updated");
       fireEvent.click(screen.getByRole("option", { name: "Updated profile" }));
       const body = await submitAndReadBody();
       expect(body.workspaces).toEqual([]);
