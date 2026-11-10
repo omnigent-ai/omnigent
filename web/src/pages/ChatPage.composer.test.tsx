@@ -6285,7 +6285,7 @@ describe("Composer reply quotes", () => {
       screen.getByLabelText("Open local review comment src/example.ts:12 (new)"),
     ).toBeInTheDocument();
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("[Comment 123]");
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain('"id": "123"');
     expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("Updated review");
     expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("[Attached: src/example.ts]");
     const [sentText, , sentReply] = vi.mocked(props.onSend).mock.calls[0]!;
@@ -6331,8 +6331,8 @@ describe("Composer reply quotes", () => {
     act(() => requestLocalReviewContext({ ...comment, id: "456" }));
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toContain("[Comment 456]");
-    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).not.toContain("[Comment 123]");
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toContain('"id": "456"');
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).not.toContain('"id": "123"');
     expect(vi.mocked(props.onSend).mock.calls[1]?.[1]).toEqual([attachment]);
 
     const batch = [

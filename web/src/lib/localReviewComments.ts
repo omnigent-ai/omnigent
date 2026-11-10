@@ -3,6 +3,9 @@ import type { ReviewThreadAnchor } from "./pullRequestReviewThreads";
 
 export type LocalReviewAnchor = Omit<ReviewThreadAnchor, "path"> & { pr_url: string };
 
+export const LOCAL_REVIEW_COMMENT_LANGUAGE = "local-review-comment";
+const LOCAL_REVIEW_COMMENT_FENCE = `\`\`\`${LOCAL_REVIEW_COMMENT_LANGUAGE}\n`;
+
 export function isFileComment(comment: Comment): boolean {
   return !comment.anchor_metadata;
 }
@@ -48,10 +51,26 @@ export function isLocalReviewComment(value: unknown): value is Comment {
 export function formatLocalReviewComments(comments: Comment[]): string {
   return [
     "Please address these local review comments:",
-    ...comments.map((comment) => {
-      const anchor = comment.anchor_metadata!;
-      const range = anchor.start_line ? `${anchor.start_line}–${anchor.line}` : `${anchor.line}`;
-      return `\n[Comment ${comment.id}] ${comment.path} (${anchor.side === "LEFT" ? "old" : "new"} lines ${range})\nPR: ${anchor.pr_url}\nBase: ${anchor.base_sha}; head: ${anchor.head_sha}\n${comment.body}`;
-    }),
-  ].join("\n");
+    ...comments.map(
+      (comment) => `${LOCAL_REVIEW_COMMENT_FENCE}${JSON.stringify(comment, null, 2)}\n\`\`\``,
+    ),
+  ].join("\n\n");
+}
+
+export function parseLocalReviewComment(code: string): Comment | null {
+  try {
+    const value: unknown = JSON.parse(code);
+    return isLocalReviewComment(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A collapsed prompt must not expose a snapshot cut in the middle of its JSON. */
+export function omitIncompleteLocalReviewComment(text: string): string {
+  const start = text.lastIndexOf(LOCAL_REVIEW_COMMENT_FENCE);
+  if (start < 0 || text.indexOf("\n```", start + LOCAL_REVIEW_COMMENT_FENCE.length) >= 0) {
+    return text;
+  }
+  return `${text.slice(0, start)}_Expand the prompt to read more review comments._`;
 }

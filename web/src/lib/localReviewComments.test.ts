@@ -1,5 +1,9 @@
 import { afterEach, expect, it } from "vitest";
-import { formatLocalReviewComments } from "./localReviewComments";
+import {
+  formatLocalReviewComments,
+  omitIncompleteLocalReviewComment,
+  parseLocalReviewComment,
+} from "./localReviewComments";
 import type { Comment } from "@/hooks/useComments";
 import {
   clearSessionDrafts,
@@ -37,20 +41,50 @@ const comment: Comment = {
 
 afterEach(clearSessionDrafts);
 
-it("includes comment references and historical coordinates for native agents", () => {
-  const message = formatLocalReviewComments([
+it("preserves full snapshots and Markdown bodies inside review fences", () => {
+  const comments = [
     comment,
     {
       ...comment,
       id: "comment-2",
-      anchor_metadata: { ...comment.anchor_metadata!, side: "RIGHT", line: 10, start_line: null },
+      path: "src/a`name[1].tsx",
+      body: '**Check** <div>\n\n```json\n{"key": "value"}\n```\n\n- Keep `null`.',
+      anchor_metadata: {
+        ...comment.anchor_metadata!,
+        side: "RIGHT" as const,
+        line: 10,
+        start_line: null,
+      },
     },
-  ]);
-  expect(message).toContain("[Comment comment-1] old.py (old lines 7–9)");
-  expect(message).toContain("[Comment comment-2] old.py (new lines 10)");
-  expect(message).toContain("Base: base; head: head");
-  expect(message).toContain("Keep this check");
-  expect(message).toContain("PR: https://github.com/acme/app/pull/1");
+  ];
+  const message = formatLocalReviewComments(comments);
+  expect(message).toMatch(/^Please address these local review comments:/);
+  const snapshots = [...message.matchAll(/```local-review-comment\n([\s\S]*?)\n```/g)].map(
+    (match) => parseLocalReviewComment(match[1]),
+  );
+  expect(snapshots).toEqual(comments);
+});
+
+it.each([
+  "not JSON",
+  "null",
+  "[]",
+  JSON.stringify({ ...comment, body: null }),
+  JSON.stringify({ ...comment, anchor_metadata: null }),
+  JSON.stringify({ ...comment, status: "addressed" }),
+  JSON.stringify({ ...comment, anchor_metadata: { ...comment.anchor_metadata, line: 0 } }),
+])("leaves invalid snapshots as ordinary code: %s", (code) => {
+  expect(parseLocalReviewComment(code)).toBeNull();
+});
+
+it("omits only the incomplete review snapshot at a collapsed prompt boundary", () => {
+  const message = formatLocalReviewComments([comment, { ...comment, id: "comment-2" }]);
+  const first = formatLocalReviewComments([comment]);
+  expect(omitIncompleteLocalReviewComment("ordinary text")).toBe("ordinary text");
+  expect(omitIncompleteLocalReviewComment(message)).toBe(message);
+  expect(omitIncompleteLocalReviewComment(message.slice(0, -30))).toBe(
+    `${first}\n\n_Expand the prompt to read more review comments._`,
+  );
 });
 
 it("preserves attached context through draft writes, updates edits and removes addressed or deleted comments", () => {
