@@ -88,6 +88,11 @@ from omnigent.native._native_supersession import (
     post_clear_supersession,
     unfiled_clear_replacement_body,
 )
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    normalize_failure_context,
+    provider_error_context_from_text,
+)
 from omnigent.process_logging import log_info_once
 from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.tool_output import cap_tool_output
@@ -342,6 +347,7 @@ _CODEX_AUTH_HTTP_STATUS_TOKEN = re.compile(r"(?<![\w-])40[13](?![\w-])")
 _CODEX_RATE_LIMIT_ERROR = re.compile(r"(?<![\w-])429(?![\w-])|too many requests|rate[ _-]limit")
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
+_CODEX_ERROR_DETAILS_LIMIT = 16384
 _CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
 _CODEX_OUTPUT_LIMIT_ERROR = "Incomplete response returned, reason: max_output_tokens"
 _CODEX_OUTPUT_LIMIT_HINT = (
@@ -1453,10 +1459,12 @@ class _CodexTerminalError:
     :param message: Human-readable error text, e.g.
         ``"401 Unauthorized: ChatGPT login expired"``.
     :param kind: Classification, either ``"auth"`` or ``"generic"``.
+    :param failure_context: Allowlisted transport and provider evidence.
     """
 
     message: str
     kind: str
+    failure_context: FailureContext = field(default_factory=dict)
 
     @property
     def is_auth(self) -> bool:
@@ -1483,24 +1491,28 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     :returns: :data:`_CODEX_ERROR_KIND_AUTH` or
         :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
+    refusal_text = message
+    details = error.get("additionalDetails")
+    if isinstance(details, str) and len(details) <= _CODEX_ERROR_DETAILS_LIMIT:
+        refusal_text += "\n" + details
     lowered = message.lower()
+    refusal_lowered = refusal_text.lower()
     if any(
-        fragment in lowered
+        fragment in refusal_lowered
         for fragment in (*_CODEX_BUDGET_EXHAUSTED_FRAGMENTS, *_CODEX_IP_ACCESS_LIST_FRAGMENTS)
-    ) or is_codex_provider_auth_failure(message):
+    ) or is_codex_provider_auth_failure(refusal_text):
         return _CODEX_ERROR_KIND_GENERIC
     info = error.get("codexErrorInfo")
     variant: str | None = None
-    http_status: object = None
+    http_status = _codex_error_http_status(info)
     if isinstance(info, str):
         variant = info
     elif isinstance(info, dict):
         variant = info.get("type") or info.get("kind") or info.get("variant")
-        http_status = info.get("httpStatusCode")
-    variant_is_auth = variant is not None and variant.lower() in _CODEX_AUTH_ERROR_INFO
+    variant_is_auth = isinstance(variant, str) and variant.lower() in _CODEX_AUTH_ERROR_INFO
     if variant_is_auth or http_status in _CODEX_AUTH_HTTP_STATUS:
         return _CODEX_ERROR_KIND_AUTH
-    if _CODEX_RATE_LIMIT_ERROR.search(lowered):
+    if http_status == 429 or _CODEX_RATE_LIMIT_ERROR.search(lowered):
         return _CODEX_ERROR_KIND_GENERIC
     if _CODEX_AUTH_HTTP_STATUS_TOKEN.search(lowered) or any(
         fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS
@@ -1525,6 +1537,38 @@ def _error_payload_message(payload: _JsonObject) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return "Codex turn ended with an unspecified error."
+
+
+def _codex_error_http_status(info: object) -> int | None:
+    """Read HTTP status from native enum variants and older flat error shapes."""
+    if isinstance(info, dict):
+        http_status = info.get("httpStatusCode")
+        if http_status is None and len(info) == 1:
+            for variant in (
+                "httpConnectionFailed",
+                "responseStreamConnectionFailed",
+                "responseStreamDisconnected",
+                "responseTooManyFailedAttempts",
+            ):
+                detail = info.get(variant)
+                if isinstance(detail, dict):
+                    http_status = detail.get("httpStatusCode")
+                    break
+        if type(http_status) is int and 100 <= http_status <= 599:
+            return http_status
+    return None
+
+
+def _codex_error_context(payload: _JsonObject, message: str) -> FailureContext:
+    """Retain typed native status and bounded provider JSON without its raw detail."""
+    context = provider_error_context_from_text(payload.get("additionalDetails"))
+    context.update(provider_error_context_from_text(message))
+    context.update(
+        normalize_failure_context(
+            {"http_status": _codex_error_http_status(payload.get("codexErrorInfo"))}
+        )
+    )
+    return context
 
 
 def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str] | None:
@@ -1618,7 +1662,11 @@ def _terminal_error_from_turn(params: _JsonObject) -> _CodexTerminalError | None
     if payload is None:
         return None
     message = _error_payload_message(payload)
-    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+    return _CodexTerminalError(
+        message=message,
+        kind=_classify_codex_error(payload, message),
+        failure_context=_codex_error_context(payload, message),
+    )
 
 
 def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalError | None:
@@ -1627,7 +1675,11 @@ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalErro
     if not isinstance(payload, dict):
         return None
     message = _error_payload_message(payload)
-    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+    return _CodexTerminalError(
+        message=message,
+        kind=_classify_codex_error(payload, message),
+        failure_context=_codex_error_context(payload, message),
+    )
 
 
 @dataclass(frozen=True)
@@ -8465,6 +8517,7 @@ async def _post_status(
     reauth_required: bool = False,
     compaction_model: str | None = None,
     selected_model: str | None = None,
+    failure_context: FailureContext | None = None,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -8483,9 +8536,13 @@ async def _post_status(
     :param compaction_model: Previous model a failed pre-turn compaction ran
         on, so the server can explain that switching models won't help.
     :param selected_model: The thread's selected model for that failure.
+    :param failure_context: Allowlisted evidence from the native error payload.
     :returns: None.
     """
     data: _JsonObject = {"status": status}
+    context = normalize_failure_context(failure_context)
+    if context:
+        data["failure_context"] = context
     if response_id is not None:
         data["response_id"] = response_id
     if output is not None:
@@ -8569,6 +8626,7 @@ async def _post_turn_status_edge(
             reauth_required=reauth_required,
             compaction_model=edge.compaction_model,
             selected_model=edge.selected_model,
+            failure_context=edge.error.failure_context if edge.error is not None else None,
         )
 
 

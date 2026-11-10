@@ -60,6 +60,67 @@ def test_classify_codex_error_auth_vs_generic() -> None:
     assert fwd._classify_codex_error({"codexErrorInfo": "Other"}, "disk full") == generic
 
 
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "httpConnectionFailed",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+    ],
+)
+@pytest.mark.parametrize(
+    ("http_status", "expected"),
+    [
+        (400, "generic"),
+        (401, "auth"),
+        (403, "auth"),
+        (429, "generic"),
+    ],
+)
+def test_native_http_error_disposition(variant: str, http_status: int, expected: str) -> None:
+    assert (
+        fwd._classify_codex_error(
+            {"codexErrorInfo": {variant: {"httpStatusCode": http_status}}},
+            "The provider rejected this request.",
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "403 Forbidden: Budget test-budget has reached its limit of $100.",
+        "403 Forbidden: Source IP address: 203.0.113.7 is blocked by Databricks IP ACL.",
+        "provider auth command `provider-helper` exited with status 1",
+    ],
+)
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "httpConnectionFailed",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+    ],
+)
+@pytest.mark.parametrize("source", ["message", "additionalDetails"])
+def test_native_http_403_retains_provider_refusal_guards(
+    message: str, variant: str, source: str
+) -> None:
+    assert (
+        fwd._classify_codex_error(
+            {
+                "codexErrorInfo": {variant: {"httpStatusCode": 403}},
+                **({"additionalDetails": message} if source == "additionalDetails" else {}),
+            },
+            message if source == "message" else "The provider rejected this request.",
+        )
+        == fwd._CODEX_ERROR_KIND_GENERIC
+    )
+
+
 def test_classify_codex_error_budget_exhausted_not_auth() -> None:
     """AI-gateway budget exhaustion (HTTP 403) must not classify as auth.
 
@@ -278,6 +339,137 @@ async def test_handle_event_surfaces_non_retrying_error_notification(tmp_path: P
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["notification", "turn", "item", "resume"])
+async def test_native_provider_fields_survive_status_delivery(tmp_path: Path, source: str) -> None:
+    """Typed transport and provider evidence survives every native error source."""
+    client = _RecordingClient()
+    _seed_active_turn(tmp_path, "turn_123")
+    error = {
+        "message": "The provider rejected this request.",
+        "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 400}},
+        "additionalDetails": json.dumps(
+            {
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "array_above_max_length",
+                    "param": "input[3].content",
+                    "message": "private provider detail",
+                },
+                "request_id": "inference-request",
+                "status_code": 502,
+                "origin": "forged",
+                "api_key": "synthetic-secret",
+            }
+        ),
+    }
+    turn = {"id": "turn_123", "status": "failed", "error": error}
+    if source == "item":
+        turn = {"id": "turn_123", "status": "failed", "items": [{"type": "error", **error}]}
+    if source == "resume":
+        edge = fwd._resume_turn_status_edge_for_latest_turn(tmp_path, "thread_123", [turn])
+        await fwd._post_turn_status_edge(client, "conv_x", edge)
+    else:
+        params = {"threadId": "thread_123", "turn": turn}
+        method = "turn/completed"
+        if source == "notification":
+            method = "error"
+            params = {
+                "threadId": "thread_123",
+                "turnId": "turn_123",
+                "willRetry": False,
+                "error": error,
+            }
+        await _deliver_to_parent(
+            client, tmp_path, fwd._CodexForwarderState(), {"method": method, "params": params}
+        )
+    assert len(client.posts) == 1
+    data = client.posts[0][1]["data"]
+    assert data["status"] == "failed"
+    assert data["response_id"] == "codex_turn_123"
+    assert data["output"] == error["message"]
+    assert "reauth_required" not in data
+    assert data["failure_context"] == {
+        "http_status": 400,
+        "provider_error_type": "invalid_request_error",
+        "provider_error_code": "array_above_max_length",
+        "provider_error_param": "input[3].content",
+        "native_error_request_id": "inference-request",
+        "inference_detail_source": "provider_error_json",
+    }
+
+
+@pytest.mark.parametrize(
+    ("details", "http_status"),
+    [
+        (None, True),
+        ("private unstructured detail", "400"),
+        ({"error": {"code": "bad"}}, 99),
+        (json.dumps({"error": {"code": "oversized"}, "padding": "x" * 17000}), 600),
+    ],
+    ids=["missing-bool", "prose-string", "object-low", "oversized-high"],
+)
+def test_unusable_native_provider_fields_are_not_forwarded(
+    details: object, http_status: object
+) -> None:
+    error = fwd._terminal_error_from_notification(
+        {
+            "error": {
+                "message": "The provider rejected this request.",
+                "codexErrorInfo": {"httpStatusCode": http_status},
+                "additionalDetails": details,
+            }
+        }
+    )
+    assert error is not None
+    assert error.failure_context == {}
+
+
+def test_native_provider_fields_use_wire_precedence_and_redaction() -> None:
+    error = fwd._terminal_error_from_notification(
+        {
+            "error": {
+                "message": json.dumps(
+                    {"error": {"code": "wire-code", "param": 'password="synthetic secret"'}}
+                ),
+                "additionalDetails": json.dumps(
+                    {"error": {"code": "detail-code", "param": "stale-param"}}
+                ),
+            }
+        }
+    )
+    assert error is not None
+    assert error.failure_context["provider_error_code"] == "wire-code"
+    assert error.failure_context["provider_error_param"] == 'password="[REDACTED]"'
+
+
+@pytest.mark.parametrize(
+    ("info", "expected"),
+    [
+        ({"httpStatusCode": 400}, {"http_status": 400}),
+        *[
+            ({variant: {"httpStatusCode": 400}}, {"http_status": 400})
+            for variant in (
+                "httpConnectionFailed",
+                "responseStreamConnectionFailed",
+                "responseStreamDisconnected",
+                "responseTooManyFailedAttempts",
+            )
+        ],
+        ({"unknownVariant": {"httpStatusCode": 400}}, {}),
+        ({"httpConnectionFailed": {"httpStatusCode": True}}, {}),
+        ({"httpConnectionFailed": "400"}, {}),
+        ({"httpConnectionFailed": {"httpStatusCode": 400}, "other": {}}, {}),
+    ],
+)
+def test_native_http_status_uses_known_protocol_shapes(info: object, expected: dict) -> None:
+    error = fwd._terminal_error_from_notification(
+        {"error": {"message": "The provider rejected this request.", "codexErrorInfo": info}}
+    )
+    assert error is not None
+    assert error.failure_context == expected
 
 
 @pytest.mark.asyncio
