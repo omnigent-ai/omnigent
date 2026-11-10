@@ -13,10 +13,12 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+import omnigent.harnesses.claude_native.bridge as bridge
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     BtwOverlay,
     ClaudeTranscriptItem,
+    write_tmux_target,
 )
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 from tests.harnesses.claude_native.forwarder._support import (
@@ -1013,6 +1015,64 @@ async def test_forward_pane_signals_captures_once_and_relays_both(
     assert types.count("external_permission_mode_change") == 1
     assert types.count("external_btw_sidechat") == 1
     assert dedupe.posted_permission_mode == "auto"
+
+
+@pytest.mark.asyncio
+async def test_forward_pane_signals_relays_a_repeated_btw_after_the_overlay_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Asking the same /btw again after closing the overlay relays it again.
+
+    Claude Code keeps /btw history, so the second ask lists the first above it
+    and settles on the same question and answer.
+    """
+    scrollback = [f"scrollback line {n}" for n in range(30)]
+    border, question, answer = "▔" * 80, "    /btw hello", "      Hi! How can I help?"
+    first_ask = "\n".join(
+        [
+            *scrollback,
+            border,
+            question,
+            "",
+            answer,
+            "",
+            "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        ]
+    )
+    closed = "\n".join([*scrollback, "─" * 80, "❯ ", "─" * 80, "  ? for shortcuts"])
+    second_ask = "\n".join(
+        [
+            *scrollback,
+            border,
+            question,
+            question,
+            "",
+            answer,
+            "",
+            "    ⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close",
+        ]
+    )
+    frames = [first_ask, first_ask, first_ask, closed, second_ask, second_ask, second_ask]
+    write_tmux_target(tmp_path, socket_path=tmp_path / "tmux.sock", tmux_target="claude:0.0")
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_args: frames.pop(0))
+    monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        while frames:
+            await forwarder._forward_pane_signals(
+                client,
+                session_id="conv1",
+                bridge_dir=tmp_path,
+                dedupe=dedupe,
+            )
+
+    relayed = [c["data"] for c in calls if c["type"] == "external_btw_sidechat"]
+    exchange = {"question": "/btw hello", "answer": "Hi! How can I help?", "truncated": False}
+    assert relayed == [exchange, exchange]
 
 
 @pytest.mark.asyncio

@@ -170,9 +170,9 @@ _UNSUPPORTED_PERMISSION_MODE_STATUSES = frozenset({400, 422})
 # Pause before offering a rejected mode again, so a server upgraded under a
 # live runner picks the observation up without a footer change.
 _REJECTED_PERMISSION_MODE_RETRY_S = 300.0
-# Bound on the per-session ring of already-relayed /btw exchange keys. The
-# overlay persists (and stacks history) across polls, so a handful of keys
-# covers a session's side chats while keeping the dedupe set small.
+# Bound on the ring of /btw exchange keys relayed during one overlay display.
+# The overlay persists (and stacks history) across polls, so a handful of keys
+# covers its side chats while keeping the dedupe set small.
 _MAX_SEEN_BTW_KEYS = 64
 # Hard ceiling on one live-output poll. Child-history batches run in their own
 # task, so elapsed time here means the latency-sensitive lane stopped making
@@ -951,10 +951,11 @@ class _ForwardDedupeState:
     # /btw side-chat relay. The overlay is never persisted (transcript,
     # deltas and hooks are all empty for it), so it is scraped read-only from
     # the shared pane capture. ``posted_btw_keys`` rings the (question, answer)
-    # hashes already relayed so the persistent, history-stacking overlay isn't
-    # re-posted every poll. ``btw_pending_key`` requires the same exchange on
-    # two consecutive reads before posting, so a torn capture can't relay a
-    # partial answer.
+    # hashes relayed during the current overlay display so the persistent,
+    # history-stacking overlay isn't re-posted every poll; it empties once the
+    # overlay closes or answers anew. ``btw_pending_key`` requires the same
+    # exchange on two consecutive reads before posting, so a torn capture
+    # can't relay a partial answer.
     btw_pending_key: str | None = None
     posted_btw_keys: dict[str, None] = field(default_factory=dict)
     # Session already logged as moved off this runner, so the notice is not
@@ -6210,7 +6211,11 @@ async def _forward_pane_signals(
         client, session_id=session_id, mode=signals.permission_mode, dedupe=dedupe
     )
     await _relay_btw_overlay(
-        client, session_id=session_id, overlay=signals.btw_overlay, dedupe=dedupe
+        client,
+        session_id=session_id,
+        overlay=signals.btw_overlay,
+        dedupe=dedupe,
+        display_ended=signals.btw_display_ended,
     )
 
 
@@ -6300,6 +6305,7 @@ async def _relay_btw_overlay(
     session_id: str,
     overlay: BtwOverlay | None,
     dedupe: _ForwardDedupeState,
+    display_ended: bool = False,
 ) -> None:
     """
     Mirror a completed Claude Code ``/btw`` side-chat into the web view.
@@ -6316,15 +6322,19 @@ async def _relay_btw_overlay(
     Best-effort: a long answer the pane clipped is relayed with the
     ``truncated`` flag set (the overlay points at the terminal for the full
     text — read-only capture cannot page the overlay). Deduped so the
-    persistent, history-stacking overlay posts each distinct exchange once;
-    a failed POST simply retries next poll.
+    persistent, history-stacking overlay posts each distinct exchange once
+    per display; a failed POST simply retries next poll.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param overlay: The settled ``/btw`` overlay parsed from the pane, or
         ``None`` when none is shown.
     :param dedupe: Shared per-session dedupe state; mutated in place.
+    :param display_ended: True when the pane showed the overlay closed or
+        answering anew, so a repeated question and answer is relayed again.
     """
+    if display_ended:
+        dedupe.posted_btw_keys.clear()
     if overlay is None:
         dedupe.btw_pending_key = None
         return

@@ -5682,10 +5682,14 @@ class PaneSignals:
         ``"auto"``, or ``None`` when no mode footer is visible.
     :param btw_overlay: A settled ``/btw`` side-chat overlay, or ``None``
         when none is shown / it is still generating.
+    :param btw_display_ended: True when a readable capture shows the ``/btw``
+        overlay closed or generating a new answer, so the next settled
+        exchange is a new one even if its text repeats an earlier answer.
     """
 
     permission_mode: str | None = None
     btw_overlay: BtwOverlay | None = None
+    btw_display_ended: bool = False
 
 
 def _btw_overlay_parts(pane: str) -> tuple[list[str], str] | None:
@@ -5797,6 +5801,26 @@ def _btw_overlay_present(pane: str) -> bool:
         return True
     if any(hint in footer for hint in _BTW_FOOTER_HISTORY_HINTS):
         return True
+    return any(_BTW_ANSWERING_HINT in line for line in region)
+
+
+def _btw_display_ended(pane: str) -> bool:
+    """
+    Report whether a captured pane ends the previous ``/btw`` display.
+
+    True when the overlay is closed or answering a new question. History
+    browsing and the copy indicator keep the overlay up, so they do not end
+    it. An empty capture (tmux failed) is unknown and returns False.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: True when a later settled exchange is a new display.
+    """
+    if not pane.strip():
+        return False
+    parts = _btw_overlay_parts(pane)
+    if parts is None:
+        return True
+    region, _footer = parts
     return any(_BTW_ANSWERING_HINT in line for line in region)
 
 
@@ -9782,6 +9806,7 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
     return PaneSignals(
         permission_mode=_permission_mode_from_pane(pane),
         btw_overlay=_btw_overlay_from_pane(pane),
+        btw_display_ended=_btw_display_ended(pane),
     )
 
 

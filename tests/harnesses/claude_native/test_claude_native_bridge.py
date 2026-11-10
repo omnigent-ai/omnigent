@@ -16812,6 +16812,61 @@ def test_btw_overlay_present_false_on_bare_composer(quoted_overlay: str) -> None
     assert claude_native_bridge._btw_overlay_from_pane(pane) is None
 
 
+@pytest.mark.parametrize(
+    ("pane", "ended"),
+    [
+        pytest.param(_composer_pane(), True, id="closed"),
+        pytest.param(
+            _btw_pane("    /btw q", "", "      ✻ Answering…", "", "    Esc to close"),
+            True,
+            id="answering-first",
+        ),
+        pytest.param(
+            _btw_pane(
+                "    /btw q",
+                "    /btw q",
+                "",
+                "      ✻ Answering…",
+                "",
+                "    ⇧←/→ to browse · x to clear history · Esc to close",
+            ),
+            True,
+            id="answering-with-history",
+        ),
+        pytest.param(
+            _btw_pane("    /btw q", "", "      A", "", _BTW_COMPLETE_FOOTER), False, id="settled"
+        ),
+        pytest.param(
+            _btw_pane(
+                "    /btw q1",
+                "    /btw q2",
+                "",
+                "      A1",
+                "",
+                "    ⇧←/→ to browse · c to copy · x to clear history · Esc to close",
+            ),
+            False,
+            id="browsing-history",
+        ),
+        pytest.param(
+            _btw_pane(
+                "    /btw q",
+                "",
+                "      A",
+                "",
+                "    ↑/↓ to scroll · Copied to clipboard · f to fork · Esc to close",
+            ),
+            False,
+            id="copied",
+        ),
+        pytest.param("", False, id="failed-capture"),
+    ],
+)
+def test_btw_display_ended_only_when_overlay_closes_or_answers(pane: str, ended: bool) -> None:
+    """A repeated /btw is new only after the pane shows the overlay close or answer anew."""
+    assert claude_native_bridge._btw_display_ended(pane) is ended
+
+
 def test_dismiss_btw_overlay_closes_a_wrapped_panel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
