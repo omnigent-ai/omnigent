@@ -2895,17 +2895,20 @@ function ConversationList({
   const activeProjectName = useMemo(() => {
     if (!displayedActiveId) return null;
     const active = allConversations.find((c) => c.id === displayedActiveId);
+    if (!active) {
+      // A row loaded only by its folder's own query resolves to that folder.
+      for (const [name, folder] of folderConversations) {
+        if (folder.conversations.some((c) => c.id === displayedActiveId)) return name;
+      }
+      return null;
+    }
     // Live views list an archived session outside its folder.
-    if (!active || (active.archived === true && activeTab !== "archived")) return null;
+    if (active.archived === true && activeTab !== "archived") return null;
     return projects.find((p) => sessionBelongsToProject(active, p, viewerId))?.name ?? null;
-  }, [displayedActiveId, allConversations, activeTab, projects, viewerId]);
-  // Auto-expand the project folder holding the selected session, so navigating
-  // to a filed session reveals it instead of leaving it hidden in a collapsed
-  // folder. Skipped for pinned sessions: they're already reachable from the
-  // Pinned section, so forcing their project open would undo a manual collapse
-  // every time the user clicks the pinned row. Fires once per selected session
-  // and project, from the row click, so a later pin update or route commit can't
-  // re-open a folder the user collapsed afterward.
+  }, [displayedActiveId, allConversations, folderConversations, activeTab, projects, viewerId]);
+  // Reveal the selected session's folder once per session and project, so a later
+  // pin or route update can't re-open a folder the user collapsed. Pinned sessions
+  // are skipped: the Pinned section already shows them.
   const autoExpanded = useRef<{ id: string | null; project: string | null }>({
     id: null,
     project: null,
@@ -2916,8 +2919,8 @@ function ConversationList({
     }
     if (!displayedActiveId || !activeProjectName) return;
     if (autoExpanded.current.project === activeProjectName) return;
-    autoExpanded.current.project = activeProjectName;
     if (pinnedSet.has(displayedActiveId)) return;
+    autoExpanded.current.project = activeProjectName;
     expandProject(activeProjectName);
   }, [displayedActiveId, activeProjectName, pinnedSet, expandProject]);
   // A folder's rows in render order: those above "Show more" while expanded,

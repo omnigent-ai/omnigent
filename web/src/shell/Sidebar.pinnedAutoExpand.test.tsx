@@ -145,6 +145,28 @@ describe("sidebar auto-expand vs. pinned sessions (#2506)", () => {
       ["Repro 2506"],
     );
   });
+
+  it("expands the open session's project once after it's unpinned", () => {
+    pinnedRef.current = [conv("pinned_a", "Repro 2506")];
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([]));
+    mockConversations([conv("pinned_a", "Repro 2506"), conv("sibling_b", "Repro 2506")]);
+    const { rerenderSidebar } = renderAt("/c/pinned_a");
+    expect(expandedProjects()).toEqual([]);
+
+    pinnedRef.current = [];
+    act(() => rerenderSidebar());
+    const header = screen.getByRole("button", { name: "Repro 2506" });
+    expect(header).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(header);
+    pinnedRef.current = [conv("pinned_x")];
+    act(() => rerenderSidebar());
+    expect(screen.getByRole("button", { name: "Repro 2506" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(expandedProjects()).toEqual([]);
+  });
 });
 
 describe("collapsing the project that holds the open session", () => {
@@ -207,5 +229,23 @@ describe("collapsing the project that holds the open session", () => {
     );
     fireEvent.click(screen.getByRole("link", { name: /pinned_x/ }));
     expect(screen.queryByRole("link", { name: /sibling_b/ })).not.toBeInTheDocument();
+  });
+
+  it("stays collapsed when a session only its folder had loaded joins the list", () => {
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Repro 2506"]));
+    mockConversations([conv("chat_c")]);
+    const { rerenderSidebar } = renderAt("/");
+
+    fireEvent.click(screen.getByRole("link", { name: /sibling_b/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Repro 2506" }));
+    mockConversations([conv("chat_c"), conv("sibling_b", "Repro 2506")]);
+    act(() => rerenderSidebar());
+
+    expect(screen.getByRole("button", { name: "Repro 2506" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(expandedProjects()).toEqual([]);
+    expect(screen.getAllByRole("link", { name: /sibling_b/ })).toHaveLength(1);
   });
 });
