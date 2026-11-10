@@ -6373,7 +6373,13 @@ async def test_recreated_sandbox_records_and_publishes_workspace_reset_notice(
             assert session_id == "conv_1"
             assert host_id == "host_1"
             assert workspace == "/root/workspace/omnigent"
-            return SimpleNamespace(id=session_id, host_id=host_id, workspace=workspace)
+            return SimpleNamespace(
+                id=session_id,
+                host_id=host_id,
+                workspace=workspace,
+                labels={},
+                terminal_launch_args=None,
+            )
 
         def append(self, session_id: str, items: list[object]) -> list[object]:
             assert session_id == "conv_1"
