@@ -3872,12 +3872,10 @@ function ComposerImpl(
     else restoreFiles(loadedFiles);
     textareaRef.current?.focus();
   };
-  // Reply quotes and edited messages may only land in a composer that can send.
-  const acceptsInsertedContent = () =>
-    !(disabled || isReadOnly || (unreachable && !sendReconnectsArca) || composerLockedByBtw);
   const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
     target: conversationId,
-    canAccept: acceptsInsertedContent,
+    // An edited message may land wherever the user could type it.
+    canAccept: () => !inputDisabled,
     hasDraft: () => hasDraft,
     applyDraft: (edited) => {
       setCommandError(null);
@@ -3897,7 +3895,8 @@ function ComposerImpl(
       textareaRef.current?.focus({ preventScroll: true });
     },
     appendReplyQuote(text) {
-      if (!acceptsInsertedContent() || !text.trim()) return;
+      const blocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
+      if (blocked || composerLockedByBtw || !text.trim()) return;
       appendQuote(text);
       textareaRef.current = tailTextareaRef.current;
       dirtyRef.current = true;
