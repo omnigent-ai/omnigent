@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from omnigent.native._native_post_delivery import (
     RepostResult,
     _dead_letter_record_replayable,
     append_dead_letter,
+    has_replayable_dead_letters,
     post_external_session_status,
     post_may_have_been_delivered,
     replay_dead_letters,
@@ -358,7 +360,10 @@ async def test_replay_skips_ambiguous_and_permanent_4xx(tmp_path: Path) -> None:
     assert [record["payload"]["n"] for record in retained] == [0, 1]
 
 
-async def test_replay_success_removes_and_failure_retains(tmp_path: Path) -> None:
+@pytest.mark.parametrize("concurrent_append", ["none", "append", "rotate", "cancel"])
+async def test_replay_success_removes_and_failure_retains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, concurrent_append: str
+) -> None:
     """
     A delivered record is removed; one that still fails is retained (#1579).
 
@@ -372,20 +377,155 @@ async def test_replay_success_removes_and_failure_retains(tmp_path: Path) -> Non
 
     async def repost(record: dict[str, object]) -> RepostResult:
         if record["payload"]["n"] == 0:  # type: ignore[index]
+            if concurrent_append in {"append", "rotate"}:
+                if concurrent_append == "rotate":
+                    monkeypatch.setattr(
+                        "omnigent.native._native_post_delivery._DEAD_LETTER_MAX_BYTES", 1
+                    )
+                append_dead_letter(
+                    tmp_path,
+                    session_id="conv_abc123",
+                    event_type="external_conversation_item",
+                    payload={"n": 2},
+                    reason="another failed mirror",
+                )
             return RepostResult(delivered=True)
+        if concurrent_append == "cancel":
+            raise asyncio.CancelledError
         # Still proven-undelivered (transport failed again).
         return RepostResult(delivered=False, http_status=None)
 
-    replayed = await replay_dead_letters(
-        tmp_path, repost=repost, retryable_status_codes=_RETRYABLE
-    )
+    if concurrent_append == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await replay_dead_letters(tmp_path, repost=repost, retryable_status_codes=_RETRYABLE)
+    else:
+        replayed = await replay_dead_letters(
+            tmp_path, repost=repost, retryable_status_codes=_RETRYABLE
+        )
+        assert replayed == 1
 
-    assert replayed == 1
-    retained = _read_records(current)
-    assert [record["payload"]["n"] for record in retained] == [1]
+    backup = tmp_path / _DEAD_LETTER_BACKUP_FILE
+    retained = (_read_records(backup) if backup.exists() else []) + _read_records(current)
+    assert [record["payload"]["n"] for record in retained] == (
+        [1, 2] if concurrent_append in {"append", "rotate"} else [1]
+    )
     # The retained record stays proven-undelivered (replayable on a later run).
     assert retained[0]["delivered_ambiguous"] is False
     assert retained[0]["http_status"] is None
+    if concurrent_append == "cancel":
+        retried: list[int] = []
+
+        async def recovered(record: dict[str, object]) -> RepostResult:
+            retried.append(record["payload"]["n"])  # type: ignore[index]
+            return RepostResult(delivered=True)
+
+        await replay_dead_letters(tmp_path, repost=recovered, retryable_status_codes=_RETRYABLE)
+        assert retried == [1]
+
+
+async def test_replay_filter_preserves_other_conversations_and_legacy_records(
+    tmp_path: Path,
+) -> None:
+    """Live recovery can select one owner's idempotent mirrors without draining other data."""
+    current = tmp_path / _DEAD_LETTER_FILE
+    records = [
+        _dead_letter_record(payload={"n": 0, "source_id": "native:0"}),
+        _dead_letter_record(payload={"n": 1}),
+        _dead_letter_record(session_id="conv_other", payload={"n": 2, "source_id": "native:2"}),
+    ]
+    _write_records(current, records)
+
+    def selected(record: dict[str, object]) -> bool:
+        payload = record["payload"]
+        return (
+            record["session_id"] == "conv_abc123"
+            and isinstance(payload, dict)
+            and isinstance(payload.get("source_id"), str)
+        )
+
+    seen: list[object] = []
+
+    async def repost(record: dict[str, object]) -> RepostResult:
+        seen.append(record["payload"])
+        return RepostResult(delivered=True)
+
+    assert has_replayable_dead_letters(
+        tmp_path, retryable_status_codes=_RETRYABLE, record_filter=selected
+    )
+    assert (
+        await replay_dead_letters(
+            tmp_path, repost=repost, retryable_status_codes=_RETRYABLE, record_filter=selected
+        )
+        == 1
+    )
+    assert seen == [{"n": 0, "source_id": "native:0"}]
+    assert _read_records(current) == records[1:]
+    assert not has_replayable_dead_letters(
+        tmp_path, retryable_status_codes=_RETRYABLE, record_filter=selected
+    )
+    assert has_replayable_dead_letters(tmp_path, retryable_status_codes=_RETRYABLE)
+
+
+async def test_concurrent_drains_do_not_repeat_a_legacy_post(tmp_path: Path) -> None:
+    """Concurrent recoveries serialize even when the retained item lacks server deduplication."""
+    current = tmp_path / _DEAD_LETTER_FILE
+    _write_records(current, [_dead_letter_record(payload={"n": 0})])
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    seen: list[object] = []
+
+    async def repost(record: dict[str, object]) -> RepostResult:
+        seen.append(record["payload"])
+        entered.set()
+        await release.wait()
+        return RepostResult(delivered=True)
+
+    first = asyncio.create_task(
+        replay_dead_letters(tmp_path, repost=repost, retryable_status_codes=_RETRYABLE)
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    second = asyncio.create_task(
+        replay_dead_letters(tmp_path, repost=repost, retryable_status_codes=_RETRYABLE)
+    )
+    asyncio.get_running_loop().call_soon(release.set)
+    try:
+        results = await asyncio.wait_for(asyncio.gather(first, second), timeout=2)
+    finally:
+        release.set()
+        first.cancel()
+        second.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+
+    assert results == [1, 0]
+    assert seen == [{"n": 0}]
+    assert not current.exists()
+
+
+@pytest.mark.parametrize("partial", [b'{"unfinished":', b'{"unfinished":"\xff'])
+async def test_append_after_truncated_record_preserves_the_next_mirror(
+    tmp_path: Path, partial: bytes
+) -> None:
+    """A process dying during a journal write cannot corrupt the next complete record."""
+    current = tmp_path / _DEAD_LETTER_FILE
+    current.write_bytes(partial)
+    append_dead_letter(
+        tmp_path,
+        session_id="conv_abc123",
+        event_type="external_conversation_item",
+        payload={"source_id": "native:next"},
+        reason="post failed",
+    )
+    seen: list[object] = []
+
+    async def repost(record: dict[str, object]) -> RepostResult:
+        seen.append(record["payload"])
+        return RepostResult(delivered=True)
+
+    assert (
+        await replay_dead_letters(tmp_path, repost=repost, retryable_status_codes=_RETRYABLE) == 1
+    )
+    assert seen == [{"source_id": "native:next"}]
+    assert current.read_bytes() == partial + b"\n"
 
 
 async def test_replay_reclassifies_record_that_now_fails_ambiguously(tmp_path: Path) -> None:
