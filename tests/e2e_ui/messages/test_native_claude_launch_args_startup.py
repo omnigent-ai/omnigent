@@ -27,7 +27,6 @@ from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
 from tests._helpers.session import bind_session_runner
 from tests.e2e_ui.conftest import (
-    _create_native_claude_session,
     _ensure_runner_online,
     _server_state,
 )
@@ -94,55 +93,35 @@ def _await_startup(base_url: str, session_id: str) -> tuple[str, str, list[str]]
     return "timeout", status, trail
 
 
-def test_stored_print_arg_does_not_prevent_terminal_startup(
-    live_server: str,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> None:
-    respawned = _ensure_runner_online(live_server, tmp_path_factory)
-    runner_id = str(_server_state["runner_id"])
-    session_id: str | None = None
-    try:
-        session_id = _create_native_claude_session(
-            live_server, runner_id, terminal_launch_args=["--print"]
-        )
-        outcome, status, trail = _await_startup(live_server, session_id)
-        assert outcome == "up", (
-            "claude-native session with a stored --print arg could not start its "
-            f"terminal; last status={status}, trail={trail}"
-        )
-        _assert_skipped_args_notice(live_server, session_id)
-    finally:
-        if session_id is not None:
-            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        terminate_process(respawned)
-
-
-def test_stored_missing_mcp_config_does_not_prevent_terminal_startup(
+@pytest.mark.parametrize("trigger", ["print", "missing-mcp-config"])
+def test_stored_launch_arg_claude_cannot_start_with_does_not_prevent_startup(
     live_server: str,
     tmp_path: Path,
     tmp_path_factory: pytest.TempPathFactory,
+    trigger: str,
 ) -> None:
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
-    # The file exists when the args are stored, then is deleted before the
-    # launch replays them.
+    # A config file that exists when the args are stored and is deleted before
+    # the launch replays them, as on a fork onto a host without it.
     config = tmp_path / "servers.json"
     config.write_text('{"mcpServers":{}}\n', encoding="utf-8")
+    stored_args = ["--print"] if trigger == "print" else ["--mcp-config", str(config)]
     session_id: str | None = None
     try:
         created = create_native_session(
             httpx,
             live_server,
             harness="claude",
-            metadata={"terminal_launch_args": ["--mcp-config", str(config)]},
+            metadata={"terminal_launch_args": stored_args},
         )
         session_id = str(created["session_id"])
         config.unlink()
         bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
         outcome, status, trail = _await_startup(live_server, session_id)
         assert outcome == "up", (
-            "claude-native session whose stored --mcp-config file was deleted "
-            f"could not start its terminal; last status={status}, trail={trail}"
+            f"claude-native session with stored {stored_args} could not start its "
+            f"terminal; last status={status}, trail={trail}"
         )
         _assert_skipped_args_notice(live_server, session_id)
     finally:

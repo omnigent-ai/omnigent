@@ -5152,7 +5152,10 @@ async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failin
         assert pm.released == []
         # Later launches on this runner leave the stored args out, and the
         # replacement's own startup exit fails the session.
-        assert resource_registry.claude_launch_args(conv_id, stored_args) == ([], True)
+        assert resource_registry.claude_launch_args(conv_id, stored_args) == (
+            ["--permission-mode", "default"],
+            True,
+        )
         publish_exit(startup_exit())
         await wait_for(lambda: bool(pm.released))
     finally:

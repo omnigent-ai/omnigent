@@ -38,7 +38,11 @@ def test_recovery_drops_a_restriction_and_the_bypass_beside_it() -> None:
     registry = SessionResourceRegistry()
     stored = ["--disallowedTools", "Bash", *_MISSING_CONFIG, "--dangerously-skip-permissions"]
     _recovered(registry, stored)
-    assert registry.claude_launch_args(_SESSION, stored) == ([], True)
+    # ``default`` is explicit: an absent selector would let a settings default apply.
+    assert registry.claude_launch_args(_SESSION, stored) == (
+        ["--permission-mode", "default"],
+        True,
+    )
     # The relaunch's own startup exit is a real failure, not another retry.
     assert registry.skip_claude_saved_args_after_startup_exit(_SESSION) is False
 
@@ -60,12 +64,22 @@ def test_recovery_keeps_only_a_mode_that_always_asks(mode: str, kept: bool) -> N
     registry = SessionResourceRegistry()
     stored = [*_MISSING_CONFIG, "--permission-mode", mode]
     _recovered(registry, stored)
-    expected = ["--permission-mode", mode] if kept else []
+    expected = ["--permission-mode", mode if kept else "default"]
     assert registry.claude_launch_args(_SESSION, stored) == (expected, True)
     assert registry.claude_launch_args(
         _SESSION, [*_MISSING_CONFIG, f"--permission-mode={mode}"]
     ) == (
         expected,
+        True,
+    )
+
+
+def test_recovery_without_a_stored_mode_selects_default() -> None:
+    """No stored selector still yields an explicit ``default``, not Claude's settings default."""
+    registry = SessionResourceRegistry()
+    _recovered(registry, _MISSING_CONFIG)
+    assert registry.claude_launch_args(_SESSION, _MISSING_CONFIG) == (
+        ["--permission-mode", "default"],
         True,
     )
 

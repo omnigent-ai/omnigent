@@ -1041,11 +1041,11 @@ class SessionResourceRegistry:
         Choose the stored args a Claude launch replays.
 
         Stored args that made Claude exit during startup on this runner are left
-        out, so the launch starts like a new session. The session's current
-        permission mode stays when it is one that always asks before a tool
-        runs; any other mode is reset too, so a mode that approves calls itself
-        is never kept while a stored restriction is left out. A different set
-        of stored args is tried again.
+        out. The session's current permission mode stays when it is one that
+        always asks before a tool runs; otherwise the launch selects
+        ``default`` explicitly, since leaving the selector out would let a
+        settings default that approves calls itself apply while a stored
+        restriction is left out. A different set of stored args is tried again.
 
         :param session_id: Session/conversation identifier.
         :param stored_args: The session's stored launch args, e.g.
@@ -1069,10 +1069,9 @@ class SessionResourceRegistry:
             if failed is not None and failed.other_args == other:
                 self._claude_saved_args_launches.pop(session_id, None)
                 mode = claude_permission_mode(permission)
-                kept = (
-                    ["--permission-mode", mode] if mode in CLAUDE_PERMISSION_MODES_THAT_ASK else []
-                )
-                return kept, True
+                if mode not in CLAUDE_PERMISSION_MODES_THAT_ASK:
+                    mode = "default"
+                return ["--permission-mode", mode], True
             self._claude_saved_args_skipped.pop(session_id, None)
             self._claude_saved_args_launches[session_id] = other
             return list(stored_args), False

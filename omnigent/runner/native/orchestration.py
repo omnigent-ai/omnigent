@@ -3206,9 +3206,10 @@ CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_CODE = "claude_native_saved_launch_args_skipped
 # "--- private ---"``), and the notice is part of the shared transcript.
 CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_NOTICE = (
     "Claude Code exited while starting with this session's saved launch options, so "
-    "Omnigent started it without them, like a new session. They usually come from the "
-    "tool that created the session and may only work on that machine. A permission "
-    "mode that approves actions on its own was reset; pick it again if you need it."
+    "Omnigent started it without them. They usually come from the tool that created "
+    "the session and may only work on that machine. A permission mode that approves "
+    "actions on its own was switched to the default (ask) mode, and will be again if "
+    "Claude restarts on this host while those options are saved."
 )
 
 

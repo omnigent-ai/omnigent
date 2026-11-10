@@ -6852,8 +6852,9 @@ async def test_auto_create_claude_terminal_launches_without_stored_args_after_st
     second_args = await launch()
     # The relaunch's own startup exit is a real failure, not another retry.
     assert registry.skip_claude_saved_args_after_startup_exit(session_id) is False
-    for stored in (missing_config, "--- PRIVATE_SENTINEL ---", "bypassPermissions"):
+    for stored in (missing_config, "--- PRIVATE_SENTINEL ---", "bypassPermissions", "Bash"):
         assert stored not in second_args
+    assert second_args[second_args.index("--permission-mode") + 1] == "default"
     assert len(server_client.posted_events) == 1
     notice = server_client.posted_events[0]["data"]["item_data"]
     assert notice["code"] == "claude_native_saved_launch_args_skipped"
@@ -6928,4 +6929,5 @@ async def test_launch_claude_retries_once_when_the_pane_dies_inside_the_launch(
         with pytest.raises(TerminalExitedDuringLaunch):
             await orchestration._launch_claude(ctx)
 
-    assert attempts == ([stored_args, []] if stored_args else [[]])
+    recovered = ["--permission-mode", "default"]
+    assert attempts == ([stored_args, recovered] if stored_args else [[]])
