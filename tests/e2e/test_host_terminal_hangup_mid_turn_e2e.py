@@ -32,6 +32,7 @@ from omnigent.inner import _proc
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests._helpers.live_server import isolated_local_server, isolated_process_env
+from tests._helpers.mock_llm import advertised_tool_names
 from tests._helpers.native_session import create_native_session
 from tests._helpers.session import (
     bind_session_runner,
@@ -182,7 +183,9 @@ def _pgid_or_none(pid: int | None) -> int | None:
         return None
 
 
-def _pid_running(pid: int) -> bool:
+def _pid_running(pid: int, expected_create_time: float | None = None) -> bool:
+    if expected_create_time is not None and _proc.process_create_time(pid) != expected_create_time:
+        return False
     try:
         state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
     except (OSError, IndexError):
@@ -224,7 +227,14 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
     queue = f"hangup-turn-{uuid.uuid4().hex[:8]}"
     model = {"claude-native": "claude-opus-4-8", "codex-native": "gpt-5.4"}.get(harness, queue)
     prompt = f"Hangup probe {queue}: reply with exactly {_REPLY}."
-    configure_mock_llm(mock_url, [{"text": _REPLY, "block": True}], key=queue, match=prompt)
+    required_tools = ["Bash"] if harness == "claude-native" else []
+    configure_mock_llm(
+        mock_url,
+        [{"text": _REPLY, "block": True}],
+        key=queue,
+        match=prompt,
+        required_tools=required_tools or None,
+    )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     providers = {}
@@ -446,6 +456,7 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
                     request
                     for request in get_mock_requests(mock_url)
                     if prompt in json.dumps(request)
+                    and set(required_tools) <= advertised_tool_names([request])
                 ]
 
             assert reached_model, (
@@ -478,7 +489,9 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
                 )
                 assert len(probe_requests()) == 1
                 if native_pid is not None:
-                    assert _wait_until(lambda: not _pid_running(native_pid), 15.0), (
+                    assert _wait_until(
+                        lambda: not _pid_running(native_pid, native_create_time), 15.0
+                    ), (
                         f"native pane {native_pid} survived explicit {exit_action}\n"
                         f"{terminal.log_path.read_text(errors='replace')[-12000:]}"
                     )
@@ -493,7 +506,9 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
                 f"within 2s of the SIGHUP (host exit {host_exit})"
             )
             if native_pid is not None:
-                assert _pid_running(native_pid), "native process exited during an active turn"
+                assert _pid_running(native_pid, native_create_time), (
+                    "native process exited during an active turn"
+                )
             release_mock_gate(mock_url)
             print(
                 f"gate released {time.monotonic() - hangup_at:.2f}s after hangup; "
