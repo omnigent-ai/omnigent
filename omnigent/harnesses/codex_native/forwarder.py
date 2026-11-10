@@ -70,6 +70,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -9569,6 +9570,7 @@ async def _post_session_event_inner(
         )
         return _PostResult(response=None, rejection_reason=reason)
     attempt = 0
+    auth_failures = 0
     while max_attempts is None or attempt < max_attempts:
         attempt += 1
         try:
@@ -9576,6 +9578,17 @@ async def _post_session_event_inner(
                 response = await client.post(url, json=payload)
             else:
                 response = await client.post(url, json=payload, timeout=timeout)
+        except DatabricksAuthError as exc:
+            # Credential acquisition failed before an authenticated send, so
+            # even a legacy item is safe to retry within its attempt budget.
+            auth_failures += 1
+            if _is_final_post_attempt(attempt, max_attempts) or (
+                max_attempts is None and auth_failures >= _POST_MAX_ATTEMPTS
+            ):
+                raise
+            _log_unbounded_post_retry(event_type, session_id, attempt, exc=exc)
+            await _sleep(_post_retry_delay(attempt))
+            continue
         except httpx.HTTPError as exc:
             # Legacy conversation items without a source id are not
             # idempotent, so an ambiguous response-loss failure must not be
@@ -9604,6 +9617,7 @@ async def _post_session_event_inner(
             _log_unbounded_post_retry(event_type, session_id, attempt, exc=exc)
             await _sleep(_post_retry_delay(attempt))
             continue
+        auth_failures = 0
         # An HTTP response (no transport error) proves the server is reachable,
         # so clear any stale connectivity-failure record — otherwise a recovered
         # connection could have an old failure misattributed to a later,
@@ -9687,7 +9701,7 @@ def _log_unbounded_post_retry(
     session_id: str,
     attempt: int,
     *,
-    exc: httpx.HTTPError | None = None,
+    exc: httpx.HTTPError | DatabricksAuthError | None = None,
     response: httpx.Response | None = None,
 ) -> None:
     """Log sparse progress for a durable event retrying until recovery."""
