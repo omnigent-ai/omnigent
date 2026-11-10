@@ -3101,37 +3101,41 @@ def _drop_claude_launch_args_from_another_host(
     conversation_store: ConversationStore, conv: Conversation
 ) -> Conversation:
     """
-    Drop a Claude Code fork's copied launch args when its first host isn't its source's.
+    Drop launch args a Claude Code fork still carries from its source when bound elsewhere.
 
-    A session stores the launch args whatever started it passed, such as
-    openui's ``--mcp-config`` file under that machine's home directory, and
-    every launch replays them. A fork copies them, so a fork first bound to a
-    host other than its source's would replay paths that aren't there, and
-    Claude exits at startup on a missing config file. Call this once, right
-    after a fork's first host binding: later args belong to the fork. Only the
-    permission mode Omnigent recorded for the session is kept, rebuilt from
-    the label rather than parsed out of the args, so no stored value can
-    become a flag. Omnigent adds its own launch setup on every host.
+    Stored launch args can name files on the machine that started the session
+    (an ``--mcp-config`` path, say), and Claude exits at startup when one is
+    missing. A fork's args are still its source's when they match the source's
+    apart from the permission mode; on any other host they are dropped. Args
+    that differ are the fork's own and are kept. The permission mode is rebuilt
+    from the session's label, never read out of the args.
 
     :param conversation_store: Store holding the session and its source.
-    :param conv: The session row as just bound, with its canonical ``host_id``.
+    :param conv: The session row as just bound, with its stored ``host_id``.
     :returns: The session row, updated when its args were dropped.
     """
+    from omnigent.runner.routing import routing_host_id  # noqa: FlagLocalImports
+
     source_id = conv.labels.get(FORK_SOURCE_LABEL_KEY)
     if (
         not source_id
         or conv.host_id is None
-        or not conv.terminal_launch_args
         or conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
     ):
         return conv
+    copied, _ = _strip_claude_permission_launch_arg(list(conv.terminal_launch_args or ()))
+    if not copied:
+        return conv
     source = conversation_store.get_conversation(source_id)
-    if source is None or source.host_id is None or source.host_id == conv.host_id:
+    if source is None:
+        return conv
+    source_args, _ = _strip_claude_permission_launch_arg(list(source.terminal_launch_args or ()))
+    # A side chat shares its source's runner without a host binding of its own.
+    source_host_id = routing_host_id(source, conversation_store)
+    if copied != source_args or source_host_id is None or source_host_id == conv.host_id:
         return conv
     mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
     kept = ["--permission-mode", mode] if mode in _CLAUDE_NATIVE_PERMISSION_MODES else []
-    if conv.terminal_launch_args == kept:
-        return conv
     return conversation_store.update_conversation(conv.id, terminal_launch_args=kept) or conv
 
 

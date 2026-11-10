@@ -284,14 +284,7 @@ def _claude_source(conv_store: SqlAlchemyConversationStore, host_id: str) -> Con
 async def test_launch_runner_drops_launch_args_a_fork_copied_from_another_host(
     binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
-    """A fork's first launch on a host other than its source's leaves the launcher's args behind.
-
-    openui starts Claude Code sessions with an ``--mcp-config`` file under the
-    laptop's home directory, and a fork copies it. Launched on another host,
-    Claude would exit at startup on the missing file, so the first binding
-    keeps only the permission mode Omnigent recorded for the session. Args the
-    fork gets later (a resume with this host's own options) are its own.
-    """
+    """A first cross-host launch drops copied extras; later args are the fork's own and stay."""
     app, registry, _hs, conv_store = binding_app
     comm = await _connect_host(app, registry)
     source = _claude_source(conv_store, "1a2b3c4d5e6f40718293a4b5c6d7e8f9")
@@ -303,13 +296,14 @@ async def test_launch_runner_drops_launch_args_a_fork_copied_from_another_host(
     assert kept is not None
     assert kept.terminal_launch_args == source.terminal_launch_args
 
-    # The runner stops (its host binding stays), and a resume saves this
-    # host's own args before asking for a runner again.
+    # A resume saves this host's own args; its launch fails and the rollback
+    # clears the binding, then the user retries on the same host.
     conv_store.clear_runner_id(fork.id)
     own_args = ["--mcp-config", "/home/me/servers.json", "--permission-mode", "acceptEdits"]
     conv_store.update_conversation(fork.id, terminal_launch_args=own_args)
-    relaunch = await _launch_and_capture_launch_args(app, comm, conv_store, fork.id)
-    assert relaunch == own_args
+    conv_store.clear_host_binding(fork.id)
+    retry = await _launch_and_capture_launch_args(app, comm, conv_store, fork.id)
+    assert retry == own_args
 
 
 async def test_launch_runner_keeps_launch_args_of_a_fork_on_its_source_host(

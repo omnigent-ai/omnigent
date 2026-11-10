@@ -6,7 +6,11 @@ import pytest
 
 from omnigent.entities import Conversation
 from omnigent.server.routes._sessions.helpers import _drop_claude_launch_args_from_another_host
-from omnigent.stores.conversation_store import FORK_SOURCE_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    FORK_SOURCE_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 _SOURCE_HOST = "1a2b3c4d5e6f40718293a4b5c6d7e8f9"
@@ -20,13 +24,6 @@ _OPENUI_ARGS = [
     "--plugin-dir",
     "/Users/someone/.openui/plugin",
 ]
-
-
-def _row(store: SqlAlchemyConversationStore, session_id: str) -> Conversation:
-    """The stored row for ``session_id``."""
-    conv = store.get_conversation(session_id)
-    assert conv is not None
-    return conv
 
 
 def _bind(store: SqlAlchemyConversationStore, session_id: str, host_id: str) -> Conversation:
@@ -113,27 +110,42 @@ def test_other_harnesses_and_non_forks_keep_their_args(db_uri: str) -> None:
         assert conv.terminal_launch_args == _OPENUI_ARGS
 
 
-def test_fork_dialog_mode_pick_survives_a_bind_to_another_host(db_uri: str) -> None:
-    """A mode picked in the fork dialog is the mode another host keeps.
+def test_fork_with_its_own_args_keeps_them_on_another_host(db_uri: str) -> None:
+    """Args that no longer match the source's are the fork's own, whatever host it binds."""
+    store = SqlAlchemyConversationStore(db_uri)
+    fork_id = _fork(store, labels=dict(_CLAUDE_WRAPPER), launch_args=list(_OPENUI_ARGS))
+    own_args = ["--mcp-config", "/home/me/servers.json", "--permission-mode", "plan"]
+    store.update_conversation(fork_id, terminal_launch_args=own_args)
 
-    The dialog's pick replaces the copied args and the copied label, and the
-    fork route records it on the label, which the cross-host bind rebuilds from.
-    """
+    _drop_claude_launch_args_from_another_host(store, _bind(store, fork_id, _OTHER_HOST))
+
+    fork = store.get_conversation(fork_id)
+    assert fork is not None
+    assert fork.terminal_launch_args == own_args
+
+
+def test_fork_of_a_side_chat_uses_the_host_the_side_chat_runs_on(db_uri: str) -> None:
+    """A side chat shares its source's runner without its own host, so its source's host counts."""
     store = SqlAlchemyConversationStore(db_uri)
     source = store.create_conversation(
         host_id=_SOURCE_HOST,
         workspace="/Users/someone/repo",
-        terminal_launch_args=[*_OPENUI_ARGS, "--permission-mode", "default"],
-        labels={**_CLAUDE_WRAPPER, _MODE_LABEL: "default"},
+        terminal_launch_args=list(_OPENUI_ARGS),
+        labels=dict(_CLAUDE_WRAPPER),
     )
-    fork = store.fork_conversation(
+    # A live side chat runs on its source's runner without a host of its own.
+    store.set_runner_id(source.id, "runner_token_shared")
+    side_chat = store.fork_conversation(
         source_conversation_id=source.id,
-        override_terminal_launch_args=["--permission-mode", "plan"],
-        override_terminal_launch_args_set=True,
-        dropped_label_keys=frozenset({_MODE_LABEL}),
-        extra_labels={_MODE_LABEL: "plan"},
+        extra_labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source.id},
     )
+    assert side_chat.host_id is None
+    store.set_runner_id(side_chat.id, "runner_token_shared")
+    fork = store.fork_conversation(source_conversation_id=side_chat.id)
+    assert fork.labels[FORK_SOURCE_LABEL_KEY] == side_chat.id
 
     _drop_claude_launch_args_from_another_host(store, _bind(store, fork.id, _OTHER_HOST))
 
-    assert _row(store, fork.id).terminal_launch_args == ["--permission-mode", "plan"]
+    bound = store.get_conversation(fork.id)
+    assert bound is not None
+    assert bound.terminal_launch_args == []

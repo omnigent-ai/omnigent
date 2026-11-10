@@ -1444,19 +1444,17 @@ def create_hosts_router(
                         workspace,
                         git_branch,
                     )
-                if target.conv.host_id is None:
-                    # A fork's first host: drop args copied from a source on another host.
-                    from omnigent.server.routes._sessions.helpers import (
-                        _drop_claude_launch_args_from_another_host,
-                    )
+                from omnigent.server.routes._sessions.helpers import (
+                    _drop_claude_launch_args_from_another_host,
+                )
 
-                    bound = await asyncio.to_thread(
-                        conversation_store.get_conversation, body.session_id
+                bound = await asyncio.to_thread(
+                    conversation_store.get_conversation, body.session_id
+                )
+                if bound is not None:
+                    await asyncio.to_thread(
+                        _drop_claude_launch_args_from_another_host, conversation_store, bound
                     )
-                    if bound is not None:
-                        await asyncio.to_thread(
-                            _drop_claude_launch_args_from_another_host, conversation_store, bound
-                        )
 
             persist_task = asyncio.create_task(persist_binding())
             try:

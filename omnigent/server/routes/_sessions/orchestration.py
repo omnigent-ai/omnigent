@@ -4814,9 +4814,6 @@ async def _bind_and_launch_managed_runner(
             conv = conversation_store.get_conversation(session_id)
             if conv is None:
                 raise ConversationNotFoundError(f"conversation {session_id!r} does not exist")
-        if relaunch_host is not None:
-            return conv
-        # A fork's first host: drop args copied from a source on another host.
         return _drop_claude_launch_args_from_another_host(conversation_store, conv)
 
     bind = asyncio.create_task(asyncio.to_thread(persist_binding))
