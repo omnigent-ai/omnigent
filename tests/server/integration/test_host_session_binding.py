@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -212,47 +213,29 @@ async def test_launch_runner_writes_host_id_and_runner_id(
     assert updated.host_id == _HOST_ID, "host_id should be written to session row"
 
 
-async def test_launch_runner_drops_launch_args_a_fork_copied_from_another_host(
-    binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
-) -> None:
-    """A fork launched on a host other than its source's leaves the launcher's args behind.
+async def _launch_and_capture_launch_args(
+    app: FastAPI,
+    comm: ApplicationCommunicator,
+    conv_store: SqlAlchemyConversationStore,
+    session_id: str,
+    host_path_id: str = _HOST_ID,
+) -> list[str] | None:
+    """Launch a runner for ``session_id`` and return its stored args as the launch arrives.
 
-    openui starts Claude Code sessions with an ``--mcp-config`` file under the
-    laptop's home directory, and a fork copies it. Launched on another host,
-    Claude would exit at startup on the missing file, so the binding keeps
-    only the permission mode Omnigent recorded for the session.
+    The runner reads the args as it starts, so that is the moment they must be right.
     """
-    app, registry, _hs, conv_store = binding_app
-    comm = await _connect_host(app, registry)
-    source = conv_store.create_conversation(
-        agent_id=None,
-        host_id="1a2b3c4d5e6f40718293a4b5c6d7e8f9",
-        workspace="/Users/someone/repo",
-        terminal_launch_args=[
-            "--mcp-config",
-            "/Users/someone/.openui/mcp-inject.json",
-            "--permission-mode",
-            "plan",
-        ],
-        labels={
-            "omnigent.wrapper": "claude-code-native-ui",
-            "omnigent.claude_native.permission_mode": "plan",
-        },
-    )
-    fork = conv_store.fork_conversation(source_conversation_id=source.id)
+    at_launch: list[list[str] | None] = []
 
     async def _respond_launched() -> None:
-        """Answer the host's launch frame."""
         for _ in range(20):
             output = await comm.receive_output(timeout=10.0)
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
             if isinstance(frame, HostLaunchRunnerFrame):
-                # The runner reads the args as it starts, so they must already be clean.
-                at_launch = conv_store.get_conversation(fork.id)
-                assert at_launch is not None
-                launch_args_at_launch.append(at_launch.terminal_launch_args)
+                row = conv_store.get_conversation(session_id)
+                assert row is not None
+                at_launch.append(row.terminal_launch_args)
                 await comm.send_input(
                     {
                         "type": "websocket.receive",
@@ -267,25 +250,83 @@ async def test_launch_runner_drops_launch_args_a_fork_copied_from_another_host(
                 )
                 return
 
-    launch_args_at_launch: list[list[str] | None] = []
     responder = asyncio.create_task(_respond_launched())
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            f"/v1/hosts/{_HOST_ID}/runners",
-            json={"session_id": fork.id, "workspace": "/tmp"},
+            f"/v1/hosts/{host_path_id}/runners",
+            json={"session_id": session_id, "workspace": "/tmp"},
         )
-    await responder
-    assert launch_args_at_launch == [["--permission-mode", "plan"]]
-
     assert resp.status_code == 200, resp.text
-    updated = conv_store.get_conversation(fork.id)
-    assert updated is not None
-    assert updated.host_id == _HOST_ID
-    assert updated.terminal_launch_args == ["--permission-mode", "plan"]
-    # The source keeps its own args for its own machine.
+    await responder
+    assert len(at_launch) == 1
+    return at_launch[0]
+
+
+def _claude_source(conv_store: SqlAlchemyConversationStore, host_id: str) -> Conversation:
+    """A Claude Code session on ``host_id`` started with openui's laptop-local args."""
+    return conv_store.create_conversation(
+        agent_id=None,
+        host_id=host_id,
+        workspace="/Users/someone/repo",
+        terminal_launch_args=[
+            "--mcp-config",
+            "/Users/someone/.openui/mcp-inject.json",
+            "--permission-mode",
+            "plan",
+        ],
+        labels={
+            "omnigent.wrapper": "claude-code-native-ui",
+            "omnigent.claude_native.permission_mode": "plan",
+        },
+    )
+
+
+async def test_launch_runner_drops_launch_args_a_fork_copied_from_another_host(
+    binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A fork's first launch on a host other than its source's leaves the launcher's args behind.
+
+    openui starts Claude Code sessions with an ``--mcp-config`` file under the
+    laptop's home directory, and a fork copies it. Launched on another host,
+    Claude would exit at startup on the missing file, so the first binding
+    keeps only the permission mode Omnigent recorded for the session. Args the
+    fork gets later (a resume with this host's own options) are its own.
+    """
+    app, registry, _hs, conv_store = binding_app
+    comm = await _connect_host(app, registry)
+    source = _claude_source(conv_store, "1a2b3c4d5e6f40718293a4b5c6d7e8f9")
+    fork = conv_store.fork_conversation(source_conversation_id=source.id)
+
+    first = await _launch_and_capture_launch_args(app, comm, conv_store, fork.id)
+    assert first == ["--permission-mode", "plan"]
     kept = conv_store.get_conversation(source.id)
     assert kept is not None
     assert kept.terminal_launch_args == source.terminal_launch_args
+
+    # The runner stops (its host binding stays), and a resume saves this
+    # host's own args before asking for a runner again.
+    conv_store.clear_runner_id(fork.id)
+    own_args = ["--mcp-config", "/home/me/servers.json", "--permission-mode", "acceptEdits"]
+    conv_store.update_conversation(fork.id, terminal_launch_args=own_args)
+    relaunch = await _launch_and_capture_launch_args(app, comm, conv_store, fork.id)
+    assert relaunch == own_args
+
+
+async def test_launch_runner_keeps_launch_args_of_a_fork_on_its_source_host(
+    binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A fork launched on its source's host keeps every arg, whatever host-id spelling is used."""
+    app, registry, _hs, conv_store = binding_app
+    comm = await _connect_host(app, registry)
+    source = _claude_source(conv_store, _HOST_ID)
+    fork = conv_store.fork_conversation(source_conversation_id=source.id)
+    dashed_host_id = str(uuid.UUID(_HOST_ID))
+
+    launched = await _launch_and_capture_launch_args(
+        app, comm, conv_store, fork.id, host_path_id=dashed_host_id
+    )
+
+    assert launched == source.terminal_launch_args
 
 
 async def test_sandbox_fork_cannot_launch_on_ordinary_host(

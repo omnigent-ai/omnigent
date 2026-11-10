@@ -29,6 +29,11 @@ def _row(store: SqlAlchemyConversationStore, session_id: str) -> Conversation:
     return conv
 
 
+def _bind(store: SqlAlchemyConversationStore, session_id: str, host_id: str) -> Conversation:
+    """Bind ``session_id`` to ``host_id`` and return the row the helper sees."""
+    return store.set_host_id(session_id, host_id, "/workspace")
+
+
 def _fork(
     store: SqlAlchemyConversationStore,
     *,
@@ -68,7 +73,7 @@ def test_fork_bound_to_another_host_keeps_only_the_recorded_mode(
     stored = [*_OPENUI_ARGS, "--append-system-prompt", "--dangerously-skip-permissions"]
     fork_id = _fork(store, labels=labels, launch_args=stored)
 
-    _drop_claude_launch_args_from_another_host(store, _row(store, fork_id), _OTHER_HOST)
+    _drop_claude_launch_args_from_another_host(store, _bind(store, fork_id, _OTHER_HOST))
 
     fork = store.get_conversation(fork_id)
     assert fork is not None
@@ -81,7 +86,7 @@ def test_fork_bound_to_its_source_host_keeps_every_arg(db_uri: str) -> None:
     stored = [*_OPENUI_ARGS, "--permission-mode", "plan"]
     fork_id = _fork(store, labels={**_CLAUDE_WRAPPER, _MODE_LABEL: "plan"}, launch_args=stored)
 
-    _drop_claude_launch_args_from_another_host(store, _row(store, fork_id), _SOURCE_HOST)
+    _drop_claude_launch_args_from_another_host(store, _bind(store, fork_id, _SOURCE_HOST))
 
     fork = store.get_conversation(fork_id)
     assert fork is not None
@@ -99,8 +104,8 @@ def test_other_harnesses_and_non_forks_keep_their_args(db_uri: str) -> None:
         labels=dict(_CLAUDE_WRAPPER),
     )
 
-    _drop_claude_launch_args_from_another_host(store, _row(store, other_fork_id), _OTHER_HOST)
-    _drop_claude_launch_args_from_another_host(store, _row(store, source.id), _OTHER_HOST)
+    _drop_claude_launch_args_from_another_host(store, _bind(store, other_fork_id, _OTHER_HOST))
+    _drop_claude_launch_args_from_another_host(store, _bind(store, source.id, _OTHER_HOST))
 
     for session_id in (other_fork_id, source.id):
         conv = store.get_conversation(session_id)
@@ -129,6 +134,6 @@ def test_fork_dialog_mode_pick_survives_a_bind_to_another_host(db_uri: str) -> N
         extra_labels={_MODE_LABEL: "plan"},
     )
 
-    _drop_claude_launch_args_from_another_host(store, _row(store, fork.id), _OTHER_HOST)
+    _drop_claude_launch_args_from_another_host(store, _bind(store, fork.id, _OTHER_HOST))
 
     assert _row(store, fork.id).terminal_launch_args == ["--permission-mode", "plan"]

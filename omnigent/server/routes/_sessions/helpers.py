@@ -3098,34 +3098,35 @@ def _merge_claude_permission_launch_args(
 
 
 def _drop_claude_launch_args_from_another_host(
-    conversation_store: ConversationStore, conv: Conversation, host_id: str
+    conversation_store: ConversationStore, conv: Conversation
 ) -> Conversation:
     """
-    Drop a forked Claude Code session's stored launch args when it binds to another host.
+    Drop a Claude Code fork's copied launch args when its first host isn't its source's.
 
     A session stores the launch args whatever started it passed, such as
     openui's ``--mcp-config`` file under that machine's home directory, and
-    every launch replays them. A fork copies them, so a fork bound to a host
-    other than its source's would replay paths that aren't there, and Claude
-    exits at startup on a missing config file. Only the permission mode
-    Omnigent recorded for the session is kept; it is rebuilt from the label
-    rather than parsed out of the args, so no stored value can become a flag.
-    Omnigent adds its own launch setup on every host.
+    every launch replays them. A fork copies them, so a fork first bound to a
+    host other than its source's would replay paths that aren't there, and
+    Claude exits at startup on a missing config file. Call this once, right
+    after a fork's first host binding: later args belong to the fork. Only the
+    permission mode Omnigent recorded for the session is kept, rebuilt from
+    the label rather than parsed out of the args, so no stored value can
+    become a flag. Omnigent adds its own launch setup on every host.
 
     :param conversation_store: Store holding the session and its source.
-    :param conv: The session row just bound.
-    :param host_id: The host it was bound to, e.g. ``"host_a1b2c3d4..."``.
+    :param conv: The session row as just bound, with its canonical ``host_id``.
     :returns: The session row, updated when its args were dropped.
     """
     source_id = conv.labels.get(FORK_SOURCE_LABEL_KEY)
     if (
         not source_id
+        or conv.host_id is None
         or not conv.terminal_launch_args
         or conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
     ):
         return conv
     source = conversation_store.get_conversation(source_id)
-    if source is None or source.host_id is None or source.host_id == host_id:
+    if source is None or source.host_id is None or source.host_id == conv.host_id:
         return conv
     mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
     kept = ["--permission-mode", mode] if mode in _CLAUDE_NATIVE_PERMISSION_MODES else []
