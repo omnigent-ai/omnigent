@@ -3393,7 +3393,7 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
 def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:
     """Build native Claude Code launch config for Bedrock-style gateways.
 
-    AWS Bedrock and Bedrock-compatible gateways (like corporate AI gateways)
+    AWS Bedrock and Bedrock-compatible gateways (like enterprise AI gateways)
     use a different set of environment variables than the standard Anthropic API:
     - ``ANTHROPIC_BEDROCK_BASE_URL`` instead of ``ANTHROPIC_BASE_URL``
     - ``AWS_BEARER_TOKEN_BEDROCK`` for the credential (a static ``api_key``
@@ -7021,7 +7021,7 @@ def _claude_terminal_request(
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
     )
-    # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
+    # Let a registered launcher plugin (e.g. a wrapper such as isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by
     # default. See omnigent.claude_launcher.
     command, args = resolve_claude_launch(command, args)

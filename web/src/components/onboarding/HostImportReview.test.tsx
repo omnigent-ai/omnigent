@@ -244,7 +244,7 @@ describe("ImportReviewGate", () => {
       );
       expect(await screen.findByText("Connecting to Arca…")).toBeTruthy();
 
-      // A cold Arca boot outlasts the picker's grace period.
+      // A slow Arca start outlasts the picker's grace period.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(ONBOARDING_RUNNER_GRACE_MS + 1_000);
       });
