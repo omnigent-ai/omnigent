@@ -6,16 +6,7 @@ import type React from "react";
 import { defaultFilter } from "cmdk";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import {
-  CalendarClockIcon,
-  InboxIcon,
-  type LucideIcon,
-  PanelLeftIcon,
-  PanelRightIcon,
-  SettingsIcon,
-  SquarePenIcon,
-  XIcon,
-} from "lucide-react";
+import { XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import {
   type ConversationsPage,
@@ -28,13 +19,7 @@ import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import {
-  CompactShortcutKeys,
-  newSessionShortcutKeys,
-  rightSidebarToggleShortcutKeys,
-  settingsShortcutKeys,
-  sidebarToggleShortcutKeys,
-} from "@/components/KeyboardShortcut";
+import { CompactShortcutKeys } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
@@ -45,6 +30,7 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
+import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
 
 export interface CommandPaletteProps {
@@ -57,18 +43,6 @@ export interface CommandPaletteProps {
   onToggleRightSidebar: () => void;
   /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
   rightSidebarShortcutEnabled?: boolean;
-}
-
-interface ActionCommand {
-  id: string;
-  label: string;
-  /** Mirrors the icon on the equivalent button elsewhere in the UI. */
-  icon: LucideIcon;
-  /** Extra terms the client-side filter matches against (beyond the label). */
-  keywords: string[];
-  run: () => void;
-  /** Chord shown beside the row when the same action has a shortcut. */
-  shortcut?: readonly string[];
 }
 
 /** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
@@ -182,67 +156,16 @@ export function CommandPalette({
 
   const close = (): void => onOpenChange(false);
 
-  const actions = useMemo<ActionCommand[]>(
-    () => [
-      {
-        id: "new-chat",
-        label: "New chat",
-        icon: SquarePenIcon,
-        keywords: ["compose", "start", "new session"],
-        run: () => navigate("/"),
-        shortcut: newSessionShortcutKeys(),
-      },
-      {
-        id: "go-inbox",
-        label: "Go to Inbox",
-        icon: InboxIcon,
-        keywords: ["notifications", "comments", "needs response"],
-        run: () => navigate("/inbox"),
-      },
-      {
-        id: "go-tasks",
-        label: "Go to Automations",
-        icon: CalendarClockIcon,
-        keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
-        run: () => navigate("/tasks"),
-      },
-      {
-        id: "go-settings",
-        label: "Go to Settings",
-        icon: SettingsIcon,
-        keywords: ["preferences", "configuration", "account"],
-        run: () => navigate("/settings"),
-        shortcut: settingsShortcutKeys(),
-      },
-      {
-        id: "toggle-left-sidebar",
-        label: "Toggle conversations sidebar",
-        icon: PanelLeftIcon,
-        keywords: ["panel", "left", "sessions list"],
-        run: onToggleLeftSidebar,
-        shortcut: sidebarToggleShortcutKeys(),
-      },
-      {
-        id: "toggle-right-sidebar",
-        label: "Toggle workspace sidebar",
-        icon: PanelRightIcon,
-        keywords: ["panel", "right", "files", "terminal"],
-        run: onToggleRightSidebar,
-        shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
-      },
-    ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
-  );
+  const actions = useAppCommands({
+    onToggleLeftSidebar,
+    onToggleRightSidebar,
+    rightSidebarShortcutEnabled,
+  });
 
-  const filteredActions = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (sessionsOnly) return [];
-    if (q === "") return actions;
-    return actions.filter(
-      (a) =>
-        a.label.toLowerCase().includes(q) || a.keywords.some((k) => k.toLowerCase().includes(q)),
-    );
-  }, [actions, query, sessionsOnly]);
+  const filteredActions = useMemo(
+    () => (sessionsOnly ? [] : filterAppCommands(actions, query)),
+    [actions, query, sessionsOnly],
+  );
 
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
     useConversations("", false, { enabled: open });
