@@ -166,7 +166,7 @@ export interface SessionMention {
  * ``omnigent/entities/conversation.py``.
  */
 export const SESSION_MENTION_HINT =
-  "[Tagged sessions: read with sys_session_get_history; to message one, use " +
+  "[Tagged sessions: read with sys_session_get_history; if asked to message one, use " +
   "sys_session_send if it is your own subagent and that tool is available, " +
   "otherwise sys_session_message]";
 
