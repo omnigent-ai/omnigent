@@ -32,6 +32,7 @@ import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import {
   acceptsApprovalSkippingModes,
+  acceptsScheduledPermissionMode,
   useScheduledHarnessSettings,
 } from "./useScheduledHarnessSettings";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
@@ -635,7 +636,7 @@ export function CreateScheduledTaskDialog({
   const approvalSkippingAccepted = acceptsApprovalSkippingModes(info);
   // A saved mode the server would refuse edits as the harness default, so saving sends null.
   const editablePermissionMode = (mode: string | null | undefined): string =>
-    mode && (approvalSkippingAccepted || !APPROVAL_SKIPPING_PERMISSION_MODES.has(mode)) ? mode : "";
+    mode && acceptsScheduledPermissionMode(info, mode) ? mode : "";
   const newAutomationPermission =
     !isEdit && !permissionPicked && harnessSettings.harness
       ? NEW_AUTOMATION_PERMISSION_MODES[harnessSettings.harness]

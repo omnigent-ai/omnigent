@@ -16,6 +16,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import {
   APPROVAL_SKIPPING_PERMISSION_MODES,
+  CODEX_NATIVE_REVIEWER_MODE_VALUES,
   nativePermissionOptions,
 } from "@/lib/nativeHarnessModes";
 import { nativeEffortOptions } from "@/components/HarnessConfigControls";
@@ -27,6 +28,18 @@ const EMPTY_MODELS: NativeModelOption[] = [];
 /** Whether the server accepts automation modes that skip approval; older ones may reject them. */
 export function acceptsApprovalSkippingModes(info: ReturnType<typeof useServerInfo>): boolean {
   return info !== "loading" && info.scheduled_task_approval_skipping_modes === true;
+}
+
+/** Whether the server accepts this automation permission mode; older ones reject newer modes. */
+export function acceptsScheduledPermissionMode(
+  info: ReturnType<typeof useServerInfo>,
+  mode: string,
+): boolean {
+  if (APPROVAL_SKIPPING_PERMISSION_MODES.has(mode)) return acceptsApprovalSkippingModes(info);
+  if (CODEX_NATIVE_REVIEWER_MODE_VALUES.has(mode)) {
+    return info !== "loading" && info.scheduled_task_codex_reviewer_modes === true;
+  }
+  return true;
 }
 
 /** Resolve choices for the automation's execution target without launching it. */
@@ -124,11 +137,9 @@ export function useScheduledHarnessSettings(
   const supportsHarnessPermissions =
     harness === "claude-native" ||
     (info !== "loading" && info.scheduled_task_harness_settings === true);
-  const approvalSkippingAccepted = acceptsApprovalSkippingModes(info);
   const permissions = supportsHarnessPermissions
-    ? nativePermissionOptions(harness).filter(
-        (option) =>
-          approvalSkippingAccepted || !APPROVAL_SKIPPING_PERMISSION_MODES.has(option.value),
+    ? nativePermissionOptions(harness).filter((option) =>
+        acceptsScheduledPermissionMode(info, option.value),
       )
     : [];
   const loading = sandbox ? sandboxModels.isLoading : hostModels.isLoading;

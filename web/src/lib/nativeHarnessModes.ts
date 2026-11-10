@@ -274,6 +274,12 @@ export const APPROVAL_SKIPPING_PERMISSION_MODES: ReadonlySet<string> = new Set([
   "dangerous",
 ]);
 
+/** Codex presets that pin `approvals_reviewer`; automations need server support for them. */
+export const CODEX_NATIVE_REVIEWER_MODE_VALUES: ReadonlySet<string> = new Set([
+  "ask-for-approval",
+  "approve-for-me",
+]);
+
 /**
  * Mode a new automation starts with. Nobody watches an automation's turns, so a
  * mode that asks would stall them; the user can still pick another one.

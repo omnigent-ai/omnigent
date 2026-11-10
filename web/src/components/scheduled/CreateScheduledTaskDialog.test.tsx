@@ -256,6 +256,7 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
           ...SERVER_INFO_OFFLINE_FALLBACK,
           features: { automations_v2: true },
           scheduled_task_harness_settings: true,
+          scheduled_task_codex_reviewer_modes: true,
           scheduled_task_approval_skipping_modes: true,
           scheduled_task_worktrees: true,
         }}
@@ -279,12 +280,18 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
   };
 }
 
-/** A server with harness settings that predates modes that skip approval. */
-const REFUSES_APPROVAL_SKIPPING = {
+/** A server with harness settings that predates the Codex reviewer modes. */
+const PREDATES_CODEX_REVIEWER_MODES = {
   ...SERVER_INFO_OFFLINE_FALLBACK,
   features: { automations_v2: true },
   scheduled_task_harness_settings: true,
   scheduled_task_worktrees: true,
+};
+
+/** A server with harness settings that predates modes that skip approval. */
+const REFUSES_APPROVAL_SKIPPING = {
+  ...PREDATES_CODEX_REVIEWER_MODES,
+  scheduled_task_codex_reviewer_modes: true,
 };
 
 function serverInfo(acceptsApprovalSkipping: boolean) {
@@ -632,9 +639,8 @@ describe("agent picker readiness (needs-setup badges)", () => {
     fireEvent.click(submit);
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0].agentId).toBe("ag_codex");
-    // A new automation starts on Approve for me; model and effort keep the agent's defaults.
-    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("approve-for-me");
-    for (const override of ["modelOverride", "reasoningEffort"]) {
+    // This server doesn't advertise the Codex reviewer modes, so nothing is prefilled.
+    for (const override of ["permissionMode", "modelOverride", "reasoningEffort"]) {
       expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty(override);
     }
 
@@ -2243,26 +2249,37 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     },
   );
 
-  it.each([
-    ["bypassPermissions", false, { permissionMode: null }],
-    ["bypassPermissions", true, {}],
-    ["acceptEdits", false, {}],
+  it.each<[string, string, Partial<ServerInfo>, { permissionMode?: null }]>([
+    ["bypassPermissions", "ag_claude_native", {}, { permissionMode: null }],
+    ["bypassPermissions", "ag_claude_native", { scheduled_task_approval_skipping_modes: true }, {}],
+    ["acceptEdits", "ag_claude_native", {}, {}],
+    [
+      "approve-for-me",
+      "ag_codex",
+      { scheduled_task_harness_settings: true },
+      { permissionMode: null },
+    ],
+    [
+      "approve-for-me",
+      "ag_codex",
+      { scheduled_task_harness_settings: true, scheduled_task_codex_reviewer_modes: true },
+      {},
+    ],
   ])(
-    "on a continued-session edit, clears a saved %s only for a server that refuses it (accepts: %s)",
-    async (savedMode, accepted, expectedPermission) => {
+    "on a continued-session edit, clears a saved %s on %s only for a server that refuses it (%o)",
+    async (savedMode, agentId, info, expectedPermission) => {
+      vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+        data: [...AGENTS, testAgent("ag_codex", "codex-native-ui", { harness: "codex-native" })],
+      } as ReturnType<typeof agentsHook.useAvailableAgents>);
       render(
         <CapabilitiesProvider
-          info={{
-            ...SERVER_INFO_OFFLINE_FALLBACK,
-            scheduled_task_session_modes: true,
-            scheduled_task_approval_skipping_modes: accepted,
-          }}
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true, ...info }}
         >
           <CreateScheduledTaskDialog
             open
             onOpenChange={vi.fn()}
             editingTask={scheduledTask({
-              agentId: "ag_claude_native",
+              agentId,
               sessionMode: "continue",
               sessionId: "conv_1",
               modelOverride: "opus",
@@ -4434,6 +4451,25 @@ describe("automation harness settings", () => {
     },
   );
 
+  it("hides and never prefills the Codex reviewer modes on an older server", async () => {
+    mockHarness("codex-native");
+    render(
+      <CapabilitiesProvider info={PREDATES_CODEX_REVIEWER_MODES}>
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Read Only" })).toBeInTheDocument();
+    for (const name of ["Ask for approval", "Approve for me"]) {
+      expect(screen.queryByRole("option", { name })).not.toBeInTheDocument();
+    }
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("permissionMode");
+  });
+
   it("starts a new Codex automation on Approve for me", async () => {
     mockHarness("codex-native");
     render(
@@ -4470,6 +4506,40 @@ describe("automation harness settings", () => {
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input.permissionMode).toBeNull();
   });
+
+  it.each([
+    ["ask-for-approval", "an older server", "Default", PREDATES_CODEX_REVIEWER_MODES, null],
+    ["approve-for-me", "an older server", "Default", PREDATES_CODEX_REVIEWER_MODES, null],
+    ["approve-for-me", "a current server", "Approve for me", serverInfo(true), "approve-for-me"],
+  ])(
+    "on edit, a saved Codex %s mode on %s shows %s",
+    async (mode, _server, shown, info, expected) => {
+      const agent = mockHarness("codex-native");
+      render(
+        <CapabilitiesProvider info={info}>
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: agent.id,
+              permissionMode: mode,
+              hostId: "host_1",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent(shown);
+      fireEvent.change(screen.getByLabelText("Instructions"), {
+        target: { value: "Review again" },
+      });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+        prompt: "Review again",
+        permissionMode: expected,
+      });
+    },
+  );
 
   it.each([
     [false, null],
@@ -5283,6 +5353,29 @@ describe("creating an automation from a session", () => {
       renderFromSession({ info });
 
       expect((await submit()).permissionMode === mode).toBe(kept);
+    },
+  );
+
+  it.each<[string, Partial<ServerInfo>, string | undefined]>([
+    // Servers that don't advertise the Codex reviewer modes reject them.
+    ["ask-for-approval", {}, undefined],
+    ["approve-for-me", {}, undefined],
+    ["ask-for-approval", { scheduled_task_codex_reviewer_modes: true }, "ask-for-approval"],
+  ])(
+    "starts from the Codex session's %s mode only if automations accept it (%o)",
+    async (mode, info, expected) => {
+      vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+        data: [...AGENTS, testAgent("ag_codex", "codex-native-ui", { harness: "codex-native" })],
+      } as ReturnType<typeof agentsHook.useAvailableAgents>);
+      sourceSnapshot.current = {
+        id: "conv_src",
+        labels: { "omnigent.codex_native.approval_mode": mode },
+      };
+      renderFromSession({ source: { ...SOURCE, agentId: "ag_codex" }, info });
+
+      const input = await submit();
+      expect(input.permissionMode).toBe(expected);
+      expect("permissionMode" in input).toBe(expected !== undefined);
     },
   );
 
