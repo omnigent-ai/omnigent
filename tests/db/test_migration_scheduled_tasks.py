@@ -938,9 +938,9 @@ def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
 ) -> None:
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.upgrade(config, _MCP_SERVICES_PREVIOUS)
+    # Later migrations open their own autocommit blocks on PostgreSQL, so this
+    # upgrade cannot run inside an outer transaction.
+    command.upgrade(config, _MCP_SERVICES_PREVIOUS)
     values = {
         "name": "nightly",
         "prompt": b"p",
