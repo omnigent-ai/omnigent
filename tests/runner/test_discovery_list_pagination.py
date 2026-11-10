@@ -534,6 +534,7 @@ def _archive_scope_server(
     *,
     scoped_archives: bool,
     me_status: int = 200,
+    me_body: dict[str, object] | None = None,
 ) -> Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]:
     """A ``/v1/sessions`` fake with current or older archive semantics.
 
@@ -553,7 +554,8 @@ def _archive_scope_server(
                 200, json={"session_list_scoped_archives": True} if scoped_archives else {}
             )
         if path == "/v1/me":
-            return httpx.Response(me_status, json={"user_id": _VIEWER, "is_admin": False})
+            body = {"user_id": _VIEWER, "is_admin": False} if me_body is None else me_body
+            return httpx.Response(me_status, json=body)
         if path == "/v1/sessions":
             visibility = request.url.params.get("visibility")
             archived = request.url.params.get("include_archived") == "true"
@@ -635,11 +637,27 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
 
 
 @pytest.mark.asyncio
-async def test_sys_session_list_archive_fallback_fails_closed_without_identity() -> None:
-    """Without the caller's identity, the older-server fallback lists nothing, not everything."""
+@pytest.mark.parametrize(
+    ("me_status", "me_body"),
+    [(503, None), (200, {"is_admin": True})],
+    ids=["identity-unavailable", "identity-missing"],
+)
+async def test_sys_session_list_archive_fallback_fails_closed_without_identity(
+    me_status: int, me_body: dict[str, object] | None
+) -> None:
+    """Without the caller's identity, the older-server fallback lists nothing, not everything.
+
+    A ``/v1/me`` answer without ``user_id`` is not the same as an explicit
+    anonymous ``null``: reading it as anonymous would let an admin's access to
+    other users' sessions pass as ownership.
+    """
     requests: list[tuple[str, dict[str, str]]] = []
     handler = _archive_scope_server(
-        _archive_scope_rows(), requests, scoped_archives=False, me_status=503
+        _archive_scope_rows(),
+        requests,
+        scoped_archives=False,
+        me_status=me_status,
+        me_body=me_body,
     )
 
     async with httpx.AsyncClient(

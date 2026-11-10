@@ -6710,9 +6710,12 @@ async def _session_list_viewer(
         body = resp.json() if resp.status_code == 200 else None
     except (httpx.HTTPError, ValueError):
         return False, None
-    if not isinstance(body, dict):
+    # Only an explicit null means "no authentication"; a missing key is a
+    # malformed answer, and treating it as anonymous would let an admin's
+    # access to other users' sessions pass as ownership.
+    if not isinstance(body, dict) or "user_id" not in body:
         return False, None
-    user_id = body.get("user_id")
+    user_id = body["user_id"]
     if user_id is not None and (not isinstance(user_id, str) or not user_id):
         return False, None
     return True, user_id
