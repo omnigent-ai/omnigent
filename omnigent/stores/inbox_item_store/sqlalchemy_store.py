@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable
 from typing import TypeVar
 
-from sqlalchemy import Select, func, select, tuple_
+from sqlalchemy import ColumnElement, Select, and_, func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session
 
@@ -140,16 +140,25 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
                 return _sized(lambda: self._insert(item, retire_item_id))
             except InboxSessionCapError:
                 # A concurrent post with the same key may have taken the last slot.
-                if self.get_by_dedupe_key(item.user_id, item.dedupe_key) is not None:
+                if self._live_duplicate(item, retire_item_id) is not None:
                     raise DuplicateInboxItemError(item.dedupe_key) from None
                 raise
             except IntegrityError as exc:
                 # Either a concurrent post took our slot, or another item holds the key.
-                if self.get_by_dedupe_key(item.user_id, item.dedupe_key) is not None:
+                if self._live_duplicate(item, retire_item_id) is not None:
                     raise DuplicateInboxItemError(item.dedupe_key) from exc
                 if attempt == _SLOT_RETRIES:
                     raise
         raise AssertionError("unreachable")
+
+    def _live_duplicate(self, item: NewInboxItem, retire_item_id: str | None) -> InboxItem | None:
+        """The item holding *item*'s key, unless it is the expired item being replaced."""
+        existing = self.get_by_dedupe_key(item.user_id, item.dedupe_key)
+        if existing is None or existing.id == retire_item_id:
+            return None
+        if existing.expires_at is not None and existing.expires_at <= now_epoch():
+            return None
+        return existing
 
     def _insert(self, item: NewInboxItem, retire_item_id: str | None) -> InboxItem:
         item_id = uuid.uuid4().hex
@@ -225,10 +234,23 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         if created_after is not None:
             stmt = stmt.where(SqlInboxItem.created_at >= created_after)
         if after is not None:
-            # A row-value comparison seeks the index instead of filtering earlier history.
-            stmt = stmt.where(tuple_(SqlInboxItem.created_at, SqlInboxItem.id) < after)
+            stmt = stmt.where(self._before_cursor(after))
         stmt = stmt.order_by(SqlInboxItem.created_at.desc(), SqlInboxItem.id.desc()).limit(limit)
         return list(session.execute(stmt).scalars().all())
+
+    def _before_cursor(self, after: tuple[int, str]) -> ColumnElement[bool]:
+        """Rows older than the ``(created_at, id)`` cursor, as a predicate that seeks.
+
+        A row-value comparison seeks the index on most engines; MySQL needs it
+        spelled as scalar ranges, as in the scheduled-task store.
+        """
+        created_at, item_id = after
+        if self._engine.dialect.name != "mysql":
+            return tuple_(SqlInboxItem.created_at, SqlInboxItem.id) < after
+        return or_(
+            SqlInboxItem.created_at < created_at,
+            and_(SqlInboxItem.created_at == created_at, SqlInboxItem.id < item_id),
+        )
 
     def list_for_user(
         self,

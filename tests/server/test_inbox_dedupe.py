@@ -44,6 +44,9 @@ def test_other_links() -> None:
     assert canonical_link({"type": "url", "ref": "http://example.test:443/a"}) == (
         "example.test:443/a"
     )
+    assert canonical_link(
+        {"type": "url", "ref": "https://[2001:db8::1]:8080/a"}
+    ) != canonical_link({"type": "url", "ref": "https://[2001:db8::1:8080]/a"})
     assert canonical_link({"type": "url", "ref": "https://example.test:8443/a"}) != canonical_link(
         {"type": "url", "ref": "https://example.test:9443/a"}
     )

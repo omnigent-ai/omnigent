@@ -118,7 +118,9 @@ def canonical_link(link: Mapping[str, Any]) -> str | None:
             query = f"?{parts.query}" if parts.query else ""
             # A port other than the scheme's default names a different service.
             default_port = _DEFAULT_PORTS[parts.scheme.lower()]
-            netloc = host if port in (None, default_port) else f"{host}:{port}"
+            # urlsplit drops an IPv6 host's brackets; restore them so a port stays distinct.
+            bracketed = f"[{host}]" if ":" in host else host
+            netloc = bracketed if port in (None, default_port) else f"{bracketed}:{port}"
             canonical = f"{netloc}{path}{query}"
     if len(canonical) > MAX_CANONICAL_LINK_CHARS:
         raise InvalidLinkError("link is too long")
