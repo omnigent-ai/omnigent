@@ -1871,14 +1871,14 @@ def create_runner_app(
     ) -> None:
         background_agents: list[dict[str, object]] = []
         if status == "waiting":
-            # Claude's background-agent hold. A server known to predate
+            # Claude's background-agent hold. A server that may predate
             # ``waiting`` gets ``idle``: the turn ended, and ``running`` would
-            # hold every follow-up behind Steer. An unknown version still gets
-            # ``waiting``, since the deduplicated edge isn't sent again once
-            # the version probe lands.
-            if _server_version is not None and not _version_supports_waiting_status(
-                _server_version
-            ):
+            # hold every follow-up behind Steer. An unknown version is treated
+            # the same way, since a pre-0.3.0 server 500s its session reads on
+            # ``waiting``. Current servers always name their version in the
+            # session-init envelope, so only a legacy server whose probe failed
+            # lands here.
+            if _server_version is None or not _version_supports_waiting_status(_server_version):
                 status = "idle"
             else:
                 background_agents = resource_registry.session_background_agents(session_id)

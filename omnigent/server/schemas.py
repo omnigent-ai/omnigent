@@ -2254,13 +2254,13 @@ class SessionResponse(BaseModel):
         executing), ``"waiting"`` (loop parked on background
         work / sub-agents), or ``"failed"`` (terminal failure).
         Read paths collapse ``"waiting"`` -> ``"running"``, because headless
-        clients poll this field to tell when a run is done. The one exception
-        is a claude-native turn that ended with a background agent still
-        running: it reads ``"waiting"`` with :attr:`background_agents` set,
-        so a reload can show the agent while the composer stays free.
+        clients poll this field to tell when a run is done; the literal stays
+        a superset so a server that forwards the raw status never 500s.
     :param background_agents: Background agents a finished claude-native
-        turn left running, while :attr:`status` is ``"waiting"``, so a
-        reload can name them. ``None`` otherwise.
+        turn left running, while the session waits on them. :attr:`status`
+        still reads ``"running"`` then, so older clients keep treating the run
+        as unfinished; clients that know this field show the session as
+        waiting, with its composer free. ``None`` otherwise.
     :param background_task_count: Background shells (claude-native) still
         running as of the last status edge, so a reload re-shows "N shells
         still running" even though the session has settled to ``"idle"``.

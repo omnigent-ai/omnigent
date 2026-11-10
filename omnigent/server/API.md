@@ -448,14 +448,15 @@ Fields:
 
   status (string, required)
     Current lifecycle state: `"idle"`, `"running"`, `"waiting"`, or
-    `"failed"`. Reads `"waiting"` only for a claude-native turn that ended
-    with a background agent still running; any other `waiting` reads
-    `"running"`, which headless clients treat as unfinished.
+    `"failed"`. A live `waiting` reads `"running"` here, which headless
+    clients treat as unfinished.
 
   background_agents (array, optional)
-    Background agents that claude-native turn left running, while
-    `status` is `"waiting"`. Each entry has the same shape as a
-    `background_tasks` entry. Omitted otherwise.
+    Background agents a claude-native turn left running after it ended,
+    while the session waits on them. `status` still reads `"running"`
+    then, so older clients keep waiting; clients that know this field
+    show the session as waiting, with its composer free. Each entry has
+    the same shape as a `background_tasks` entry. Omitted otherwise.
 
   created_at (integer, required)
     Unix timestamp (seconds) when the session was created.

@@ -37,14 +37,15 @@ def test_version_supports_waiting_status(server_version: str, expected: bool) ->
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("server_version", "expected_status"),
-    [("0.21.0", "waiting"), (None, "waiting"), ("0.2.0", "idle")],
+    [("0.21.0", "waiting"), (None, "idle"), ("0.2.0", "idle"), ("source", "idle")],
 )
 async def test_background_agent_waiting_edge_names_its_agents(
     monkeypatch: pytest.MonkeyPatch, server_version: str | None, expected_status: str
 ) -> None:
-    """A Claude background-agent ``waiting`` edge names the agents; too old a server gets idle.
+    """A background-agent ``waiting`` edge names the agents; old or unknown servers get idle.
 
-    ``running`` would hold follow-ups behind Steer although the turn ended.
+    ``running`` would hold follow-ups behind Steer although the turn ended, and
+    a pre-0.3.0 server 500s its session reads on ``waiting``.
     """
     import asyncio
 

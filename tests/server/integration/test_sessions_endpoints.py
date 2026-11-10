@@ -1518,15 +1518,17 @@ async def test_a_session_unbound_from_its_runner_lists_no_background_work(
     assert row["background_work_running"] is False
 
 
-async def test_snapshot_reads_waiting_only_for_a_background_agent_hold(
+async def test_snapshot_names_the_agents_of_a_background_agent_hold(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    A Claude turn waiting on its background agent reads ``waiting`` and names the agent.
+    A Claude turn waiting on its background agent reads ``running`` and names the agent.
 
-    Any other ``waiting`` (an SDK orchestrator parked on sub-agents) still reads
-    ``running``: headless ``-p`` clients poll the snapshot to tell when a run ends.
-    The list row collapses both to ``running``.
+    Released headless ``-p`` clients stop polling on any status but ``running`` /
+    ``launching``, so the hold keeps the collapsed status and signals itself only
+    through the additive ``background_agents`` field. Any other ``waiting`` (an
+    SDK orchestrator parked on sub-agents) names no agents. The list row reads
+    ``running`` for both.
     """
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.schemas import BackgroundTaskInfo
@@ -1544,7 +1546,7 @@ async def test_snapshot_reads_waiting_only_for_a_background_agent_hold(
         sessions_module._publish_status(sid, "waiting")
         parked = (await client.get(f"/v1/sessions/{sid}")).json()
 
-        assert held["status"] == "waiting"
+        assert held["status"] == "running"
         assert [(a["id"], a["description"]) for a in held["background_agents"]] == [
             ("a1", "Audit")
         ]

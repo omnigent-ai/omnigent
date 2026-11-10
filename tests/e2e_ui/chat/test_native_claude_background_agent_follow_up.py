@@ -149,6 +149,16 @@ def _launch_background_agent(page: Page, mock_llm_server_url: str, nonce: str) -
     )
 
 
+def _waits_on_background_agent(base_url: str, session_id: str) -> bool:
+    """Whether the snapshot reports the background-agent hold.
+
+    The status stays the collapsed ``running`` that released headless ``-p``
+    clients poll for; the hold shows only in ``background_agents``.
+    """
+    snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10).json()
+    return snapshot.get("status") == "running" and bool(snapshot.get("background_agents"))
+
+
 def _session_status(base_url: str, session_id: str) -> Any:
     return httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10).json().get("status")
 
@@ -226,7 +236,7 @@ def test_follow_up_after_background_agent_launch_settles_and_delivers_next_messa
         "Background agent running", timeout=_SETTLE_TIMEOUT_MS
     )
     poll_until(
-        lambda: _session_status(base_url, session_id) == "waiting",
+        lambda: _waits_on_background_agent(base_url, session_id),
         timeout_s=_MOCK_REQUEST_TIMEOUT_S,
         interval_s=0.2,
     )
@@ -289,6 +299,8 @@ def test_blocked_stop_keeps_working_until_claude_stops_with_the_agent_running(
     expect(page.get_by_test_id("composer-queued-strip")).to_be_visible(timeout=_SETTLE_TIMEOUT_MS)
     assert not _user_text_seen(mock_llm_server_url, queued_token)
     assert _session_status(base_url, session_id) == "running"
+    # A hold would also read ``running``; the continuation must not look like one.
+    assert not _waits_on_background_agent(base_url, session_id)
 
     # The background agent's request stays held; only the continuation resumes.
     poll_until(

@@ -1446,7 +1446,8 @@ def _build_session_response(
     :param background_tasks: Per-shell detail for that tally, so a reload can
         restore it. ``None`` when none are tracked.
     :param background_agents: Background agents a finished claude-native turn
-        left running, for a ``"waiting"`` *status*. ``None`` otherwise.
+        left running while its session waits on them (the snapshot *status*
+        still reads ``"running"``). ``None`` otherwise.
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
@@ -1542,7 +1543,7 @@ def _build_session_response(
         agent_id=conv.agent_id,
         agent_name=agent_name,
         status=status,
-        background_agents=background_agents if status == "waiting" else None,
+        background_agents=background_agents or None,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
         created_at=conv.created_at,
@@ -14102,20 +14103,19 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
-    snapshot_status: Literal["idle", "running", "waiting", "failed"] = status
-    background_agents = _session_background_agents_cache.get(session_id)
-    # Only a claude-native turn waiting on its background agent reads
-    # ``waiting``: headless clients treat a collapsed ``running`` as unfinished.
-    if (
-        status == "running"
-        and background_agents
-        and _session_status_cache.get(session_id) == "waiting"
-    ):
-        snapshot_status = "waiting"
+    # A claude-native turn waiting on its background agent keeps the collapsed
+    # ``running`` status: released headless ``-p`` clients stop polling on any
+    # other value and would return before the agent's result. The agents ride
+    # alongside, and clients that know the field read the session as waiting.
+    background_agents = (
+        _session_background_agents_cache.get(session_id)
+        if status == "running" and _session_status_cache.get(session_id) == "waiting"
+        else None
+    )
     response = _build_session_response(
         conv,
         items,
-        snapshot_status,
+        status,
         permission_level,
         side_chat_sealed=await _codex_side_chat_fork_sealed(conv, conv_store),
         background_agents=background_agents,
