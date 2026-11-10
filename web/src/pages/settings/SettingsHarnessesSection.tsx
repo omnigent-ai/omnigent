@@ -31,8 +31,7 @@ import {
   type Host,
 } from "@/hooks/useHosts";
 import { ApiError } from "@/lib/sessionsApi";
-import { INVENTORY_HARNESS_IDS } from "@/hooks/useHarnessInventory";
-import { BRAND_HARNESSES } from "@/components/onboarding/harnessBrand";
+import { INVENTORY_HARNESS_IDS, INVENTORY_HARNESSES } from "@/hooks/useHarnessInventory";
 import {
   HARNESS_CREDENTIAL_COPY,
   harnessInstallableOnHost,
@@ -757,7 +756,7 @@ function HarnessDetail({
     </div>
   ) : null;
   // The host inventory only covers these families' MCP servers, skills, and plugins.
-  const family = BRAND_HARNESSES.find((f) => INVENTORY_HARNESS_IDS[f] === entry.harness);
+  const family = INVENTORY_HARNESSES.find((f) => INVENTORY_HARNESS_IDS[f] === entry.harness);
   if (host && family && (status.ready || canFix)) {
     return (
       <HarnessCatalog

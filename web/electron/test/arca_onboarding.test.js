@@ -25,7 +25,7 @@ function setup(child, options = {}) {
 }
 
 describe("Arca onboarding setup", () => {
-  it("uses a remote TTY and Companion browser without changing ordinary connection arguments", () => {
+  it("uses a remote TTY and the sign-in browser without changing ordinary connection arguments", () => {
     const url = "https://account.databricks.com/omnigent?o=123";
     const args = buildSetupArgs(url);
     assert.equal(args[0], "ssh");
