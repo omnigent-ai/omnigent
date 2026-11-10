@@ -13935,18 +13935,27 @@ async def test_external_error_item_model_unavailable_card_live_and_after_reload(
             assert shown.get(field) == value, (field, shown)
 
 
+_CODEX_CONTEXT_NATIVE_OUTPUT = (
+    "Codex ran out of room in the model's context window. "
+    "Start a new thread or clear earlier history before retrying."
+)
+
+
 @pytest.mark.parametrize(
     "wire_output,reauth_required,expected_code",
     [
-        (False, False, "native_turn_error"),
-        (True, False, "context_length_exceeded"),
-        (True, True, "codex_reauth_required"),
+        (None, False, "native_turn_error"),
+        (_CODEX_CONTEXT_NATIVE_OUTPUT, False, "context_length_exceeded"),
+        (_CODEX_CONTEXT_NATIVE_OUTPUT, True, "codex_reauth_required"),
+        (True, False, "native_turn_error"),
+        ({"message": _CODEX_CONTEXT_NATIVE_OUTPUT}, False, "native_turn_error"),
+        ("   ", False, "native_turn_error"),
     ],
 )
 async def test_codex_context_code_requires_native_wire_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
-    wire_output: bool,
+    wire_output: object,
     reauth_required: bool,
     expected_code: str,
 ) -> None:
@@ -13957,10 +13966,7 @@ async def test_codex_context_code_requires_native_wire_output(
         client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
     )
     session = await _create_session(client, agent["id"])
-    detail = (
-        "Codex ran out of room in the model's context window. "
-        "Start a new thread or clear earlier history before retrying."
-    )
+    detail = _CODEX_CONTEXT_NATIVE_OUTPUT
     stored = await client.post(
         f"/v1/sessions/{session['id']}/events",
         json={
@@ -13983,8 +13989,8 @@ async def test_codex_context_code_requires_native_wire_output(
         "error_code": "context_length_exceeded",
         "reauth_required": reauth_required,
     }
-    if wire_output:
-        data["output"] = detail
+    if wire_output is not None:
+        data["output"] = wire_output
     published.clear()
     response = await client.post(
         f"/v1/sessions/{session['id']}/events",

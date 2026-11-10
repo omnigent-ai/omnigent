@@ -2636,6 +2636,8 @@ def register_events_routes(
                     agent_store=agent_store,
                     agent_cache=agent_cache,
                 )
+                wire_output = body.data.get("output")
+                has_wire_output = isinstance(wire_output, str) and bool(wire_output.strip())
                 # Native forwarders share the output and reauth fields.
                 # Codex-specific codes require a resolved Codex session.
                 if harness == "codex-native" and data.get("reauth_required") is True:
@@ -2643,11 +2645,10 @@ def register_events_routes(
                 elif (
                     harness == "codex-native"
                     and data.get("error_code") == "context_length_exceeded"
-                    and isinstance(body.data.get("output"), str)
-                    and body.data["output"].strip()
+                    and has_wire_output
                 ):
                     error_code = "context_length_exceeded"
-                elif harness == "codex-native" and body.data.get("output"):
+                elif harness == "codex-native" and has_wire_output:
                     error_code = "codex_turn_error"
                 else:
                     error_code = "native_turn_error"
