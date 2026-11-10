@@ -4,12 +4,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSharing, useSetSharing } from "@/hooks/useSharing";
 import { AdminGeneralPage } from "./AdminGeneralPage";
 
-const mocks = vi.hoisted(() => ({ isAdmin: true, singleUser: false, nestedAgents: true }));
+const mocks = vi.hoisted(() => ({
+  isAdmin: true,
+  singleUser: false,
+  nestedAgents: true,
+  advisor: undefined as { can_manage_workspace: boolean } | undefined,
+}));
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => mocks.isAdmin }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ single_user: mocks.singleUser, sibling_sessions: mocks.nestedAgents }),
 }));
 vi.mock("@/hooks/useSharing", () => ({ useSharing: vi.fn(), useSetSharing: vi.fn() }));
+vi.mock("@/hooks/useProactiveAgentSettings", () => ({
+  useProactiveAgentSettings: () => ({
+    available: mocks.advisor !== undefined,
+    settings: mocks.advisor,
+  }),
+}));
+vi.mock("@/components/ProactiveAgentSettingControl", () => ({
+  ProactiveAgentSettingControl: ({ scope }: { scope: string }) => (
+    <div data-testid={`advisor-control-${scope}`} />
+  ),
+}));
 const mutate = vi.fn();
 
 function renderPage() {
@@ -25,6 +41,7 @@ beforeEach(() => {
   mocks.isAdmin = true;
   mocks.singleUser = false;
   mocks.nestedAgents = true;
+  mocks.advisor = undefined;
   vi.mocked(useSharing).mockReturnValue({
     data: {
       sibling_session_destinations: "any_host",
@@ -41,6 +58,20 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("AdminGeneralPage", () => {
+  it("shows the workspace Omni Advisor switch when the server offers it", () => {
+    mocks.nestedAgents = false;
+    mocks.advisor = { can_manage_workspace: true };
+    renderPage();
+    expect(screen.getByTestId("advisor-control-workspace")).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Nested agent destinations" })).toBeNull();
+  });
+
+  it("hides the Omni Advisor switch from callers who cannot manage it", () => {
+    mocks.advisor = { can_manage_workspace: false };
+    renderPage();
+    expect(screen.queryByTestId("advisor-control-workspace")).toBeNull();
+  });
+
   it.each(["disabled", "non-admin"])("does not expose destinations when %s", (mode) => {
     mocks.nestedAgents = mode !== "disabled";
     mocks.isAdmin = mode !== "non-admin";

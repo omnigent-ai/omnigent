@@ -15,7 +15,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // tests also use the real ApprovalCard; other prompts use an Accept-button stub.
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { InboxPage } from "./InboxPage";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -25,6 +25,9 @@ import type { ComponentProps } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
+import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
+import type { Suggestion } from "@/lib/proactiveInbox";
+import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
 import { resetLocalElicitationResolutionsForTests } from "@/lib/localElicitationResolutions";
 import * as sessionsApi from "@/lib/sessionsApi";
@@ -82,6 +85,16 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useConversations: vi.fn(),
 }));
 vi.mock("@/hooks/useAutomationInbox", () => ({ useAutomationInbox: vi.fn() }));
+vi.mock("@/hooks/useProactiveInbox", () => ({ useProactiveInbox: vi.fn() }));
+const advisor = vi.hoisted(() => ({
+  settings: { enabled: true } as { enabled: boolean } | undefined,
+}));
+vi.mock("@/hooks/useProactiveAgentSettings", () => ({
+  useProactiveAgentSettings: () => ({
+    available: advisor.settings !== undefined,
+    settings: advisor.settings,
+  }),
+}));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
 // Real exports (ApiError, codes) so failure handling sees genuine error types.
 vi.mock("@/lib/sessionsApi", async (importActual) => ({
@@ -160,11 +173,21 @@ function renderPage(
         <SidebarDataProvider>
           <MemoryRouter>
             <InboxPage />
+            <LocationProbe />
           </MemoryRouter>
         </SidebarDataProvider>
       </CapabilitiesProvider>
     </QueryClientProvider>,
   );
+}
+
+let lastLocation = { pathname: "", search: "" };
+
+/** Records where the page navigated, e.g. to the new-session composer. */
+function LocationProbe() {
+  const location = useLocation();
+  lastLocation = { pathname: location.pathname, search: location.search };
+  return null;
 }
 
 function automationInboxStub(overrides: Record<string, unknown> = {}) {
@@ -180,8 +203,27 @@ function automationInboxStub(overrides: Record<string, unknown> = {}) {
   } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>;
 }
 
+function proactiveInboxStub(overrides: Record<string, unknown> = {}) {
+  return {
+    items: [],
+    unreadCount: 0,
+    unreadCountCapped: false,
+    isLoading: false,
+    isError: false,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
+    refetch: vi.fn(),
+    update: vi.fn(),
+    ...overrides,
+  } as unknown as ReturnType<typeof proactiveInboxHook.useProactiveInbox>;
+}
+
 beforeEach(() => {
+  advisor.settings = { enabled: true };
+  window.localStorage.removeItem("omnigent:inbox-filter");
   vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(automationInboxStub());
+  vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(proactiveInboxStub());
   vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([]));
   vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(commentInboxStub());
   vi.mocked(sessionsApi.getSession).mockResolvedValue({
@@ -1670,5 +1712,185 @@ describe("automation failures", () => {
       expect(fetchNextPage).toHaveBeenCalledOnce();
     }
     if (state !== "continuation") expect(screen.queryByText(/Nothing waiting/)).toBeNull();
+  });
+});
+
+describe("agent suggestions", () => {
+  function suggestion(overrides: Partial<Suggestion> = {}): Suggestion {
+    return {
+      id: "sug_1",
+      kind: "followup",
+      title: "Ramp up the flag",
+      bodyMd: "The PR merged yesterday.",
+      links: [
+        { type: "pr", ref: "https://github.com/acme/app/pull/7", label: "PR 7" },
+        { type: "session", ref: "sess_src" },
+      ],
+      actions: [
+        { label: "Ramp to 50%", prompt: "Ramp the flag to 50%" },
+        { label: "Check metrics", prompt: "Check the flag's metrics" },
+      ],
+      media: [],
+      sourceSessionId: "sess_src",
+      state: "unread",
+      resolution: "none",
+      createdAt: 1_700_000_000,
+      ...overrides,
+    };
+  }
+
+  function stub(overrides: Record<string, unknown>) {
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(proactiveInboxStub(overrides));
+  }
+
+  it("marks a suggestion read on expand and shows its evidence", () => {
+    const update = vi.fn();
+    stub({ items: [suggestion()], unreadCount: 1, update });
+    renderPage();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+
+    expect(update).toHaveBeenCalledWith("sug_1", { state: "read" });
+    expect(screen.getByRole("link", { name: "PR 7" })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/7",
+    );
+    expect(screen.getByRole("link", { name: "Open session" })).toHaveAttribute(
+      "href",
+      "/c/sess_src",
+    );
+  });
+
+  it("lists a suggestion's links under Source", () => {
+    stub({ items: [suggestion()], unreadCount: 1 });
+    renderPage();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+
+    const source = screen.getByRole("region", { name: "Source" });
+    expect(within(source).getByRole("link", { name: "PR 7" })).toBeInTheDocument();
+  });
+
+  it("filters to Omni Advisor suggestions only", () => {
+    stub({ items: [suggestion()], unreadCount: 1 });
+    renderPage();
+
+    selectTab("Omni Advisor");
+
+    expect(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    ).toBeInTheDocument();
+    expect(vi.mocked(proactiveInboxHook.useProactiveInbox).mock.lastCall?.[1]).toEqual([
+      "unread",
+      "read",
+    ]);
+    stub({ items: [] });
+    selectTab("All");
+    selectTab("Omni Advisor");
+    expect(screen.getByText("No suggestions from Omni Advisor")).toBeInTheDocument();
+  });
+
+  it("has no Omni Advisor tab while it is off for the viewer", () => {
+    window.localStorage.setItem("omnigent:inbox-filter", "advisor");
+    advisor.settings = { enabled: false };
+    renderPage();
+
+    expect(screen.queryByRole("tab", { name: "Omni Advisor" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "All" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("keeps an expanded suggestion on the Unread tab after it is marked read", () => {
+    const item = suggestion();
+    const update = vi.fn();
+    stub({ items: [item], unreadCount: 1, update });
+    renderPage();
+    selectTab("Unread");
+    expect(vi.mocked(proactiveInboxHook.useProactiveInbox).mock.lastCall?.[1]).toEqual(["unread"]);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    // The hook drops the read item from the unread-only list.
+    stub({ items: [], unreadCount: 0, update });
+    selectTab("All");
+    selectTab("Unread");
+
+    expect(screen.getByText("The PR merged yesterday.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ramp to 50%" })).toBeInTheDocument();
+
+    // Collapsing lets it go while the unread-only list is still reloading.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
+  });
+
+  it("shows a suggestion load failure instead of an empty Inbox", () => {
+    const refetch = vi.fn();
+    stub({ isError: true, refetch });
+    renderPage();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load suggestions.");
+    expect(screen.queryByText("Nothing waiting on you")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry suggestions" }));
+    expect(refetch).toHaveBeenCalledOnce();
+  });
+
+  it("takes an agent action and opens the composer with its prompt", () => {
+    const update = vi.fn();
+    stub({ items: [suggestion({ state: "read" })], update });
+    renderPage();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Check metrics" }));
+
+    expect(update).toHaveBeenCalledWith("sug_1", {
+      resolution: "action_taken",
+      resolutionAction: 1,
+    });
+    const token = new URLSearchParams(lastLocation.search).get(NEW_SESSION_HANDOFF_PARAM);
+    expect(lastLocation.pathname).toBe("/");
+    expect(peekNewSessionHandoff(token)).toEqual({ text: "Check the flag's metrics", files: [] });
+  });
+
+  it("dismisses with a reason from the menu", async () => {
+    const update = vi.fn();
+    stub({ items: [suggestion({ state: "read" })], update });
+    renderPage();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Dismiss/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Useful, no action needed" }));
+
+    expect(update).toHaveBeenCalledWith("sug_1", { resolution: "useful" });
+  });
+
+  it("offers the next page of suggestions", () => {
+    const fetchNextPage = vi.fn();
+    stub({ items: [suggestion({ state: "read" })], hasNextPage: true, fetchNextPage });
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more suggestions" }));
+
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps suggestions off the Awaiting response tab", () => {
+    stub({ items: [suggestion()] });
+    renderPage();
+
+    selectTab("Awaiting response");
+    expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
   });
 });
