@@ -316,6 +316,8 @@ import {
   useSandboxModelOptions,
   useSandboxUnsupportedAgents,
 } from "@/hooks/useSandboxModelOptions";
+import { useSavedSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
+import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
@@ -586,12 +588,11 @@ export function ConnectHostInstructions({
   /** After the desktop shell connects a machine over SSH, with its host id. */
   onSshConnected?: (hostId: string) => void;
 }) {
-  // Databricks/internal deployments add the "Databricks Lakebox" connect
-  // path; OSS deployments (where the lakebox launcher is excluded) show
-  // only the plain `omni host` command. Driven by /v1/info.
+  // Managed servers add the Lakebox connect path. Other builds show only the
+  // plain `omni host` command. Driven by /v1/info.
   const info = useServerInfo();
-  // "loading" before the boot probe resolves → treat as OSS (no Databricks
-  // hints) until known, so the clean UI shows first and lakebox never flashes.
+  // "loading" counts as no managed hints until the probe resolves, so the
+  // Lakebox option never flashes in.
   const databricksFeatures = info !== "loading" && info.databricks_features;
   const quotedServerUrl = quoteShellArgument(serverUrl);
   const sshConnectAvailable = useSshConnectAvailable();
@@ -2693,8 +2694,8 @@ function NewChatLandingContent({
   // consumed in the menu's onOpenChange) — connecting while the menu is open
   // looks janky. A ref so the close handler sees it synchronously.
   const pendingConnectRef = useRef(false);
-  // Arca (Databricks-internal): the desktop shell reports the MDM flag; when
-  // set, the picker offers connecting the user's Arca dev instance as a host.
+  // The desktop shell reports whether Arca is enabled. When it is, the picker
+  // offers connecting the user's Arca instance as a host.
   const [arcaEnabled, setArcaEnabled] = useState(false);
   const [arcaPreviewRecovery, setArcaPreviewRecovery] = useState(false);
   const [connectingArca, setConnectingArca] = useState(false);
@@ -3005,9 +3006,8 @@ function NewChatLandingContent({
     };
   }, []);
 
-  // Desktop feature gates (MDM-managed). Read once per mount — the shell
-  // re-reads macOS preferences on every call, so reopening the composer is
-  // enough to pick up a profile change.
+  // Desktop feature gates. Read once per mount, so reopening the composer
+  // picks up a change.
   useEffect(() => {
     if (!isElectronShell()) return;
     let cancelled = false;
@@ -3133,7 +3133,7 @@ function NewChatLandingContent({
         setSandboxProvider(defaultSandboxProvider());
         return;
       }
-      // Sandbox no longer offered (e.g. an OSS server) — fall through.
+      // Sandbox no longer offered (e.g. the server dropped it) — fall through.
     } else if (lastChoice) {
       // Restore offline hosts too; availability gates creation, not selection.
       // Wait for the list so a remembered host cannot lose to a default.
@@ -3529,6 +3529,16 @@ function NewChatLandingContent({
   // A harness the default catalog cannot serve keeps its ordinary picker.
   const sandboxDefaultModelsEnabled =
     sandboxDefaultModelsOffered && sandboxModels.data?.status !== "unconfigured";
+  // The agent's last sandbox session catalog is more accurate than the gateway preview.
+  const savedSandboxCatalog = useSavedSandboxSessionCatalog(
+    sandboxDefaultModelsOffered ? previewSandboxProvider : null,
+    previewHarness,
+    effectiveAgentId,
+  );
+  const sandboxSessionCatalog =
+    sandboxDefaultModelsEnabled && sandboxModels.data?.status !== "unsupported"
+      ? savedSandboxCatalog
+      : undefined;
   const sandboxInferenceConfigured =
     sandboxPreviewEnabled && sandboxModels.data?.configured === true;
   const sandboxHasModelCatalog = sandboxInferenceConfigured || sandboxDefaultModelsEnabled;
@@ -3548,28 +3558,37 @@ function NewChatLandingContent({
           ? (sandboxModels.data.error ?? "No usable models are available for this harness.")
           : null))
       : null;
-  const sandboxDefaultCatalogError = sandboxDefaultModelsEnabled
-    ? (sandboxModels.error?.message ??
-      (sandboxModels.data !== undefined &&
-      ["unavailable", "empty"].includes(sandboxModels.data.status)
-        ? (sandboxModels.data.error ?? "Could not load AI Gateway models.")
-        : null))
-    : null;
+  const sandboxDefaultCatalogError =
+    sandboxDefaultModelsEnabled && sandboxSessionCatalog === undefined
+      ? (sandboxModels.error?.message ??
+        (sandboxModels.data !== undefined &&
+        ["unavailable", "empty"].includes(sandboxModels.data.status)
+          ? (sandboxModels.data.error ?? "Could not load AI Gateway models.")
+          : null))
+      : null;
   const sandboxCatalog = useMemo(
     () =>
       sandboxDefaultModelsEnabled
-        ? sandboxDefaultCatalogError
-          ? []
-          : (sandboxModels.data?.models ?? [])
+        ? (sandboxSessionCatalog ??
+          (sandboxDefaultCatalogError ? [] : (sandboxModels.data?.models ?? [])))
         : sandboxInferenceConfigured
           ? sandboxModels.data!.models
           : undefined,
     [
       sandboxDefaultModelsEnabled,
+      sandboxSessionCatalog,
       sandboxDefaultCatalogError,
       sandboxInferenceConfigured,
       sandboxModels.data,
     ],
+  );
+  // Saved session rows keep the harness's in-session effort ladder.
+  const sandboxEffortLevels = useCallback(
+    (models: readonly NativeModelOption[], model: string | null | undefined): readonly string[] =>
+      sandboxSessionCatalog !== undefined
+        ? (nativeEffortOptions(previewHarness, models, model) ?? []).map((option) => option.value)
+        : codexEffortLevelsForModel(models, model),
+    [sandboxSessionCatalog, previewHarness],
   );
   const claudeModelOptions = useMemo(
     () =>
@@ -4002,7 +4021,7 @@ function NewChatLandingContent({
   const visiblePermissionRow =
     pickerLoading && !interactiveWhileLoading ? cachedPermission?.row : permissionConfigRow;
   const pickerEffortOptions = sandboxDefaultModelsEnabled
-    ? codexEffortLevelsForModel(pickerModelOptions, pickedModel).map((value) => ({
+    ? sandboxEffortLevels(pickerModelOptions, pickedModel).map((value) => ({
         value,
         label: normalizeEffortLabel(value),
       }))
@@ -4060,9 +4079,10 @@ function NewChatLandingContent({
       : picked || codexModelOptions.find((option) => option.isDefault)?.id;
     const effort =
       (sandboxDefaultModelsEnabled || selectedNativeHarness === "codex-native") &&
-      !codexEffortLevelsForModel(
-        sandboxDefaultModelsEnabled ? pickerModelOptions : codexModelOptions,
-        effortModel,
+      !(
+        sandboxDefaultModelsEnabled
+          ? sandboxEffortLevels(pickerModelOptions, effortModel)
+          : codexEffortLevelsForModel(codexModelOptions, effortModel)
       ).includes(pickedEffort)
         ? ""
         : pickedEffort;
@@ -4628,7 +4648,7 @@ function NewChatLandingContent({
         : saved.model;
     const model = sandboxCatalog?.find((row) => row.id === candidate);
     setPickedModel(model?.id ?? "");
-    const effortLevels = codexEffortLevelsForModel(sandboxCatalog ?? [], model?.id);
+    const effortLevels = sandboxEffortLevels(sandboxCatalog ?? [], model?.id);
     const effortCandidate =
       !userPickedEffortRef.current &&
       projectDefaultEffort != null &&
@@ -4643,6 +4663,7 @@ function NewChatLandingContent({
     previewHarness,
     effectiveAgentId,
     sandboxCatalog,
+    sandboxEffortLevels,
     pickerEdits,
     projectDefaultModel,
     projectDefaultEffort,
@@ -5769,11 +5790,9 @@ function NewChatLandingContent({
     }
   }
 
-  // Connect the user's Arca dev instance (Databricks-internal sandbox) as a
-  // host, then select it. The bridge runs `arca ssh … isaac omni host
-  // --background` and resolves once the remote daemon started; the daemon then
-  // registers over its own tunnel moments later, so we poll the host list
-  // briefly to pick the host that newly came online.
+  // Connect the user's Arca instance as a host, then select it. The bridge
+  // resolves once the remote daemon starts. The daemon registers a moment
+  // later, so poll the host list briefly for the host that came online.
   async function connectArca() {
     if (connectingArca) return;
     setConnectingArca(true);
@@ -5819,7 +5838,7 @@ function NewChatLandingContent({
         });
         const fresh = hostList.find((h) => h.status === "online" && !onlineBefore.has(h.host_id));
         if (fresh) {
-          // Remember which host is the Arca box so the picker can tag it.
+          // Remember which host is the Arca instance so the picker can tag it.
           writeArcaHostId(fresh.host_id);
           selectHost(fresh.host_id);
           return;
@@ -6428,6 +6447,14 @@ function NewChatLandingContent({
         // New Chat is the only create path that can produce a managed sandbox;
         // interactionTelemetry completes/settles the span once the session runs.
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
+        if (sandboxSelected) {
+          const launchedRow = sandboxCatalog?.find((row) => row.id === normalizedModelOverride);
+          markSandboxLaunch(created.id, {
+            model: normalizedModelOverride ?? null,
+            effort: normalizedReasoningEffort ?? null,
+            modelLabel: launchedRow ? nativeModelLabel(launchedRow) : null,
+          });
+        }
       }
       // Persist the configuration that actually launched. Modal Save updates
       // storage eagerly so an immediate Send cannot observe stale state; this
