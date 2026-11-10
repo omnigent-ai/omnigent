@@ -93,6 +93,8 @@ the header menu), and each place is a separate entry point.
   in the sidebar.
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
+  Agents file sessions the same way with `sys_session_move` (see
+  [session orchestration](session-orchestration.md)).
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
 - `project-show-more`: an expanded project folder lists its five newest

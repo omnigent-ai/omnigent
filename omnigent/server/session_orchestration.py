@@ -63,8 +63,8 @@ def require_owned_session(
             # public grant, cannot add input, so they cannot steer other sessions.
             if _shared_with_editors(current.id, user_id, permissions):
                 raise OmnigentError(
-                    "Sessions shared with edit access cannot send messages or launch "
-                    "independent sessions",
+                    "Sessions shared with edit access cannot send messages, launch "
+                    "independent sessions or move other sessions",
                     code=ErrorCode.FORBIDDEN,
                 )
             if current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
@@ -75,6 +75,28 @@ def require_owned_session(
         assert session is not None
         return session
     raise OmnigentError("Session is not owned or available", code=ErrorCode.FORBIDDEN)
+
+
+def require_private_bound_source(
+    request: Request,
+    user_id: str,
+    conversations: ConversationStore,
+    permissions: PermissionStore,
+) -> Conversation:
+    """Resolve the header's source as a private owned session on the caller's runner."""
+    source = require_owned_session(
+        request.headers.get(ORCHESTRATION_SOURCE_HEADER, ""),
+        user_id,
+        conversations,
+        permissions,
+        private=True,
+    )
+    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+    if not token or not source.runner_id or token_bound_runner_id(token) != source.runner_id:
+        raise OmnigentError(
+            "Session orchestration requires the sender's bound runner", code=ErrorCode.FORBIDDEN
+        )
+    return source
 
 
 def require_orchestration_source(
@@ -94,18 +116,7 @@ def require_orchestration_source(
         raise OmnigentError("Messaging other sessions is disabled", code=ErrorCode.FORBIDDEN)
     if not user_id or permissions is None:
         raise OmnigentError("Session orchestration requires ownership", code=ErrorCode.FORBIDDEN)
-    source = require_owned_session(
-        request.headers.get(ORCHESTRATION_SOURCE_HEADER, ""),
-        user_id,
-        conversations,
-        permissions,
-        private=True,
-    )
-    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
-    if not token or not source.runner_id or token_bound_runner_id(token) != source.runner_id:
-        raise OmnigentError(
-            "Session orchestration requires the sender's bound runner", code=ErrorCode.FORBIDDEN
-        )
+    source = require_private_bound_source(request, user_id, conversations, permissions)
     if target_id is not None:
         target = require_owned_session(target_id, user_id, conversations, permissions)
         if source.id == target.id:

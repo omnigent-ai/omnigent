@@ -388,6 +388,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_os_shell",
     "sys_os_write",
     "sys_policy_registry",
+    "sys_project_list",
     "sys_session_close",
     "sys_session_create",
     "sys_session_get_history",

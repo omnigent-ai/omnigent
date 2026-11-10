@@ -63,6 +63,20 @@ MCP independent creation.
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
   kept session starts one worker per match (`docs/AUTOMATIONS.md`).
+- `projects`: `sys_project_list` lists the owner's projects in sidebar order and
+  their own sessions with each one's project, marking the calling session.
+  `sys_session_move` files up to 100 of those sessions into a project by name,
+  creating a missing project, or unfiles them with `""`, through the sidebar's
+  move request. An open sidebar regroups without a reload; a collapsed folder
+  stays collapsed. Moving changes only folder membership,
+  so running sessions, including the caller, keep their turn. Sub-agents follow
+  their parent and a family moves through its representative (`moves_with`);
+  each session gets its own result. An edit-shared caller cannot move sessions,
+  while listing stays an ordinary owner read. `tool_groups.projects: false` drops
+  both tools. Covered by
+  `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_bulk_move_running_sessions`
+  and the browser journeys in
+  `tests/e2e_ui/sessions/test_agent_moves_sessions_to_project.py`.
 - `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
@@ -83,6 +97,9 @@ MCP independent creation.
   Pass `sandbox_provider`, `sandbox_profile_id`, and `sandbox_profile_revision`
   to choose an authorized profile/revision from the
   [provider catalog](../docs/extending/provider_profiles.md).
+- In a session's Chat, ask the agent to list your projects and file some
+  sessions, including itself, into an existing or new project. The sidebar folders
+  update while the agent keeps running.
 - Use the existing Share dialog to share the sender or receiver, then repeat.
   A read-only share of the sender keeps both tools working; an edit share
   refuses them.
@@ -202,6 +219,9 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
 - A fresh managed sandbox is distinct from reusing an existing managed host.
   Even the most permissive setting offers only the clicked session's existing
   managed host; another family's managed host remains unavailable.
+- Project moves skip the source check in no-auth and single-user local mode,
+  where nobody else can hold an edit grant. A move only ever applies to the
+  owner's own sessions; the PATCH remains owner-gated per session and family member.
 - A receiver shared with edit access can continue working but cannot message
   back while shared that way. A read-only share does not stop it.
 - Privacy checks govern these tools. They do not confine arbitrary code holding

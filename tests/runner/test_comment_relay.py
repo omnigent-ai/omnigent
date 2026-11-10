@@ -463,6 +463,8 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_get_info",
         "sys_session_rename",
         "sys_session_message",
+        "sys_project_list",
+        "sys_session_move",
         "ui_open_file",
         "sys_agent_list",
         "sys_agent_get",
