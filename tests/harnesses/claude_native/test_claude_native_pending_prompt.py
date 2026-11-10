@@ -51,6 +51,10 @@ _WRAPPED_EXIT_PLAN_QUESTION = _EXIT_PLAN_QUESTION.replace(
     "switch to default (ask each time) for this session",
     "switch to default (ask each time)\n       for this session",
 )
+_WRAPPED_EXIT_PLAN_TITLE = _EXIT_PLAN_QUESTION.replace("Exit plan mode?", "Exit plan\n mode?")
+_WRAPPED_EXIT_PLAN_EXPLANATION = _EXIT_PLAN_QUESTION.replace(
+    "Claude wants to exit plan mode", "Claude wants to exit\n plan mode"
+)
 
 
 @pytest.fixture
@@ -95,6 +99,8 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
         _EXIT_PLAN_QUESTION,
         _EXIT_PLAN_QUESTION.replace("❯ 1.", "  1.").replace("  2. No", "❯ 2. No"),
         _WRAPPED_EXIT_PLAN_QUESTION,
+        _WRAPPED_EXIT_PLAN_TITLE,
+        _WRAPPED_EXIT_PLAN_EXPLANATION,
     ],
     ids=[
         "question",
@@ -106,6 +112,8 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
         "clipped-plan-yes",
         "clipped-plan-no",
         "clipped-plan-wrapped",
+        "wrapped-plan-title",
+        "wrapped-plan-explanation",
     ],
 )
 @pytest.mark.parametrize("operation", ["message", "settings"])
@@ -136,6 +144,8 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
         _WRAPPED_MULTISELECT,
         _PERMISSION,
         _EXIT_PLAN_QUESTION,
+        _WRAPPED_EXIT_PLAN_TITLE,
+        _WRAPPED_EXIT_PLAN_EXPLANATION,
     ],
     ids=[
         "question",
@@ -144,6 +154,8 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
         "wrapped-submit",
         "permission",
         "clipped-plan",
+        "wrapped-plan-title",
+        "wrapped-plan-explanation",
     ],
 )
 def test_decision_text_above_a_ready_composer_does_not_block_delivery(
@@ -224,8 +236,18 @@ def test_question_appearing_after_readiness_prevents_paste(
         _WRAPPED_SELECT_QUESTION,
         _WRAPPED_MULTISELECT,
         _EXIT_PLAN_QUESTION,
+        _WRAPPED_EXIT_PLAN_TITLE,
+        _WRAPPED_EXIT_PLAN_EXPLANATION,
     ],
-    ids=["question", "wrapped-cancel", "wrapped-select", "wrapped-submit", "clipped-plan"],
+    ids=[
+        "question",
+        "wrapped-cancel",
+        "wrapped-select",
+        "wrapped-submit",
+        "clipped-plan",
+        "wrapped-plan-title",
+        "wrapped-plan-explanation",
+    ],
 )
 def test_question_appearing_during_readiness_does_not_become_a_terminal_timeout(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str

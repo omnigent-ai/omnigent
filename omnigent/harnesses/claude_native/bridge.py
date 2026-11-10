@@ -6422,8 +6422,8 @@ def _user_prompt_visible(pane: str) -> bool:
     # A short pane can clip the plan decision's footer entirely.
     plan_region = "\n".join(lines[rules[-1] + 1 :]) if rules else ""
     plan_exit = re.search(
-        r"(?m)^[ \t]*Exit plan mode\?[ \t]*\n"
-        r"[ \t]*Claude wants to exit plan mode[ \t]*\n"
+        r"(?m)^[ \t]*Exit\s+plan\s+mode\?[ \t]*\n"
+        r"[ \t]*Claude\s+wants\s+to\s+exit\s+plan\s+mode[ \t]*\n"
         r"[ \t]*(?:❯[ \t]*)?1\.[ \t]+Yes\b[\s\S]*?"
         r"^[ \t]*(?:❯[ \t]*)?2\.[ \t]+No[ \t]*$",
         plan_region,
