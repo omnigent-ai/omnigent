@@ -15,6 +15,7 @@ import {
   clearSessionTombstones,
   useArchiveConversation,
   useConversations,
+  useMoveToProject,
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
@@ -662,6 +663,70 @@ describe("SessionUpdatesProvider archive tombstone", () => {
         .pages[0].data.find((row) => row.id === "conv_a"),
     ).toMatchObject({ title: "Late edit", archived: true });
     await waitFor(() => expect(archive.result.current.isSuccess).toBe(true));
+  });
+});
+
+describe("SessionUpdatesProvider move-to-project in flight", () => {
+  it("does not let a stale changed frame move a moving row back to its old project", async () => {
+    let resolvePatch: (value: unknown) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            object: "list",
+            data: [
+              { id: "p_old", name: "Old" },
+              { id: "p_new", name: "New" },
+            ],
+          }),
+        })
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolvePatch = resolve;
+          }),
+        ),
+    );
+    const client = new QueryClient();
+    client.setQueryData(
+      ["projects"],
+      [
+        { id: "p_old", name: "Old" },
+        { id: "p_new", name: "New" },
+      ],
+    );
+    const moving = { ...conv("conv_a"), project_id: "p_old" };
+    client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
+      pages: [{ data: [moving], first_id: "conv_a", last_id: "conv_a", has_more: false }],
+      pageParams: [undefined],
+    });
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const move = renderHook(() => useMoveToProject(), { wrapper });
+    const row = () =>
+      client
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+        .pages[0].data.find((c) => c.id === "conv_a");
+
+    move.result.current.mutate({ id: "conv_a", project: "New" });
+    await waitFor(() => expect(row()?.project_id).toBe("p_new"));
+
+    // Built from a read that predates the PATCH commit.
+    act(() => handler({ type: "changed", items: [{ ...moving, title: "Late edit" }] }));
+    expect(row()).toMatchObject({ project_id: "p_new", title: "Late edit" });
+
+    resolvePatch({
+      ok: true,
+      status: 200,
+      json: async () => ({ ...moving, project_id: "p_new", updated_at: 10 }),
+    });
+    await waitFor(() => expect(move.result.current.isSuccess).toBe(true));
   });
 });
 

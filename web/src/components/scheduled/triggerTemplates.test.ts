@@ -6,6 +6,9 @@ import {
   describeLinearFilter,
   describePagerDutyFilter,
   describeSlackFilter,
+  emptyTriggerFields,
+  jiraAssignee,
+  parseGithubReviewer,
   isTriggerPrompt,
   readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
@@ -16,6 +19,7 @@ import {
   stripScopePrefix,
   splitJqlOrderBy,
   triggerConditionFields,
+  triggerEventDescription,
   triggerFieldsComplete,
   triggerScopeOperators,
   updateTriggerWorkerSettings,
@@ -242,6 +246,26 @@ describe("triggerFieldsComplete", () => {
       { conditions: [{ field: "assignee", operator: "empty", value: "" }] },
       true,
     ],
+    [
+      "a custom field with no name",
+      { conditions: [{ field: "custom_field", operator: "is", name: " ", value: "Backend" }] },
+      false,
+    ],
+    [
+      "a custom field that is empty",
+      { conditions: [{ field: "custom_field", operator: "empty", name: "Team", value: "" }] },
+      true,
+    ],
+    [
+      "an unnamed custom field that is empty",
+      { conditions: [{ field: "custom_field", operator: "empty", name: " ", value: "" }] },
+      false,
+    ],
+    [
+      "a custom field with no name set",
+      { conditions: [{ field: "custom_field", operator: "not_empty", value: "" }] },
+      false,
+    ],
     ["empty instructions", { instructions: "" }, false],
     ["instructions at the cap", { instructions: "x".repeat(MAX_INSTRUCTIONS_CHARS) }, true],
     ["instructions over the cap", { instructions: "x".repeat(MAX_INSTRUCTIONS_CHARS + 1) }, false],
@@ -428,6 +452,133 @@ describe("compileJiraJql", () => {
       }),
     ).toBe('project = "ES" AND (summary ~ "crash" OR priority = Highest)');
   });
+
+  it("compiles custom-field rows by quoted name or cf[] ID", () => {
+    const custom = (operator: TriggerCondition["operator"], name: string, value = "") =>
+      jql("ES", { field: "custom_field", operator, name, value });
+    expect(custom("is", "ES Component", "Backend")).toBe(
+      'project = "ES" AND "ES Component" = "Backend"',
+    );
+    expect(custom("is_not", "ES Component", "Docs")).toBe(
+      'project = "ES" AND ("ES Component" is EMPTY OR "ES Component" != "Docs")',
+    );
+    expect(custom("empty", "Team")).toBe('project = "ES" AND "Team" is EMPTY');
+    expect(custom("not_empty", "Team")).toBe('project = "ES" AND "Team" is not EMPTY');
+    expect(custom("is", " cf[10010] ", "Backend")).toBe('project = "ES" AND cf[10010] = "Backend"');
+    // Quotes copied from a JQL example aren't doubled.
+    expect(custom("is", '"ES Component"', "Backend")).toBe(
+      'project = "ES" AND "ES Component" = "Backend"',
+    );
+  });
+
+  it("escapes custom-field names and values so neither can end the clause", () => {
+    expect(
+      jql("ES", {
+        field: "custom_field",
+        operator: "is",
+        name: 'a" OR x = "1',
+        value: 'b\\" OR y = "2',
+      }),
+    ).toBe('project = "ES" AND "a\\" OR x = \\"1" = "b\\\\\\" OR y = \\"2"');
+    // Only a bare numeric ID skips quoting.
+    expect(
+      jql("ES", { field: "custom_field", operator: "is", name: "cf[1] OR x", value: "v" }),
+    ).toBe('project = "ES" AND "cf[1] OR x" = "v"');
+  });
+});
+
+describe("jiraAssignee", () => {
+  it.each([
+    ["me", "assignee CHANGED TO currentUser()", "assignee = currentUser()"],
+    ["", "assignee CHANGED", "assignee is not EMPTY"],
+    ["Anyone", "assignee CHANGED", "assignee is not EMPTY"],
+    ["unassigned", "assignee CHANGED TO EMPTY", "assignee is EMPTY"],
+    ['al"ice', 'assignee CHANGED TO "al\\"ice"', 'assignee = "al\\"ice"'],
+  ])("compiles %j", (target, change, current) => {
+    expect(jiraAssignee(target)).toEqual({ change, current });
+  });
+
+  it("keeps only tickets still assigned that way", () => {
+    expect(compileJiraJql(fields({ event: "assigned", target: "me" }))).toBe(
+      `${JQL} AND assignee = currentUser()`,
+    );
+  });
+});
+
+describe("change events", () => {
+  const github = (overrides: Partial<TriggerFields> = {}) =>
+    fields({ event: "pr", scope: "acme/app", conditions: [], ...overrides });
+
+  it("defaults the reviewer to me and turns link-back off unless it was changed", () => {
+    const review = withTriggerEvent("github", github(), "review");
+    expect(review).toMatchObject({ event: "review", target: "me", linkBack: false });
+    // Back on an opened event, the reviewer goes and link-back follows its default.
+    const opened = withTriggerEvent("github", review, "pr");
+    expect(opened.linkBack).toBe(true);
+    expect(opened).not.toHaveProperty("target");
+    // An explicit link-back choice survives switching events, even a round trip.
+    const unchecked = github({ linkBack: false, linkBackTouched: true });
+    const roundTrip = withTriggerEvent(
+      "github",
+      withTriggerEvent("github", unchecked, "review"),
+      "pr",
+    );
+    expect(roundTrip.linkBack).toBe(false);
+    const checked = { ...review, linkBack: true, linkBackTouched: true };
+    const checkedRoundTrip = withTriggerEvent(
+      "github",
+      withTriggerEvent("github", checked, "pr"),
+      "review",
+    );
+    expect(checkedRoundTrip.linkBack).toBe(true);
+    expect(withTriggerEvent("github", { ...review, target: "alice" }, "review").target).toBe(
+      "alice",
+    );
+  });
+
+  it("hides fields that the review queue or opened issues can't use", () => {
+    const ids = (event: string) => triggerConditionFields("github", event).map((f) => f.id);
+    expect(ids("review")).toEqual(["label", "author", "qualifiers"]);
+    expect(ids("pr")).toContain("reviewer");
+    expect(ids("issue")).not.toContain("reviewer");
+    expect(ids("any")).not.toContain("reviewer");
+    expect(triggerConditionFields("jira", "assigned").map((f) => f.id)).not.toContain("assignee");
+  });
+
+  it("requires a reviewer but lets an empty assignee mean anyone", () => {
+    expect(triggerFieldsComplete(github({ event: "review", target: " " }), "github")).toBe(false);
+    expect(triggerFieldsComplete(github({ event: "review", target: "me" }), "github")).toBe(true);
+    expect(triggerFieldsComplete(fields({ event: "assigned", target: "" }), "jira")).toBe(true);
+  });
+
+  it.each([
+    ["me", true],
+    ["@octocat", true],
+    ["acme/release-team", true],
+    ["octo cat", false],
+    ["acme/a/b", false],
+    ['"octocat"', false],
+  ])("accepts %j as a GitHub reviewer: %s", (reviewer, valid) => {
+    expect(parseGithubReviewer(reviewer) !== null).toBe(valid);
+    expect(triggerFieldsComplete(github({ event: "review", target: reviewer }), "github")).toBe(
+      valid,
+    );
+    const filter = { field: "reviewer", operator: "is" as const, value: reviewer };
+    expect(triggerFieldsComplete(github({ conditions: [filter] }), "github")).toBe(valid);
+  });
+
+  it("describes when each event fires", () => {
+    expect(triggerEventDescription("github", "issue")).toBe(
+      "Runs your automation on all new issues that match these conditions. Older issues are skipped, even if they are edited to match later.",
+    );
+    expect(triggerEventDescription("github", "review")).toContain("including re-requests");
+    expect(triggerEventDescription("jira", "assigned")).toContain("assigned again later");
+  });
+
+  it("leaves new triggers on their creation event", () => {
+    expect(emptyTriggerFields("github")).not.toHaveProperty("target");
+    expect(emptyTriggerFields("jira").event).toBe("created");
+  });
 });
 
 describe("compileGithubQuery", () => {
@@ -449,6 +600,28 @@ describe("compileGithubQuery", () => {
     );
     expect(query("issue", { field: "assignee", operator: "empty", value: "" })).toBe(
       "repo:acme/app is:issue no:assignee",
+    );
+  });
+
+  it("lists the open, ready review queue of the named reviewer", () => {
+    const review = (target: string) =>
+      compileGithubQuery(fields({ event: "review", scope: "acme/app", conditions: [], target }));
+    expect(review("me")).toBe("repo:acme/app is:pr is:open -is:draft user-review-requested:@me");
+    expect(review("Me")).toBe("repo:acme/app is:pr is:open -is:draft user-review-requested:@me");
+    expect(review("@octocat")).toBe(
+      "repo:acme/app is:pr is:open -is:draft user-review-requested:octocat",
+    );
+    expect(review("acme/maintainers")).toBe(
+      "repo:acme/app is:pr is:open -is:draft team-review-requested:acme/maintainers",
+    );
+  });
+
+  it("compiles reviewer rows on opened pull requests", () => {
+    expect(query("pr", { field: "reviewer", operator: "is", value: "me" })).toBe(
+      "repo:acme/app is:pr user-review-requested:@me",
+    );
+    expect(query("pr", { field: "reviewer", operator: "is_not", value: "acme/bots" })).toBe(
+      "repo:acme/app is:pr -team-review-requested:acme/bots",
     );
   });
 
@@ -589,6 +762,8 @@ describe("renderTriggerPrompt", () => {
   it("renders the Jira manager prompt with the JQL, placement, dedupe title and link", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
     expect(prompt).toContain("On the first run, use one hour ago and nothing pending.");
+    expect(prompt).not.toContain("CHANGED");
+    expect(prompt).not.toContain("Watching since:");
 
     // Only creation fires: an older ticket that's edited or starts matching later doesn't.
     expect(prompt).toContain(
@@ -1014,5 +1189,107 @@ describe("renderTriggerPrompt", () => {
     expect(either).toContain(
       "search for: repo:acme/app created:>=<that time>, oldest first, through every page (for example gh api -X GET search/issues -f q='repo:acme/app created:>=<that time>' -f sort=created -f order=asc -f per_page=100 --paginate).",
     );
+  });
+});
+
+describe("change-event prompts", () => {
+  const review = (target: string) =>
+    renderTriggerPrompt(
+      "github",
+      fields({ event: "review", scope: "acme/app", conditions: [], target, linkBack: false }),
+      CTX,
+    );
+
+  it("reads the review queue and keys each session by its review_requested event", () => {
+    const prompt = review("me");
+    expect(prompt).toContain(
+      "starts one Omnigent session for each new review request that matches.",
+    );
+    expect(prompt).toContain(
+      "Watch: review requests for you on GitHub pull requests matching: repo:acme/app is:pr is:open -is:draft user-review-requested:@me",
+    );
+    expect(prompt).toContain(
+      "gh api -X GET search/issues -f q='repo:acme/app is:pr is:open -is:draft user-review-requested:@me' -f per_page=100 --paginate",
+    );
+    expect(prompt).toContain("so don't add a time to this search");
+    expect(prompt).toContain(
+      "gh api -X GET repos/<owner>/<repo>/issues/<number>/timeline -f per_page=100 --paginate) and find the latest review_requested event whose requested_reviewer login is your own GitHub login",
+    );
+    expect(prompt).toContain(
+      "That review request counts only if the event was created since that time",
+    );
+    expect(prompt).toContain("Leave out review requests made after the time you noted");
+    expect(prompt).toContain('title "GitHub <owner/repo>#<number> review <event id>"');
+    expect(prompt).toContain("whether you started a session for an earlier review request");
+    // Requests from before activation never count, even inside the search overlap.
+    expect(prompt).toContain(
+      'On the first run, use the current time as both the check time and the "Watching since:" time',
+    );
+    expect(prompt).toContain(
+      'Then search from 5 minutes before the check time or from the "Watching since:" time, whichever is later',
+    );
+    expect(prompt).toContain('Above it, repeat the "Watching since: <time>" line unchanged.');
+    expect(prompt).not.toContain("one hour ago");
+    // A queue past the search cap can't be read in full, so the run keeps its check time.
+    expect(prompt).toContain(
+      "if the queue reaches that, start no sessions in this run, keep the previous check time",
+    );
+    expect(prompt).not.toContain("created:>=");
+    expect(prompt).toContain(
+      "the time the last review request you handled (started or skipped) before you stopped was requested",
+    );
+  });
+
+  it("matches team requests by slug and other users by login", () => {
+    expect(review("acme/maintainers")).toContain(
+      "Watch: review requests for team acme/maintainers on GitHub pull requests",
+    );
+    expect(review("acme/maintainers")).toContain(
+      'whose requested_team slug is "maintainers", ignoring case',
+    );
+    expect(review("octocat")).toContain(
+      'whose requested_reviewer login is "octocat", ignoring case',
+    );
+  });
+
+  it("finds Jira assignee changes and rechecks earlier sessions after their search time", () => {
+    const prompt = renderTriggerPrompt(
+      "jira",
+      fields({ event: "assigned", target: "me", conditions: [] }),
+      CTX,
+    );
+    expect(prompt).toContain(
+      "starts one Omnigent session for each ticket assigned to you that matches.",
+    );
+    expect(prompt).toContain(
+      'search for (project = "ES" AND assignee = currentUser()) AND assignee CHANGED TO currentUser() AFTER "-<A>m", through every page, where A is the whole minutes from that time until now, rounded up; when that time is the "Watching since:" time, round down instead, so nothing from before it counts.',
+    );
+    // Day offsets snap to calendar days and malformed times silently match nothing.
+    expect(prompt).toContain(
+      'Write it as a minute offset such as "-95m", never days, hours or dates',
+    );
+    // The title's time is after every assignment the search found, so a recheck never repeats one.
+    expect(prompt).toContain(
+      "note its search time: the current UTC time rounded up to the next whole minute.",
+    );
+    expect(prompt).toContain('title "Jira <ticket key> assigned <search time>"');
+    expect(prompt).toContain(
+      "the ticket counts again only if its latest matching assignee change is after that time",
+    );
+    expect(prompt).toContain(
+      'Otherwise search for key = <ticket key> AND assignee CHANGED TO currentUser() AFTER "-<C>m", where C is the whole minutes from that time until now, rounded down',
+    );
+    expect(prompt).toContain("Rounding down never repeats an assignment");
+    // A pending delivery covers only its own assignment, not a later reassignment.
+    expect(prompt).toContain(
+      "a pending entry covers only that assignment, so a newer one still counts and gets its own session, while the pending one is never resent",
+    );
+    expect(prompt).not.toContain('Skip any ticket on a "Delivery pending:" line');
+    expect(prompt).toContain("rely on your earlier replies for archived ones");
+    expect(prompt).toContain('or from the "Watching since:" time, whichever is later');
+    expect(prompt).toContain(
+      "handled every match; otherwise the previous check time, and say why you stopped.",
+    );
+    expect(prompt).not.toContain("created >=");
   });
 });

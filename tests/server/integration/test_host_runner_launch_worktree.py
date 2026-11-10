@@ -359,6 +359,39 @@ async def test_launch_runner_without_git_binds_source_dir_no_worktree(
     assert conv.host_id == _HOST_ID
 
 
+async def test_launch_runner_relays_only_a_well_formed_session_env_handoff_id(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """The host receives the CLI's opaque handoff ID; malformed IDs never reach it."""
+    cap = register_host()
+    session_id = await _bare_session(client, "session-env-agent")
+    endpoint = f"/v1/hosts/{_HOST_ID}/runners"
+
+    rejected = await client.post(
+        endpoint,
+        json={
+            "session_id": session_id,
+            "workspace": _SOURCE_REPO,
+            "session_env_handoff_id": "../escape",
+        },
+    )
+    assert rejected.status_code == 422, rejected.text
+    assert cap.launch == []
+
+    resp = await client.post(
+        endpoint,
+        json={
+            "session_id": session_id,
+            "workspace": _SOURCE_REPO,
+            "session_env_handoff_id": "Hq3_x-9ZlaunchA",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    (launch,) = cap.launch
+    assert launch.session_env_handoff_id == "Hq3_x-9ZlaunchA"
+
+
 async def test_concurrent_source_launch_cannot_overtake_worktree_launch(
     register_host: RegisterHost,
     client: httpx.AsyncClient,

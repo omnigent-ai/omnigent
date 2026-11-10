@@ -15,6 +15,7 @@ import {
   useProjectFolderCollapse,
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
+import { useSessionRowQuickActions } from "@/lib/sessionRowQuickActionsPreferences";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
@@ -50,6 +51,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   ClockIcon,
+  ClockPlusIcon,
   CircleAlertIcon,
   CircleStopIcon,
   FolderGit2Icon,
@@ -185,6 +187,7 @@ import {
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
+  useAutomationsEnabled,
 } from "@/hooks/useConversations";
 import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { useHosts, type Host } from "@/hooks/useHosts";
@@ -196,7 +199,7 @@ import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
-import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import { useArchivePrompt } from "./ArchivePrompt";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
@@ -244,6 +247,7 @@ import {
   isMacElectronShell,
 } from "@/lib/nativeBridge";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
+import { isTextEntry } from "@/lib/hotkeys";
 import {
   type SessionFilter,
   readSessionFilter,
@@ -325,6 +329,16 @@ import {
 } from "./NewChatDialog";
 import { useDesktopHostId } from "./RevealInFileManager";
 import { ForkSessionDialog } from "./ForkSessionDialog";
+import { CreateAutomationFromSessionDialog } from "@/components/scheduled/CreateAutomationFromSessionDialog";
+import {
+  AutomationSourceDeleteNotice,
+  AutomationSourcesDeleteNotice,
+} from "@/components/scheduled/AutomationSourceDeleteNotice";
+import {
+  canCreateAutomationFromSession,
+  automationDeletedWith,
+  useDeleteSourceAutomations,
+} from "@/lib/automationFromSession";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
@@ -903,6 +917,7 @@ function SidebarImpl({
     activeExtensionPageId,
     newSessionProjectName,
   } = useActiveNavItem();
+  const automationsEnabled = useAutomationsEnabled();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -1049,6 +1064,25 @@ function SidebarImpl({
   // keyboard inset so every session row can still scroll into view while an
   // inline rename holds the keyboard up. No-op off iOS / keyboard closed.
   const keyboardInset = useIOSNativeKeyboardInset(effectiveOpen);
+  // Opening the overlay drawer by swipe leaves the chat composer focused (a tap
+  // on the header toggle moves focus itself), and on iOS its soft keyboard then
+  // stays up over the drawer. Drop focus held outside the drawer so it goes down.
+  // Only on opening: narrowing the window with the sidebar open keeps focus.
+  const overlayOpen = open && mobileLayout && !sideBySide && !inSettings;
+  const wasOpenRef = useRef(open);
+  useLayoutEffect(() => {
+    const opened = open && !wasOpenRef.current;
+    wasOpenRef.current = open;
+    if (!opened || !overlayOpen) return;
+    const active = document.activeElement;
+    if (
+      active instanceof HTMLElement &&
+      isTextEntry(active) &&
+      !drawerRef.current?.contains(active)
+    ) {
+      active.blur();
+    }
+  }, [open, overlayOpen]);
   // The iOS shell disables WebKit's focus reveal: while that padding shrinks the list,
   // center a focused row (an inline rename) when the keyboard opens and on later focus.
   // Centered rather than nearest so the floating Settings action can't cover it.
@@ -1372,32 +1406,34 @@ function SidebarImpl({
                 </Link>
               </Button>
               {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
-              <Button
-                asChild
-                className={cn(
-                  // Same shared nav-row construct as "New session" / "Inbox" so
-                  // the active-pill, hover, insets, icon column, and text weight
-                  // all match post-refactor.
-                  SIDEBAR_ROW,
-                  "w-full justify-start border-0 font-normal mobile-touch-target",
-                  SIDEBAR_HOVER_HIGHLIGHT,
-                  isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-                )}
-                variant="ghost"
-                data-testid="scheduled-tasks-nav"
-              >
-                <Link to="/tasks" onClick={onNavClick} componentId="sidebar.tasks">
-                  <ClockIcon
-                    className={cn(
-                      "ui-icon",
-                      isTasksPage
-                        ? "text-[var(--sidebar-active-foreground)]"
-                        : "text-muted-foreground",
-                    )}
-                  />
-                  Automations
-                </Link>
-              </Button>
+              {automationsEnabled && (
+                <Button
+                  asChild
+                  className={cn(
+                    // Same shared nav-row construct as "New session" / "Inbox" so
+                    // the active-pill, hover, insets, icon column, and text weight
+                    // all match post-refactor.
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal mobile-touch-target",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  variant="ghost"
+                  data-testid="scheduled-tasks-nav"
+                >
+                  <Link to="/tasks" onClick={onNavClick} componentId="sidebar.tasks">
+                    <ClockIcon
+                      className={cn(
+                        "ui-icon",
+                        isTasksPage
+                          ? "text-[var(--sidebar-active-foreground)]"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    Automations
+                  </Link>
+                </Button>
+              )}
               <Button
                 asChild
                 variant="ghost"
@@ -2769,13 +2805,13 @@ function ConversationList({
     (name: string, conversations: Conversation[], visibleCount: number) => {
       setFolderConversations((prev) => {
         const existing = prev.get(name);
-        // Skip the update when the id set is unchanged, so a background refetch
-        // that returns the same rows doesn't churn state (and re-render).
+        // Skip unchanged rows to avoid re-renders, but keep refreshed row objects
+        // so bulk actions see updated labels.
         if (
           existing &&
           existing.visibleCount === visibleCount &&
           existing.conversations.length === conversations.length &&
-          existing.conversations.every((c, i) => c.id === conversations[i]?.id)
+          existing.conversations.every((c, i) => c === conversations[i])
         ) {
           return prev;
         }
@@ -4486,6 +4522,8 @@ function ConversationMenuItems({
   moveToProject,
   setShareOpen,
   setForkOpen,
+  canCreateAutomation,
+  setAutomationOpen,
   setIsEditing,
   setStopOpen,
   setDeleteOpen,
@@ -4520,6 +4558,9 @@ function ConversationMenuItems({
   moveToProject: ReturnType<typeof useMoveToProject>;
   setShareOpen: (open: boolean) => void;
   setForkOpen: (open: boolean) => void;
+  /** Whether "Create automation" applies to this session. */
+  canCreateAutomation: boolean;
+  setAutomationOpen: (open: boolean) => void;
   setIsEditing: (editing: boolean) => void;
   setStopOpen: (open: boolean) => void;
   setDeleteOpen: (open: boolean) => void;
@@ -4551,6 +4592,7 @@ function ConversationMenuItems({
       )
     : [];
   const { forkDisabledReason } = useSessionActionRestrictions(conversation.id, conversation);
+  const showQuickActions = useSessionRowQuickActions();
   // Mobile lacks the horizontal room for a side-opening submenu, so the
   // project picker replaces the menu body in place instead of flying out
   // to the side. `view` swaps between the main actions and that sub-view;
@@ -4620,9 +4662,6 @@ function ConversationMenuItems({
           <C.Separator />
         </>
       )}
-      {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
-          hover-revealed quick-pin button. Archived rows omit it (archive
-          outranks pin). */}
       {!isArchived && gridOptions.length > 0 && (
         <C.Sub>
           <C.SubTrigger className="mobile-touch-target">Open in grid</C.SubTrigger>
@@ -4639,11 +4678,13 @@ function ConversationMenuItems({
           </C.SubContent>
         </C.Sub>
       )}
+      {/* Desktop pins from the hover button unless Settings hides it; archived
+          rows omit Pin (archive outranks pin). */}
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
           disabled={pinSaving || (!isPinned && atPinCap)}
-          className="mobile-touch-target md:hidden"
+          className={cn("mobile-touch-target", showQuickActions && "md:hidden")}
           onSelect={() => onTogglePinned(conversation.id)}
         >
           {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -4748,6 +4789,16 @@ function ConversationMenuItems({
         >
           <MailOpenIcon className="size-3.5" />
           Mark as read
+        </C.Item>
+      )}
+      {canCreateAutomation && (
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="create-automation-from-session"
+          onSelect={() => setAutomationOpen(true)}
+        >
+          <ClockPlusIcon className="size-3.5" />
+          Create automation
         </C.Item>
       )}
       {/* The keyboard path for drag-to-reorder within the session's list. */}
@@ -5361,7 +5412,9 @@ function ConversationRowImpl({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt();
+  const archivePrompt = useArchivePrompt();
+  // Settings → Appearance can keep Pin and Archive in the menus only.
+  const showQuickActions = useSessionRowQuickActions();
   const leave = useLeaveSession();
   const moveToProject = useMoveToProject();
   // The kebab's user-facing "Stop session" action. Archiving does NOT go
@@ -5393,6 +5446,7 @@ function ConversationRowImpl({
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
+  const [automationOpen, setAutomationOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
@@ -5409,6 +5463,15 @@ function ConversationRowImpl({
   // (share enabled) while the capability probe is still loading. From context.
   const serverInfo = useContext(ServerInfoContext);
   const sharingOff = serverInfo !== "loading" && serverInfo.sharing_mode === "off";
+  const canCreateAutomation = canCreateAutomationFromSession({
+    info: serverInfo,
+    automationsEnabled: serverInfo !== "loading" && serverInfo.automations_enabled !== false,
+    conversation,
+    isOwner,
+  });
+  // Deleting a session an automation runs from deletes the automation first.
+  const automationSourceOf = automationDeletedWith(serverInfo, conversation);
+  const deleteSourceAutomations = useDeleteSourceAutomations();
   // Single-user mode has no other users to share with, so the Share item is
   // hidden entirely (not just disabled) — mirrors the header Share button.
   const isSingleUser = isSingleUserMode(serverInfo);
@@ -5667,10 +5730,23 @@ function ConversationRowImpl({
     // hook (a mutate-level callback would never fire).
     setDeleteOpen(false);
     setDeleteBranch(false);
+    if (automationSourceOf !== null) {
+      void deleteWithAutomation(automationSourceOf, gitBranch !== null && deleteBranch);
+      return;
+    }
     // Viewing the session being deleted? Leave now, so the chat surface
     // doesn't sit on an id that's about to 404.
     if (isActive) navigate("/", { replace: true });
     del.mutate({ id: conversation.id, deleteBranch: gitBranch !== null && deleteBranch });
+  }
+
+  // "Delete both": the automation first, so no run starts from a missing session.
+  async function deleteWithAutomation(taskId: string, deleteLocalBranch: boolean) {
+    if (!(await deleteSourceAutomations([taskId], [conversation.id]))) {
+      showToast("Couldn't delete the automation, so the session was kept");
+      return;
+    }
+    del.mutate({ id: conversation.id, deleteBranch: deleteLocalBranch });
   }
 
   function runArchive() {
@@ -5678,7 +5754,7 @@ function ConversationRowImpl({
       runUnarchive();
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+    archivePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
       archiveNow(deleteWorktreeIds.has(conversation.id)),
     );
   }
@@ -5760,6 +5836,8 @@ function ConversationRowImpl({
     moveToProject,
     setShareOpen,
     setForkOpen,
+    canCreateAutomation,
+    setAutomationOpen,
     setIsEditing,
     setStopOpen,
     setDeleteOpen,
@@ -6124,7 +6202,7 @@ function ConversationRowImpl({
             >
               {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
-              {!isArchived && (
+              {showQuickActions && !isArchived && (
                 <Tooltip disableHoverableContent>
                   <TooltipContent
                     shortcut={
@@ -6180,7 +6258,7 @@ function ConversationRowImpl({
               {/* Archive is owner-only, same as the kebab's Archive item; non-owners
               don't get the quick affordance and instead see that item disabled
               with an explanation. */}
-              {isOwner && (
+              {showQuickActions && isOwner && (
                 <Tooltip disableHoverableContent>
                   <TooltipContent
                     shortcut={
@@ -6293,6 +6371,13 @@ function ConversationRowImpl({
           onOpenChange={setForkOpen}
         />
       )}
+      {automationOpen && (
+        <CreateAutomationFromSessionDialog
+          conversation={conversation}
+          open
+          onOpenChange={setAutomationOpen}
+        />
+      )}
       <Dialog
         open={deleteOpen}
         onOpenChange={(open) => {
@@ -6310,12 +6395,23 @@ function ConversationRowImpl({
             onClick={(e) => e.stopPropagation()}
           >
             <DialogHeader>
-              <DialogTitle>Delete conversation?</DialogTitle>
+              <DialogTitle>
+                {automationSourceOf !== null ? "Delete session and automation?" : "Delete session?"}
+              </DialogTitle>
               <DialogDescription>
                 <span className="font-medium break-all">{label}</span> and all of its history will
                 be removed. This cannot be undone.
               </DialogDescription>
             </DialogHeader>
+            {automationSourceOf !== null && (
+              <AutomationSourceDeleteNotice
+                taskId={automationSourceOf}
+                onNavigate={() => {
+                  setDeleteOpen(false);
+                  setDeleteBranch(false);
+                }}
+              />
+            )}
             {gitBranch !== null && (
               <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
                 <p className="text-sm text-muted-foreground">
@@ -6358,13 +6454,13 @@ function ConversationRowImpl({
                 disabled={del.isPending}
                 componentId="sidebar.conversation.delete"
               >
-                Delete
+                {automationSourceOf !== null ? "Delete both" : "Delete"}
               </Button>
             </DialogFooter>
           </DialogContent>
         )}
       </Dialog>
-      {archiveWorktreePrompt.dialog}
+      {archivePrompt.dialog}
       <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
         {leaveOpen && (
           <DialogContent
@@ -7226,7 +7322,7 @@ function BulkActionBar({
   const queryClient = useQueryClient();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt();
+  const archivePrompt = useArchivePrompt();
   const bulkDelete = useBulkDeleteConversations();
   const bulkMove = useBulkMoveToProject();
   const { data: projects = [] } = useProjects();
@@ -7253,6 +7349,13 @@ function BulkActionBar({
     () => selectedConversations.filter((c) => isOwnedByViewer(c, viewerId)),
     [selectedConversations, viewerId],
   );
+  // Selected sessions automations run from: those automations are deleted first.
+  const serverInfo = useServerInfo();
+  const automationSourceTaskIds = useMemo(
+    () => ownedSelected.flatMap((c) => automationDeletedWith(serverInfo, c) ?? []),
+    [ownedSelected, serverInfo],
+  );
+  const deleteSourceAutomations = useDeleteSourceAutomations();
 
   const archivedSelected = useMemo(
     () => ownedSelected.filter((c) => c.archived === true),
@@ -7359,7 +7462,7 @@ function BulkActionBar({
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
     const toArchive = nonArchivedSelected;
-    archiveWorktreePrompt.requestArchive(toArchive, (deleteWorktreeIds) =>
+    archivePrompt.requestArchive(toArchive, (deleteWorktreeIds) =>
       archiveNow(toArchive, deleteWorktreeIds),
     );
   }
@@ -7386,7 +7489,7 @@ function BulkActionBar({
     bulkArchive.mutate({ ids: archivedSelected.map((c) => c.id), archived: false });
   }
 
-  function handleDelete() {
+  async function handleDelete() {
     const ids = ownedSelected.map((c) => c.id);
     if (ids.length === 0) return;
     setConfirmDeleteOpen(false);
@@ -7394,15 +7497,20 @@ function BulkActionBar({
     // meaningless and the chat surface would be sitting on an id that's about
     // to 404. Both are settled here rather than in a mutate-level callback:
     // this bar unmounts with the selection, and callbacks on an unmounted
-    // observer never fire.
-    if (activeId && ids.includes(activeId)) navigate("/", { replace: true });
+    // observer never fire. Deleting their automations first leaves the page itself.
+    if (automationSourceTaskIds.length === 0) {
+      if (activeId && ids.includes(activeId)) navigate("/", { replace: true });
+    } else if (!(await deleteSourceAutomations(automationSourceTaskIds, ids))) {
+      showToast("Couldn't delete every automation, so the sessions were kept");
+      return;
+    }
     onDeselectAll();
     bulkDelete.mutate({ ids, deleteBranchIds: branchesToDelete });
   }
 
   return (
     <>
-      {archiveWorktreePrompt.dialog}
+      {archivePrompt.dialog}
       <div className="mt-1 mb-1 flex flex-col gap-1.5">
         <div className="flex items-center gap-2 rounded-lg border border-border bg-transparent p-1.5">
           <Tooltip>
@@ -7619,12 +7727,25 @@ function BulkActionBar({
       >
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>Delete {ownedSelected.length} session(s)?</DialogTitle>
+            <DialogTitle>
+              {automationSourceTaskIds.length > 0
+                ? `Delete ${ownedSelected.length} ${ownedSelected.length === 1 ? "session" : "sessions"} and ${automationSourceTaskIds.length} ${automationSourceTaskIds.length === 1 ? "automation" : "automations"}?`
+                : `Delete ${ownedSelected.length} session(s)?`}
+            </DialogTitle>
             <DialogDescription>
               This will permanently delete the selected sessions and all their history. This cannot
               be undone.
             </DialogDescription>
           </DialogHeader>
+          {automationSourceTaskIds.length > 0 && (
+            <AutomationSourcesDeleteNotice
+              taskIds={automationSourceTaskIds}
+              onNavigate={() => {
+                setConfirmDeleteOpen(false);
+                setBranchesToDelete(new Set());
+              }}
+            />
+          )}
           {worktreeSelected.length > 0 && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
               <p className="text-sm text-muted-foreground">
@@ -7704,7 +7825,7 @@ function BulkActionBar({
             <Button
               type="button"
               variant="destructive"
-              onClick={handleDelete}
+              onClick={() => void handleDelete()}
               disabled={bulkDelete.isPending}
             >
               Delete {ownedSelected.length} session(s)
