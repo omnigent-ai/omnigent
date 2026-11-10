@@ -66,7 +66,7 @@ def set_envelope_cipher(cipher: EnvelopeCipher | None) -> None:
 
 def seal(value: Any) -> bytes:
     """Return the envelope for a JSON-serializable *value*."""
-    framed = encode(json.dumps(value, separators=(",", ":")))
+    framed = encode(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
     assert framed is not None
     if _cipher is None:
         return bytes((ENVELOPE_FORMAT, _PLAINTEXT)) + framed
