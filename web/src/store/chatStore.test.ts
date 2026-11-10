@@ -7519,21 +7519,24 @@ describe("chatStore — stop", () => {
       clearedPendingId,
       data: { role: "user", content: [{ type: "input_text", text }] },
     });
+  const steer = (tempId: string, text: string, extra: Partial<PendingUserMessage> = {}) => ({
+    tempId,
+    content: text ? [{ type: "input_text" as const, text }] : [],
+    sentMidTurn: true,
+    ...extra,
+  });
 
   it("returns unread native steers to the composer until the agent reads them", () => {
-    const steer = (tempId: string, text: string, extra: Partial<PendingUserMessage>) => ({
-      tempId,
-      content: [{ type: "input_text" as const, text }],
-      sentMidTurn: true,
-      ...extra,
-    });
+    const notes = new File(["notes"], "notes.txt");
+    const photo = new File(["photo"], "photo.png", { type: "image/png" });
     useChatStore.setState({
       conversationId: "conv_abc",
       pendingUserMessages: [
         { tempId: "pend_0", content: [{ type: "input_text", text: "first" }], posted: true },
         steer("pend_1", "steer one", { posted: true, pendingId: "pi_1" }),
-        steer("pend_2", "still posting", {}),
-        steer("pend_3", "steer two", { posted: true, pendingId: "pi_3" }),
+        steer("pend_2", "still posting"),
+        steer("pend_3", "steer two", { posted: true, pendingId: "pi_3", steerFiles: [notes] }),
+        steer("pend_4", "", { posted: true, pendingId: "pi_4", steerFiles: [photo] }),
       ],
       status: "streaming",
       sessionStatus: "running",
@@ -7544,38 +7547,151 @@ describe("chatStore — stop", () => {
     expect(useChatStore.getState().failedSendDraft).toEqual({
       conversationId: "conv_abc",
       text: "steer one\n\nstill posting\n\nsteer two",
-      files: [],
-      returnedSteers: [
-        { tempId: "pend_1", pendingId: "pi_1" },
-        { tempId: "pend_2" },
-        { tempId: "pend_3", pendingId: "pi_3" },
+      files: [notes, photo],
+      returnedParts: [
+        { tempId: "pend_1", pendingId: "pi_1", text: "steer one", files: [] },
+        { tempId: "pend_2", text: "still posting", files: [] },
+        { tempId: "pend_3", pendingId: "pi_3", text: "steer two", files: [notes] },
+        { tempId: "pend_4", pendingId: "pi_4", text: "", files: [photo] },
       ],
       serverRefused: false,
       recovered: true,
     });
-    expect(takeFailedSendDraft("conv_abc", false)?.text).toBe(
-      "steer one\n\nstill posting\n\nsteer two",
-    );
+    readSteer("pi_1", "steer one");
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "still posting\n\nsteer two",
+      files: [notes, photo],
+    });
+    expect(takeFailedSendDraft("conv_abc", false)?.text).toBe("still posting\n\nsteer two");
     // A resend must not reuse the original's stable id, which the server dedupes.
     expect(useChatStore.getState().pendingRetryStableId).toBeNull();
-    readSteer("pi_1", "steer one");
     readSteer("pi_3", "steer two");
-    // The steer whose POST never answered may not have reached the agent.
     expect(useChatStore.getState().restoredSendDraft).toMatchObject({
-      returnedSteers: [{ tempId: "pend_2" }],
-      delivered: false,
+      returnedParts: [
+        { tempId: "pend_2", text: "still posting" },
+        { tempId: "pend_4", files: [photo] },
+      ],
+      delivered: true,
     });
   });
 
   it.each([
-    { outcome: "read after its POST answers", read: true },
-    { outcome: "kept when its POST fails", read: false },
-  ])("returns a steer still posting at Stop, $outcome", async ({ read }) => {
+    { held: "a failed send", pending: [] as PendingUserMessage[], kept: "failed earlier" },
+    {
+      held: "a message held for the model",
+      pending: [
+        {
+          tempId: "pend_held",
+          content: [{ type: "input_text" as const, text: "held" }],
+          initialDraft: { text: "held", files: [] },
+          sentMidTurn: true,
+        },
+      ],
+      kept: "held",
+    },
+  ])("returns steers after $held, which stays once they are read", ({ pending, kept }) => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      pendingUserMessages: [
+        steer("pend_1", "steer", { posted: true, pendingId: "pi_1" }),
+        ...pending,
+      ],
+      failedSendDraft:
+        pending.length === 0
+          ? { conversationId: "conv_abc", text: kept, files: [], stableId: "c".repeat(32) }
+          : null,
+      status: "streaming",
+      sessionStatus: "running",
+    });
+
+    useChatStore.getState().stop();
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: `${kept}\n\nsteer`,
+      recovered: true,
+    });
+    readSteer("pi_1", "steer");
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: kept,
+      returnedParts: undefined,
+    });
+  });
+
+  it.each([
+    { outcome: "read after its POST answers", readEarly: false, answer: "accepted" },
+    { outcome: "read before its POST answers", readEarly: true, answer: "accepted" },
+    { outcome: "kept when its POST fails", readEarly: false, answer: "failed" },
+    { outcome: "kept once when read before its POST fails", readEarly: true, answer: "failed" },
+    {
+      outcome: "kept, not requeued, when the host is offline",
+      readEarly: false,
+      answer: "offline",
+    },
+  ])("returns a steer still posting at Stop, $outcome", async ({ readEarly, answer }) => {
     let answerPost: ((response: Response) => void) | null = null;
     fetchMock.mockImplementation((input, init) => {
-      if (String(input).endsWith("/conv_existing/events") && String(init?.body).includes("steer"))
+      const url = String(input);
+      if (url.endsWith("/conv_existing/resources/files"))
+        return mockResponse({
+          id: "file_1",
+          name: "notes.txt",
+          metadata: { filename: "notes.txt" },
+        });
+      if (url.endsWith("/conv_existing/events") && String(init?.body).includes("steer"))
         return new Promise<Response>((resolve) => {
           answerPost = resolve;
+        });
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+      status: "streaming",
+      pendingUserMessages: [],
+      queuedMessages: [],
+    });
+    const notes = new File(["notes"], "notes.txt");
+
+    const sending = useChatStore.getState().send("late steer", "agent_xyz", [notes]);
+    useChatStore.getState().stop();
+    const returned = useChatStore.getState().failedSendDraft;
+    expect(returned).toMatchObject({
+      text: "late steer",
+      files: [notes],
+      returnedParts: [{ text: "late steer", files: [notes] }],
+      recovered: true,
+    });
+    await vi.waitFor(() => expect(answerPost).not.toBeNull());
+    if (readEarly) readSteer("pi_late", "late steer");
+    answerPost!(
+      answer === "accepted"
+        ? mockResponse({ queued: true, pending_id: "pi_late" })
+        : answer === "offline"
+          ? mockResponse({ error: { code: "host_offline" } }, { ok: false, status: 503 })
+          : mockResponse({ error: "boom" }, { ok: false, status: 500 }),
+    );
+    await sending;
+
+    if (answer === "accepted" && !readEarly) {
+      expect(useChatStore.getState().failedSendDraft?.returnedParts).toEqual([
+        { ...returned!.returnedParts![0], pendingId: "pi_late" },
+      ]);
+      readSteer("pi_late", "late steer");
+    }
+    expect(useChatStore.getState().failedSendDraft).toEqual(
+      answer === "accepted" ? null : returned,
+    );
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("does not recover a returned steer again when its POST fails after a resend", async () => {
+    let failPost: (() => void) | null = null;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/conv_existing/events") && failPost === null)
+        return new Promise<Response>((resolve) => {
+          failPost = () => resolve(mockResponse({ error: "boom" }, { ok: false, status: 500 }));
         });
       return defaultFetchHandler(input, init);
     });
@@ -7589,26 +7705,14 @@ describe("chatStore — stop", () => {
     });
 
     const sending = useChatStore.getState().send("late steer", "agent_xyz");
+    await vi.waitFor(() => expect(failPost).not.toBeNull());
     useChatStore.getState().stop();
-    const returned = useChatStore.getState().failedSendDraft;
-    expect(returned).toMatchObject({ text: "late steer", returnedSteers: [{}], recovered: true });
-    await vi.waitFor(() => expect(answerPost).not.toBeNull());
-    answerPost!(
-      read
-        ? mockResponse({ queued: true, pending_id: "pi_late" })
-        : mockResponse({ error: "boom" }, { ok: false, status: 500 }),
-    );
-    await sending;
+    expect(takeFailedSendDraft("conv_existing", false, true)?.text).toBe("late steer");
+    const resending = useChatStore.getState().send("late steer", "agent_xyz");
+    failPost!();
+    await Promise.all([sending, resending]);
 
-    if (read) {
-      expect(useChatStore.getState().failedSendDraft?.returnedSteers).toEqual([
-        { tempId: returned!.returnedSteers![0]!.tempId, pendingId: "pi_late" },
-      ]);
-      readSteer("pi_late", "late steer");
-      expect(useChatStore.getState().failedSendDraft).toBeNull();
-    } else {
-      expect(useChatStore.getState().failedSendDraft).toEqual(returned);
-    }
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
   it("no-op when no session is bound", () => {

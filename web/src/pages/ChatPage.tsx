@@ -108,6 +108,7 @@ import {
   holdsInitialDraft,
   isStaleTempConvId,
   isTempConvId,
+  joinReturnedParts,
   retryConversationLoad,
   type ChatState,
   type PendingInitialPrompt,
@@ -3366,7 +3367,7 @@ function ComposerImpl(
       return;
     }
     pendingFailedSendRestore.current =
-      failed.stableId || failed.returnedSteers ? { stableId: failed.stableId, draft } : null;
+      failed.stableId || failed.returnedParts ? { stableId: failed.stableId, draft } : null;
     replaceText(recalled.text, recalled.replyDraft);
     restoreTaggedMentionsRef.current({ files: [], sessions: recalled.sessions });
     textareaRef.current = tailTextareaRef.current;
@@ -3398,6 +3399,23 @@ function ComposerImpl(
       filesRef.current.length === restoredSendDraft.files.length &&
       filesRef.current.every((f) => restoredSendDraft.files.includes(f));
     if (valueRef.current !== expected || !filesUnedited) return;
+    // Of what Stop handed back, keep what the agent has not read.
+    const parts = restoredSendDraft.returnedParts ?? [];
+    const unread = joinReturnedParts(parts);
+    if (unread.text !== "" || unread.files.length > 0) {
+      if (parts.some((part) => part.tempId !== undefined)) {
+        pendingFailedSendRestore.current = { draft };
+        useChatStore.setState({
+          restoredSendDraft: { ...restoredSendDraft, ...unread, delivered: false },
+        });
+      }
+      const recalled = recallComposerDraft(unread.text);
+      replaceText(recalled.text, recalled.replyDraft);
+      restoreTaggedMentionsRef.current({ files: [], sessions: recalled.sessions });
+      attachmentsRef.current.replaceFiles(unread.files);
+      dirtyRef.current = true;
+      return;
+    }
     replaceText("");
     attachmentsRef.current.replaceFiles([]);
     dirtyRef.current = false;
