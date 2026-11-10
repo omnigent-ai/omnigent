@@ -253,9 +253,9 @@ async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServe
     """
     Connect to the bridge's app-server, or return ``None`` when it is unreachable.
 
-    A socket/handshake failure or explicit drain refusal during initialization
-    leaves the turn provably undelivered. Other protocol failures remain the
-    caller's responsibility.
+    A socket/handshake failure, timeout, or explicit drain refusal during
+    initialization leaves the turn provably undelivered. Other protocol failures
+    remain the caller's responsibility.
     Any other exit, a cancel included, closes the half-open client first.
 
     :param state: Bridge state naming the app-server transport.
@@ -267,7 +267,8 @@ async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServe
     )
     connected = False
     try:
-        await client.connect()
+        async with asyncio.timeout(_DELIVERY_RPC_TIMEOUT_SECONDS):
+            await client.connect()
         connected = True
         return client
     except CodexAppServerResponseError as exc:
@@ -341,7 +342,8 @@ async def _native_delivery_request(
         )
         try:
             await client.close()
-            await client.connect()
+            async with asyncio.timeout(_DELIVERY_RPC_TIMEOUT_SECONDS):
+                await client.connect()
         except Exception as exc:
             # The rejected request cannot have delivered input, and reconnecting
             # does not send any. Keep the sender's copy if this step fails.
