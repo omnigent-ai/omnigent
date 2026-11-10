@@ -28,6 +28,10 @@ const fixture = vi.hoisted(() => ({
   renderError: new Error("Grid surface render failed"),
   // Set while a cell's viewer holds unsaved edits and is asking to discard them.
   discardEdits: null as (() => void) | null,
+  fileTreeSplit: false,
+}));
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({ features: { workspace_file_tree_split_ui: fixture.fileTreeSplit } }),
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
@@ -130,6 +134,9 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => context.openFolder?.("/workspace/experimental")}>
           Open folder
         </button>
+        <button type="button" onClick={context.openGithubTab}>
+          Open Pull Requests
+        </button>
       </>
     );
   },
@@ -147,6 +154,8 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         data-terminal={props.selectedTerminalKey ?? ""}
         data-tab={props.rightRailTab ?? ""}
         data-end-line={props.filePosition?.endLine}
+        data-preview={props.treePreviewPath ?? ""}
+        data-split-enabled={String(props.fileTreeSplitEnabled)}
       >
         <span>{props.selectedFilePath ?? "No file"}</span>
         <span>{props.filePosition?.line}</span>
@@ -160,6 +169,19 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         <button type="button" onClick={() => props.openFileViewer("other.md")}>
           Open other
         </button>
+        {props.fileTreeSplitEnabled && (
+          <>
+            <button type="button" onClick={() => props.openFileInTree?.("preview.md")}>
+              Preview file
+            </button>
+            <button type="button" onClick={() => props.onClosePanel("changes")}>
+              Close Changes
+            </button>
+            <button type="button" onClick={props.onCloseTreePreview}>
+              Close preview
+            </button>
+          </>
+        )}
         <button type="button" onClick={() => props.onCloseFile(props.selectedFilePath!)}>
           Close file
         </button>
@@ -184,6 +206,7 @@ afterEach(() => {
   fixture.failedChat = "";
   fixture.failedTerminal = "";
   fixture.discardEdits = null;
+  fixture.fileTreeSplit = false;
   vi.restoreAllMocks();
 });
 
@@ -599,4 +622,58 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
     "data-width",
     "504",
   );
+});
+
+it.each([false, true])("gates tree previews and keeps them per session (enabled=%s)", (enabled) => {
+  fixture.fileTreeSplit = enabled;
+  writeSessionWorkspaceState("grid:previews", { open: true });
+  writeSessionWorkspaceState("first", { rightRailTab: "files", openPanels: ["changes"] });
+  writeSessionWorkspaceState("second", { treePreviewPath: "second.md" });
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "previews", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const first = screen.getByRole("region", { name: "first (active)" });
+  const second = screen.getByRole("region", { name: "second" });
+  const workspace = screen.getByRole("complementary", { name: "Workspace" });
+  expect(workspace).toHaveAttribute("data-split-enabled", String(enabled));
+  if (!enabled) {
+    expect(within(workspace).queryByText("Preview file")).toBeNull();
+    fireEvent.click(within(first).getByText("Open citation"));
+    expect(readSessionWorkspaceState("first").openFiles).toEqual(["notes.md"]);
+    return;
+  }
+  fireEvent.click(within(workspace).getByText("Preview file"));
+  expect(readSessionWorkspaceState("first")).toMatchObject({
+    treePreviewPath: "preview.md",
+    selectedFilePath: null,
+    openFiles: [],
+  });
+  fireEvent.click(within(second).getByRole("textbox", { name: "Message" }));
+  expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveAttribute(
+    "data-preview",
+    "second.md",
+  );
+  fireEvent.click(within(first).getByRole("textbox", { name: "Message" }));
+  expect(screen.getByRole("complementary", { name: "Workspace" })).toBe(workspace);
+  expect(workspace).toHaveAttribute("data-preview", "preview.md");
+  fireEvent.click(within(first).getByText("Edit file"));
+  fireEvent.click(within(workspace).getByText("Close Changes"));
+  expect(fixture.discardEdits).toBeNull();
+  expect(readSessionWorkspaceState("first").openPanels).toEqual([]);
+  fireEvent.click(within(first).getByText("Open Pull Requests"));
+  expect(workspace).toHaveAttribute("data-tab", "files");
+  expect(fixture.discardEdits).not.toBeNull();
+  act(() => fixture.discardEdits?.());
+  expect(workspace).toHaveAttribute("data-tab", "github");
+  fireEvent.click(within(workspace).getByText("Close preview"));
+  expect(readSessionWorkspaceState("first").treePreviewPath).toBe("preview.md");
+  act(() => fixture.discardEdits?.());
+  expect(readSessionWorkspaceState("first").treePreviewPath).toBeNull();
+  expect(readSessionWorkspaceState("second").treePreviewPath).toBe("second.md");
 });

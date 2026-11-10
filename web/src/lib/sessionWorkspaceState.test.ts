@@ -109,13 +109,27 @@ describe("sessionWorkspaceState", () => {
   });
 
   it("keeps sessions isolated by id", () => {
-    writeSessionWorkspaceState("conv_a", { open: true });
-    writeSessionWorkspaceState("conv_b", { open: false, widthPx: 600 });
+    writeSessionWorkspaceState("conv_a", { open: true, treePreviewPath: "README.md" });
+    writeSessionWorkspaceState("conv_b", {
+      open: false,
+      widthPx: 600,
+      treePreviewPath: "src/main.ts",
+    });
 
     // Writing conv_b must not bleed into conv_a — a failure means the store is
     // keying entries together or sharing state across ids.
-    expect(readSessionWorkspaceState("conv_a")).toEqual({ open: true });
-    expect(readSessionWorkspaceState("conv_b")).toEqual({ open: false, widthPx: 600 });
+    expect(readSessionWorkspaceState("conv_a")).toEqual({
+      open: true,
+      treePreviewPath: "README.md",
+    });
+    expect(readSessionWorkspaceState("conv_b")).toEqual({
+      open: false,
+      widthPx: 600,
+      treePreviewPath: "src/main.ts",
+    });
+    writeSessionWorkspaceState("conv_a", { treePreviewPath: null });
+    expect(readSessionWorkspaceState("conv_a").treePreviewPath).toBeNull();
+    expect(readSessionWorkspaceState("conv_b").treePreviewPath).toBe("src/main.ts");
   });
 
   it("caps the persisted open-file tabs at 20, keeping the most recent", () => {
@@ -217,7 +231,12 @@ describe("sessionWorkspaceState", () => {
     // proving one bad field can't poison the whole entry.
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify([{ id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } }]),
+      JSON.stringify([
+        {
+          id: "conv_b",
+          state: { open: true, widthPx: -5, rightRailTab: "bogus", treePreviewPath: 42 },
+        },
+      ]),
     );
     expect(readSessionWorkspaceState("conv_b")).toEqual({ open: true });
 

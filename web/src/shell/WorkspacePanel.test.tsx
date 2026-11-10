@@ -35,18 +35,14 @@ import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import {
   type DefaultWorkspaceTab,
+  writeAlwaysOpenFilesInTab,
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
 } from "@/lib/workspaceTabPreferences";
 import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { WorkspacePanel } from "./WorkspacePanel";
 
-// The rail's content children are exercised by their own suites; stub them so
-// these tests focus on WorkspacePanel's own logic (the open-file/shell tab
-// strips and the content branch that swaps FileViewer ↔ FilesPanel ↔ shell).
-// Each stub renders a testid (plus, for FileViewer, the path it was asked to
-// show) so we can prove which child mounted without dragging in Monaco / hook
-// stacks / xterm.
+// Stub heavy content children while exercising rail selection and viewer identity.
 vi.mock("./FileViewer", () => ({
   FileViewer: ({
     path,
@@ -63,14 +59,51 @@ vi.mock("./FileViewer", () => ({
   ),
 }));
 vi.mock("./FilesPanel", () => ({
-  // Echo the fixed scope so tests can prove the Files tab renders the tree
-  // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
+  FilesPanel: ({
+    flatView,
+    conversationId,
+    showTree = true,
+    treeWidth,
+    fileViewer,
+    resizeHandle,
+    onFileSelect,
+    onFileOpenInTree,
+    onClosePreview,
+    selectedFilePath,
+  }: {
+    flatView: boolean;
+    conversationId: string;
+    showTree?: boolean;
+    treeWidth?: number;
+    fileViewer?: ReactNode;
+    resizeHandle?: ReactNode;
+    selectedFilePath?: string | null;
+    onFileSelect: (path: string) => void;
+    onFileOpenInTree?: (path: string) => void;
+    onClosePreview?: () => void;
+  }) => (
     <div
       data-testid="files-panel-stub"
       data-session={conversationId}
       data-flat-view={String(flatView)}
-    />
+      data-show-tree={showTree}
+      data-tree-width={treeWidth}
+      data-selected-file={selectedFilePath ?? ""}
+    >
+      <button type="button" onClick={() => (onFileOpenInTree ?? onFileSelect)("README.md")}>
+        Tree file
+      </button>
+      <button type="button" onClick={() => onFileSelect("README.md")}>
+        Standalone file
+      </button>
+      {onClosePreview && (
+        <button type="button" onClick={onClosePreview}>
+          Close preview
+        </button>
+      )}
+      {resizeHandle}
+      {fileViewer}
+    </div>
   ),
 }));
 vi.mock("./SubagentsPanel", () => ({
@@ -222,6 +255,8 @@ function renderWorkspace(
     rightRailTab?: RightRailTab | null;
     openPanels?: DefaultWorkspaceTab[];
     selectedFilePath?: string | null;
+    treePreviewPath?: string | null;
+    fileTreeSplitEnabled?: boolean;
     openFiles?: string[];
     changedCount?: number;
     showGithubTab?: boolean;
@@ -248,6 +283,8 @@ function renderWorkspace(
 ) {
   let overrides = initialOverrides;
   const openFileViewer = vi.fn();
+  const openFileInTree = vi.fn();
+  const onCloseTreePreview = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
   const onClosePanel = vi.fn();
@@ -295,6 +332,10 @@ function renderWorkspace(
         selectedFilePath={overrides.selectedFilePath ?? null}
         openFiles={overrides.openFiles ?? []}
         openFileViewer={openFileViewer}
+        openFileInTree={openFileInTree}
+        treePreviewPath={overrides.treePreviewPath}
+        fileTreeSplitEnabled={overrides.fileTreeSplitEnabled}
+        onCloseTreePreview={onCloseTreePreview}
         onCloseFile={onCloseFile}
         onShowScopeView={vi.fn()}
         onCommentsOpenChange={vi.fn()}
@@ -340,6 +381,8 @@ function renderWorkspace(
       view.rerender(tree());
     },
     openFileViewer,
+    openFileInTree,
+    onCloseTreePreview,
     onCloseFile,
     onRightRailTabChange,
     onClosePanel,
@@ -3190,4 +3233,151 @@ describe("WorkspacePanel desktop menu commands", () => {
     expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
     expect(onReveal).toHaveBeenCalledTimes(3);
   });
+});
+
+describe("WorkspacePanel inline file preview", () => {
+  let measuredWidth: number;
+  const observers = new Set<() => void>();
+  beforeEach(() => {
+    measuredWidth = 600;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      () => new DOMRect(0, 0, measuredWidth, 600),
+    );
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        callback: () => void;
+        constructor(callback: () => void) {
+          this.callback = callback;
+          observers.add(callback);
+        }
+        observe() {}
+        unobserve() {}
+        disconnect() {
+          observers.delete(this.callback);
+        }
+      },
+    );
+  });
+  afterEach(() => {
+    observers.clear();
+    vi.unstubAllGlobals();
+  });
+
+  it.each([false, true])(
+    "keeps one tree and viewer across inline/tab selection (maximized=%s)",
+    (maximized) => {
+      const view = renderWorkspace({ fileTreeSplitEnabled: true, maximized });
+      const tree = screen.getByTestId("files-panel-stub");
+      expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+      expect(screen.queryByRole("separator", { name: "Resize file tree" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Tree file" }));
+      expect(view.openFileInTree).toHaveBeenCalledWith("README.md");
+      expect(view.openFileViewer).not.toHaveBeenCalled();
+      view.rerender({ treePreviewPath: "README.md" });
+      const viewer = screen.getByTestId("file-viewer-stub");
+      expect(viewer).toHaveAttribute("data-open", "true");
+      expect(tree).toHaveAttribute("data-tree-width", "260");
+      expect(tree).toHaveAttribute("data-selected-file", "README.md");
+      expect(screen.getByRole("separator", { name: "Resize file tree" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Close README.md" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Standalone file" }));
+      expect(view.openFileViewer).toHaveBeenCalledWith("README.md");
+      view.rerender({ selectedFilePath: "README.md", openFiles: ["README.md"] });
+      expect(screen.getByTestId("file-viewer-stub")).toBe(viewer);
+      expect(tree).toHaveAttribute("data-show-tree", "false");
+      expect(tree).not.toHaveAttribute("data-tree-width");
+      expect(screen.queryByRole("separator", { name: "Resize file tree" })).toBeNull();
+      view.rerender({ selectedFilePath: null });
+      expect(screen.getByTestId("file-viewer-stub")).toBe(viewer);
+      expect(screen.getByTestId("files-panel-stub")).toBe(tree);
+      expect(screen.getAllByTestId("files-panel-stub")).toHaveLength(1);
+      expect(tree).toHaveAttribute("data-show-tree", "true");
+      fireEvent.click(screen.getByRole("button", { name: "Close preview" }));
+      expect(view.onCloseTreePreview).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(["files", "changes"] as const)("guards only closing the active panel (%s)", (tab) => {
+    writePinnedWorkspaceTabs([]);
+    const fileGuard = vi.fn();
+    const view = renderWorkspace({
+      fileTreeSplitEnabled: true,
+      rightRailTab: "files",
+      treePreviewPath: "README.md",
+      openPanels: ["files", "changes"],
+      fileGuard,
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: tab === "files" ? "Close Files" : "Close Changes" }),
+    );
+    if (tab === "files") {
+      expect(fileGuard).toHaveBeenCalledOnce();
+      expect(view.onClosePanel).not.toHaveBeenCalled();
+    } else {
+      expect(fileGuard).not.toHaveBeenCalled();
+      expect(view.onClosePanel).toHaveBeenCalledWith("changes");
+    }
+  });
+
+  it.each(["flag off", "setting", "narrow", "mobile", "changes"])(
+    "keeps standalone routing for %s",
+    (mode) => {
+      if (mode === "setting") writeAlwaysOpenFilesInTab(true);
+      if (mode === "mobile") isMobileMock.mockReturnValue(true);
+      if (mode === "narrow") measuredWidth = 300;
+      const view = renderWorkspace({
+        fileTreeSplitEnabled: mode !== "flag off",
+        rightRailTab: mode === "changes" ? "changes" : "files",
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Tree file" }));
+      expect(view.openFileViewer).toHaveBeenCalledWith("README.md");
+      expect(view.openFileInTree).not.toHaveBeenCalled();
+      expect(screen.queryByRole("separator", { name: "Resize file tree" })).toBeNull();
+    },
+  );
+
+  it.each([false, true])(
+    "uses measured 523/524px bounds and preserves hidden previews (contained=%s)",
+    (contained) => {
+      measuredWidth = 523;
+      const view = renderWorkspace({
+        fileTreeSplitEnabled: true,
+        contained,
+        width: 900,
+        treePreviewPath: "README.md",
+      });
+      const viewer = screen.getByTestId("file-viewer-stub");
+      expect(viewer).toHaveAttribute("data-open", "false");
+      fireEvent.click(screen.getByRole("button", { name: "Tree file" }));
+      expect(view.openFileViewer).toHaveBeenCalledWith("README.md");
+      expect(screen.queryByRole("separator", { name: "Resize file tree" })).toBeNull();
+      act(() => {
+        measuredWidth = 524;
+        observers.forEach((callback) => callback());
+      });
+      expect(screen.getByTestId("file-viewer-stub")).toBe(viewer);
+      expect(viewer).toHaveAttribute("data-open", "true");
+      expect(screen.getByRole("separator", { name: "Resize file tree" })).toHaveAttribute(
+        "aria-valuenow",
+        "200",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Tree file" }));
+      expect(view.openFileInTree).toHaveBeenCalledWith("README.md");
+      act(() => writeAlwaysOpenFilesInTab(true));
+      expect(viewer).toHaveAttribute("data-open", "false");
+      expect(screen.queryByRole("separator", { name: "Resize file tree" })).toBeNull();
+      act(() => writeAlwaysOpenFilesInTab(false));
+      expect(screen.getByTestId("file-viewer-stub")).toBe(viewer);
+      expect(viewer).toHaveAttribute("data-open", "true");
+      isMobileMock.mockReturnValue(true);
+      view.rerender({});
+      expect(screen.getByTestId("file-viewer-stub")).toBe(viewer);
+      expect(viewer).toHaveAttribute("data-open", String(contained));
+      isMobileMock.mockReturnValue(false);
+      view.rerender({});
+      expect(screen.getByTestId("file-viewer-stub")).toBe(viewer);
+      expect(viewer).toHaveAttribute("data-open", "true");
+    },
+  );
 });

@@ -36,6 +36,8 @@ export interface SessionWorkspaceState {
   openFiles?: string[];
   /** The active file tab (null = a scope view is active). */
   selectedFilePath?: string | null;
+  /** Last file previewed beside the Files tree. */
+  treePreviewPath?: string | null;
   /** Ordered list of open shell tabs (``terminalTabKey`` values). */
   openTerminals?: string[];
   /** The active shell tab (null = a file/scope view is active). */
@@ -118,6 +120,9 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   }
   if (record.selectedFilePath === null || typeof record.selectedFilePath === "string") {
     state.selectedFilePath = record.selectedFilePath;
+  }
+  if (record.treePreviewPath === null || typeof record.treePreviewPath === "string") {
+    state.treePreviewPath = record.treePreviewPath;
   }
   if (
     Array.isArray(record.openTerminals) &&

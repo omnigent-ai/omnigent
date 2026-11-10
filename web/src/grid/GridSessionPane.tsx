@@ -29,6 +29,8 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { isNativeWrapper, nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
 import { isOwnerLevel } from "@/lib/permissionsApi";
@@ -87,6 +89,8 @@ export function GridSessionPane({
   workspacePanel: GridWorkspacePanelProps;
   onOpenWorkspace: () => void;
 }) {
+  const serverInfo = useServerInfo();
+  const fileTreeSplitEnabled = isFeatureEnabled(serverInfo, "workspace_file_tree_split_ui");
   const { session, isLoading: sessionLoading } = useSession(sessionId);
   const state = useConversationEntryState(sessionId);
   const canEdit = useCanEdit(sessionId);
@@ -224,6 +228,7 @@ export function GridSessionPane({
       openPanels: saved.openPanels ?? [],
       openFiles: saved.openFiles ?? [],
       selectedFilePath: saved.selectedFilePath ?? null,
+      treePreviewPath: saved.treePreviewPath ?? null,
       selectedTerminalKey: saved.selectedTerminalKey ?? null,
     };
   });
@@ -275,6 +280,24 @@ export function GridSessionPane({
     },
     [navigateWorkspace, onOpenWorkspace],
   );
+  const openFileInTree = useCallback(
+    (path: string) =>
+      navigateWorkspace(path, undefined, () => {
+        setPosition(undefined);
+        onOpenWorkspace();
+        updateWorkspace({
+          treePreviewPath: path,
+          selectedFilePath: null,
+          selectedTerminalKey: null,
+          rightRailTab: "files",
+        });
+      }),
+    [navigateWorkspace, onOpenWorkspace, updateWorkspace],
+  );
+  const closeTreePreview = useCallback(
+    () => navigateWorkspace(null, undefined, () => updateWorkspace({ treePreviewPath: null })),
+    [navigateWorkspace, updateWorkspace],
+  );
   useUiOpenFile(sessionId, selected && canBrowse, openFile);
   const showTab = useCallback((rightRailTab: RightRailTab | null) => {
     setWorkspace((previous) => ({
@@ -290,9 +313,11 @@ export function GridSessionPane({
   }, []);
   const selectTab = useCallback(
     (rightRailTab: RightRailTab | null) => {
-      navigateWorkspace("", undefined, () => showTab(rightRailTab));
+      const destination =
+        fileTreeSplitEnabled && rightRailTab === "files" ? (workspace.treePreviewPath ?? null) : "";
+      navigateWorkspace(destination, undefined, () => showTab(rightRailTab));
     },
-    [navigateWorkspace, showTab],
+    [navigateWorkspace, showTab, fileTreeSplitEnabled, workspace.treePreviewPath],
   );
   const closeFile = useCallback(
     (path: string) => {
@@ -326,11 +351,15 @@ export function GridSessionPane({
       },
       openFolder: showFiles
         ? (absolutePath: string) =>
-            navigateWorkspace(absolutePath, undefined, () => {
-              revealFolderInFilesPanel(sessionId, absolutePath);
-              showTab("files");
-              onOpenWorkspace();
-            })
+            navigateWorkspace(
+              fileTreeSplitEnabled ? (workspace.treePreviewPath ?? null) : absolutePath,
+              undefined,
+              () => {
+                revealFolderInFilesPanel(sessionId, absolutePath);
+                showTab("files");
+                onOpenWorkspace();
+              },
+            )
         : undefined,
       conversationId: sessionId,
       workspaceRoot: environment.data?.root ?? null,
@@ -343,6 +372,8 @@ export function GridSessionPane({
       registerNavigationGuard,
       selectTab,
       navigateWorkspace,
+      fileTreeSplitEnabled,
+      workspace.treePreviewPath,
       showTab,
       onOpenWorkspace,
       showFiles,
@@ -498,7 +529,7 @@ export function GridSessionPane({
                 onRightRailTabChange={selectTab}
                 openPanels={workspace.openPanels ?? []}
                 onClosePanel={(tab) => {
-                  navigateWorkspace("", undefined, () =>
+                  const close = () =>
                     setWorkspace((previous) => {
                       const remaining = previous.openPanels?.filter((panel) => panel !== tab) ?? [];
                       return {
@@ -509,8 +540,13 @@ export function GridSessionPane({
                             ? (remaining.at(-1) ?? readInitialWorkspaceTab())
                             : previous.rightRailTab,
                       };
-                    }),
-                  );
+                    });
+                  if (
+                    fileTreeSplitEnabled &&
+                    (tab !== workspace.rightRailTab || workspace.selectedFilePath != null)
+                  )
+                    close();
+                  else navigateWorkspace("", undefined, close);
                 }}
                 showFilesPanel={showFiles}
                 showGithubTab={showFiles}
@@ -520,6 +556,10 @@ export function GridSessionPane({
                 subagentsWorking={childSessions.filter((child) => child.busy).length}
                 agentCount={childSessions.length + 1}
                 rootSessionId={rootSessionId}
+                fileTreeSplitEnabled={fileTreeSplitEnabled}
+                treePreviewPath={workspace.treePreviewPath ?? null}
+                openFileInTree={openFileInTree}
+                onCloseTreePreview={closeTreePreview}
                 selectedFilePath={canBrowse ? (workspace.selectedFilePath ?? null) : null}
                 filePosition={position}
                 openFiles={canBrowse ? (workspace.openFiles ?? []) : []}

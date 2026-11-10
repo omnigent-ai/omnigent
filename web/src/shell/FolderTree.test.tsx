@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { isMacPlatform } from "@/lib/hotkeys";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
@@ -88,6 +89,105 @@ function dir(path: string, modifiedAt: number | null = null): WorkspaceFile {
     type: "directory",
   };
 }
+
+describe("FolderTree file opening", () => {
+  it.each([false, true])(
+    "marks only the previewed file in tree/search rows (search=%s)",
+    (search) => {
+      renderTree({
+        files: [file("README.md"), file("other.md")],
+        searchQuery: search ? ".md" : "",
+        searchResults: search ? [file("README.md"), file("other.md")] : undefined,
+        browseLocation: "/tmp/project",
+        selectedFilePath: "/tmp/project/README.md",
+      });
+      const selected = screen.getByRole("button", { name: "README.md" });
+      const other = screen.getByRole("button", { name: "other.md" });
+      expect(selected).toHaveAttribute("aria-current", "true");
+      expect(selected.parentElement).toHaveClass("bg-accent");
+      expect(other).not.toHaveAttribute("aria-current");
+      expect(other.parentElement).not.toHaveClass("bg-accent");
+    },
+  );
+
+  it.each([false, true])(
+    "opens tree and search rows with tab gestures (search=%s)",
+    async (search) => {
+      const onFileSelect = vi.fn();
+      renderTree({
+        files: [file("README.md")],
+        searchQuery: search ? "README" : "",
+        searchResults: search ? [file("README.md")] : undefined,
+        showOpenInTab: true,
+        onFileSelect,
+      });
+      const row = screen.getByRole("button", { name: "README.md" });
+      fireEvent.click(row);
+      expect(onFileSelect.mock.calls).toEqual([["README.md"]]);
+
+      fireEvent.click(row, { metaKey: isMacPlatform(), ctrlKey: !isMacPlatform() });
+      expect(onFileSelect).toHaveBeenLastCalledWith("README.md", true);
+      fireEvent.click(row, { metaKey: !isMacPlatform(), ctrlKey: isMacPlatform() });
+      expect(onFileSelect).toHaveBeenLastCalledWith("README.md");
+
+      onFileSelect.mockClear();
+      expect(fireEvent.mouseDown(row, { button: 0 })).toBe(true);
+      expect(fireEvent.mouseDown(row, { button: 2 })).toBe(true);
+      fireEvent(row, new MouseEvent("auxclick", { bubbles: true, button: 2 }));
+      expect(fireEvent.mouseDown(row, { button: 1 })).toBe(false);
+      expect(onFileSelect).not.toHaveBeenCalled();
+      fireEvent(row, new MouseEvent("auxclick", { bubbles: true, button: 1 }));
+      expect(onFileSelect.mock.calls).toEqual([["README.md", true]]);
+
+      fireEvent.contextMenu(row);
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Open in new tab" }));
+      expect(onFileSelect.mock.calls).toEqual([
+        ["README.md", true],
+        ["README.md", true],
+      ]);
+    },
+  );
+
+  it("leaves modified clicks and the native context menu unchanged when disabled", () => {
+    const onFileSelect = vi.fn();
+    renderTree({ files: [file("README.md")], showOpenInTab: false, onFileSelect });
+    const row = screen.getByRole("button", { name: "README.md" });
+    fireEvent.click(row, { metaKey: isMacPlatform(), ctrlKey: !isMacPlatform() });
+    expect(onFileSelect.mock.calls).toEqual([["README.md"]]);
+    onFileSelect.mockClear();
+    expect(fireEvent.mouseDown(row, { button: 1 })).toBe(true);
+    fireEvent(row, new MouseEvent("auxclick", { bubbles: true, button: 1 }));
+    expect(fireEvent.contextMenu(row)).toBe(true);
+    expect(screen.queryByRole("menuitem", { name: "Open in new tab" })).toBeNull();
+    expect(onFileSelect).not.toHaveBeenCalled();
+  });
+
+  it("does not open deleted files through any gesture", () => {
+    const onFileSelect = vi.fn();
+    renderTree({
+      files: [file("README.md")],
+      changedFiles: [
+        {
+          ...file("README.md"),
+          status: "deleted",
+          lines_added: null,
+          lines_removed: null,
+        },
+      ],
+      showOpenInTab: true,
+      onFileSelect,
+    });
+    const row = screen.getByRole("button", { name: /^README\.md/ });
+    expect(row).toBeDisabled();
+    expect(fireEvent.mouseDown(row, { button: 1 })).toBe(true);
+    fireEvent.click(row);
+    fireEvent.click(row, { metaKey: isMacPlatform(), ctrlKey: !isMacPlatform() });
+    fireEvent(row, new MouseEvent("auxclick", { bubbles: true, button: 1 }));
+    expect(fireEvent.contextMenu(row)).toBe(true);
+    expect(screen.queryByRole("menuitem", { name: "Open in new tab" })).toBeNull();
+    expect(onFileSelect).not.toHaveBeenCalled();
+  });
+});
 
 describe("FolderTree runner-offline state", () => {
   it("shows the reconnect hint when the runner went offline (session failed)", () => {

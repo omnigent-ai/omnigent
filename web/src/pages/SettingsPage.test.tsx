@@ -28,6 +28,7 @@ import {
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { useAlwaysOpenFilesInTab } from "@/lib/workspaceTabPreferences";
 import * as host from "@/lib/host";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
@@ -55,6 +56,7 @@ const mocks = vi.hoisted(() => ({
   singleUser: false,
   sessionTitleInstructions: false,
   nestedAgents: false,
+  fileTreeSplit: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
@@ -86,6 +88,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     sibling_sessions: mocks.nestedAgents,
     enabled_connections: mocks.enabledConnections,
     session_title_instructions: mocks.sessionTitleInstructions,
+    features: { workspace_file_tree_split_ui: mocks.fileTreeSplit },
   }),
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
@@ -282,6 +285,7 @@ beforeEach(() => {
   mocks.accountsEnabled = true;
   mocks.sessionTitleInstructions = false;
   mocks.nestedAgents = false;
+  mocks.fileTreeSplit = false;
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
@@ -764,6 +768,29 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
   });
 
+  it("hides the file-opening preference when its feature is disabled", () => {
+    renderPage("/settings/appearance");
+    expect(
+      screen.queryByRole("switch", { name: "Always open files in a new tab" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("persists the file-opening preference when its feature is enabled", () => {
+    mocks.fileTreeSplit = true;
+    const first = renderPage("/settings/appearance");
+    const toggle = screen.getByRole("switch", { name: "Always open files in a new tab" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:always-open-files-in-tab")).toBe("true");
+    first.unmount();
+    renderPage("/settings/appearance");
+    expect(screen.getByRole("switch", { name: "Always open files in a new tab" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
   it("selects and persists the default Workspace tab", () => {
     renderPage("/settings/appearance");
 
@@ -1181,7 +1208,11 @@ describe("SettingsPage", () => {
 
   it("resets every appearance preference back to product defaults", () => {
     localStorage.clear();
+    mocks.fileTreeSplit = true;
     renderPage("/settings/appearance");
+    const fileOpening = renderHook(() => useAlwaysOpenFilesInTab());
+    fireEvent.click(screen.getByRole("switch", { name: "Always open files in a new tab" }));
+    expect(fileOpening.result.current).toBe(true);
 
     // Tweak a representative set of appearance preferences.
     mocks.theme = "dark";
@@ -1277,6 +1308,12 @@ describe("SettingsPage", () => {
     );
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
     expect(localStorage.getItem("omnigent:pinned-workspace-tabs")).toBeNull();
+    expect(localStorage.getItem("omnigent:always-open-files-in-tab")).toBeNull();
+    expect(fileOpening.result.current).toBe(false);
+    expect(screen.getByRole("switch", { name: "Always open files in a new tab" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
     expect(screen.getByRole("button", { name: "Pin Changes" })).toHaveAttribute(
       "aria-pressed",
       "true",

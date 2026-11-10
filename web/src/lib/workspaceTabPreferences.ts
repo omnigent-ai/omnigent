@@ -5,9 +5,22 @@ import {
   resetSessionWorkspaceTabSelections,
   unpinSessionWorkspaceTabs,
 } from "./sessionWorkspaceState";
+import { createStoredPreference } from "./storedChoicePreference";
 
 const STORAGE_KEY = "omnigent:default-workspace-tab";
 export const PINNED_WORKSPACE_TABS_STORAGE_KEY = "omnigent:pinned-workspace-tabs";
+export const ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY = "omnigent:always-open-files-in-tab";
+
+const fileOpeningPreference = createStoredPreference(
+  ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
+  (stored) => stored === "true",
+  false,
+);
+
+export const readAlwaysOpenFilesInTab = fileOpeningPreference.read;
+export const writeAlwaysOpenFilesInTab = fileOpeningPreference.write;
+export const useAlwaysOpenFilesInTab = fileOpeningPreference.use;
+export const notifyAlwaysOpenFilesInTabChanged = fileOpeningPreference.notifyChanged;
 
 export const defaultWorkspaceTabs = ["files", "changes", "github", "subagents"] as const;
 export type DefaultWorkspaceTab = (typeof defaultWorkspaceTabs)[number];

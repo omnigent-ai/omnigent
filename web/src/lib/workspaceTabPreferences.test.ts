@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { act, renderHook } from "@testing-library/react";
 import {
+  ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
   DEFAULT_WORKSPACE_TAB,
   defaultWorkspaceTabs,
   normalizeDefaultWorkspaceTab,
@@ -7,6 +9,9 @@ import {
   readDefaultWorkspaceTab,
   readInitialWorkspaceTab,
   readPinnedWorkspaceTabs,
+  readAlwaysOpenFilesInTab,
+  useAlwaysOpenFilesInTab,
+  writeAlwaysOpenFilesInTab,
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
 } from "./workspaceTabPreferences";
@@ -24,6 +29,28 @@ afterEach(() => {
 });
 
 describe("workspaceTabPreferences — read/write", () => {
+  it("defaults to inline opening and follows local and cross-window preference changes", () => {
+    const { result } = renderHook(() => useAlwaysOpenFilesInTab());
+    expect(result.current).toBe(false);
+    localStorage.setItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY, "invalid");
+    expect(readAlwaysOpenFilesInTab()).toBe(false);
+
+    act(() => writeAlwaysOpenFilesInTab(true));
+    expect(result.current).toBe(true);
+    expect(localStorage.getItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY)).toBe("true");
+    act(() => {
+      localStorage.removeItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY);
+      window.dispatchEvent(
+        new StorageEvent("storage", { key: ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY }),
+      );
+    });
+    expect(result.current).toBe(false);
+    act(() => writeAlwaysOpenFilesInTab(true));
+    act(() => writeAlwaysOpenFilesInTab(false));
+    expect(result.current).toBe(false);
+    expect(localStorage.getItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY)).toBeNull();
+  });
+
   it("persists pins, clears stale selections, and never defaults to an unpinned page", () => {
     expect(readPinnedWorkspaceTabs()).toEqual(defaultWorkspaceTabs);
     writeSessionWorkspaceState("conv", { rightRailTab: "files", open: true });

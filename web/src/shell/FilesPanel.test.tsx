@@ -26,6 +26,7 @@ import { useSession } from "@/hooks/useSession";
 import { FilesPanel, fileListStatus, revealFolderInFilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
+import * as OpenInMenuModule from "./OpenInMenu";
 import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
@@ -334,6 +335,59 @@ describe("FilesPanel working folder directory", () => {
 });
 
 describe("FilesPanel header role", () => {
+  it("keeps the header above both columns and replaces the folder action with Close file", () => {
+    const openIn = vi
+      .spyOn(OpenInMenuModule, "OpenInMenu")
+      .mockImplementation(() => <button type="button">Open folder in editor</button>);
+    try {
+      const conversationId = "conv_split_header";
+      const view = renderPanel({ conversationId, files: [], workingDir: "/workspace" });
+      const tree = screen.getByTestId("workspace-file-tree-column");
+      const search = screen.getByRole("searchbox", { name: "Search all files" });
+      const onClosePreview = vi.fn();
+      expect(screen.getByRole("button", { name: "Open folder in editor" })).toBeInTheDocument();
+
+      view.rerender(
+        panelAt(conversationId, {
+          compactTreeControls: true,
+          treeWidth: 200,
+          fileViewer: <div data-testid="preview">File contents</div>,
+          onClosePreview,
+        }),
+      );
+      const close = screen.getByRole("button", { name: "Close file" });
+      const header = close.closest("[data-files-header]");
+      expect(header).not.toBeNull();
+      expect(tree.contains(header)).toBe(false);
+      expect(tree.parentElement).toContainElement(screen.getByTestId("preview"));
+      expect(screen.getByTestId("workspace-file-tree-column")).toBe(tree);
+      expect(screen.getByRole("searchbox", { name: "Search all files" })).toBe(search);
+      expect(screen.queryByRole("button", { name: "Open folder in editor" })).toBeNull();
+      fireEvent.click(close);
+      expect(onClosePreview).toHaveBeenCalledOnce();
+
+      view.rerender(panelAt(conversationId, { compactTreeControls: true }));
+      expect(screen.queryByRole("button", { name: "Close file" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Open folder in editor" })).toBeInTheDocument();
+    } finally {
+      openIn.mockRestore();
+    }
+  });
+
+  it("offers working-folder copy and refresh from the compact actions menu", async () => {
+    const conversationId = "conv_compact_actions";
+    const view = renderPanel({ conversationId, files: [], workingDir: "/workspace" });
+    expect(screen.queryByRole("button", { name: "Folder actions" })).toBeNull();
+    view.rerender(panelAt(conversationId, { compactTreeControls: true }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Folder actions" }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy folder path" }));
+    expect(copyTextMock).toHaveBeenCalledWith("/workspace");
+    fireEvent.keyDown(screen.getByRole("button", { name: "Folder actions" }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Refresh files" }));
+    await waitFor(() => expect(allFilesRefetchMock).toHaveBeenCalledOnce());
+    expect(changedFilesRefetchMock).toHaveBeenCalledOnce();
+  });
+
   it("omits the redundant Working folder heading in the standalone card", () => {
     renderPanel({ conversationId: "conv_header_card", files: [] });
     expect(screen.queryByText("Working folder")).toBeNull();

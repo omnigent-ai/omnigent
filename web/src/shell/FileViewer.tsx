@@ -334,6 +334,10 @@ function useToolbarOverflow(actionsKey: string): {
 
 interface FileViewerProps {
   syncUrl?: boolean;
+  /** Let a persistent workspace viewer restore its URL when shown again. */
+  syncFilePath?: boolean;
+  /** Hidden workspace editors retain their drafts and navigation guard. */
+  keepNavigationGuard?: boolean;
   agentId?: string | null;
   position?: FilePosition;
   open: boolean;
@@ -397,6 +401,8 @@ export function FileViewer(props: FileViewerProps) {
 
 function FileViewerBody({
   syncUrl = true,
+  syncFilePath = false,
+  keepNavigationGuard = false,
   position,
   open,
   mediaActive = true,
@@ -507,6 +513,7 @@ function FileViewerBody({
   // to decide whether to preserve the pending mark when the user clicks away.
   const pendingBodyRef = useRef("");
   const [isEditorDirty, setIsEditorDirty] = useState(false);
+  const [discardedDraftVersion, setDiscardedDraftVersion] = useState(0);
   // Acceptance clears this synchronously before entering another navigation guard.
   const isEditorDirtyRef = useRef(false);
   const handleDirtyChange = useCallback((dirty: boolean) => {
@@ -992,7 +999,7 @@ function FileViewerBody({
 
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
   useLayoutEffect(() => {
-    if (!open || !registerNavigationGuard) return;
+    if ((!open && !keepNavigationGuard) || !registerNavigationGuard) return;
     return registerNavigationGuard((destination, options, navigate) => {
       if (destination !== path || (options?.line && viewMode === "editor")) {
         guardDirty(navigate);
@@ -1000,7 +1007,7 @@ function FileViewerBody({
         navigate();
       }
     });
-  }, [open, path, viewMode, guardDirty, registerNavigationGuard]);
+  }, [open, keepNavigationGuard, path, viewMode, guardDirty, registerNavigationGuard]);
 
   useEffect(() => {
     const last = lastNavigationRef.current;
@@ -1160,10 +1167,15 @@ function FileViewerBody({
     if (!syncUrl || !open || !isActiveViewport) return;
     const wantDiff = diffActive && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
-    if (wantDiff === hasDiff) return; // already in sync — no navigate needed
+    const pathChanged = syncFilePath && searchParams.get("file") !== path;
+    if (wantDiff === hasDiff && !pathChanged) return; // already in sync — no navigate needed
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
+        if (pathChanged) {
+          next.set("file", path);
+          for (const key of ["comment", "line", "column", "endLine"]) next.delete(key);
+        }
         if (wantDiff) {
           next.set("diff", "1");
         } else {
@@ -1173,7 +1185,17 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [syncUrl, diffActive, isDiffAvailable, open, isActiveViewport, searchParams, setSearchParams]);
+  }, [
+    syncUrl,
+    syncFilePath,
+    path,
+    diffActive,
+    isDiffAvailable,
+    open,
+    isActiveViewport,
+    searchParams,
+    setSearchParams,
+  ]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
@@ -1952,6 +1974,7 @@ function FileViewerBody({
             )
           ) : (
             <CodeViewer
+              key={keepNavigationGuard ? discardedDraftVersion : undefined}
               position={filePosition}
               conversationId={conversationId}
               path={path}
@@ -2073,6 +2096,8 @@ function FileViewerBody({
               variant="destructive"
               onClick={() => {
                 handleDirtyChange(false);
+                // A shared viewer may survive navigation; discard its editor buffer too.
+                if (keepNavigationGuard) setDiscardedDraftVersion((version) => version + 1);
                 pendingAction?.apply();
                 setPendingAction(null);
               }}

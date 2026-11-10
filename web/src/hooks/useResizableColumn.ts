@@ -1,30 +1,74 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth = 480) {
-  const [width, setWidth] = useState(defaultWidth);
-  const dragging = useRef(false);
+export function useResizableColumn(
+  defaultWidth = 176,
+  minWidth = 100,
+  maxWidth = 480,
+  storageKey?: string,
+) {
+  const [preferredWidth, setPreferredWidth] = useState(() => {
+    try {
+      const stored = storageKey ? Number(localStorage.getItem(storageKey)) : NaN;
+      if (Number.isFinite(stored) && stored > 0) return stored;
+    } catch {
+      // Storage can be unavailable in embedded or private contexts.
+    }
+    return defaultWidth;
+  });
+  const maximum = Math.max(minWidth, maxWidth);
+  const width = Math.max(minWidth, Math.min(maximum, preferredWidth));
+  const current = useRef({ width, preferredWidth, minWidth, maximum, storageKey });
+  current.current = { width, preferredWidth, minWidth, maximum, storageKey };
+  const dragging = useRef<{ startX: number; startWidth: number; changed: boolean } | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
-  const minRef = useRef(minWidth);
-  const maxRef = useRef(maxWidth);
-  minRef.current = minWidth;
-  maxRef.current = maxWidth;
+
+  const persist = useCallback(() => {
+    const state = current.current;
+    if (!state.storageKey) return;
+    try {
+      localStorage.setItem(state.storageKey, String(state.preferredWidth));
+    } catch {
+      // A failed preference write must not prevent resizing.
+    }
+  }, []);
+
+  const resize = useCallback((requested: number) => {
+    const state = current.current;
+    const next = Math.max(state.minWidth, Math.min(state.maximum, requested));
+    if (next === state.width) return false;
+    state.width = next;
+    state.preferredWidth = next;
+    setPreferredWidth(next);
+    return true;
+  }, []);
 
   const onMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
     e.preventDefault();
-    dragging.current = true;
+    dragging.current = { startX: e.clientX, startWidth: current.current.width, changed: false };
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
   }, []);
 
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      e.preventDefault();
+      if (resize(current.current.width + (e.key === "ArrowLeft" ? -16 : 16))) persist();
+    },
+    [persist, resize],
+  );
+
   useEffect(() => {
     function onMouseMove(e: MouseEvent) {
-      if (!dragging.current || !containerRef.current) return;
-      const left = containerRef.current.getBoundingClientRect().left;
-      setWidth(Math.max(minRef.current, Math.min(maxRef.current, e.clientX - left)));
+      const drag = dragging.current;
+      if (!drag || !containerRef.current) return;
+      if (resize(drag.startWidth + e.clientX - drag.startX)) drag.changed = true;
     }
     function onMouseUp() {
       if (!dragging.current) return;
-      dragging.current = false;
+      if (dragging.current.changed) persist();
+      dragging.current = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     }
@@ -34,24 +78,29 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
       if (dragging.current) {
-        dragging.current = false;
+        dragging.current = null;
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
       }
     };
-  }, []);
+  }, [persist, resize]);
 
   return {
     /** Pixel width for the left column (apply as inline style). */
     width,
-    /** Attach to the flex-row container to anchor drag calculations. */
+    /** Attach to the flex-row container that owns the resize handle. */
     containerRef,
     /** Spread onto the resize handle element at the right edge of the left column. */
     handleProps: {
       onMouseDown,
+      onKeyDown,
+      tabIndex: 0,
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize terminal list",
+      "aria-valuenow": width,
+      "aria-valuemin": minWidth,
+      "aria-valuemax": maximum,
     },
   };
 }

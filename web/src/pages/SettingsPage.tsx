@@ -120,6 +120,7 @@ import {
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -225,6 +226,8 @@ import {
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
   readPinnedWorkspaceTabs,
+  useAlwaysOpenFilesInTab,
+  writeAlwaysOpenFilesInTab,
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
   type DefaultWorkspaceTab,
@@ -1064,7 +1067,30 @@ function SessionRowQuickActionsControl() {
   );
 }
 
+function FileOpeningControl() {
+  const enabled = useAlwaysOpenFilesInTab();
+  const labelId = useId();
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Always open files in a new tab"
+        labelId={labelId}
+        description="Clicking a file in the Files tree opens it in its own tab instead of beside the tree."
+      />
+      <Switch
+        aria-labelledby={labelId}
+        checked={enabled}
+        onCheckedChange={writeAlwaysOpenFilesInTab}
+        className="mt-0.5 shrink-0"
+        data-testid="always-open-files-in-tab-toggle"
+        componentId="settings.appearance.always_open_files_in_tab"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
+  const info = useServerInfo();
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
@@ -1089,6 +1115,7 @@ function AppearanceSection() {
 
     writeDefaultWorkspaceTab(DEFAULT_WORKSPACE_TAB);
     writePinnedWorkspaceTabs(defaultWorkspaceTabs);
+    writeAlwaysOpenFilesInTab(false);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
     writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
@@ -1207,6 +1234,11 @@ function AppearanceSection() {
             <div className="mt-4 border-t border-border pt-4">
               <WorkspaceTabsControl />
             </div>
+            {isFeatureEnabled(info, "workspace_file_tree_split_ui") && (
+              <div className="mt-4 border-t border-border pt-4">
+                <FileOpeningControl />
+              </div>
+            )}
           </SettingsGroup>
 
           <SettingsGroup title="Sidebar" testId="settings-group-sidebar">

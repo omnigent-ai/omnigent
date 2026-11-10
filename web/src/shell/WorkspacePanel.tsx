@@ -44,6 +44,7 @@ import {
   defaultWorkspaceTabs,
   readDefaultWorkspaceTab,
   readPinnedWorkspaceTabs,
+  useAlwaysOpenFilesInTab,
 } from "@/lib/workspaceTabPreferences";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -62,6 +63,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
+import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { useInertRef } from "@/hooks/useInertRef";
 import { requestSandboxWake } from "@/hooks/useSandboxAutoWake";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
@@ -739,6 +741,10 @@ interface WorkspacePanelProps {
   rootSessionId: string | null;
   /** Active file path, or null when the Files tab shows a scope view. */
   selectedFilePath: string | null;
+  fileTreeSplitEnabled?: boolean;
+  treePreviewPath?: string | null;
+  openFileInTree?: (path: string) => void;
+  onCloseTreePreview?: () => void;
   filePosition?: FilePosition;
   mobileFileTarget?: HTMLElement | null;
   onMobileFileClose?: () => void;
@@ -901,6 +907,10 @@ function WorkspacePanelImpl({
   agentCount,
   rootSessionId,
   selectedFilePath,
+  fileTreeSplitEnabled = false,
+  treePreviewPath = null,
+  openFileInTree,
+  onCloseTreePreview,
   filePosition,
   mobileFileTarget = null,
   onMobileFileClose,
@@ -993,6 +1003,27 @@ function WorkspacePanelImpl({
     selectedFilePath === null &&
     selectedTerminalKey === null;
   const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
+  const leaveFileRef = useRef<(path: string | null, commit: () => void) => void>((_path, commit) =>
+    commit(),
+  );
+  leaveFileRef.current = (path, commit) => {
+    if (
+      guardFileNavigation &&
+      (selectedFilePath !== null || (fileTreeSplitEnabled && treePreviewPath !== null))
+    ) {
+      guardFileNavigation(path, undefined, commit);
+    } else commit();
+  };
+  const selectWorkspaceContent = (commit: () => void) => {
+    if (fileTreeSplitEnabled) leaveFileRef.current(null, commit);
+    else commit();
+  };
+  const selectBrowser = (tabId: string) =>
+    selectWorkspaceContent(() => {
+      browsers.select(tabId);
+      onRightRailTabChange("browser");
+    });
+
   // The browser page that took keyboard focus from this page, if any. Clicking into
   // a page leaves this page's focus where it was, so only the shell can tell.
   // `pending` is the shell's answer while it's still on its way.
@@ -1079,11 +1110,7 @@ function WorkspacePanelImpl({
       onReveal?.();
     };
     // A new browser tab replaces the file on screen, so its viewer confirms unsaved edits first.
-    if (selectedFilePath !== null && guardFileNavigation) {
-      guardFileNavigation(null, undefined, openBrowser);
-    } else {
-      openBrowser();
-    }
+    leaveFileRef.current(null, openBrowser);
   };
   useDesktopCommand(
     "new-browser-tab",
@@ -1092,6 +1119,11 @@ function WorkspacePanelImpl({
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
+  const selectSideChat = (childId: string) =>
+    selectWorkspaceContent(() => {
+      sideChats.select(childId);
+      onRightRailTabChange("sidechat");
+    });
   // Open tabs stay reachable even where this viewer can't start a side chat.
   const hasSideChatTabs = sideChats.tabs.length > 0;
   useEffect(() => {
@@ -1123,27 +1155,38 @@ function WorkspacePanelImpl({
     // screen now.
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
-    const subagentId = subagentSessionIdFromTab(childId);
-    if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
-      // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
-      sideChats.select(subagentId);
-    } else if (childId.startsWith("pending:") || subagentId !== null) {
-      // "Ask in side chat" (a not-yet-forked tab) and sub-agent tabs (an
-      // existing session) must not take a slot in the Codex awaiting queue.
-      sideChats.open(childId);
-    } else {
-      const awaiting = awaitingPendingIdsRef.current.shift();
-      if (awaiting !== undefined) {
-        sideChats.rekey(awaiting, childId);
-        useChatStore.getState().clearSideChatComposer(awaiting);
-      } else {
-        // Generic already rekeyed its own tab; this just re-selects it (idempotent).
-        sideChats.open(childId);
-      }
-    }
-    onRightRailTabChange("sidechat");
     clearSideChatToOpen();
-  }, [sideChatToOpen, conversationId, sideChats, onRightRailTabChange, clearSideChatToOpen]);
+    const select = () => {
+      const subagentId = subagentSessionIdFromTab(childId);
+      if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
+        // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
+        sideChats.select(subagentId);
+      } else if (childId.startsWith("pending:") || subagentId !== null) {
+        // "Ask in side chat" (a not-yet-forked tab) and sub-agent tabs (an
+        // existing session) must not take a slot in the Codex awaiting queue.
+        sideChats.open(childId);
+      } else {
+        const awaiting = awaitingPendingIdsRef.current.shift();
+        if (awaiting !== undefined) {
+          sideChats.rekey(awaiting, childId);
+          useChatStore.getState().clearSideChatComposer(awaiting);
+        } else {
+          // Generic already rekeyed its own tab; this just re-selects it (idempotent).
+          sideChats.open(childId);
+        }
+      }
+      onRightRailTabChange("sidechat");
+    };
+    if (fileTreeSplitEnabled) leaveFileRef.current(null, select);
+    else select();
+  }, [
+    sideChatToOpen,
+    conversationId,
+    sideChats,
+    onRightRailTabChange,
+    clearSideChatToOpen,
+    fileTreeSplitEnabled,
+  ]);
   const sideChatSelected =
     rightRailTab === "sidechat" &&
     selectedFilePath === null &&
@@ -1176,10 +1219,11 @@ function WorkspacePanelImpl({
     }
   }, [savedSideChats, discoverSideChats, restoreSideChats]);
   const onNewSideChat = supportsSideChat(sideChatHarness, canStartSideChat)
-    ? () => {
-        useChatStore.getState().requestSideChatFocus(sideChats.openPending());
-        onRightRailTabChange("sidechat");
-      }
+    ? () =>
+        selectWorkspaceContent(() => {
+          useChatStore.getState().requestSideChatFocus(sideChats.openPending());
+          onRightRailTabChange("sidechat");
+        })
     : undefined;
   // First message sent in a pending side-chat tab: create the fork now. The
   // pending tab stays put and is rekeyed to the real child once it arrives (via
@@ -1378,8 +1422,13 @@ function WorkspacePanelImpl({
     if (selectedFilePath !== null) closeFile(selectedFilePath);
   }, [closeFile, selectedFilePath]);
   const closePanel = (tab: DefaultWorkspaceTab) => {
-    rememberClosedTab(conversationId, { kind: "panel", tab });
-    onClosePanel(tab);
+    const close = () => {
+      rememberClosedTab(conversationId, { kind: "panel", tab });
+      onClosePanel(tab);
+    };
+    if (tab === rightRailTab && selectedFilePath === null && !terminalShown)
+      selectWorkspaceContent(close);
+    else close();
   };
   // Resolve shell tab keys to display labels. The terminals list is already
   // fetched elsewhere for the session, so this shares the same query cache.
@@ -1526,20 +1575,14 @@ function WorkspacePanelImpl({
       key: `browser:${tabId}`,
       label: browsers.labelFor(tabId, index),
       active: browserSelected && browsers.selected === tabId,
-      select: () => {
-        browsers.select(tabId);
-        onRightRailTabChange("browser");
-      },
+      select: () => selectBrowser(tabId),
       disabled: false,
     })),
     ...sideChats.tabs.map((childId) => ({
       key: `sidechat:${childId}`,
       label: chatTabLabels[childId] ?? childId,
       active: sideChatSelected && sideChats.selected === childId,
-      select: () => {
-        sideChats.select(childId);
-        onRightRailTabChange("sidechat");
-      },
+      select: () => selectSideChat(childId),
       disabled: false,
     })),
   ];
@@ -1590,8 +1633,41 @@ function WorkspacePanelImpl({
                 ? "content-search"
                 : "files";
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
-  const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
-  const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
+  const sharedFileViewer = fileTreeSplitEnabled && showFilesPanel;
+  const alwaysOpenFilesInTab = useAlwaysOpenFilesInTab();
+  const [filesWidth, setFilesWidth] = useState(0);
+  const filesContainerRef = useRef<HTMLDivElement | null>(null);
+  const filesPanelMounted =
+    showFilesPanel && !pending && (scopeView === "files" || sharedFileViewer);
+  const filesPanelActive =
+    filesPanelMounted &&
+    !terminalShown &&
+    (selectedFilePath !== null ? sharedFileViewer : scopeView === "files");
+  useEffect(() => {
+    const node = filesContainerRef.current;
+    if (!sharedFileViewer || !node) return;
+    const measure = () => setFilesWidth(node.getBoundingClientRect().width);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [sharedFileViewer, filesPanelMounted]);
+  const treeColumn = useResizableColumn(
+    260,
+    200,
+    Math.max(200, Math.min(filesWidth / 2, filesWidth - 324)),
+    "omnigent:workspace-file-tree-width",
+  );
+  const canSplitFiles =
+    sharedFileViewer &&
+    !isMobile &&
+    !alwaysOpenFilesInTab &&
+    rightRailTab === "files" &&
+    filesWidth >= 524;
+  const splitFiles = canSplitFiles && selectedFilePath === null && treePreviewPath !== null;
+  const viewerPath = selectedFilePath ?? treePreviewPath;
+  const viewerVisible = filesPanelActive && (selectedFilePath !== null || splitFiles);
+
   // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
   // has focus: close the tab on screen, or hide the rail on a fixed page.
   // Otherwise AppShell's handler leaves the session.
@@ -1614,6 +1690,8 @@ function WorkspacePanelImpl({
         if (closingTerminalKey !== selectedTerminalKey) onCloseTerminal(selectedTerminalKey);
       } else if (selectedFilePath !== null) {
         handleCloseTab();
+      } else if (splitFiles) {
+        onCloseTreePreview?.();
       } else if (scopeView === "sidechat" && sideChats.selected !== null) {
         void closeSideChat(sideChats.selected);
       } else if (scopeView === "browser" && browsers.selected !== null) {
@@ -1660,16 +1738,6 @@ function WorkspacePanelImpl({
   // Desktop ⇧⌘[ / ⇧⌘] step through the tabs in strip order; ⇧⌘T reopens the last closed one.
   // Leaves the file on screen, if any, once its viewer allows it (it confirms unsaved
   // edits). A ref, so a reopen that finishes later asks about the file shown by then.
-  const leaveFileRef = useRef<(path: string | null, commit: () => void) => void>((_path, commit) =>
-    commit(),
-  );
-  leaveFileRef.current = (path, commit) => {
-    if (selectedFilePath !== null && guardFileNavigation) {
-      guardFileNavigation(path, undefined, commit);
-    } else {
-      commit();
-    }
-  };
   const showAdjacentTab = (step: -1 | 1) => {
     const options = panelOptions.filter((option) => !option.disabled);
     const index = options.findIndex((option) => option.active);
@@ -1962,10 +2030,7 @@ function WorkspacePanelImpl({
                             void closeBrowserTab(tabId);
                           }
                         }}
-                        onClick={() => {
-                          browsers.select(tabId);
-                          onRightRailTabChange("browser");
-                        }}
+                        onClick={() => selectBrowser(tabId)}
                       >
                         <GlobeIcon className="size-4 shrink-0" />
                         <span className="max-w-44 truncate">{browsers.labelFor(tabId, index)}</span>
@@ -2007,10 +2072,7 @@ function WorkspacePanelImpl({
                             closeSideChat(childId);
                           }
                         }}
-                        onClick={() => {
-                          sideChats.select(childId);
-                          onRightRailTabChange("sidechat");
-                        }}
+                        onClick={() => selectSideChat(childId)}
                       >
                         <TabIcon className="size-4 shrink-0" />
                         <span className="max-w-[16ch] truncate">{label}</span>
@@ -2135,6 +2197,10 @@ function WorkspacePanelImpl({
           )}
           {filesPanelMounted && (
             <div
+              ref={(node) => {
+                filesContainerRef.current = node;
+                treeColumn.containerRef.current = node;
+              }}
               className={cn(
                 "flex min-h-0 flex-1 flex-col",
                 // Not display:none: hidden rows would measure 0px and collapse
@@ -2146,6 +2212,76 @@ function WorkspacePanelImpl({
                 conversationId={contained ? conversationId : undefined}
                 frameless
                 onFileSelect={openFileViewer}
+                onFileOpenInTree={canSplitFiles ? openFileInTree : undefined}
+                showOpenInTab={sharedFileViewer && !isMobile}
+                selectedFilePath={splitFiles ? treePreviewPath : null}
+                compactTreeControls={sharedFileViewer && !isMobile && rightRailTab === "files"}
+                showTree={!sharedFileViewer || selectedFilePath === null}
+                treeWidth={splitFiles ? treeColumn.width : undefined}
+                onClosePreview={splitFiles ? onCloseTreePreview : undefined}
+                resizeHandle={
+                  splitFiles ? (
+                    <div
+                      {...treeColumn.handleProps}
+                      aria-label="Resize file tree"
+                      className="absolute inset-y-0 right-0 w-1 cursor-col-resize hover:bg-primary/30 focus-visible:bg-primary/30 focus-visible:outline-none"
+                    />
+                  ) : undefined
+                }
+                fileViewer={
+                  sharedFileViewer &&
+                  viewerPath !== null &&
+                  !terminalShown &&
+                  (selectedFilePath !== null || rightRailTab === "files") ? (
+                    <div
+                      className={cn(
+                        "flex min-h-0 min-w-0 flex-1 flex-col",
+                        !viewerVisible && "invisible absolute inset-0 pointer-events-none",
+                      )}
+                    >
+                      <ResponsiveViewerSlot
+                        mobile={isMobile && selectedFilePath !== null}
+                        mobileTarget={mobileFileTarget}
+                      >
+                        <FileViewer
+                          syncUrl={!contained}
+                          syncFilePath
+                          keepNavigationGuard
+                          agentId={agentId}
+                          frameless
+                          mobileOverlay={isMobile}
+                          open={isMobile ? selectedFilePath !== null : open && viewerVisible}
+                          mediaActive={
+                            isMobile
+                              ? selectedFilePath !== null && mobileFileTarget !== null
+                              : open && viewerVisible
+                          }
+                          conversationId={conversationId}
+                          path={viewerPath}
+                          position={selectedFilePath !== null ? filePosition : undefined}
+                          onClose={
+                            isMobile && onMobileFileClose
+                              ? onMobileFileClose
+                              : selectedFilePath !== null
+                                ? onShowScopeView
+                                : (onCloseTreePreview ?? onShowScopeView)
+                          }
+                          onCloseTab={
+                            isMobile && onMobileFileClose
+                              ? onMobileFileClose
+                              : selectedFilePath !== null
+                                ? handleCloseTab
+                                : onCloseTreePreview
+                          }
+                          onNavigateTo={openFileViewer}
+                          permissionLevel={permissionLevel}
+                          onCommentsOpenChange={onCommentsOpenChange}
+                          sort={filesPanelSort}
+                        />
+                      </ResponsiveViewerSlot>
+                    </div>
+                  ) : undefined
+                }
                 flatView={rightRailTab === "changes"}
                 showHidden={filesPanelShowHidden}
                 onShowHiddenChange={onShowHiddenChange}
@@ -2171,25 +2307,27 @@ function WorkspacePanelImpl({
               autoFocus={autoFocusSelectedTerminal}
             />
           ) : selectedFilePath !== null ? (
-            <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
-              <FileViewer
-                syncUrl={!contained}
-                agentId={agentId}
-                mobileOverlay={isMobile}
-                frameless
-                open
-                mediaActive={isMobile ? mobileFileTarget != null : open}
-                conversationId={conversationId}
-                path={selectedFilePath}
-                position={filePosition}
-                onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
-                onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
-                onNavigateTo={openFileViewer}
-                permissionLevel={permissionLevel}
-                onCommentsOpenChange={onCommentsOpenChange}
-                sort={filesPanelSort}
-              />
-            </ResponsiveViewerSlot>
+            sharedFileViewer ? null : (
+              <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
+                <FileViewer
+                  syncUrl={!contained}
+                  agentId={agentId}
+                  mobileOverlay={isMobile}
+                  frameless
+                  open
+                  mediaActive={isMobile ? mobileFileTarget != null : open}
+                  conversationId={conversationId}
+                  path={selectedFilePath}
+                  position={filePosition}
+                  onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
+                  onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
+                  onNavigateTo={openFileViewer}
+                  permissionLevel={permissionLevel}
+                  onCommentsOpenChange={onCommentsOpenChange}
+                  sort={filesPanelSort}
+                />
+              </ResponsiveViewerSlot>
+            )
           ) : scopeView === "sidechat" ? (
             // A side chat: a forked child conversation streamed here in its own
             // scoped surface, beside the still-active main chat. Phones show it
