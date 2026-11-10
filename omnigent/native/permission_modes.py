@@ -49,6 +49,9 @@ PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
     },
 }
 
+# Shared by every rejection of an automation's permission_mode.
+AGENT_DEFAULT_PERMISSION_MODE_HINT = "JSON null (not the string 'null') for the agent default"
+
 # Modes that skip the approval prompt (``dontAsk`` denies instead, by rules the server
 # cannot see). An automation runs in one only when the task itself selects it, never
 # through an agent default or a reused session's live mode.

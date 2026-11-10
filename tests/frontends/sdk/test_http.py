@@ -61,7 +61,7 @@ def test_loopback_urls_are_detected(url: str) -> None:
 def test_remote_urls_are_not_loopback(url: str) -> None:
     """Remote targets keep their proxy.
 
-    A false positive would strip the proxy a corporate network needs to
+    A false positive would strip the proxy that some networks need to
     reach the server at all, so the check must not over-match.
     """
     assert is_loopback_url(url) is False

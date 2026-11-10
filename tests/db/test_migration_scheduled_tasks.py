@@ -87,6 +87,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         assert columns[name]["nullable"] is (name != "created_at")
     assert columns["session_mode"]["nullable"] is False
     assert columns["session_id"]["nullable"] is True
+    assert columns["source_session_id"]["nullable"] is True
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -116,6 +117,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "delegation_ref",
         "session_mode",
         "session_id",
+        "source_session_id",
     }
 
 

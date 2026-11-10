@@ -1356,6 +1356,10 @@ async def test_malformed_config_read_keeps_the_launch_model_provider_pin(
 async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
     tmp_path, monkeypatch, active, saved
 ):
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
+    active = launch_activation(active)
+
     from omnigent import mcp_disabled_servers as disabled
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))

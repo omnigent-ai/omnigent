@@ -220,8 +220,24 @@ def _cursor_servers(home: Path) -> list[ConfiguredMcpServer]:
     ]
 
 
+def _pi_servers(env: Mapping[str, str]) -> list[ConfiguredMcpServer]:
+    """``mcp.json`` in Pi's agent dir, which managed Pi sessions link into their own.
+
+    An entry with no ``command``, ``url`` or ``type`` only overrides a server Pi
+    defines elsewhere, so ``_summary`` leaves it out.
+    """
+    from omnigent.harnesses.pi_native.credentials import global_pi_agent_dir
+
+    data = _read_config(global_pi_agent_dir(env=env) / "mcp.json", "pi")
+    return [
+        ConfiguredMcpServer(summary, config)
+        for name, config in _servers_in(data).items()
+        if isinstance(config, Mapping) and (summary := _summary(name, config, "pi")) is not None
+    ]
+
+
 def configured_mcp_servers() -> list[ConfiguredMcpServer]:
-    """List user-level MCP servers across Claude, Codex, and Cursor on this host.
+    """List user-level MCP servers across Claude, Codex, Cursor, and Pi on this host.
 
     Each harness is read independently, so a missing or broken config for one
     never hides another's servers.
@@ -231,6 +247,7 @@ def configured_mcp_servers() -> list[ConfiguredMcpServer]:
         ("claude", lambda: _claude_servers(home, os.environ)),
         ("codex", _codex_servers),
         ("cursor", lambda: _cursor_servers(home)),
+        ("pi", lambda: _pi_servers(os.environ)),
     )
     out: list[ConfiguredMcpServer] = []
     for harness, read in readers:
@@ -239,6 +256,28 @@ def configured_mcp_servers() -> list[ConfiguredMcpServer]:
         except Exception:
             _logger.exception("MCP inventory failed for %s", harness)
     return out
+
+
+def find_configured_server(
+    harness: str,
+    name: str,
+    plugin: str | None = None,
+    source_id: str | None = None,
+    *,
+    servers: list[ConfiguredMcpServer] | None = None,
+) -> ConfiguredMcpServer:
+    """Resolve one inventory identity, rejecting stale or ambiguous sources."""
+    matches = [
+        server
+        for server in (configured_mcp_servers() if servers is None else servers)
+        if server.summary["harness"] == harness
+        and server.summary["name"] == name
+        and server.summary.get("plugin") == plugin
+        and (source_id is None or server.summary.get("source_id") == source_id)
+    ]
+    if len(matches) != 1:
+        raise LookupError("MCP server unavailable or ambiguous")
+    return matches[0]
 
 
 def discover_mcp_servers() -> list[McpServerSummary]:
@@ -327,6 +366,28 @@ def apply_auth_status(
     return servers
 
 
+def apply_enabled_status(servers: list[McpServerSummary]) -> list[McpServerSummary]:
+    """Overlay saved preferences without altering the harness configuration."""
+    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS, ServerKey, read_disabled_servers
+
+    disabled = read_disabled_servers()
+    managed_names = {
+        (server["harness"], server["name"])
+        for server in servers
+        if server.get("managed") == "true"
+    }
+    for server in servers:
+        harness = server["harness"]
+        if harness not in HARNESS_EXECUTORS:
+            continue
+        locked = (harness, server["name"]) in managed_names
+        server["locked"] = str(locked).lower()
+        server["enabled"] = str(
+            locked or ServerKey(harness, server["name"], server.get("plugin")) not in disabled
+        ).lower()
+    return servers
+
+
 class HostMcpInventory:
     """Cache the inventory briefly and serialize scans off the event loop."""
 
@@ -343,4 +404,4 @@ class HostMcpInventory:
                 result = discover_mcp_servers()
                 self._cached = (time.monotonic() + MCP_INVENTORY_CACHE_TTL_SECONDS, result)
                 servers = [dict(server) for server in result]
-        return apply_auth_status(servers, _auth_status_overlay())
+        return apply_enabled_status(apply_auth_status(servers, _auth_status_overlay()))
