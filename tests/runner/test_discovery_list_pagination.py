@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -493,7 +494,8 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     assert first["sessions"][0]["session_id"] == "conv_0000"
     assert second["sessions"][0]["session_id"] == "conv_0100"
     assert received_afters == [None, "conv_0099"]
-    assert received_visibilities == ["all", "all"]
+    # Own sessions only by default, like the UI sidebar.
+    assert received_visibilities == ["mine", "mine"]
 
 
 @pytest.mark.asyncio
@@ -569,6 +571,93 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
     assert mismatched == {"error": "sys_session_list: cursor uses different filter arguments"}
     # Callers that don't ask keep the old row shape.
     assert "archived" not in default["sessions"][0]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_lists_own_sessions_unless_a_wider_scope_is_asked() -> None:
+    """The global view holds the caller's own sessions by default, like the UI sidebar.
+
+    A scheduled agent that listed every accessible session read another user's
+    shared "running" session as its own work and kept the host awake. Wider
+    scopes stay available, and their rows name the owner.
+    """
+    owners = {"mine": {"alice"}, "shared": {"bob"}, "all": {"alice", "bob"}}
+    rows: list[dict[str, object]] = [
+        {
+            "id": f"conv_{owner}_{index}",
+            "agent_id": "ag_1",
+            "agent_name": "claude",
+            "title": f"{owner} {index}",
+            "status": "running",
+            "runner_id": None,
+            "parent_session_id": None,
+            "owner": owner,
+        }
+        for index in range(2)
+        for owner in ("alice", "bob")
+    ]
+    received: list[tuple[str | None, str | None]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.url.path == "/v1/sessions":
+            visibility = request.url.params.get("visibility")
+            received.append((visibility, request.url.params.get("include_archived")))
+            scoped = [row for row in rows if row["owner"] in owners[visibility or "all"]]
+            return _server_page(request, scoped)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+
+        async def call(args: dict[str, object]) -> dict[str, Any]:
+            return json.loads(
+                await execute_tool(
+                    tool_name="sys_session_list",
+                    arguments=json.dumps(args),
+                    server_client=client,
+                    conversation_id="conv_caller",
+                )
+            )
+
+        default = await call({})
+        archived = await call({"include_archived": True})
+        shared = await call({"visibility": "shared"})
+        everything = await call({"visibility": "all", "limit": 1})
+        cursor = everything["page"]["next_cursor"]
+        continued = await call({"visibility": "all", "limit": 1, "cursor": cursor})
+        rescoped = await call({"limit": 1, "cursor": cursor})
+        invalid = await call({"visibility": "everyone"})
+
+    assert received == [
+        ("mine", None),
+        # Workers a trigger automation archived are still the caller's own.
+        ("mine", "true"),
+        ("shared", None),
+        ("all", None),
+        ("all", None),
+    ]
+    assert [row["session_id"] for row in default["sessions"]] == ["conv_alice_0", "conv_alice_1"]
+    # Every default row is the caller's, so the row shape is unchanged.
+    assert all("owner" not in row for row in default["sessions"])
+    assert [row["session_id"] for row in archived["sessions"]] == ["conv_alice_0", "conv_alice_1"]
+    assert [(row["session_id"], row["owner"]) for row in shared["sessions"]] == [
+        ("conv_bob_0", "bob"),
+        ("conv_bob_1", "bob"),
+    ]
+    assert [(row["session_id"], row["owner"]) for row in everything["sessions"]] == [
+        ("conv_alice_0", "alice")
+    ]
+    assert [row["session_id"] for row in continued["sessions"]] == ["conv_bob_0"]
+    # A cursor minted for a wider scope cannot silently continue as "mine".
+    assert rescoped == {"error": "sys_session_list: cursor uses different filter arguments"}
+    assert invalid == {
+        "error": "sys_session_list: visibility must be one of 'mine', 'shared', 'all'"
+    }
 
 
 @pytest.mark.asyncio
