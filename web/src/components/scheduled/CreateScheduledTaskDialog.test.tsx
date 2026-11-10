@@ -3319,6 +3319,8 @@ describe("automation trigger type", () => {
       const input = updateMutateAsync.mock.calls[0][0].input;
       expect(triggerPromptSource(input.prompt)).toBe("jira");
       expect(input.prompt).toContain('project = "ES"');
+      expect(slackPrompt).toContain("support");
+      expect(input.prompt).not.toContain("support");
       expect(splitTriggerPrompt(input.prompt).userPrompt).toBe("Answer the question.");
       expect(readTriggerWorkerSettings(input.prompt)).toEqual({
         agentId: "ag_claude_native",
@@ -3454,6 +3456,7 @@ describe("automation trigger type", () => {
       await choose("GitHub");
       type("task-trigger-scope", "acme/app");
       fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
+      type("task-prompt-input", "Answer the question in English.");
       fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
       fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
       const editor = screen.getByRole("textbox", { name: "System prompt" });
@@ -3464,11 +3467,14 @@ describe("automation trigger type", () => {
       expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
       await choose("GitHub");
       expect(screen.queryByTestId("task-trigger-fields")).not.toBeInTheDocument();
-      expect(screen.getByTestId("task-prompt-input")).toHaveValue("Answer the question.");
+      expect(screen.getByTestId("task-prompt-input")).toHaveValue(
+        "Answer the question in English.",
+      );
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       const input = updateMutateAsync.mock.calls[0][0].input;
       expect(triggerPromptSource(input.prompt)).toBe("github");
+      expect(splitTriggerPrompt(input.prompt).userPrompt).toBe("Answer the question in English.");
       expect(input.prompt).toContain("acme/app");
       expect(input.prompt).toContain("Skip draft pull requests.");
       expect(input).toMatchObject({ sessionId: null });

@@ -1052,7 +1052,8 @@ export function CreateScheduledTaskDialog({
     if (name === TRIGGER_TEMPLATES[editedTriggerSource].name) {
       setName(TRIGGER_TEMPLATES[next].name);
     }
-    // Saved prompts and drafts come back unchanged; only a new draft takes the instructions.
+    // Restored prompts and drafts keep their text, with the current worker settings;
+    // only a new draft takes the instructions.
     const draft = next === editingTriggerSource ? null : editSourceDrafts.current[next];
     const promptEditor =
       next === editingTriggerSource
