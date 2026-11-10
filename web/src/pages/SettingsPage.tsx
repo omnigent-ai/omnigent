@@ -214,6 +214,12 @@ import {
   writeProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
 import {
+  DEFAULT_SESSION_ROW_QUICK_ACTIONS,
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
+  useSessionRowQuickActions,
+  writeSessionRowQuickActions,
+} from "@/lib/sessionRowQuickActionsPreferences";
+import {
   DEFAULT_WORKSPACE_TAB,
   defaultWorkspaceTabs,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
@@ -1035,6 +1041,29 @@ function ProjectFolderPaginationControl() {
   );
 }
 
+/** On by default: sidebar rows show hover Pin and Archive buttons beside the "…" menu. */
+function SessionRowQuickActionsControl() {
+  const shown = useSessionRowQuickActions();
+  const labelId = useId();
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Show Pin and Archive buttons on session rows"
+        labelId={labelId}
+        description={`Turn this off to keep Pin and Archive in the session row's "…" menu and right-click menu only, so they are harder to click by mistake.`}
+      />
+      <Switch
+        aria-labelledby={labelId}
+        checked={shown}
+        onCheckedChange={writeSessionRowQuickActions}
+        data-testid="session-row-quick-actions-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.appearance.session_row_quick_actions"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
@@ -1065,6 +1094,7 @@ function AppearanceSection() {
     writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
     writeProjectFolderCollapse(DEFAULT_PROJECT_FOLDER_COLLAPSE);
     writeProjectFolderPageSize(PROJECT_FOLDER_PAGE_SIZE);
+    writeSessionRowQuickActions(DEFAULT_SESSION_ROW_QUICK_ACTIONS);
 
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -1095,6 +1125,7 @@ function AppearanceSection() {
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
           PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
           PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+          SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
           HIDDEN_PICKER_AGENTS_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
@@ -1179,7 +1210,10 @@ function AppearanceSection() {
           </SettingsGroup>
 
           <SettingsGroup title="Sidebar" testId="settings-group-sidebar">
-            <ProjectFolderPaginationControl />
+            <SessionRowQuickActionsControl />
+            <div className="mt-4 border-t border-border pt-4">
+              <ProjectFolderPaginationControl />
+            </div>
           </SettingsGroup>
 
           <SettingsGroup title="Interface typography" testId="settings-group-interface-type">
