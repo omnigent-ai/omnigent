@@ -217,7 +217,8 @@ def create_session_mcp_servers_router(
             return SessionLiveMCPServers(
                 live=False, reason="unavailable", detail=_HARNESS_BUSY_MESSAGE
             )
-        except httpx.HTTPError:
+        # A closed host tunnel raises the built-in ConnectionError, not an httpx error.
+        except (httpx.HTTPError, ConnectionError):
             _logger.warning(
                 "live MCP status read failed for session=%s", session_id, exc_info=True
             )
@@ -265,7 +266,7 @@ def create_session_mcp_servers_router(
             )
         except httpx.TimeoutException as exc:
             raise OmnigentError(_HARNESS_BUSY_MESSAGE, code=ErrorCode.RUNNER_UNAVAILABLE) from exc
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ConnectionError) as exc:
             raise OmnigentError(
                 "Could not reach the session's host.", code=ErrorCode.RUNNER_UNAVAILABLE
             ) from exc

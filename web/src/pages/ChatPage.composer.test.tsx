@@ -4434,31 +4434,22 @@ describe("Composer MCP status command", () => {
     expect(reconnect).toHaveBeenCalledWith("plugin:tools:search");
   });
 
-  it.each([
-    [
-      { live: false, reason: "not_running" as const, servers: [] },
-      false,
-      "Live connection status appears once this session’s agent is running; send a message to start it.",
-    ],
-    [
-      { live: false, reason: "unavailable" as const, detail: "Host offline.", servers: [] },
-      false,
-      "Couldn’t read this session’s live MCP connections: Host offline.",
-    ],
-    [undefined, true, "Couldn’t read this session’s live MCP connections."],
-  ])("notes why a claude-sdk session shows no live state: %j", (data, isError, note) => {
+  it("notes why a claude-sdk session shows no live state", () => {
+    const data = { live: false, reason: "not_running" as const, servers: [] };
     composerSessionSnapshot.hostId = "host_sdk";
     setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
     const agent = { id: "agent_sdk", name: "SDK agent", mcp_servers: [] };
     sessionAgentQueryMock.mockReturnValue({ data: agent, isError: false });
-    liveMcpQueryMock.mockReturnValue({ data, isError });
+    liveMcpQueryMock.mockReturnValue({ data, isError: false });
     render(
       <MemoryRouter>
         <Composer {...composerProps({ agents: [agent] })} />
       </MemoryRouter>,
     );
     fireEvent.change(textarea(), { target: { value: "/mcp" } });
-    expect(screen.getByRole("status")).toHaveTextContent(note);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Live connection status appears once this session’s agent is running; send a message to start it.",
+    );
   });
 
   it("does not ask a native harness for live MCP connections", () => {

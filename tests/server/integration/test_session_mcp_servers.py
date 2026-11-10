@@ -448,6 +448,7 @@ async def test_live_mcp_status_maps_each_runner_answer(
         httpx.Response(502, json={"error": "harness_unreachable", "detail": "harness exited"}),
         httpx.ReadTimeout("slow"),
         httpx.ConnectError("refused"),
+        ConnectionError("host tunnel closed"),
         OmnigentError("The session's host is offline.", code=ErrorCode.RUNNER_UNAVAILABLE),
     ]
     results = []
@@ -473,6 +474,7 @@ async def test_live_mcp_status_maps_each_runner_answer(
         (False, "unavailable", mcp_routes._HARNESS_BUSY_MESSAGE),
         (False, "unavailable", "harness exited"),
         (False, "unavailable", mcp_routes._HARNESS_BUSY_MESSAGE),
+        (False, "unavailable", "Could not reach the session's host."),
         (False, "unavailable", "Could not reach the session's host."),
         (False, "unavailable", "The session's host is offline."),
     ]
@@ -560,6 +562,7 @@ async def test_live_mcp_reconnect_maps_each_runner_answer(
         ),
         (httpx.ReadTimeout("slow"), 503, "did not answer in time"),
         (httpx.ConnectError("refused"), 503, "Could not reach"),
+        (ConnectionError("host tunnel closed"), 503, "Could not reach"),
         (OmnigentError("on another replica", code=ErrorCode.WRONG_REPLICA), 400, "replica"),
     ]
     for answer, status_code, message in cases:

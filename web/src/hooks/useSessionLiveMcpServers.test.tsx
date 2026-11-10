@@ -9,6 +9,7 @@ vi.mock("@/lib/identity", () => ({
 }));
 
 import {
+  liveMcpStatusNote,
   sessionLiveMcpServersQueryKey,
   useReconnectLiveMcpServer,
   useSessionLiveMcpServers,
@@ -229,5 +230,31 @@ describe("useReconnectLiveMcpServer", () => {
       "/v1/sessions/conv_a/live-mcp-servers/reconnect",
       "/v1/sessions/conv_a/live-mcp-servers",
     ]);
+  });
+});
+
+describe("liveMcpStatusNote", () => {
+  it.each([
+    [
+      { live: false, reason: "not_running" as const, servers: [] },
+      false,
+      "Live connection status appears once this session’s agent is running; send a message to start it.",
+    ],
+    [
+      { live: false, reason: "unavailable" as const, detail: "Host offline.", servers: [] },
+      false,
+      "Couldn’t read this session’s live MCP connections: Host offline.",
+    ],
+    [
+      { live: false, reason: "unavailable" as const, servers: [] },
+      false,
+      "Couldn’t read this session’s live MCP connections.",
+    ],
+    [undefined, true, "Couldn’t read this session’s live MCP connections."],
+    [{ live: false, reason: "unsupported" as const, servers: [] }, false, undefined],
+    [{ live: true, servers: [] }, false, undefined],
+    [undefined, false, undefined],
+  ])("explains %j (failed read: %s)", (result, failed, note) => {
+    expect(liveMcpStatusNote(result, failed)).toBe(note);
   });
 });
