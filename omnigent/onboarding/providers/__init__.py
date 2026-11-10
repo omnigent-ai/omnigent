@@ -300,9 +300,7 @@ def _catalog_age_seconds(entry: _DiskCatalogEntry, now: float) -> float:
 def _catalog_download_backing_off() -> bool:
     """Whether a recent unreachable download is still suppressing new attempts."""
     failed_at = _catalog_download_failed_at
-    return (
-        failed_at is not None and time.monotonic() - failed_at < _CATALOG_DOWNLOAD_BACKOFF_SECONDS
-    )
+    return failed_at is not None and _catalog_now() - failed_at < _CATALOG_DOWNLOAD_BACKOFF_SECONDS
 
 
 def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
@@ -331,7 +329,7 @@ def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
         return None
     except OSError:
         # Unreachable or timed out: every other provider would wait as long.
-        _catalog_download_failed_at = time.monotonic()
+        _catalog_download_failed_at = _catalog_now()
         return None
     except Exception:
         return None

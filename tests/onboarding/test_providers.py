@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
@@ -510,10 +509,67 @@ def test_provider_catalog_skips_network_briefly_after_unreachable_download(
     monkeypatch.setattr(
         _providers_mod,
         "_catalog_download_failed_at",
-        time.monotonic() - _providers_mod._CATALOG_DOWNLOAD_BACKOFF_SECONDS - 1,
+        _providers_mod._catalog_now() - _providers_mod._CATALOG_DOWNLOAD_BACKOFF_SECONDS - 1,
     )
     assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == _FAKE_CATALOG["anthropic"]
     assert len(attempts) == 3
+
+
+@pytest.mark.parametrize(
+    "unreachable",
+    [TimeoutError("timed out"), urllib.error.URLError("unreachable")],
+    ids=["timeout", "url-error"],
+)
+def test_provider_catalog_backoff_serves_eligible_stale_disk_until_expiry(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unreachable: Exception,
+) -> None:
+    """During backoff, bounded stale disk data is served without a download."""
+    del real_catalog_loader
+    stale_window = _providers_mod._CATALOG_STALE_IF_ERROR_SECONDS
+    backoff = _providers_mod._CATALOG_DOWNLOAD_BACKOFF_SECONDS
+    clock = 0.0
+    attempts: list[str] = []
+    reachable = True
+
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(_FAKE_CATALOG["anthropic"]).encode()
+
+    def _urlopen(url: str, timeout: float) -> _Response:
+        attempts.append(url)
+        if not reachable:
+            raise unreachable
+        return _Response()
+
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: clock)
+    monkeypatch.setattr(_providers_mod.urllib.request, "urlopen", _urlopen)
+    # gemini's disk copy will be past the stale window; anthropic's still inside it.
+    _REAL_FETCH_PROVIDER_CATALOG("gemini")
+    clock = stale_window
+    _REAL_FETCH_PROVIDER_CATALOG("anthropic")
+    _providers_mod._catalog_cache.clear()
+
+    clock = stale_window + _providers_mod._CATALOG_TTL_SECONDS + 1
+    reachable = False
+    assert _REAL_FETCH_PROVIDER_CATALOG("openai") == {}
+    started_backoff = clock
+    clock = started_backoff + backoff - 1
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == _FAKE_CATALOG["anthropic"]
+    assert _REAL_FETCH_PROVIDER_CATALOG("gemini") == {}
+    assert len(attempts) == 3
+
+    clock = started_backoff + backoff
+    reachable = True
+    assert _REAL_FETCH_PROVIDER_CATALOG("gemini") == _FAKE_CATALOG["anthropic"]
+    assert len(attempts) == 4
 
 
 def test_provider_catalog_rejects_over_age_cache(
