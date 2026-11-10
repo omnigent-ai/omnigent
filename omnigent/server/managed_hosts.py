@@ -1638,6 +1638,11 @@ def _parse_multi_provider_sandbox_config(
             "server config 'sandbox.providers' must be a non-empty list of "
             "provider mappings, e.g. [{provider: modal}, {provider: e2b}]"
         )
+    if "default_profile_id" in raw:
+        raise ValueError(
+            "server config 'sandbox.default_profile_id' names one provider's profile; "
+            "set it inside that provider's 'sandbox.providers' entry"
+        )
     # Shared keys describe THIS server, so they ride into every entry
     # instead of being repeated per entry.
     shared = {

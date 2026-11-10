@@ -87,7 +87,9 @@ export function useSandboxProfileCatalog(
           (defaultProfileId !== null && defaultInPage === undefined && defaultQuery.isFetching) ||
           (selection && (selectedQuery.isPending || selectedQuery.isFetching))
         ? "Loading sandbox profiles…"
-        : query.isError || (selection && selectedQuery.isError)
+        : query.isError ||
+            (selection && selectedQuery.isError) ||
+            (defaultProfileId !== null && defaultInPage === undefined && defaultQuery.isError)
           ? "Could not load sandbox profiles. Try again."
           : stale
             ? "This profile changed or is unavailable. Choose a profile again before launching."

@@ -197,6 +197,23 @@ it("shows a recoverable provider error", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Try again" }));
   expect(await screen.findByRole("option", { name: /^Build profile 0/ })).toBeVisible();
 });
+it("reports a failed lookup of an off-page default instead of asking for a choice", async () => {
+  defaults = { company: "profile-30" };
+  const listPage = vi.mocked(fetchSandboxProfiles).getMockImplementation()!;
+  vi.mocked(fetchSandboxProfiles).mockImplementation(async (provider, options) => {
+    if (options?.profileId === "profile-30") throw new Error("unavailable");
+    return listPage(provider, options);
+  });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  const { result } = renderHook(() => useSandboxProfileCatalog("company", null), { wrapper });
+  await waitFor(() =>
+    expect(result.current.launchError).toBe("Could not load sandbox profiles. Try again."),
+  );
+  expect(result.current.selection).toBeNull();
+});
 it("distinguishes no access from no search matches", async () => {
   available = [];
   mount();

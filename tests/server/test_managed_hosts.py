@@ -6762,6 +6762,18 @@ def test_parse_default_profile_id(
     assert cfg.default.default_profile_id == default_profile_id
 
 
+def test_default_profile_id_belongs_inside_a_provider_entry() -> None:
+    """Shared keys reach every listed provider, so a top-level default would mis-apply."""
+    with pytest.raises(ValueError, match=r"inside that provider's 'sandbox\.providers' entry"):
+        parse_sandbox_config(
+            {
+                "server_url": "https://s.example.com",
+                "default_profile_id": "build",
+                "providers": [{"provider": "kubernetes"}],
+            }
+        )
+
+
 def test_contributed_provider_config_is_validated(
     contributed_acme_provider: None,
 ) -> None:

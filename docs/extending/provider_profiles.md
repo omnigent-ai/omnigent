@@ -82,8 +82,9 @@ Implement bounded controller timeouts and make authorization calls idempotent.
 
 ### Default profile
 
-Set `sandbox.default_profile_id` (or `default_profile_id` on an embedding
-deployment's `ManagedSandboxConfig`) to the ID of a profile a new managed session
+Set `sandbox.default_profile_id` (inside the provider's entry when using a
+`sandbox.providers` list, or `default_profile_id` on an embedding deployment's
+`ManagedSandboxConfig`) to the ID of a profile a new managed session
 takes when its caller names none, such as API clients that predate profiles and
 scheduled fresh sandboxes. The default is resolved through `list_profiles` and
 `select_profile` exactly like an explicit selection: a caller who cannot use it is

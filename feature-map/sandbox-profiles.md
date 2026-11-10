@@ -119,8 +119,8 @@ integration evidence separately; the browser test does not exercise them.
 - Existing unprofiled sessions retain wake, relaunch, missing-sandbox replacement
   and runner rotation after opt-in. The provider must retain its unselected
   lifecycle path; scoped lookup returns `None` only for an authorized legacy
-  resource. Fresh sandbox creation still requires selection, and saved profiles
-  never fall back to defaults. The rollout regression lives in
+  resource. Fresh sandbox creation still requires an explicit selection or a
+  configured provider default, and saved profiles never fall back to defaults. The rollout regression lives in
   `tests/server/integration/test_sandbox_profile_launch.py::test_unprofiled_session_survives_provider_opt_in`.
 
 Controller recovery is covered in `tests/server/integration/test_sandbox_profile_controller.py`: last-session deletion, restart, historical revision, revocation and missing-sandbox replacement. The [controller walkthrough](../examples/sandbox-profile-provider/README.md#controller-recovery-demo) is runnable without a cluster.
