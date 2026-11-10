@@ -6,6 +6,7 @@ import heapq
 import json
 import uuid
 from collections.abc import Callable
+from functools import partial
 from typing import TypeVar
 
 from sqlalchemy import ColumnElement, Select, and_, func, or_, select, tuple_
@@ -80,6 +81,10 @@ def _sized(write: Callable[[], _T]) -> _T:
         raise
 
 
+def _expired(item: InboxItem) -> bool:
+    return item.expires_at is not None and item.expires_at <= now_epoch()
+
+
 class SqlAlchemyInboxItemStore(InboxItemStore):
     """SQLAlchemy-backed implementation of :class:`InboxItemStore`."""
 
@@ -137,16 +142,21 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         """See base class."""
         for attempt in range(_SLOT_RETRIES + 1):
             try:
-                return _sized(lambda: self._insert(item, retire_item_id))
+                return _sized(partial(self._insert, item, retire_item_id))
             except InboxSessionCapError:
                 # A concurrent post with the same key may have taken the last slot.
                 if self._live_duplicate(item, retire_item_id) is not None:
                     raise DuplicateInboxItemError(item.dedupe_key) from None
                 raise
             except IntegrityError as exc:
-                # Either a concurrent post took our slot, or another item holds the key.
-                if self._live_duplicate(item, retire_item_id) is not None:
-                    raise DuplicateInboxItemError(item.dedupe_key) from exc
+                # A concurrent post took our slot, or another item holds the key.
+                holder = self.get_by_dedupe_key(item.user_id, item.dedupe_key)
+                if holder is not None and holder.id != retire_item_id:
+                    if not _expired(holder):
+                        raise DuplicateInboxItemError(item.dedupe_key) from exc
+                    # The holder expired, so this post replaces it, even when it
+                    # was inserted after the caller's duplicate check.
+                    retire_item_id = holder.id
                 if attempt == _SLOT_RETRIES:
                     raise
         raise AssertionError("unreachable")
@@ -154,9 +164,7 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
     def _live_duplicate(self, item: NewInboxItem, retire_item_id: str | None) -> InboxItem | None:
         """The item holding *item*'s key, unless it is the expired item being replaced."""
         existing = self.get_by_dedupe_key(item.user_id, item.dedupe_key)
-        if existing is None or existing.id == retire_item_id:
-            return None
-        if existing.expires_at is not None and existing.expires_at <= now_epoch():
+        if existing is None or existing.id == retire_item_id or _expired(existing):
             return None
         return existing
 

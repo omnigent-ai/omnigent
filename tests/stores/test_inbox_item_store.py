@@ -133,6 +133,20 @@ def test_oversized_text_is_rejected(store: SqlAlchemyInboxItemStore) -> None:
         store.update(created.id, "alice", feedback_text=incompressible, now=1)
 
 
+def test_create_refreshes_expired_collision_after_stale_preflight(
+    store: SqlAlchemyInboxItemStore,
+) -> None:
+    """A post whose duplicate check missed a newer expired same-key item replaces it."""
+    winner = store.create(_new(expires_at=1))
+
+    replacement = store.create(_new(source_session_id="b" * 32))
+
+    assert replacement.dedupe_key == "v1:aaa"
+    retired = store.get(winner.id, "alice")
+    assert retired is not None
+    assert retired.dedupe_key == f"v1:aaa#{winner.id}"
+
+
 def test_retiring_an_expired_item_frees_its_key(store: SqlAlchemyInboxItemStore) -> None:
     expired = store.create(_new(expires_at=5))
 
@@ -246,5 +260,6 @@ def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) ->
     finally:
         event.remove(store._engine, "before_cursor_execute", explain)
     for plan in plans:
-        examined = [int(n) for n in re.findall(r"rows=(\d+)", plan)]
+        # Rows each step actually read; the planner's estimates are not bounded.
+        examined = [int(n) for n in re.findall(r"actual time=[\d.]+\.\.[\d.]+ rows=(\d+)", plan)]
         assert max(examined) <= 200, plan
