@@ -1571,3 +1571,70 @@ def test_shell_continuation_respects_quoting(quote: str, created: bool) -> None:
     refs, was_created = extract_prs("Bash", {"command": command}, A)
     assert [pr.url for pr in refs] == [A]
     assert was_created is created
+
+
+@pytest.mark.parametrize(
+    "tool_name,tool_input,cwd,result,checkouts",
+    [
+        pytest.param(
+            "Bash",
+            {"command": "cd ~/w/topic && git pp 2>&1 | tail -3"},
+            "/repo",
+            {},
+            [str(Path("~/w/topic").expanduser())],
+            id="claude-cd-to-worktree",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd sub && git push -q"},
+            "/repo",
+            {},
+            ["/repo/sub"],
+            id="relative-cd",
+        ),
+        pytest.param(
+            "Bash", {"command": "git -C /w/topic pp"}, None, {}, ["/w/topic"], id="git-dash-C"
+        ),
+        pytest.param(
+            "exec_command",
+            {"cmd": "git push", "workdir": "topic"},
+            "/w",
+            {},
+            ["/w/topic"],
+            id="codex-workdir",
+        ),
+        pytest.param(
+            "sys_os_shell",
+            {"command": "cd /elsewhere && git pp"},
+            None,
+            {"stdout": "", "stderr": "", "exit_code": 0, "cwd": "/workspace"},
+            ["/workspace"],
+            id="runner-shell-uses-its-reported-cwd",
+        ),
+        pytest.param("Bash", {"command": "cd /w/topic && make"}, "/repo", {}, [], id="no-git"),
+        pytest.param("Bash", {"command": "git pp"}, None, {}, [], id="no-known-directory"),
+    ],
+)
+def test_shell_calls_infer_the_pr_of_each_checkout_they_ran_git_in(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    tool_input: dict[str, object],
+    cwd: str | None,
+    result: dict[str, str],
+    checkouts: list[str],
+) -> None:
+    from omnigent.runner import pr_resource
+
+    inferred: list[tuple[str, str]] = []
+    # Records requests only; pr_resource's own tests cover what inference does with them.
+    monkeypatch.setattr(pr_resource, "infer_checkout_pr", lambda *call: inferred.append(call))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        pr_observer.observe_tool_completion(
+            "conv_infer",
+            tool_name=tool_name,
+            arguments=tool_input,
+            result=json.dumps(result) if tool_name == "sys_os_shell" else result,
+            cwd=cwd,
+        )
+    assert inferred == [("conv_infer", checkout) for checkout in checkouts]

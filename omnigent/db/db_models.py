@@ -1152,6 +1152,8 @@ class SqlComment(OmnigentBase):
     :param created_by: Email of the user who created this comment,
         e.g. ``"alice@example.com"``. ``NULL`` for legacy comments or
         comments created in single-user mode.
+    :param anchor_metadata: Bounded provider-specific coordinates for comments
+        that are not anchored by workspace-file character offsets.
     """
 
     __tablename__ = "comments"
@@ -1185,6 +1187,10 @@ class SqlComment(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(BigInteger)
     anchor_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    anchor_metadata: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=1_024), nullable=True
+    )
 
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
 
@@ -1636,6 +1642,9 @@ class SqlScheduledTask(OmnigentBase):
     session_mode: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     # Relates to conversations.id. No DB foreign key (Rule R032).
     session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # The session each run's new session starts as a copy of. Relates to
+    # conversations.id. No DB foreign key (Rule R032).
+    source_session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 

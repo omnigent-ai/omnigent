@@ -19,6 +19,18 @@ const row = (id: string, updated_at: number): Conversation => ({
 });
 
 describe("scope merge", () => {
+  it("retains family context below the raw cursor without admitting unrelated older rows", () => {
+    const family = { id: "family", representative_id: "old", pinned: false };
+    const mine = [
+      { ...row("recent", 100), family },
+      row("cursor", 80),
+      { ...row("old", 10), family },
+      row("unrelated", 5),
+    ];
+    const merged = mergeScopeRows(mine, [row("shared", 90)], true, false, "cursor");
+    expect(merged.watermark?.id).toBe("cursor");
+    expect(merged.rows.map((item) => item.id)).toEqual(["recent", "shared", "cursor", "old"]);
+  });
   it("buffers rows below the shallower tail until both scopes advance", () => {
     const mine = [row("m1", 100), row("m2", 80), row("m3", 20)];
     const shared = [row("s1", 90), row("s2", 70)];
@@ -120,6 +132,67 @@ describe("scope merge", () => {
 });
 
 describe("scope refresh", () => {
+  it("retains history when a filtered cursor precedes appended family context", () => {
+    const family = { id: "family", representative_id: "representative", pinned: false };
+    const current = {
+      pages: [
+        {
+          ...sessionRowsPage(
+            [row("recent", 100), row("history", 70), row("older", 40), row("representative", 10)],
+            true,
+          ),
+          last_id: "older",
+        },
+      ],
+      pageParams: [undefined],
+      windowSize: 240,
+    };
+    const incoming = {
+      ...sessionRowsPage(
+        [
+          { ...row("recent", 100), family },
+          { ...row("representative", 10), family },
+        ],
+        true,
+      ),
+      last_id: "side_chat",
+      page_boundary: { id: "recent", created_at: 0, updated_at: 100 },
+    };
+    const refreshed = refreshScopeWindow(current, incoming, 100);
+    expect(refreshed.pages[0].data.map((item) => item.id)).toEqual([
+      "recent",
+      "history",
+      "older",
+      "representative",
+    ]);
+    expect(refreshed.pages[0].last_id).toBe("older");
+    expect(
+      appendScopePage(refreshed, sessionRowsPage([row("next", 30)]), 30).pages[0].data.map(
+        (item) => item.id,
+      ),
+    ).toEqual(["recent", "history", "older", "next", "representative"]);
+  });
+  it("retains loaded history beyond the raw cursor when expansion appends older context", () => {
+    const family = { id: "family", representative_id: "old", pinned: false };
+    const current = {
+      pages: [sessionRowsPage([row("cursor", 30), row("history", 20)], true)],
+      pageParams: [undefined],
+      windowSize: 240,
+    };
+    const incoming = {
+      ...sessionRowsPage(
+        [
+          { ...row("cursor", 30), family },
+          { ...row("old", 10), family },
+        ],
+        true,
+      ),
+      last_id: "cursor",
+    };
+    expect(refreshScopeWindow(current, incoming, 100).pages[0].data.map((item) => item.id)).toEqual(
+      ["cursor", "history", "old"],
+    );
+  });
   it("replaces a loaded window instead of retaining removed rows", () => {
     const current = {
       pages: [sessionRowsPage([row("removed", 40), row("a", 30)], true)],

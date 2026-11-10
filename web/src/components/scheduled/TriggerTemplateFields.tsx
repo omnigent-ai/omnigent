@@ -19,14 +19,28 @@ import {
   MAX_INSTRUCTIONS_CHARS,
   MAX_SESSIONS_PER_RUN,
   OMNIGENT_ATTRIBUTION,
+  singleValueScope,
+  stripScopePrefix,
+  TRIGGER_SCOPE_OPERATOR_LABELS,
   TRIGGER_TEMPLATES,
+  triggerConditionFields,
+  triggerConditionFilledIn,
+  triggerEvent,
+  triggerEventDescription,
   triggerOperatorLabel,
+  triggerScope,
+  triggerScopeEntries,
+  triggerScopeOperators,
+  triggerTargetValid,
   triggerServiceName,
   VALUELESS_OPERATORS,
+  withTriggerEvent,
   type TriggerCondition,
   type TriggerFields,
   type TriggerOperator,
+  type TriggerScopeOperator,
   type TriggerSource,
+  type TriggerTaskSessionMode,
 } from "@/components/scheduled/triggerTemplates";
 import { cn } from "@/lib/utils";
 
@@ -41,10 +55,13 @@ export function TriggerTemplateFields({
   onEditAsPrompt,
   onSelectOpenChange,
   toolsProvided = false,
+  taskSessionMode = "new",
 }: {
   source: TriggerSource;
   fields: TriggerFields;
   onChange: (next: TriggerFields) => void;
+  /** "continue" sends every match to one task session, which these instructions then direct. */
+  taskSessionMode?: TriggerTaskSessionMode;
   /** The prompt the task will save; "" until the required fields are filled. */
   renderedPrompt: string;
   /** Leave the template and edit the rendered prompt as a plain prompt. */
@@ -57,9 +74,16 @@ export function TriggerTemplateFields({
   const [warningsOpen, setWarningsOpen] = useState(false);
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
-  const authorAction = (
-    template.events.find((event) => event.id === fields.event) ?? template.events[0]
-  ).authorAction;
+  const { authorAction, target } = triggerEvent(source, fields.event);
+  const targetInvalid = !triggerTargetValid(fields, source);
+  // Reviewers added after the pull request opens never match the opened event.
+  const reviewerOnOpen =
+    source === "github" &&
+    fields.event === "pr" &&
+    fields.conditions.some((c) => c.field === "reviewer");
+  const scope = triggerScope(source, fields.event);
+  const conditionFields = triggerConditionFields(source, fields.event);
+  const scopeEntries = triggerScopeEntries(source, fields);
   const instructionsTooLong = fields.instructions.trim().length > MAX_INSTRUCTIONS_CHARS;
 
   function setCondition(index: number, next: TriggerCondition) {
@@ -70,7 +94,7 @@ export function TriggerTemplateFields({
   }
 
   function addCondition() {
-    const field = template.fields[0];
+    const field = conditionFields[0];
     onChange({
       ...fields,
       conditions: [
@@ -84,9 +108,8 @@ export function TriggerTemplateFields({
     <div className="flex flex-col gap-4" data-testid="task-trigger-fields">
       <div className="flex flex-col gap-1.5">
         <Label>Trigger</Label>
-        <p className="text-sm text-muted-foreground">
-          Runs your automation on all new {template.itemPlural} that match these conditions. Older{" "}
-          {template.itemPlural} are skipped, even if they are edited to match later.
+        <p className="text-sm text-muted-foreground" data-testid="task-trigger-description">
+          {triggerEventDescription(source, fields.event)}
         </p>
         <div
           className="flex flex-col gap-2 rounded-lg border border-border p-3"
@@ -97,7 +120,7 @@ export function TriggerTemplateFields({
             {template.events.length > 1 ? (
               <Select
                 value={fields.event}
-                onValueChange={(event) => onChange({ ...fields, event })}
+                onValueChange={(event) => onChange(withTriggerEvent(source, fields, event))}
                 onOpenChange={onSelectOpenChange}
               >
                 <SelectTrigger
@@ -121,50 +144,104 @@ export function TriggerTemplateFields({
                 {template.events[0].label}
               </span>
             )}
-            <span className="text-muted-foreground">where {template.scopeLabel}</span>
-            <Select
-              value={fields.scopeOperator ?? "in"}
-              onValueChange={(operator) =>
-                onChange({ ...fields, scopeOperator: operator as "is" | "in" })
-              }
-              onOpenChange={onSelectOpenChange}
-            >
-              <SelectTrigger
-                size="sm"
-                className={CHIP}
-                aria-label="Scope operator"
-                data-testid="task-trigger-scope-operator"
+            {target && (
+              <>
+                <span className="text-muted-foreground">{target.word}</span>
+                <Input
+                  value={fields.target ?? ""}
+                  placeholder={target.placeholder}
+                  aria-label={target.label}
+                  data-testid="task-trigger-target"
+                  className={cn(CHIP, "min-w-16 placeholder:text-primary/50")}
+                  // Fit the placeholder or value so neither is cut off.
+                  style={{
+                    width: `calc(${Math.max((fields.target ?? "").length, target.placeholder.length) + 2}ch + 1rem)`,
+                  }}
+                  onChange={(e) => onChange({ ...fields, target: e.target.value })}
+                />
+              </>
+            )}
+            <span className="text-muted-foreground">where {scope.label}</span>
+            {!scope.isGroup && (
+              <Select
+                value={fields.scopeOperator ?? "in"}
+                onValueChange={(operator) =>
+                  onChange({ ...fields, scopeOperator: operator as TriggerScopeOperator })
+                }
+                onOpenChange={onSelectOpenChange}
               >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start">
-                <SelectItem value="is">equals</SelectItem>
-                <SelectItem value="in">in</SelectItem>
-              </SelectContent>
-            </Select>
-            <Input
-              value={fields.scope}
-              placeholder={
-                fields.scopeOperator === "is"
-                  ? template.scopePlaceholder.split(",")[0]
-                  : template.scopePlaceholder
-              }
-              aria-label={template.scopeLabel}
-              data-testid="task-trigger-scope"
-              className={cn(CHIP, "min-w-28 flex-1 placeholder:text-primary/50")}
-              onChange={(e) => onChange({ ...fields, scope: e.target.value })}
-            />
+                <SelectTrigger
+                  size="sm"
+                  className={CHIP}
+                  aria-label="Scope operator"
+                  data-testid="task-trigger-scope-operator"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {triggerScopeOperators(source).map((operator) => (
+                    <SelectItem key={operator} value={operator}>
+                      {TRIGGER_SCOPE_OPERATOR_LABELS[operator]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+            {/* The prefix wraps with its input, so it never ends a line on its own. */}
+            <span className="flex min-w-36 flex-1 items-center gap-1">
+              {scope.prefix !== "" && (
+                <span
+                  className="text-sm font-medium text-primary"
+                  aria-hidden="true"
+                  data-testid="task-trigger-scope-prefix"
+                >
+                  {scope.prefix}
+                </span>
+              )}
+              <Input
+                value={fields.scope}
+                placeholder={
+                  singleValueScope(fields) && !scope.isGroup
+                    ? scope.placeholder.split(",")[0]
+                    : scope.placeholder
+                }
+                aria-label={scope.label}
+                data-testid="task-trigger-scope"
+                className={cn(CHIP, "min-w-0 flex-1 placeholder:text-primary/50")}
+                onChange={(e) =>
+                  onChange({ ...fields, scope: stripScopePrefix(e.target.value, scope.prefix) })
+                }
+              />
+            </span>
           </div>
 
-          {fields.scopeOperator === "is" && fields.scope.includes(",") && (
+          {targetInvalid && target?.hint && (
+            <p
+              className="pl-6 text-sm text-muted-foreground"
+              data-testid="task-trigger-target-hint"
+            >
+              {target.hint}
+            </p>
+          )}
+
+          {scope.isGroup && scopeEntries.length > 0 && scopeEntries.length < 2 && (
+            <p className="pl-6 text-sm text-muted-foreground" data-testid="task-trigger-group-hint">
+              List at least two people. For one person, choose Direct message received.
+            </p>
+          )}
+
+          {!scope.isGroup && singleValueScope(fields) && fields.scope.includes(",") && (
             <p className="pl-6 text-sm text-destructive" role="alert">
-              Equals matches one value. Choose in to match a comma-separated list.
+              {fields.scopeOperator === "contains"
+                ? "Contains matches one piece of text."
+                : "Equals matches one value."}{" "}
+              Choose in to match a comma-separated list.
             </p>
           )}
 
           {fields.conditions.map((condition, index) => {
             const field =
-              template.fields.find((f) => f.id === condition.field) ?? template.fields[0];
+              conditionFields.find((f) => f.id === condition.field) ?? conditionFields[0];
             return (
               <div
                 // Rows have no identity beyond their position.
@@ -177,7 +254,7 @@ export function TriggerTemplateFields({
                 <Select
                   value={field.id}
                   onValueChange={(id) => {
-                    const next = template.fields.find((f) => f.id === id) ?? field;
+                    const next = conditionFields.find((f) => f.id === id) ?? field;
                     setCondition(index, { field: next.id, operator: next.operators[0], value: "" });
                   }}
                   onOpenChange={onSelectOpenChange}
@@ -191,7 +268,7 @@ export function TriggerTemplateFields({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent position="popper" align="start">
-                    {template.fields.map((f) => (
+                    {conditionFields.map((f) => (
                       <SelectItem
                         key={f.id}
                         value={f.id}
@@ -202,6 +279,16 @@ export function TriggerTemplateFields({
                     ))}
                   </SelectContent>
                 </Select>
+                {field.namePlaceholder !== undefined && (
+                  <Input
+                    value={condition.name ?? ""}
+                    placeholder={field.namePlaceholder}
+                    aria-label={`${field.label} name`}
+                    data-testid={`task-trigger-condition-${index}-name`}
+                    className={cn(CHIP, "w-36 placeholder:text-primary/50")}
+                    onChange={(e) => setCondition(index, { ...condition, name: e.target.value })}
+                  />
+                )}
                 {field.operators.length > 1 ? (
                   <Select
                     value={condition.operator}
@@ -267,6 +354,16 @@ export function TriggerTemplateFields({
             );
           })}
 
+          {reviewerOnOpen && (
+            <p
+              className="pl-6 text-sm text-muted-foreground"
+              data-testid="task-trigger-reviewer-hint"
+            >
+              Only matches reviewers requested before the next check after the pull request opens.
+              To catch later requests and re-requests, choose Review requested.
+            </p>
+          )}
+
           <div className="pl-6">
             <Button
               type="button"
@@ -282,9 +379,7 @@ export function TriggerTemplateFields({
             </Button>
           </div>
         </div>
-        {fields.conditions.some(
-          (c) => !VALUELESS_OPERATORS.has(c.operator) && c.value.trim() === "",
-        ) && (
+        {!fields.conditions.every(triggerConditionFilledIn) && (
           <p className="text-sm text-muted-foreground" data-testid="task-trigger-empty-condition">
             Fill in or remove each condition.
           </p>
@@ -293,7 +388,9 @@ export function TriggerTemplateFields({
           <Checkbox
             id="task-trigger-link-back"
             checked={fields.linkBack}
-            onCheckedChange={(checked) => onChange({ ...fields, linkBack: checked === true })}
+            onCheckedChange={(checked) =>
+              onChange({ ...fields, linkBack: checked === true, linkBackTouched: true })
+            }
             data-testid="task-trigger-link-back"
             componentId="tasks.scheduled.trigger_link_back"
           />
@@ -305,7 +402,11 @@ export function TriggerTemplateFields({
 
       <div className="flex flex-col gap-1.5">
         <div className="flex items-center gap-1.5">
-          <Label htmlFor="task-trigger-instructions">Instructions for each session</Label>
+          <Label htmlFor="task-trigger-instructions">
+            {taskSessionMode === "continue"
+              ? "Instructions for the task session"
+              : "Instructions for each session"}
+          </Label>
           {!toolsProvided && (
             <TooltipProvider>
               <Tooltip open={warningsOpen} onOpenChange={setWarningsOpen}>
@@ -345,7 +446,11 @@ export function TriggerTemplateFields({
         {instructionsTooLong && (
           <p className="text-sm text-destructive" role="alert" data-testid="task-trigger-too-long">
             Keep instructions to {MAX_INSTRUCTIONS_CHARS.toLocaleString("en-US")} characters or
-            fewer so each session&apos;s first message has room for the item.
+            fewer so each{" "}
+            {taskSessionMode === "continue"
+              ? "message to the task session"
+              : "session's first message"}{" "}
+            has room for the item.
           </p>
         )}
         <p className="text-sm text-muted-foreground" data-testid="task-trigger-attribution-note">

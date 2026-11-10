@@ -18,14 +18,30 @@ const { contextBridge, ipcRenderer, webFrame, webUtils } = require("electron");
 
 // Native window controls stay in window pixels while the page zooms.
 if (process.platform === "darwin") {
+  const setFullScreenAttribute = (fullScreen) => {
+    document.documentElement.toggleAttribute("data-electron-full-screen", fullScreen === true);
+  };
   const syncTitlebarZoom = () => {
     document.documentElement.style.setProperty(
       "--omnigent-electron-zoom",
       String(webFrame.getZoomFactor()),
     );
   };
-  window.addEventListener("DOMContentLoaded", syncTitlebarZoom, { once: true });
+  window.addEventListener(
+    "DOMContentLoaded",
+    () => {
+      syncTitlebarZoom();
+      void ipcRenderer
+        .invoke("omnigent:is-full-screen")
+        .then(setFullScreenAttribute)
+        .catch(() => {});
+    },
+    { once: true },
+  );
   window.addEventListener("resize", syncTitlebarZoom);
+  ipcRenderer.on("omnigent:full-screen-changed", (_event, fullScreen) => {
+    setFullScreenAttribute(fullScreen);
+  });
 }
 
 // Collapse the update states the in-page UpdateBanner renders on
@@ -150,6 +166,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
   confirmQuit: (options) =>
     ipcRenderer.invoke("omnigent:confirm-quit", { dontAskAgain: options?.dontAskAgain === true }),
+  // macOS ships system Dictation; elsewhere the composer mic needs server dictation.
+  ...(process.platform === "darwin"
+    ? {
+        /** Start macOS Dictation in the focused field. Resolves whether it started. */
+        startSystemDictation: () => ipcRenderer.invoke("omnigent:start-system-dictation"),
+      }
+    : {}),
   /** The "Show Omnigent from anywhere" shortcut (off by default). */
   getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
   /**
@@ -213,14 +236,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   controlHost: (action) => ipcRenderer.invoke("omnigent:host-control", action),
   /**
-   * Desktop feature gates the server can't know about — currently
+   * Desktop feature gates the server can't know about: currently
    * `{ databricksInternalFeatures }` from macOS Managed Preferences, scoped
-   * to the window's server (true only on Databricks-managed servers).
+   * to the window's server (true only on managed servers).
    * Resolves null off a connected server.
    */
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
   /**
-   * Connect the user's Arca instance (Databricks-internal) to the window's
+   * Connect the user's Arca instance to the window's
    * server as a host, via `arca ssh`. Native consent is asked in the main
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
@@ -239,11 +262,10 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
   /**
-   * Renew this machine's dbcert (Databricks-internal); Arca Companion copies
-   * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
+   * Renew this machine's dbcert. Resolves a `{ ok, error? }` result.
    */
   refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),
-  /** Check the laptop's dbcert without starting sign-in. */
+  /** Check this machine's dbcert without starting sign-in. */
   checkDbcert: () => ipcRenderer.invoke("omnigent:dbcert-check"),
 
   /**
