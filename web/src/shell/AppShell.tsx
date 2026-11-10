@@ -152,6 +152,7 @@ import {
 import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { AppShellOverlays } from "./AppShellOverlays";
+import { captureGoToFileOpener, GoToFileDialog } from "./GoToFileDialog";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { CloseWindowDialog } from "./CloseWindowDialog";
 import { QuitDialog } from "./QuitDialog";
@@ -1925,6 +1926,21 @@ function AppShellImpl() {
   useSettingsHotkey();
   useHistoryNavigation();
 
+  // Go to File searches the routed session's workspace. Grid cells own their
+  // workspaces, so a grid route doesn't offer it.
+  const goToFileConversationId =
+    serverConversationId && showFilesPanel && !gridRoute ? serverConversationId : null;
+  const [goToFileOpen, setGoToFileOpen] = useState(false);
+  const [goToFileOpener, setGoToFileOpener] = useState<HTMLElement | null>(null);
+  const openGoToFile = useCallback(() => {
+    setGoToFileOpener(captureGoToFileOpener());
+    setGoToFileOpen(true);
+  }, []);
+  // Leaving the session or its workspace closes the dialog rather than retargeting it.
+  useEffect(() => {
+    setGoToFileOpen(false);
+  }, [goToFileConversationId]);
+
   // Mobile back button: close the open file and return to the files/changes
   // list. On mobile the tab strip is hidden, so a "back" should fully drop the
   // file (remove it from openFiles) rather than leaving an orphan tab the user
@@ -3099,6 +3115,16 @@ function AppShellImpl() {
               </DialogContent>
             </Dialog>
           )}
+          {goToFileConversationId && (
+            <GoToFileDialog
+              key={goToFileConversationId}
+              open={goToFileOpen}
+              onOpenChange={setGoToFileOpen}
+              conversationId={goToFileConversationId}
+              onOpenFile={openFileViewer}
+              opener={goToFileOpener}
+            />
+          )}
           <AppShellOverlays
             isEmbedded={isEmbedded}
             serverInfo={serverInfo}
@@ -3111,6 +3137,7 @@ function AppShellImpl() {
             allConversations={allConversations}
             serverConversationId={serverConversationId}
             updateOverlayHeight={updateOverlayHeight}
+            onGoToFile={goToFileConversationId ? openGoToFile : undefined}
           />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>

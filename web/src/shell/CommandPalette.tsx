@@ -8,6 +8,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   CalendarClockIcon,
+  FileSearchIcon,
   InboxIcon,
   type LucideIcon,
   PanelLeftIcon,
@@ -57,6 +58,8 @@ export interface CommandPaletteProps {
   onToggleRightSidebar: () => void;
   /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
   rightSidebarShortcutEnabled?: boolean;
+  /** Opens Go to File for the routed session's workspace; absent when there's none. */
+  onGoToFile?: () => void;
 }
 
 interface ActionCommand {
@@ -159,6 +162,7 @@ export function CommandPalette({
   onToggleLeftSidebar,
   onToggleRightSidebar,
   rightSidebarShortcutEnabled = true,
+  onGoToFile,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
@@ -206,6 +210,17 @@ export function CommandPalette({
         keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
         run: () => navigate("/tasks"),
       },
+      ...(onGoToFile
+        ? [
+            {
+              id: "go-to-file",
+              label: "Go to File…",
+              icon: FileSearchIcon,
+              keywords: ["open", "find", "file", "path", "quick open"],
+              run: onGoToFile,
+            },
+          ]
+        : []),
       {
         id: "go-settings",
         label: "Go to Settings",
@@ -231,7 +246,7 @@ export function CommandPalette({
         shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
       },
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
+    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled, onGoToFile],
   );
 
   const filteredActions = useMemo(() => {

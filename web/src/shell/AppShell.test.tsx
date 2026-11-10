@@ -84,6 +84,15 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceEnvironment: vi.fn(() => ({ data: undefined, isLoading: true })),
   useWorkspaceChangedFiles: vi.fn(() => ({ data: undefined, isLoading: true })),
+  // Go to File's search, which only runs while its dialog is open.
+  useWorkspaceFileSearch: vi.fn(() => ({
+    data: undefined,
+    isSuccess: false,
+    isError: false,
+    isFetching: false,
+    isPlaceholderData: false,
+  })),
+  useWorkspaceServeable: vi.fn(() => true),
 }));
 
 // AppShell reads the GitHub info to gate the rail's GitHub tab; keep it
@@ -636,6 +645,7 @@ function renderShell(
         }
       />
       <Route path="extensions/:extensionId/*" element={<div>extension page</div>} />
+      <Route path="grid/:gridId" element={null} />
     </>,
     <AppShellWithRerenderProbe enabled={options.rerenderable === true} />,
   );
@@ -3030,6 +3040,81 @@ describe("FilesPanel visibility", () => {
     // dotfiles would disappear the moment the user moves between sessions.
     fireEvent.click(screen.getByTestId("nav-session"));
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "true");
+  });
+});
+
+describe("Go to File", () => {
+  function openPalette(): void {
+    act(() => {
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true, cancelable: true }),
+      );
+    });
+  }
+
+  async function openGoToFileFromPalette(): Promise<HTMLElement> {
+    openPalette();
+    const paletteInput = await screen.findByTestId("command-palette-input");
+    fireEvent.click(screen.getByText("Go to File…"));
+    expect(await screen.findByRole("dialog", { name: "Go to File" })).toBeInTheDocument();
+    return paletteInput;
+  }
+
+  function withFilesPanel(available: boolean) {
+    useEnvironmentMock.mockReturnValue({
+      data: { available, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+  }
+
+  it("opens from ⌘K for a routed session with files, and closes on Escape", async () => {
+    withFilesPanel(true);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    const paletteInput = await openGoToFileFromPalette();
+    fireEvent.keyDown(screen.getByTestId("go-to-file-input"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Go to File" })).toBeNull());
+    // Focus never goes back to the palette's removed input.
+    expect(paletteInput.isConnected).toBe(false);
+    expect(document.activeElement).not.toBe(paletteInput);
+  });
+
+  it("isn't offered for a session without a files panel", async () => {
+    withFilesPanel(false);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    openPalette();
+    await screen.findByTestId("command-palette-input");
+    expect(screen.queryByText("Go to File…")).toBeNull();
+  });
+
+  it("isn't offered on a grid route, where each cell owns its workspace", async () => {
+    withFilesPanel(true);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/grid/grid_1", serverInfo({ features: { grid_sessions_display_ui: true } }));
+    // AppShell draws its own grid surface on this route.
+    expect(
+      await screen.findByRole("heading", { name: /^(Loading grid…|Grid unavailable)$/ }),
+    ).toBeInTheDocument();
+
+    openPalette();
+    await screen.findByTestId("command-palette-input");
+    expect(screen.queryByText("Go to File…")).toBeNull();
+  });
+
+  it("closes when the route moves to another session", async () => {
+    withFilesPanel(true);
+    mockConversations([
+      { id: "conv_abc", permission_level: null },
+      { id: "conv_def", permission_level: null },
+    ]);
+    renderShell("/c/conv_abc", undefined, { sessionNavTo: "/c/conv_def" });
+
+    await openGoToFileFromPalette();
+    fireEvent.click(screen.getByTestId("nav-session"));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Go to File" })).toBeNull());
   });
 });
 
