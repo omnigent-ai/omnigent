@@ -4205,6 +4205,7 @@ async def _auto_create_devin_terminal(
     )
     from omnigent.harnesses.devin_native.main import build_devin_launch, resolve_devin_launch_model
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.runtime.prompt import build_native_startup_instructions, raw_author_instructions
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args + model_override); reused here, not
@@ -4219,15 +4220,15 @@ async def _auto_create_devin_terminal(
     workspace = str(workspace_path)
     bridge_dir = prepare_bridge_dir(session_id)
 
-    # Use a session-owned Windsurf rule, falling back to a first-message preamble
-    # when the workspace is shared or machine-global.
-    startup_instructions = _native_startup_instructions_from_spec(agent_spec)
-    rule_is_live = write_devin_agent_rule(
-        workspace_path, startup_instructions, session_id=session_id
+    # Reserve the workspace rule for authored roles; framework guidance belongs
+    # in this session's preamble so plain sessions cannot occupy the shared slot.
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    authored = raw_author_instructions(spec) if spec is not None else None
+    rule_is_live = write_devin_agent_rule(workspace_path, authored, session_id=session_id)
+    write_agent_instructions_preamble(
+        bridge_dir, build_native_startup_instructions(None if rule_is_live else spec)
     )
-    if not rule_is_live:
-        write_agent_instructions_preamble(bridge_dir, startup_instructions)
-    else:
+    if rule_is_live:
         # Record the workspace so the SessionEnd hook can remove this rule when
         # the session ends, rather than leaving it to load into a later Devin run.
         write_devin_workspace_hint(bridge_dir, workspace_path)

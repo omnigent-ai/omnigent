@@ -647,7 +647,7 @@ def _render_agent_rule(instructions: str, session_id: str) -> str:
 
 
 def write_devin_agent_rule(workspace: Path, instructions: str | None, *, session_id: str) -> bool:
-    """Deliver session startup instructions to Devin as an always-on rule.
+    """Deliver authored instructions to Devin as an always-on rule.
 
     Writes ``<workspace>/.windsurf/rules/omnigent-agent-instructions.md`` with the
     ``trigger: always_on`` frontmatter Devin requires to load a rule into every
@@ -656,7 +656,7 @@ def write_devin_agent_rule(workspace: Path, instructions: str | None, *, session
 
     :param workspace: The session's workspace directory (Devin reads rules
         relative to its CWD, which is this workspace).
-    :param instructions: Author instructions and stable framework guidance, or ``None``.
+    :param instructions: Author instructions, or ``None`` for a plain session.
     :param session_id: The Omnigent conversation id, stamped as the rule's owner.
     :returns: ``True`` when the instructions are live in the rule file. ``False``
         means the caller must deliver them another way (see
@@ -760,12 +760,11 @@ def remove_devin_agent_rule_if_owned(workspace: Path, session_id: str) -> bool:
 def write_agent_instructions_preamble(bridge_dir: Path, instructions: str) -> None:
     """Stage instructions for the first injected message.
 
-    The fallback for workspaces where the rule channel is not session-scoped.
-    Unlike the rule this is not always-on, so it is a weaker delivery — used only
-    when the alternative is leaking instructions into other sessions.
+    Carries framework guidance and any authored text that cannot use the shared
+    workspace rule. Unlike that rule, this is scoped to the session's first message.
 
     :param bridge_dir: Per-session bridge directory.
-    :param instructions: Verbatim agent instructions; blank writes nothing.
+    :param instructions: Startup instructions; blank writes nothing.
     """
     if not instructions.strip():
         return

@@ -1470,6 +1470,64 @@ def _stub_devin_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main, "resolve_devin_launch_model", lambda _model, _effort: None)
 
 
+async def test_devin_image_guidance_leaves_the_rule_for_authored_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.devin_native import bridge
+    from omnigent.runner.native import orchestration
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda **_kwargs: None)
+    _stub_devin_launch(tmp_path, monkeypatch)
+
+    async def launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=workspace,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr(orchestration, "_pi_native_launch_config", launch_config)
+
+    class Registry(SessionResourceRegistry):
+        async def launch_required_terminal(self, **_kwargs: Any) -> SessionResourceView:
+            raise _TerminalLaunchCaptured
+
+    rule = workspace / ".windsurf" / "rules" / "omnigent-agent-instructions.md"
+    for session_id, authored in (
+        ("plain-session", None),
+        ("authored-session", "Follow the authored role."),
+        ("fallback-session", "Follow the other role."),
+    ):
+        spec = AgentSpec(
+            spec_version=1, name="devin", executor=ExecutorSpec(), instructions=authored
+        )
+        with pytest.raises(_TerminalLaunchCaptured):
+            await orchestration._auto_create_devin_terminal(
+                session_id, Registry(), lambda *_args: None, server_client=None, agent_spec=spec
+            )
+        preamble = bridge.read_agent_instructions_preamble(
+            bridge.bridge_dir_for_session_id(session_id)
+        )
+        expected = (
+            f"{authored}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+            if session_id == "fallback-session"
+            else WORKSPACE_IMAGE_INSTRUCTION
+        )
+        assert preamble == expected
+        if authored is None:
+            assert not rule.exists()
+        else:
+            text = rule.read_text()
+            assert "omnigent_session: authored-session" in text
+            assert "Follow the authored role." in text
+            assert WORKSPACE_IMAGE_INSTRUCTION not in text
+            assert "Follow the other role." not in text
+
+
 def _stub_qwen_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import omnigent.harnesses.qwen_native.bridge as bridge
     import omnigent.harnesses.qwen_native.main as main
