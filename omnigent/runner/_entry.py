@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import posixpath
 import shutil
 import signal
 import sys
@@ -353,6 +354,25 @@ class _RunnerDatabricksAuth(ThreadedAuth):
         self._factory = factory
         self._server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
 
+    def _is_server_api_request(self, request: httpx.Request) -> bool:
+        if self._server_url is None:
+            return False
+        server = httpx.URL(self._server_url)
+        return (request.url.scheme, request.url.host, request.url.port) == (
+            server.scheme,
+            server.host,
+            server.port,
+        ) and posixpath.normpath(request.url.path).startswith(
+            f"{posixpath.normpath(server.path).rstrip('/')}/v1/"
+        )
+
+    async def server_request_hook(self, request: httpx.Request) -> None:
+        """Strip runner identity before a redirected request leaves the server API."""
+        from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+        if not self._is_server_api_request(request):
+            request.headers.pop(RUNNER_TUNNEL_TOKEN_HEADER, None)
+
     def auth_flow(
         self,
         request: httpx.Request,
@@ -383,6 +403,14 @@ class _RunnerDatabricksAuth(ThreadedAuth):
         # Workspace routing: name the workspace or the request routes to the
         # account (the forwarder's POST /events otherwise 403s). Empty when
         # none recorded. Set once here; it persists across the retry yield.
+        from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+        if self._is_server_api_request(request):
+            binding_token = _runner_tunnel_binding_token_from_env()
+            if binding_token is not None:
+                request.headers[RUNNER_TUNNEL_TOKEN_HEADER] = binding_token
+        else:
+            request.headers.pop(RUNNER_TUNNEL_TOKEN_HEADER, None)
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
             from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION

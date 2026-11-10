@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import Mock
@@ -15,9 +15,11 @@ import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.datastructures import Headers
 
 from omnigent.entities import MessageData, NewConversationItem, SlashCommandData
 from omnigent.errors import OmnigentError
+from omnigent.runner.transports.ws_tunnel.frames import EventBatchFrame
 from omnigent.runtime import session_stream
 from omnigent.server import session_live_state, session_metadata_logging
 from omnigent.server.routes import sessions
@@ -31,6 +33,42 @@ from tests.debug_log_helpers import capture_debug_rows
 from tests.server.routes.test_sessions_runner_relay import _ScriptedRunnerClient
 
 _BACKGROUND_TASK = BackgroundTaskInfo(status="running", description="Wait for CI")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token_state", ["departed", "unknown"])
+async def test_late_http_status_from_an_old_runner_cannot_fail_the_rebound_session(
+    status_route: _StatusRoute, token_state: str
+) -> None:
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    current_token = "synthetic-current-runner-binding"
+    reporting_token = (
+        "synthetic-departed-runner-binding"
+        if token_state == "departed"
+        else "synthetic-unknown-token"
+    )
+    store, session_id = status_route.store, status_route.child_id
+    store.replace_runner_id(session_id, token_bound_runner_id(current_token))
+    before = store.get_conversation(session_id)
+    prior_items = store.list_items(session_id).data
+    published = status_route.published.call_count
+    response = await status_route.client.post(
+        f"/v1/sessions/{session_id}/events",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: reporting_token},
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "failed",
+                "output": "Prior runner's failure",
+                "runner_id": token_bound_runner_id(current_token),
+            },
+        },
+    )
+    assert response.status_code == 403
+    assert store.get_conversation(session_id) == before
+    assert store.list_items(session_id).data == prior_items
+    assert status_route.published.call_count == published
 
 
 async def _flush_live_state() -> None:
@@ -51,6 +89,8 @@ class _StatusRoute:
     published: Mock
     telemetry: Mock
     forwarded: list[tuple[str, dict[str, Any]]]
+    app: FastAPI
+    ingest: Callable[..., Awaitable[Any]]
 
 
 @pytest.fixture
@@ -95,8 +135,12 @@ async def status_route(
             content={"error": {"code": exc.code, "message": exc.message}},
         )
 
+    ingesters = []
     app.include_router(
-        sessions.create_sessions_router(store, SqlAlchemyAgentStore(db_uri)), prefix="/v1"
+        sessions.create_sessions_router(
+            store, SqlAlchemyAgentStore(db_uri), register_runner_ingest=ingesters.append
+        ),
+        prefix="/v1",
     )
     published = Mock()
     telemetry = Mock()
@@ -133,6 +177,8 @@ async def status_route(
                 published,
                 telemetry,
                 forwarded,
+                app,
+                ingesters[0],
             )
         finally:
             await _flush_live_state()
@@ -145,6 +191,69 @@ async def status_route(
                     common._session_background_tasks_cache,
                 ):
                     cache.pop(conv.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "tunnel"])
+@pytest.mark.parametrize(
+    ("binding", "reporter", "accepted"),
+    [
+        ("inherited", "current", True),
+        ("inherited", "departed", False),
+        ("inherited", "unrelated", False),
+        ("native_old", "current", True),
+        ("native_old", "departed", False),
+        ("independent", "departed", True),
+        ("independent", "current", False),
+    ],
+)
+async def test_native_child_status_uses_current_runtime_owner(
+    status_route: _StatusRoute, transport: str, binding: str, reporter: str, accepted: bool
+) -> None:
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    tokens = {name: f"synthetic-{name}-binding" for name in ("current", "departed", "unrelated")}
+    runner_ids = {name: token_bound_runner_id(token) for name, token in tokens.items()}
+    store = status_route.store
+    store.replace_runner_id(status_route.parent_id, runner_ids["current"])
+    if binding != "inherited":
+        store.replace_runner_id(status_route.child_id, runner_ids["departed"])
+    if binding == "native_old":
+        store.set_labels(status_route.child_id, {"omnigent.wrapper": "codex-native-ui-subagent"})
+    published = status_route.published.call_count
+    body = {"type": "external_session_status", "data": {"status": "running"}}
+    if transport == "http":
+        response = await status_route.client.post(
+            f"/v1/sessions/{status_route.child_id}/events",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: tokens[reporter]},
+            json=body,
+        )
+        assert response.status_code == (202 if accepted else 403)
+    else:
+        acknowledgement = await status_route.ingest(
+            app=status_route.app,
+            headers=Headers(),
+            owner=None,
+            runner_id=runner_ids[reporter],
+            batch=EventBatchFrame(
+                id="synthetic-status-batch", session_id=status_route.child_id, events=[body]
+            ),
+        )
+        assert acknowledgement.error is None
+        assert acknowledgement.applied == 1
+    assert (status_route.published.call_count > published) is accepted
+
+
+@pytest.mark.asyncio
+async def test_headerless_owner_status_keeps_legacy_compatibility(
+    status_route: _StatusRoute,
+) -> None:
+    status_route.store.replace_runner_id(status_route.parent_id, "legacy-parent-runner")
+    response = await status_route.client.post(
+        f"/v1/sessions/{status_route.child_id}/events",
+        json={"type": "external_session_status", "data": {"status": "running"}},
+    )
+    assert response.status_code == 202
 
 
 @pytest.mark.parametrize("is_child", [True, False], ids=["child", "top-level"])

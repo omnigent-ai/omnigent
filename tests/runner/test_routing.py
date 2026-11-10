@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runner.routing import RunnerRouter, runner_dispatch_harness
+from omnigent.runner.routing import RunnerRouter, routing_runner_session, runner_dispatch_harness
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.spec import AgentSpec, ExecutorSpec, LLMConfig
@@ -63,6 +64,26 @@ class _FailOnReadConversationStore:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """Fail because the caller should use its preloaded conversation."""
         raise AssertionError(f"unexpected conversation read for {conversation_id}")
+
+
+@pytest.mark.parametrize("depth", [1, 16, 17])
+def test_routing_runner_session_inherits_without_host_binding_within_read_budget(
+    depth: int,
+) -> None:
+    root = _conversation("root", runner_id="runner_root")
+    nodes = {root.id: root}
+    parent_id = root.id
+    for index in range(depth):
+        child = replace(
+            _conversation(f"child_{index}"),
+            kind="sub_agent",
+            parent_conversation_id=parent_id,
+            root_conversation_id=root.id,
+        )
+        nodes[child.id] = child
+        parent_id = child.id
+    owner = routing_runner_session(nodes[parent_id], _ConversationStore(nodes))  # type: ignore[arg-type]
+    assert owner == (root if depth <= 16 else None)
 
 
 def _conversation(

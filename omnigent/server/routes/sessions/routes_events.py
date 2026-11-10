@@ -998,6 +998,18 @@ def register_events_routes(
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         return token_bound_runner_id(token) if token else None
 
+    async def _status_reporting_runner_matches(conv: Any, reporter: str) -> bool:
+        from omnigent.runner.routing import routing_runner_session
+        from omnigent.server.child_session_recovery import is_parent_owned_subagent
+
+        owner = await asyncio.to_thread(
+            routing_runner_session,
+            conv,
+            conversation_store,
+            prefer_parent=is_parent_owned_subagent(conv),
+        )
+        return owner is not None and owner.runner_id == reporter
+
     def _has_runner_created_by_authority(
         request: Request | _RunnerEventContext | StartupInputContext, conv: Any
     ) -> bool:
@@ -1013,6 +1025,7 @@ def register_events_routes(
         session_id: str,
         *,
         external_transcript: bool = False,
+        inherited_status: bool = False,
     ) -> tuple[str | None, Any]:
         """Authorize event writes, reserving transcripts for owners and bound runners."""
         user_id = (
@@ -1044,9 +1057,12 @@ def register_events_routes(
             if conv is None:
                 raise _session_not_found()
         if isinstance(request, _RunnerEventContext) and conv.runner_id != request.runner_id:
-            raise _RunnerNotBoundError(
-                "session is not bound to this runner", code=ErrorCode.FORBIDDEN
-            )
+            if not inherited_status or not await _status_reporting_runner_matches(
+                conv, request.runner_id
+            ):
+                raise _RunnerNotBoundError(
+                    "session is not bound to this runner", code=ErrorCode.FORBIDDEN
+                )
         return user_id, conv
 
     @event_router.post(
@@ -1322,6 +1338,7 @@ def register_events_routes(
                 _EXTERNAL_CONVERSATION_ITEM_TYPE,
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
+            inherited_status=body.type in {_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE},
         )
         native_harness = (
             await asyncio.to_thread(
@@ -2537,6 +2554,11 @@ def register_events_routes(
                 )
             return {"queued": False}
         if body.type in (_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE):
+            reporter = _reporting_runner_id(request)
+            if reporter is not None and not await _status_reporting_runner_matches(conv, reporter):
+                raise _RunnerNotBoundError(
+                    "session is not bound to this runner", code=ErrorCode.FORBIDDEN
+                )
             status = body.data.get("status")
             if body.type == _SUBAGENT_STATUS_TYPE:
                 if body.data.get("idle") is not True:

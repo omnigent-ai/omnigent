@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import httpx
 
@@ -102,7 +102,40 @@ def routing_host_session(
     max_ancestor_reads: int = 16,
 ) -> Conversation | None:
     """Return the session owning the routing host and its workspace together."""
-    if conv.host_id is not None:
+    return _routing_binding_session(
+        conv, conversation_store, binding="host_id", max_ancestor_reads=max_ancestor_reads
+    )
+
+
+def routing_runner_session(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    *,
+    prefer_parent: bool = False,
+    max_ancestor_reads: int = 16,
+) -> Conversation | None:
+    """Return the nearest runner binding, respecting parent-owned native runtimes."""
+    return _routing_binding_session(
+        conv,
+        conversation_store,
+        binding="runner_id",
+        include_current=not prefer_parent,
+        allow_root_fallback=False,
+        max_ancestor_reads=max_ancestor_reads,
+    )
+
+
+def _routing_binding_session(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    *,
+    binding: Literal["host_id", "runner_id"],
+    include_current: bool = True,
+    allow_root_fallback: bool = True,
+    max_ancestor_reads: int,
+) -> Conversation | None:
+    """Resolve a bounded ownership chain for either runner or host affinity."""
+    if include_current and getattr(conv, binding) is not None:
         return conv
     reads = 0
     visited = {conv.id}
@@ -123,7 +156,8 @@ def routing_host_session(
             return None
         # Reserve the final read for a known root in deep sub-agent chains.
         if (
-            reads + 1 == max_ancestor_reads
+            allow_root_fallback
+            and reads + 1 == max_ancestor_reads
             and root_id not in (None, ancestor_id)
             and root_id not in visited
         ):
@@ -139,17 +173,17 @@ def routing_host_session(
             and current.runner_id != ancestor.runner_id
         ):
             return None
-        if ancestor.host_id is not None:
+        if getattr(ancestor, binding) is not None:
             return ancestor
         current = ancestor
 
     # Retain the root fallback when an intermediate parent is missing or cyclic.
-    if root_id is not None and root_id not in visited:
+    if allow_root_fallback and root_id is not None and root_id not in visited:
         if reads >= max_ancestor_reads:
             return None
         root = conversation_store.get_conversation(root_id)
         if root is not None:
-            return root if root.host_id is not None else None
+            return root if getattr(root, binding) is not None else None
     return None
 
 
