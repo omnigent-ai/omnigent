@@ -2174,13 +2174,20 @@ def create_runner_app(
                 event.session_id,
                 extra={"session_id": event.session_id},
             )
-            _relaunch_task = asyncio.create_task(
-                _ensure_native_terminal_for_turn(event.session_id, "claude-native")
-            )
+
+            async def _relaunch() -> None:
+                if not await _ensure_native_terminal_for_turn(event.session_id, "claude-native"):
+                    _fail_required_terminal_exit(event)
+
+            _relaunch_task = asyncio.create_task(_relaunch())
             _relaunch_task.add_done_callback(_background_tasks.discard)
             _background_tasks.add(_relaunch_task)
             return
 
+        _fail_required_terminal_exit(event)
+
+    def _fail_required_terminal_exit(event: TerminalExitEvent) -> None:
+        """Report a required terminal's exit as the session's failure, then release it."""
         # Record the exit before release severs its stream, preserving the cause.
         diagnosis = classify_terminal_failure(
             command=event.command,

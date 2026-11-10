@@ -3202,27 +3202,14 @@ async def _post_native_launch_notice(
 CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_CODE = "claude_native_saved_launch_args_skipped"
 
 
-def _claude_saved_launch_args_skipped_notice(skipped_args: Sequence[str]) -> str:
-    """
-    Explain that Claude Code was started without the session's stored launch options.
-
-    Only option names are shown: stored values can hold prompts, paths or
-    tokens, and the notice is part of the shared transcript.
-
-    :param skipped_args: The stored args that were left out, e.g.
-        ``["--mcp-config", "/Users/me/.openui/mcp-inject.json"]``.
-    :returns: The notice text.
-    """
-    names = list(
-        dict.fromkeys(arg.partition("=")[0] for arg in skipped_args if arg.startswith("-"))
-    )
-    options = ", ".join(f"`{name}`" for name in names) if names else "its saved options"
-    return (
-        "Claude Code exited while starting with this session's saved launch options "
-        f"({options}), so Omnigent started it without them. They usually come from "
-        "the tool that created the session and may only work on that machine. "
-        "The permission mode was kept."
-    )
+# Names no stored arg: a value can look like an option (``--append-system-prompt
+# "--- private ---"``), and the notice is part of the shared transcript.
+CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_NOTICE = (
+    "Claude Code exited while starting with this session's saved launch options, so "
+    "Omnigent started it without them, like a new session. They usually come from the "
+    "tool that created the session and may only work on that machine. The permission "
+    "mode was reset too; pick it again if you need it."
+)
 
 
 _CODEX_THREAD_RESET_NOTICE = (
@@ -9335,22 +9322,22 @@ async def _auto_create_claude_terminal(
     session_effort = launch_metadata.reasoning_effort
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
-    # Stored pass-through args come from whatever launched the session, e.g. an
+    # Stored args come from whatever launched the session, e.g. an
     # ``--mcp-config`` file on that machine. Once one made Claude exit during
-    # startup, launch with only the permission mode Omnigent stores there too.
+    # startup, launch without any of them, as a fresh session would start; the
+    # permission mode goes too, so no stored restriction is dropped while a
+    # stored bypass is kept. A permission mode alone is never the cause.
     from omnigent.harnesses.claude_native.launch_args import (
         split_claude_permission_launch_args,
     )
 
-    stored_other_args, stored_permission_args = split_claude_permission_launch_args(
-        session_launch_args or ()
-    )
-    skipped_launch_args: list[str] = []
-    if not resource_registry.note_claude_launch_args(
+    stored_other_args, _ = split_claude_permission_launch_args(session_launch_args or ())
+    replays_stored_args = resource_registry.note_claude_launch_args(
         session_id, uses_saved_args=bool(stored_other_args)
-    ):
-        skipped_launch_args = stored_other_args
-        session_launch_args = stored_permission_args or None
+    )
+    skipped_launch_args = bool(stored_other_args) and not replays_stored_args
+    if skipped_launch_args:
+        session_launch_args = None
     session_external_id = launch_metadata.external_session_id
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history
@@ -10038,7 +10025,7 @@ async def _auto_create_claude_terminal(
             session_id=session_id,
             server_client=server_client,
             code=CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_CODE,
-            notice=_claude_saved_launch_args_skipped_notice(skipped_launch_args),
+            notice=CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_NOTICE,
         )
     # Surface the terminal on the live SSE stream so an already-connected
     # web UI enables the Terminal toggle immediately. The required-terminal

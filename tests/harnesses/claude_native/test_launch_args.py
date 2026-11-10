@@ -21,6 +21,11 @@ from omnigent.harnesses.claude_native.launch_args import split_claude_permission
         ),
         # A selector with no value does not swallow the next flag.
         (["--permission-mode", "--verbose"], (["--verbose"], ["--permission-mode"])),
+        # Positional text after ``--`` is never a selector.
+        (
+            ["--mcp-config", "/a.json", "--", "--dangerously-skip-permissions"],
+            (["--mcp-config", "/a.json", "--", "--dangerously-skip-permissions"], []),
+        ),
         ([], ([], [])),
     ],
 )

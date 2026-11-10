@@ -11,9 +11,8 @@ def split_claude_permission_launch_args(args: Sequence[str]) -> tuple[list[str],
 
     The selectors are ``--permission-mode`` (space- or ``=``-joined) and the
     standalone ``--dangerously-skip-permissions``, which Claude treats as
-    ``--permission-mode bypassPermissions``. Omnigent writes the selector into a
-    session's stored launch args itself, so it is the one stored arg a launch
-    keeps when it drops the rest.
+    ``--permission-mode bypassPermissions``. Tokens after an ``--`` option
+    terminator are positional text, never selectors.
 
     :param args: Launch args, e.g. ``["--model", "opus", "--permission-mode", "plan"]``.
     :returns: ``(other_args, permission_args)``, each in its original order, e.g.
@@ -25,6 +24,9 @@ def split_claude_permission_launch_args(args: Sequence[str]) -> tuple[list[str],
     while index < len(args):
         arg = args[index]
         index += 1
+        if arg == "--":
+            other.extend(args[index - 1 :])
+            break
         if arg == "--dangerously-skip-permissions" or arg.startswith("--permission-mode="):
             permission.append(arg)
         elif arg == "--permission-mode":

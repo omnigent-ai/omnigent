@@ -99,7 +99,7 @@ class _EnsureCommentRelayStartedFn(Protocol):
 class ResourceRoutes:
     """Resource-route helpers the rest of the runner app calls directly."""
 
-    ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]]
+    ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, bool]]
     require_os_env: Callable[[str], Coroutine[Any, Any, AgentSpec | None]]
     resolve_conversation_id: Callable[[str], Coroutine[Any, Any, str | None]]
 
@@ -645,7 +645,7 @@ def register_resource_routes(
             content=session_resource_view_to_dict(resource_view),
         )
 
-    async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
+    async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> bool:
         """Re-create a reaped native pane before forwarding a turn (self-heal).
 
         The native-pane idle reaper may reclaim an idle pane while a session sits
@@ -667,26 +667,30 @@ def register_resource_routes(
         short-name this can target has a matching
         ``ensure_native_terminal`` branch in ``create_session_terminal``
         (kept in lockstep with ``harness_aliases.NATIVE_HARNESSES``).
+
+        :returns: ``False`` when the pane is missing and could not be re-created,
+            so a caller that needs the pane can report the failure; ``True``
+            otherwise, including for a non-native harness.
         """
         terminal_name = native_terminal_name(harness_name)
         if terminal_name is None:
-            return
+            return True
         terminal_registry = resource_registry.terminal_registry if resource_registry else None
         if terminal_registry is None:
-            return
+            return False
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
             if terminal_name != "codex":
-                return
+                return True
             terminal_id = terminal_resource_id("codex", "main")
             if (
                 resource_registry.terminal_resource_role(conv_id, terminal_id)
                 != CODEX_NATIVE_TERMINAL_ROLE
             ):
-                return
+                return True
             resource = await resource_registry.get_terminal_resource(conv_id, terminal_id)
             if resource is None or _is_runner_owned_codex_terminal(resource_registry, resource):
-                return
+                return True
             # The terminal ensure rechecks ownership under its launch lock.
         elif instance is not None:
             _logger.info(
@@ -744,7 +748,7 @@ def register_resource_routes(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-            return
+            return False
         status = getattr(resp, "status_code", 200)
         if status >= 400:
             _logger.warning(
@@ -754,6 +758,8 @@ def register_resource_routes(
                 terminal_name,
                 extra={"session_id": conv_id},
             )
+            return False
+        return True
 
     @app.get("/v1/sessions/{session_id}/resources/terminals/{terminal_id}")
     async def get_session_terminal(

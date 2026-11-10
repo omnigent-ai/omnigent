@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import os
 import sys
@@ -5042,15 +5043,21 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
 
 
 @pytest.mark.asyncio
-async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failing() -> None:
+@pytest.mark.parametrize("relaunch_starts", [True, False], ids=["relaunched", "relaunch-failed"])
+async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failing(
+    monkeypatch: pytest.MonkeyPatch, relaunch_starts: bool
+) -> None:
     """A Claude that dies during startup after replaying stored args is relaunched once.
 
     A stored arg can stop Claude from starting (say an ``--mcp-config`` file that
     exists only on the machine the session was forked from), and every relaunch
-    replays it. The first such startup exit must not fail or release the
-    session: the runner relaunches without the stored args. If Claude also dies
-    while starting without them, that exit is a real failure.
+    replays it. The first such startup exit re-creates the pane instead of
+    failing the session. A relaunch that cannot produce a pane is reported as
+    the original exit, once; a second startup exit is an ordinary failure.
+
+    :param relaunch_starts: Whether the replacement pane comes up.
     """
+    import omnigent.runner.app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.runner.resource_registry import (
         TerminalExitEvent,
@@ -5058,6 +5065,21 @@ async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failin
     )
 
     conv_id = uuid.uuid4().hex
+    relaunches: list[tuple[str, str | None]] = []
+    real_register = runner_app.register_resource_routes
+
+    def register_with_recorded_relaunch(*args: Any, **kwargs: Any) -> Any:
+        # Launching a real Claude pane is out of scope here (the e2e test does
+        # that); record the self-heal call and report the chosen outcome.
+        routes = real_register(*args, **kwargs)
+
+        async def ensure(session_id: str, harness_name: str | None) -> bool:
+            relaunches.append((session_id, harness_name))
+            return relaunch_starts
+
+        return dataclasses.replace(routes, ensure_native_terminal_for_turn=ensure)
+
+    monkeypatch.setattr(runner_app, "register_resource_routes", register_with_recorded_relaunch)
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     pm._sessions.add(conv_id)
     app = create_runner_app(
@@ -5088,31 +5110,35 @@ async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failin
             if event.get("type") == "session.status" and event.get("status") == "failed"
         ]
 
+    queued_events: list[dict[str, Any]] = []
+
+    async def settle() -> None:
+        for _ in range(200):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            await asyncio.sleep(0)
+
     try:
         publish_exit(startup_exit())
-        queued_events: list[dict[str, Any]] = []
-        for _ in range(100):
-            queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-            )
-            await asyncio.sleep(0)
+        await settle()
+        assert relaunches == [(conv_id, "claude-native")]
+        if not relaunch_starts:
+            assert len(failed(queued_events)) == 1
+            assert pm.released == [conv_id]
+            return
         assert failed(queued_events) == []
         assert pm.released == []
-        # Later launches on this runner leave the stored args out.
+        # Later launches on this runner leave the stored args out, and the
+        # replacement's own startup exit fails the session.
         assert resource_registry.note_claude_launch_args(conv_id, uses_saved_args=True) is False
-
         publish_exit(startup_exit())
-        for _ in range(1000):
-            queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-            )
-            if pm.released:
-                break
-            await asyncio.sleep(0)
+        await settle()
     finally:
         _session_event_queues_ref.pop(conv_id, None)
         subagent_work.unregister_child_session(conv_id)
 
+    assert relaunches == [(conv_id, "claude-native")]
     assert len(failed(queued_events)) == 1
     assert pm.released == [conv_id]
 
