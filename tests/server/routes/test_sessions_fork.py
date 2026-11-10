@@ -2329,6 +2329,68 @@ async def test_fork_managed_schedules_sandbox_launch(
     assert conv_store.label_writes == []
 
 
+_CLAUDE_NATIVE_LABELS = {"omnigent.wrapper": "claude-code-native-ui"}
+_HOST_LOCAL_LAUNCH_ARGS = [
+    "--mcp-config",
+    "/Users/someone/.openui/mcp-inject.json",
+    "--plugin-dir",
+    "/Users/someone/.openui/plugin",
+    "--permission-mode",
+    "plan",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_json", "labels", "expected_override"),
+    [
+        # A managed fork lands on a fresh sandbox: only the permission mode carries.
+        ({"host_type": "managed"}, _CLAUDE_NATIVE_LABELS, ["--permission-mode", "plan"]),
+        # A fork that keeps the host binding keeps every stored arg (inherit path).
+        ({}, _CLAUDE_NATIVE_LABELS, None),
+        # Only Claude Code's selectors are known; other harnesses inherit as before.
+        ({"host_type": "managed"}, {}, None),
+        # An explicit dialog pick still replaces the args wholesale.
+        (
+            {"host_type": "managed", "terminal_launch_args": ["--permission-mode", "auto"]},
+            _CLAUDE_NATIVE_LABELS,
+            ["--permission-mode", "auto"],
+        ),
+    ],
+    ids=["managed", "same-host", "not-claude", "explicit-pick"],
+)
+async def test_fork_managed_claude_session_drops_host_local_launch_args(
+    monkeypatch: pytest.MonkeyPatch,
+    request_json: dict[str, object],
+    labels: dict[str, str],
+    expected_override: list[str] | None,
+) -> None:
+    """A Claude Code session's stored launch args stay on its own machine.
+
+    Args a launcher passed (openui's ``--mcp-config`` and ``--plugin-dir``)
+    point at files only that machine has, and Claude exits at startup when an
+    MCP config file is missing, so a fork onto a fresh sandbox could never
+    start. The fork keeps the permission mode, and keeps the copied
+    permission-mode label so it agrees with the carried selector.
+    """
+    conv = _make_conversation(labels=labels)
+    conv.terminal_launch_args = list(_HOST_LOCAL_LAUNCH_ARGS)
+    conv_store = _ConversationStore(conversations={conv.id: conv})
+    app = _build_app(conv_store)
+    _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post(f"/v1/sessions/{conv.id}/fork", json=request_json)
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["override_terminal_launch_args_set"] is (expected_override is not None)
+    if expected_override is not None:
+        assert fork_call["override_terminal_launch_args"] == expected_override
+    if "terminal_launch_args" not in request_json:
+        assert "omnigent.claude_native.permission_mode" not in fork_call["dropped_label_keys"]
+
+
 class _HostIdentityStore:
     """Host store answering only the requested-host-id collision check."""
 

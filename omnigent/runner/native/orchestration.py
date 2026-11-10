@@ -3199,20 +3199,6 @@ async def _post_native_launch_notice(
         )
 
 
-CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_CODE = "claude_native_saved_launch_args_skipped"
-
-
-# Names no stored arg: a value can look like an option (``--append-system-prompt
-# "--- private ---"``), and the notice is part of the shared transcript.
-CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_NOTICE = (
-    "Claude Code exited while starting with this session's saved launch options, so "
-    "Omnigent started it without them. They usually come from the tool that created "
-    "the session and may only work on that machine. A permission mode that approves "
-    "actions on its own was switched to the default (ask) mode, and will be again if "
-    "Claude restarts on this host while those options are saved."
-)
-
-
 _CODEX_THREAD_RESET_NOTICE = (
     "Codex could not load this session's saved transcript, so Omnigent started a fresh "
     "Codex thread instead of failing the turn. The chat history here is intact, but "
@@ -9323,13 +9309,6 @@ async def _auto_create_claude_terminal(
     session_effort = launch_metadata.reasoning_effort
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
-    # Stored args come from whatever launched the session, e.g. an
-    # ``--mcp-config`` file on that machine; after one made Claude exit during
-    # startup, the registry leaves them out.
-    stored_launch_args, skipped_launch_args = resource_registry.claude_launch_args(
-        session_id, session_launch_args or ()
-    )
-    session_launch_args = stored_launch_args or None
     session_external_id = launch_metadata.external_session_id
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history
@@ -10012,13 +9991,6 @@ async def _auto_create_claude_terminal(
     timings.mark("tmux_launch")
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
-    if skipped_launch_args and resource_registry.take_claude_saved_args_notice(session_id):
-        await _post_native_launch_notice(
-            session_id=session_id,
-            server_client=server_client,
-            code=CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_CODE,
-            notice=CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_NOTICE,
-        )
     # Surface the terminal on the live SSE stream so an already-connected
     # web UI enables the Terminal toggle immediately. The required-terminal
     # launch helper registers the resource and starts the activity watcher but
@@ -10735,42 +10707,22 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
     """
     if ctx.server_client is None:
         raise ValueError("claude-native launch requires a bound server_client")
-    from omnigent.terminals.registry import TerminalExitedDuringLaunch
-
-    server_client = ctx.server_client
-
-    async def launch() -> SessionResourceView:
-        return await _auto_create_claude_terminal(
-            ctx.session_id,
-            ctx.resource_registry,
-            ctx.publish_event,
-            server_client=server_client,
-            event_dispatcher=ctx.event_dispatcher,
-            bundle_dir=ctx.bundle_dir,
-            agent_name=ctx.agent_name,
-            agent_spec=ctx.agent_spec,
-            skills_filter=ctx.skills_filter,
-            session_init=ctx.session_init,
-            auth_token_factory=ctx.auth_token_factory,
-            resolve_launch_config=ctx.resolve_launch_config,
-            record_launch_config=ctx.record_launch_config,
-            rebind_bridge=ctx.rebind_bridge,
-        )
-
-    try:
-        view = await launch()
-    except TerminalExitedDuringLaunch:
-        # A pane that dies later reaches the runner's terminal-exit handler,
-        # which relaunches the same way.
-        if not ctx.resource_registry.skip_claude_saved_args_after_startup_exit(ctx.session_id):
-            raise
-        _logger.warning(
-            "Claude exited during startup with stored launch args for session=%s; "
-            "relaunching without them",
-            ctx.session_id,
-            extra={"session_id": ctx.session_id},
-        )
-        view = await launch()
+    view = await _auto_create_claude_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        event_dispatcher=ctx.event_dispatcher,
+        bundle_dir=ctx.bundle_dir,
+        agent_name=ctx.agent_name,
+        agent_spec=ctx.agent_spec,
+        skills_filter=ctx.skills_filter,
+        session_init=ctx.session_init,
+        auth_token_factory=ctx.auth_token_factory,
+        resolve_launch_config=ctx.resolve_launch_config,
+        record_launch_config=ctx.record_launch_config,
+        rebind_bridge=ctx.rebind_bridge,
+    )
     _start_claude_relay_after_launch(ctx)
     return view
 

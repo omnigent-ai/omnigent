@@ -353,7 +353,7 @@ def build_native_controls(
     _codex_native_bridge_state_and_dir_for_session: _CodexNativeBridgeStateAndDirForSessionFn,
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock],
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
-    _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, bool]],
+    _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
     _ingest_cond: dict[str, asyncio.Condition],
     _ingest_next_seq: dict[str, int],

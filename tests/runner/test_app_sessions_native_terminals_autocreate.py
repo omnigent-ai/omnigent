@@ -2077,7 +2077,7 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_under_w
         _no_op_forwarder,
     )
 
-    class _UnreachedResourceRegistry(SessionResourceRegistry):
+    class _UnreachedResourceRegistry:
         """Fails the test if the launch reaches actual terminal spawn."""
 
         terminal_registry = None
@@ -2140,7 +2140,7 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_env_ove
         _no_op_forwarder,
     )
 
-    class _UnreachedResourceRegistry(SessionResourceRegistry):
+    class _UnreachedResourceRegistry:
         """Fails the test if the launch reaches actual terminal spawn."""
 
         terminal_registry = None
@@ -6772,162 +6772,3 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
 
     await fake_client.aclose()
-
-
-class _NoticeRecordingServerClient(_ResumeSnapshotServerClient):
-    """Snapshot server client that records the events the launch posts."""
-
-    def __init__(self, session_url: str, snapshot: dict[str, Any]) -> None:
-        super().__init__(session_url, snapshot)
-        self.posted_events: list[dict[str, Any]] = []
-
-    async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
-        """Record session event posts; acknowledge everything."""
-        if url == f"{self._session_url}/events":
-            self.posted_events.append(kwargs["json"])
-        return NullServerClient._Response()
-
-
-@pytest.mark.asyncio
-async def test_auto_create_claude_terminal_launches_without_stored_args_after_startup_exit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Stored args a startup exit ruled out are left off the launch, and the chat is told once.
-
-    A launcher can store args that only work on its own machine, such as an
-    ``--mcp-config`` file a fork onto a sandbox does not have. The first launch
-    replays them; once Claude exits during startup the runner launches like a
-    fresh session, without the stored restriction or the bypass beside it
-    (the permission rules themselves are covered in
-    ``test_claude_saved_launch_args.py``). The chat is told once, with a fixed
-    notice that repeats no stored token.
-    """
-    from omnigent.runner.native.orchestration import CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_NOTICE
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
-    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
-    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
-    )
-    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
-    missing_config = "/Users/someone/.openui/mcp-inject.json"
-    stored_args = [
-        "--disallowedTools",
-        "Bash",
-        "--mcp-config",
-        missing_config,
-        "--append-system-prompt",
-        "--- PRIVATE_SENTINEL ---",
-        "--permission-mode",
-        "bypassPermissions",
-    ]
-    captured: dict[str, Any] = {}
-    registry = _RecordingClaudeRegistry(captured)
-    server_client = _NoticeRecordingServerClient(
-        f"/v1/sessions/{session_id}", {"terminal_launch_args": stored_args}
-    )
-
-    async def launch() -> list[str]:
-        await _auto_create_claude_terminal(
-            session_id,
-            registry,
-            lambda _sid, _evt: None,
-            server_client=server_client,  # type: ignore[arg-type]
-        )
-        return list(captured["spec"].args)
-
-    first_args = await launch()
-    assert missing_config in first_args
-    assert server_client.posted_events == []
-
-    assert registry.skip_claude_saved_args_after_startup_exit(session_id) is True
-    second_args = await launch()
-    # The relaunch's own startup exit is a real failure, not another retry.
-    assert registry.skip_claude_saved_args_after_startup_exit(session_id) is False
-    for stored in (missing_config, "--- PRIVATE_SENTINEL ---", "bypassPermissions", "Bash"):
-        assert stored not in second_args
-    assert second_args[second_args.index("--permission-mode") + 1] == "default"
-    assert len(server_client.posted_events) == 1
-    notice = server_client.posted_events[0]["data"]["item_data"]
-    assert notice["code"] == "claude_native_saved_launch_args_skipped"
-    assert notice["level"] == "info"
-    assert notice["message"] == CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_NOTICE
-
-    third_args = await launch()
-    assert missing_config not in third_args
-    assert len(server_client.posted_events) == 1
-
-
-class _DeadPane:
-    """Stand-in for the dead instance a ``TerminalExitedDuringLaunch`` carries."""
-
-    name = "claude"
-    session_key = "main"
-
-    def last_exit_status(self) -> int:
-        """Claude's exit status for a rejected launch arg."""
-        return 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("stored_args", "retry_starts"),
-    [
-        (["--mcp-config", "/missing.json"], True),
-        (["--mcp-config", "/missing.json"], False),
-        ([], False),
-    ],
-    ids=["retry-starts", "retry-dies", "no-stored-args"],
-)
-async def test_launch_claude_retries_once_when_the_pane_dies_inside_the_launch(
-    monkeypatch: pytest.MonkeyPatch, stored_args: list[str], retry_starts: bool
-) -> None:
-    """A pane that dies before the launch returns gets the same single retry.
-
-    Only a launch that replayed stored args is retried, and only once: the
-    retry's own death is the launch failure.
-
-    :param stored_args: The session's stored launch args.
-    :param retry_starts: Whether the retry's pane comes up.
-    """
-    from omnigent.runner.native import orchestration
-    from omnigent.terminals.registry import TerminalExitedDuringLaunch
-
-    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
-    registry = SessionResourceRegistry()
-    attempts: list[list[str]] = []
-    view = object()
-
-    async def auto_create(*_args: Any, **_kwargs: Any) -> object:
-        # The builder itself is covered above; this test is about the retry
-        # around it, so each attempt records the stored args it would replay.
-        launch_args, _ = registry.claude_launch_args(session_id, stored_args)
-        attempts.append(launch_args)
-        if len(attempts) == 2 and retry_starts:
-            return view
-        raise TerminalExitedDuringLaunch(_DeadPane())  # type: ignore[arg-type]
-
-    monkeypatch.setattr(orchestration, "_auto_create_claude_terminal", auto_create)
-    ctx = orchestration.NativeLaunchContext(
-        session_id=session_id,
-        resource_registry=registry,
-        publish_event=lambda _sid, _evt: None,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-
-    if retry_starts:
-        assert await orchestration._launch_claude(ctx) is view
-    else:
-        with pytest.raises(TerminalExitedDuringLaunch):
-            await orchestration._launch_claude(ctx)
-
-    recovered = ["--permission-mode", "default"]
-    assert attempts == ([stored_args, recovered] if stored_args else [[]])

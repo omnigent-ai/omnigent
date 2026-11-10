@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import dataclasses
 import logging
 import os
 import sys
@@ -5039,131 +5038,6 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
         if event.get("type") == "session.status" and event.get("status") == "failed"
     ] == []
     # The harness subprocess is released.
-    assert pm.released == [conv_id]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("relaunch_starts", "closed_outside_omnigent"),
-    [(True, False), (False, False), (True, True)],
-    ids=["relaunched", "relaunch-failed", "tmux-killed-outside"],
-)
-async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failing(
-    monkeypatch: pytest.MonkeyPatch, relaunch_starts: bool, closed_outside_omnigent: bool
-) -> None:
-    """A Claude that dies during startup after replaying stored args is relaunched once.
-
-    A stored arg can stop Claude from starting (say an ``--mcp-config`` file that
-    exists only on the machine the session was forked from), and every relaunch
-    replays it. The first such startup exit re-creates the pane instead of
-    failing the session. A relaunch that cannot produce a pane is reported as
-    the original exit, once; a second startup exit is an ordinary failure. A
-    pane killed from outside Omnigent is not a startup failure to recover from.
-
-    :param relaunch_starts: Whether the replacement pane comes up.
-    :param closed_outside_omnigent: Whether tmux was killed outside Omnigent.
-    """
-    import omnigent.runner.app as runner_app
-    from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.runner.resource_registry import (
-        TerminalExitEvent,
-        TerminalLifecycle,
-    )
-
-    conv_id = uuid.uuid4().hex
-    relaunches: list[tuple[str, str | None]] = []
-    real_register = runner_app.register_resource_routes
-
-    def register_with_recorded_relaunch(*args: Any, **kwargs: Any) -> Any:
-        # Launching a real Claude pane is out of scope here (the e2e test does
-        # that); record the self-heal call and report the chosen outcome.
-        routes = real_register(*args, **kwargs)
-
-        async def ensure(session_id: str, harness_name: str | None) -> bool:
-            relaunches.append((session_id, harness_name))
-            return relaunch_starts
-
-        return dataclasses.replace(routes, ensure_native_terminal_for_turn=ensure)
-
-    monkeypatch.setattr(runner_app, "register_resource_routes", register_with_recorded_relaunch)
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    pm._sessions.add(conv_id)
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-    resource_registry = app.state.session_resource_registry
-    publish_exit = resource_registry._terminal_exit_publisher
-    assert callable(publish_exit)
-    stored_args = ["--mcp-config", "/Users/someone/.openui/mcp-inject.json"]
-    assert resource_registry.claude_launch_args(conv_id, stored_args) == (stored_args, False)
-
-    def startup_exit() -> TerminalExitEvent:
-        return TerminalExitEvent(
-            session_id=conv_id,
-            terminal_id="terminal_claude_main",
-            terminal_name="claude",
-            session_key="main",
-            lifecycle=TerminalLifecycle.REQUIRED,
-            exit_status=1,
-            last_output="Error: Invalid MCP configuration:\nMCP config file not found",
-            exited_during_startup=True,
-            closed_outside_omnigent=closed_outside_omnigent,
-        )
-
-    def failed(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [
-            event
-            for event in events
-            if event.get("type") == "session.status" and event.get("status") == "failed"
-        ]
-
-    queued_events: list[dict[str, Any]] = []
-
-    async def wait_for(done: Callable[[], bool]) -> None:
-        for _ in range(1000):
-            queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-            )
-            if done():
-                return
-            await asyncio.sleep(0)
-        raise AssertionError("the exit was neither relaunched nor reported")
-
-    def handled() -> bool:
-        # Done once the relaunch ran (and, when it failed, its failure was released)
-        # or the exit was reported without one.
-        return bool(pm.released) or (bool(relaunches) and relaunch_starts)
-
-    try:
-        publish_exit(startup_exit())
-        await wait_for(handled)
-        if closed_outside_omnigent:
-            assert relaunches == []
-            assert len(failed(queued_events)) == 1
-            assert pm.released == [conv_id]
-            return
-        assert relaunches == [(conv_id, "claude-native")]
-        if not relaunch_starts:
-            assert len(failed(queued_events)) == 1
-            assert pm.released == [conv_id]
-            return
-        assert failed(queued_events) == []
-        assert pm.released == []
-        # Later launches on this runner leave the stored args out, and the
-        # replacement's own startup exit fails the session.
-        assert resource_registry.claude_launch_args(conv_id, stored_args) == (
-            ["--permission-mode", "default"],
-            True,
-        )
-        publish_exit(startup_exit())
-        await wait_for(lambda: bool(pm.released))
-    finally:
-        _session_event_queues_ref.pop(conv_id, None)
-        subagent_work.unregister_child_session(conv_id)
-
-    assert relaunches == [(conv_id, "claude-native")]
-    assert len(failed(queued_events)) == 1
     assert pm.released == [conv_id]
 
 

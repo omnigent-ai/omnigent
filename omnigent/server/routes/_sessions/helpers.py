@@ -81,7 +81,6 @@ from omnigent.harness_plugins import (
     DEVIN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
-from omnigent.harnesses.claude_native.launch_args import split_claude_permission_launch_args
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
 from omnigent.mcp_selection import mcp_selection_revision
@@ -3036,20 +3035,48 @@ def _merge_codex_permission_launch_args(
     return [*merged, *permission_args]
 
 
+def _split_claude_permission_launch_args(args: list[str]) -> tuple[list[str], list[str]]:
+    """
+    Split Claude launch args into permission-mode selectors and everything else.
+
+    The selectors are ``--permission-mode`` (space- or ``=``-joined) and the
+    standalone ``--dangerously-skip-permissions``, which Claude treats as
+    ``--permission-mode bypassPermissions``.
+
+    :param args: Launch args, e.g. ``["--model", "opus", "--permission-mode", "plan"]``.
+    :returns: ``(other_args, selector_args)``, each in order, e.g.
+        ``(["--model", "opus"], ["--permission-mode", "plan"])``.
+    """
+    other: list[str] = []
+    selectors: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "--dangerously-skip-permissions" or arg.startswith("--permission-mode="):
+            selectors.append(arg)
+        elif arg == "--permission-mode":
+            selectors.append(arg)
+            if index < len(args) and not args[index].startswith("-"):
+                selectors.append(args[index])
+                index += 1
+        else:
+            other.append(arg)
+    return other, selectors
+
+
 def _strip_claude_permission_launch_arg(args: list[str]) -> tuple[list[str], bool]:
     """
     Drop every permission-mode selector from Claude launch args.
 
-    Removes ``--permission-mode`` (space- or ``=``-joined) and the standalone
-    ``--dangerously-skip-permissions``, which Claude treats as
-    ``--permission-mode bypassPermissions``; leaving that flag next to a pinned
-    mode would resume the session in bypass under a restricted label.
+    Leaving ``--dangerously-skip-permissions`` next to a pinned mode would
+    resume the session in bypass under a restricted label.
 
     :param args: Launch args, e.g. ``["--model", "opus", "--permission-mode", "plan"]``.
     :returns: The remaining args in order, and whether a selector was present.
     """
-    stripped, permission_args = split_claude_permission_launch_args(args)
-    return stripped, bool(permission_args)
+    stripped, selectors = _split_claude_permission_launch_args(args)
+    return stripped, bool(selectors)
 
 
 def _merge_claude_permission_launch_args(
@@ -12714,6 +12741,7 @@ __all__ = [
     "_signal_terminal_resolved_harness_elicitation",
     "_spec_config_flag_explicitly_disabled",
     "_spec_harness",
+    "_split_claude_permission_launch_args",
     "_start_managed_launch_task",
     "_stop_session_host_runner",
     "_stop_session_via_runner",
