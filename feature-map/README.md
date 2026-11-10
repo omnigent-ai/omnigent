@@ -209,8 +209,9 @@ map an area, remove it here in the same change.
 - Sub-agents and the agent info popover: `tests/e2e_ui/agents/` (only Claude-native
   discovery and idle-runner performance are mapped in Native harnesses)
 - Comments: `tests/e2e_ui/comments/`
-- Files and workspace browsing: `tests/e2e_ui/files/` (only inline previews,
-  file tabs, resizing, draft protection and the opening preference are mapped)
+- Files and workspace browsing: `tests/e2e_ui/files/`, `tests/browser_ui/files/`
+  (inline previews, file tabs, resizing, draft protection and the opening preference
+  are mapped; in-file search, word wrap, Open in app and tab overflow remain unmapped)
 - Sharing and session permissions: `tests/e2e_ui/collaboration/`
 - GitHub integration: `tests/e2e_ui/github/`
 - Scheduled tasks: `tests/e2e_ui/scheduled/`

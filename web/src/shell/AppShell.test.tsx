@@ -6583,19 +6583,25 @@ describe("AppShell tree preview", () => {
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-tree", "false");
   });
 
-  it.each(["README.md", "AGENTS.md"])(
-    "opens URL deep links as soft tabs with saved preview %s",
-    (preview) => {
+  it.each([
+    ["README.md", ""],
+    ["AGENTS.md", ""],
+    ["README.md", "&line=12"],
+  ])(
+    "opens URL deep links as soft tabs with saved preview %s and coordinates %s",
+    (preview, coordinates) => {
       writeSessionWorkspaceState("conv_tree", { treePreviewPath: preview });
-      renderShell("/c/conv_tree?file=README.md&line=12", splitInfo);
+      renderShell(`/c/conv_tree?file=README.md${coordinates}`, splitInfo);
       expect(readSessionWorkspaceState("conv_tree")).toMatchObject({
         treePreviewPath: preview,
         selectedFilePath: "README.md",
         openFiles: ["README.md"],
       });
       expect(screen.getAllByTestId("file-viewer-inline")).toHaveLength(1);
-      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-line", "12");
-      expect(screen.getByTestId("url-params")).toHaveTextContent("line=12");
+      if (coordinates) {
+        expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-line", "12");
+        expect(screen.getByTestId("url-params")).toHaveTextContent("line=12");
+      }
       expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-tree", "false");
     },
   );

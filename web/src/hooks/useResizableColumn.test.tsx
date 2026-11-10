@@ -146,6 +146,5 @@ describe("useResizableColumn", () => {
     unmount();
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
-    release();
   });
 });

@@ -88,7 +88,7 @@ export function useResizableColumn(
   return {
     /** Pixel width for the left column (apply as inline style). */
     width,
-    /** Optional ref for the flex-row container that owns the resize handle. */
+    /** Optional container ref; resizing uses pointer deltas, not this ref. */
     containerRef,
     /** Spread onto the resize handle element at the right edge of the left column. */
     handleProps: {

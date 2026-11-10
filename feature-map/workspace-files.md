@@ -26,6 +26,8 @@ header stays above both columns, and the current file stays highlighted.
 - In Files, right-click a file and choose **Open in new tab**, or use Cmd-click
   on macOS, Ctrl-click elsewhere, or middle-click. Choose **Files** again to
   return to the expanded tree and previous preview.
+- At narrow widths, the header's **Folder actions** menu contains **Copy folder path**
+  and **Refresh files**.
 - Settings → Appearance → Workspace → **Always open files in a new tab** opts
   out of inline previews. Appearance **Reset** restores inline opening.
 - Settings → Appearance → Settings data → **Export** saves the opening preference;

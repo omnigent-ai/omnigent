@@ -1654,10 +1654,12 @@ function WorkspacePanelImpl({
     observer.observe(node);
     return () => observer.disconnect();
   }, [sharedFileViewer, filesPanelMounted]);
+  const minimumTreeWidth = 200;
+  const minimumPreviewWidth = 320 + 4; // Include the divider allowance.
   const treeColumn = useResizableColumn(
     260,
-    200,
-    Math.max(200, Math.min(filesWidth / 2, filesWidth - 324)),
+    minimumTreeWidth,
+    Math.max(minimumTreeWidth, Math.min(filesWidth / 2, filesWidth - minimumPreviewWidth)),
     "omnigent:workspace-file-tree-width",
   );
   const canSplitFiles =
@@ -1665,7 +1667,7 @@ function WorkspacePanelImpl({
     !isMobile &&
     !alwaysOpenFilesInTab &&
     rightRailTab === "files" &&
-    filesWidth >= 524;
+    filesWidth >= minimumTreeWidth + minimumPreviewWidth;
   const splitFiles = canSplitFiles && selectedFilePath === null && treePreviewPath !== null;
   const viewerPath = selectedFilePath ?? treePreviewPath;
   const viewerVisible = filesPanelActive && (selectedFilePath !== null || splitFiles);
