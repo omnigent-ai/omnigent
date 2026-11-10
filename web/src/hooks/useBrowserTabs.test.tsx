@@ -33,6 +33,8 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   Reflect.deleteProperty(window, "omnigentDesktop");
+  vi.mocked(getSessionSlim).mockReset();
+  vi.mocked(toast.error).mockClear();
 });
 
 describe("browser tab titles", () => {
@@ -654,11 +656,18 @@ describe("browser soft tabs", () => {
       },
     });
     vi.mocked(getSessionSlim).mockImplementation(
-      async (id: string) => ({ id, hostId: "this-mac", labels: {} }) as unknown as Session,
+      async (id: string) =>
+        ({
+          id,
+          hostId: id === "session-a" ? "this-mac" : "build-host",
+          labels: {},
+        }) as unknown as Session,
     );
     openBrowserTab("session-a", "clicked");
+    openBrowserTab("session-b", "other");
     const rail = renderHook(() => useBrowserTabs("session-a"));
     const gridRail = renderHook(() => useBrowserTabs("session-a"));
+    const otherSessionRail = renderHook(() => useBrowserTabs("session-b"));
     expect(browserSetOpenTabSupported.mock.calls).toEqual([[true]]);
 
     await act(async () => {
@@ -679,6 +688,24 @@ describe("browser soft tabs", () => {
         { force: true, sourceHostId: "this-mac", sessionHostProtocol: SESSION_HOST_PROTOCOL },
       ],
     ]);
+    expect(otherSessionRail.result.current.tabs).toEqual(["other"]);
+
+    await act(async () => {
+      openTab({
+        conversationId: browserViewId("session-b", "other"),
+        url: "https://example.com/other",
+      });
+    });
+    await waitFor(() => expect(otherSessionRail.result.current.tabs).toHaveLength(2));
+    const otherNewTab = otherSessionRail.result.current.tabs[1];
+    expect(otherSessionRail.result.current.selected).toBe("other");
+    expect(browserOpenOrNavigate).toHaveBeenLastCalledWith(
+      browserViewId("session-b", otherNewTab),
+      "https://example.com/other",
+      undefined,
+      { force: true, sourceHostId: "build-host", sessionHostProtocol: SESSION_HOST_PROTOCOL },
+    );
+    expect(rail.result.current.tabs).toEqual(["clicked", newTab]);
 
     browserOpenOrNavigate.mockResolvedValueOnce({ ok: false, error: "browser view cap reached" });
     await act(async () => {
@@ -692,8 +719,9 @@ describe("browser soft tabs", () => {
     expect(rail.result.current.tabs).toEqual(["clicked", newTab]);
 
     rail.unmount();
-    expect(stopOpenTabs).not.toHaveBeenCalled();
     gridRail.unmount();
+    expect(stopOpenTabs).not.toHaveBeenCalled();
+    otherSessionRail.unmount();
     expect(stopOpenTabs).toHaveBeenCalledTimes(1);
     expect(browserSetOpenTabSupported.mock.calls).toEqual([[true], [false]]);
   });
