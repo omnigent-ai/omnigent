@@ -3337,14 +3337,20 @@ describe("automation trigger type", () => {
       type("task-trigger-instructions", "Answer the question quickly.");
       await choose("Linear");
       expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
+      expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(
+        "Answer the question quickly.",
+      );
+      type("task-trigger-instructions", "Summarize the issue.");
       await choose("GitHub");
       expect(screen.getByTestId("task-trigger-scope")).toHaveValue("acme/app");
+      expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(
+        "Answer the question quickly.",
+      );
       await choose("Slack");
       expect(screen.queryByTestId("task-trigger-fields")).not.toBeInTheDocument();
       expect(screen.queryByTestId("task-trigger-type-note")).not.toBeInTheDocument();
       expect(screen.getByTestId("task-name-input")).toHaveValue("Support desk");
-      expect(screen.getByTestId("task-prompt-input")).toHaveValue("Answer the question quickly.");
-      type("task-prompt-input", "Answer the question.");
+      expect(screen.getByTestId("task-prompt-input")).toHaveValue("Answer the question.");
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       const input = updateMutateAsync.mock.calls[0][0].input;
@@ -3377,6 +3383,54 @@ describe("automation trigger type", () => {
       const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
       expect(triggerPromptSource(prompt)).toBe("jira");
       expect(readTriggerWorkerPlacement(prompt)).toBe("managed");
+    });
+
+    it("keeps same-host workers beside a sandbox poller on the new source", async () => {
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+        data: { models: [], configured: false, status: "ready" },
+      } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            scheduled_task_session_modes: true,
+            scheduled_task_subhour: true,
+            automation_trigger_poll_minutes: 30,
+            features: { automations_v2: true, session_orchestration: true },
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "modal",
+            sandbox_provider_capabilities: { modal: { default_models: true } },
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={{ ...slackTask, executionTarget: "managed_sandbox", hostId: null }}
+          />
+        </CapabilitiesProvider>,
+      );
+      await choose("Jira");
+      type("task-trigger-scope", "ES");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
+      expect(triggerPromptSource(prompt)).toBe("jira");
+      expect(readTriggerWorkerPlacement(prompt)).toBe("same_host");
+    });
+
+    it("saves the new source's form after the saved system prompt was cleared", async () => {
+      render(dialog({ editingTask: slackTask }));
+      fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+      fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
+        target: { value: "" },
+      });
+      await choose("Jira");
+      type("task-trigger-scope", "ES");
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(triggerPromptSource(updateMutateAsync.mock.calls[0][0].input.prompt)).toBe("jira");
     });
 
     it("always starts a new polling session after a switch, even when edited as a prompt", async () => {

@@ -895,8 +895,8 @@ export function CreateScheduledTaskDialog({
     trigger !== null && triggerFieldsComplete(triggerFields, trigger)
       ? renderTriggerPrompt(trigger, triggerFields, {
           // Workers run where the manager runs: beside it on a connected host,
-          // or each in its own sandbox. A switched edit keeps sandboxed workers.
-          placement: workerSandboxMode ? "managed" : "same_host",
+          // or each in its own sandbox. A switched edit keeps the saved placement.
+          placement: workerPlacement ?? (sandboxMode ? "managed" : "same_host"),
           sessionLink,
           pollingIntervalMinutes:
             schedule.preset === "custom" && schedule.customFreq === "minutely"
@@ -965,7 +965,7 @@ export function CreateScheduledTaskDialog({
     name.trim() !== "" &&
     (startsFromSession ||
       (effectivePrompt.trim() !== "" && (trigger !== null || prompt.trim() !== ""))) &&
-    (systemPrompt === null || systemPrompt.trim() !== "") &&
+    (trigger !== null || systemPrompt === null || systemPrompt.trim() !== "") &&
     (isEdit || effectiveAgentId !== null) &&
     (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
@@ -1046,6 +1046,7 @@ export function CreateScheduledTaskDialog({
     if (name === TRIGGER_TEMPLATES[editedTriggerSource].name) {
       setName(TRIGGER_TEMPLATES[next].name);
     }
+    // Saved prompts and drafts come back unchanged; only a new draft takes the instructions.
     const draft = next === editingTriggerSource ? null : editSourceDrafts.current[next];
     const promptEditor =
       next === editingTriggerSource
@@ -1053,9 +1054,7 @@ export function CreateScheduledTaskDialog({
         : draft?.promptEditor;
     if (promptEditor) {
       const restored = restoreSourcePrompt(
-        promptEditor.systemPrompt !== null && instructions.trim() !== ""
-          ? instructions
-          : promptEditor.prompt,
+        promptEditor.prompt,
         promptEditor.systemPrompt,
         workerSettings,
       );
@@ -1071,7 +1070,7 @@ export function CreateScheduledTaskDialog({
       setStartNewSession(saved.savedStartNewSession);
       setSourceSwitch(null);
     } else {
-      setTriggerFields({ ...(draft?.fields ?? emptyTriggerFields(next)), instructions });
+      setTriggerFields(draft?.fields ?? { ...emptyTriggerFields(next), instructions });
       setStartNewSession(true);
       setSourceSwitch({ ...saved, source: next });
     }
