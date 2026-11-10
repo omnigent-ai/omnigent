@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import tarfile
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -11,6 +12,7 @@ import pytest
 import yaml
 from fastapi import FastAPI
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.bundles import bundle_location
 from omnigent.server.routes import session_mcp_servers as mcp_routes
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -575,3 +577,55 @@ async def test_live_mcp_reconnect_maps_each_runner_answer(
         invalid = await client.post(url, json=body)
         assert invalid.status_code in (400, 422), invalid.text
     assert answers == []
+
+
+class _LiveMcpRouter:
+    """Routes one conversation to a fake runner, or raises the offline error."""
+
+    def __init__(self, routed: Any) -> None:
+        self.routed = routed
+
+    def client_for_existing_conversation(self, conversation_id: str) -> Any:
+        if isinstance(self.routed, Exception):
+            raise self.routed
+        return self.routed
+
+
+async def test_live_mcp_runner_request_forwards_to_the_sessions_runner() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"live": True, "servers": []})
+
+    async with httpx.AsyncClient(
+        base_url="http://runner.example.com", transport=httpx.MockTransport(handler)
+    ) as client:
+        router: Any = _LiveMcpRouter(SimpleNamespace(client=client))
+        response = await mcp_routes._live_mcp_runner_request(
+            router,
+            "conv/a b",
+            "POST",
+            "live-mcp-servers/reconnect",
+            json={"name": "docs"},
+            timeout=5,
+        )
+    assert response is not None and response.status_code == 200
+    assert seen[0].method == "POST"
+    assert seen[0].url.raw_path == b"/v1/sessions/conv%2Fa%20b/live-mcp-servers/reconnect"
+    assert seen[0].read() == b'{"name":"docs"}'
+
+    # No router, or no runner holding the session, means nothing is running.
+    no_runner: Any = _LiveMcpRouter(None)
+    for absent in (None, no_runner):
+        assert (
+            await mcp_routes._live_mcp_runner_request(
+                absent, "conv_a", "GET", "live-mcp-servers", timeout=5
+            )
+            is None
+        )
+    offline: Any = _LiveMcpRouter(OmnigentError("runner offline", code=ErrorCode.RUNNER_UNAVAILABLE))
+    with pytest.raises(OmnigentError, match="runner offline"):
+        await mcp_routes._live_mcp_runner_request(
+            offline, "conv_a", "GET", "live-mcp-servers", timeout=5
+        )
