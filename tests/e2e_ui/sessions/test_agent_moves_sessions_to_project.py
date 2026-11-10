@@ -72,6 +72,14 @@ def _project_ids_named(base_url: str, names: set[str]) -> list[str]:
     return [project["id"] for project in projects if project["name"] in names]
 
 
+def _delete_projects_named(base_url: str, names: set[str]) -> None:
+    # Cleanup must not replace the journey's own failure with a server error.
+    with contextlib.suppress(httpx.HTTPError, ValueError, KeyError):
+        for project_id in _project_ids_named(base_url, names):
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0)
+
+
 def _session_project_id(base_url: str, session_id: str) -> str | None:
     response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     response.raise_for_status()
@@ -132,9 +140,7 @@ def filing_journey(
             for session_id in session_ids:
                 with contextlib.suppress(httpx.HTTPError):
                     httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-            for project_id in _project_ids_named(live_server, {existing_project, new_project}):
-                with contextlib.suppress(httpx.HTTPError):
-                    httpx.delete(f"{live_server}/v1/projects/{project_id}", timeout=10.0)
+            _delete_projects_named(live_server, {existing_project, new_project})
         finally:
             if respawned is not None:
                 respawned.terminate()
@@ -294,6 +300,4 @@ def test_native_claude_moves_itself_into_a_project(
         (project_id,) = _project_ids_named(base_url, {project})
         assert _session_project_id(base_url, session_id) == project_id
     finally:
-        for project_id in _project_ids_named(base_url, {project}):
-            with contextlib.suppress(httpx.HTTPError):
-                httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0)
+        _delete_projects_named(base_url, {project})
