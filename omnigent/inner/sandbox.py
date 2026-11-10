@@ -519,7 +519,18 @@ def _resolve_grant_root(cwd: Path, root: str) -> Path:
     path = Path(expanded)
     if not path.is_absolute():
         path = cwd / path
-    return path.resolve(strict=False)
+    resolved = path.resolve(strict=False)
+    _check_relative_grant_containment(cwd, root, resolved)
+    return resolved
+
+
+def _check_relative_grant_containment(cwd: Path, root: str, resolved: Path) -> None:
+    """Keep workspace-relative grants from resolving through external symlinks."""
+    if Path(os.path.expanduser(root)).is_absolute() or ".." in Path(root).parts:
+        return
+    workspace = Path(os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or cwd).resolve(strict=False)
+    if not resolved.is_relative_to(workspace):
+        raise ValueError(f"relative sandbox grant resolves outside workspace: {root!r}")
 
 
 def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:

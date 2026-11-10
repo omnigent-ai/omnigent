@@ -86,6 +86,7 @@ from .sandbox import (
     HOST_SANDBOX_BACKEND_ENV,
     SandboxBackend,
     SandboxPolicy,
+    _check_relative_grant_containment,
     register_backend,
 )
 
@@ -873,7 +874,9 @@ def _resolve_root(cwd: Path, root: str) -> Path:
     path = Path(expanded)
     if not path.is_absolute():
         path = cwd / path
-    return path.resolve(strict=False)
+    resolved = path.resolve(strict=False)
+    _check_relative_grant_containment(cwd, root, resolved)
+    return resolved
 
 
 def _is_same_path(a: Path, b: Path) -> bool:
