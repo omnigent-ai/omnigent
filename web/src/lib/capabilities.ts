@@ -304,8 +304,11 @@ export interface ServerInfo {
   scheduled_task_projects?: boolean;
   /** Latest sessionless automation failures can be listed for Inbox. */
   scheduled_task_inbox?: boolean;
-  /** Agent-posted suggestions can be listed for Inbox, for this caller. */
-  proactive_agent_enabled?: boolean;
+  /**
+   * The deployment offers the proactive agent (Omni Advisor) to this caller;
+   * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
+   */
+  proactive_agent_available?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Automations accept modes that skip approval; older servers may reject them. */
@@ -500,6 +503,14 @@ export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
   );
 }
 
+/** Whether the Admin > General page has a setting to show: nested agents or Omni Advisor. */
+export function adminGeneralSettingsAvailable(info: ServerInfo | "loading"): boolean {
+  return (
+    info !== "loading" &&
+    (info.sibling_sessions === true || info.proactive_agent_available === true)
+  );
+}
+
 export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
   return (
     isFeatureEnabled(info, "custom_agents_settings_ui") &&
@@ -640,7 +651,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
-          proactive_agent_enabled: data.proactive_agent_enabled === true,
+          proactive_agent_available: data.proactive_agent_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:
             data.scheduled_task_approval_skipping_modes === true,

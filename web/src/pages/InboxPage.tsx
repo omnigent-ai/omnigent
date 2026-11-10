@@ -74,6 +74,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useProactiveInbox } from "@/hooks/useProactiveInbox";
+import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { PageScroll } from "@/components/PageScroll";
@@ -129,6 +130,7 @@ import { newSessionLocation } from "@/lib/newSessionHandoff";
 import {
   DISMISS_REASONS,
   OPEN_SUGGESTION_STATES,
+  PROACTIVE_AGENT_DISPLAY_NAME,
   suggestionKindLabel,
   suggestionLinkTarget,
   suggestionPreview,
@@ -184,6 +186,7 @@ const INBOX_TABS: { value: InboxFilter; label: string }[] = [
   { value: "all", label: "All" },
   { value: "unread", label: "Unread" },
   { value: "awaiting", label: "Awaiting response" },
+  { value: "advisor", label: PROACTIVE_AGENT_DISPLAY_NAME },
 ];
 
 const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
@@ -198,6 +201,10 @@ const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
   awaiting: {
     title: "No approvals waiting",
     body: "When an agent needs your input, it will show up here.",
+  },
+  advisor: {
+    title: `No suggestions from ${PROACTIVE_AGENT_DISPLAY_NAME}`,
+    body: "Follow-ups, related information, and reminders about your recent work will show up here.",
   },
 };
 
@@ -243,7 +250,13 @@ export function InboxPage() {
   } = useSidebarData();
   const navigate = useNavigate();
   const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
-  const [filter, setFilter] = useState<InboxFilter>(readInboxFilter);
+  const [storedFilter, setFilter] = useState<InboxFilter>(readInboxFilter);
+  const { available: advisorAvailable, settings: advisorSettings } = useProactiveAgentSettings();
+  // The Omni Advisor tab exists only while the agent is on for the viewer; it
+  // stays selected while that is still loading.
+  const advisorTab = advisorAvailable && advisorSettings?.enabled !== false;
+  const filter: InboxFilter = storedFilter === "advisor" && !advisorTab ? "all" : storedFilter;
+  const advisorOnly = filter === "advisor";
   // The Unread tab pages through unread suggestions only, so an older unread
   // one is reachable behind newer read ones.
   const proactiveInbox = useProactiveInbox(
@@ -306,8 +319,10 @@ export function InboxPage() {
   // sidebar) drops the row immediately instead of on the next list poll.
   useUnseenTick();
   const unreadItems = collectUnreadInboxItems(allRows, isConversationUnseen);
-  const showApprovals = filter !== "unread";
-  const showUnread = filter !== "awaiting";
+  const showApprovals = filter === "all" || filter === "awaiting";
+  // Unread sessions, file comments, and automation results.
+  const showUnread = filter === "all" || filter === "unread";
+  const showSuggestions = filter !== "awaiting";
 
   // Latest-output preview per unread session. `updated_at` in the key
   // refetches after a new turn; a failed fetch just leaves the row bare.
@@ -360,7 +375,7 @@ export function InboxPage() {
   const visibleUnread = showUnread ? unreadItems : [];
   const visibleAutomations = showUnread ? automationInbox.items : [];
   const listedSuggestionIds = new Set(proactiveInbox.items.map((item) => item.id));
-  const visibleSuggestions = showUnread
+  const visibleSuggestions = showSuggestions
     ? [
         ...proactiveInbox.items,
         ...Object.values(pinnedSuggestions).filter((item) => !listedSuggestionIds.has(item.id)),
@@ -463,15 +478,19 @@ export function InboxPage() {
   // would be a lie. Failed snapshots also block the empty state (their
   // approvals exist, we just couldn't fetch them) and get a banner.
   const assembling =
-    conversationsQuery.isLoading ||
-    isFetchingNextPage ||
-    snapshotQueries.some((q) => q.isLoading) ||
-    commentInbox.isLoading ||
+    (!advisorOnly &&
+      (conversationsQuery.isLoading ||
+        isFetchingNextPage ||
+        snapshotQueries.some((q) => q.isLoading) ||
+        commentInbox.isLoading)) ||
     (showUnread && automationInbox.isLoading) ||
-    (showUnread && proactiveInbox.isLoading);
+    (showSuggestions && proactiveInbox.isLoading);
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
-  const failedSessionCount =
-    failedSnapshots.length + commentInbox.failedCount + Number(Boolean(conversationsQuery.isError));
+  const failedSessionCount = advisorOnly
+    ? 0
+    : failedSnapshots.length +
+      commentInbox.failedCount +
+      Number(Boolean(conversationsQuery.isError));
 
   // Mirrors `chatStore.submitApproval`: optimistic flip → resolve POST →
   // rollback on error. Success invalidates the session list so the row's
@@ -563,7 +582,7 @@ export function InboxPage() {
           testId="inbox-suggestion"
           dataKind={item.kind}
           tile={<KindTile icon={LightbulbIcon} tone="gray" />}
-          kindLabel={suggestionKindLabel(item.kind)}
+          kindLabel={`${PROACTIVE_AGENT_DISPLAY_NAME} · ${suggestionKindLabel(item.kind)}`}
           title={item.title}
           preview={suggestionPreview(item.bodyMd)}
           at={entry.at}
@@ -1037,15 +1056,17 @@ export function InboxPage() {
           aria-label="Inbox filter"
           className="gap-1 mobile-app:max-w-full mobile-app:flex-wrap mobile-app:justify-start"
         >
-          {INBOX_TABS.map(({ value, label }) => (
-            <TabsTrigger
-              key={value}
-              value={value}
-              className="h-7 mobile-touch-target mobile-app:h-auto flex-none mobile-app:whitespace-normal px-3"
-            >
-              {label}
-            </TabsTrigger>
-          ))}
+          {INBOX_TABS.filter(({ value }) => value !== "advisor" || advisorTab).map(
+            ({ value, label }) => (
+              <TabsTrigger
+                key={value}
+                value={value}
+                className="h-7 mobile-touch-target mobile-app:h-auto flex-none mobile-app:whitespace-normal px-3"
+              >
+                {label}
+              </TabsTrigger>
+            ),
+          )}
         </TabsList>
       </Tabs>
 
@@ -1074,7 +1095,7 @@ export function InboxPage() {
         </div>
       )}
 
-      {showUnread && proactiveInbox.isError && (
+      {showSuggestions && proactiveInbox.isError && (
         <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
           Couldn’t load suggestions.
           <Button
@@ -1111,13 +1132,15 @@ export function InboxPage() {
 
       {!assembling &&
         failedSessionCount === 0 &&
-        !(showUnread && (automationInbox.isError || proactiveInbox.isError)) &&
+        !(showUnread && automationInbox.isError) &&
+        !(showSuggestions && proactiveInbox.isError) &&
         visibleCount === 0 && (
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />
             <p className="text-ui font-medium">
-              {hasNextPage ||
-              (showUnread && (automationInbox.hasNextPage || proactiveInbox.hasNextPage))
+              {(!advisorOnly && hasNextPage) ||
+              (showUnread && automationInbox.hasNextPage) ||
+              (showSuggestions && proactiveInbox.hasNextPage)
                 ? "Nothing waiting in the loaded items"
                 : emptyState.title}
             </p>
@@ -1139,7 +1162,7 @@ export function InboxPage() {
           </div>
         )}
       </div>
-      {hasNextPage && (
+      {!advisorOnly && hasNextPage && (
         <Button
           variant="outline"
           disabled={conversationsQuery.isFetching}
@@ -1150,7 +1173,7 @@ export function InboxPage() {
           {isFetchingNextPage ? "Loading…" : "Load more sessions"}
         </Button>
       )}
-      {showUnread && proactiveInbox.hasNextPage && (
+      {showSuggestions && proactiveInbox.hasNextPage && (
         <Button
           variant="outline"
           disabled={proactiveInbox.isFetchingNextPage}
@@ -1283,8 +1306,9 @@ function SessionLine({ title, detail }: { title: string; detail?: string }) {
   );
 }
 
-/** A suggestion's evidence: sessions open here, other links in a new tab. */
+/** What a suggestion is based on: sessions open here, other links in a new tab. */
 function SuggestionLinks({ item }: { item: Suggestion }) {
+  const headingId = useId();
   const seen = new Set<string>();
   const links = item.links.flatMap((link) => {
     const target = suggestionLinkTarget(link);
@@ -1295,30 +1319,35 @@ function SuggestionLinks({ item }: { item: Suggestion }) {
   });
   if (links.length === 0) return null;
   return (
-    <ul className="flex flex-col gap-1 text-sm">
-      {links.map(({ key, link, target }) => (
-        <li key={key} className="truncate">
-          {target.kind === "session" ? (
-            <Link
-              to={target.path}
-              componentId="inbox.suggestion.open_session"
-              className="underline underline-offset-2"
-            >
-              {link.label ?? "Open session"}
-            </Link>
-          ) : (
-            <a
-              href={target.href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="underline underline-offset-2"
-            >
-              {link.label ?? link.ref}
-            </a>
-          )}
-        </li>
-      ))}
-    </ul>
+    <section aria-labelledby={headingId} className="flex flex-col gap-1 text-sm">
+      <h3 id={headingId} className="text-xs font-medium text-muted-foreground">
+        Source
+      </h3>
+      <ul className="flex flex-col gap-1">
+        {links.map(({ key, link, target }) => (
+          <li key={key} className="truncate">
+            {target.kind === "session" ? (
+              <Link
+                to={target.path}
+                componentId="inbox.suggestion.open_session"
+                className="underline underline-offset-2"
+              >
+                {link.label ?? "Open session"}
+              </Link>
+            ) : (
+              <a
+                href={target.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline underline-offset-2"
+              >
+                {link.label ?? link.ref}
+              </a>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

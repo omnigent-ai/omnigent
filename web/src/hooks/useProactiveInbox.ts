@@ -1,7 +1,6 @@
 import { useInfiniteQuery, useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import { useCallback, useRef, useState } from "react";
 import { showToast } from "@/components/ui/toast";
-import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { withBasePath } from "@/lib/basePath";
 import { getOmnigentHostGeneration, getOmnigentServerIdentity } from "@/lib/host";
 import {
@@ -16,12 +15,13 @@ import {
   type SuggestionUpdate,
 } from "@/lib/proactiveInbox";
 import { useRebasePath } from "@/lib/routing";
+import { useProactiveAgentSettings } from "./useProactiveAgentSettings";
 import { useViewerId } from "./useViewerId";
 
 type Pages = InfiniteData<SuggestionPage, string | null>;
 
 /**
- * Agent-posted suggestions for the Inbox, when the server offers them.
+ * Agent-posted suggestions for the Inbox, when the proactive agent is on for the viewer.
  *
  * Updates apply optimistically. Fetches in flight when an update starts or
  * settles are cancelled, pending updates are re-applied over any page that
@@ -37,7 +37,7 @@ export function useProactiveInbox(
   identityReady: boolean,
   states: readonly SuggestionState[] = OPEN_SUGGESTION_STATES,
 ) {
-  const info = useServerInfo();
+  const { settings } = useProactiveAgentSettings();
   const viewerId = useViewerId();
   const rebasePath = useRebasePath();
   const queryClient = useQueryClient();
@@ -48,7 +48,7 @@ export function useProactiveInbox(
     viewerId,
   ];
   const scopeKeyText = JSON.stringify(scopeKey);
-  const enabled = identityReady && info !== "loading" && info.proactive_agent_enabled === true;
+  const enabled = identityReady && settings?.enabled === true;
   const query = useInfiniteQuery({
     queryKey: [...scopeKey, [...states]],
     queryFn: ({ pageParam }) => listSuggestions(pageParam, states),

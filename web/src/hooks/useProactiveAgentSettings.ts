@@ -1,0 +1,81 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { getOmnigentHostGeneration, getOmnigentServerIdentity } from "@/lib/host";
+import { authenticatedFetch } from "@/lib/identity";
+import { useViewerId } from "./useViewerId";
+
+/** The caller's view of ``GET /v1/proactive-agent/settings``. */
+export interface ProactiveAgentSettings {
+  /** The admin's workspace-wide setting. */
+  workspace_enabled: boolean;
+  /** The caller's own setting. */
+  user_enabled: boolean;
+  /** Whether the agent runs for the caller: both settings on. */
+  enabled: boolean;
+  /** Whether the caller may change the workspace setting. */
+  can_manage_workspace: boolean;
+}
+
+/** Which setting a change targets: the caller's own, or the workspace's. */
+export type ProactiveAgentSettingScope = "me" | "workspace";
+
+async function readJson(res: Response): Promise<ProactiveAgentSettings> {
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body?.error?.message ?? `${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as ProactiveAgentSettings;
+}
+
+function useSettingsKey() {
+  const viewerId = useViewerId();
+  return [
+    "proactive-agent-settings",
+    getOmnigentServerIdentity() ?? `mount:${getOmnigentHostGeneration()}`,
+    viewerId,
+  ];
+}
+
+/**
+ * The proactive agent's settings, when the server offers the agent; ``undefined``
+ * while loading or where it is not offered, so callers treat both as off.
+ */
+export function useProactiveAgentSettings() {
+  const info = useServerInfo();
+  const available = info !== "loading" && info.proactive_agent_available === true;
+  const queryKey = useSettingsKey();
+  const query = useQuery({
+    queryKey,
+    enabled: available,
+    staleTime: 60_000,
+    queryFn: async () => readJson(await authenticatedFetch("/v1/proactive-agent/settings")),
+  });
+  return { available, settings: available ? query.data : undefined, query };
+}
+
+/** Change the caller's own setting or, for an admin, the workspace's. */
+export function useSetProactiveAgentSetting() {
+  const queryClient = useQueryClient();
+  const queryKey = useSettingsKey();
+  return useMutation({
+    mutationFn: async ({
+      scope,
+      enabled,
+    }: {
+      scope: ProactiveAgentSettingScope;
+      enabled: boolean;
+    }) =>
+      readJson(
+        await authenticatedFetch(`/v1/proactive-agent/settings/${scope}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        }),
+      ),
+    onSuccess: (data) => {
+      queryClient.setQueryData(queryKey, data);
+      // Turning it off hides the suggestions; turning it on shows them again.
+      void queryClient.invalidateQueries({ queryKey: ["proactive-inbox"] });
+    },
+  });
+}

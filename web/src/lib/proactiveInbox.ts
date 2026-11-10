@@ -61,6 +61,9 @@ export interface SuggestionPage {
 
 /** States still waiting on the viewer; done and dismissed items leave the Inbox. */
 export const OPEN_SUGGESTION_STATES: readonly SuggestionState[] = ["unread", "read"];
+
+/** What the UI calls the proactive agent; the one place to change when it is renamed. */
+export const PROACTIVE_AGENT_DISPLAY_NAME = "Omni Advisor";
 export const SUGGESTION_PAGE_SIZE = 50;
 
 /** Reasons the Dismiss menu offers, in menu order. */

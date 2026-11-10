@@ -22,13 +22,16 @@ vi.mock("@/lib/proactiveInbox", async (importActual) => ({
   updateSuggestion: vi.fn(),
 }));
 vi.mock("./useViewerId", () => ({ useViewerId: () => "alice" }));
+vi.mock("./useProactiveAgentSettings", () => ({
+  useProactiveAgentSettings: () => ({ settings: enabled ? { enabled: true } : undefined }),
+}));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 let client: QueryClient;
 let enabled = true;
 const wrapper = ({ children }: { children: ReactNode }) => (
   <QueryClientProvider client={client}>
-    <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, proactive_agent_enabled: enabled }}>
+    <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
       <RoutingProvider value={basenamedRouting("/")}>{children}</RoutingProvider>
     </CapabilitiesProvider>
   </QueryClientProvider>
