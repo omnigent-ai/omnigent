@@ -7109,17 +7109,7 @@ describe("Composer — editing queued messages", () => {
 
 describe("Composer — editing a sent message", () => {
   const CONV = "conv_edit_sent";
-  const notesContent = [
-    { type: "input_file" as const, file_id: "file_notes", filename: "notes.txt" },
-    { type: "input_file" as const, file_id: "file_gone", filename: "chart.png" },
-    { type: "input_text" as const, text: "Summarize these" },
-  ];
-  const sentMessage = {
-    sessionId: CONV,
-    text: "Summarize these",
-    content: notesContent,
-  };
-  const fetchMock = vi.fn();
+  const sentMessage = { text: "Summarize these [Attached: src/app.ts]" };
   const toasts: unknown[] = [];
   const recordToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
 
@@ -7133,40 +7123,25 @@ describe("Composer — editing a sent message", () => {
       sessionStatus: "running",
       queuedMessages: [],
     });
-    fetchMock.mockReset();
-    fetchMock.mockImplementation(async (url: string) =>
-      url.endsWith("/files/file_notes/content")
-        ? new Response("meeting notes", { headers: { "Content-Type": "text/plain" } })
-        : new Response(JSON.stringify({ detail: "gone" }), { status: 404 }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
     toasts.length = 0;
     window.addEventListener("omnigent:toast", recordToast);
   });
 
   afterEach(() => {
     window.removeEventListener("omnigent:toast", recordToast);
-    vi.unstubAllGlobals();
     cleanup();
   });
 
-  it("loads the text, attachments, and @-mentions into an empty composer", async () => {
+  it("copies the text and @-tags into an empty composer and sends it as a new message", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     const props = composerProps({ isWorking: true });
     renderWithTooltips(<Composer {...props} ref={ref} />);
 
-    act(() =>
-      ref.current?.editSentMessage({
-        ...sentMessage,
-        text: "Summarize these [Attached: src/app.ts]",
-      }),
-    );
+    act(() => ref.current?.editSentMessage(sentMessage));
 
     // The sent marker comes back as the file's tag token.
-    await waitFor(() => expect(textarea()).toHaveValue("Summarize these @src/app.ts"));
+    expect(textarea()).toHaveValue("Summarize these @src/app.ts");
     expect(textarea()).toHaveFocus();
-    expect(screen.getByText("notes.txt")).toBeInTheDocument();
-    expect(toasts).toEqual(["Couldn't copy chart.png. Attach again before you send."]);
     expect(props.onStop).not.toHaveBeenCalled();
 
     fireEvent.change(textarea(), { target: { value: "Summarize these, briefly, @src/app.ts" } });
@@ -7177,60 +7152,25 @@ describe("Composer — editing a sent message", () => {
       string,
       File[] | undefined,
     ];
-    expect(sentText).toContain("Summarize these, briefly");
+    expect(sentText).toContain("Summarize these, briefly,");
     expect(sentText).toContain("src/app.ts");
-    expect(sentFiles?.map((file) => file.name)).toEqual(["notes.txt"]);
-    expect(await sentFiles?.[0]?.text()).toBe("meeting notes");
+    expect(sentFiles).toBeUndefined();
   });
 
-  it("keeps a file and a session with the same name as separate tags", async () => {
+  it("keeps a file and a session with the same name as separate tags", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     const props = composerProps();
     renderWithTooltips(<Composer {...props} ref={ref} />);
     const session = '[Session: "README.md" id=sess_readme subagent=no]';
     const sent = withSessionMentionHint(`compare [Attached: README.md] with ${session}`, true);
 
-    act(() => ref.current?.editSentMessage({ sessionId: CONV, text: sent, content: [] }));
+    act(() => ref.current?.editSentMessage({ text: sent }));
 
-    await waitFor(() =>
-      expect(textarea()).toHaveValue("compare @README.md (file) with @README.md"),
-    );
+    expect(textarea()).toHaveValue("compare @README.md (file) with @README.md");
     fireEvent.keyDown(textarea(), { key: "Enter" });
-
     const [sentText] = vi.mocked(props.onSend).mock.calls[0]! as [string];
     expect(sentText.match(/\[Attached(?: file)?: README\.md\]/g)).toHaveLength(1);
     expect(sentText.split(session)).toHaveLength(2);
-  });
-
-  it("drops a recovered attachment this server no longer accepts and says why", async () => {
-    fetchMock.mockImplementation(
-      async () => new Response("zip", { headers: { "Content-Type": "application/zip" } }),
-    );
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(
-      <CapabilitiesProvider
-        info={{
-          ...FALLBACK_SERVER_INFO,
-          filesystem_attachments: { extensions: [], all_types: false },
-        }}
-      >
-        <Composer {...composerProps()} ref={ref} />
-      </CapabilitiesProvider>,
-    );
-
-    act(() =>
-      ref.current?.editSentMessage({
-        ...sentMessage,
-        content: [
-          { type: "input_file", file_id: "file_zip", filename: "bundle.zip" },
-          { type: "input_text", text: "Summarize these" },
-        ],
-      }),
-    );
-
-    await waitFor(() => expect(textarea()).toHaveValue("Summarize these"));
-    expect(screen.queryByText("bundle.zip")).toBeNull();
-    expect(screen.getByText(/bundle\.zip.*can't be attached/)).toBeInTheDocument();
   });
 
   it("asks before replacing a draft, keeping it unless the user confirms", async () => {
@@ -7240,65 +7180,38 @@ describe("Composer — editing a sent message", () => {
 
     act(() => ref.current?.editSentMessage(sentMessage));
     const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
-    expect(fetchMock).not.toHaveBeenCalled();
     fireEvent.click(within(dialog).getByRole("button", { name: "Keep draft" }));
 
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(textarea()).toHaveValue("half-written thought");
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(toasts).toEqual([]);
 
     act(() => ref.current?.editSentMessage(sentMessage));
     fireEvent.click(
       within(await screen.findByRole("dialog")).getByRole("button", { name: "Replace draft" }),
     );
 
-    await waitFor(() => expect(textarea()).toHaveValue("Summarize these"));
-    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("Summarize these @src/app.ts");
     expect(textarea()).toHaveFocus();
-    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+    expect(toasts).toEqual([]);
   });
 
-  it("treats an attachment-only draft as a draft worth asking about", async () => {
+  it("treats an attachment-only draft as a draft, and replacing it drops the attachment", async () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
     const draftFile = new File(["draft"], "draft.txt", { type: "text/plain" });
     fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
       target: { files: [draftFile] },
     });
-    expect(screen.getByText("draft.txt")).toBeInTheDocument();
 
     act(() => ref.current?.editSentMessage(sentMessage));
     const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Keep draft" }));
-
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(screen.getByText("draft.txt")).toBeInTheDocument();
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("loads the text at once and adds attachments when they arrive", async () => {
-    let finishDownload: () => void = () => {};
-    fetchMock.mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          finishDownload = () => resolve(new Response("meeting notes"));
-        }),
-    );
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
-    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
-
-    act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
-    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
     fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
 
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(textarea()).toHaveValue("Summarize these");
-    expect(screen.queryByText("notes.txt")).toBeNull();
-    await act(async () => finishDownload());
-    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+    await waitFor(() => expect(textarea()).toHaveValue("Summarize these @src/app.ts"));
+    expect(screen.queryByText("draft.txt")).toBeNull();
   });
+
   it("dismisses a pending confirmation when the conversation changes", async () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
@@ -7312,136 +7225,6 @@ describe("Composer — editing a sent message", () => {
     await act(async () => {});
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(textarea()).toHaveValue("half-written thought");
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("keeps edits typed while the attachments download", async () => {
-    let finishDownload: () => void = () => {};
-    fetchMock.mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          finishDownload = () => resolve(new Response("meeting notes"));
-        }),
-    );
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
-
-    act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
-    expect(textarea()).toHaveValue("Summarize these");
-    fireEvent.change(textarea(), { target: { value: "Summarize these, briefly" } });
-    await act(async () => finishDownload());
-
-    expect(textarea()).toHaveValue("Summarize these, briefly");
-    expect(screen.getByText("notes.txt")).toBeInTheDocument();
-  });
-
-  it("drops attachments still loading when the edited draft is sent, and says so", async () => {
-    let finishDownload: () => void = () => {};
-    fetchMock.mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          finishDownload = () => resolve(new Response("meeting notes"));
-        }),
-    );
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    const props = composerProps();
-    renderWithTooltips(<Composer {...props} ref={ref} />);
-
-    act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-    fireEvent.change(textarea(), { target: { value: "a new thought" } });
-    await act(async () => finishDownload());
-
-    expect(props.onSend).toHaveBeenCalledWith("Summarize these", undefined);
-    expect(screen.queryByText("notes.txt")).toBeNull();
-    expect(toasts).toEqual([
-      "The edited message's attachments were still loading, so they weren't sent.",
-    ]);
-  });
-
-  it.each([
-    ["no text", ""],
-    ["only an upload marker", "[Attached: /tmp/uploads/notes.txt]"],
-  ])("loads an attachment-only message with %s", async (_label, text) => {
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
-    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
-
-    act(() =>
-      ref.current?.editSentMessage({ ...sentMessage, text, content: notesContent.slice(0, 1) }),
-    );
-    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
-
-    await waitFor(() => expect(screen.getByText("notes.txt")).toBeInTheDocument());
-    expect(textarea()).toHaveValue("");
-  });
-  it("drops a load that finishes after switching conversations", async () => {
-    let finishDownload: () => void = () => {};
-    fetchMock.mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          finishDownload = () => resolve(new Response("meeting notes"));
-        }),
-    );
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
-
-    act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
-    act(() => useChatStore.setState({ conversationId: "conv_other" }));
-    await act(async () => finishDownload());
-
-    expect(textarea()).toHaveValue("");
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(screen.queryByText("notes.txt")).toBeNull();
-  });
-
-  it("drops a load that finishes after the composer unmounts", async () => {
-    // A failed download would toast if the stale load still applied.
-    let finishDownload: () => void = () => {};
-    fetchMock.mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          finishDownload = () => resolve(new Response("gone", { status: 404 }));
-        }),
-    );
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    const { unmount } = renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
-    const editSentMessage = ref.current!.editSentMessage;
-
-    act(() => editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
-    unmount();
-    await act(async () => finishDownload());
-
-    expect(toasts).toEqual([]);
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
-
-  it("lets the newer Edit win when an older download finishes last", async () => {
-    const finishDownloads: (() => void)[] = [];
-    fetchMock.mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          finishDownloads.push(() => resolve(new Response("meeting notes")));
-        }),
-    );
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
-    const first = { ...sentMessage, text: "First message", content: notesContent.slice(0, 1) };
-    const second = { ...sentMessage, text: "Second message", content: notesContent.slice(0, 1) };
-
-    act(() => ref.current?.editSentMessage(first));
-    act(() => ref.current?.editSentMessage(second));
-    // The first message's text is now a draft, so the second asks first.
-    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
-    await act(async () => finishDownloads[1]!());
-    await waitFor(() => expect(textarea()).toHaveValue("Second message"));
-    await act(async () => finishDownloads[0]!());
-
-    expect(textarea()).toHaveValue("Second message");
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(screen.getAllByText("notes.txt")).toHaveLength(1);
   });
 
   it("says so when the composer stops taking input before Replace draft", async () => {
@@ -7460,20 +7243,17 @@ describe("Composer — editing a sent message", () => {
 
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(textarea()).toHaveValue("half-written thought");
-    expect(fetchMock).not.toHaveBeenCalled();
     expect(toasts).toEqual(["The composer can't take a message right now."]);
   });
 
-  it("ignores Edit while the composer is disabled", async () => {
+  it("ignores Edit while the composer is disabled", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...composerProps({ disabled: true })} ref={ref} />);
 
     act(() => ref.current?.editSentMessage(sentMessage));
 
-    await act(async () => {});
     expect(textarea()).toHaveValue("");
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(fetchMock).not.toHaveBeenCalled();
     expect(toasts).toEqual(["The composer can't take a message right now."]);
   });
 });

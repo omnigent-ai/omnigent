@@ -988,14 +988,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Badge OTHER contributors' messages only (never your own).
   const author = bubble.createdBy;
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
-  // Edit only messages you sent, shared session or not. Single-user messages
-  // carry no author. A pending message counts once the server has it, e.g. a
-  // mid-turn send the agent hasn't read yet.
+  // Edit copies the text of a message you sent, shared session or not; single-user
+  // messages carry no author. A pending message counts once the server has it.
   const canEdit =
     editSentMessage !== null &&
-    (!bubble.pending || (bubble.awaitingAgent === true && bubble.accepted === true)) &&
+    (!bubble.pending || bubble.accepted === true) &&
     (author === undefined || author === getCurrentUserId()) &&
-    Boolean(text || images.length || fileChips.length);
+    text.trim().length > 0;
 
   return (
     <Message
@@ -1209,9 +1208,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 className="[@media(pointer:coarse)]:size-8"
                 onClick={() =>
                   editSentMessage({
-                    sessionId,
                     text: isShellCommand ? text : userMessageBody(bubble.content),
-                    content: bubble.content,
                   })
                 }
                 componentId="chat.message.edit_user"

@@ -1,11 +1,10 @@
 """UI journeys: Edit on a sent message copies it into the composer.
 
-The bubble's Edit button hands its text and attachments to the composer of
-the same pane; the original bubble and history stay. Sending is an ordinary
-new message, sent mid-turn like any other while the agent works. Component
-tests cover the input matrix (draft confirmation, pending, other authors,
-read-only, failed downloads); these drive the real server, runner and file
-store through the browser.
+The bubble's Edit button copies its text (not its attachments) into the
+composer of the same pane; the original bubble and history stay. Sending is
+an ordinary new message, sent mid-turn like any other while the agent works.
+Component tests cover the input matrix (draft confirmation, pending, other
+authors, read-only); these drive the real server and runner through the browser.
 """
 
 from __future__ import annotations
@@ -69,13 +68,13 @@ def _pause(page: Page) -> None:
         page.wait_for_timeout(2500)
 
 
-def test_edit_sent_message_with_image_and_send_revision(
+def test_edit_sent_message_copies_text_and_sends_revision(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """Edit copies text and image into the composer; the revision sends as a new turn."""
+    """Edit copies the text, not the image; the revision sends as a new turn."""
     base_url, session_id = seeded_session
     original = "edit-e2e-a1 Summarize the trend in this chart"
     revised = "edit-e2e-a2 Summarize the trend in this chart in one sentence"
@@ -109,7 +108,8 @@ def test_edit_sent_message_with_image_and_send_revision(
     _click_edit(first)
     expect(composer).to_have_value(original)
     expect(composer).to_be_focused()
-    expect(remove_chip).to_be_visible(timeout=10_000)
+    # The agent already has the image from the original message.
+    expect(remove_chip).to_have_count(0)
     expect(page.locator(_USER)).to_have_count(1)
     _pause(page)
 
@@ -117,7 +117,8 @@ def test_edit_sent_message_with_image_and_send_revision(
     _pause(page)
     page.get_by_role("button", name="Send", exact=True).click()
     second = _user_bubble(page, revised)
-    expect(second.locator("img").first).to_be_visible(timeout=30_000)
+    expect(second).to_be_visible(timeout=30_000)
+    expect(second.locator("img")).to_have_count(0)
     expect(page.locator(_ASSISTANT, has_text="It climbs every month.")).to_be_visible(
         timeout=60_000
     )
@@ -125,8 +126,8 @@ def test_edit_sent_message_with_image_and_send_revision(
     # The original message is still in the transcript, unchanged.
     expect(page.locator(_USER)).to_have_count(2)
     expect(page.locator(_USER).first).to_contain_text(original)
+    expect(first.locator("img").first).to_be_visible()
     expect(composer).to_have_value("")
-    expect(remove_chip).to_have_count(0)
     _pause(page)
 
 

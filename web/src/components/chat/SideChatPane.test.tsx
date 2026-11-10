@@ -161,16 +161,15 @@ describe("editing a sent side-chat message", () => {
     });
   }
 
-  it("loads the message, its attachment, and its @-mention into this side chat's composer", async () => {
+  it("copies the message's text and @-mention into this side chat's composer", async () => {
     // The side-chat composer has no mention picker, so the mention returns as the
     // marker it was sent with.
     const withMention = "[Attached: src/app.ts]\n\nWhy did this build fail?";
     seedSentMessage(withMention);
-    const download = vi
-      .spyOn(filesApi, "downloadSessionFile")
-      .mockResolvedValue(new File(["error: boom"], "build.log", { type: "text/plain" }));
     useChatStore.setState({
-      sideChatComposers: { [childId]: { text: "", files: [], settings: { modelOverride: "m" } } },
+      sideChatComposers: {
+        [childId]: { text: "", files: [], settings: { modelOverride: "m" } },
+      },
     });
     renderPane(<SideChatPane childId={childId} />);
 
@@ -178,130 +177,43 @@ describe("editing a sent side-chat message", () => {
 
     const input = screen.getByTestId("side-chat-input");
     await waitFor(() => expect(input).toHaveValue(withMention));
-    expect(download).toHaveBeenCalledExactlyOnceWith(childId, "file_log", "build.log");
     const composer = useChatStore.getState().sideChatComposers[childId];
-    expect(composer?.files.map((file) => file.name)).toEqual(["build.log"]);
+    expect(composer?.files).toEqual([]);
     expect(composer?.settings).toEqual({ modelOverride: "m" });
     expect(input).toHaveFocus();
     // The sent message stays in the side chat's transcript.
     expect(screen.getByText("Why did this build fail?", { selector: "p, p *" })).toBeTruthy();
-    expect(send).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
     await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
-    const [sentText, , sentFiles] = send.mock.calls[0]!;
-    expect(sentText).toBe(withMention);
-    expect(sentFiles?.map((file) => file.name)).toEqual(["build.log"]);
+    expect(send.mock.calls[0]![0]).toBe(withMention);
   });
 
-  it("drops a recovered attachment this server no longer accepts and says why", async () => {
+  it("asks before replacing the side chat's draft", async () => {
     seedSentMessage();
-    vi.spyOn(filesApi, "downloadSessionFile").mockResolvedValue(
-      new File(["zip"], "bundle.zip", { type: "application/zip" }),
-    );
-    useChatStore.setState({ sideChatComposers: { [childId]: { text: "", files: [] } } });
-    renderPane(
-      <CapabilitiesProvider
-        info={{
-          ...FALLBACK_SERVER_INFO,
-          filesystem_attachments: { extensions: [], all_types: false },
-        }}
-      >
-        <SideChatPane childId={childId} />
-      </CapabilitiesProvider>,
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-
-    await waitFor(() =>
-      expect(screen.getByTestId("side-chat-input")).toHaveValue("Why did this build fail?"),
-    );
-    expect(useChatStore.getState().sideChatComposers[childId]?.files).toEqual([]);
-    expect(toast.error).toHaveBeenCalledExactlyOnceWith(
-      expect.stringMatching(/bundle\.zip.*can't be attached/),
-    );
-  });
-
-  it("asks before replacing the side chat's draft and downloads only after Replace", async () => {
-    seedSentMessage();
-    const download = vi.spyOn(filesApi, "downloadSessionFile").mockRejectedValue(new Error("gone"));
-    const toasts: unknown[] = [];
-    const recordToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
-    window.addEventListener("omnigent:toast", recordToast);
     const draft = { text: "", files: [], quotes: [{ id: "q", before: "", text: "quoted" }] };
     useChatStore.setState({ sideChatComposers: { [childId]: draft } });
     renderPane(<SideChatPane childId={childId} />);
 
-    try {
-      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-      fireEvent.click(
-        within(await screen.findByRole("dialog", { name: "Replace your draft?" })).getByRole(
-          "button",
-          { name: "Keep draft" },
-        ),
-      );
-      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-      expect(download).not.toHaveBeenCalled();
-      expect(useChatStore.getState().sideChatComposers[childId]?.quotes).toEqual(draft.quotes);
-
-      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-      const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
-      expect(download).not.toHaveBeenCalled();
-      fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
-
-      await waitFor(() =>
-        expect(screen.getByTestId("side-chat-input")).toHaveValue("Why did this build fail?"),
-      );
-      expect(download).toHaveBeenCalledOnce();
-      expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({
-        quotes: [],
-        files: [],
-      });
-      expect(toasts).toEqual(["Couldn't copy build.log. Attach again before you send."]);
-      await waitFor(() => expect(screen.getByTestId("side-chat-input")).toHaveFocus());
-    } finally {
-      window.removeEventListener("omnigent:toast", recordToast);
-    }
-  });
-
-  it("loads an attachment-only message into this side chat's composer", async () => {
-    seedSentMessage("");
-    vi.spyOn(filesApi, "downloadSessionFile").mockResolvedValue(
-      new File(["error: boom"], "build.log", { type: "text/plain" }),
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog", { name: "Replace your draft?" })).getByRole(
+        "button",
+        { name: "Keep draft" },
+      ),
     );
-    useChatStore.setState({ sideChatComposers: { [childId]: { text: "", files: [] } } });
-    renderPane(<SideChatPane childId={childId} />);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(useChatStore.getState().sideChatComposers[childId]?.quotes).toEqual(draft.quotes);
 
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
 
-    await waitFor(() =>
-      expect(
-        useChatStore.getState().sideChatComposers[childId]?.files.map((file) => file.name),
-      ).toEqual(["build.log"]),
-    );
-  });
-
-  it("drops attachments still loading once the edited draft is sent", async () => {
-    seedSentMessage();
-    let finishDownload: () => void = () => {};
-    vi.spyOn(filesApi, "downloadSessionFile").mockImplementation(
-      () =>
-        new Promise<File>((resolve) => {
-          finishDownload = () => resolve(new File(["error: boom"], "build.log"));
-        }),
-    );
-    useChatStore.setState({ sideChatComposers: { [childId]: { text: "", files: [] } } });
-    renderPane(<SideChatPane childId={childId} />);
-
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     await waitFor(() =>
       expect(screen.getByTestId("side-chat-input")).toHaveValue("Why did this build fail?"),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
-    await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
-    await act(async () => finishDownload());
-
-    expect(useChatStore.getState().sideChatComposers[childId]?.files ?? []).toEqual([]);
+    expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({ quotes: [] });
+    await waitFor(() => expect(screen.getByTestId("side-chat-input")).toHaveFocus());
   });
 
   it("is not offered in a read-only side chat", () => {

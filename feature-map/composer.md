@@ -237,17 +237,15 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   session. Up/Down at the text boundaries browse recalled messages; editing one
   returns to normal caret navigation. Whitespace and queued messages recalled
   for editing remain drafts.
-- `edit-sent-message`: Edit (pencil) on your own sent message copies its text,
-  attachments, and "@"-mentions into that pane's composer; the transcript is
-  unchanged. Sending is a new message, steered or queued like any mid-turn send,
-  and Edit never stops the agent. A non-empty draft asks "Replace your draft?"
-  first. The text loads at once and attachments join when they download, unless
-  the draft was emptied or sent meanwhile. Side chats,
-  grid session panes, and writable sub-agent Workspace tabs edit into their own
+- `edit-sent-message`: Edit (pencil) on your own sent message copies its text
+  and "@"-mentions into that pane's composer; attachments stay with the original
+  message, which the agent already has. The transcript is unchanged. Sending is a
+  new message, steered or queued like any mid-turn send, and Edit never stops the
+  agent. A non-empty draft asks "Replace your draft?" first. Side chats, grid
+  session panes, and writable sub-agent Workspace tabs edit into their own
   composer, where "@"-mentions return as attachment markers. Edit is hidden on
-  messages still being sent, other contributors' messages (shared session or not), and
-  read-only composers. An attachment that can't be recovered is skipped and
-  named in a toast; inline images from imported transcripts are recovered.
+  messages the server hasn't accepted yet, messages with no text, other
+  contributors' messages (shared session or not), and read-only composers.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
   untouched draft; user edits remain. The "Something went wrong" card from the
@@ -863,14 +861,12 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/pages/ChatPage.composer.test.tsx`. The new-session and side-chat
   composers have no prompt recall; the vendor terminal owns its own history.
 - **`edit-sent-message`:**
-  `tests/e2e_ui/chat/test_edit_sent_message.py` covers an image round trip,
-  editing mid-turn, and side chats. The replace-draft dialog, downloads that
-  finish late, pending messages, other authors, read-only composers, and failed
-  downloads have component coverage in
-  `web/src/pages/ChatPage.userBubble.test.tsx`,
-  `web/src/pages/ChatPage.composer.test.tsx`,
-  `web/src/components/chat/SideChatPane.test.tsx`, and
-  `web/src/lib/recoverMessageAttachments.test.ts`. Grid session panes and
+  `tests/e2e_ui/chat/test_edit_sent_message.py` covers editing a message with
+  an image (only its text is copied), editing mid-turn, and side chats. The
+  replace-draft dialog, pending messages, other authors, and read-only composers
+  have component coverage in `web/src/pages/ChatPage.userBubble.test.tsx`,
+  `web/src/pages/ChatPage.composer.test.tsx`, and
+  `web/src/components/chat/SideChatPane.test.tsx`. Grid session panes and
   sub-agent Workspace tabs render the same `SideChatPane`, whose Edit logic has
   component coverage; their own wiring is checked by hand: open
   a grid pane or a writable Workspace tab, click Edit on a message you sent

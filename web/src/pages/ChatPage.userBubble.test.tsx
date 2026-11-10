@@ -574,7 +574,7 @@ describe("UserBubble edit button", () => {
     return editMessage;
   }
 
-  it("hands the message's text, blocks, and @-mentions to the composer", () => {
+  it("hands only the message's text, mention markers included, to the composer", () => {
     const content: MessageContentBlock[] = [
       { type: "input_file", file_id: "file_1", filename: "notes.pdf" },
       { type: "input_text", text: "summarize this\n\n[Attached: src/app.ts]" },
@@ -585,19 +585,17 @@ describe("UserBubble edit button", () => {
 
     // The composer turns the sent mention markers back into tags.
     expect(editMessage).toHaveBeenCalledWith({
-      sessionId: null,
       text: "summarize this\n\n[Attached: src/app.ts]",
-      content,
     });
     // Editing copies the message; the bubble stays in the transcript.
     expect(screen.getByText(/summarize this/)).toBeInTheDocument();
   });
 
-  it("offers Edit on an attachments-only message", () => {
+  it("offers no Edit on an attachments-only message, which has no text to copy", () => {
     renderEditable(
       userBubble("", { content: [{ type: "input_image", file_id: "img_1", filename: "a.png" }] }),
     );
-    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
   });
 
   it("is absent without a composer to take the message", () => {
@@ -605,13 +603,13 @@ describe("UserBubble edit button", () => {
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
   });
 
-  const midTurnSend = (posted: boolean) =>
+  const pendingSend = (posted: boolean, sentMidTurn = true) =>
     buildPendingBubbles(
       [
         {
           tempId: "pend_mid",
           content: [{ type: "input_text", text: "hello" }],
-          sentMidTurn: true,
+          ...(sentMidTurn ? { sentMidTurn: true } : {}),
           ...(posted ? { posted: true } : {}),
         },
       ],
@@ -619,20 +617,25 @@ describe("UserBubble edit button", () => {
     )[0]!;
 
   it("is absent until the server accepts the message", () => {
-    renderEditable(userBubble("hello", { pending: true }));
+    renderEditable(pendingSend(false, false));
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
     cleanup();
     // Sent mid-turn, but the send request hasn't succeeded yet.
-    renderEditable(midTurnSend(false));
+    renderEditable(pendingSend(false));
     expect(screen.getByText("The agent will read this after its current step")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
   });
 
   it("offers Edit on a mid-turn message the agent hasn't read yet", () => {
-    const onEdit = renderEditable(midTurnSend(true));
+    const onEdit = renderEditable(pendingSend(true));
     expect(screen.getByText("The agent will read this after its current step")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-    expect(onEdit).toHaveBeenCalledWith(expect.objectContaining({ text: "hello" }));
+    expect(onEdit).toHaveBeenCalledWith({ text: "hello" });
+  });
+
+  it("offers Edit on an accepted send that started a turn", () => {
+    renderEditable(pendingSend(true, false));
+    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
   });
 
   describe("with a signed-in viewer", () => {
