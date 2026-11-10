@@ -21,7 +21,7 @@ def test_comment_anchor_upgrade_and_downgrade(tmp_path: Path) -> None:
     try:
         with engine.begin() as connection:
             config.attributes["connection"] = connection
-            command.upgrade(config, "c7cd88f24c1c")
+            command.upgrade(config, "1ad1db53f99d")
         comments = sa.Table("comments", sa.MetaData(), autoload_with=engine)
         legacy = {
             "workspace_id": 0,
@@ -91,7 +91,7 @@ def test_comment_anchor_upgrade_and_downgrade(tmp_path: Path) -> None:
 
         with engine.begin() as connection:
             config.attributes["connection"] = connection
-            command.downgrade(config, "c7cd88f24c1c")
+            command.downgrade(config, "1ad1db53f99d")
 
         assert "anchor_metadata" not in {
             column["name"] for column in sa.inspect(engine).get_columns("comments")

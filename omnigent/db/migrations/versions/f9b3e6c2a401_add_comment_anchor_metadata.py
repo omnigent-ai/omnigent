@@ -1,7 +1,7 @@
 """Persist provider-specific anchor metadata on session comments.
 
 Revision ID: f9b3e6c2a401
-Revises: c7cd88f24c1c
+Revises: 1ad1db53f99d
 """
 
 import sqlalchemy as sa
@@ -10,7 +10,7 @@ from alembic import op
 from omnigent.db.compression import CompressedText
 
 revision: str = "f9b3e6c2a401"
-down_revision: str | None = "c7cd88f24c1c"
+down_revision: str | None = "1ad1db53f99d"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 

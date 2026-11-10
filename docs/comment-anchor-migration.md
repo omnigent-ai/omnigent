@@ -1,6 +1,6 @@
 # Comment anchor schema rollout
 
-Revision `f9b3e6c2a401`, following `c7cd88f24c1c`, adds nullable
+Revision `f9b3e6c2a401`, following `1ad1db53f99d`, adds nullable
 `comments.anchor_metadata`. It stores compressed provider-specific coordinates
 with a database-enforced 16,383-byte stored limit. Existing rows remain NULL. There is no default,
 backfill, index, or application consumer in this change.
