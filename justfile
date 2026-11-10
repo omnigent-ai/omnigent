@@ -110,8 +110,9 @@ generate-theme-palettes: _ensure-web
 
 # --- Electron desktop app ---
 
+# Checks for vite too: the shell bundle build needs it.
 _ensure-electron:
-    cd web/electron && test -d node_modules || pnpm install
+    cd web/electron && test -d node_modules/vite || pnpm install
 
 [group('electron')]
 electron-dev: _ensure-web _ensure-electron

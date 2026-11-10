@@ -16,7 +16,9 @@
 
 const { spawn } = require("child_process");
 
-const cli = require("./omnigent_cli");
+const { withTestOverrides } = require("./testOverrides");
+
+const cli = withTestOverrides("omnigent_cli", require("./omnigent_cli"));
 
 /** Max seconds to wait for `host` to print its connected marker before giving up. */
 const CONNECT_TIMEOUT_MS = 30000;

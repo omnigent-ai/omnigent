@@ -28,3 +28,7 @@ ios/fastlane/test_output/
 android/build/
 android/app/build/
 android/.gradle/
+
+# Electron shell bundle (written by electron/scripts/build.mjs). Git-ignored via
+# electron/.gitignore, but Prettier doesn't read nested .gitignore files.
+electron/app/

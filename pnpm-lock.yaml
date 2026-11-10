@@ -518,6 +518,12 @@ importers:
       playwright:
         specifier: ^1.62.1
         version: 1.62.1
+      typescript:
+        specifier: ~6.0.2
+        version: 6.0.3
+      vite:
+        specifier: 8.1.6
+        version: 8.1.6(@types/node@24.19.1)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0)
 
 packages:
 

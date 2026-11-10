@@ -4,7 +4,7 @@
   "version": "0.21.0",
   "description": "Omnigent desktop shell (Electron edition) \u2014 a thin native wrapper around the server-served web UI.",
   "private": true,
-  "main": "src/main.js",
+  "main": "app/main.cjs",
   "homepage": "https://omnigent.ai",
   "repository": {
     "type": "git",
@@ -18,25 +18,29 @@
     "start": "electron .",
     "dev": "electron .",
     "test": "node --test",
+    "typecheck": "tsc -p tsconfig.json",
     "build": "electron-builder -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev",
     "build:mac": "electron-builder --mac -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev",
     "build:mac:release": "OMNIGENT_NOTARIZE_DMG=true electron-builder --mac -c.mac.notarize=true -c.dmg.sign=true",
     "build:linux": "electron-builder --linux -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev",
     "build:win": "electron-builder --win -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev",
+    "build:app": "node scripts/build.mjs",
     "build:overlay": "pnpm --filter web run build:overlay && pnpm --filter web run build:server-selector-v2",
-    "predev": "pnpm run build:overlay",
-    "prestart": "pnpm run build:overlay",
-    "prebuild": "pnpm run build:overlay",
-    "prebuild:mac": "pnpm run build:overlay",
-    "prebuild:mac:release": "pnpm run build:overlay",
-    "prebuild:linux": "pnpm run build:overlay",
-    "prebuild:win": "pnpm run build:overlay"
+    "predev": "pnpm run build:overlay && pnpm run build:app",
+    "prestart": "pnpm run build:overlay && pnpm run build:app",
+    "prebuild": "pnpm run build:overlay && pnpm run build:app",
+    "prebuild:mac": "pnpm run build:overlay && pnpm run build:app",
+    "prebuild:mac:release": "pnpm run build:overlay && pnpm run build:app",
+    "prebuild:linux": "pnpm run build:overlay && pnpm run build:app",
+    "prebuild:win": "pnpm run build:overlay && pnpm run build:app"
   },
   "devDependencies": {
     "electron": "^45.2.1",
     "electron-builder": "^26.0.0",
     "jsdom": "^29.1.1",
-    "playwright": "^1.62.1"
+    "playwright": "^1.62.1",
+    "typescript": "~6.0.2",
+    "vite": "catalog:"
   },
   "build": {
     "appId": "ai.omnigent.desktop",
@@ -61,7 +65,8 @@
     "afterPack": "build/afterPack.js",
     "afterAllArtifactBuild": "build/afterAllArtifactBuild.js",
     "files": [
-      "src/**/*",
+      "app/**/*",
+      "src/url.js",
       "about/**/*",
       "browser-permission/**/*",
       "workspace-picker/**/*",

@@ -376,7 +376,9 @@ one `web` bundle works both in a browser and under Electron.
 ```
 electron/
   package.json             # Electron + electron-builder deps and build config
+  scripts/build.mjs        # bundles main + preloads into the generated app/
   src/main.js              # main process: window, settings, menu, IPC, badge, notify
+  src/paths.js             # page, preload and icon locations
   src/preload.js           # contextBridge: window.omnigentDesktop + omnigentSetup
   src/about_window.js      # shell-owned About modal + guarded update IPC
   src/about_preload.js     # narrow contextBridge for the About modal
@@ -890,8 +892,15 @@ From the `web/electron/` directory:
 
 ```bash
 pnpm install     # installs electron + electron-builder
-pnpm start        # launches the Electron shell
+pnpm start        # bundles src/ into app/, then launches the Electron shell
 ```
+
+Electron runs the bundle, not `src/`: `scripts/build.mjs` (`pnpm run build:app`)
+uses Vite to write the main process to `app/main.cjs` and each preload to its own
+`app/<name>.js`. `pnpm start` and `pnpm dev` run it first. To rebuild on change,
+keep `pnpm run build:app --watch` running in a second terminal; reload a window
+to pick up preload changes and restart the app for main-process changes.
+`pnpm run typecheck` runs the TypeScript check (`tsconfig.json`).
 
 The shell opens on the bundled setup page. Point it at a running Omnigent
 server (see below), Connect, and you're in.
@@ -924,9 +933,9 @@ OMNIGENT_DESKTOP_VERSION_OVERRIDE=0.9.0 pnpm start
 The override controls both the **Current version** shown in update prompts and
 the baseline `electron-updater` uses to decide whether a production release is
 newer. It does not change Electron's real app/package version. Packaged builds
-ignore it. `pnpm start` rebuilds the shell-owned update overlay before launching
-it. Unpackaged runs read `dev-app-update.yml`, which intentionally checks the
-same production HTTPS update server as packaged builds.
+ignore it. `pnpm start` rebuilds the shell-owned update overlay and the `app/`
+bundle before launching it. Unpackaged runs read `dev-app-update.yml`, which
+intentionally checks the same production HTTPS update server as packaged builds.
 
 ## Build a distributable
 
@@ -939,6 +948,10 @@ pnpm run build:mac:release # .dmg + .zip; app and DMG signed + notarized (see be
 pnpm run build:linux       # AppImage + .deb
 pnpm run build:win         # NSIS installer
 ```
+
+Each build script first runs `build:overlay` and `build:app`, then
+electron-builder packages `app/` (with source maps), the page directories and
+icons.
 
 Local packages use the `ai.omnigent.desktop-dev` app ID and the **Omnigent Dev**
 name; output lands in `electron/dist-dev/` (the DMG is named

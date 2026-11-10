@@ -12,3 +12,7 @@ overlay/
 # Built server selector v2 page (produced by web's build:server-selector-v2,
 # shipped into the app by electron-builder). Generated, not committed.
 server-selector-v2/
+
+# Bundled main process and preloads (produced by scripts/build.mjs, shipped
+# into the app by electron-builder). Generated, not committed.
+app/
