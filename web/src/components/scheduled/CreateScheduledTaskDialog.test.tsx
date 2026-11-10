@@ -38,6 +38,7 @@ import type { AutomationSourceSession } from "@/lib/automationFromSession";
 import { MemoryRouter } from "react-router-dom";
 import {
   emptyTriggerFields,
+  isTaskSessionTriggerPrompt,
   readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
@@ -3122,6 +3123,24 @@ describe("automation trigger type", () => {
     },
   );
 
+  it("keeps the task session choice when switching integrations", async () => {
+    render(dialog());
+    const toggle = () => screen.getByRole("switch", { name: "Start a new session for each match" });
+    await choose("Jira");
+    fireEvent.click(toggle());
+    await choose("Slack");
+    expect(toggle()).not.toBeChecked();
+    await choose("Schedule");
+    expect(screen.queryByTestId("task-trigger-session-mode-field")).not.toBeInTheDocument();
+    await choose("Slack");
+    expect(toggle()).not.toBeChecked();
+    type("task-trigger-scope", "support");
+    type("task-trigger-instructions", "Answer the question.");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(isTaskSessionTriggerPrompt(mutateAsync.mock.calls[0][0].prompt)).toBe(true);
+  });
+
   // This full draft round-trip needs extra time with coverage on shared CI runners.
   it("restores schedule and source drafts without carrying conditions between integrations", async () => {
     async function chooseTimezone(zone: string) {
@@ -3365,6 +3384,37 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     await submittedPrompt();
     expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
+  });
+
+  it("starts a session per match unless Advanced sends every match to one task session", async () => {
+    renderTrigger("jira");
+    fillJira();
+    const toggle = screen.getByRole("switch", { name: "Start a new session for each match" });
+    expect(toggle).toBeChecked();
+    expect(screen.getByLabelText("Instructions for each session")).toHaveValue("Triage it.");
+    expect(screen.getByTestId("task-trigger-preview")).not.toHaveTextContent("task session");
+    expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent(
+      "Matching items start sessions automatically.",
+    );
+
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(screen.getByTestId("task-trigger-session-mode-field")).toHaveTextContent(
+      "Every match goes to one task session, started on the first match, so it keeps its context across matches.",
+    );
+    expect(screen.getByLabelText("Instructions for the task session")).toHaveValue("Triage it.");
+    expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent("One task session");
+    expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent(
+      "Matching items go to the task session automatically.",
+    );
+    type("task-name-input", "Ticket triage");
+
+    const prompt = await submittedPrompt();
+    expect(isTaskSessionTriggerPrompt(prompt)).toBe(true);
+    expect(prompt).toContain('title "Ticket triage"');
+    expect(prompt).toContain("Instructions for the task session:\nTriage it.\n");
+    // The polling session still continues; only matches share one task session.
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ sessionMode: "continue" });
   });
 
   it("replaces the prompt with a trigger builder, runs hourly and keeps one session", async () => {
@@ -3867,69 +3917,98 @@ describe("CreateScheduledTaskDialog trigger template", () => {
 });
 
 describe("editing template prompts", () => {
-  const original = renderTriggerPrompt(
-    "jira",
-    { ...emptyTriggerFields("jira"), scope: "ENG", instructions: "Triage the ticket." },
-    { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
-  );
+  function templatePrompt(taskSessionMode: "new" | "continue" = "new") {
+    return renderTriggerPrompt(
+      "jira",
+      { ...emptyTriggerFields("jira"), scope: "ENG", instructions: "Triage the ticket." },
+      {
+        placement: "same_host",
+        sessionLink: "https://example.test/c/CONVERSATION_ID",
+        taskSessionMode,
+        taskSessionTitle: "Ticket triage",
+      },
+    );
+  }
+  const original = templatePrompt();
 
-  it("saves worker harness, model, and effort without rebinding the polling session", async () => {
-    const task = scheduledTask({ prompt: original, sessionMode: "continue", sessionId: "poller" });
-    const props = { onOpenChange: vi.fn(), editingTask: task };
-    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />, {
-      expandAdvanced: false,
-    });
-    const select = async (id: string, name: string) => {
-      fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name }));
-    };
-    expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Polly");
-    expect(screen.getByTestId("task-worker-agent-trigger")).toBeVisible();
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
-    await select("task-worker-agent-trigger", "Claude Code");
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-    await select("task-model-trigger", "Opus");
-    await select("task-effort-trigger", "High");
-    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    const input = updateMutateAsync.mock.calls[0][0].input;
-    expect(readTriggerWorkerSettings(input.prompt)).toEqual({
-      agentId: "ag_claude_native",
-      model: "opus",
-      effort: "high",
-    });
-    for (const key of [
-      "agentId",
-      "modelOverride",
-      "reasoningEffort",
-      "sessionId",
-      "permissionMode",
-    ])
-      expect(input).not.toHaveProperty(key);
-    expect(splitTriggerPrompt(input.prompt).userPrompt).toBe("Triage the ticket.");
-    rerender(<CreateScheduledTaskDialog open={false} {...props} />);
-    rerender(
-      <CreateScheduledTaskDialog open {...props} editingTask={{ ...task, prompt: input.prompt }} />,
-    );
-    expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Claude Code");
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
-    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
-    await select("task-worker-agent-trigger", "Polly");
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(2));
-    expect(readTriggerWorkerSettings(updateMutateAsync.mock.calls[1][0].input.prompt)).toEqual({
-      agentId: "ag_1",
-      model: "",
-      effort: "",
-    });
-  });
+  it.each(["new", "continue"] as const)(
+    "saves worker harness, model, and effort in %s mode without rebinding the polling session",
+    async (taskSessionMode) => {
+      const saved = templatePrompt(taskSessionMode);
+      const task = scheduledTask({
+        prompt: saved,
+        sessionMode: "continue",
+        sessionId: "poller",
+      });
+      const props = { onOpenChange: vi.fn(), editingTask: task };
+      const { rerender } = render(<CreateScheduledTaskDialog open {...props} />, {
+        expandAdvanced: false,
+      });
+      const select = async (id: string, name: string) => {
+        fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name }));
+      };
+      expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Polly");
+      expect(screen.getByTestId("task-worker-agent-trigger")).toBeVisible();
+      expect(screen.queryByTestId("task-trigger-session-mode-field")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+      expect(screen.getByTestId("task-worker-settings")).toHaveTextContent(
+        taskSessionMode === "continue"
+          ? "Applies to the next task session. The current task session and the polling session keep their settings"
+          : "Applies to new sessions started for matching items.",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+      expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+      await select("task-worker-agent-trigger", "Claude Code");
+      expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+      await select("task-model-trigger", "Opus");
+      await select("task-effort-trigger", "High");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(readTriggerWorkerSettings(input.prompt)).toEqual({
+        agentId: "ag_claude_native",
+        model: "opus",
+        effort: "high",
+      });
+      for (const key of [
+        "agentId",
+        "modelOverride",
+        "reasoningEffort",
+        "sessionId",
+        "permissionMode",
+      ])
+        expect(input).not.toHaveProperty(key);
+      expect(splitTriggerPrompt(input.prompt).userPrompt).toBe("Triage the ticket.");
+      expect(isTaskSessionTriggerPrompt(input.prompt)).toBe(taskSessionMode === "continue");
+      rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+      rerender(
+        <CreateScheduledTaskDialog
+          open
+          {...props}
+          editingTask={{ ...task, prompt: input.prompt }}
+        />,
+      );
+      expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Claude Code");
+      expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
+      expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
+      await select("task-worker-agent-trigger", "Polly");
+      expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(2));
+      expect(readTriggerWorkerSettings(updateMutateAsync.mock.calls[1][0].input.prompt)).toEqual({
+        agentId: "ag_1",
+        model: "",
+        effort: "",
+      });
+    },
+  );
 
   it.each(["Your prompt", "System prompt"])(
     "keeps polling settings unchanged while clearing and restoring %s",
