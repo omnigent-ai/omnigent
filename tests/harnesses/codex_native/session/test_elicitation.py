@@ -1399,6 +1399,14 @@ _QUOTED_ASYNC_QUESTION_REPLY = (
             _TUI_ASYNC_QUESTION_REPLY.replace("request_user_input_async", "request_user_input"),
             _TUI_ASYNC_QUESTION_REPLY.replace("request_user_input_async", "request_user_input"),
         ),
+        (
+            _TUI_ASYNC_QUESTION_REPLY.replace("call-async-1", "call-unknown"),
+            _TUI_ASYNC_QUESTION_REPLY.replace("call-async-1", "call-unknown"),
+        ),
+        (
+            _TUI_ASYNC_QUESTION_REPLY.replace('0]"}]', '0]"},{"answer":"Ship it"}]'),
+            _TUI_ASYNC_QUESTION_REPLY.replace('0]"}]', '0]"},{"answer":"Ship it"}]'),
+        ),
     ],
     ids=[
         "one_answer",
@@ -1409,16 +1417,21 @@ _QUOTED_ASYNC_QUESTION_REPLY = (
         "plain",
         "quoted_example",
         "foreign_item_id",
+        "unknown_question",
+        "entry_without_question",
     ],
 )
 def test_async_question_reply_display_text_shows_only_answers(text: str, expected: str) -> None:
     """
-    A tagged async question reply is shown as its answers; other text is unchanged.
+    A tagged reply to an asked async question is shown as its answers; other text is unchanged.
 
     :param text: Codex ``userMessage`` text.
     :param expected: Text the transcript shows.
     """
-    assert codex_native_forwarder._async_question_reply_display_text(text) == expected
+    assert (
+        codex_native_forwarder._async_question_reply_display_text(text, {"call-async-1"})
+        == expected
+    )
 
 
 @pytest.mark.parametrize(

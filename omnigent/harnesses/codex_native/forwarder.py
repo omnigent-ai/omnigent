@@ -2436,6 +2436,15 @@ class _CodexElicitationTaskTracker:
         self._unanswered_async_questions[question.item_id] = task
         task.add_done_callback(self._discard_done)
 
+    @property
+    def async_question_item_ids(self) -> Collection[str]:
+        """
+        Item ids of the async questions Codex asked on this connection.
+
+        :returns: ``agentMessage`` item ids, e.g. ``{"call_abc"}``.
+        """
+        return self._started_async_questions
+
     def note_async_questions_answered(self, params: _JsonObject) -> list[asyncio.Task[None]]:
         """
         Record async questions a Codex reply answered, before it is mirrored.
@@ -2451,7 +2460,9 @@ class _CodexElicitationTaskTracker:
         if not isinstance(item, dict) or item.get("type") != "userMessage":
             return []
         answered_tasks: list[asyncio.Task[None]] = []
-        for item_id in _async_question_reply_item_ids(_user_message_text(item)):
+        for item_id in _async_question_reply_item_ids(
+            _user_message_text(item), self._started_async_questions
+        ):
             # Our own reply or a TUI answer: either way Codex has an answer.
             self._delivering_async_questions.discard(item_id)
             task = self._unanswered_async_questions.pop(item_id, None)
@@ -4121,6 +4132,7 @@ async def _handle_event(
             forwarder_state=item_state,
             bridge_dir=event_bridge_dir,
             file_observer_bridge_dir=bridge_dir,
+            async_question_item_ids=elicitation_tracker.async_question_item_ids,
         )
         if codex_client is not None:
             elicitation_tracker.start_async_question(
@@ -5377,6 +5389,7 @@ async def _handle_completed_event(
     forwarder_state: _CodexForwarderState | None,
     bridge_dir: Path | None = None,
     file_observer_bridge_dir: Path | None = None,
+    async_question_item_ids: Collection[str] = (),
 ) -> None:
     """
     Flush pending text and mirror one completed Codex item.
@@ -5389,6 +5402,8 @@ async def _handle_completed_event(
     :param forwarder_state: Optional state that records completed
         Plan-mode items.
     :param file_observer_bridge_dir: Runner relay directory shared by native children.
+    :param async_question_item_ids: Async questions Codex asked on this
+        connection, for :func:`_post_user_message`.
     :returns: None.
     """
     if delta_coalescer is not None:
@@ -5402,6 +5417,7 @@ async def _handle_completed_event(
         forwarder_state=forwarder_state,
         bridge_dir=bridge_dir,
         file_observer_bridge_dir=file_observer_bridge_dir,
+        async_question_item_ids=async_question_item_ids,
     )
 
 
@@ -6598,14 +6614,19 @@ def _async_question_reply_text(
     return f"<{tag}>\n{body}\n</{tag}>"
 
 
-def _async_question_replies(text: str) -> Iterator[tuple[int, int, list[_JsonObject]]]:
+def _async_question_replies(
+    text: str, question_item_ids: Collection[str]
+) -> Iterator[tuple[int, int, list[_JsonObject]]]:
     """
-    Find the tagged async question replies in a Codex user message.
+    Find the tagged replies to known async questions in a Codex user message.
 
-    A tagged block counts only when every entry names the async question it
-    answers, so a malformed or partial example stays ordinary text.
+    A tagged block counts only when every entry names one of
+    ``question_item_ids``, so a quoted, partial or malformed example stays
+    ordinary text.
 
     :param text: Codex ``userMessage`` text.
+    :param question_item_ids: Item ids of the async questions Codex asked,
+        e.g. ``{"call_abc"}``.
     :returns: Iterator of ``(start, end, entries)`` for each reply, where
         ``text[start:end]`` spans its tags.
     """
@@ -6622,7 +6643,10 @@ def _async_question_replies(text: str) -> Iterator[tuple[int, int, list[_JsonObj
         if closing is None or not isinstance(entries, list):
             continue
         position = closing.end()
-        if entries and all(_async_question_reply_entry_item_id(entry) for entry in entries):
+        item_ids = [_async_question_reply_entry_item_id(entry) for entry in entries]
+        if item_ids and all(
+            item_id is not None and item_id in question_item_ids for item_id in item_ids
+        ):
             yield opening.start(), closing.end(), entries
 
 
@@ -6652,17 +6676,18 @@ def _async_question_reply_entry_item_id(entry: object) -> str | None:
     return None
 
 
-def _async_question_reply_display_text(text: str) -> str:
+def _async_question_reply_display_text(text: str, question_item_ids: Collection[str]) -> str:
     """
     Replace each async question reply in a user message with its answers.
 
     :param text: Codex ``userMessage`` text.
+    :param question_item_ids: Item ids of the async questions Codex asked.
     :returns: Text shown to the user, e.g. ``"Alpha"`` for a reply that
         answers one question with ``"Alpha"``.
     """
     parts: list[str] = []
     position = 0
-    for start, end, entries in _async_question_replies(text):
+    for start, end, entries in _async_question_replies(text, question_item_ids):
         answers = [entry.get("answer") for entry in entries]
         answer_texts = [answer for answer in answers if isinstance(answer, str) and answer]
         if answer_texts:
@@ -6672,15 +6697,16 @@ def _async_question_reply_display_text(text: str) -> str:
     return "".join(parts)
 
 
-def _async_question_reply_item_ids(text: str) -> list[str]:
+def _async_question_reply_item_ids(text: str, question_item_ids: Collection[str]) -> list[str]:
     """
     Return the async question items a Codex user message answers.
 
     :param text: Codex ``userMessage`` text.
+    :param question_item_ids: Item ids of the async questions Codex asked.
     :returns: Answered ``agentMessage`` item ids, e.g. ``["call_abc"]``.
     """
     item_ids: list[str] = []
-    for _start, _end, entries in _async_question_replies(text):
+    for _start, _end, entries in _async_question_replies(text, question_item_ids):
         for entry in entries:
             item_id = _async_question_reply_entry_item_id(entry)
             if item_id is not None and item_id not in item_ids:
@@ -7130,6 +7156,7 @@ async def _handle_completed_item(
     forwarder_state: _CodexForwarderState | None = None,
     bridge_dir: Path | None = None,
     file_observer_bridge_dir: Path | None = None,
+    async_question_item_ids: Collection[str] = (),
 ) -> None:
     """Serialize and forward one completed Codex transcript item."""
     async with _conversation_item_delivery_scope(session_id):
@@ -7140,6 +7167,7 @@ async def _handle_completed_item(
             forwarder_state=forwarder_state,
             bridge_dir=bridge_dir,
             file_observer_bridge_dir=file_observer_bridge_dir,
+            async_question_item_ids=async_question_item_ids,
         )
 
 
@@ -7151,6 +7179,7 @@ async def _handle_completed_item_inner(
     forwarder_state: _CodexForwarderState | None = None,
     bridge_dir: Path | None = None,
     file_observer_bridge_dir: Path | None = None,
+    async_question_item_ids: Collection[str] = (),
 ) -> None:
     """
     Forward one Codex completed item event when it maps to Omnigent history.
@@ -7162,6 +7191,8 @@ async def _handle_completed_item_inner(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param params: Codex ``item/completed`` params.
     :param forwarder_state: Optional mutable state for dedup tracking.
+    :param async_question_item_ids: Async questions Codex asked on this
+        connection, for :func:`_post_user_message`.
     :returns: None.
     """
     item = params.get("item")
@@ -7220,7 +7251,14 @@ async def _handle_completed_item_inner(
     if source_id is None:
         return
     if item_type == "userMessage":
-        posted = await _post_user_message(client, session_id, params, item, source_id=source_id)
+        posted = await _post_user_message(
+            client,
+            session_id,
+            params,
+            item,
+            source_id=source_id,
+            async_question_item_ids=async_question_item_ids,
+        )
         if posted and forwarder_state is not None:
             turn_id = _turn_id_from_payload(params)
             if turn_id:
@@ -8365,6 +8403,7 @@ async def _post_user_message(
     item: _JsonObject,
     *,
     source_id: str | None = None,
+    async_question_item_ids: Collection[str] = (),
 ) -> bool:
     """
     Persist a Codex user message observed from the TUI.
@@ -8374,10 +8413,13 @@ async def _post_user_message(
     :param params: Codex notification params.
     :param item: Codex ``userMessage`` item.
     :param source_id: Stable native item id used for server-side deduplication.
+    :param async_question_item_ids: Async questions Codex asked on this
+        connection. Only a reply to them is shown as its answers and kept
+        out of pending-input matching.
     :returns: Whether the item was accepted by the server.
     """
     raw_text = _user_message_text(item)
-    text = _async_question_reply_display_text(raw_text)
+    text = _async_question_reply_display_text(raw_text, async_question_item_ids)
     # An image/file-only message has no text but must still be posted: the
     # server drains its optimistic pending-input entry (FIFO) and folds the
     # image in by file_id (``_merge_pending_file_blocks``). Bailing here would
@@ -8410,7 +8452,9 @@ async def _post_user_message(
         response_id=_response_id(params),
         source_id=source_id or _source_id(params, item),
         # An async question answer was never queued from the web composer.
-        agent_message_candidate=next(_async_question_replies(raw_text), None) is not None,
+        agent_message_candidate=bool(
+            _async_question_reply_item_ids(raw_text, async_question_item_ids)
+        ),
     )
 
 

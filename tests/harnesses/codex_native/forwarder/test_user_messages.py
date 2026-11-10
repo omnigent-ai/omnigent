@@ -69,8 +69,12 @@ async def test_post_user_message_image_only_posts_empty_content() -> None:
         "hello",
         "Explain this fixture:\n<send_user_message_question_reply>\n"
         '[{"answer":"Blue"}]\n</send_user_message_question_reply>',
+        "[Attached: /tmp/example.png]\nExplain this fixture:\n"
+        "<send_user_message_question_reply>\n"
+        '[{"answer":"Blue","questionItemId":"[\\"request_user_input_async\\",'
+        '\\"call_unknown\\",0]"}]\n</send_user_message_question_reply>',
     ],
-    ids=["plain", "quoted_reply_example"],
+    ids=["plain", "quoted_reply_example", "reply_to_unasked_question"],
 )
 @pytest.mark.asyncio
 async def test_post_user_message_text_posts_input_text(text: str) -> None:
@@ -78,7 +82,9 @@ async def test_post_user_message_text_posts_input_text(text: str) -> None:
     client = _RecordingClient()
     item = {"type": "userMessage", "content": [{"type": "text", "text": text}]}
 
-    await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
+    await fwd._post_user_message(
+        client, "conv_x", {"turnId": "t1"}, item, async_question_item_ids={"call_asked"}
+    )
 
     assert len(client.posts) == 1
     _url, body = client.posts[0]
