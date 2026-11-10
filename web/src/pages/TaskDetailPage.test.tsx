@@ -105,11 +105,19 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
   CreateScheduledTaskDialog: ({
     open,
     editingTask,
+    sessionLink,
   }: {
     open: boolean;
     editingTask?: ScheduledTask | null;
+    sessionLink?: string;
   }) =>
-    open ? <div data-testid="edit-dialog-open" data-editing-id={editingTask?.id ?? ""} /> : null,
+    open ? (
+      <div
+        data-testid="edit-dialog-open"
+        data-editing-id={editingTask?.id ?? ""}
+        data-session-link={sessionLink ?? ""}
+      />
+    ) : null,
 }));
 
 function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
@@ -822,6 +830,11 @@ describe("header actions", () => {
     expect(screen.queryByTestId("edit-dialog-open")).toBeNull();
     fireEvent.click(screen.getByTestId("task-detail-edit"));
     expect(screen.getByTestId("edit-dialog-open")).toHaveAttribute("data-editing-id", "st_1");
+    // A trigger edit can render a new source's template, whose workers post this link.
+    expect(screen.getByTestId("edit-dialog-open")).toHaveAttribute(
+      "data-session-link",
+      `${window.location.origin}/c/CONVERSATION_ID`,
+    );
   });
 });
 

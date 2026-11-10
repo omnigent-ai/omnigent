@@ -24,6 +24,7 @@ import {
   TRIGGER_SCOPE_OPERATOR_LABELS,
   TRIGGER_TEMPLATES,
   triggerConditionFields,
+  triggerConditionFilledIn,
   triggerEvent,
   triggerEventDescription,
   triggerOperatorLabel,
@@ -39,6 +40,7 @@ import {
   type TriggerOperator,
   type TriggerScopeOperator,
   type TriggerSource,
+  type TriggerTaskSessionMode,
 } from "@/components/scheduled/triggerTemplates";
 import { cn } from "@/lib/utils";
 
@@ -53,10 +55,13 @@ export function TriggerTemplateFields({
   onEditAsPrompt,
   onSelectOpenChange,
   toolsProvided = false,
+  taskSessionMode = "new",
 }: {
   source: TriggerSource;
   fields: TriggerFields;
   onChange: (next: TriggerFields) => void;
+  /** "continue" sends every match to one task session, which these instructions then direct. */
+  taskSessionMode?: TriggerTaskSessionMode;
   /** The prompt the task will save; "" until the required fields are filled. */
   renderedPrompt: string;
   /** Leave the template and edit the rendered prompt as a plain prompt. */
@@ -274,6 +279,16 @@ export function TriggerTemplateFields({
                     ))}
                   </SelectContent>
                 </Select>
+                {field.namePlaceholder !== undefined && (
+                  <Input
+                    value={condition.name ?? ""}
+                    placeholder={field.namePlaceholder}
+                    aria-label={`${field.label} name`}
+                    data-testid={`task-trigger-condition-${index}-name`}
+                    className={cn(CHIP, "w-36 placeholder:text-primary/50")}
+                    onChange={(e) => setCondition(index, { ...condition, name: e.target.value })}
+                  />
+                )}
                 {field.operators.length > 1 ? (
                   <Select
                     value={condition.operator}
@@ -364,9 +379,7 @@ export function TriggerTemplateFields({
             </Button>
           </div>
         </div>
-        {fields.conditions.some(
-          (c) => !VALUELESS_OPERATORS.has(c.operator) && c.value.trim() === "",
-        ) && (
+        {!fields.conditions.every(triggerConditionFilledIn) && (
           <p className="text-sm text-muted-foreground" data-testid="task-trigger-empty-condition">
             Fill in or remove each condition.
           </p>
@@ -389,7 +402,11 @@ export function TriggerTemplateFields({
 
       <div className="flex flex-col gap-1.5">
         <div className="flex items-center gap-1.5">
-          <Label htmlFor="task-trigger-instructions">Instructions for each session</Label>
+          <Label htmlFor="task-trigger-instructions">
+            {taskSessionMode === "continue"
+              ? "Instructions for the task session"
+              : "Instructions for each session"}
+          </Label>
           {!toolsProvided && (
             <TooltipProvider>
               <Tooltip open={warningsOpen} onOpenChange={setWarningsOpen}>
@@ -429,7 +446,11 @@ export function TriggerTemplateFields({
         {instructionsTooLong && (
           <p className="text-sm text-destructive" role="alert" data-testid="task-trigger-too-long">
             Keep instructions to {MAX_INSTRUCTIONS_CHARS.toLocaleString("en-US")} characters or
-            fewer so each session&apos;s first message has room for the item.
+            fewer so each{" "}
+            {taskSessionMode === "continue"
+              ? "message to the task session"
+              : "session's first message"}{" "}
+            has room for the item.
           </p>
         )}
         <p className="text-sm text-muted-foreground" data-testid="task-trigger-attribution-note">

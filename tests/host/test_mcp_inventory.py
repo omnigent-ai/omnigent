@@ -27,6 +27,7 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
     monkeypatch.setattr(mcp_inventory, "_warned_auth_status", None)
     # A real managed config or status-file override on the dev machine must not leak in.
     monkeypatch.setattr(mcp_inventory, "_managed_mcp_paths", tuple)
@@ -102,6 +103,21 @@ def test_reads_each_harness_and_drops_secrets(home: Path) -> None:
         '[mcp_servers.omnigent]\ncommand = "python"\n'
     )
     _write_json(home / ".cursor" / "mcp.json", {"mcpServers": {"slack": _stdio()}})
+    _write_json(
+        home / ".pi" / "agent" / "mcp.json",
+        {
+            "mcpServers": {
+                "jira": _stdio(),
+                "wiki": {
+                    "url": f"https://wiki.example.com/mcp?key={_SECRET}",
+                    "headers": {"Authorization": f"Bearer {_SECRET}"},
+                },
+                # Pi reads a transport-less entry as an override of a server defined elsewhere.
+                "github": {"exposure": "lazy"},
+                "omnigent": _stdio(),
+            }
+        },
+    )
 
     servers = discover_mcp_servers()
 
@@ -140,6 +156,14 @@ def test_reads_each_harness_and_drops_secrets(home: Path) -> None:
             "url_host": "docs.example.com",
         },
         {"name": "slack", "harness": "cursor", "transport": "stdio", "scope": "user"},
+        {"name": "jira", "harness": "pi", "transport": "stdio", "scope": "user"},
+        {
+            "name": "wiki",
+            "harness": "pi",
+            "transport": "http",
+            "scope": "user",
+            "url_host": "wiki.example.com",
+        },
     ]
     assert _SECRET not in json.dumps(servers)
     assert "/usr/bin/tool" not in json.dumps(servers)
@@ -164,6 +188,17 @@ def test_honors_claude_and_codex_config_homes(
     ]
 
 
+def test_honors_pi_coding_agent_dir(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pi_dir = tmp_path / "pi-agent"
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(pi_dir))
+    _write_json(home / ".pi" / "agent" / "mcp.json", {"mcpServers": {"wrong-dir": _stdio()}})
+    _write_json(pi_dir / "mcp.json", {"mcpServers": {"right-dir": _stdio()}})
+
+    assert [(s["harness"], s["name"]) for s in discover_mcp_servers()] == [("pi", "right-dir")]
+
+
 def test_missing_and_malformed_configs_do_not_fail(
     home: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -173,6 +208,8 @@ def test_missing_and_malformed_configs_do_not_fail(
     (home / ".claude.json").write_text("{not json")
     (home / ".codex").mkdir()
     (home / ".codex" / "config.toml").write_text("[mcp_servers\n")
+    (home / ".pi" / "agent").mkdir(parents=True)
+    (home / ".pi" / "agent" / "mcp.json").write_text("{not json")
     _write_json(
         home / ".cursor" / "mcp.json",
         {"mcpServers": {"ok": {"command": "x"}, "junk": "not a table", "bare": {}}},
@@ -181,7 +218,7 @@ def test_missing_and_malformed_configs_do_not_fail(
     assert discover_mcp_servers() == [
         {"name": "ok", "harness": "cursor", "transport": "stdio", "scope": "user"}
     ]
-    assert {"claude", "codex"} <= {
+    assert {"claude", "codex", "pi"} <= {
         word for record in caplog.records for word in record.getMessage().split()
     }
 

@@ -28,6 +28,9 @@ implements them separately, so a fix for one harness does not reach the others.
   saved selections on edit. Project-settings pickers are unchanged.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
+- `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
+  Pi gateway executor) also get the MCP servers configured for Claude Code, Codex
+  and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it. With `OMNIGENT_SESSION_ENV_PASSTHROUGH=NAME,...`
   the named shell variables reach only the new runner that command launches; a
@@ -116,11 +119,15 @@ implements them separately, so a fix for one harness does not reach the others.
   turn and reconnect must not leave a stale idle or working state. The sidebar
   status follows these rules:
   - Claude: the status Claude Code reports for itself (OSC 7501) decides
-    working, idle and waiting for input, with three exceptions. A background
+    working, idle and waiting for input, with four exceptions. A background
     shell still running after its turn keeps the session working until it
-    exits. A prompt that a turn waits on in Claude's terminal, with no card in
-    Chat, shows "Needs response" and its tooltip names the prompt. A sign-in block
-    after a failed turn shows the turn as failed, not working.
+    exits. A background agent still running after its turn reports `waiting`:
+    the sidebar keeps the session working, Chat says "Background agent running"
+    with the agent's description instead of "Working…", a follow-up is sent at
+    once rather than queued, and a headless `-p` run keeps waiting until the
+    agent finishes. A prompt that a turn waits on in Claude's terminal, with no
+    card in Chat, shows "Needs response" and its tooltip names the prompt. A
+    sign-in block after a failed turn shows the turn as failed, not working.
   - Codex: an active goal keeps the session working between turns, and a
     background terminal keeps it working after its turn until it exits. A goal
     stopped by its usage or budget limit fails the session, and so does a
@@ -1084,6 +1091,14 @@ Cross-harness journeys:
   A 501 shows an update hint; inject a 404 from the tools route to retain plain
   rows without expansion. Confirm no raw config, schemas or synthetic secrets
   appear in responses/logs and no probe processes survive cancellation/timeout.
+- **`pi-host-mcp`:** run `tests/inner/test_pi_mcp.py` and, with Pi 0.99 or newer
+  on `PATH` or in `OMNIGENT_PI_PATH`, `tests/e2e/test_pi_native_host_mcp_e2e.py`
+  (it skips on older Pi). Manually, add a server to `~/.claude.json` only, start
+  `omnigent pi` with an Omnigent provider, and run `/mcp`: the server is listed
+  and connected. A same-name entry in `~/.pi/agent/mcp.json` replaces it, and
+  `{"name": {"enabled": false}}` there turns it off. `~/.pi/agent` stays unchanged.
+  A server whose env or headers use `${VAR}` connects only when the runner gets
+  that variable, for example through `OMNIGENT_RUNNER_ENV_PASSTHROUGH=VAR`.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
