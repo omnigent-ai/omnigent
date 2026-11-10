@@ -828,12 +828,88 @@ def create_scheduled_tasks_router(
                 f"cannot continue this session: {problem[0]}", code=ErrorCode.INVALID_INPUT
             )
 
+    async def _existing_source_copy(copy_id: str) -> tuple[Conversation, str]:
+        """An automation's own session copy and its last finished reply, to copy again."""
+        from omnigent.server.scheduled.source_session import last_finished_response_id
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, copy_id)
+        if conv is None or conv.agent_id is None:
+            raise OmnigentError(
+                "The session this automation starts from no longer exists",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        up_to = await asyncio.to_thread(
+            last_finished_response_id, conversation_store, conv.id, running=False
+        )
+        if up_to is None:
+            raise OmnigentError(
+                "The session this automation starts from has no finished reply",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return conv, up_to
+
     @router.post("/scheduled-tasks")
     async def create_scheduled_task(
         request: Request,
         body: CreateScheduledTaskRequest,
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
+        return await _create_task(request, body)
+
+    @router.post("/scheduled-tasks/{scheduled_task_id}/duplicate")
+    async def duplicate_scheduled_task(
+        request: Request,
+        scheduled_task_id: str,
+    ) -> dict[str, Any]:
+        """Create a paused copy of one of the caller's scheduled tasks.
+
+        The copy keeps the original's settings but not its run history. A
+        continue-mode copy starts its own session on its first run, and a task
+        started from a session gets its own copy of that session.
+        """
+        owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        original = _require_owned(scheduled_task_id, owner_id)
+        source = None
+        if original.source_session_id is not None:
+            source = await _existing_source_copy(original.source_session_id)
+        project_id = original.project_id
+        if project_id is not None and (
+            project_store is None
+            or await asyncio.to_thread(
+                project_store.get, project_id, user_id=_project_owner(owner)
+            )
+            is None
+        ):
+            # Runs of a task whose project was deleted already file nowhere.
+            project_id = None
+        body = CreateScheduledTaskRequest(
+            name=f"{original.name} (copy)",
+            prompt=original.prompt,
+            rrule=original.rrule,
+            agent_id=original.agent_id,
+            timezone=original.timezone,
+            model_override=original.model_override,
+            reasoning_effort=original.reasoning_effort,
+            permission_mode=original.permission_mode,
+            max_cost_usd=original.max_cost_usd,
+            session_mode="continue" if original.session_mode == "continue" else "new",
+            workspace=original.workspace,
+            base_branch=original.base_branch,
+            host_id=original.host_id,
+            execution_target=original.execution_target,
+            project_id=project_id,
+        )
+        return await _create_task(request, body, state="paused", copy_source=source)
+
+    async def _create_task(
+        request: Request,
+        body: CreateScheduledTaskRequest,
+        *,
+        state: Literal["active", "paused"] = "active",
+        copy_source: tuple[Conversation, str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a task from *body*; *copy_source* is an automation's session copy to copy."""
         owner = _owner(request)
         require_scheduled_task_agent_origin(
             request,
@@ -892,8 +968,11 @@ def create_scheduled_tasks_router(
             if host_id is None and body.execution_target != "managed_sandbox":
                 host_id = picked.host_id
         else:
-            if body.source_session_id is not None:
+            if copy_source is not None:
+                source, source_up_to = copy_source
+            elif body.source_session_id is not None:
                 source, source_up_to = await _require_source_session(body.source_session_id, owner)
+            if source is not None:
                 # Runs rebuild the copied history in the task's agent, so it must carry one,
                 # and open the files it refers to.
                 await _source_history_carry(agent)
@@ -935,6 +1014,7 @@ def create_scheduled_tasks_router(
                 host_id=host_id,
                 project_id=project_id,
                 execution_target=body.execution_target,
+                state=state,
             )
         except Exception as exc:
             if source_copy is not None:
@@ -960,8 +1040,10 @@ def create_scheduled_tasks_router(
             template=request.headers.get("x-omnigent-automation-template"),
         )
         scheduler = _scheduler(request)
-        if scheduler is not None and not getattr(
-            request.app.state, "scheduled_task_dispatch_enabled", False
+        if (
+            task.state == "active"
+            and scheduler is not None
+            and not getattr(request.app.state, "scheduled_task_dispatch_enabled", False)
         ):
             scheduler.add(task)
         # A freshly created task has no runs (last_run_status is None); its

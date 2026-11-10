@@ -16743,6 +16743,51 @@
         ]
       }
     },
+    "/v1/scheduled-tasks/{scheduled_task_id}/duplicate": {
+      "post": {
+        "description": "Create a paused copy of one of the caller's scheduled tasks.\n\nThe copy keeps the original's settings but not its run history. A\ncontinue-mode copy starts its own session on its first run, and a task\nstarted from a session gets its own copy of that session.",
+        "operationId": "duplicate_scheduled_task_v1_scheduled_tasks__scheduled_task_id__duplicate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Duplicate Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Duplicate Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Duplicate Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
     "/v1/scheduled-tasks/{scheduled_task_id}/run": {
       "post": {
         "description": "Trigger an immediate fire of one of the caller's scheduled tasks.\n\nA manual override that reuses the SHARED scheduled-fire path (the same\n`on_fire` machinery \u2014 session create, owner grant, runner launch,\nprompt dispatch, run recording). Legacy timers fire through\n`app.state.scheduled_task_run_now` and share its process-local overlap\nguard. With `automations_v2`, the request is recorded as a pending run\nthat the host's owning replica claims and starts like any occurrence, so\nRun now gets the same lease, recovery, and host routing. Each request is\nits own run; it may overlap a scheduled one.\n\nPaused tasks ARE runnable here \u2014 run-now is an explicit manual override,\nso it does not require the `active` state the scheduler enforces.\n\nFire-and-forget: like the scheduler, the session create + launch runs in\nthe background, so this returns `202 Accepted` with the task id rather\nthan the finished run. The new run row appears in the task's `/runs`\nhistory and in the LIST endpoint's `last_run_status`. Legacy timers\nreturn `409` when a fire for this task is already in flight. Both return\n`503` when the scheduler subsystem is not running.\nThe database scheduler also returns `run_id` to identify the queued run.",

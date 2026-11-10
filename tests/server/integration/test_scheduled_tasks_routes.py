@@ -3906,3 +3906,80 @@ async def test_concurrent_schedule_edits_reject_stale_validation(
     )
     assert retry.status_code == 400, retry.text
     assert "Minimum interval is 60 minutes" in retry.text
+
+
+# ── POST /v1/scheduled-tasks/{id}/duplicate ──────────────────────────────────
+
+
+async def test_duplicate_creates_a_paused_copy(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    _make_user(db_uri, "bob@example.com")
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(session_mode="continue", reasoning_effort="high"),
+            headers=_headers(),
+        )
+    ).json()
+    scheduler = auth_app.state.scheduled_task_scheduler
+    jobs_before = scheduler.job_count
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/duplicate", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    copy = resp.json()
+    assert copy["id"] != original["id"]
+    assert copy["name"] == "nightly triage (copy)"
+    assert copy["state"] == "paused"
+    assert copy["next_run_at"] is None
+    assert copy["session_id"] is None
+    for field in (
+        "prompt",
+        "rrule",
+        "agent_id",
+        "timezone",
+        "reasoning_effort",
+        "session_mode",
+        "workspace",
+        "host_id",
+        "execution_target",
+    ):
+        assert copy[field] == original[field], field
+    # A paused copy is not armed.
+    assert scheduler.job_count == jobs_before
+    other = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/duplicate", headers=_headers("bob@example.com")
+    )
+    assert other.status_code == 404
+
+
+async def test_duplicate_gives_the_copy_its_own_source_session(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=_session_with_history(db_uri)),
+            headers=_headers(),
+        )
+    ).json()
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/duplicate", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    copy = resp.json()
+    copied_source = copy["source_session_id"]
+    assert copied_source not in (None, original["source_session_id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert (
+        store.get_conversation(copied_source).labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] == copy["id"]
+    )
+    assert _item_texts(db_uri, copied_source) == _item_texts(db_uri, original["source_session_id"])

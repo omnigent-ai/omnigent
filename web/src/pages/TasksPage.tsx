@@ -29,6 +29,7 @@ import { useNavigate, useRebasePath, useSearchParams } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import {
   useDeleteScheduledTask,
+  useDuplicateScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTasks,
   useUpdateScheduledTask,
@@ -61,6 +62,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
   const runNowMutation = useRunScheduledTaskNow();
+  const duplicateMutation = useDuplicateScheduledTask();
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<FilterTab>("all");
@@ -165,7 +167,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }, [tasks, search, filter]);
 
   // A per-task busy flag so a row's menu disables while its own mutation runs.
-  // Covers pause/resume (update), delete, and run-now so the ⋯ menu can't be
+  // Covers pause/resume (update), delete, run-now, and duplicate so the ⋯ menu can't be
   // re-triggered mid-flight for the task whose mutation is pending.
   const busyId =
     updateMutation.isPending && updateMutation.variables
@@ -174,7 +176,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         ? (deleteMutation.variables as string | undefined)
         : runNowMutation.isPending
           ? (runNowMutation.variables as string | undefined)
-          : undefined;
+          : duplicateMutation.isPending
+            ? (duplicateMutation.variables as string | undefined)
+            : undefined;
 
   function handlePauseToggle(task: ScheduledTask) {
     updateMutation.mutate({
@@ -200,6 +204,22 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         } else {
           showToast("Couldn't start the run");
         }
+      },
+    });
+  }
+
+  function handleDuplicate(task: ScheduledTask) {
+    duplicateMutation.mutate(task.id, {
+      onSuccess: (copy) => {
+        // Clear filters so the paused copy is visible in the list.
+        setFilter("all");
+        setSearch("");
+        showToast(`Created "${copy.name}". It's paused until you resume it.`);
+      },
+      onError: (err) => {
+        showToast(
+          err instanceof Error ? `Couldn't duplicate: ${err.message}` : "Couldn't duplicate",
+        );
       },
     });
   }
@@ -383,6 +403,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   now={now}
                   busy={busyId === task.id}
                   onEdit={handleEdit}
+                  onDuplicate={handleDuplicate}
                   onPauseToggle={handlePauseToggle}
                   onRunNow={handleRunNow}
                   onDelete={handleDelete}

@@ -457,6 +457,18 @@ export async function updateScheduledTask(
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
 }
 
+/**
+ * Copy a task into a new PAUSED task named "<name> (copy)", keeping its
+ * settings but not its runs or continued session. Paused so the copy can't
+ * fire alongside the original before the user reviews it.
+ */
+export async function duplicateScheduledTask(id: string): Promise<ScheduledTask> {
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/duplicate`, {
+    method: "POST",
+  });
+  return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+}
+
 /** Delete a task so it no longer fires. */
 export async function deleteScheduledTask(id: string): Promise<void> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {

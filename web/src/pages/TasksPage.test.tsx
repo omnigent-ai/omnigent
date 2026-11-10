@@ -23,6 +23,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
+  useDuplicateScheduledTask: vi.fn(),
 }));
 
 // Stub the create dialog — its internals are covered separately; here we only
@@ -109,6 +110,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
 const mutate = vi.fn();
 const deleteMutate = vi.fn();
 const runNowMutate = vi.fn();
+const duplicateMutate = vi.fn();
 
 function setTasks(
   tasks: ScheduledTask[] | undefined,
@@ -131,6 +133,7 @@ beforeEach(() => {
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
+  duplicateMutate.mockReset();
   vi.mocked(showToast).mockReset();
   vi.mocked(hooks.useUpdateScheduledTask).mockReturnValue({
     mutate,
@@ -147,6 +150,11 @@ beforeEach(() => {
     isPending: false,
     variables: undefined,
   } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
+  vi.mocked(hooks.useDuplicateScheduledTask).mockReturnValue({
+    mutate: duplicateMutate,
+    isPending: false,
+    variables: undefined,
+  } as unknown as ReturnType<typeof hooks.useDuplicateScheduledTask>);
 });
 
 afterEach(() => {
@@ -692,6 +700,16 @@ describe("row actions", () => {
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     fireEvent.click(screen.getByTestId("task-delete"));
     expect(deleteMutate).toHaveBeenCalledWith("st_1");
+  });
+
+  it("duplicates a task via the row menu and confirms the paused copy", () => {
+    setTasks([task({ id: "st_1" })]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("task-duplicate"));
+    expect(duplicateMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
+    duplicateMutate.mock.calls[0][1].onSuccess(task({ id: "st_2", name: "copy name" }));
+    expect(showToast).toHaveBeenCalledWith(expect.stringContaining("copy name"));
   });
 });
 
