@@ -2434,30 +2434,48 @@ class _CodexElicitationTaskTracker:
         self._unanswered_async_questions[question.item_id] = task
         task.add_done_callback(self._discard_done)
 
+    def note_async_questions_answered(self, params: _JsonObject) -> list[asyncio.Task[None]]:
+        """
+        Record async questions a Codex reply answered, before it is mirrored.
+
+        Ends any web answer delivery for them at once, so a slow transcript
+        post cannot let a retry send a second answer.
+
+        :param params: Codex ``item/completed`` params for a ``userMessage``.
+        :returns: Hook tasks of the still-open cards the reply answered, for
+            :meth:`resolve_async_questions_answered_natively`.
+        """
+        item = params.get("item")
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            return []
+        answered_tasks: list[asyncio.Task[None]] = []
+        for item_id in _async_question_reply_item_ids(_user_message_text(item)):
+            # Our own reply or a TUI answer: either way Codex has an answer.
+            self._delivering_async_questions.discard(item_id)
+            task = self._unanswered_async_questions.pop(item_id, None)
+            if task is not None:
+                answered_tasks.append(task)
+        return answered_tasks
+
     async def resolve_async_questions_answered_natively(
         self,
         client: httpx.AsyncClient,
         *,
         session_id: str,
-        params: _JsonObject,
+        answered_tasks: list[asyncio.Task[None]],
     ) -> None:
         """
         Close async question cards that a native Codex reply already answered.
 
         :param client: HTTP client for Omnigent event posts.
         :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-        :param params: Codex ``item/completed`` params for a ``userMessage``.
+        :param answered_tasks: Hook tasks from
+            :meth:`note_async_questions_answered`.
         :returns: None.
         """
-        item = params.get("item")
-        if not isinstance(item, dict) or item.get("type") != "userMessage":
-            return
-        for item_id in _async_question_reply_item_ids(_user_message_text(item)):
-            # Our own reply or a TUI answer: either way Codex has an answer.
-            self._delivering_async_questions.discard(item_id)
-            task = self._unanswered_async_questions.pop(item_id, None)
-            pending = self._pending.get(task) if task is not None else None
-            if task is None or pending is None:
+        for task in answered_tasks:
+            pending = self._pending.get(task)
+            if pending is None:
                 continue
             await self._post_resolved_once(client, session_id, pending)
             task.cancel()
@@ -4058,6 +4076,11 @@ async def _handle_event(
             in {_CODEX_COLLAB_AGENT_ITEM_TYPE, _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE}
             else event_state
         )
+        answered_tasks = (
+            elicitation_tracker.note_async_questions_answered(params)
+            if codex_client is not None
+            else []
+        )
         await _handle_completed_event(
             client,
             session_id=route_session_id,
@@ -4078,7 +4101,7 @@ async def _handle_event(
             await elicitation_tracker.resolve_async_questions_answered_natively(
                 client,
                 session_id=route_session_id,
-                params=params,
+                answered_tasks=answered_tasks,
             )
 
 

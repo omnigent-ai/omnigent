@@ -1434,13 +1434,19 @@ def test_forwarder_retries_undelivered_codex_async_question_answer(
 
 
 @pytest.mark.parametrize(
-    ("echoed_reply", "send_error", "echoing_send"),
+    ("echoed_reply", "send_error", "echoing_send", "mirror_stalls"),
     [
-        (_TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"), ConnectionResetError, 1),
-        (_TUI_ASYNC_QUESTION_REPLY, TimeoutError, 1),
-        (_TUI_ASYNC_QUESTION_REPLY, ConnectionResetError, 4),
+        (_TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"), ConnectionResetError, 1, False),
+        (_TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"), ConnectionResetError, 1, True),
+        (_TUI_ASYNC_QUESTION_REPLY, TimeoutError, 1, False),
+        (_TUI_ASYNC_QUESTION_REPLY, ConnectionResetError, 4, False),
     ],
-    ids=["refused_tui_answer", "unacknowledged_own_reply", "final_attempt_own_reply"],
+    ids=[
+        "refused_tui_answer",
+        "refused_tui_answer_slow_mirror",
+        "unacknowledged_own_reply",
+        "final_attempt_own_reply",
+    ],
 )
 def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
     tmp_path: Path,
@@ -1448,6 +1454,7 @@ def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
     echoed_reply: str,
     send_error: type[Exception],
     echoing_send: int,
+    mirror_stalls: bool,
 ) -> None:
     """
     An answer Codex echoes during a failed send ends the retries.
@@ -1460,6 +1467,8 @@ def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
     :param send_error: Failure from every send; ``TimeoutError`` is how an
         unacknowledged send ends.
     :param echoing_send: Send, counting from 1, during which Codex echoes.
+    :param mirror_stalls: Whether posting the echo to the transcript stalls
+        until delivery has ended.
     """
     monkeypatch.setattr(
         codex_native_forwarder, "_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S", (0.0, 0.0, 0.0)
@@ -1485,6 +1494,26 @@ def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
         raise send_error("app-server send failed")
 
     fake_client.request = fake_request  # type: ignore[method-assign]
+    mirror_started = asyncio.Event()
+    mirror_released = asyncio.Event()
+    post_user_message = codex_native_forwarder._post_user_message
+
+    async def stalled_post_user_message(*args: Any, **kwargs: Any) -> bool:
+        """
+        Hold the echo's transcript post until delivery has ended.
+
+        :param args: Positional arguments for ``_post_user_message``.
+        :param kwargs: Keyword arguments for ``_post_user_message``.
+        :returns: Whether the server accepted the message.
+        """
+        mirror_started.set()
+        await mirror_released.wait()
+        return await post_user_message(*args, **kwargs)
+
+    if mirror_stalls:
+        monkeypatch.setattr(
+            codex_native_forwarder, "_post_user_message", stalled_post_user_message
+        )
 
     async def echo_answer(client: httpx.AsyncClient, context: dict[str, Any]) -> None:
         """
@@ -1495,12 +1524,20 @@ def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
         :returns: None.
         """
         await asyncio.wait_for(echoing_send_started.wait(), timeout=30.0)
-        await codex_native_forwarder._handle_event(
-            client,
-            **context,
-            event=_tui_reply_event(echoed_reply),
-            codex_client=fake_client,  # type: ignore[arg-type]
+        echo = asyncio.create_task(
+            codex_native_forwarder._handle_event(
+                client,
+                **context,
+                event=_tui_reply_event(echoed_reply),
+                codex_client=fake_client,  # type: ignore[arg-type]
+            )
         )
+        if mirror_stalls:
+            await asyncio.wait_for(mirror_started.wait(), timeout=30.0)
+            reply_echoed.set()
+            await asyncio.wait_for(context["elicitation_tracker"].drain(), timeout=30.0)
+            mirror_released.set()
+        await echo
         reply_echoed.set()
 
     hook_bodies, posted_events = _answer_async_question(
