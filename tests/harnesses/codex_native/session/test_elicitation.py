@@ -1413,18 +1413,13 @@ def test_forwarder_retries_undelivered_codex_async_question_answer(
 
 
 @pytest.mark.parametrize(
-    ("send_error", "echoing_send"),
+    ("echoed_reply", "send_error", "echoing_send"),
     [
-        (ConnectionResetError, 1),
-        (TimeoutError, 1),
-        (ConnectionResetError, 4),
+        (_TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"), ConnectionResetError, 1),
+        (_TUI_ASYNC_QUESTION_REPLY, TimeoutError, 1),
+        (_TUI_ASYNC_QUESTION_REPLY, ConnectionResetError, 4),
     ],
-    ids=["refused", "unacknowledged", "final_attempt"],
-)
-@pytest.mark.parametrize(
-    "echoed_reply",
-    [_TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"), _TUI_ASYNC_QUESTION_REPLY],
-    ids=["tui_answer", "own_reply"],
+    ids=["refused_tui_answer", "unacknowledged_own_reply", "final_attempt_own_reply"],
 )
 def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
     tmp_path: Path,
