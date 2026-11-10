@@ -104,7 +104,20 @@ describe("session drafts", () => {
     vi.resetModules();
     const reloaded = await import("./sessionDrafts");
     expect(reloaded.getSessionDraft("conversation")?.reviewComments).toEqual([comment]);
-    reloaded.clearSessionDrafts();
+    const mentions = {
+      files: [{ path: "file.ts", isDir: false, token: "@file.ts" }],
+      sessions: [],
+    };
+    reloaded.setSessionDraft("conversation", { text: "Check @file.ts", files: [], mentions });
+    vi.resetModules();
+    const withMentions = await import("./sessionDrafts");
+    expect(withMentions.getSessionDraft("conversation")).toEqual({
+      text: "Check @file.ts",
+      files: [],
+      mentions,
+      reviewComments: [comment],
+    });
+    withMentions.clearSessionDrafts();
     expect(sessionStorage.getItem(key)).toBeNull();
   });
 

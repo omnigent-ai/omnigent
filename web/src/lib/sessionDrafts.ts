@@ -11,7 +11,8 @@ export interface SessionDraft extends ComposerDraft {
   reviewComments?: Comment[];
 }
 
-type StoredDraft = string | (ComposerDraft & { mentions?: TaggedMentions; reviewComments?: Comment[] });
+type StoredDraft =
+  string | (ComposerDraft & { mentions?: TaggedMentions; reviewComments?: Comment[] });
 
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
 const listeners = new Set<() => void>();

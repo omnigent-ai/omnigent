@@ -517,7 +517,7 @@ export function PullRequestChangesTab({
     if (selected) markCommentsSeen(localComments.map((comment) => comment.id));
   }, [selected, localComments]);
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
-  const { revealedPaths, reveal, clearReveal, find, setPathFilter, setHideViewed } = view;
+  const { revealedPaths, reveal, clearReveal, find, setPathFilter, setHideViewed, setMode } = view;
   const navigationTarget = useLocalReviewNavigation(conversationId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const commentHighlight = useRef<Animation | null>(null);
@@ -538,6 +538,10 @@ export function PullRequestChangesTab({
       navigationTarget.anchor_metadata?.pr_url !== selectedPrUrl
     )
       return;
+    if (view.mode !== "changes") {
+      setMode("changes");
+      return;
+    }
     if (!localComments.some((comment) => comment.id === navigationTarget.id)) {
       toast.error("This review comment is no longer available.");
       consumeLocalReviewNavigation(conversationId);
@@ -586,6 +590,8 @@ export function PullRequestChangesTab({
     selectedPrUrl,
     setHideViewed,
     setPathFilter,
+    setMode,
+    view.mode,
     localComments,
     sessionComments.isSuccess,
     sessionComments.isFetching,
@@ -631,7 +637,6 @@ export function PullRequestChangesTab({
   const nextCommit =
     commitIndex >= 0 && commitIndex < commitList.length - 1 ? commitList[commitIndex + 1] : null;
   // The open commit left the loaded list (the head moved), so there is nothing to step from.
-  const { setMode } = view;
   useEffect(() => {
     if (commitView && commits.data && commitIndex < 0) setMode("commits");
   }, [commitView, commits.data, commitIndex, setMode]);

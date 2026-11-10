@@ -3297,7 +3297,8 @@ function ComposerImpl(
     draft.quotes.length === 0 && findMentionTokens(draft.text, mentionTokens).length > 0;
   const mirrorActive = composerIsCommand || mentionTokensShown;
   useComposerMirrorAlignment(backdropRef, tailTextareaRef, mirrorActive);
-  const hasDraft = fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
+  const hasDraft =
+    fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
   const showInterruptButton =
     isWorking &&
     (!hasDraft ||
@@ -4062,7 +4063,8 @@ function ComposerImpl(
       draft.quotes.length === 0 &&
       (skill !== null || isSlashCommandText(trimmed)) &&
       files.length === 0 &&
-      !hasMentions && localReviewComments.length === 0
+      !hasMentions &&
+      localReviewComments.length === 0
     ) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
@@ -4146,7 +4148,8 @@ function ComposerImpl(
     // the harness's "[Attached: <path>]" wording (the vendor reads the on-disk
     // path; no upload), sessions as "[Session: …]". A tagged session also adds
     // one tool hint at the end.
-    const reviewPreamble = localReviewComments.length > 0 ? `${formatLocalReviewComments(localReviewComments)}\n\n` : "";
+    const reviewPreamble =
+      localReviewComments.length > 0 ? `${formatLocalReviewComments(localReviewComments)}\n\n` : "";
     const tagsSessions = liveMentions.some((m) => m.marker.startsWith("[Session: "));
     const expand = (text: string) => expandMentionTokens(text, liveMentions);
     // Sending while a prior response is streaming is fine — the
@@ -4160,7 +4163,10 @@ function ComposerImpl(
       const outgoing = {
         ...draft,
         text: withSessionMentionHint(expand(draft.text), tagsSessions),
-        quotes: draft.quotes.map((quote, index) => ({ ...quote, before: (index === 0 ? reviewPreamble : "") + expand(quote.before) })),
+        quotes: draft.quotes.map((quote, index) => ({
+          ...quote,
+          before: (index === 0 ? reviewPreamble : "") + expand(quote.before),
+        })),
       };
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
@@ -4210,7 +4216,8 @@ function ComposerImpl(
   };
 
   // An empty composer with no attachments or @-mentions; ↑ recalls from the queue here.
-  const composerEmptyForRecall = fullText === "" && files.length === 0 && !hasMentions && localReviewComments.length === 0;
+  const composerEmptyForRecall =
+    fullText === "" && files.length === 0 && !hasMentions && localReviewComments.length === 0;
   // The queued row ↑ recalls: the queue tail, only while the composer takes input and
   // is empty and quote-free.
   const arrowUpRecallQueueId =
