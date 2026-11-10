@@ -92,14 +92,17 @@ let startupData = STARTUP;
 let startupError: ApiError | null = null;
 const startupCalls = vi.fn();
 const accountRefreshCalls = vi.fn();
+const hostsCalls = vi.fn();
 let hosts: Host[] = [];
+let hostsPending = false;
 vi.mock("@/hooks/useHosts", async (importActual) => ({
   ...(await importActual()),
-  useHosts: () => {
+  useHosts: (options?: unknown) => {
+    hostsCalls(options);
     return useQuery({
-      queryKey: ["hosts", { includeSandbox: false }],
-      queryFn: async () => hosts,
-      initialData: hosts,
+      queryKey: hostsPending ? ["hosts", "pending"] : ["hosts", { includeSandbox: false }],
+      queryFn: () => (hostsPending ? new Promise<Host[]>(() => {}) : Promise.resolve(hosts)),
+      initialData: hostsPending ? undefined : hosts,
     });
   },
   useHarnessStartup: (hostId: string, harness: string) => {
@@ -267,6 +270,8 @@ afterEach(() => {
   fixDialogProps.mockReset();
   startupCalls.mockClear();
   accountRefreshCalls.mockClear();
+  hostsCalls.mockClear();
+  hostsPending = false;
   startupData = STARTUP;
   startupError = null;
 });
@@ -290,6 +295,37 @@ describe("Harnesses grid", () => {
     expect(startupCalls).toHaveBeenCalledWith("host & two", "claude-native");
     fireEvent.click(screen.getByRole("link", { name: /Harnesses/ }));
     expect(screen.getByRole("button", { name: "session-host" })).toBeInTheDocument();
+  });
+
+  it("asks for a session's linked host even when it is a sandbox the picker hides", () => {
+    hosts = [{ ...ONLINE, host_id: "sandbox_1", sandbox_provider: "example-sandbox" }];
+    renderHarnesses("claude-native", "?host=sandbox_1&tab=settings");
+    // fetchHosts keeps a sandbox host only when it is named as the source host.
+    expect(hostsCalls).toHaveBeenCalledWith({ refetchOnFocus: true, sourceHostId: "sandbox_1" });
+    expect(startupCalls).toHaveBeenCalledWith("sandbox_1", "claude-native");
+    expect(screen.queryByText(/Connect an online host/)).toBeNull();
+    // In-section links drop `?host`; the linked sandbox host must stay listed.
+    fireEvent.click(screen.getByRole("link", { name: /Harnesses/ }));
+    expect(hostsCalls).toHaveBeenLastCalledWith({
+      refetchOnFocus: true,
+      sourceHostId: "sandbox_1",
+    });
+  });
+
+  it("reads the shared hosts list when no host is linked", () => {
+    hosts = [ONLINE];
+    renderHarnesses();
+    // `null` would key a separate cache entry from every other `useHosts()` caller.
+    expect(hostsCalls).toHaveBeenCalled();
+    for (const [options] of hostsCalls.mock.calls)
+      expect((options as { sourceHostId?: unknown }).sourceHostId).toBeUndefined();
+  });
+
+  it("shows hosts loading rather than asking to connect one while the list loads", () => {
+    hostsPending = true;
+    renderHarnesses("claude-native", "?host=sandbox_1&tab=settings");
+    expect(screen.getByText("Loading hosts…")).toBeTruthy();
+    expect(screen.queryByTestId("harness-no-host")).toBeNull();
   });
 
   it.each([

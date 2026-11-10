@@ -164,6 +164,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   inventory every few seconds until the row is connected. In a claude-sdk
   session, the next turn after the row turns connected reaches that server
   without starting a new session. Custom agent servers carry no account state.
+  A claude-sdk session whose agent is running also shows each host server's
+  live connection in that session (connected, failed with its error, needs
+  sign-in, connecting, disabled), including servers only the CLI loaded; a
+  failed or needs-sign-in row offers **Reconnect**, which shows reconnecting,
+  then the refreshed state or the reconnect error. Before the first turn the
+  panel says live status appears once the agent is running. Read-only viewers
+  see the state without Reconnect. **Go to Settings** keeps the session's host
+  selected even when it is a sandbox host the host picker otherwise hides.
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
@@ -710,6 +718,13 @@ Other connection providers alone do not enable the managed MCP picker.
   server's tool. Covered by
   `tests/e2e_ui/chat/test_claude_sdk_host_mcp_servers.py::test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session`
   and, for a reconnect that hangs, `tests/e2e/test_claude_sdk_mcp_reconnect_timeout_e2e.py`.
+  For live state, open `/mcp` in a new claude-sdk session on a host and expect
+  the not-running note; send a message while a Claude server rejects sign-in,
+  reopen `/mcp` and expect **Failed** or **Needs sign-in** with **Reconnect**;
+  finish the sign-in, click Reconnect and expect **Connected**. Covered by
+  `test_claude_sdk_host_mcp_servers.py::test_claude_sdk_mcp_panel_shows_live_state_and_reconnects`,
+  with the row and merge cases in `SlashCommandMenu.test.tsx` and
+  `ChatPage.composer.test.tsx`.
   Registry states: `web/src/components/SlashCommandMenu.test.tsx` covers the
   row labels, the Sign in / Signing in… / error renderings and the Settings
   link; `ChatPage.composer.test.tsx` covers the catalog join (sign-in from the

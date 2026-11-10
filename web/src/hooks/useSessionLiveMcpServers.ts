@@ -1,0 +1,139 @@
+// The MCP connections a session's running harness holds, and reconnecting one.
+
+import { skipToken, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useState } from "react";
+import { authenticatedFetch } from "@/lib/identity";
+import { apiErrorFromResponse } from "@/lib/sessionsApi";
+
+/** One MCP server as the session's harness reports it. */
+export interface LiveMcpServer {
+  /** The harness's name for it; plugin servers read `plugin:<plugin>:<server>`. */
+  name: string;
+  /** `connected`, `failed`, `needs-auth`, `pending`, or `disabled`; others pass through. */
+  status: string;
+  error?: string | null;
+  scope?: string | null;
+}
+
+export interface SessionLiveMcpServers {
+  /** The harness answered, so `servers` is current. */
+  live: boolean;
+  reason?: "not_running" | "unsupported" | "unavailable" | null;
+  detail?: string | null;
+  servers: LiveMcpServer[];
+  /** On a reconnect response, the harness's reason it refused. */
+  reconnect_error?: string | null;
+}
+
+/** A reconnect that did not leave its server connected. */
+export interface LiveMcpReconnectError {
+  name: string;
+  message: string;
+}
+
+// Re-read while a server is still connecting, so the row settles without a reopen.
+const LIVE_MCP_PENDING_POLL_MS = 2_000;
+
+export function sessionLiveMcpServersQueryKey(sessionId: string | null) {
+  return ["session-live-mcp-servers", sessionId] as const;
+}
+
+function sessionLiveMcpServersPath(sessionId: string): string {
+  return `/v1/sessions/${encodeURIComponent(sessionId)}/live-mcp-servers`;
+}
+
+async function fetchSessionLiveMcpServers(
+  sessionId: string,
+  signal: AbortSignal,
+): Promise<SessionLiveMcpServers> {
+  const response = await authenticatedFetch(sessionLiveMcpServersPath(sessionId), { signal });
+  if (!response.ok) throw await apiErrorFromResponse(response);
+  return (await response.json()) as SessionLiveMcpServers;
+}
+
+async function postLiveMcpReconnect(
+  sessionId: string,
+  name: string,
+): Promise<SessionLiveMcpServers> {
+  const response = await authenticatedFetch(`${sessionLiveMcpServersPath(sessionId)}/reconnect`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!response.ok) throw await apiErrorFromResponse(response);
+  return (await response.json()) as SessionLiveMcpServers;
+}
+
+/** Read the session harness's MCP connections; re-read on each enable. */
+export function useSessionLiveMcpServers(sessionId: string | null, enabled: boolean) {
+  return useQuery({
+    queryKey: sessionLiveMcpServersQueryKey(sessionId),
+    queryFn:
+      enabled && sessionId !== null
+        ? ({ signal }) => fetchSessionLiveMcpServers(sessionId, signal)
+        : skipToken,
+    staleTime: 0,
+    retry: false,
+    refetchInterval: (query) =>
+      query.state.data?.servers.some((server) => server.status === "pending")
+        ? LIVE_MCP_PENDING_POLL_MS
+        : false,
+  });
+}
+
+/** Reconnect one of the session harness's MCP servers; the panel shows the outcome. */
+export function useReconnectLiveMcpServer(sessionId: string | null) {
+  const client = useQueryClient();
+  const [error, setError] = useState<LiveMcpReconnectError | null>(null);
+  const mutation = useMutation({
+    mutationFn: (name: string) => {
+      if (sessionId === null) throw new Error("This session has not started yet.");
+      return postLiveMcpReconnect(sessionId, name);
+    },
+    onMutate: () => setError(null),
+    onSuccess: (result, name) => {
+      const { reconnect_error: reconnectError, ...snapshot } = result;
+      client.setQueryData(sessionLiveMcpServersQueryKey(sessionId), snapshot);
+      if (reconnectError) setError({ name, message: reconnectError });
+    },
+    onError: (failure: Error, name) => {
+      setError({ name, message: failure.message || "Couldn’t reconnect. Try again." });
+    },
+  });
+  const { mutate } = mutation;
+  const reconnect = useCallback((name: string) => mutate(name), [mutate]);
+  const clearError = useCallback(() => setError(null), []);
+  return {
+    reconnect,
+    reconnectingName: mutation.isPending ? (mutation.variables ?? null) : null,
+    error,
+    clearError,
+  };
+}
+
+/** The harness's name for a host inventory server; the CLI prefixes plugin servers. */
+export function liveMcpNameForHostServer(server: { name: string; plugin?: string | null }): string {
+  return server.plugin ? `plugin:${server.plugin}:${server.name}` : server.name;
+}
+
+/** The `/mcp` row fields that carry one server's live connection. */
+export function liveMcpRowFields(server: LiveMcpServer): {
+  live: { status: string; error?: string | null };
+  liveName: string;
+} {
+  return { live: { status: server.status, error: server.error }, liveName: server.name };
+}
+
+/** Panel note for a live read that has no servers to show, or nothing. */
+export function liveMcpStatusNote(
+  result: SessionLiveMcpServers | undefined,
+  failed: boolean,
+): string | undefined {
+  if (failed) return "Couldn’t read this session’s live MCP connections.";
+  if (result === undefined || result.live) return undefined;
+  if (result.reason === "not_running")
+    return "Live connection status appears once this session’s agent is running; send a message to start it.";
+  if (result.reason === "unavailable")
+    return `Couldn’t read this session’s live MCP connections${result.detail ? `: ${result.detail}` : "."}`;
+  return undefined;
+}

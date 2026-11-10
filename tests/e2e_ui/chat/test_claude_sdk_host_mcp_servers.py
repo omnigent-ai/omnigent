@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import re
 import shutil
 import threading
 import time
@@ -13,7 +15,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 from tests._helpers.compat import runner_executable
 from tests._helpers.host import isolated_host
@@ -328,3 +330,112 @@ def test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session(
                 )
             except AssertionError:
                 pytest.fail("the session never reached the MCP server signed in after it started")
+
+
+# Readers of a recorded run need a moment on each state; unrecorded runs skip it.
+_HOLD_MS = 4000 if os.environ.get("OMNIGENT_E2E_RECORD_DIR") else 0
+
+
+def _mark_host_as_sandbox(page: Page, host_id: str) -> None:
+    """Report *host_id* as a server-managed sandbox host, which host pickers hide."""
+
+    def patch(route: Route) -> None:
+        response = route.fetch()
+        body = response.json()
+        for listed in body.get("hosts", []):
+            if listed.get("host_id") == host_id:
+                listed["sandbox_provider"] = "example-sandbox"
+        route.fulfill(response=response, json=body)
+
+    page.route(re.compile(r"/v1/hosts(\?.*)?$"), patch)
+
+
+@pytest.mark.timeout(900)
+def test_claude_sdk_mcp_panel_shows_live_state_and_reconnects(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> None:
+    """The panel shows what the running CLI holds, reconnects a server, and links to its host."""
+    if shutil.which("claude") is None:
+        pytest.skip("needs the claude CLI")
+    uid = uuid.uuid4().hex[:6]
+    first = f"LIVEMCP-{uid}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "ack one"}] * 4,
+        key=first,
+        match=first,
+        required_tools=[_SESSION_TOOL],
+    )
+    managed = tmp_path / "managed" / "managed-mcp.json"
+    managed.parent.mkdir(parents=True)
+    home = tmp_path / "host" / "home"
+    (home / ".omnigent").mkdir(parents=True)
+    with _SignInGate() as gate:
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {_USER_SERVER: {"type": "http", "url": gate.url}}})
+        )
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        with (
+            httpx.Client(base_url=live_server, timeout=30) as client,
+            isolated_host(
+                tmp_path / "host",
+                live_server,
+                env=_HOST_ENV,
+                config=_host_config(mock_llm_server_url),
+                command=_host_command(live_server, managed),
+                ready=lambda started: started.wait_online(client, timeout=120),
+            ) as host,
+            _claude_sdk_session(
+                client, mock_llm_server_url, f"sdk-live-mcp-{uid}", host.host_id, workspace
+            ) as session_id,
+        ):
+            page = request.getfixturevalue("page")
+            _skip_imports_review(page, host.host_id)
+            _mark_host_as_sandbox(page, host.host_id)
+            page.goto(f"{live_server}/c/{session_id}")
+            composer = page.get_by_label("Message the agent")
+            expect(composer).to_be_visible(timeout=60_000)
+
+            # Before the first turn there is no harness to ask.
+            composer.fill("/mcp")
+            panel = page.get_by_test_id("mcp-server-menu")
+            expect(panel.get_by_role("status")).to_contain_text(
+                "Live connection status appears once", timeout=15_000
+            )
+            expect(panel.get_by_test_id(f"mcp-server-row-{_USER_SERVER}")).to_be_visible()
+            page.wait_for_timeout(_HOLD_MS)
+            composer.fill("")
+
+            _send(page, f"Say ack. {first}")
+            _wait_reply(page, "ack one")
+            poll_until(lambda: gate.rejected, timeout_s=30)
+
+            composer.fill("/mcp")
+            live = panel.get_by_test_id(f"mcp-live-status-{_USER_SERVER}")
+            expect(live).to_contain_text(re.compile("Failed|Needs sign-in"), timeout=30_000)
+            reconnect = panel.get_by_test_id(f"mcp-reconnect-{_USER_SERVER}")
+            expect(reconnect).to_be_visible()
+            page.wait_for_timeout(_HOLD_MS)
+
+            gate.signed_in = True
+            reconnect.click()
+            expect(live).to_contain_text("In this session: Connected", timeout=60_000)
+            expect(reconnect).to_have_count(0)
+            page.wait_for_timeout(_HOLD_MS)
+
+            panel.get_by_role("link", name="Go to Settings").click()
+            expect(page).to_have_url(
+                re.compile(rf"/settings/harnesses/claude-native\?host={re.escape(host.host_id)}")
+            )
+            expect(page.get_by_test_id("harness-no-host")).to_have_count(0)
+            expect(page.get_by_text(_USER_SERVER, exact=True).first).to_be_visible(timeout=30_000)
+            page.wait_for_timeout(max(_HOLD_MS, 1000))
+            # A later hosts refetch must keep the linked sandbox host listed.
+            expect(page.get_by_test_id("harness-no-host")).to_have_count(0)
+            expect(page.get_by_text(_USER_SERVER, exact=True).first).to_be_visible()
+            # A hosts refetch still in the patch handler must not fail browser teardown.
+            page.unroute_all(behavior="ignoreErrors")

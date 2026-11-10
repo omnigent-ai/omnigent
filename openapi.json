@@ -3913,6 +3913,51 @@
         "title": "LaunchRunnerRequest",
         "type": "object"
       },
+      "LiveMCPServerStatus": {
+        "description": "One MCP server's connection inside a session's running harness.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The harness's reason for a failed connection, or `None`.",
+            "title": "Error"
+          },
+          "name": {
+            "description": "Server name as the harness reports it, e.g. `\"docs\"` or `\"plugin:tools:docs\"`.",
+            "title": "Name",
+            "type": "string"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the harness loaded the server from, e.g. `\"user\"`.",
+            "title": "Scope"
+          },
+          "status": {
+            "description": "`\"connected\"`, `\"failed\"`, `\"needs-auth\"`, `\"pending\"`, or `\"disabled\"`; other harness values pass through.",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status"
+        ],
+        "title": "LiveMCPServerStatus",
+        "type": "object"
+      },
       "LocalImportRequest": {
         "description": "Request to import local harness sessions from a host.\n\nUnlike `/imports` (the CLI posts already-normalized items), the server\nasks the chosen host to read + normalize its own transcripts over the\ntunnel \u2014 the transcripts live on the caller's machine, not the server. A\nsupplied `session_id` loads that exact session without enumerating local\nhistory.",
         "properties": {
@@ -5699,6 +5744,23 @@
           "delta"
         ],
         "title": "ReasoningTextDeltaEvent",
+        "type": "object"
+      },
+      "ReconnectLiveMCPServerRequest": {
+        "additionalProperties": false,
+        "description": "Body for reconnecting one MCP server in a session's running harness.",
+        "properties": {
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ReconnectLiveMCPServerRequest",
         "type": "object"
       },
       "ResetSessionModelOverrideRequest": {
@@ -8740,6 +8802,70 @@
           "updated_at"
         ],
         "title": "SessionListItem",
+        "type": "object"
+      },
+      "SessionLiveMCPServers": {
+        "description": "The MCP connections a session's running harness reports.",
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Readable explanation for `\"unavailable\"`, or `None`.",
+            "title": "Detail"
+          },
+          "live": {
+            "description": "`True` when the harness answered; `servers` is then current.",
+            "title": "Live",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_running",
+                  "unsupported",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why there is no live answer: `\"not_running\"` (no harness process yet; it starts with the next message), `\"unsupported\"` (the harness cannot report MCP status), or `\"unavailable\"` (the harness did not answer). `None` when `live` is true.",
+            "title": "Reason"
+          },
+          "reconnect_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "On a reconnect response, the harness's reason the reconnect failed, or `None` when it succeeded.",
+            "title": "Reconnect Error"
+          },
+          "servers": {
+            "description": "The harness's servers; empty unless `live`.",
+            "items": {
+              "$ref": "#/components/schemas/LiveMCPServerStatus"
+            },
+            "title": "Servers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "live"
+        ],
+        "title": "SessionLiveMCPServers",
         "type": "object"
       },
       "SessionMcpStartupEvent": {
@@ -18641,6 +18767,102 @@
         "summary": "Get Session Labels",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/live-mcp-servers": {
+      "get": {
+        "description": "Report the MCP connections the session's running harness holds.\n\nNever starts a harness; a session whose harness has not started yet\nanswers `live: false` with `reason: \"not_running\"`.",
+        "operationId": "get_live_mcp_servers_v1_sessions__session_id__live_mcp_servers_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionLiveMCPServers"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Live Mcp Servers",
+        "tags": [
+          "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/live-mcp-servers/reconnect": {
+      "post": {
+        "description": "Reconnect one MCP server in the session's running harness.\n\nA refused reconnect still answers 200, with the harness's reason in\n`reconnect_error` and the connections as they stand.",
+        "operationId": "reconnect_live_mcp_server_v1_sessions__session_id__live_mcp_servers_reconnect_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReconnectLiveMCPServerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionLiveMCPServers"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reconnect Live Mcp Server",
+        "tags": [
+          "session_mcp_servers"
         ]
       }
     },
