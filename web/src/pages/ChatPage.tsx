@@ -3877,15 +3877,16 @@ function ComposerImpl(
     // An edited message may land wherever the user could type it.
     canAccept: () => !inputDisabled,
     hasDraft: () => hasDraft,
-    applyDraft: (edited) => {
+    loadText: (text) => {
       setCommandError(null);
       dismissMention();
-      const sessionTokens = recallSessionMentions(edited.text).sessions.map((it) => it.token!);
-      const recalled = recallFileMentions(edited.text, sessionTokens);
-      loadIntoComposer(recalled.text, edited.files, { validateFiles: true });
+      const sessionTokens = recallSessionMentions(text).sessions.map((it) => it.token!);
+      const recalled = recallFileMentions(text, sessionTokens);
+      loadIntoComposer(recalled.text, [], { validateFiles: true });
       // After the load, which clears file mentions while restoring session mentions.
       setMentionedItems(recalled.files);
     },
+    addFiles,
     focusComposer: () => textareaRef.current?.focus(),
   });
 

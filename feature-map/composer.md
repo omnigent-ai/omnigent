@@ -241,8 +241,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   attachments, and "@"-mentions into that pane's composer; the transcript is
   unchanged. Sending is a new message, steered or queued like any mid-turn send,
   and Edit never stops the agent. A non-empty draft asks "Replace your draft?"
-  before anything downloads, and a draft typed while attachments download asks
-  once they finish. Side chats,
+  first. The text loads at once and attachments join when they download, unless
+  the draft was emptied or sent meanwhile. Side chats,
   grid session panes, and writable sub-agent Workspace tabs edit into their own
   composer, where "@"-mentions return as attachment markers. Edit is hidden on
   messages still being sent, other contributors' messages (shared session or not), and

@@ -7277,7 +7277,7 @@ describe("Composer — editing a sent message", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("keeps the dialog open while a confirmed replacement downloads", async () => {
+  it("loads the text at once and adds attachments when they arrive", async () => {
     let finishDownload: () => void = () => {};
     fetchMock.mockImplementation(
       () =>
@@ -7292,41 +7292,13 @@ describe("Composer — editing a sent message", () => {
     act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
     const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
     fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
-
-    expect(within(dialog).getByRole("button", { name: "Replacing…" })).toBeDisabled();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(textarea()).toHaveValue("half-written thought");
-    await act(async () => finishDownload());
-
-    await waitFor(() => expect(textarea()).toHaveValue("Summarize these"));
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(screen.getByText("notes.txt")).toBeInTheDocument();
-  });
-
-  it("cancels a confirmed replacement when the user keeps the draft mid-download", async () => {
-    let finishDownload: () => void = () => {};
-    fetchMock.mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          finishDownload = () => resolve(new Response("meeting notes"));
-        }),
-    );
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
-    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
-
-    act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
-    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
-    fireEvent.click(within(dialog).getByRole("button", { name: "Keep draft" }));
-    await act(async () => finishDownload());
 
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(textarea()).toHaveValue("half-written thought");
+    expect(textarea()).toHaveValue("Summarize these");
     expect(screen.queryByText("notes.txt")).toBeNull();
-    expect(toasts).toEqual([]);
+    await act(async () => finishDownload());
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
   });
-
   it("dismisses a pending confirmation when the conversation changes", async () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
@@ -7343,33 +7315,43 @@ describe("Composer — editing a sent message", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("asks about a draft typed while the attachments download", async () => {
+  it("keeps edits typed while the attachments download", async () => {
     let finishDownload: () => void = () => {};
     fetchMock.mockImplementation(
-      (url: string) =>
+      () =>
         new Promise<Response>((resolve) => {
-          finishDownload = () =>
-            resolve(
-              url.endsWith("/files/file_notes/content")
-                ? new Response("meeting notes", { headers: { "Content-Type": "text/plain" } })
-                : new Response(JSON.stringify({ detail: "gone" }), { status: 404 }),
-            );
+          finishDownload = () => resolve(new Response("meeting notes"));
         }),
     );
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
 
     act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
-    fireEvent.change(textarea(), { target: { value: "typed meanwhile" } });
+    expect(textarea()).toHaveValue("Summarize these");
+    fireEvent.change(textarea(), { target: { value: "Summarize these, briefly" } });
     await act(async () => finishDownload());
 
-    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
-    expect(textarea()).toHaveValue("typed meanwhile");
-    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
-    await waitFor(() => expect(textarea()).toHaveValue("Summarize these"));
+    expect(textarea()).toHaveValue("Summarize these, briefly");
     expect(screen.getByText("notes.txt")).toBeInTheDocument();
   });
 
+  it("drops attachments that arrive after the draft was emptied", async () => {
+    let finishDownload: () => void = () => {};
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishDownload = () => resolve(new Response("meeting notes"));
+        }),
+    );
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+
+    act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
+    fireEvent.change(textarea(), { target: { value: "" } });
+    await act(async () => finishDownload());
+
+    expect(screen.queryByText("notes.txt")).toBeNull();
+  });
   it("drops a load that finishes after switching conversations", async () => {
     let finishDownload: () => void = () => {};
     fetchMock.mockImplementation(
@@ -7426,6 +7408,9 @@ describe("Composer — editing a sent message", () => {
 
     act(() => ref.current?.editSentMessage(first));
     act(() => ref.current?.editSentMessage(second));
+    // The first message's text is now a draft, so the second asks first.
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
     await act(async () => finishDownloads[1]!());
     await waitFor(() => expect(textarea()).toHaveValue("Second message"));
     await act(async () => finishDownloads[0]!());
@@ -7433,30 +7418,6 @@ describe("Composer — editing a sent message", () => {
     expect(textarea()).toHaveValue("Second message");
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.getAllByText("notes.txt")).toHaveLength(1);
-  });
-
-  it("rejects a download that finishes after the composer stops taking input", async () => {
-    let finishDownload: () => void = () => {};
-    fetchMock.mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          finishDownload = () => resolve(new Response("meeting notes"));
-        }),
-    );
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    const { rerender } = renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
-
-    act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
-    rerender(
-      <TooltipProvider>
-        <Composer {...composerProps({ disabled: true })} ref={ref} />
-      </TooltipProvider>,
-    );
-    await act(async () => finishDownload());
-
-    expect(textarea()).toHaveValue("");
-    expect(screen.queryByText("notes.txt")).toBeNull();
-    expect(toasts).toEqual(["The composer can't take a message right now."]);
   });
 
   it("says so when the composer stops taking input before Replace draft", async () => {

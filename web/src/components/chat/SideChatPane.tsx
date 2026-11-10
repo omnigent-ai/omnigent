@@ -232,14 +232,19 @@ export function SideChatPane({
       const draft = useChatStore.getState().sideChatComposers[childId];
       return Boolean(draft && (draft.text.trim() || draft.files.length || draft.quotes?.length));
     },
-    applyDraft: ({ text, files }) => {
-      const { accepted, errors } = validateAttachments(files, sideChatAttachmentPolicy);
+    loadText: (text) =>
       useChatStore.getState().updateSideChatComposer(childId, (current) => ({
         ...current,
         text,
-        files: accepted,
+        files: [],
         quotes: [],
         autoFocus: true,
+      })),
+    addFiles: (files) => {
+      const { accepted, errors } = validateAttachments(files, sideChatAttachmentPolicy);
+      useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+        ...current,
+        files: [...current.files, ...accepted],
       }));
       errors.forEach((message) => toast.error(message));
     },
