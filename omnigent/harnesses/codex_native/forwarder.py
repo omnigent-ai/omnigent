@@ -9139,8 +9139,8 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :param message_id: Optional live-preview stream finalized by this item.
     :param source_id: Stable native source id for server-side idempotency.
-    :param agent_message_candidate: Whether the server may settle a queued
-        web message with this user message only by exact text match.
+    :param agent_message_candidate: Whether this is an async question answer,
+        which a Codex session's server keeps out of pending-input matching.
     :returns: Whether the item was accepted by the server.
     """
     data: _JsonObject = {
