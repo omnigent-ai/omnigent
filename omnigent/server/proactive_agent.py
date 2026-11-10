@@ -18,6 +18,7 @@ import uuid
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from omnigent.db.account_authority import account_generation
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import ScheduledTask
@@ -40,6 +41,10 @@ PROACTIVE_TASK_MAX_COST_USD = 2.0
 TIMEZONE_HEADER = "X-Omnigent-Timezone"
 # A slow provisioning step gives up instead of holding the session create.
 _PROVISION_TIMEOUT_S = 5.0
+# Longer than any IANA name; a longer header is not a timezone.
+_MAX_TIMEZONE_CHARS = 64
+# Each account re-registration leaves one deleted task behind.
+_MAX_TASK_SLOTS = 32
 _TASK_ID_NAMESPACE = uuid.UUID("7b6c3e0a-5a7e-4b55-9a3c-2f1d6e9c8b41")
 
 
@@ -48,10 +53,19 @@ def is_proactive_task(task: ScheduledTask) -> bool:
     return task.agent_id in PROACTIVE_AGENT_IDS
 
 
-def proactive_task_id(user_id: str | None, agent_name: str = PROACTIVE_AGENT_NAME) -> str:
-    """Return the fixed task id for one owner and agent, as bare 32-char hex."""
+def proactive_task_id(
+    user_id: str | None, agent_name: str = PROACTIVE_AGENT_NAME, *, slot: int = 0
+) -> str:
+    """Return a fixed task id for one owner and agent, as bare 32-char hex.
+
+    Deleting an account soft-deletes its tasks, keeping their ids, so a user who
+    registers again gets their task at the next *slot*.
+    """
     owner = user_id or ""
-    return uuid.uuid5(_TASK_ID_NAMESPACE, f"{current_workspace_id()}:{owner}:{agent_name}").hex
+    name = f"{current_workspace_id()}:{owner}:{agent_name}"
+    if slot:
+        name = f"{name}:{slot}"
+    return uuid.uuid5(_TASK_ID_NAMESPACE, name).hex
 
 
 def proactive_agent_available(app_state: Any) -> bool:
@@ -73,13 +87,40 @@ def proactive_agent_available(app_state: Any) -> bool:
 
 def request_timezone(value: str | None) -> str:
     """Return the IANA timezone a client sent, or ``"UTC"`` when absent or invalid."""
-    if value:
+    if value and len(value) <= _MAX_TIMEZONE_CHARS:
         try:
             ZoneInfo(value)
             return value
-        except (ZoneInfoNotFoundError, ValueError):
+        # A directory such as "America", or a name too long for the filesystem,
+        # raises OSError rather than ZoneInfoNotFoundError.
+        except (ZoneInfoNotFoundError, ValueError, OSError):
             pass
     return "UTC"
+
+
+_ProvisionKey = tuple[int, str | None, str | None]
+
+
+def _provision_key(user_id: str | None) -> _ProvisionKey:
+    # A re-registered account has a new generation, so it is provisioned again.
+    generation = account_generation(user_id) if user_id is not None else None
+    return (current_workspace_id(), user_id, generation)
+
+
+def _free_task_id(store: Any, user_id: str | None) -> str | ScheduledTask:
+    """Return the owner's live proactive task, or the id a new one should take.
+
+    Rows soft-deleted with an earlier account registration are skipped rather
+    than reactivated, so their authority never carries over.
+    """
+    for slot in range(_MAX_TASK_SLOTS):
+        task_id = proactive_task_id(user_id, slot=slot)
+        existing = store.get(task_id)
+        if existing is None:
+            return task_id
+        if existing.state != "deleted":
+            return existing
+    raise RuntimeError(f"no free proactive task id after {_MAX_TASK_SLOTS} deleted tasks")
 
 
 class ProactiveProvisioner:
@@ -91,12 +132,12 @@ class ProactiveProvisioner:
     """
 
     def __init__(self) -> None:
-        self._checked: set[tuple[int, str | None]] = set()
-        self._running: set[tuple[int, str | None]] = set()
+        self._checked: set[_ProvisionKey] = set()
+        self._running: set[_ProvisionKey] = set()
 
     def needed(self, user_id: str | None) -> bool:
         """Whether *user_id* is neither provisioned nor being provisioned here."""
-        key = (current_workspace_id(), user_id)
+        key = _provision_key(user_id)
         return key not in self._checked and key not in self._running
 
     def ensure_task(self, store: Any, user_id: str | None, timezone: str) -> ScheduledTask:
@@ -106,10 +147,10 @@ class ProactiveProvisioner:
         :param user_id: The owner, or ``None`` in single-user mode.
         :param timezone: IANA timezone a new schedule runs in.
         """
-        task_id = proactive_task_id(user_id)
-        existing = store.get(task_id)
-        if existing is not None:
-            return existing
+        task_id = _free_task_id(store, user_id)
+        if not isinstance(task_id, str):
+            return task_id
+        # The store checks the caller's current account registration.
         task = store.create(
             scheduled_task_id=task_id,
             name=PROACTIVE_TASK_NAME,
@@ -133,7 +174,7 @@ class ProactiveProvisioner:
         :param scheduler: Legacy in-process scheduler, or ``None`` when persistent
             dispatch picks the row up from the database.
         """
-        key = (current_workspace_id(), user_id)
+        key = _provision_key(user_id)
         self._running.add(key)
         try:
             task = await asyncio.to_thread(self.ensure_task, store, user_id, timezone)
@@ -154,6 +195,14 @@ def start_provisioning(request: Any, user_id: str | None) -> asyncio.Task[Schedu
     process already provisioned the caller, or the deployment cannot launch
     managed sandboxes.
     """
+    try:
+        return _start_provisioning(request, user_id)
+    except Exception:
+        _logger.warning("Proactive task provisioning could not start", exc_info=True)
+        return None
+
+
+def _start_provisioning(request: Any, user_id: str | None) -> asyncio.Task[ScheduledTask] | None:
     state = request.app.state
     provisioner: ProactiveProvisioner | None = getattr(state, "proactive_provisioner", None)
     store = getattr(state, "scheduled_task_store", None)

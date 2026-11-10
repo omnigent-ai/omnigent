@@ -579,6 +579,12 @@ def create_scheduled_tasks_router(
             )
         if conv.agent_id is None:
             raise OmnigentError("The session has no agent to copy", code=ErrorCode.INVALID_INPUT)
+        # Its copy would carry the hidden proactive agent into a user automation.
+        if normalize_uuid(conv.agent_id) in PROACTIVE_AGENT_IDS:
+            raise OmnigentError(
+                "An automation can't start from a proactive agent's session",
+                code=ErrorCode.INVALID_INPUT,
+            )
         from omnigent.server.scheduled.source_session import last_finished_response_id
 
         # Runs start from the history through the last finished reply, so there must be one.
