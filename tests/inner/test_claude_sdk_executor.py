@@ -4002,7 +4002,7 @@ async def test_live_mcp_status_and_reconnect_for_the_mcp_panel(
             reconnects.append(server_name)
             if server_name == "docs":
                 # The SDK's form for the CLI's own error reply.
-                raise Exception("still unauthorized")  # noqa: TRY002
+                raise Exception("still unauthorized")
             if server_name == "wiki":
                 raise RuntimeError("transport closed at /run/cli.sock")
             live[server_name] = {"status": "connected"}

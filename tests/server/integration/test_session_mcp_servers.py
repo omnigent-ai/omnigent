@@ -624,7 +624,9 @@ async def test_live_mcp_runner_request_forwards_to_the_sessions_runner() -> None
             )
             is None
         )
-    offline: Any = _LiveMcpRouter(OmnigentError("runner offline", code=ErrorCode.RUNNER_UNAVAILABLE))
+    offline: Any = _LiveMcpRouter(
+        OmnigentError("runner offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+    )
     with pytest.raises(OmnigentError, match="runner offline"):
         await mcp_routes._live_mcp_runner_request(
             offline, "conv_a", "GET", "live-mcp-servers", timeout=5
