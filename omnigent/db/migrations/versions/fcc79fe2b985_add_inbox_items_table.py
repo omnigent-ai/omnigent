@@ -5,7 +5,10 @@ Revises: a7d4c2e9f610
 Create Date: 2026-11-09 00:00:00.000000
 
 Adds the ``inbox_items`` table: suggestions an agent posts to its owner's
-Inbox. ``workspace_id`` leads the primary key, there are no foreign keys
+Inbox. The agent's content, its media, and the owner's comment are storage
+envelopes (``omnigent.db.envelope``) in bounded binary columns, so a deployment
+can encrypt them later without a schema change; the other columns are routing
+metadata. ``workspace_id`` leads the primary key, there are no foreign keys
 (schema Rule R032), and no column has a SQL default: the application supplies
 every value. The table is new and unused until the Inbox item routes ship, so
 deploying it first, and rolling it back by downgrade before those routes ship,
@@ -35,23 +38,15 @@ _SQLITE_CHECKS: tuple[tuple[str, str], ...] = (
         "prompt_version IS NULL OR length(CAST(prompt_version AS BLOB)) <= 256",
         "ck_inbox_items_prompt_version_bytes",
     ),
-    ("title IS NULL OR length(CAST(title AS BLOB)) <= 1024", "ck_inbox_items_title_bytes"),
-    (
-        "primary_link IS NULL OR length(CAST(primary_link AS BLOB)) <= 8192",
-        "ck_inbox_items_primary_link_bytes",
-    ),
-    ("topic IS NULL OR length(CAST(topic AS BLOB)) <= 512", "ck_inbox_items_topic_bytes"),
     (
         "dedupe_key IS NULL OR length(CAST(dedupe_key AS BLOB)) <= 512",
         "ck_inbox_items_dedupe_key_bytes",
     ),
-    ("body_md IS NULL OR length(CAST(body_md AS BLOB)) <= 16383", "ck_inbox_items_body_md_bytes"),
-    ("links IS NULL OR length(CAST(links AS BLOB)) <= 16383", "ck_inbox_items_links_bytes"),
-    ("actions IS NULL OR length(CAST(actions AS BLOB)) <= 16383", "ck_inbox_items_actions_bytes"),
+    ("content IS NULL OR length(CAST(content AS BLOB)) <= 16383", "ck_inbox_items_content_bytes"),
     ("media IS NULL OR length(CAST(media AS BLOB)) <= 16383", "ck_inbox_items_media_bytes"),
     (
-        "feedback_text IS NULL OR length(CAST(feedback_text AS BLOB)) <= 16383",
-        "ck_inbox_items_feedback_text_bytes",
+        "feedback IS NULL OR length(CAST(feedback AS BLOB)) <= 16383",
+        "ck_inbox_items_feedback_bytes",
     ),
     (
         "workspace_id IS NULL OR typeof(workspace_id) = 'integer'",
@@ -91,15 +86,10 @@ def upgrade() -> None:
         sa.Column("prompt_version", sa.String(64), nullable=True),
         # INBOX_ITEM_KIND: followup=1, info=2, reminder=3.
         sa.Column("kind", sa.SmallInteger(), nullable=False),
-        sa.Column("title", sa.String(256), nullable=False),
-        # Compressed text, capped at 16,383 stored bytes by the model.
-        sa.Column("body_md", sa.LargeBinary(), nullable=False),
-        sa.Column("links", sa.LargeBinary(), nullable=False),
-        sa.Column("actions", sa.LargeBinary(), nullable=False),
-        # A JSON list of typed rich-content blocks, such as a chart.
+        # Storage envelopes (omnigent.db.envelope), capped at 16,383 bytes by the
+        # model: the agent's content, its media blocks, and the owner's comment.
+        sa.Column("content", sa.LargeBinary(), nullable=False),
         sa.Column("media", sa.LargeBinary(), nullable=False),
-        sa.Column("primary_link", sa.String(2048), nullable=True),
-        sa.Column("topic", sa.String(128), nullable=False),
         sa.Column("dedupe_key", sa.String(128), nullable=False),
         # INBOX_ITEM_STATE: unread=1, read=2, done=3, dismissed=4.
         sa.Column("state", sa.SmallInteger(), nullable=False),
@@ -107,7 +97,7 @@ def upgrade() -> None:
         # not_relevant=4, incorrect=5, not_now=6.
         sa.Column("resolution", sa.SmallInteger(), nullable=False),
         sa.Column("resolution_action", sa.SmallInteger(), nullable=True),
-        sa.Column("feedback_text", sa.LargeBinary(), nullable=True),
+        sa.Column("feedback", sa.LargeBinary(), nullable=True),
         sa.Column("created_at", sa.BigInteger(), nullable=False),
         sa.Column("read_at", sa.BigInteger(), nullable=True),
         sa.Column("acted_at", sa.BigInteger(), nullable=True),

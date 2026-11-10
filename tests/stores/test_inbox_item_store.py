@@ -146,6 +146,24 @@ def test_a_post_outlasts_successive_slot_conflicts(
     assert calls["n"] == 5
 
 
+def test_content_is_stored_in_envelopes(store: SqlAlchemyInboxItemStore) -> None:
+    """The agent's text, media, and the owner's comment are plaintext envelopes in the database."""
+    from sqlalchemy import text
+
+    from omnigent.db.envelope import ENVELOPE_FORMAT
+
+    created = store.create(_new(title="Private title"))
+    store.update(created.id, "alice", feedback_text="Private comment", now=1)
+
+    with store._engine.connect() as conn:
+        row = conn.execute(text("SELECT content, media, feedback FROM inbox_items")).one()
+    for column in row:
+        assert bytes(column)[:2] == bytes((ENVELOPE_FORMAT, 0x00))
+    read = store.get(created.id, "alice")
+    assert read is not None
+    assert (read.title, read.feedback_text) == ("Private title", "Private comment")
+
+
 def test_oversized_text_is_rejected(store: SqlAlchemyInboxItemStore) -> None:
     incompressible = "".join(chr(0x4E00 + (n * 7919) % 20000) for n in range(9000))
 
@@ -251,11 +269,15 @@ def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) ->
             "session_slot": index % 10,
             "agent_id": "a" * 32,
             "kind": 1,
-            "title": "t",
-            "body_md": "b",
-            "links": "[]",
-            "actions": "[]",
-            "topic": "t",
+            "content": {
+                "title": "t",
+                "body_md": "b",
+                "links": [],
+                "actions": [],
+                "topic": "t",
+                "primary_link": None,
+            },
+            "media": [],
             "dedupe_key": f"v1:{index}",
             "state": 1 + index % 2,
             "resolution": 0,

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import heapq
-import json
 import uuid
 from collections.abc import Callable
 from functools import partial
@@ -47,6 +46,7 @@ _T = TypeVar("_T")
 
 def _to_entity(row: SqlInboxItem) -> InboxItem:
     """Convert an ORM row to an :class:`InboxItem`."""
+    content = row.content
     return InboxItem(
         id=row.id,
         user_id=row.user_id,
@@ -54,17 +54,17 @@ def _to_entity(row: SqlInboxItem) -> InboxItem:
         agent_id=row.agent_id,
         prompt_version=row.prompt_version,
         kind=decode_inbox_item_kind(row.kind),
-        title=row.title,
-        body_md=row.body_md,
-        links=json.loads(row.links),
-        actions=json.loads(row.actions),
-        media=json.loads(row.media),
-        primary_link=row.primary_link,
-        topic=row.topic,
+        title=content["title"],
+        body_md=content["body_md"],
+        links=content["links"],
+        actions=content["actions"],
+        media=row.media,
+        primary_link=content["primary_link"],
+        topic=content["topic"],
         dedupe_key=row.dedupe_key,
         state=decode_inbox_item_state(row.state),
         resolution=decode_inbox_item_resolution(row.resolution),
-        feedback_text=row.feedback_text,
+        feedback_text=row.feedback["text"] if row.feedback is not None else None,
         created_at=row.created_at,
         read_at=row.read_at,
         acted_at=row.acted_at,
@@ -202,13 +202,15 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
                 agent_id=item.agent_id,
                 prompt_version=item.prompt_version,
                 kind=encode_inbox_item_kind(item.kind),
-                title=item.title,
-                body_md=item.body_md,
-                links=json.dumps(item.links),
-                actions=json.dumps(item.actions),
-                media=json.dumps(item.media),
-                primary_link=item.primary_link,
-                topic=item.topic,
+                content={
+                    "title": item.title,
+                    "body_md": item.body_md,
+                    "links": item.links,
+                    "actions": item.actions,
+                    "topic": item.topic,
+                    "primary_link": item.primary_link,
+                },
+                media=item.media,
                 dedupe_key=item.dedupe_key,
                 state=encode_inbox_item_state("unread"),
                 resolution=encode_inbox_item_resolution("none"),
@@ -344,7 +346,7 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
                 if resolution != "none":
                     row.acted_at = now
             if feedback_text is not None:
-                row.feedback_text = feedback_text
+                row.feedback = {"text": feedback_text}
             session.flush()
             return _to_entity(row)
 
