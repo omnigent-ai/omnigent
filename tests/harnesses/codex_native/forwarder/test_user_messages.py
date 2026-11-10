@@ -73,8 +73,12 @@ async def test_post_user_message_image_only_posts_empty_content() -> None:
         "<send_user_message_question_reply>\n"
         '[{"answer":"Blue","questionItemId":"[\\"request_user_input_async\\",'
         '\\"call_unknown\\",0]"}]\n</send_user_message_question_reply>',
+        "[Attached: /tmp/example.png]\nExplain this fixture:\n"
+        "<send_user_message_question_reply>\n"
+        '[{"answer":"","questionItemId":"[\\"request_user_input_async\\",'
+        '\\"call_asked\\",0]"}]\n</send_user_message_question_reply>',
     ],
-    ids=["plain", "quoted_reply_example", "reply_to_unasked_question"],
+    ids=["plain", "quoted_reply_example", "reply_to_unasked_question", "empty_reply"],
 )
 @pytest.mark.asyncio
 async def test_post_user_message_text_posts_input_text(text: str) -> None:

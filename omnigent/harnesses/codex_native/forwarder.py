@@ -6625,8 +6625,8 @@ def _async_question_replies(
     Find the tagged replies to known async questions in a Codex user message.
 
     A tagged block counts only when every entry names one of
-    ``question_item_ids``, so a quoted, partial or malformed example stays
-    ordinary text.
+    ``question_item_ids`` and some entry has answer text, so a quoted,
+    partial, empty or malformed example stays ordinary text.
 
     :param text: Codex ``userMessage`` text.
     :param question_item_ids: Item ids of the async questions Codex asked,
@@ -6648,10 +6648,23 @@ def _async_question_replies(
             continue
         position = closing.end()
         item_ids = [_async_question_reply_entry_item_id(entry) for entry in entries]
-        if item_ids and all(
-            item_id is not None and item_id in question_item_ids for item_id in item_ids
+        if (
+            item_ids
+            and all(item_id is not None and item_id in question_item_ids for item_id in item_ids)
+            and _async_question_reply_answers(entries)
         ):
             yield opening.start(), closing.end(), entries
+
+
+def _async_question_reply_answers(entries: list[_JsonObject]) -> list[str]:
+    """
+    Return the answer texts of a tagged async question reply.
+
+    :param entries: Decoded reply entries, each naming an asked question.
+    :returns: Nonempty ``answer`` strings, e.g. ``["Alpha"]``.
+    """
+    answers = [entry.get("answer") for entry in entries]
+    return [answer for answer in answers if isinstance(answer, str) and answer]
 
 
 def _async_question_reply_entry_item_id(entry: object) -> str | None:
@@ -6692,11 +6705,8 @@ def _async_question_reply_display_text(text: str, question_item_ids: Collection[
     parts: list[str] = []
     position = 0
     for start, end, entries in _async_question_replies(text, question_item_ids):
-        answers = [entry.get("answer") for entry in entries]
-        answer_texts = [answer for answer in answers if isinstance(answer, str) and answer]
-        if answer_texts:
-            parts.extend((text[position:start], "\n".join(answer_texts)))
-            position = end
+        parts.extend((text[position:start], "\n".join(_async_question_reply_answers(entries))))
+        position = end
     parts.append(text[position:])
     return "".join(parts)
 

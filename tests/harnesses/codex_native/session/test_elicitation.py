@@ -1460,12 +1460,17 @@ def test_async_question_reply_display_text_shows_only_answers(text: str, expecte
     """
     A tagged reply to an asked async question is shown as its answers; other text is unchanged.
 
+    Only text shown as answers answers the question; other text leaves it open.
+
     :param text: Codex ``userMessage`` text.
     :param expected: Text the transcript shows.
     """
     assert (
         codex_native_forwarder._async_question_reply_display_text(text, {"call-async-1"})
         == expected
+    )
+    assert codex_native_forwarder._async_question_reply_item_ids(text, {"call-async-1"}) == (
+        [] if expected == text else ["call-async-1"]
     )
 
 
