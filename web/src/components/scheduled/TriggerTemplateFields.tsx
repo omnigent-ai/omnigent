@@ -147,7 +147,11 @@ export function TriggerTemplateFields({
                   placeholder={target.placeholder}
                   aria-label={target.label}
                   data-testid="task-trigger-target"
-                  className={cn(CHIP, "w-44 placeholder:text-primary/50")}
+                  className={cn(CHIP, "min-w-16 placeholder:text-primary/50")}
+                  // Fit the placeholder or value so neither is cut off.
+                  style={{
+                    width: `calc(${Math.max((fields.target ?? "").length, target.placeholder.length) + 2}ch + 1rem)`,
+                  }}
                   onChange={(e) => onChange({ ...fields, target: e.target.value })}
                 />
               </>
@@ -206,12 +210,12 @@ export function TriggerTemplateFields({
             </span>
           </div>
 
-          {targetInvalid && target && (
+          {targetInvalid && target?.hint && (
             <p
               className="pl-6 text-sm text-muted-foreground"
               data-testid="task-trigger-target-hint"
             >
-              Enter a {target.label.toLowerCase()}: {target.placeholder}.
+              {target.hint}
             </p>
           )}
 

@@ -3748,7 +3748,13 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     type("task-trigger-scope", "acme/app");
     type("task-trigger-instructions", "Review the pull request.");
     type("task-trigger-target", " ");
-    expect(screen.getByTestId("task-trigger-target-hint")).toBeVisible();
+    expect(screen.getByTestId("task-trigger-target")).toHaveAttribute(
+      "placeholder",
+      "username or org/team",
+    );
+    expect(screen.getByTestId("task-trigger-target-hint")).toHaveTextContent(
+      "Enter a reviewer: me, a username, or an org/team.",
+    );
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
     type("task-trigger-target", "octo cat");
     expect(screen.getByTestId("task-trigger-target-hint")).toBeVisible();
@@ -3793,6 +3799,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     type("task-trigger-instructions", "Triage it.");
     type("task-trigger-target", "");
     expect(screen.queryByTestId("task-trigger-target-hint")).toBeNull();
+    expect(screen.getByTestId("task-trigger-target")).toHaveAttribute("placeholder", "me or email");
     const prompt = await submittedPrompt();
     expect(prompt).toContain(
       '(project = "ES" AND assignee is not EMPTY) AND assignee CHANGED AFTER "-<A>m"',

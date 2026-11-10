@@ -115,6 +115,8 @@ export interface TriggerEventTarget {
   word: string;
   label: string;
   placeholder: string;
+  /** Shown when a required value is missing or invalid. */
+  hint?: string;
   /** An empty value can't render a prompt; otherwise empty means anyone. */
   required: boolean;
 }
@@ -190,7 +192,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         target: {
           word: "to",
           label: "Assignee",
-          placeholder: "anyone, me, or an account ID",
+          placeholder: "me or email",
           required: false,
         },
         description:
@@ -209,7 +211,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         label: "Assignee",
         operators: ["is", "is_not", "empty", "not_empty"],
         operatorLabels: { empty: "is unassigned", not_empty: "is assigned" },
-        placeholder: "me, or an account ID",
+        placeholder: "me or email",
       },
       {
         id: "jql",
@@ -310,7 +312,8 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         target: {
           word: "from",
           label: "Reviewer",
-          placeholder: "me, user, or org/team",
+          placeholder: "username or org/team",
+          hint: "Enter a reviewer: me, a username, or an org/team.",
           required: true,
         },
         description:
@@ -336,7 +339,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
         id: "reviewer",
         label: "Reviewer",
         operators: ["is", "is_not"],
-        placeholder: "me, user, or org/team",
+        placeholder: "username or org/team",
       },
       {
         id: "qualifiers",
