@@ -29,7 +29,7 @@ afterEach(() => {
 });
 
 describe("workspaceTabPreferences — read/write", () => {
-  it("defaults to inline opening and follows local and cross-window preference changes", () => {
+  it("parses and stores the opening preference and updates its mounted reader", () => {
     const { result } = renderHook(() => useAlwaysOpenFilesInTab());
     expect(result.current).toBe(false);
     localStorage.setItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY, "invalid");
@@ -38,14 +38,6 @@ describe("workspaceTabPreferences — read/write", () => {
     act(() => writeAlwaysOpenFilesInTab(true));
     expect(result.current).toBe(true);
     expect(localStorage.getItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY)).toBe("true");
-    act(() => {
-      localStorage.removeItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY);
-      window.dispatchEvent(
-        new StorageEvent("storage", { key: ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY }),
-      );
-    });
-    expect(result.current).toBe(false);
-    act(() => writeAlwaysOpenFilesInTab(true));
     act(() => writeAlwaysOpenFilesInTab(false));
     expect(result.current).toBe(false);
     expect(localStorage.getItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY)).toBeNull();

@@ -94,11 +94,9 @@ export function useSideChats(conversationId: string) {
     return id;
   }, [update]);
 
-  /** Add a child id as a tab and select it. Idempotent: an already-open child
-   *  is re-selected, not duplicated (a create both returns the id and fires a
-   *  `session_created`, so `open` can be reached twice for one child). */
+  /** Add a child without duplicates. Background arrivals can defer selection. */
   const open = useCallback(
-    (childId: string) =>
+    (childId: string, activate = true) =>
       update((current) => {
         const key = subagentSessionIdFromTab(childId) === null ? "tabs" : "subagentTabs";
         const list = current[key];
@@ -108,7 +106,7 @@ export function useSideChats(conversationId: string) {
           closed: current.closed.filter(
             (id) => id !== (subagentSessionIdFromTab(childId) ?? childId),
           ),
-          selected: childId,
+          selected: activate ? childId : current.selected,
         };
       }),
     [update],

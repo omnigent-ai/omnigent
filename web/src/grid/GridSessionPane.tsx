@@ -541,12 +541,11 @@ export function GridSessionPane({
                             : previous.rightRailTab,
                       };
                     });
-                  if (
-                    fileTreeSplitEnabled &&
-                    (tab !== workspace.rightRailTab || workspace.selectedFilePath != null)
-                  )
+                  if (fileTreeSplitEnabled) {
                     close();
-                  else navigateWorkspace("", undefined, close);
+                  } else {
+                    navigateWorkspace("", undefined, close);
+                  }
                 }}
                 showFilesPanel={showFiles}
                 showGithubTab={showFiles}
@@ -557,7 +556,7 @@ export function GridSessionPane({
                 agentCount={childSessions.length + 1}
                 rootSessionId={rootSessionId}
                 fileTreeSplitEnabled={fileTreeSplitEnabled}
-                treePreviewPath={workspace.treePreviewPath ?? null}
+                treePreviewPath={canBrowse ? (workspace.treePreviewPath ?? null) : null}
                 openFileInTree={openFileInTree}
                 onCloseTreePreview={closeTreePreview}
                 selectedFilePath={canBrowse ? (workspace.selectedFilePath ?? null) : null}

@@ -28,6 +28,8 @@ header stays above both columns, and the current file stays highlighted.
   return to the expanded tree and previous preview.
 - Settings → Appearance → Workspace → **Always open files in a new tab** opts
   out of inline previews. Appearance **Reset** restores inline opening.
+- Settings → Appearance → Settings data → **Export** saves the opening preference;
+  **Import** restores it and updates already-open Workspace panels.
 - Chat citations, agent file opens, Content search results, Changes, explicit
   file URLs and the viewer's previous/next actions continue to open file tabs.
 - The desktop composer's PR link can leave Files for Pull Requests. It must

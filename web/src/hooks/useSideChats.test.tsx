@@ -73,6 +73,9 @@ describe("side-chat soft tabs", () => {
     act(() => result.current.open("conv_side1"));
     expect(result.current.tabs).toEqual(["conv_side1", "conv_side2"]);
     expect(result.current.selected).toBe("conv_side1");
+    act(() => result.current.open("conv_arrived", false));
+    expect(result.current.tabs).toEqual(["conv_side1", "conv_side2", "conv_arrived"]);
+    expect(result.current.selected).toBe("conv_side1");
   });
 
   it("reloads its own tabs when the parent conversation changes without a remount", () => {

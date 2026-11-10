@@ -2079,7 +2079,9 @@ function FileViewerBody({
           <DialogHeader>
             <DialogTitle>Unsaved changes</DialogTitle>
             <DialogDescription>
-              Your edits will be lost if you leave without saving.
+              {open
+                ? "Your edits will be lost if you leave without saving."
+                : `Your edits to ${path} will be lost if you leave without saving.`}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

@@ -8,7 +8,6 @@ interface Column {
 }
 
 function startDrag(result: Column, clientX = 300) {
-  result.current.containerRef.current = document.createElement("div");
   act(() =>
     result.current.handleProps.onMouseDown({
       button: 0,

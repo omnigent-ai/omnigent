@@ -1003,6 +1003,7 @@ function WorkspacePanelImpl({
     selectedFilePath === null &&
     selectedTerminalKey === null;
   const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
+  // Late commits ask the viewer that is current when they finish.
   const leaveFileRef = useRef<(path: string | null, commit: () => void) => void>((_path, commit) =>
     commit(),
   );
@@ -1156,25 +1157,26 @@ function WorkspacePanelImpl({
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
     clearSideChatToOpen();
-    const select = () => {
-      const subagentId = subagentSessionIdFromTab(childId);
-      if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
-        // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
-        sideChats.select(subagentId);
-      } else if (childId.startsWith("pending:") || subagentId !== null) {
-        // "Ask in side chat" (a not-yet-forked tab) and sub-agent tabs (an
-        // existing session) must not take a slot in the Codex awaiting queue.
-        sideChats.open(childId);
+    const subagentId = subagentSessionIdFromTab(childId);
+    let tabId = childId;
+    // Record arrivals before asking to leave the editor; cancellation must not lose a fork.
+    if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
+      tabId = subagentId;
+      if (!fileTreeSplitEnabled) sideChats.select(tabId);
+    } else if (childId.startsWith("pending:") || subagentId !== null) {
+      // Pending and sub-agent tabs don't consume the native-fork queue.
+      sideChats.open(tabId, !fileTreeSplitEnabled);
+    } else {
+      const awaiting = awaitingPendingIdsRef.current.shift();
+      if (awaiting !== undefined) {
+        sideChats.rekey(awaiting, childId);
+        useChatStore.getState().clearSideChatComposer(awaiting);
       } else {
-        const awaiting = awaitingPendingIdsRef.current.shift();
-        if (awaiting !== undefined) {
-          sideChats.rekey(awaiting, childId);
-          useChatStore.getState().clearSideChatComposer(awaiting);
-        } else {
-          // Generic already rekeyed its own tab; this just re-selects it (idempotent).
-          sideChats.open(childId);
-        }
+        sideChats.open(tabId, !fileTreeSplitEnabled);
       }
+    }
+    const select = () => {
+      if (fileTreeSplitEnabled) sideChats.select(tabId);
       onRightRailTabChange("sidechat");
     };
     if (fileTreeSplitEnabled) leaveFileRef.current(null, select);
@@ -1667,6 +1669,14 @@ function WorkspacePanelImpl({
   const splitFiles = canSplitFiles && selectedFilePath === null && treePreviewPath !== null;
   const viewerPath = selectedFilePath ?? treePreviewPath;
   const viewerVisible = filesPanelActive && (selectedFilePath !== null || splitFiles);
+  let viewerOnClose = onShowScopeView;
+  let viewerOnCloseTab = selectedFilePath !== null ? handleCloseTab : onCloseTreePreview;
+  if (isMobile && onMobileFileClose) {
+    viewerOnClose = onMobileFileClose;
+    viewerOnCloseTab = onMobileFileClose;
+  } else if (selectedFilePath === null) {
+    viewerOnClose = onCloseTreePreview ?? onShowScopeView;
+  }
 
   // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
   // has focus: close the tab on screen, or hide the rail on a fixed page.
@@ -1736,8 +1746,7 @@ function WorkspacePanelImpl({
     else if (point.shown && browsers.tabs.includes(point.tabId)) returnPointRef.current = null;
   });
   // Desktop ⇧⌘[ / ⇧⌘] step through the tabs in strip order; ⇧⌘T reopens the last closed one.
-  // Leaves the file on screen, if any, once its viewer allows it (it confirms unsaved
-  // edits). A ref, so a reopen that finishes later asks about the file shown by then.
+  // Leaves the file on screen once its viewer allows it (it confirms unsaved edits).
   const showAdjacentTab = (step: -1 | 1) => {
     const options = panelOptions.filter((option) => !option.disabled);
     const index = options.findIndex((option) => option.active);
@@ -2259,20 +2268,8 @@ function WorkspacePanelImpl({
                           conversationId={conversationId}
                           path={viewerPath}
                           position={selectedFilePath !== null ? filePosition : undefined}
-                          onClose={
-                            isMobile && onMobileFileClose
-                              ? onMobileFileClose
-                              : selectedFilePath !== null
-                                ? onShowScopeView
-                                : (onCloseTreePreview ?? onShowScopeView)
-                          }
-                          onCloseTab={
-                            isMobile && onMobileFileClose
-                              ? onMobileFileClose
-                              : selectedFilePath !== null
-                                ? handleCloseTab
-                                : onCloseTreePreview
-                          }
+                          onClose={viewerOnClose}
+                          onCloseTab={viewerOnCloseTab}
                           onNavigateTo={openFileViewer}
                           permissionLevel={permissionLevel}
                           onCommentsOpenChange={onCommentsOpenChange}

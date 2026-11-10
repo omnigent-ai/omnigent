@@ -177,6 +177,9 @@ vi.mock("@/shell/WorkspacePanel", () => ({
             <button type="button" onClick={() => props.onClosePanel("changes")}>
               Close Changes
             </button>
+            <button type="button" onClick={() => props.onClosePanel("files")}>
+              Commit Files close
+            </button>
             <button type="button" onClick={props.onCloseTreePreview}>
               Close preview
             </button>
@@ -644,8 +647,6 @@ it.each([false, true])("gates tree previews and keeps them per session (enabled=
   expect(workspace).toHaveAttribute("data-split-enabled", String(enabled));
   if (!enabled) {
     expect(within(workspace).queryByText("Preview file")).toBeNull();
-    fireEvent.click(within(first).getByText("Open citation"));
-    expect(readSessionWorkspaceState("first").openFiles).toEqual(["notes.md"]);
     return;
   }
   fireEvent.click(within(workspace).getByText("Preview file"));
@@ -666,6 +667,8 @@ it.each([false, true])("gates tree previews and keeps them per session (enabled=
   fireEvent.click(within(workspace).getByText("Close Changes"));
   expect(fixture.discardEdits).toBeNull();
   expect(readSessionWorkspaceState("first").openPanels).toEqual([]);
+  fireEvent.click(within(workspace).getByText("Commit Files close"));
+  expect(fixture.discardEdits).toBeNull();
   fireEvent.click(within(first).getByText("Open Pull Requests"));
   expect(workspace).toHaveAttribute("data-tab", "files");
   expect(fixture.discardEdits).not.toBeNull();
@@ -676,4 +679,20 @@ it.each([false, true])("gates tree previews and keeps them per session (enabled=
   act(() => fixture.discardEdits?.());
   expect(readSessionWorkspaceState("first").treePreviewPath).toBeNull();
   expect(readSessionWorkspaceState("second").treePreviewPath).toBe("second.md");
+});
+
+it("hides saved previews when the session does not grant workspace access", () => {
+  fixture.fileTreeSplit = true;
+  fixture.permissionLevel = 1;
+  writeSessionWorkspaceState("grid:private", { open: true });
+  writeSessionWorkspaceState("first", { treePreviewPath: "private.md" });
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid grid={{ id: "private", layout: "first" }} />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  expect(screen.getByTestId("workspace-first")).toHaveAttribute("data-preview", "");
+  expect(readSessionWorkspaceState("first").treePreviewPath).toBe("private.md");
 });

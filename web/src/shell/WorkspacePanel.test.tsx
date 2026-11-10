@@ -1915,6 +1915,62 @@ describe("WorkspacePanel sub-agent tabs", () => {
     }
   });
 
+  it("pairs native forks even when leaving a dirty preview is cancelled", async () => {
+    const before = useChatStore.getState();
+    const send = vi.fn(() => Promise.resolve());
+    const fileGuard = vi.fn<FileNavigationGuard>();
+    useChatStore.setState({ sessionHarness: "codex-native", boundAgentId: "agent_x", send });
+    try {
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["pending:one", "pending:two"],
+        selectedSideChatId: "pending:one",
+      });
+      const view = renderWorkspace({
+        rightRailTab: "sidechat",
+        fileTreeSplitEnabled: true,
+        fileGuard,
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Start side chat" }));
+      await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      fireEvent.click(screen.getByRole("tab", { name: "Side chat 2" }));
+      fireEvent.click(screen.getByRole("button", { name: "Start side chat" }));
+      await waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+      view.rerender({ rightRailTab: "files", treePreviewPath: "draft.md" });
+      view.onRightRailTabChange.mockClear();
+
+      act(() => {
+        useChatStore.setState({ sideChatToOpen: { childId: "child_one", parentId: "conv_ws" } });
+      });
+      expect(readSessionWorkspaceState("conv_ws").openSideChats).toEqual([
+        "child_one",
+        "pending:two",
+      ]);
+      expect(fileGuard).toHaveBeenCalledOnce();
+      expect(view.onRightRailTabChange).not.toHaveBeenCalled();
+      // Cancel the first navigation by leaving its commit uncalled; the next fork still pairs.
+      act(() => {
+        useChatStore.setState({ sideChatToOpen: { childId: "child_two", parentId: "conv_ws" } });
+      });
+      expect(readSessionWorkspaceState("conv_ws").openSideChats).toEqual([
+        "child_one",
+        "child_two",
+      ]);
+      expect(fileGuard).toHaveBeenCalledTimes(2);
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      expect(view.onRightRailTabChange).not.toHaveBeenCalled();
+      act(() => fileGuard.mock.calls[1][2]());
+      expect(view.onRightRailTabChange).toHaveBeenCalledOnce();
+      expect(readSessionWorkspaceState("conv_ws").selectedSideChatId).toBe("child_two");
+    } finally {
+      useChatStore.setState({
+        sessionHarness: before.sessionHarness,
+        boundAgentId: before.boundAgentId,
+        send: before.send,
+        sideChatToOpen: null,
+      });
+    }
+  });
+
   it("shows the transcript read-only without edit access", () => {
     canEditMock.mockReturnValue(false);
     writeSessionWorkspaceState("conv_ws", { openSubagentTabs: [SUBAGENT_TAB] });

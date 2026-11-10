@@ -6587,14 +6587,44 @@ describe("AppShell tree preview", () => {
     "opens URL deep links as soft tabs with saved preview %s",
     (preview) => {
       writeSessionWorkspaceState("conv_tree", { treePreviewPath: preview });
-      renderShell("/c/conv_tree?file=README.md", splitInfo);
+      renderShell("/c/conv_tree?file=README.md&line=12", splitInfo);
       expect(readSessionWorkspaceState("conv_tree")).toMatchObject({
         treePreviewPath: preview,
         selectedFilePath: "README.md",
         openFiles: ["README.md"],
       });
       expect(screen.getAllByTestId("file-viewer-inline")).toHaveLength(1);
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-line", "12");
+      expect(screen.getByTestId("url-params")).toHaveTextContent("line=12");
       expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-tree", "false");
     },
   );
+
+  it("keeps citation coordinates when opening a tab from another preview", () => {
+    writeSessionWorkspaceState("conv_tree", { treePreviewPath: "AGENTS.md" });
+    function Citation() {
+      const openFile = useFileViewer();
+      return (
+        <button type="button" onClick={() => openFile?.("README.md", { line: 12 })}>
+          Cite README
+        </button>
+      );
+    }
+    render(
+      <CapabilitiesProvider info={splitInfo}>
+        {sessionShellTree(
+          new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+          "/c/conv_tree",
+          <>
+            <Citation />
+            <LocationDisplay />
+          </>,
+        )}
+      </CapabilitiesProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Cite README" }));
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-line", "12");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("line=12");
+    expect(readSessionWorkspaceState("conv_tree").selectedFilePath).toBe("README.md");
+  });
 });

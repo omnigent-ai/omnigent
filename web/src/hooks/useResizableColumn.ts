@@ -62,7 +62,7 @@ export function useResizableColumn(
   useEffect(() => {
     function onMouseMove(e: MouseEvent) {
       const drag = dragging.current;
-      if (!drag || !containerRef.current) return;
+      if (!drag) return;
       if (resize(drag.startWidth + e.clientX - drag.startX)) drag.changed = true;
     }
     function onMouseUp() {
@@ -88,7 +88,7 @@ export function useResizableColumn(
   return {
     /** Pixel width for the left column (apply as inline style). */
     width,
-    /** Attach to the flex-row container that owns the resize handle. */
+    /** Optional ref for the flex-row container that owns the resize handle. */
     containerRef,
     /** Spread onto the resize handle element at the right edge of the left column. */
     handleProps: {

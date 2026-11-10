@@ -2784,6 +2784,11 @@ describe("file position navigation", () => {
       const navigate = vi.fn();
       act(() => guard!("file2.md", { line: 12 }, navigate));
       expect(navigate).not.toHaveBeenCalled();
+      expect(screen.getByRole("dialog")).toHaveTextContent(
+        keepNavigationGuard
+          ? "Your edits to file1.md will be lost if you leave without saving."
+          : "Your edits will be lost if you leave without saving.",
+      );
       fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
       expect(navigate).not.toHaveBeenCalled();
       expect(draft).toHaveValue("Unsaved draft");
