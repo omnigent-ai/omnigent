@@ -229,20 +229,41 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
 
 
 @pytest.mark.parametrize("cost", [0.0, 0.004, 1.25])
+@pytest.mark.parametrize("usage_field", ["cumulative_cost_usd", "attributed_cost_usd"])
 async def test_child_sessions_cost_excludes_descendants(
-    client: httpx.AsyncClient, db_uri: str, cost: float
+    client: httpx.AsyncClient, db_uri: str, cost: float, usage_field: str
 ) -> None:
     """Child cards report their own priced usage, including a genuine zero."""
     session = await _create_parent_session(client)
     store = SqlAlchemyConversationStore(db_uri)
     child = _seed_child(conv_store=store, parent_id=session["id"], title="worker:task")
     grandchild = _seed_child(conv_store=store, parent_id=child.id, title="worker:nested")
-    store.set_session_usage(child.id, {"total_cost_usd": cost})
+    store.set_session_usage(session["id"], {"total_cost_usd": 20.0, "policy_cost_usd": 25.0})
     store.set_session_usage(grandchild.id, {"total_cost_usd": 10.0})
+    posted = await client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={"type": "external_session_usage", "data": {usage_field: cost}},
+    )
+    assert posted.status_code == 202, posted.text
 
     response = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
     assert response.status_code == 200
     assert response.json()["data"][0]["own_cost_usd"] == cost
+
+    if usage_field == "attributed_cost_usd":
+        rejected = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={"type": "external_session_usage", "data": {usage_field: -1}},
+        )
+        assert rejected.status_code == 400
+        assert store.get_conversation(child.id).session_usage == {"attributed_cost_usd": cost}
+
+    from omnigent.runtime.policies.builder import load_session_usage
+
+    total = load_session_usage(session["id"], store)
+    extra = cost if usage_field == "cumulative_cost_usd" else 0
+    assert total["total_cost_usd"] == pytest.approx(30.0 + extra)
+    assert total["policy_cost_usd"] == pytest.approx(35.0 + extra)
 
 
 async def test_child_sessions_surfaces_durable_failure_error(

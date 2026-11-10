@@ -1876,6 +1876,9 @@ def _persist_native_cumulative_usage(
     - ``cost_complete`` — whether the reporter priced all accumulated usage.
       Native Pi uses this to distinguish a resumable cost baseline from a
       display subtotal that excludes unpriced turns.
+    - ``attributed_cost_usd`` — an agent's cost breakdown already included in
+      another session's billing. Displayed on child summaries only; excluded
+      from subtree totals, budget enforcement and daily charges.
     - ``policy_cost_usd`` — total session cost for ENFORCEMENT (the
       cost-budget gate). claude-native forwards ``max(S, real-time
       transcript estimate)`` here so the gate reflects in-flight sub-agent
@@ -1914,11 +1917,18 @@ def _persist_native_cumulative_usage(
     :raises OmnigentError: When a cumulative field is the wrong type.
     """
     cost = _coerce_cumulative_field(data, "cumulative_cost_usd", numeric=True)
+    attributed_cost = _coerce_cumulative_field(data, "attributed_cost_usd", numeric=True)
     policy_cost = _coerce_cumulative_field(data, "policy_cost_usd", numeric=True)
     cin = _coerce_cumulative_field(data, "cumulative_input_tokens", numeric=False)
     cout = _coerce_cumulative_field(data, "cumulative_output_tokens", numeric=False)
     ccache = _coerce_cumulative_field(data, "cumulative_cache_read_input_tokens", numeric=False)
-    if cost is None and policy_cost is None and cin is None and cout is None:
+    if (
+        cost is None
+        and attributed_cost is None
+        and policy_cost is None
+        and cin is None
+        and cout is None
+    ):
         return None
 
     # Deliberately a FRESH read — never a caller-supplied row. This row is the
@@ -2069,6 +2079,12 @@ def _persist_native_cumulative_usage(
     if policy_cost is not None:
         current["policy_cost_usd"] = max(old_policy_cost, float(policy_cost))
 
+    if attributed_cost is not None:
+        # Claude's parent already bills this spend; keep the child breakdown
+        # outside the summable usage and daily-cost counters.
+        current["attributed_cost_usd"] = max(
+            current.get("attributed_cost_usd", 0.0), float(attributed_cost)
+        )
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup. Native reports cumulative totals, so the turn's
     # delta is the increase in cumulative cost. Uses the authoritative
@@ -2129,6 +2145,7 @@ async def _persist_external_session_usage(
         )
     _CUMULATIVE_USAGE_KEYS = (
         "cumulative_cost_usd",
+        "attributed_cost_usd",
         # ``policy_cost_usd`` alone is a valid post: mid-turn the displayed
         # statusLine total (``cumulative_cost_usd``) is frozen, so the
         # forwarder posts only the advancing real-time enforcement cost.

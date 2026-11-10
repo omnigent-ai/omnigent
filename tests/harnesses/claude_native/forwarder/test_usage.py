@@ -16,6 +16,96 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import omnigent.harnesses.claude_native.forwarder as forwarder
+from omnigent.llms.context_window import ModelPricing
+from tests.harnesses.claude_native.forwarder._support import _seed_subagent_on_disk
+
+
+@pytest.mark.parametrize("failure_status", [400, 429])
+async def test_subagent_cost_is_forwarded_without_new_transcript_items_and_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_status: int
+) -> None:
+    """Backfill settled children, retry failed posts, and dedupe after restart."""
+    parent = tmp_path / "session.jsonl"
+    parent.write_text("", encoding="utf-8")
+    record = {
+        "type": "assistant",
+        "isSidechain": True,
+        "uuid": "reply",
+        "message": {
+            "id": "message-one",
+            "role": "assistant",
+            "model": "test-model",
+            "content": [{"type": "text", "text": "Done"}],
+            "usage": {"input_tokens": 2, "output_tokens": 3},
+        },
+    }
+    child_path = _seed_subagent_on_disk(
+        transcript_path=parent,
+        subagent_id="child",
+        agent_type="Explore",
+        description="Inspect files",
+        tool_use_id="spawn",
+        transcript_records=[record],
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._transcript_model_pricing",
+        lambda *_args, **_kwargs: ModelPricing(input_per_token=0.01, output_per_token=0.02),
+    )
+    bridge_dir = tmp_path / "bridge"
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "child": forwarder.SubagentEntry(
+                subagent_id="child",
+                child_conversation_id="conv_child",
+                byte_offset=child_path.stat().st_size,
+            ),
+        }
+    )
+    cache: dict[Path, forwarder._TranscriptCostCacheEntry] = {}
+    retries = forwarder._PostRetryTracker(max_permanent_attempts=1)
+    attempts: list[dict[str, Any]] = []
+    clock = [100.0]
+    monkeypatch.setattr(forwarder.time, "monotonic", lambda: clock[0])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_child/events"
+        body = json.loads(request.content)
+        assert body["type"] == "external_session_usage"
+        attempts.append(body["data"])
+        return httpx.Response(failure_status if len(attempts) == 1 else 202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://example.test"
+    ) as client:
+
+        async def poll() -> None:
+            nonlocal state
+            state = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=parent,
+                state=state,
+                agent_name="assistant",
+                start_retry_tracker=forwarder._PostRetryTracker(),
+                item_retry_tracker=forwarder._PostRetryTracker(),
+                status_retry_tracker=retries,
+                cost_cache=cache,
+            )
+
+        await poll()
+        assert state.subagents["child"].posted_cost_usd is None
+        await poll()
+        assert len(attempts) == 1
+        clock[0] += 100
+        await poll()
+        assert attempts == [{"attributed_cost_usd": pytest.approx(0.08)}] * 2
+        assert state.subagents["child"].posted_cost_usd == pytest.approx(0.08)
+
+        state = forwarder._read_subagent_forward_state(bridge_dir)
+        cache.clear()
+        await poll()
+        assert len(attempts) == 2
 
 
 def test_usage_from_status_state_surfaces_cumulative_cost() -> None:

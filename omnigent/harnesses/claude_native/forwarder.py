@@ -653,6 +653,7 @@ class SubagentEntry:
         means no observation has been handled yet.
     :param delivery_error: Durable reason the mirrored transcript is
         incomplete. After inactivity it reports ``failed`` instead of idle.
+    :param posted_cost_usd: Last successfully posted transcript-priced own cost.
     """
 
     subagent_id: str
@@ -663,6 +664,7 @@ class SubagentEntry:
     last_activity_ts: float | None = None
     last_status: str | None = None
     delivery_error: str | None = None
+    posted_cost_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1116,6 +1118,7 @@ class _PostRetryTracker:
         *,
         session_id: str,
         max_transient_attempts: int | None = None,
+        retry_permanent: bool = False,
     ) -> _PostRetryDecision:
         """
         Record one failed post and compute the next retry action.
@@ -1125,6 +1128,7 @@ class _PostRetryTracker:
         :param session_id: Session targeted by the failed post.
         :param max_transient_attempts: Optional batch budget before splitting
             into individual requests. Individual transient failures have no limit.
+        :param retry_permanent: Keep optional metadata retrying across server upgrades.
         :returns: Retry decision for this failure.
         """
         # Count every failed post (transient or permanent) so a sustained
@@ -1138,7 +1142,7 @@ class _PostRetryTracker:
         permanent = _is_permanent_http_error(exc)
         not_confirmed = _is_subagent_delivery_not_confirmed(exc)
         give_up = (
-            (permanent and entry.attempts >= self._max_permanent_attempts)
+            (permanent and not retry_permanent and entry.attempts >= self._max_permanent_attempts)
             or (not_confirmed and entry.attempts >= self._max_not_confirmed_attempts)
             or (
                 not permanent
@@ -1643,6 +1647,7 @@ async def forward_claude_transcript_to_session(
                                         status_retry_tracker=subagent_status_retries,
                                         batch_capability=session_event_batch_capability,
                                         status_capability=subagent_status_capability,
+                                        cost_cache=cost_cache,
                                     ),
                                     timeout=_FORWARD_LOOP_STALL_DEADLINE_S,
                                 ),
@@ -1818,6 +1823,9 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             seen_source_ids=tuple(seen_source_ids),
             last_activity_ts=last_activity_ts,
             last_status=last_status,
+            posted_cost_usd=_cumulative_cost_from_status_state(
+                {"total_cost_usd": row.get("posted_cost_usd")}
+            ),
             delivery_error=(
                 row.get("delivery_error") if isinstance(row.get("delivery_error"), str) else None
             ),
@@ -1844,6 +1852,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
                 "delivery_error": entry.delivery_error,
+                "posted_cost_usd": entry.posted_cost_usd,
             }
             for entry in state.subagents.values()
         },
@@ -2305,6 +2314,7 @@ async def _forward_one_subagent(
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability,
     status_capability: _SubagentStatusCapability,
+    cost_cache: dict[Path, _TranscriptCostCacheEntry] | None = None,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches."""
     retry_prefixes = (
@@ -2539,6 +2549,38 @@ async def _forward_one_subagent(
         await checkpoint.put(new_entry)
         if stop_after_batch:
             break
+
+    cost_retry_key = f"subagent_cost:{entry.child_conversation_id}"
+    if status_retry_tracker.retry_delay_s(cost_retry_key) is None:
+        cost = await asyncio.to_thread(
+            _transcript_cost_size_cached,
+            jsonl_path,
+            include_sidechains=True,
+            cache=cost_cache if cost_cache is not None else {},
+        )
+        if cost is not None and (
+            new_entry.posted_cost_usd is None or cost > new_entry.posted_cost_usd
+        ):
+            try:
+                await _post_external_session_usage(
+                    client,
+                    session_id=entry.child_conversation_id,
+                    usage={"attributed_cost_usd": cost},
+                )
+            except httpx.HTTPError as exc:
+                status_retry_tracker.record_failure(
+                    cost_retry_key,
+                    exc,
+                    session_id=entry.child_conversation_id,
+                    retry_permanent=True,
+                )
+                _logger.warning(
+                    "Failed to forward Claude subagent cost; child=%s", entry.child_conversation_id
+                )
+            else:
+                status_retry_tracker.clear(cost_retry_key)
+                new_entry = replace(new_entry, posted_cost_usd=cost)
+                await checkpoint.put(new_entry)
 
     delivery_pending = any(item.item.source_id not in seen for item in pending)
     desired_status: str | None = None
@@ -2782,6 +2824,7 @@ async def _forward_available_subagents(
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability | None = None,
     status_capability: _SubagentStatusCapability | None = None,
+    cost_cache: dict[Path, _TranscriptCostCacheEntry] | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
@@ -2814,6 +2857,7 @@ async def _forward_available_subagents(
         event arrays. A new cache is created for direct callers that omit it.
     :param status_capability: Process-local cache of whether the server accepts
         idle observations. A new cache is created for direct callers that omit it.
+    :param cost_cache: Transcript pricing cache shared with the parent cost reporter.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
@@ -3026,6 +3070,7 @@ async def _forward_available_subagents(
                 status_retry_tracker=status_retry_tracker,
                 batch_capability=batch_capability,
                 status_capability=status_capability,
+                cost_cache=cost_cache,
             )
 
     entries = list(updated.subagents.values())

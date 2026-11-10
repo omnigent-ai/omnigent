@@ -11600,7 +11600,9 @@ def _child_session_summary_from_conversation(
         id=conv.id,
         parent_session_id=parent_session_id,
         title=display_title,
-        own_cost_usd=_priced_cost_for_display(conv.session_usage),
+        own_cost_usd=conv.session_usage.get(
+            "attributed_cost_usd", _priced_cost_for_display(conv.session_usage)
+        ),
         task_summary=conv.task_summary,
         tool=tool,
         session_name=session_name,
