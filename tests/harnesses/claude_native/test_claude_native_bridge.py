@@ -13885,6 +13885,30 @@ _WRAPPED_BTW_PANE = "\n".join(
     ]
 )
 
+_WRAPPED_BACKGROUND_PANEL = """\
+──────────────────────────────────────────────────
+  Background
+  1 active shell
+  ❯ ● make test   running
+  ↑/↓ to select · Enter to view · x to stop · Esc
+  to close
+"""
+
+_WRAPPED_EMPTY_BACKGROUND_PANEL = """\
+─────────────────────────────────────────
+  Background
+  No tasks currently running
+  ↑/↓ to select · Enter to view · Esc to
+  close
+"""
+
+_BOXED_SETTINGS_PANEL = """\
+╭─────────────────────────────────────────╮
+│ Settings                                │
+│ Type to filter · Esc to close           │
+╰─────────────────────────────────────────╯
+"""
+
 
 @pytest.mark.parametrize(
     ("occupied_pane", "after_preflight"),
@@ -13900,6 +13924,12 @@ _WRAPPED_BTW_PANE = "\n".join(
         (_TASK_DETAILS_PANE, True),
         (_WRAPPED_BTW_PANE, False),
         (_WRAPPED_BTW_PANE, True),
+        (_WRAPPED_BACKGROUND_PANEL, False),
+        (_WRAPPED_BACKGROUND_PANEL, True),
+        (_WRAPPED_EMPTY_BACKGROUND_PANEL, False),
+        (_WRAPPED_EMPTY_BACKGROUND_PANEL, True),
+        (_BOXED_SETTINGS_PANEL, False),
+        (_BOXED_SETTINGS_PANEL, True),
     ],
     ids=[
         "reverse-search",
@@ -13913,6 +13943,12 @@ _WRAPPED_BTW_PANE = "\n".join(
         "task-details-after-preflight",
         "wrapped-quick-answer",
         "wrapped-quick-answer-after-preflight",
+        "wrapped-background-panel",
+        "wrapped-background-panel-after-preflight",
+        "wrapped-empty-background-panel",
+        "wrapped-empty-background-panel-after-preflight",
+        "boxed-settings-panel",
+        "boxed-settings-panel-after-preflight",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -14416,9 +14452,17 @@ No changes made to /home/user/.claude.json.
 """
 
 
+@pytest.mark.parametrize(
+    "quoted_panel",
+    ["", _WRAPPED_BACKGROUND_PANEL, _WRAPPED_BTW_PANE, _BOXED_SETTINGS_PANEL],
+    ids=["plain", "background", "quick-answer", "boxed-settings"],
+)
+@pytest.mark.parametrize("after_preflight", [False, True], ids=["initial", "after-preflight"])
 def test_inject_user_message_sends_no_escape_into_launcher_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    quoted_panel: str,
+    after_preflight: bool,
 ) -> None:
     """
     Launcher output shown before the input box is drawn draws no Escape.
@@ -14439,8 +14483,14 @@ def test_inject_user_message_sends_no_escape_into_launcher_output(
     )
 
     captures = {"n": 0}
-    tui = {"pane": _LAUNCHER_OUTPUT_PANE}
+    startup_pane = (
+        quoted_panel + "\n──────────────────────────────\n" + _LAUNCHER_OUTPUT_PANE
+        if quoted_panel
+        else _LAUNCHER_OUTPUT_PANE
+    )
+    tui = {"pane": startup_pane}
     sent: list[str] = []
+    pasted: list[str] = []
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
@@ -14454,11 +14504,15 @@ def test_inject_user_message_sends_no_escape_into_launcher_output(
         del kwargs
         if "capture-pane" in cmd:
             captures["n"] += 1
-            if captures["n"] > 20 and tui["pane"] == _LAUNCHER_OUTPUT_PANE:
+            if after_preflight and captures["n"] == 1:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if captures["n"] > 20 and tui["pane"] == startup_pane:
                 tui["pane"] = _composer_pane()
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
             tui["pane"] = _composer_pane("hello")
+        if "load-buffer" in cmd:
+            pasted.append(Path(cmd[-1]).read_text())
         if cmd[-1] == "Enter":
             tui["pane"] = _composer_pane()
         sent.append(cmd[-1])
@@ -14468,6 +14522,8 @@ def test_inject_user_message_sends_no_escape_into_launcher_output(
     inject_user_message(bridge_dir, content="hello")
 
     assert "Escape" not in sent, f"Escape typed into launcher output: {sent}"
+    assert pasted == ["hello\n"]
+    assert sent.count("Enter") == 1
     assert sent[-1] == "Enter"
 
 
@@ -14513,8 +14569,20 @@ def test_occupied_input_retries_stay_outside_the_double_escape_window(
 
 @pytest.mark.parametrize(
     "occupied_pane",
-    [_REVERSE_SEARCH_PANE, _WRAPPED_BTW_PANE],
-    ids=["search", "wrapped-quick-answer"],
+    [
+        _REVERSE_SEARCH_PANE,
+        _WRAPPED_BTW_PANE,
+        _WRAPPED_BACKGROUND_PANEL,
+        _WRAPPED_EMPTY_BACKGROUND_PANEL,
+        _BOXED_SETTINGS_PANEL,
+    ],
+    ids=[
+        "search",
+        "wrapped-quick-answer",
+        "wrapped-background",
+        "wrapped-empty-background",
+        "boxed-settings",
+    ],
 )
 def test_inject_slash_command_restores_an_occupied_input_box_first(
     tmp_path: Path,
@@ -14551,6 +14619,26 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
         "/effort high",
         "Enter",
     ]
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _WRAPPED_BACKGROUND_PANEL + _IDLE_PANE,
+        _WRAPPED_BACKGROUND_PANEL + "\n──────────────────────────────\nStarting Claude…",
+        _WRAPPED_BACKGROUND_PANEL
+        + "\n╭──────────────────────────────╮\n"
+        + "│ Starting Claude…             │\n"
+        + "╰──────────────────────────────╯",
+    ],
+    ids=["composer", "scrollback", "fresh-box-without-dismissal"],
+)
+def test_wrapped_background_footer_does_not_dismiss_other_screens(
+    monkeypatch: pytest.MonkeyPatch, pane: str
+) -> None:
+    sends = _fake_tmux(monkeypatch, [pane])
+    claude_native_bridge._restore_occupied_input("/tmp/example.sock", "main")
+    assert sends == []
 
 
 class _BootingClaudePane:

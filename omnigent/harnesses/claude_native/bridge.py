@@ -6932,8 +6932,7 @@ def _restore_occupied_input(
         # Nothing an Escape can clear: launcher output before the input box
         # mounts, a dialog that offers no dismissal, or one Escape would quit.
         unclearable = surface == _OVERLAY_SURFACE and (
-            not (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
-            or _escape_quits_claude(pane)
+            not _overlay_escape_hint(pane) or _escape_quits_claude(pane)
         )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
@@ -6967,6 +6966,21 @@ def _restore_occupied_input(
             last_escape = now
         unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _overlay_escape_hint(pane: str) -> bool:
+    """Read dismissal hints from the current footer, beyond any scrollback rule."""
+    lines = [line for line in pane.splitlines() if line.strip()]
+    last_rule = max((index for index, line in enumerate(lines) if _is_box_rule(line)), default=-1)
+    region = lines[last_rule + 1 :]
+    if not region and last_rule >= 0 and lines[last_rule].lstrip().startswith("╰"):
+        # A bordered panel can put its footer just inside its closing rule.
+        previous_rule = max(
+            (index for index in range(last_rule) if _is_box_rule(lines[index])), default=-1
+        )
+        region = lines[previous_rule + 1 : last_rule]
+    footer = "\n".join(region[-_PROMPT_SCAN_TAIL_LINES:])
+    return bool(_ESCAPE_DISMISS_HINT.search(footer)) or _btw_overlay_present(pane)
 
 
 def _escape_quits_claude(pane: str) -> bool:
@@ -7773,7 +7787,7 @@ def _wait_for_claude_prompt_ready(
             bridge_dir is not None
             and remaining > 0
             and _occupying_surface(pane) == _OVERLAY_SURFACE
-            and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+            and _overlay_escape_hint(pane)
             and _terminal_dialog_headline(pane) is None
             and not _escape_quits_claude(pane)
         ):

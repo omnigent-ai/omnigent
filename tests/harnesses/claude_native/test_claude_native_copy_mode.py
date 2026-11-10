@@ -33,7 +33,8 @@ import tty
 from pathlib import Path
 
 received, delivered = map(Path, sys.argv[1:3])
-panel_open = len(sys.argv) > 3 and sys.argv[3] == "btw"
+surface = sys.argv[3] if len(sys.argv) > 3 else ""
+panel_open = surface in {"btw", "background", "empty_background"}
 tty.setraw(sys.stdin.fileno())
 sys.stdout.write("\x1b[?2004h")
 
@@ -44,10 +45,18 @@ def render(draft=""):
     sys.stdout.flush()
 
 
-if panel_open:
+if surface == "btw":
     sys.stdout.write("\x1b[H\x1b[2J" + "▔" * os.get_terminal_size().columns + "\r\n"
         "    /btw do the checks pass?\r\n      Yes, the checks pass.\r\n"
         "    ↑/↓ to scroll · c to copy · f to fork · Esc to close\r\n")
+    sys.stdout.flush()
+elif panel_open:
+    body = ("  No tasks currently running\r\n" if surface == "empty_background"
+        else "  1 active shell\r\n  ❯ ● make test   running\r\n")
+    stop_hint = "" if surface == "empty_background" else "x to stop · "
+    sys.stdout.write("\x1b[H\x1b[2J" + "─" * os.get_terminal_size().columns + "\r\n"
+        + "  Background\r\n" + body
+        + "  ↑/↓ to select · Enter to view · " + stop_hint + "Esc to close\r\n")
     sys.stdout.flush()
 else:
     render()
@@ -134,7 +143,7 @@ def pane(
                     "-s",
                     "main",
                     "-x",
-                    "48" if panel else "120",
+                    {"background": "50", "empty_background": "41", "btw": "48"}.get(panel, "120"),
                     "-y",
                     "24",
                     command,
@@ -154,7 +163,7 @@ def pane(
             # Keys sent before the composer switches its tty to raw mode are
             # flushed by tcsetattr(TCSAFLUSH), so wait for its first render.
             deadline = time.monotonic() + 5.0
-            marker = "▔" if panel else "❯"
+            marker = "Background" if "background" in panel else "▔" if panel else "❯"
             while marker not in bridge._capture_pane(str(socket_path), "main"):
                 assert time.monotonic() < deadline, "The stand-in composer never rendered."
                 time.sleep(0.05)
@@ -197,6 +206,27 @@ def test_quick_answer_can_be_read_and_closed_in_a_narrow_pane(pane: _Pane) -> No
     assert _wait_for_bytes(pane.received, b"\x1b") == b"\x1b"
     bridge.inject_user_message(pane.bridge_dir, content="SENT_AFTER_QUICK_ANSWER", timeout_s=5.0)
     assert json.loads(pane.delivered.read_text()) == ["SENT_AFTER_QUICK_ANSWER"]
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [("emacs", "background"), ("emacs", "empty_background")],
+    indirect=True,
+    ids=["populated", "empty"],
+)
+def test_web_message_dismisses_wrapped_background_panel(
+    pane: _Pane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real terminal wraps the close hint before delivery reclaims the composer."""
+    monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 2.0)
+    captured = bridge._capture_pane(pane.tmux[-1], "main")
+    assert "Esc to close" not in captured
+    assert "Esc\nto close" in captured or "Esc to\nclose" in captured
+
+    bridge.inject_user_message(pane.bridge_dir, content="AFTER_BACKGROUND_PANEL", timeout_s=2.0)
+
+    assert json.loads(pane.delivered.read_text()) == ["AFTER_BACKGROUND_PANEL"]
+    assert pane.received.read_bytes().count(b"\x1b[200~") == 1
 
 
 def test_interrupt_reaches_scrolled_back_pane(pane: _Pane) -> None:
