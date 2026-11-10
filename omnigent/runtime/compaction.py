@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import tiktoken
+from pydantic import ValidationError
 
 from omnigent.entities import (
     CompactionData,
@@ -27,6 +28,7 @@ from omnigent.entities import (
     FunctionCallData,
     FunctionCallOutputData,
     MessageData,
+    NativeToolData,
     parse_item_data,
 )
 from omnigent.llms.adapters._content import redact_binary_payloads
@@ -529,12 +531,16 @@ def compaction_to_history_items(
         items: list[ConversationItem] = []
         for i, msg in enumerate(data.compacted_messages):
             item_type = msg.get("type", "message")
+            if not isinstance(item_type, str) or not item_type:
+                _logger.warning("Invalid compaction snapshot type; restoring summary")
+                break
             payload: dict[str, Any] = dict(msg)
             if (
                 item_type in NATIVE_TOOL_OUTPUT_TYPES
                 or item_type in {"custom_tool_call", "custom_tool_call_output"}
                 or (item_type == "compaction" and "encrypted_content" in msg)
                 or (item_type == "reasoning" and not (msg.get("agent") or msg.get("model")))
+                or (item_type == "message" and msg.get("role") in ("developer", "system"))
             ):
                 item_type = "native_tool"
                 payload.clear()
@@ -548,10 +554,22 @@ def compaction_to_history_items(
                 payload["agent"] = (
                     msg.get("agent") or msg.get("model") or data.model or "compaction"
                 )
-            if item_type == "function_call_output" and isinstance(
-                payload.get("output"), (dict, list)
+            if (
+                item_type == "function_call_output"
+                and "output" in payload
+                and not isinstance(payload["output"], str)
             ):
                 payload["output"] = json.dumps(payload["output"], ensure_ascii=False)
+            try:
+                parsed = parse_item_data(item_type, payload)
+            except ValidationError:
+                _logger.warning(
+                    "Invalid %s compaction snapshot entry; restoring summary", item_type
+                )
+                break
+            except ValueError:
+                item_type = "native_tool"
+                parsed = NativeToolData(item=msg)
             items.append(
                 ConversationItem(
                     id=f"{compaction_item.id}_compacted_{i}",
@@ -559,10 +577,11 @@ def compaction_to_history_items(
                     status="completed",
                     response_id=compaction_item.response_id,
                     created_at=compaction_item.created_at,
-                    data=parse_item_data(item_type, payload),
+                    data=parsed,
                 )
             )
-        return items
+        else:
+            return items
 
     synthetic_user_content = (
         "[This is an automatically generated summary of the prior conversation "
@@ -590,7 +609,7 @@ def compaction_to_history_items(
         data=MessageData(
             role="assistant",
             content=[{"type": "output_text", "text": data.summary}],
-            agent=data.model,
+            agent=data.model or "compaction",
         ),
     )
     return [user_item, assistant_item]
