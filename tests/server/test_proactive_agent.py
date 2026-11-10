@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import threading
 import uuid
 from collections.abc import AsyncIterator
@@ -38,6 +39,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
+from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.helpers import FakeSandboxLauncher
 
@@ -77,8 +79,10 @@ def test_bundle_opts_into_the_inbox_tools_only() -> None:
     spec = load(_BUNDLE)
 
     assert spec.name == PROACTIVE_AGENT_NAME
-    assert spec.tool_groups.user_inbox
-    assert not (spec.tool_groups.scheduled_tasks or spec.tool_groups.browser)
+    groups = dataclasses.asdict(spec.tool_groups)
+    # A new framework group defaults to on, so the bundle must turn it off explicitly.
+    assert groups.pop("user_inbox") is True
+    assert not any(groups.values()), groups
 
 
 def test_seeded_outside_the_seeded_agents_allowlist(
@@ -179,6 +183,7 @@ def _app(db_uri: str, tmp_path: Path, *, enabled: bool, sandbox: bool = True) ->
         inbox_item_store=SqlAlchemyInboxItemStore(db_uri),
         # A callable, like a deployment's per-request gate.
         proactive_agent=lambda: enabled,
+        proactive_agent_settings_store=ProactiveAgentSettingsStore(db_uri),
     )
     # The lifespan seeds built-in agents; these tests skip it.
     app.state.seed_builtin_agents = lambda: _ensure_default_agents(agents, artifacts, cache)
@@ -220,6 +225,21 @@ async def test_session_create_provisions_one_hidden_task(client: httpx.AsyncClie
     assert listed == []
     assert (await client.get(f"/v1/scheduled-tasks/{task.id}")).status_code == 404
     assert (await client.post(f"/v1/scheduled-tasks/{task.id}/run")).status_code == 404
+
+
+async def test_a_user_who_turned_it_off_gets_no_task_until_they_turn_it_on(
+    client: httpx.AsyncClient,
+) -> None:
+    store: Any = client.app.state.scheduled_task_store  # type: ignore[attr-defined]
+    off = await client.put("/v1/proactive-agent/settings/me", json={"enabled": False})
+    assert off.status_code == 200, off.text
+
+    await _create_session(client)
+    assert store.get(proactive_task_id(None)) is None
+
+    await client.put("/v1/proactive-agent/settings/me", json={"enabled": True})
+    await _create_session(client)
+    assert store.get(proactive_task_id(None)) is not None
 
 
 @pytest.mark.parametrize(

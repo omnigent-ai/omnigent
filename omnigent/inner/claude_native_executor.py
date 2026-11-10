@@ -74,6 +74,10 @@ _AUTH_COMMAND_GUIDANCE_MANAGED_SANDBOX = (
     "Claude Code's sign-in runs in its own terminal, so /login and /logout do "
     "nothing from the web chat. " + MANAGED_SANDBOX_SIGN_IN_REMEDY
 )
+_STALE_SESSION_MESSAGE = (
+    "Claude native session is no longer active after /clear; "
+    "open the latest conversation and retry."
+)
 
 # Hold refusals raised before typing until the person answers or frees the box.
 # Report the result before the server's 600 s pending-input lifetime ends.
@@ -192,6 +196,7 @@ class ClaudeNativeExecutor(Executor):
     ) -> None:
         """Apply a routed ``/model`` switch, then inject the message, in one lock hold."""
         async with self._inject_lock:
+            self._require_active_session()
             context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
             context_path.unlink(missing_ok=True)
             if wanted_model_arg is not None:
@@ -344,6 +349,7 @@ class ClaudeNativeExecutor(Executor):
 
     async def _inject_prompt(self, text: str, notices: list[str]) -> None:
         """Inject user text with one-shot context while holding the injection lock."""
+        self._require_active_session()
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
         if notices:
@@ -353,6 +359,11 @@ class ClaudeNativeExecutor(Executor):
         except BaseException:
             context_path.unlink(missing_ok=True)
             raise
+
+    def _require_active_session(self) -> None:
+        """Reject queued input if /clear replaced its conversation while it waited."""
+        if not _session_is_active(self._bridge_dir, self._request_session_id):
+            raise ClaudeMessageNotAccepted(_STALE_SESSION_MESSAGE)
 
     async def run_turn(
         self,
@@ -393,12 +404,7 @@ class ClaudeNativeExecutor(Executor):
         """
         del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
-            yield ExecutorError(
-                message=(
-                    "Claude native session is no longer active after /clear; "
-                    "open the latest conversation and retry."
-                )
-            )
+            yield ExecutorError(message=_STALE_SESSION_MESSAGE, undelivered=True)
             return
         text = _latest_user_text(messages, self._bridge_dir)
         notices = _latest_framework_notices(messages)

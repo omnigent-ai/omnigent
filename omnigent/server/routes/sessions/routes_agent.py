@@ -16,7 +16,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from omnigent.automations_availability import AUTOMATIONS_HEADER
+from omnigent.automations_availability import AUTOMATIONS_HEADER, USER_INBOX_HEADER
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
@@ -36,6 +36,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
 )
 from omnigent.server.bundles import bundle_location, redacted_agent_bundle, validate_agent_bundle
@@ -44,6 +45,7 @@ from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     can_mutate_session_agent as _can_mutate_session_agent,
 )
+from omnigent.server.routes._auth_helpers import get_session_owner_id
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
@@ -288,6 +290,16 @@ def register_agent_routes(
         automations_available = getattr(request.app.state, "automations_available", None)
         if automations_available is not None:
             selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
+        inbox_enabled_for = getattr(request.app.state, "proactive_agent_enabled_for", None)
+        if inbox_enabled_for is not None:
+            # For the session's owner, whoever downloads the bundle for it.
+            owner = (
+                await asyncio.to_thread(get_session_owner_id, session_id, permission_store)
+                if permission_store is not None
+                else RESERVED_USER_LOCAL
+            )
+            inbox_on = owner is not None and await asyncio.to_thread(inbox_enabled_for, owner)
+            selection_headers[USER_INBOX_HEADER] = "1" if inbox_on else "0"
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",

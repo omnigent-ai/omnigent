@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
+from collections.abc import Callable
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -22,6 +23,7 @@ from omnigent.db.account_authority import account_generation
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import ScheduledTask
+from omnigent.server.auth import RESERVED_USER_LOCAL
 
 _logger = logging.getLogger(__name__)
 
@@ -83,6 +85,22 @@ def proactive_agent_available(app_state: Any) -> bool:
         return bool(available())
     except Exception:
         _logger.warning("proactive_agent gate failed; treating as off", exc_info=True)
+        return False
+
+
+def proactive_agent_enabled_for(app_state: Any, user_id: str | None) -> bool:
+    """Whether the agent is on for *user_id*: the deployment gate and both settings.
+
+    Reads the settings store, so call it off the event loop, in the user's
+    request or identity scope. A failing check is off.
+    """
+    enabled_for = getattr(app_state, "proactive_agent_enabled_for", None)
+    if enabled_for is None:
+        return False
+    try:
+        return bool(enabled_for(user_id or RESERVED_USER_LOCAL))
+    except Exception:
+        _logger.warning("proactive_agent settings check failed; treating as off", exc_info=True)
         return False
 
 
@@ -181,15 +199,20 @@ class ProactiveProvisioner:
         user_id: str | None,
         timezone: str,
         scheduler: Any | None,
+        enabled: Callable[[str | None], bool] | None = None,
     ) -> ScheduledTask | None:
         """Ensure the row off the event loop, then arm the in-process timer on it.
 
         :param scheduler: Legacy in-process scheduler, or ``None`` when persistent
             dispatch picks the row up from the database.
+        :param enabled: Whether the agent is on for the user; while it is off,
+            nothing is created and the next session create checks again.
         """
         key = _provision_key(user_id)
         self._running.add(key)
         try:
+            if enabled is not None and not await asyncio.to_thread(enabled, user_id):
+                return None
             task = await asyncio.to_thread(self.ensure_task, store, agent_store, user_id, timezone)
             if task is not None and scheduler is not None:
                 # Re-adding replaces the timer, so a row left by a failed attempt is armed too.
@@ -204,9 +227,9 @@ def start_provisioning(request: Any, user_id: str | None) -> _ProvisionTask | No
     """Start provisioning the caller's proactive task alongside a session create.
 
     Runs inside the request, so a store that creates per-owner authorization
-    acts as the caller. Skipped when the gate is off for the caller, this
-    process already provisioned the caller, or the deployment cannot launch
-    managed sandboxes.
+    acts as the caller. Skipped when the deployment gate or either setting is
+    off for the caller, this process already provisioned the caller, or the
+    deployment cannot launch managed sandboxes.
     """
     try:
         return _start_provisioning(request, user_id)
@@ -235,7 +258,14 @@ def _start_provisioning(request: Any, user_id: str | None) -> _ProvisionTask | N
     if not getattr(state, "scheduled_task_dispatch_enabled", False):
         scheduler = getattr(state, "scheduled_task_scheduler", None)
     task = asyncio.create_task(
-        provisioner.provision(store, agent_store, user_id, timezone, scheduler)
+        provisioner.provision(
+            store,
+            agent_store,
+            user_id,
+            timezone,
+            scheduler,
+            enabled=lambda owner: proactive_agent_enabled_for(state, owner),
+        )
     )
     task.add_done_callback(_log_provisioning_failure)
     return task
@@ -260,8 +290,8 @@ async def finish_provisioning(task: _ProvisionTask | None) -> None:
 
 def fire_skip_reason(app_state: Any, agent_store: Any, task: ScheduledTask) -> str | None:
     """Why a proactive task should not run now, or ``None`` to run it."""
-    if not proactive_agent_available(app_state):
-        return "proactive agent is turned off"
+    if not proactive_agent_enabled_for(app_state, task.user_id):
+        return "proactive agent is turned off for this user"
     if agent_store.get(task.agent_id) is None:
         return "proactive agent is not available"
     return None

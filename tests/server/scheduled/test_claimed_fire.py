@@ -693,7 +693,7 @@ async def test_proactive_gate_is_checked_as_the_task_owner(store) -> None:
     from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
 
     owner: contextvars.ContextVar[str | None] = contextvars.ContextVar("owner", default=None)
-    seen: list[str | None] = []
+    seen: list[tuple[str | None, str]] = []
 
     @contextlib.asynccontextmanager
     async def identity(task: ScheduledTask) -> AsyncIterator[None]:
@@ -703,15 +703,15 @@ async def test_proactive_gate_is_checked_as_the_task_owner(store) -> None:
         finally:
             owner.reset(token)
 
-    def gate() -> bool:
-        seen.append(owner.get())
+    def enabled_for(user_id: str) -> bool:
+        seen.append((owner.get(), user_id))
         return False
 
     claimed = _claim(store, agent_id=PROACTIVE_AGENT_ID)
     deps = _deps(store)
     # The agent is shipped, so only the gate can skip the run.
     deps.agent_store = FakeAgentStore({PROACTIVE_AGENT_ID: _FakeAgent(PROACTIVE_AGENT_ID)})
-    deps.app_state = SimpleNamespace(proactive_agent_available=gate)
+    deps.app_state = SimpleNamespace(proactive_agent_enabled_for=enabled_for)
     dispatch = AsyncMock()
 
     await ClaimedRunExecutor(deps, fire_identity=identity, launch_dispatch=dispatch).fire(
@@ -720,7 +720,8 @@ async def test_proactive_gate_is_checked_as_the_task_owner(store) -> None:
 
     [run] = _runs(store, claimed.task)
     assert (run.status, run.error_code) == ("skipped", "proactive_agent_off")
-    assert seen == ["task-owner"]
+    # Checked for the task's owner, inside the owner's identity scope.
+    assert seen == [("task-owner", claimed.task.user_id or "local")]
     dispatch.assert_not_awaited()
     assert store.get(claimed.task.id).state == "active"
 
@@ -730,7 +731,7 @@ async def test_proactive_task_skips_when_its_agent_is_not_shipped(store) -> None
 
     claimed = _claim(store, agent_id=PROACTIVE_AGENT_ID)
     deps = _deps(store)
-    deps.app_state = SimpleNamespace(proactive_agent_available=lambda: True)
+    deps.app_state = SimpleNamespace(proactive_agent_enabled_for=lambda _user: True)
     dispatch = AsyncMock()
 
     await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)

@@ -23,6 +23,7 @@ tool_groups:
   comments: false
   policies: false
   agent_discovery: false
+  projects: false
 
 async: false
 
@@ -78,7 +79,9 @@ prompt: |
      - `reminder`: something to raise or send, with `expires_at` when it is
        tied to a date.
      Put the thing the item is about first in `links`, keep the title to one
-     line, and explain why in the body. A `pr` or `url` link's `ref` is a full
+     line, and explain why in the body. The card lists `links` under
+     "Source", so list every session, pull request, or page the item is
+     based on there instead of writing "Based on ..." in the body. A `pr` or `url` link's `ref` is a full
      URL with its scheme, such as `https://github.com/owner/repo/pull/123`; a
      `session` link's `ref` is the session id.
   4. Add up to three `actions` when a new session could act on the item. Each
