@@ -123,6 +123,29 @@ def test_a_lost_slot_is_retried_when_replacing_an_expired_item(
     assert calls["n"] == 2
 
 
+def test_a_post_outlasts_successive_slot_conflicts(
+    store: SqlAlchemyInboxItemStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent posts that keep taking the chosen slot do not fail a post while slots remain."""
+    real_insert = store._insert
+    calls = {"n": 0}
+
+    def lose_to_a_competitor(item: NewInboxItem, retire: str | None) -> object:
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            # A competitor commits into the slot this attempt picked.
+            real_insert(_new(dedupe_key=f"v1:competitor-{calls['n']}"), None)
+            raise IntegrityError("INSERT", {}, Exception("duplicate session slot"))
+        return real_insert(item, retire)
+
+    monkeypatch.setattr(store, "_insert", lose_to_a_competitor)
+
+    created = store.create(_new(dedupe_key="v1:target"))
+
+    assert created.dedupe_key == "v1:target"
+    assert calls["n"] == 5
+
+
 def test_oversized_text_is_rejected(store: SqlAlchemyInboxItemStore) -> None:
     incompressible = "".join(chr(0x4E00 + (n * 7919) % 20000) for n in range(9000))
 
