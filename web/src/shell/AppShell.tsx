@@ -2328,6 +2328,7 @@ function AppShellImpl() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setTasksPanelOpen(false); // close mobile tasks drawer
     setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setContentSearchPanelOpen(false); // close mobile content-search drawer
     setGithubPanelOpen(true);
