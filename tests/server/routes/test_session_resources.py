@@ -10740,6 +10740,57 @@ async def test_selected_pr_reaches_offline_host(
             assert captured["params"]["base_sha"] == "b" * 40
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource", "params", "op", "host_error", "status"),
+    [
+        (
+            "/commits",
+            {"head_sha": "a" * 40},
+            "github_commits",
+            "unknown fs op: 'github_commits'",
+            404,
+        ),
+        (
+            "/commit-diff",
+            {"commit_sha": "c" * 40},
+            "github_commit_diff",
+            "unknown fs op: 'github_commit_diff'",
+            404,
+        ),
+        (
+            "/commits",
+            {"head_sha": "a" * 40},
+            "github_commits",
+            "Expected head_sha to be a full commit SHA",
+            400,
+        ),
+    ],
+)
+async def test_offline_host_predating_commit_ops_reports_not_found(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+    params: dict[str, str],
+    op: str,
+    host_error: str,
+    status: int,
+) -> None:
+    """An older host's 400 for an op it lacks reads as a missing route."""
+    from omnigent.server.routes import _host_filesystem
+
+    async def read(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["op"] == op
+        raise _host_filesystem.HostFsError(400, "invalid_request", host_error)
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
+    response = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}",
+        params={"pr_url": "https://github.com/example/second/pull/42", **params},
+    )
+    assert response.status_code == status, response.text
+
+
 async def test_pr_attachment_uses_bound_session_when_runner_offline(
     offline_env_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
