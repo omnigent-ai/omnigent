@@ -123,6 +123,23 @@ describe("assistant workspace markdown images", () => {
     },
   );
 
+  it("loads a typed WebP blob when MIME metadata is absent", async () => {
+    const content =
+      "UklGRj4AAABXRUJQVlA4IDIAAADQAQCdASoBAAEAAUAmJaACdLoB+AADsAD+6SIf+8+fufP3" +
+      "Pn/Rn/+U/fI4/kcf/KBAAA==";
+    fetchMock.mockResolvedValue(
+      imageResponse({ path: "shot.webp", content_type: null, content, bytes: 70 }),
+    );
+    renderMarkdown("![Screenshot](shot.webp)");
+
+    await screen.findByRole("button", { name: "Zoom image: Screenshot" });
+    expect(screen.getByRole("img", { name: "Screenshot" })).toHaveAttribute(
+      "src",
+      "blob:workspace-image-1",
+    );
+    expect(createObjectURL.mock.calls[0][0]).toMatchObject({ size: 70, type: "image/webp" });
+  });
+
   it.each([
     ["shot.png", "shot.png"],
     ["./shot.png", "shot.png"],
@@ -189,6 +206,8 @@ describe("assistant workspace markdown images", () => {
     ["old server", () => imageResponse({}, false)],
     ["SVG", () => imageResponse({ content_type: "image/svg+xml" })],
     ["HTML", () => imageResponse({ content_type: "text/html" })],
+    ["empty MIME type", () => imageResponse({ content_type: "" })],
+    ["unknown MIME type", () => imageResponse({ content_type: "application/octet-stream" })],
     ["truncated", () => imageResponse({ truncated: true })],
     ["oversized", () => imageResponse({ bytes: MAX_IMAGE_BYTES + 1 })],
     [
