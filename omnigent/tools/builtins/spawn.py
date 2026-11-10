@@ -551,11 +551,9 @@ class SysSessionListTool(Tool):
             "for children or sys_session_message for independent sessions. "
             "Pass agent_name to filter the global list to "
             "sessions running that agent, and include_archived to also list "
-            "archived sessions (marked archived). Calls without pagination keep "
-            "the complete result while it fits the tool-output budget; "
-            "larger global session lists return a page with has_more "
-            "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
-            "complete."
+            "archived sessions (marked archived). 'sessions' returns the newest 50 by "
+            "default; when more remain, pass page.next_cursor as cursor to continue. "
+            "sub_agents stays complete."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -606,8 +604,7 @@ class SysSessionListTool(Tool):
                             "minimum": 1,
                             "maximum": 100,
                             "description": (
-                                "Optional maximum rows returned from 'sessions'. "
-                                "Omit it to keep the complete result while it fits."
+                                "Optional maximum rows returned from 'sessions'. Defaults to 50."
                             ),
                         },
                         "cursor": {
