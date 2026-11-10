@@ -992,6 +992,27 @@ Cross-harness journeys:
   retained bridge state and an absent bridge directory. Machine-wide Codex
   managed settings require an isolated container for the local model endpoint.
 - **`chat-render`, `steer`, per harness:** use the matrix.
+- **`chat-render`, `steer`, Claude paste acknowledgement:**
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter`
+  checks delayed drafts, fresh native records, Stop and changed owners. An
+  unobserved paste waits without another paste or Enter. A confirmed native
+  record needs no further typing; an unresolved delivery asks the person to
+  inspect the terminal and preserves its running work. Framework context stays
+  with its exact prompt and native launch; later identical prompts wait for an
+  earlier unresolved submission hook. Exact plain `/help` needs no prompt-hook
+  fence; `/help` with required attachment context is refused before typing.
+  An older running terminal without the
+  current SessionStart hook must finish its work and be stopped, then reopened
+  to resume before receiving web input. Updating its settings or advertisement
+  alone does not establish hook adoption.
+  The bridge component checks use scripted terminal frames;
+  `tests/harnesses/claude_native/test_framework_context.py` checks context
+  ownership and local-command completion. Run
+  `tests/e2e/test_claude_native_delivery_timeout_e2e.py` for the real tmux/PTY
+  boundary: delayed visible and hidden drafts, Stop and the delivery watchdog.
+  On a disposable slow Claude session, send once during terminal recovery;
+  verify one prompt after recovery and no later delivery after Stop. Check the
+  terminal before retrying an unconfirmed send.
 - **`chat-render`, Claude shell commands from the web composer:**
   `tests/browser_ui/chat/test_native_shell_settlement.py::test_shell_mirror_settles_its_bubble_before_the_next_prompt`
   drives the built SPA at desktop and phone widths with controlled backend

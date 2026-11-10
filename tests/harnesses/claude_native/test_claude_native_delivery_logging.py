@@ -21,7 +21,7 @@ from omnigent.native.input_diagnostics import input_delivery_scope
         ("normal", "draft_absent", "returned"),
         ("session_fallback", "draft_absent", "returned"),
         ("unknown_command", "draft_absent", "returned"),
-        ("blank_line", "unverified", "returned"),
+        ("blank_line", "unconfirmed_paste", "error"),
         ("retry", "draft_absent", "returned"),
         ("timeout", "draft_still_present", "error"),
         ("empty_capture", "inconclusive_capture", "error"),
@@ -116,6 +116,9 @@ def test_delivery_diagnostics(
     monkeypatch.setattr(bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.06)
     monkeypatch.setattr(bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge.write_tmux_target(tmp_path, socket_path=Path("/unused/socket"), tmux_target="main")
 
     if scenario == "session_fallback":
         (tmp_path / bridge._CONFIG_FILE).write_text(
@@ -217,8 +220,8 @@ def test_delivery_diagnostics(
         assert attrs["draft_seen"] is False
         assert attrs["draft_needle_visible_below_prompt"] is True
         assert attrs["leading_blank_line"] is True
-        assert attrs["submit_sent"] is True
-        assert enters == 1
+        assert attrs["submit_sent"] is False
+        assert enters == 0
         assert pane == "❯ \n" + secret
     elif scenario in {"normal", "retry", "timeout", "empty_capture", "missing_glyph"}:
         assert attrs["retries"] == enters - 1

@@ -232,7 +232,8 @@ def trace_delivery(
                     last_attempt = trace.attempts[-1] if trace.attempts else {}
                     verification = last_attempt.get("verification", "not_started")
                     uncertain = any(
-                        attempt.get("verification") != "draft_absent" for attempt in trace.attempts
+                        attempt.get("verification") not in {"draft_absent", "native_recorded"}
+                        for attempt in trace.attempts
                     )
                     level = logging.WARNING if outcome != "returned" or uncertain else logging.INFO
                     if _logger.isEnabledFor(level):
@@ -252,7 +253,9 @@ def trace_delivery(
                             "outcome": outcome,
                             "verification": verification,
                             "delivery_outcome": (
-                                "draft_cleared"
+                                "native_recorded"
+                                if outcome == "returned" and verification == "native_recorded"
+                                else "draft_cleared"
                                 if outcome == "returned" and verification == "draft_absent"
                                 else "unknown"
                             ),

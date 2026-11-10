@@ -1494,6 +1494,7 @@ async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
 @pytest.mark.asyncio
 async def test_create_terminal_publishes_bridge_tmux_target(
     client: httpx.AsyncClient,
+    registry: TerminalRegistry,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1510,6 +1511,21 @@ async def test_create_terminal_publishes_bridge_tmux_target(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
     )
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.harnesses.claude_native.framework_context import (
+        prompt_framework_context_capability_ready,
+    )
+
+    derived = bridge.prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    bridge.record_hook_event(
+        derived, {"hook_event_name": "SessionStart", "session_id": "native-session"}
+    )
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    bridge.write_tmux_target(
+        derived, socket_path=instance.socket_path, tmux_target=instance.tmux_target
+    )
+    assert bridge.read_delivery_owner(derived).launch_id is None
 
     resp = await client.post(
         "/v1/sessions/conv_abc/resources/terminals",
@@ -1525,12 +1541,13 @@ async def test_create_terminal_publishes_bridge_tmux_target(
     )
 
     assert resp.status_code == 200
-    from omnigent.harnesses.claude_native.bridge import bridge_dir_for_conversation_id
-
-    derived = bridge_dir_for_conversation_id("conv_abc")
     payload = json.loads((derived / "tmux.json").read_text(encoding="utf-8"))
     assert payload["socket_path"] == str(tmp_path / "bash-s1.sock")
     assert payload["tmux_target"] == "main"
+    assert registry.get("conv_abc", "bash", "s1") is instance
+    assert payload["launch_id"] == instance.lifecycle_trace.launch_id
+    assert payload["instance_id"] == instance.diagnostic_id
+    assert not prompt_framework_context_capability_ready(derived)
 
 
 @pytest.mark.asyncio

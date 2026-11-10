@@ -57,7 +57,7 @@ import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -82,6 +82,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
     capture_submit_boundary,
     has_matching_hook_refusal,
+    read_fresh_submit_records,
 )
 from omnigent.harnesses.diagnostics import (
     SIGN_IN_RESEND_STEP,
@@ -172,6 +173,16 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
 
     @functools.wraps(function)
     def wrapped(bridge_dir: Path, *args: Any, **kwargs: Any) -> Any:
+        ownership = _INJECTION_OWNERSHIP.get()
+        token = _INJECTION_OWNERSHIP.set(
+            ownership or _InjectionOwnership(bridge_dir, read_delivery_owner(bridge_dir))
+        )
+        try:
+            return _locked(bridge_dir, *args, **kwargs)
+        finally:
+            _INJECTION_OWNERSHIP.reset(token)
+
+    def _locked(bridge_dir: Path, *args: Any, **kwargs: Any) -> Any:
         with (
             _cancellable_injection_lock(_bridge_injection_lock(bridge_dir)),
             _cancellable_injection_lock(_bridge_injection_file_lock(bridge_dir)),
@@ -755,20 +766,50 @@ class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
     """A fresh matching native refusal stops retries without proving web ownership."""
 
 
+class ClaudeDeliveryUnconfirmed(RuntimeError):
+    """A pasted message has no conclusive native acknowledgement and must not be replayed."""
+
+
 @contextlib.contextmanager
-def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
+def cancellable_injection(
+    cancel_event: threading.Event,
+    *,
+    expected_owner: ClaudeDeliveryOwner | None = None,
+    bridge_dir: Path | None = None,
+) -> Iterator[_InjectionOwnership | None]:
     """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
     token = _INJECTION_CANCEL_EVENT.set(cancel_event)
+    ownership_token = None
+    ownership = None
+    if expected_owner is not None and bridge_dir is not None:
+        ownership = _InjectionOwnership(bridge_dir, expected_owner)
+        ownership_token = _INJECTION_OWNERSHIP.set(ownership)
     try:
-        yield
+        yield ownership
     finally:
         _INJECTION_CANCEL_EVENT.reset(token)
+        if ownership_token is not None:
+            _INJECTION_OWNERSHIP.reset(ownership_token)
 
 
 def _check_injection_cancelled() -> None:
     cancel_event = _INJECTION_CANCEL_EVENT.get()
     if cancel_event is not None and cancel_event.is_set():
         raise ClaudeInjectionCancelled("Claude Code message delivery was cancelled")
+    ownership = _INJECTION_OWNERSHIP.get()
+    if ownership is not None:
+        current = _current_delivery_owner(ownership.bridge_dir, ownership.owner)
+        if current is not None:
+            ownership.owner = current
+        elif ownership.wrote_input:
+            raise ClaudeDeliveryUnconfirmed(
+                "Claude's conversation or terminal changed after typing began. "
+                "Inspect the terminal before retrying."
+            )
+        else:
+            raise ClaudeMessageNotAccepted(
+                "Claude's conversation or terminal changed before typing; nothing was sent."
+            )
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -2561,18 +2602,23 @@ def build_hook_settings(
         "--bridge-dir",
         str(bridge_dir),
     ]
-    # Most prompts carry no framework context, so the shell answers those.
-    framework_context_file = shlex.quote(str(bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE))
+    # Avoid Python when no web input is awaiting its submission hook.
+    from omnigent.harnesses.claude_native.framework_context import PROMPT_FRAMEWORK_CONTEXT_DIR
+
+    framework_context_dir = shlex.quote(str(bridge_dir / PROMPT_FRAMEWORK_CONTEXT_DIR))
     framework_context_hook = {
         "type": "command",
         "command": (
-            f"if [ ! -e {framework_context_file} ]; then cat >/dev/null; exit 0; fi; "
+            f"if [ ! -d {framework_context_dir} ]; then cat >/dev/null; exit 0; fi; "
             f"{_python_hook_command(framework_context_parts)} 2>> {observer_stderr}"
         ),
     }
     session_start_hook = {
         "type": "command",
-        "command": command,
+        "command": (
+            f"{_python_hook_command([*command_parts, '--prompt-framework-context'])} "
+            f"2>> {observer_stderr}"
+        ),
     }
     # ``MessageDisplay`` fires once per streamed assistant-text chunk and
     # Claude blocks on the hook, so the hot path must not even pay an
@@ -3178,6 +3224,16 @@ def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str
     return args
 
 
+def is_root_claude_hook_payload(payload: Mapping[str, object]) -> bool:
+    """Exclude agent-marked and subagent-transcript hook payloads from root identity."""
+    agent_id = payload.get("agent_id")
+    transcript_path = payload.get("transcript_path")
+    return not (
+        (isinstance(agent_id, str) and bool(agent_id))
+        or (isinstance(transcript_path, str) and "subagents" in Path(transcript_path).parts)
+    )
+
+
 def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
     """
     Record one Claude Code hook payload in the bridge directory.
@@ -3205,10 +3261,7 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
             state["last_hook_event_name"] = event_name
         claude_session_id = payload.get("session_id")
         transcript_path = payload.get("transcript_path")
-        agent_id = payload.get("agent_id")
-        child_identity = (isinstance(agent_id, str) and bool(agent_id)) or (
-            isinstance(transcript_path, str) and "subagents" in Path(transcript_path).parts
-        )
+        child_identity = not is_root_claude_hook_payload(payload)
         pinned = state.get("claude_session_id")
         # Identity pin: only a SessionStart or an event from the already-pinned
         # session may change transcript/session identity; a side-channel event
@@ -4492,6 +4545,8 @@ def write_tmux_target(
     socket_path: Path,
     tmux_target: str,
     pid: int | None = None,
+    launch_id: str | None = None,
+    instance_id: str | None = None,
 ) -> None:
     """
     Advertise the tmux socket + target for the Claude terminal.
@@ -4506,6 +4561,8 @@ def write_tmux_target(
         socket, e.g. ``Path("/tmp/.../tmux.sock")``.
     :param tmux_target: tmux pane target string, e.g. ``"claude:0.0"``.
     :param pid: Optional Claude process pid, recorded for diagnostics.
+    :param launch_id: Immutable terminal launch identity when the runner owns it.
+    :param instance_id: Terminal instance identity used by the launch's hook evidence.
     :returns: None.
     """
     _ensure_secure_dir(bridge_dir)
@@ -4516,7 +4573,96 @@ def write_tmux_target(
     }
     if pid is not None:
         payload["pid"] = pid
-    _write_json_file(bridge_dir / _TMUX_FILE, payload)
+    if launch_id is not None:
+        payload["launch_id"] = launch_id
+    if instance_id is not None:
+        payload["instance_id"] = instance_id
+    with _bridge_metadata_write_lock(bridge_dir):
+        _write_json_file(bridge_dir / _TMUX_FILE, payload)
+
+
+@dataclass(frozen=True)
+class ClaudeDeliveryOwner:
+    """The conversation and terminal launch a pending injection may still affect."""
+
+    session_id: str | None
+    native_session_id: str | None
+    socket_path: str | None
+    tmux_target: str | None
+    launch_id: str | None
+    legacy_advertisement: tuple[int, int, int] | None
+    instance_id: str | None = None
+
+
+def read_delivery_owner(bridge_dir: Path) -> ClaudeDeliveryOwner:
+    """Use immutable launch identity, retaining file identity for older advertisements."""
+    path = bridge_dir / _TMUX_FILE
+    info = _read_json_file(path)
+    info = info if isinstance(info, dict) else {}
+    launch_id = info.get("launch_id")
+    launch_id = launch_id if isinstance(launch_id, str) and launch_id else None
+    legacy_advertisement = None
+    if launch_id is None:
+        with contextlib.suppress(OSError):
+            stat = path.stat()
+            legacy_advertisement = stat.st_dev, stat.st_ino, stat.st_mtime_ns
+    socket_path, tmux_target = info.get("socket_path"), info.get("tmux_target")
+    instance_id = info.get("instance_id")
+    return ClaudeDeliveryOwner(
+        session_id=read_active_session_id(bridge_dir),
+        native_session_id=read_claude_session_id(bridge_dir),
+        socket_path=socket_path if isinstance(socket_path, str) else None,
+        tmux_target=tmux_target if isinstance(tmux_target, str) else None,
+        launch_id=launch_id,
+        legacy_advertisement=legacy_advertisement,
+        instance_id=instance_id if isinstance(instance_id, str) and instance_id else None,
+    )
+
+
+def _current_delivery_owner(
+    bridge_dir: Path, expected: ClaudeDeliveryOwner
+) -> ClaudeDeliveryOwner | None:
+    """Allow a cold native identity only when this captured launch recorded its start."""
+    current = read_delivery_owner(bridge_dir)
+    if current == expected:
+        return current
+    if (
+        expected.native_session_id is not None
+        or current.native_session_id is None
+        or not expected.instance_id
+        or not expected.launch_id
+        or replace(expected, native_session_id=current.native_session_id) != current
+    ):
+        return None
+    from omnigent.harnesses.claude_native.lifecycle import read_lifecycle_snapshot
+
+    lifecycle = read_lifecycle_snapshot(bridge_dir, expected.instance_id, expected.launch_id)
+    start = lifecycle.get("session_start")
+    matched = (
+        lifecycle.get("read_status") == "ok"
+        and lifecycle.get("claude_session_id") == current.native_session_id
+        and lifecycle.get("session_end") is None
+        and isinstance(start, dict)
+        and start.get("bridge_session_id") == expected.session_id
+    )
+    return current if matched else None
+
+
+def delivery_owner_is_current(bridge_dir: Path, expected: ClaudeDeliveryOwner) -> bool:
+    """Whether an injection still addresses its captured conversation and native launch."""
+    return _current_delivery_owner(bridge_dir, expected) is not None
+
+
+@dataclass
+class _InjectionOwnership:
+    bridge_dir: Path
+    owner: ClaudeDeliveryOwner
+    wrote_input: bool = False
+
+
+_INJECTION_OWNERSHIP: ContextVar[_InjectionOwnership | None] = ContextVar(
+    "claude_injection_ownership", default=None
+)
 
 
 @delivery_diagnostics.trace_delivery(
@@ -4713,34 +4859,48 @@ def _paste_and_submit(
     # Clear stale text first, or the paste lands inside the person's draft and
     # Enter submits both together.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
-    transcript_before_paste = _capture_pane(socket_path, tmux_target)
+    ownership = _INJECTION_OWNERSHIP.get()
+    owner = ownership.owner if ownership is not None else read_delivery_owner(bridge_dir)
+    transcript_path = read_transcript_path(bridge_dir)
+    paste_boundary = (
+        capture_submit_boundary(transcript_path, owner.native_session_id)
+        if transcript_path is not None and owner.native_session_id is not None
+        else None
+    )
+
+    def owns_paste() -> bool:
+        return (
+            owner.socket_path is not None
+            and owner.tmux_target is not None
+            and delivery_owner_is_current(bridge_dir, owner)
+        )
+
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
         bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
     )
-    box = _composer_box(pane)
-    # A TUI that submits the paste itself leaves an empty box and a new transcript line.
-    submitted_by_paste = bool(needle) and (
-        pane.count(needle) > transcript_before_paste.count(needle)
+    delivery_diagnostics.record_draft(
+        pane=pane,
+        needle=needle,
+        prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+        draft_seen=draft_seen,
+        start=paste_wait_started,
+        polls=polls,
+        empty_captures=empty_captures,
     )
-    if (
-        not draft_seen
-        and not submitted_by_paste
-        and (box is None or (box.framed and "".join(box.rows).strip() == _CLAUDE_PROMPT_GLYPH))
-    ):
-        # A resuming TUI can drop the paste, then remount an empty composer
-        # before the draft wait ends. Recover once before sending any Enter.
-        delivery_diagnostics.set_stage("waiting_for_composer")
-        _wait_for_claude_prompt_ready(
+    waited_for_paste = bool(needle) and not draft_seen and not has_pending_user_prompt(bridge_dir)
+    if waited_for_paste:
+        pane = _wait_for_unobserved_paste(
             socket_path,
             tmux_target,
-            timeout_s=_TMUX_READY_TIMEOUT_S,
-            bridge_dir=bridge_dir,
-            extend_for_slow_boot=False,
+            needle=needle,
+            tail_needle=tail_needle,
+            text=text,
+            boundary=paste_boundary,
+            owns_paste=owns_paste,
         )
-        _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
-        draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-            bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
-        )
+        if pane is None:
+            return
+        draft_seen = True
     delivery_diagnostics.record_draft(
         pane=pane,
         needle=needle,
@@ -4765,6 +4925,11 @@ def _paste_and_submit(
         if transcript_path is not None and native_session_id is not None
         else None
     )
+    if waited_for_paste and not owns_paste():
+        raise ClaudeDeliveryUnconfirmed(
+            "Claude's session changed while this message was waiting for its pasted draft. "
+            "Inspect the terminal before retrying; the message may already have arrived."
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
@@ -4801,6 +4966,77 @@ def _paste_and_submit(
     raise ClaudeMessageNotAccepted(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
+    )
+
+
+def _wait_for_unobserved_paste(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    needle: str,
+    tail_needle: str,
+    text: str,
+    boundary: SubmitBoundary | None,
+    owns_paste: Callable[[], bool],
+) -> str | None:
+    """Wait without typing until the pasted draft or a fresh native receipt appears."""
+    delivery_diagnostics.set_stage("waiting_for_paste_ack")
+    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+    expected = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    another_prompt_observed = False
+    while time.monotonic() < deadline:
+        _check_injection_cancelled()
+        if not owns_paste():
+            break
+        if boundary is not None:
+            for entry in read_fresh_submit_records(boundary):
+                if (
+                    entry.get("type") != "user"
+                    or entry.get("sessionId") != boundary.native_session_id
+                    or entry.get("isSidechain") is True
+                    or entry.get("isMeta") is True
+                    or entry.get("isCompactSummary") is True
+                    or entry.get("agentId")
+                    or not isinstance(entry.get("uuid"), str)
+                    or not entry["uuid"]
+                ):
+                    continue
+                message = entry.get("message")
+                if not isinstance(message, dict) or message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if isinstance(content, list) and all(
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                    for block in content
+                ):
+                    content = "\n".join(str(block["text"]) for block in content)
+                if not isinstance(content, str):
+                    continue
+                normalized = _unwrap_pasted_content_markers(content)
+                if normalized.replace("\r\n", "\n").replace("\r", "\n").strip() != expected:
+                    another_prompt_observed = True
+                    continue
+                if owns_paste():
+                    delivery_diagnostics.record_details(verification="native_recorded")
+                    return None
+                break
+        pane = _capture_pane(socket_path, tmux_target)
+        composer = _composer_box(pane)
+        if (
+            not another_prompt_observed
+            and composer is not None
+            and composer.framed
+            and _draft_in_input_box(pane, needle, tail_needle=tail_needle)
+            and owns_paste()
+        ):
+            return pane
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    delivery_diagnostics.record_details(verification="unconfirmed_paste")
+    raise ClaudeDeliveryUnconfirmed(
+        "Claude did not confirm this pasted message. It may already be queued or running. "
+        "Inspect the terminal before retrying."
     )
 
 
@@ -6046,35 +6282,47 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
     """
     import subprocess
 
-    _check_injection_cancelled()
-    operation = args[0] if args else ""
-    if operation == "send-keys" and "-t" in args:
-        target = args[args.index("-t") + 1]
-        args = ("copy-mode", "-q", "-t", target, ";", *args)
-    cmd = ["tmux", "-S", socket_path, *args]
-    try:
-        proc = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired as exc:
-        delivery_diagnostics.record_tmux_failure(operation, timeout_s=_TMUX_SEND_TIMEOUT_S)
-        raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
-    except OSError as exc:
-        delivery_diagnostics.record_tmux_failure(operation, os_errno=exc.errno)
-        raise
-    if proc.returncode != 0:
-        delivery_diagnostics.record_tmux_failure(operation, returncode=proc.returncode)
-        detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
-        if allow_missing_target:
-            from omnigent.inner.terminal import _tmux_reports_target_gone
+    ownership = _INJECTION_OWNERSHIP.get()
+    metadata_guard = (
+        _cancellable_injection_lock(native_bridge_common._bridge_dir_lock(ownership.bridge_dir))
+        if ownership is not None
+        else contextlib.nullcontext()
+    )
+    with metadata_guard:
+        _check_injection_cancelled()
+        operation = args[0] if args else ""
+        ownership = _INJECTION_OWNERSHIP.get()
+        if ownership is not None and (
+            operation == "paste-buffer" or (operation == "send-keys" and "-l" in args)
+        ):
+            ownership.wrote_input = True
+        if operation == "send-keys" and "-t" in args:
+            target = args[args.index("-t") + 1]
+            args = ("copy-mode", "-q", "-t", target, ";", *args)
+        cmd = ["tmux", "-S", socket_path, *args]
+        try:
+            proc = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_TMUX_SEND_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired as exc:
+            delivery_diagnostics.record_tmux_failure(operation, timeout_s=_TMUX_SEND_TIMEOUT_S)
+            raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
+        except OSError as exc:
+            delivery_diagnostics.record_tmux_failure(operation, os_errno=exc.errno)
+            raise
+        if proc.returncode != 0:
+            delivery_diagnostics.record_tmux_failure(operation, returncode=proc.returncode)
+            detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
+            if allow_missing_target:
+                from omnigent.inner.terminal import _tmux_reports_target_gone
 
-            if _tmux_reports_target_gone(detail):
-                return
-        raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
+                if _tmux_reports_target_gone(detail):
+                    return
+            raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
 
 @contextlib.contextmanager
@@ -7515,6 +7763,7 @@ def _wait_for_claude_prompt_ready(
     timeout_s: float,
     bridge_dir: Path | None = None,
     extend_for_slow_boot: bool = True,
+    read_only: bool = False,
 ) -> None:
     """
     Block until Claude Code's TUI input box is ready for keystrokes.
@@ -7549,6 +7798,7 @@ def _wait_for_claude_prompt_ready(
         time). A slow boot then fails the wait instead of outliving the request,
         while a dead pane still ends it at the first liveness check, a
         :data:`_CLAUDE_LIVENESS_POLL_INTERVAL_S` in, rather than at the cap.
+    :param read_only: Observe startup blockers without dismissing or repainting the pane.
     :returns: None.
     :raises ClaudeTerminalExited: If the pane is gone: tmux affirms the
         process exited, carrying its wait-status so a clean quit is
@@ -7621,7 +7871,8 @@ def _wait_for_claude_prompt_ready(
             return
         remaining = hard_deadline - time.monotonic()
         if (
-            bridge_dir is not None
+            not read_only
+            and bridge_dir is not None
             and remaining > 0
             and _occupying_surface(pane) == _OVERLAY_SURFACE
             and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
@@ -7642,7 +7893,7 @@ def _wait_for_claude_prompt_ready(
                 )
             continue
         billing_notice = auto_mode_billing_notice_visible(pane)
-        if billing_notice:
+        if billing_notice and not read_only:
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
         # A dialog seen on two consecutive polls is real; one frame can be a
         # repaint artifact. Fail now rather than stalling to the cap.
@@ -7713,7 +7964,7 @@ def _wait_for_claude_prompt_ready(
             )
         waited_on_sign_in = waiting_on_sign_in
         now = time.monotonic()
-        if now >= next_repaint:
+        if not read_only and now >= next_repaint:
             # Output from another process can hide a live composer until
             # Claude Code repaints.
             if _request_claude_repaint(socket_path, tmux_target, bridge_dir):

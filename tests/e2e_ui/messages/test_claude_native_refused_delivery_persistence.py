@@ -24,7 +24,7 @@ from tests.e2e.test_native_terminal_start_error_log_correlation_e2e import (
     _ensure_claude_terminal,
     _native_stack,
 )
-from tests.e2e_ui.messages.test_message_render_parity import _ensure_chat_view
+from tests.e2e_ui.messages.test_message_render_parity import _select_view_mode
 
 
 @pytest.mark.parametrize("refusal", ["missing_target", "draft_not_accepted"])
@@ -58,7 +58,7 @@ def test_claude_refused_message_survives_reload(
     monkeypatch.setenv("OPENAI_API_KEY", "mock-key")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", mock_llm_server_url)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "mock-key")
-    runner_env = {}
+    runner_env = {"OMNIGENT_TEST_CLAUDE_HOOKS": "1"}
     observed_budget = tmp_path / "delivery-budget.json"
     if delivery_timeout_s is not None:
         startup = tmp_path / "startup"
@@ -108,7 +108,7 @@ def test_claude_refused_message_survives_reload(
         if refusal == "missing_target":
             adverts[0].unlink()
         page.goto(f"{stack.base_url}/c/{session_id}")
-        _ensure_chat_view(page)
+        _select_view_mode(page, "Chat")
         composer = page.get_by_label("Message the agent")
         composer.fill(marker)
         composer.press("Enter")
@@ -133,10 +133,15 @@ def test_claude_refused_message_survives_reload(
         )
         assert expected in detail, detail
         if delivery_timeout_s is not None:
-            assert json.loads(observed_budget.read_text()) == {
-                "target_wait_s": delivery_timeout_s,
-                "submit_wait_s": delivery_timeout_s,
-            }
+            if refusal == "missing_target":
+                assert not observed_budget.exists(), (
+                    "a missing target must refuse before injection"
+                )
+            else:
+                assert json.loads(observed_budget.read_text()) == {
+                    "target_wait_s": delivery_timeout_s,
+                    "submit_wait_s": delivery_timeout_s,
+                }
         assert (
             not client.get(f"{stack.base_url}/v1/sessions/{session_id}")
             .json()
@@ -156,7 +161,7 @@ def test_claude_refused_message_survives_reload(
         )
         assert alive.returncode == 0, alive.stderr.decode()
         page.reload()
-        _ensure_chat_view(page)
+        _select_view_mode(page, "Chat")
         expect(
             page.locator('[data-testid="message-bubble"][data-role="user"]', has_text=marker)
         ).to_have_count(1)

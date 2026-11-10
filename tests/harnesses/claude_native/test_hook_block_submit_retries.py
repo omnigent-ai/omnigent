@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
+from omnigent.harnesses.claude_native import bridge, delivery_diagnostics, submit_verification
 from omnigent.native.input_diagnostics import input_delivery_scope
 from omnigent.util.json_types import JsonObject
 from tests.harnesses.claude_native.test_claude_native_bridge import _composer_pane
@@ -185,7 +185,7 @@ async def test_unconfirmed_terminal_refusal_remains_an_executor_error(
     from omnigent.inner.executor import ExecutorError
     from omnigent.runtime import pending_inputs
 
-    async def refused(*_args: object) -> None:
+    async def refused(*_args: object, **_kwargs: object) -> None:
         raise bridge.ClaudeSubmitBlockedUnconfirmed("Web delivery could not be confirmed.")
 
     pending_inputs.reset_for_tests()
@@ -216,3 +216,180 @@ async def test_unconfirmed_terminal_refusal_remains_an_executor_error(
         ]
     finally:
         pending_inputs.reset_for_tests()
+
+
+@pytest.mark.parametrize(
+    "scenario,completed",
+    [
+        ("inline-system", True),
+        ("inline-user", True),
+        ("linked-stdout", True),
+        ("command-run", True),
+        ("compact-noop", True),
+        ("echo-only", False),
+        ("stdout-only", False),
+        ("compact-noop-only", False),
+        ("compact-other-command", False),
+        ("compact-ambiguous", False),
+        ("ambiguous-inline", False),
+        ("ambiguous-command-run", False),
+        ("different-arguments", False),
+        ("same-argument-prefix", False),
+        ("conflicting-run-metadata", False),
+        ("wrong-session", False),
+        ("sidechain", False),
+        ("agent", False),
+        ("subagent-path", False),
+        ("missing-uuid", False),
+        ("partial", False),
+        ("stale", False),
+        ("stale-echo", False),
+        ("replaced-file", False),
+        ("rewritten-prefix", False),
+        ("quoted-markup", False),
+        ("ordinary-input", False),
+    ],
+)
+def test_local_command_completion_requires_fresh_full_parent_evidence(
+    tmp_path: Path, scenario: str, completed: bool
+) -> None:
+    native_session_id = "native-parent"
+    command, arguments = "model", "example-model"
+    submitted = f"/{command} {arguments}"
+    if scenario.startswith("compact"):
+        command, arguments, submitted = "compact", "", "/compact"
+    if scenario == "same-argument-prefix":
+        arguments = "a" * 1000 + "owned"
+        submitted = f"/model {arguments}"
+        arguments = "a" * 1000 + "foreign"
+    elif scenario == "different-arguments":
+        arguments = "another-model"
+    echo_content = (
+        f"<command-name>/{command}</command-name><command-args>{arguments}</command-args>"
+    )
+    stdout = (
+        "<local-command-stdout>Not enough messages to compact.</local-command-stdout>"
+        if scenario.startswith("compact")
+        else "<local-command-stdout>Local operation completed.</local-command-stdout>"
+    )
+    echo: JsonObject = {
+        "type": "system",
+        "subtype": "local_command",
+        "sessionId": native_session_id,
+        "uuid": "command-echo",
+        "content": echo_content,
+    }
+    output: JsonObject = {
+        "type": "system",
+        "subtype": "local_command",
+        "sessionId": native_session_id,
+        "uuid": "command-output",
+        "parentUuid": "command-echo",
+        "content": stdout,
+    }
+    records = [echo, output]
+    if scenario == "inline-system":
+        echo["content"] = echo_content + stdout
+        records = [echo]
+    elif scenario == "inline-user":
+        records = [
+            {
+                "type": "user",
+                "sessionId": native_session_id,
+                "uuid": "command-echo",
+                "message": {"role": "user", "content": echo_content + stdout},
+            }
+        ]
+    elif scenario == "command-run":
+        output.pop("parentUuid")
+        output["commandRun"] = {"command": command, "args": arguments}
+        records = [output]
+    elif scenario == "ambiguous-inline":
+        echo["content"] = echo_content + stdout
+        records = [echo, {**echo, "uuid": "another-command"}]
+    elif scenario == "ambiguous-command-run":
+        output.pop("parentUuid")
+        output["commandRun"] = {"command": command, "args": arguments}
+        records = [output, {**output, "uuid": "another-output"}]
+    elif scenario == "echo-only":
+        records = [echo]
+    elif scenario in {"stdout-only", "compact-noop-only"}:
+        output.pop("parentUuid")
+        records = [output]
+    elif scenario.startswith("compact"):
+        output.pop("parentUuid")
+        if scenario == "compact-other-command":
+            other = {**echo, "uuid": "other", "content": "<command-name>/model</command-name>"}
+            records = [echo, other, output]
+        elif scenario == "compact-ambiguous":
+            records = [echo, {**echo, "uuid": "another-echo"}, output]
+    elif scenario == "conflicting-run-metadata":
+        output["commandRun"] = {"command": command, "args": "another-model"}
+    elif scenario == "quoted-markup":
+        echo["content"] = "Quoted log:\n" + echo_content + stdout
+        records = [echo]
+    elif scenario == "ordinary-input":
+        submitted = "ordinary input"
+    for record in records:
+        if scenario == "wrong-session":
+            record["sessionId"] = "foreign-native"
+        elif scenario == "sidechain":
+            record["isSidechain"] = True
+        elif scenario == "agent":
+            record["agentId"] = "child"
+        elif scenario == "subagent-path":
+            record["transcriptPath"] = str(tmp_path / "subagents" / "child.jsonl")
+        elif scenario == "missing-uuid":
+            record.pop("uuid")
+
+    transcript = tmp_path / "native.jsonl"
+    transcript.write_text('{"type":"system","content":"prefix"}\n')
+    serialized = "".join(json.dumps(record) + "\n" for record in records)
+    if scenario == "stale":
+        with transcript.open("a") as handle:
+            handle.write(serialized)
+    elif scenario == "stale-echo":
+        with transcript.open("a") as handle:
+            handle.write(json.dumps(echo) + "\n")
+        serialized = json.dumps(output) + "\n"
+    boundary = submit_verification.capture_submit_boundary(transcript, native_session_id)
+    assert boundary is not None
+    if scenario == "replaced-file":
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(transcript.read_bytes())
+        replacement.replace(transcript)
+    elif scenario == "rewritten-prefix":
+        transcript.write_bytes(transcript.read_bytes().replace(b"prefix", b"edited"))
+    if scenario != "stale":
+        with transcript.open("a") as handle:
+            handle.write(serialized.rstrip("\n") if scenario == "partial" else serialized)
+
+    assert (
+        submit_verification.has_matching_local_command_completion(boundary, submitted) is completed
+    )
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "version", "relative-path", "native", "offset", "prefix", "file-id"]
+)
+def test_submit_checkpoint_round_trip_and_validation(tmp_path: Path, fault: str | None) -> None:
+    transcript = tmp_path / "native.jsonl"
+    transcript.write_text('{"type":"system","content":"prefix"}\n')
+    boundary = submit_verification.capture_submit_boundary(transcript, "native-parent")
+    assert boundary is not None
+    serialized = submit_verification.serialize_submit_boundary(boundary)
+    payload = json.loads(json.dumps(serialized))
+    if fault == "version":
+        payload["schema_version"] = True
+    elif fault == "relative-path":
+        payload["path"] = "native.jsonl"
+    elif fault == "native":
+        payload["native_session_id"] = ""
+    elif fault == "offset":
+        payload["byte_offset"] = False
+    elif fault == "prefix":
+        payload["prefix_sha256"] = "broken"
+    elif fault == "file-id":
+        payload["file_id"] = [True, 1]
+    parsed = submit_verification.parse_submit_boundary(payload)
+    assert parsed == (boundary if fault is None else None)

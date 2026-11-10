@@ -549,6 +549,41 @@ class ExecutorAdapter(HarnessApp):
             ctx.cancelled.set()
             if self._executor is not None:
                 await self._executor.interrupt_session(self._session_key)
+        except InjectionDeliveryAmbiguous as exc:
+            cancelled = ctx.cancelled.is_set()
+            _turn_outcome = "cancelled" if cancelled else "error"
+            if not input_outcome_logged:
+                log_input_event(
+                    _logger,
+                    "native_input_execution_finished",
+                    session_id=turn_session_id,
+                    attributes=input_identity,
+                    response_id=ctx.response_id,
+                    outcome=_turn_outcome,
+                    error_code=None if cancelled else "native_delivery_unconfirmed",
+                )
+                input_outcome_logged = True
+            if tctx is not None and agent_span is not None:
+                if cancelled:
+                    from omnigent.runtime.telemetry import record_cancellation
+
+                    record_cancellation(agent_span)
+                tctx.end_agent_span(
+                    agent_span, response=None, error=None if cancelled else str(exc)
+                )
+                agent_span = None
+            if cancelled:
+                await executor.interrupt_session(self._session_key)
+                clean_exit = True
+                return
+            # Native work may already be running; ending this adapter call cannot replay it.
+            clean_exit = True
+            raise InnerExecutorError(
+                str(exc) or "Native input delivery could not be confirmed.",
+                code="native_delivery_unconfirmed",
+                title="Native delivery is unconfirmed",
+                remediation="Inspect the terminal before sending this message again.",
+            ) from exc
         except BaseException as exc:
             _turn_outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
             if input_identity and not input_outcome_logged:
@@ -804,6 +839,9 @@ class ExecutorAdapter(HarnessApp):
                         injection_id=injection_id,
                     )
                 )
+            watcher = asyncio.current_task()
+            if outcome == "executor_ambiguous" and watcher is not None and watcher.cancelling():
+                raise asyncio.CancelledError
 
     async def _stable_tool_executor(
         self,

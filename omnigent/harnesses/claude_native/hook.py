@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, NoReturn, TextIO
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
-    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     approval_wait_marker_path,
     hold_approval_wait_marker,
     read_active_session_id,
@@ -242,7 +241,10 @@ def main(argv: list[str] | None = None) -> int:
         print("omnigent claude hook: expected JSON object", file=sys.stderr)
         return 0
     output = record_hook_payload(
-        Path(args.bridge_dir), payload, conversation_url=args.conversation_url
+        Path(args.bridge_dir),
+        payload,
+        conversation_url=args.conversation_url,
+        prompt_framework_context=args.prompt_framework_context,
     )
     if output is not None:
         print(json.dumps(output))
@@ -256,6 +258,7 @@ def record_hook_payload(
     conversation_url: str | None = None,
     env: Mapping[str, str] | None = None,
     diagnostics: TextIO | None = None,
+    prompt_framework_context: bool = False,
 ) -> dict[str, object] | None:
     """
     Record one Claude hook event for the forwarder.
@@ -271,6 +274,7 @@ def record_hook_payload(
         active session URL can be built.
     :param env: The hook terminal's environment; ``None`` reads this process's.
     :param diagnostics: Where failure messages go; ``None`` is stderr.
+    :param prompt_framework_context: New SessionStart invocation confirms prompt-context support.
     :returns: The hook's output for Claude (the SessionStart banner), or ``None``.
     """
     from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
@@ -296,6 +300,19 @@ def record_hook_payload(
             f"omnigent claude hook: failed to record hook: {exc}",
             file=sys.stderr if diagnostics is None else diagnostics,
         )
+    else:
+        if prompt_framework_context:
+            from omnigent.harnesses.claude_native.framework_context import (
+                record_prompt_framework_context_capability,
+            )
+
+            try:
+                record_prompt_framework_context_capability(bridge_dir, payload, env=env)
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(
+                    f"omnigent claude hook: failed to record input-hook capability: {exc}",
+                    file=sys.stderr if diagnostics is None else diagnostics,
+                )
     url = _conversation_url_for_active_session(bridge_dir, conversation_url)
     if url and payload.get("hook_event_name") == "SessionStart":
         return {"systemMessage": f"Open this session in Omnigent: {url}"}
@@ -1312,18 +1329,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m omnigent.harnesses.claude_native.hook")
     parser.add_argument("--bridge-dir", required=True)
     parser.add_argument("--conversation-url")
+    parser.add_argument("--prompt-framework-context", action="store_true")
     return parser.parse_args(argv)
 
 
 def _main_framework_context(argv: list[str]) -> int:
-    """Add pending framework context to one submitted prompt."""
+    """Add framework context only to the prompt that owns it."""
+    from omnigent.harnesses.claude_native.framework_context import consume_prompt_framework_context
+
     args = _parse_evaluate_policy_args(argv)
-    sys.stdin.read()
-    path = Path(args.bridge_dir) / CLAUDE_FRAMEWORK_CONTEXT_FILE
     try:
-        text = path.read_text(encoding="utf-8")
-        path.unlink(missing_ok=True)
-    except OSError:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    try:
+        text = consume_prompt_framework_context(Path(args.bridge_dir), payload)
+    except (OSError, RuntimeError, ValueError):
         return 0
     if text:
         sys.stdout.write(

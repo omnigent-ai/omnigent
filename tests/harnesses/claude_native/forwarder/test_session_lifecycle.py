@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 import omnigent.harnesses.claude_native.forwarder as forwarder
+from omnigent.harnesses.claude_native import bridge, framework_context, hook
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     prepare_bridge_dir,
@@ -18,6 +19,7 @@ from omnigent.harnesses.claude_native.bridge import (
     record_hook_event,
     write_active_session_id,
 )
+from omnigent.inner.terminal_lifecycle import TERMINAL_INSTANCE_ID_ENV, TERMINAL_LAUNCH_ID_ENV
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _start_recording_server,
@@ -51,13 +53,26 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
         workspace=tmp_path,
     )
     (bridge_dir / "transcript_forwarder.json").write_text("{}", encoding="utf-8")
-    record_hook_event(
+    bridge.write_tmux_target(
+        bridge_dir,
+        socket_path=tmp_path / "terminal.sock",
+        tmux_target="main",
+        launch_id="a" * 32,
+        instance_id="b" * 32,
+    )
+    monkeypatch.setenv(TERMINAL_LAUNCH_ID_ENV, "a" * 32)
+    monkeypatch.setenv(TERMINAL_INSTANCE_ID_ENV, "b" * 32)
+    monkeypatch.setattr(hook, "_rotate_session_on_clear", lambda _bridge: None)
+    hook.record_hook_payload(
         bridge_dir,
         {
             "hook_event_name": "SessionStart",
             "source": "clear",
+            "session_id": "native-clear",
         },
+        prompt_framework_context=True,
     )
+    old_context = framework_context.write_prompt_framework_context(bridge_dir, "prompt", ["old"])
     calls: list[tuple[str, str, dict[str, Any] | None]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -134,6 +149,21 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
     assert rotated_to == "conv_new"
     assert rotated_again is None
     assert read_active_session_id(bridge_dir) == "conv_new"
+    assert framework_context.prompt_framework_context_capability_ready(bridge_dir)
+    fresh_context = framework_context.write_prompt_framework_context(bridge_dir, "prompt", ["new"])
+    assert not old_context.path.exists()
+    assert fresh_context.owner.session_id == "conv_new"
+    assert (
+        framework_context.consume_prompt_framework_context(
+            bridge_dir,
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "native-clear",
+                "prompt": "prompt",
+            },
+        )
+        == "new"
+    )
     assert not (bridge_dir / "transcript_forwarder.json").exists()
     assert (bridge_dir / "hook_forwarder.json").exists()
     unfiled_body = {
@@ -561,7 +591,17 @@ async def test_fork_hook_creates_omnigent_fork_and_consumes_hook(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.time.time", lambda: 1779922393.245
     )
-    record_hook_event(
+    bridge.write_tmux_target(
+        bridge_dir,
+        socket_path=tmp_path / "terminal.sock",
+        tmux_target="main",
+        launch_id="a" * 32,
+        instance_id="b" * 32,
+    )
+    monkeypatch.setenv(TERMINAL_LAUNCH_ID_ENV, "a" * 32)
+    monkeypatch.setenv(TERMINAL_INSTANCE_ID_ENV, "b" * 32)
+    monkeypatch.setattr(hook, "_rotate_session_on_fork", lambda _bridge: None)
+    hook.record_hook_payload(
         bridge_dir,
         {
             "hook_event_name": "SessionStart",
@@ -571,7 +611,9 @@ async def test_fork_hook_creates_omnigent_fork_and_consumes_hook(
             "omnigent_previous_claude_session_id": "claude_old",
             "omnigent_claude_session_was_seen": False,
         },
+        prompt_framework_context=True,
     )
+    old_context = framework_context.write_prompt_framework_context(bridge_dir, "prompt", ["old"])
     calls: list[tuple[str, str, dict[str, Any] | None]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -642,6 +684,21 @@ async def test_fork_hook_creates_omnigent_fork_and_consumes_hook(
     assert rotated_to == "conv_fork"
     assert rotated_again is None
     assert read_active_session_id(bridge_dir) == "conv_fork"
+    assert framework_context.prompt_framework_context_capability_ready(bridge_dir)
+    fresh_context = framework_context.write_prompt_framework_context(bridge_dir, "prompt", ["new"])
+    assert not old_context.path.exists()
+    assert fresh_context.owner.session_id == "conv_fork"
+    assert (
+        framework_context.consume_prompt_framework_context(
+            bridge_dir,
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "claude_fork",
+                "prompt": "prompt",
+            },
+        )
+        == "new"
+    )
     transcript_state = json.loads(
         (bridge_dir / "transcript_forwarder.json").read_text(encoding="utf-8")
     )

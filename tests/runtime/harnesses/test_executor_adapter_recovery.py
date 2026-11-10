@@ -15,6 +15,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     TextChunk,
     ToolSpec,
@@ -22,9 +23,11 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.native.input_diagnostics import current_input_attributes
+from omnigent.runtime.harnesses import _scaffold
 from omnigent.runtime.harnesses._executor_adapter import (
     _ORPHAN_RESYNC_THRESHOLD,
     ExecutorAdapter,
+    InnerExecutorError,
 )
 from omnigent.runtime.harnesses._scaffold import ToolResultEvent, TurnContext
 from omnigent.server.schemas import CreateResponseRequest
@@ -46,10 +49,12 @@ class _FakeExecutor(Executor):
         *,
         on_iter: Any = None,
         block_event: asyncio.Event | None = None,
+        cancellation_error: Exception | None = None,
     ) -> None:
         self._events = events or []
         self._on_iter = on_iter
         self._block_event = block_event
+        self._cancellation_error = cancellation_error
         self.interrupt_calls: list[str] = []
         self.close_calls = 0
         self.close_session_calls = 0
@@ -64,7 +69,12 @@ class _FakeExecutor(Executor):
         if self._on_iter is not None:
             self._on_iter()
         if self._block_event is not None:
-            await self._block_event.wait()
+            try:
+                await self._block_event.wait()
+            except asyncio.CancelledError as exc:
+                if self._cancellation_error is not None:
+                    raise self._cancellation_error from exc
+                raise
         for event in self._events:
             yield event
 
@@ -496,13 +506,21 @@ class _InterruptScriptExecutor(_FakeExecutor):
         return True
 
 
-async def test_failing_inline_interrupt_falls_back_to_detached(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("delivery_ambiguous", [False, True])
+async def test_failing_inline_interrupt_falls_back_to_detached(
+    monkeypatch: Any, delivery_ambiguous: bool
+) -> None:
     """Failing inline interrupt falls back to the detached bounded interrupt."""
-    executor = _InterruptScriptExecutor(events=[TextChunk(text="x")])
+
+    def begin() -> None:
+        if delivery_ambiguous:
+            raise InjectionDeliveryAmbiguous("native acknowledgement is unknown")
+
+    executor = _InterruptScriptExecutor(events=[TextChunk(text="x")], on_iter=begin)
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
 
     ctx = _ctx("resp_cancelled_inline")
-    # Pre-set cancellation so the first event hits the inline-interrupt branch.
+    # Explicit cancellation reaches the same interrupt path with output or unknown delivery.
     ctx.cancelled.set()
 
     with pytest.raises(RuntimeError, match="inline interrupt boom"):
@@ -946,3 +964,122 @@ async def test_safe_interrupt_unexpected_failure_still_errors(
     records = [rec for rec in caplog.records if rec.name == _ADAPTER_LOGGER]
     assert [rec.levelno for rec in records] == [logging.ERROR]
     assert "failed or timed out" in records[0].getMessage()
+
+
+@pytest.mark.parametrize("explicit_stop", [False, True], ids=["watchdog", "stop"])
+async def test_ambiguous_native_watchdog_never_replays_or_reaps(
+    monkeypatch: pytest.MonkeyPatch, explicit_stop: bool
+) -> None:
+    """Unknown native delivery survives a short watchdog; an explicit Stop remains cancelled."""
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(_scaffold, "_WEDGED_TURN_RECOVERY_RETRIES", 1)
+    started = asyncio.Event()
+    executor = _FakeExecutor(
+        on_iter=started.set,
+        block_event=asyncio.Event(),
+        cancellation_error=InjectionDeliveryAmbiguous("native acknowledgement is unknown"),
+    )
+    creations = []
+
+    def create_executor() -> _FakeExecutor:
+        creations.append(executor)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=create_executor)
+    ctx = _ctx("resp_unknown_native")
+    turn = asyncio.create_task(adapter._guarded_run_turn(_request(), ctx))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+        if explicit_stop:
+            ctx.cancelled.set()
+            turn.cancel()
+            await asyncio.wait_for(turn, timeout=5.0)
+            assert executor.interrupt_calls == [adapter._session_key]
+            terminal = await adapter._build_terminal_event(ctx, "agent", turn, 1)
+            assert terminal.type == "response.cancelled"
+        else:
+            with pytest.raises(InnerExecutorError) as caught:
+                await asyncio.wait_for(turn, timeout=5.0)
+            assert caught.value.code == "native_delivery_unconfirmed"
+            assert caught.value.undelivered is False
+            assert executor.interrupt_calls == []
+            assert ctx.cancelled.is_set() is False
+        assert len(creations) == 1
+        assert adapter._executor is executor
+        assert adapter._abandoned_executor_cleanup is None
+        assert not adapter._bg_tasks
+        assert executor.close_calls == executor.close_session_calls == 0
+        assert ctx._has_progress is False
+        assert [
+            event
+            for event in ctx._event_queue._queue
+            if getattr(event, "type", None) == "response.retry"
+        ] == []
+    finally:
+        turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+        await adapter.on_shutdown()
+
+
+@pytest.mark.parametrize(
+    "cancel_during_delivery", [False, True], ids=["lost-ack", "cancelled-ack"]
+)
+async def test_adapter_finally_drains_ambiguous_steering(
+    cancel_during_delivery: bool,
+) -> None:
+    """A cancelled steering worker acknowledges uncertainty once and cannot strand finally."""
+    from omnigent.server.schemas import InjectionConsumedEvent
+
+    ctx = _ctx("resp_steering_cleanup")
+    injection_started = asyncio.Event()
+    complete_turn = asyncio.Event()
+    received = []
+
+    class AmbiguousSteeringExecutor(_FakeExecutor):
+        async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+            received.append(content)
+            injection_started.set()
+            if cancel_during_delivery:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as exc:
+                    raise InjectionDeliveryAmbiguous(
+                        "native steering acknowledgement is unknown"
+                    ) from exc
+            raise InjectionDeliveryAmbiguous("native steering acknowledgement is unknown")
+
+    def begin() -> None:
+        ctx._push_injection(
+            CreateResponseRequest(model="agent", input="steer once", injection_id="steering-once")
+        )
+
+    executor = AmbiguousSteeringExecutor(
+        events=[TurnComplete()], on_iter=begin, block_event=complete_turn
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    turn = asyncio.create_task(adapter.run_turn(_request(), ctx))
+    markers = []
+    try:
+        await asyncio.wait_for(injection_started.wait(), timeout=5.0)
+        if not cancel_during_delivery:
+            marker = await asyncio.wait_for(ctx._event_queue.get(), timeout=5.0)
+            assert isinstance(marker, InjectionConsumedEvent)
+            markers.append(marker)
+            assert not turn.done()
+        complete_turn.set()
+        completed, _ = await asyncio.wait({turn}, timeout=5.0)
+        assert turn in completed, "adapter finally must not swallow steering-task cancellation"
+        await turn
+        markers.extend(
+            event for event in ctx._event_queue._queue if isinstance(event, InjectionConsumedEvent)
+        )
+        assert [marker.injection_id for marker in markers] == ["steering-once"]
+        assert received == ["steer once"]
+        assert not executor.interrupt_calls
+        assert not adapter._bg_tasks
+    finally:
+        complete_turn.set()
+        turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+        await adapter.on_shutdown()
