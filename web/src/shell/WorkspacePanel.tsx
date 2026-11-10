@@ -1652,12 +1652,13 @@ function WorkspacePanelImpl({
     ),
     WORKSPACE_FILE_TREE_WIDTH_STORAGE_KEY,
   );
-  const splitFiles =
+  const canSplitFiles =
     fileTreeSplitEnabled &&
     !isMobile &&
     !alwaysOpenFilesInTab &&
     rightRailTab === "files" &&
     filesWidth >= FILE_TREE_MIN_WIDTH + FILE_PREVIEW_MIN_WIDTH + FILE_TREE_HANDLE_WIDTH;
+  const splitFiles = canSplitFiles && treePreviewPath !== null;
   // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
   // has focus: close the tab on screen, or hide the rail on a fixed page.
   // Otherwise AppShell's handler leaves the session.
@@ -2193,7 +2194,6 @@ function WorkspacePanelImpl({
                 splitContainerRef.current = node;
                 treeColumn.containerRef.current = node;
               }}
-              data-testid={splitFiles ? "workspace-files-split" : undefined}
               className={cn(
                 "flex min-h-0 flex-1",
                 // Not display:none: hidden rows would measure 0px and collapse
@@ -2201,70 +2201,62 @@ function WorkspacePanelImpl({
                 !filesPanelActive && "invisible absolute inset-0",
               )}
             >
-              <div
-                data-testid="workspace-file-tree-column"
-                className={cn(
-                  "relative flex min-h-0 min-w-0 flex-col",
-                  splitFiles ? "shrink-0 border-r" : "flex-1",
-                )}
-                style={splitFiles ? { width: treeColumn.width } : undefined}
-              >
-                <FilesPanel
-                  conversationId={contained ? conversationId : undefined}
-                  frameless
-                  onFileSelect={openFileViewer}
-                  onFileOpenInTree={splitFiles ? openFileInTree : undefined}
-                  showOpenInTab={fileTreeSplitEnabled && !isMobile}
-                  compactTreeControls={
-                    fileTreeSplitEnabled && !isMobile && rightRailTab === "files"
-                  }
-                  flatView={rightRailTab === "changes"}
-                  showHidden={filesPanelShowHidden}
-                  onShowHiddenChange={onShowHiddenChange}
-                  sort={filesPanelSort}
-                  onSortChange={onSortChange}
-                />
-                {splitFiles && (
-                  <div
-                    {...treeColumn.handleProps}
-                    aria-label="Resize file tree"
-                    className="absolute inset-y-0 right-0 cursor-col-resize hover:bg-primary/30 focus-visible:bg-primary/30 focus-visible:outline-none"
-                    style={{ width: FILE_TREE_HANDLE_WIDTH }}
-                  />
-                )}
-              </div>
-              {fileTreeSplitEnabled && filesPanelActive && rightRailTab === "files" && (
-                <div
-                  className={cn(
-                    "flex min-h-0 min-w-0 flex-1 flex-col",
-                    !splitFiles && "invisible absolute inset-0 pointer-events-none",
-                  )}
-                >
-                  {treePreviewPath ? (
-                    <FileViewer
-                      syncUrl={!contained}
-                      syncFilePath
-                      keepNavigationGuard
-                      agentId={agentId}
-                      frameless
-                      open={open && splitFiles}
-                      mediaActive={open && splitFiles}
-                      conversationId={conversationId}
-                      path={treePreviewPath}
-                      onClose={onCloseTreePreview}
-                      onCloseTab={onCloseTreePreview}
-                      onNavigateTo={openFileViewer}
-                      permissionLevel={permissionLevel}
-                      onCommentsOpenChange={onCommentsOpenChange}
-                      sort={filesPanelSort}
+              <FilesPanel
+                conversationId={contained ? conversationId : undefined}
+                frameless
+                onFileSelect={openFileViewer}
+                onFileOpenInTree={canSplitFiles ? openFileInTree : undefined}
+                selectedFilePath={splitFiles ? treePreviewPath : null}
+                showOpenInTab={fileTreeSplitEnabled && !isMobile}
+                compactTreeControls={fileTreeSplitEnabled && !isMobile && rightRailTab === "files"}
+                flatView={rightRailTab === "changes"}
+                showHidden={filesPanelShowHidden}
+                onShowHiddenChange={onShowHiddenChange}
+                sort={filesPanelSort}
+                onSortChange={onSortChange}
+                treeColumnWidth={splitFiles ? treeColumn.width : undefined}
+                treeResizeHandle={
+                  splitFiles && (
+                    <div
+                      {...treeColumn.handleProps}
+                      aria-label="Resize file tree"
+                      className="absolute inset-y-0 right-0 cursor-col-resize hover:bg-primary/30 focus-visible:bg-primary/30 focus-visible:outline-none"
+                      style={{ width: FILE_TREE_HANDLE_WIDTH }}
                     />
-                  ) : splitFiles ? (
-                    <div className="flex flex-1 items-center justify-center p-4 text-center text-sm text-muted-foreground">
-                      Select a file to view it here
+                  )
+                }
+                filePreview={
+                  fileTreeSplitEnabled &&
+                  filesPanelActive &&
+                  rightRailTab === "files" &&
+                  treePreviewPath ? (
+                    <div
+                      className={cn(
+                        "flex min-h-0 min-w-0 flex-1 flex-col",
+                        !splitFiles && "invisible absolute inset-0 pointer-events-none",
+                      )}
+                    >
+                      <FileViewer
+                        syncUrl={!contained}
+                        syncFilePath
+                        keepNavigationGuard
+                        agentId={agentId}
+                        frameless
+                        open={open && splitFiles}
+                        mediaActive={open && splitFiles}
+                        conversationId={conversationId}
+                        path={treePreviewPath}
+                        onClose={onCloseTreePreview}
+                        onCloseTab={onCloseTreePreview}
+                        onNavigateTo={openFileViewer}
+                        permissionLevel={permissionLevel}
+                        onCommentsOpenChange={onCommentsOpenChange}
+                        sort={filesPanelSort}
+                      />
                     </div>
-                  ) : null}
-                </div>
-              )}
+                  ) : null
+                }
+              />
             </div>
           )}
           {pending ? (

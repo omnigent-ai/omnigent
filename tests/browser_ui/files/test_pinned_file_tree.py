@@ -82,22 +82,72 @@ def _open_tree(
 def test_docked_tree_preview_and_explicit_soft_tabs(
     page: Page, seeded_session: BrowserSession
 ) -> None:
+    seeded_session.contract.route(
+        re.compile(r".*/environments/default/search\?.*"),
+        lambda route: route.fulfill(
+            json={
+                "object": "list",
+                "has_more": False,
+                "data": [
+                    {"path": path, "name": path.split("/")[-1], "type": "file"} for path in _FILES
+                ],
+            }
+        ),
+    )
     _open_tree(page, seeded_session)
     tree = page.get_by_test_id("workspace-file-tree-column")
     toolbar = page.get_by_role("toolbar", name="Workspace tabs")
     tabs = toolbar.locator('[role="button"][title^="src/"]')
     viewer = page.locator('[data-testid="file-viewer"]:visible')
-    expect(page.get_by_test_id("workspace-files-split")).to_be_visible()
-    expect(page.get_by_text("Select a file to view it here", exact=True)).to_be_visible()
+    expect(page.get_by_test_id("workspace-files-split")).to_have_count(0)
+    expect(page.get_by_role("separator", name="Resize file tree", exact=True)).to_have_count(0)
+    expect(page.get_by_text("Select a file to view it here", exact=True)).to_have_count(0)
+    expect(viewer).to_have_count(0)
     expect(tree.get_by_text("src/", exact=True)).to_be_visible()
+    header = page.locator("[data-files-header]")
+    tree_box, header_box = tree.bounding_box(), header.bounding_box()
+    assert tree_box is not None and header_box is not None
+    assert abs(tree_box["width"] - header_box["width"]) <= 1
     tree.get_by_text("src/", exact=True).click()
     for name in ("app.md", "guide.md"):
         tree.get_by_text(name, exact=True).click()
         expect(viewer).to_contain_text(_FILES[f"src/{name}"])
+        expect(page.get_by_test_id("workspace-files-split")).to_be_visible()
+        expect(page.get_by_role("separator", name="Resize file tree", exact=True)).to_be_visible()
+        expect(tree.locator('button[aria-current="true"]')).to_have_count(1)
+        expect(tree.locator('button[aria-current="true"]')).to_have_text(name)
+        toolbar.hover()
+        assert tree.locator('button[aria-current="true"]').evaluate("""button => {
+            const selected = getComputedStyle(button.parentElement).backgroundColor;
+            const other = [...button.closest('section').querySelectorAll('button')]
+                .find(row => row.textContent === 'notes.md');
+            return selected !== 'rgba(0, 0, 0, 0)' &&
+                selected !== getComputedStyle(other.parentElement).backgroundColor;
+        }""")
         expect(tabs).to_have_count(0)
         expect(tree).to_have_count(1)
         expect(page.locator('input[aria-label="Search all files"]')).to_have_count(1)
         expect(tree).to_be_visible()
+
+    search = tree.get_by_role("searchbox", name="Search all files")
+    search.fill(".md")
+    expect(tree.get_by_role("button", name="src/guide.md", exact=True)).to_have_attribute(
+        "aria-current", "true"
+    )
+    tree.get_by_role("button", name="src/app.md", exact=True).click()
+    expect(tree.locator('button[aria-current="true"]')).to_have_text("src/app.md")
+    toolbar.hover()
+    assert tree.locator('button[aria-current="true"]').evaluate(
+        "button => getComputedStyle(button.parentElement).backgroundColor !== 'rgba(0, 0, 0, 0)'"
+    )
+    expect(viewer).to_contain_text(_FILES["src/app.md"])
+    expect(tabs).to_have_count(0)
+    tree.get_by_role("button", name="src/guide.md", exact=True).click()
+    expect(tree.locator('button[aria-current="true"]')).to_have_text("src/guide.md")
+    search.fill("")
+    expect(tree.get_by_role("button", name="guide.md", exact=True)).to_have_attribute(
+        "aria-current", "true"
+    )
 
     for name, gesture in (("app.md", "modified"), ("notes.md", "middle"), ("guide.md", "menu")):
         row = tree.get_by_text(name, exact=True)
@@ -119,6 +169,7 @@ def test_docked_tree_preview_and_explicit_soft_tabs(
         toolbar.locator('[data-workspace-tab="files"]').click()
         expect(tree.get_by_text("app.md", exact=True)).to_be_visible()
         expect(viewer).to_contain_text(_FILES["src/guide.md"])
+        expect(tree.locator('button[aria-current="true"]')).to_have_text("guide.md")
     expect(tabs).to_have_count(3)
     expect(page).to_have_url(re.compile(r"[?&]file=src%2Fguide.md(?:&|$)"))
     toolbar.locator('[data-workspace-tab="changes"]').click()
@@ -210,20 +261,27 @@ def test_tree_minimum_width_keeps_controls_separate_and_persists(
     page.mouse.move(tree_box["x"] + 100, box["y"] + box["height"] / 2, steps=10)
     page.mouse.up()
     expect(handle).to_have_attribute("aria-valuenow", "200")
-    header = tree.locator("[data-files-header]")
+    header = page.locator("[data-files-header]")
     label = header.get_by_text("workspace", exact=True)
     label_box = label.bounding_box()
     assert label_box is not None and label_box["width"] >= 72
     assert header.evaluate("""header => {
-        const column = header.closest('[data-testid="workspace-file-tree-column"]')
-          .getBoundingClientRect();
+        const panel = header.parentElement.getBoundingClientRect();
+        const headerBox = header.getBoundingClientRect();
+        const tree = header.parentElement.querySelector(
+          '[data-testid="workspace-file-tree-column"]').getBoundingClientRect();
+        const viewer = header.parentElement.querySelector(
+          '[data-testid="file-viewer"]').getBoundingClientRect();
         const controls = [...header.querySelectorAll('button')]
           .filter(el => el.checkVisibility()).map(el => el.getBoundingClientRect());
         const label = [...header.querySelectorAll('span')]
           .find(el => el.textContent === 'workspace' && el.children.length === 0);
         controls.push(label.getBoundingClientRect());
-        return controls.every((box, index) =>
-          box.left >= column.left && box.right <= column.right &&
+        return Math.abs(headerBox.width - panel.width) <= 1 &&
+          headerBox.left <= tree.left && headerBox.right >= viewer.right &&
+          headerBox.bottom <= tree.top && headerBox.bottom <= viewer.top &&
+          controls.every((box, index) =>
+          box.left >= panel.left && box.right <= panel.right &&
           controls.slice(index + 1).every(other =>
             box.right <= other.left || other.right <= box.left ||
             box.bottom <= other.top || other.bottom <= box.top));
@@ -231,15 +289,26 @@ def test_tree_minimum_width_keeps_controls_separate_and_persists(
     search = tree.get_by_role("searchbox", name="Search all files")
     search_box = search.bounding_box()
     assert search_box is not None and search_box["width"] >= 100
+    assert search.evaluate("""input => {
+        const column = input.closest('[data-testid="workspace-file-tree-column"]')
+          .getBoundingClientRect();
+        const controls = [input, ...input.parentElement.parentElement.querySelectorAll('button')]
+          .filter(el => el.checkVisibility()).map(el => el.getBoundingClientRect());
+        return controls.every((box, index) =>
+          box.left >= column.left && box.right <= column.right &&
+          controls.slice(index + 1).every(other =>
+            box.right <= other.left || other.right <= box.left ||
+            box.bottom <= other.top || other.bottom <= box.top));
+    }""")
     expect(header.get_by_test_id("files-host-served-badge")).to_be_visible()
-    header.get_by_role("button", name="Open in IDE", exact=True).click()
+    header.get_by_role("button", name="Choose app to open in", exact=True).click()
     expect(page.get_by_role("menuitem", name="VS Code", exact=True)).to_be_visible()
     page.keyboard.press("Escape")
-    expect(header.get_by_role("button", name="More file actions", exact=True)).to_be_visible()
-    header.get_by_role("button", name="More file actions", exact=True).click()
-    expect(page.get_by_role("menuitem", name="Copy folder path", exact=True)).to_be_visible()
-    expect(page.get_by_role("menuitem", name="Refresh files", exact=True)).to_be_visible()
-    page.keyboard.press("Escape")
+    expect(
+        header.get_by_role("button", name="Copy folder path: workspace", exact=True)
+    ).to_be_visible()
+    expect(header.get_by_role("button", name="Refresh files", exact=True)).to_be_visible()
+    expect(header.get_by_role("button", name="More file actions", exact=True)).not_to_be_visible()
 
     handle.focus()
     page.keyboard.press("ArrowRight")

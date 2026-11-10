@@ -206,6 +206,7 @@ function renderPanel({
   reachable = null,
   onFileSelect = vi.fn(),
   onFileOpenInTree,
+  selectedFilePath,
   showOpenInTab = false,
   listsLoaded = true,
   environment,
@@ -227,6 +228,7 @@ function renderPanel({
   } | null;
   onFileSelect?: (path: string) => void;
   onFileOpenInTree?: (path: string) => void;
+  selectedFilePath?: string | null;
   showOpenInTab?: boolean;
   /** False: both list queries are disabled and hold no data (nothing could serve them). */
   listsLoaded?: boolean;
@@ -257,6 +259,7 @@ function renderPanel({
       flatView,
       onFileSelect,
       onFileOpenInTree,
+      selectedFilePath,
       showOpenInTab,
       showHidden,
       onClose,
@@ -348,6 +351,49 @@ describe("FilesPanel working folder directory", () => {
 });
 
 describe("FilesPanel header role", () => {
+  it("keeps the header above the tree and preview without remounting the tree", () => {
+    const { rerender } = renderPanel({
+      conversationId: "conv_header_split",
+      files: [file("README.md"), file("other.md")],
+      workingDir: "/home/user/project",
+    });
+    const fileButton = screen.getByRole("button", { name: "README.md" });
+    const tree = screen.getByTestId("workspace-file-tree-column");
+    expect(tree.style.width).toBe("");
+    expect(screen.queryByTestId("workspace-files-split")).not.toBeInTheDocument();
+
+    rerender(
+      panelAt("conv_header_split", {
+        frameless: true,
+        selectedFilePath: "README.md",
+        treeColumnWidth: 200,
+        filePreview: <div data-testid="preview">File content</div>,
+      }),
+    );
+    const split = screen.getByTestId("workspace-files-split");
+    const header = screen
+      .getByRole("button", { name: "Refresh files" })
+      .closest("[data-files-header]");
+    expect(header?.parentElement).toBe(split.parentElement);
+    expect(header?.compareDocumentPosition(split)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(split).toContainElement(tree);
+    expect(split).toContainElement(screen.getByTestId("preview"));
+    expect(tree).not.toContainElement(header as HTMLElement);
+    expect(tree).toContainElement(screen.getByRole("searchbox", { name: "Search all files" }));
+    expect(tree).toHaveStyle({ width: "200px" });
+    expect(screen.getByRole("button", { name: "README.md" })).toBe(fileButton);
+    expect(fileButton).toHaveAttribute("aria-current", "true");
+
+    rerender(panelAt("conv_header_split", { selectedFilePath: "other.md" }));
+    expect(tree.style.width).toBe("");
+    expect(fileButton).not.toHaveAttribute("aria-current");
+    expect(screen.getByRole("button", { name: "other.md" })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+    expect(screen.queryByTestId("preview")).not.toBeInTheDocument();
+  });
+
   it("omits the redundant Working folder heading in the standalone card", () => {
     renderPanel({ conversationId: "conv_header_card", files: [] });
     expect(screen.queryByText("Working folder")).toBeNull();
@@ -2110,6 +2156,7 @@ describe("FilesPanel double-click navigation", () => {
         workingDir: "/home/user/proj",
         onFileSelect,
         onFileOpenInTree: inline ? onFileOpenInTree : undefined,
+        selectedFilePath: inline ? "src/App.tsx" : null,
         showOpenInTab: inline,
       });
 
@@ -2122,7 +2169,9 @@ describe("FilesPanel double-click navigation", () => {
       );
 
       fireEvent.doubleClick(screen.getByRole("button", { name: "src/" }));
-      fireEvent.click(screen.getByText("App.tsx"));
+      const openedFile = screen.getByRole("button", { name: "App.tsx" });
+      expect(openedFile.getAttribute("aria-current")).toBe(inline ? "true" : null);
+      fireEvent.click(openedFile);
 
       expect(inline ? onFileOpenInTree : onFileSelect).toHaveBeenCalledWith("src/App.tsx");
       expect(inline ? onFileSelect : onFileOpenInTree).not.toHaveBeenCalled();

@@ -158,18 +158,19 @@ vi.mock("./FilesPanel", () => ({
   // and the FileViewer moved up to WorkspacePanel. It echoes its fixed scope
   // (data-flat-view) and exposes file-select buttons; the scope is now the
   // Files vs Changes rail tab (driven by the real WorkspacePanel), not an
-  // in-panel toggle. The inline viewer is rendered directly by WorkspacePanel
-  // via the FileViewer mock below (data-testid="file-viewer-inline").
+  // in-panel toggle. Render the preview slot supplied by WorkspacePanel.
   FilesPanel: ({
     onFileSelect,
     onFileOpenInTree,
     flatView,
     showHidden,
+    filePreview,
   }: {
     onFileSelect: (path: string) => void;
     onFileOpenInTree?: (path: string) => void;
     flatView: boolean;
     showHidden: boolean;
+    filePreview?: ReactNode;
   }) => (
     <div
       data-testid="files-panel"
@@ -190,6 +191,7 @@ vi.mock("./FilesPanel", () => ({
       >
         select-agents
       </button>
+      {filePreview}
     </div>
   ),
 }));

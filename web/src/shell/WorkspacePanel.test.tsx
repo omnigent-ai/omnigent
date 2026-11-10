@@ -71,20 +71,32 @@ vi.mock("./FilesPanel", () => ({
     conversationId,
     onFileSelect,
     onFileOpenInTree,
+    selectedFilePath,
+    treeColumnWidth,
+    treeResizeHandle,
+    filePreview,
   }: {
     flatView: boolean;
     conversationId: string;
     onFileSelect: (path: string) => void;
     onFileOpenInTree?: (path: string) => void;
+    selectedFilePath?: string | null;
+    treeColumnWidth?: number;
+    treeResizeHandle?: ReactNode;
+    filePreview?: ReactNode;
   }) => (
     <div
       data-testid="files-panel-stub"
       data-session={conversationId}
       data-flat-view={String(flatView)}
+      data-selected-file={selectedFilePath ?? ""}
+      data-tree-width={treeColumnWidth}
     >
       <button type="button" onClick={() => (onFileOpenInTree ?? onFileSelect)("src/a.md")}>
         Open tree file
       </button>
+      {treeResizeHandle}
+      {filePreview}
     </div>
   ),
 }));
@@ -3291,7 +3303,11 @@ describe("WorkspacePanel file tree split", () => {
       fileTreeSplitEnabled: true,
       maximized,
     });
-    expect(screen.getByText("Select a file to view it here")).toBeVisible();
+    expect(screen.queryByText("Select a file to view it here")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("file-viewer-stub")).not.toBeInTheDocument();
+    expect(screen.queryByRole("separator", { name: "Resize file tree" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("files-panel-stub")).not.toHaveAttribute("data-tree-width");
+    const tree = screen.getByTestId("files-panel-stub");
     fireEvent.click(screen.getByRole("button", { name: "Open tree file" }));
     expect(openFileInTree).toHaveBeenCalledWith("src/a.md");
     expect(openFileViewer).not.toHaveBeenCalled();
@@ -3299,14 +3315,24 @@ describe("WorkspacePanel file tree split", () => {
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/a.md");
     expect(screen.getAllByTestId("files-panel-stub")).toHaveLength(1);
     expect(screen.queryByRole("button", { name: "Close a.md" })).not.toBeInTheDocument();
-    const tree = screen.getByTestId("files-panel-stub");
+    expect(screen.getByTestId("files-panel-stub")).toBe(tree);
+    expect(tree).toHaveAttribute("data-selected-file", "src/a.md");
+    expect(tree).toHaveAttribute("data-tree-width", "260");
+    expect(screen.getByRole("separator", { name: "Resize file tree" })).toBeInTheDocument();
+    rerender({ treePreviewPath: "src/c.md" });
+    expect(tree).toHaveAttribute("data-selected-file", "src/c.md");
     rerender({ selectedFilePath: "src/b.md", openFiles: ["src/b.md"] });
     expect(screen.getAllByTestId("file-viewer-stub")).toHaveLength(1);
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/b.md");
     expect(screen.getByTestId("files-panel-stub")).toBe(tree);
     expect(tree.closest(".invisible")).not.toBeNull();
     rerender({ selectedFilePath: null });
-    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/a.md");
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/c.md");
+    rerender({ treePreviewPath: null });
+    expect(screen.getByTestId("files-panel-stub")).toBe(tree);
+    expect(tree).not.toHaveAttribute("data-tree-width");
+    expect(tree).toHaveAttribute("data-selected-file", "");
+    expect(screen.queryByTestId("file-viewer-stub")).not.toBeInTheDocument();
   });
 
   it.each(["flag off", "setting", "narrow", "mobile", "changes"])(
@@ -3322,7 +3348,7 @@ describe("WorkspacePanel file tree split", () => {
         fileTreeSplitEnabled: mode !== "flag off",
         rightRailTab: mode === "changes" ? "changes" : "files",
       });
-      expect(screen.queryByTestId("workspace-files-split")).not.toBeInTheDocument();
+      expect(screen.getByTestId("files-panel-stub")).not.toHaveAttribute("data-tree-width");
       fireEvent.click(screen.getByRole("button", { name: "Open tree file" }));
       expect(openFileViewer).toHaveBeenCalledWith("src/a.md");
       expect(openFileInTree).not.toHaveBeenCalled();
@@ -3332,11 +3358,11 @@ describe("WorkspacePanel file tree split", () => {
 
   it("applies the setting live and measures contained panes independently of the viewport", () => {
     isMobileMock.mockReturnValue(true);
-    renderWorkspace({ fileTreeSplitEnabled: true, contained: true });
-    expect(screen.getByTestId("workspace-files-split")).toBeInTheDocument();
+    renderWorkspace({ fileTreeSplitEnabled: true, contained: true, treePreviewPath: "src/a.md" });
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-tree-width", "260");
     act(() => writeAlwaysOpenFilesInTab(true));
-    expect(screen.queryByTestId("workspace-files-split")).not.toBeInTheDocument();
+    expect(screen.getByTestId("files-panel-stub")).not.toHaveAttribute("data-tree-width");
     act(() => writeAlwaysOpenFilesInTab(false));
-    expect(screen.getByTestId("workspace-files-split")).toBeInTheDocument();
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-tree-width", "260");
   });
 });

@@ -8,6 +8,7 @@ import {
   type WorkspaceChangedFile,
   type WorkspaceFile,
   useWorkspaceDirectories,
+  joinBrowseLocation,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { hasCommandModifier } from "@/lib/hotkeys";
@@ -411,6 +412,7 @@ function FolderTreeInner({
   isError,
   error,
   onFileSelect,
+  selectedFilePath,
   showOpenInTab = false,
   conversationId,
   showHidden,
@@ -435,6 +437,7 @@ function FolderTreeInner({
   isError: boolean;
   error: Error | null;
   onFileSelect: (path: string, openInTab?: boolean) => void;
+  selectedFilePath?: string | null;
   showOpenInTab?: boolean;
   conversationId: string | undefined;
   showHidden: boolean;
@@ -820,6 +823,7 @@ function FolderTreeInner({
             <SearchResultRow
               key={file.path}
               file={file}
+              selected={selectedFilePath === joinBrowseLocation(browseLocation, file.path)}
               onFileSelect={onFileSelect}
               showOpenInTab={showOpenInTab}
               onRevealDir={revealDirectory}
@@ -900,6 +904,10 @@ function FolderTreeInner({
               ) : (
                 <TreeNodeRow
                   node={row.node}
+                  selected={
+                    row.node.type === "file" &&
+                    selectedFilePath === joinBrowseLocation(browseLocation, row.node.file.path)
+                  }
                   depth={row.depth}
                   open={row.open}
                   onFileSelect={onFileSelect}
@@ -955,6 +963,7 @@ function FileRowItem({
   bytes,
   onFileSelect,
   showOpenInTab = false,
+  selected = false,
   conversationId,
 }: {
   /** Canonical workspace-relative path, used for the download button and title. */
@@ -971,6 +980,7 @@ function FileRowItem({
   bytes: number | null;
   onFileSelect: (path: string, openInTab?: boolean) => void;
   showOpenInTab?: boolean;
+  selected?: boolean;
   conversationId: string | undefined;
 }) {
   const isDeleted = fileStatus === "deleted";
@@ -993,13 +1003,14 @@ function FileRowItem({
         onContextMenu={reveal.onContextMenu}
         className={cn(
           "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1",
-          isDeleted ? "opacity-50" : "hover:bg-muted",
+          isDeleted ? "opacity-50" : selected ? "bg-accent" : "hover:bg-muted",
         )}
         style={{ paddingLeft: `${indentFor(depth)}px` }}
       >
         <IndentGuides depth={depth} />
         <button
           type="button"
+          aria-current={selected || undefined}
           className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
           onClick={(event) => {
             if (showOpenInTab && hasCommandModifier(event)) onFileSelect(path, true);
@@ -1085,6 +1096,7 @@ function SearchResultRow({
   file,
   onFileSelect,
   showOpenInTab = false,
+  selected = false,
   onRevealDir,
   conversationId,
   changedFileMap,
@@ -1092,6 +1104,7 @@ function SearchResultRow({
   file: WorkspaceFile;
   onFileSelect: (path: string, openInTab?: boolean) => void;
   showOpenInTab?: boolean;
+  selected?: boolean;
   /** Reveal a matched directory in the tree (expand it + ancestors). */
   onRevealDir: (path: string) => void;
   conversationId: string | undefined;
@@ -1109,6 +1122,7 @@ function SearchResultRow({
       bytes={file.bytes}
       onFileSelect={onFileSelect}
       showOpenInTab={showOpenInTab}
+      selected={selected}
       conversationId={conversationId}
     />
   );
@@ -1171,6 +1185,7 @@ function TreeFileRow({
   depth,
   onFileSelect,
   showOpenInTab = false,
+  selected = false,
   conversationId,
   fileStatus,
 }: {
@@ -1178,6 +1193,7 @@ function TreeFileRow({
   depth: number;
   onFileSelect: (path: string, openInTab?: boolean) => void;
   showOpenInTab?: boolean;
+  selected?: boolean;
   conversationId: string | undefined;
   fileStatus: WorkspaceChangedFile["status"] | undefined;
 }) {
@@ -1190,6 +1206,7 @@ function TreeFileRow({
       bytes={node.file.bytes}
       onFileSelect={onFileSelect}
       showOpenInTab={showOpenInTab}
+      selected={selected}
       conversationId={conversationId}
     />
   );
@@ -1212,6 +1229,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   open,
   onFileSelect,
   showOpenInTab = false,
+  selected = false,
   conversationId,
   onTogglePath,
   changedFileMap,
@@ -1225,6 +1243,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   open: boolean;
   onFileSelect: (path: string, openInTab?: boolean) => void;
   showOpenInTab?: boolean;
+  selected?: boolean;
   conversationId: string | undefined;
   onTogglePath: (path: string) => void;
   changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
@@ -1241,6 +1260,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
         depth={depth}
         onFileSelect={onFileSelect}
         showOpenInTab={showOpenInTab}
+        selected={selected}
         conversationId={conversationId}
         fileStatus={changedFileMap.get(node.file.path)}
       />

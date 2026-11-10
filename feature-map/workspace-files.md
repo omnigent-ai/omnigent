@@ -1,13 +1,19 @@
 # Workspace file tree
 
 The desktop Workspace Files tab can show the folder tree beside the selected
-file. Users browse files without adding tabs, resize the tree, or open a file
-in its own tab when they want a standalone view.
+file. The tree fills the panel until a file is selected. Users browse files
+without adding tabs, resize the tree, or open a file in its own tab when they
+want a standalone view.
 
 ## Sub-features
 
-- `inline`: a plain tree-file click replaces the adjacent preview without adding
-  a tab; before selection, the viewer asks the user to select a file.
+- `inline`: the first plain tree-file click opens an adjacent preview without
+  adding a tab; before selection, the tree fills the panel with no empty viewer
+  or divider. Later clicks replace the preview.
+- `selection`: the previewed file stays highlighted in the tree and file-name
+  search results, so users can see which file is open beside them.
+- `header`: folder navigation and actions span the full Files panel above both
+  columns; file-name search stays with the tree below that header.
 - `tabs`: Cmd-click on macOS, Ctrl-click elsewhere, middle-click, or the file's
   **Open in new tab** context-menu action opens a standalone file tab.
 - `resize`: drag the divider or focus it and use the arrow keys; the tree width
@@ -49,10 +55,14 @@ below own their environment and use a built SPA with mocked backend responses.
   `tests/server/test_feature_flags.py` and
   `tests/server/integration/test_utility_endpoints.py`.
 
-For the picker and session-grid entry points, choose Files, widen the panel,
-expand a folder and click two files. Confirm the preview changes beside the tree
-without adding tabs. Narrow the panel until the split disappears and confirm a
-file click now opens a standalone tab. Repeat in full screen.
+For the picker and session-grid entry points, choose Files, widen the panel, and
+confirm the tree initially fills the panel with no empty viewer or divider.
+Expand a folder and click two files. Confirm the first click reveals the split,
+the preview changes without adding tabs, and the current file is highlighted.
+Search for that file by name and confirm its search result stays highlighted.
+The folder header should span both columns while search stays in the tree.
+Narrow the panel until the split disappears and confirm a file click now opens
+a standalone tab. Repeat in full screen.
 
 For Settings, turn **Always open files in a new tab** on and return to Files:
 the tree should fill the panel and clicks should create tabs. Reload to check

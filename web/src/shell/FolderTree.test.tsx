@@ -92,6 +92,25 @@ function dir(path: string, modifiedAt: number | null = null): WorkspaceFile {
 
 describe("FolderTree file opening", () => {
   it.each([false, true])(
+    "marks only the previewed file in tree/search rows (search=%s)",
+    (search) => {
+      renderTree({
+        files: [file("README.md"), file("other.md")],
+        searchQuery: search ? ".md" : "",
+        searchResults: search ? [file("README.md"), file("other.md")] : undefined,
+        browseLocation: "/tmp/project",
+        selectedFilePath: "/tmp/project/README.md",
+      });
+      const selected = screen.getByRole("button", { name: "README.md" });
+      const other = screen.getByRole("button", { name: "other.md" });
+      expect(selected).toHaveAttribute("aria-current", "true");
+      expect(selected.parentElement).toHaveClass("bg-accent");
+      expect(other).not.toHaveAttribute("aria-current");
+      expect(other.parentElement).not.toHaveClass("bg-accent");
+    },
+  );
+
+  it.each([false, true])(
     "opens tree and search rows with tab gestures (search=%s)",
     async (search) => {
       const onFileSelect = vi.fn();
