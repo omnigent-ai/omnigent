@@ -275,7 +275,7 @@ _MCP_PROTOCOL_VERSION = "2024-11-05"
 # on its MCP stdout. Standard MCP notification — unrelated to the
 # experimental Claude Channels feature that this module no longer
 # uses.
-_TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
+TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
 _TOOLS_CHANGED_POST_TIMEOUT_S = 10.0
 # The control POST carries an empty JSON object; anything larger is not ours.
 _TOOLS_CHANGED_BODY_MAX_BYTES = 4096
@@ -6102,10 +6102,14 @@ def display_cost_approval_popup(
     )
 
 
+class ClaudeBridgeNotReady(RuntimeError):
+    """The MCP control endpoint has not published its connection details yet."""
+
+
 def post_tools_changed(
     bridge_dir: Path,
     *,
-    timeout_s: float = _TOOLS_CHANGED_READY_TIMEOUT_S,
+    timeout_s: float = TOOLS_CHANGED_READY_TIMEOUT_S,
     cancelled: threading.Event | None = None,
 ) -> None:
     """
@@ -6118,7 +6122,7 @@ def post_tools_changed(
 
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait for the bridge control endpoint
-        to publish itself, e.g. ``30.0``.
+        to publish itself, e.g. ``30.0``; ``0`` probes once without waiting.
     :param cancelled: Stops waiting when the notifying task is cancelled.
     :returns: None.
     :raises RuntimeError: If the bridge server is not ready, cannot
@@ -11689,7 +11693,7 @@ def _wait_for_server_info(
     """
     deadline = time.monotonic() + timeout_s
     path = bridge_dir / _SERVER_FILE
-    while time.monotonic() < deadline:
+    while True:
         if cancelled is not None and cancelled.is_set():
             raise RuntimeError("Claude native bridge notification was cancelled")
         payload = _read_json_file(path)
@@ -11699,11 +11703,13 @@ def _wait_for_server_info(
             and (payload.get("socket") or payload.get("url"))
         ):
             return payload
+        if time.monotonic() >= deadline:
+            break
         if cancelled is None:
             time.sleep(0.05)
         else:
             cancelled.wait(0.05)
-    raise RuntimeError(
+    raise ClaudeBridgeNotReady(
         "Claude native bridge is not ready yet. Wait for Claude Code "
         "startup to finish before notifying tool list changes."
     )
