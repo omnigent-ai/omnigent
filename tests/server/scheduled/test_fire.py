@@ -1128,10 +1128,30 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
 
 
 @pytest.mark.asyncio
-async def test_incompatible_permission_mode_fails_without_session() -> None:
+@pytest.mark.parametrize(
+    ("saved_mode", "error_code", "expected"),
+    [
+        (
+            "bypassPermissions",
+            "permission_mode_unsupported",
+            ["'bypassPermissions' is not supported by 'codex-native'", "Edit the automation"],
+        ),
+        (
+            "unknown-permission-mode",
+            "invalid_input",
+            [
+                "Unsupported permission_mode: 'unknown-permission-mode'",
+                "JSON null (not the string",
+            ],
+        ),
+    ],
+)
+async def test_incompatible_permission_mode_fails_without_session(
+    saved_mode: str, error_code: str, expected: list[str]
+) -> None:
     """A saved mode for another harness must not silently fall back to defaults."""
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=saved_mode)})
 
     launch = AsyncMock()
 
@@ -1146,9 +1166,9 @@ async def test_incompatible_permission_mode_fails_without_session() -> None:
     assert conv_store.created == []
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
-    assert store.runs[0]["error_code"] == "permission_mode_unsupported"
-    assert "'bypassPermissions' is not supported by 'codex-native'" in store.runs[0]["error"]
-    assert "Edit the automation" in store.runs[0]["error"]
+    assert store.runs[0]["error_code"] == error_code
+    for fragment in expected:
+        assert fragment in store.runs[0]["error"]
     assert store.runs[0]["conversation_id"] is None
 
 

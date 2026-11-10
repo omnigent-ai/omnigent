@@ -40,6 +40,7 @@ import {
   type TriggerOperator,
   type TriggerScopeOperator,
   type TriggerSource,
+  type TriggerTaskSessionMode,
 } from "@/components/scheduled/triggerTemplates";
 import { cn } from "@/lib/utils";
 
@@ -54,10 +55,13 @@ export function TriggerTemplateFields({
   onEditAsPrompt,
   onSelectOpenChange,
   toolsProvided = false,
+  taskSessionMode = "new",
 }: {
   source: TriggerSource;
   fields: TriggerFields;
   onChange: (next: TriggerFields) => void;
+  /** "continue" sends every match to one task session, which these instructions then direct. */
+  taskSessionMode?: TriggerTaskSessionMode;
   /** The prompt the task will save; "" until the required fields are filled. */
   renderedPrompt: string;
   /** Leave the template and edit the rendered prompt as a plain prompt. */
@@ -398,7 +402,11 @@ export function TriggerTemplateFields({
 
       <div className="flex flex-col gap-1.5">
         <div className="flex items-center gap-1.5">
-          <Label htmlFor="task-trigger-instructions">Instructions for each session</Label>
+          <Label htmlFor="task-trigger-instructions">
+            {taskSessionMode === "continue"
+              ? "Instructions for the task session"
+              : "Instructions for each session"}
+          </Label>
           {!toolsProvided && (
             <TooltipProvider>
               <Tooltip open={warningsOpen} onOpenChange={setWarningsOpen}>
@@ -438,7 +446,11 @@ export function TriggerTemplateFields({
         {instructionsTooLong && (
           <p className="text-sm text-destructive" role="alert" data-testid="task-trigger-too-long">
             Keep instructions to {MAX_INSTRUCTIONS_CHARS.toLocaleString("en-US")} characters or
-            fewer so each session&apos;s first message has room for the item.
+            fewer so each{" "}
+            {taskSessionMode === "continue"
+              ? "message to the task session"
+              : "session's first message"}{" "}
+            has room for the item.
           </p>
         )}
         <p className="text-sm text-muted-foreground" data-testid="task-trigger-attribution-note">

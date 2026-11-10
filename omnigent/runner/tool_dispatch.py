@@ -5058,7 +5058,7 @@ async def _execute_scheduled_task_tool(
 
     if resp.status_code >= 400:
         return json.dumps(
-            {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
         )
     return json.dumps(resp.json())
 
