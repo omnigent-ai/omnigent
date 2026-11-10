@@ -1332,6 +1332,13 @@ describe("SubagentsPanel", () => {
           tool: "researcher",
           session_name: "auth",
         }),
+        childInfo({
+          id: "conv_summarized",
+          title: "worker:find-deploy-permission-control",
+          task_summary: "Verify Claude Deploy Approval across every production environment",
+          tool: "worker",
+          session_name: "find-deploy-permission-control",
+        }),
       ],
     });
 
@@ -1343,6 +1350,13 @@ describe("SubagentsPanel", () => {
     const llmSpawned = childRow(container, "conv_llm");
     expect(llmSpawned).toHaveTextContent("auth");
     expect(llmSpawned).not.toHaveTextContent("researcher");
+    // Once a summary exists the row pairs it with the handle, and the full
+    // (possibly truncated) label stays readable through the tooltip.
+    const combined =
+      "Verify Claude Deploy Approval across every production environment · find-deploy-permission-control";
+    const summarized = childRow(container, "conv_summarized");
+    expect(summarized).toHaveTextContent(combined);
+    expect(summarized.querySelector(`[title="${combined}"]`)).not.toBeNull();
   });
 
   it("shows the Task description for Claude Code sub-agents, never the hex id", () => {
