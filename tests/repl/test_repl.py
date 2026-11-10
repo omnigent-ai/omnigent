@@ -1561,7 +1561,7 @@ def test_startup_header_shows_databricks_workspace_url_not_api_mount() -> None:
         credential="Subscription",
         creds_line=None,
     )
-    api_mount = "https://e2-dogfood.staging.cloud.databricks.com/api/2.0/omnigent"
+    api_mount = "https://example.staging.cloud.databricks.com/api/2.0/omnigent"
     plain = re.sub(
         r"\x1b\[[0-9;]*m",
         "",
@@ -1572,7 +1572,7 @@ def test_startup_header_shows_databricks_workspace_url_not_api_mount() -> None:
         ),
     )
     # The clean workspace URL is shown, the internal API path is NOT.
-    assert "https://e2-dogfood.staging.cloud.databricks.com/omnigent" in plain
+    assert "https://example.staging.cloud.databricks.com/omnigent" in plain
     assert "/api/2.0/omnigent" not in plain
     # No version row for a Databricks workspace server.
     assert "server " not in plain

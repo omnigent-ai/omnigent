@@ -400,6 +400,8 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     import omnigent.harnesses.pi_native.main as pi_native
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_PI_ENV_UNSET", "SYNTH_EXCLUDED")
+    monkeypatch.setenv("SYNTH_EXCLUDED", "sentinel-excluded")
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
     monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
 
@@ -415,15 +417,17 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     monkeypatch.setattr(
         pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: provider
     )
-    # Avoid touching the real Pi settings/models writer; the launch env is not
-    # under test here — the credential-warning surfacing is.
-    monkeypatch.setattr(
-        pi_native_credentials,
-        "pi_native_provider_launch",
-        lambda _agent_dir, _provider, _effort=None, **_kwargs: (
-            pi_native_credentials.PiNativeLaunch(env={}, args=[])
-        ),
-    )
+    # Avoid touching the real Pi settings/models writer; record the env it is
+    # given to provision the agent dir.
+    provision_envs: list[dict[str, str]] = []
+
+    def _fake_provider_launch(
+        _agent_dir: Path, _provider: Any, _effort: str | None = None, **kwargs: Any
+    ) -> Any:
+        provision_envs.append(kwargs["pi_env"])
+        return pi_native_credentials.PiNativeLaunch(env={}, args=[])
+
+    monkeypatch.setattr(pi_native_credentials, "pi_native_provider_launch", _fake_provider_launch)
 
     async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
         return _PiNativeLaunchConfig(
@@ -474,6 +478,11 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     assert data["item_type"] == "error"
     assert data["item_data"]["code"] == "pi_credentials_unresolved"
     assert "databricks auth login" in data["item_data"]["message"]
+    # The agent dir is provisioned against the env the Pi terminal will get.
+    [provision_env] = provision_envs
+    assert "SYNTH_EXCLUDED" not in provision_env
+    assert pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR in provision_env
+    assert provision_env["RUNNER_SERVER_URL"] == "http://127.0.0.1:8000"
 
 
 @pytest.mark.asyncio

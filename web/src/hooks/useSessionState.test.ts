@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getSessionState } from "./useSessionState";
+import { getSessionState, isSessionWorking } from "./useSessionState";
 import type { Conversation } from "@/hooks/useConversations";
 
 type SessionFields = Pick<
@@ -136,5 +136,19 @@ describe("getSessionState — priority composition", () => {
   it("returns null when conversation status is undefined", () => {
     // Older sessions whose server payload predates the `status` field.
     expect(getSessionState(conv({}))).toBeNull();
+  });
+});
+
+describe("isSessionWorking", () => {
+  it.each([
+    [{ status: "running" }, true],
+    [{ status: "idle", pending_elicitations_count: 1 }, true],
+    [{ status: "idle", background_work_running: true }, true],
+    [{ status: "failed", background_work_running: true }, true],
+    [{ status: "idle", pending_elicitations_count: 0, background_work_running: false }, false],
+    [{ status: "failed" }, false],
+    [{}, false],
+  ] satisfies [SessionFields, boolean][])("%o -> %s", (fields, expected) => {
+    expect(isSessionWorking(conv(fields))).toBe(expected);
   });
 });
