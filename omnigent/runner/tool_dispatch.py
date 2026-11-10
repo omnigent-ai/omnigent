@@ -91,7 +91,12 @@ from omnigent.tools.builtins.session_message import (
     SysSessionMessageTool,
     peer_session_messaging_enabled,
 )
-from omnigent.tools.builtins.session_projects import SysProjectListTool, SysSessionUpdateTool
+from omnigent.tools.builtins.session_projects import (
+    SysProjectDeleteTool,
+    SysProjectListTool,
+    SysProjectUpdateTool,
+    SysSessionUpdateTool,
+)
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -331,8 +336,15 @@ _SESSION_QUERY_TOOLS = frozenset(
 )
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
-# Project listing and moves proxy the sidebar's owner-gated REST endpoints.
-_PROJECT_TOOLS = frozenset({SysProjectListTool.name(), SysSessionUpdateTool.name()})
+# Project and session organizing proxy the sidebar's owner-gated REST endpoints.
+_PROJECT_TOOLS = frozenset(
+    {
+        SysProjectListTool.name(),
+        SysSessionUpdateTool.name(),
+        SysProjectUpdateTool.name(),
+        SysProjectDeleteTool.name(),
+    }
+)
 _UI_TOOLS = frozenset({UiOpenFileTool.name()})
 
 # The title bound the rename tool advertises to the LLM — read once from the
@@ -618,6 +630,8 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionMessageTool,
             SysProjectListTool,
             SysSessionUpdateTool,
+            SysProjectUpdateTool,
+            SysProjectDeleteTool,
             UiOpenFileTool,
             SysAgentGetTool,
             SysAgentListTool,
@@ -7254,15 +7268,18 @@ async def execute_tool(
             output = await execute_message_tool(args, server_client, conversation_id)
         elif tool_name in _PROJECT_TOOLS:
             from omnigent.runner.session_projects import (
+                execute_project_delete,
                 execute_project_list,
+                execute_project_update,
                 execute_session_update,
             )
 
-            execute = (
-                execute_project_list
-                if tool_name == SysProjectListTool.name()
-                else execute_session_update
-            )
+            execute = {
+                SysProjectListTool.name(): execute_project_list,
+                SysSessionUpdateTool.name(): execute_session_update,
+                SysProjectUpdateTool.name(): execute_project_update,
+                SysProjectDeleteTool.name(): execute_project_delete,
+            }[tool_name]
             output = await execute(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(

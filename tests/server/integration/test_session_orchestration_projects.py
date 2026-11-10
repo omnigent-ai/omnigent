@@ -366,3 +366,87 @@ async def test_project_update_refuses_a_source_shared_with_edit_access(auth_clie
         json={"project_id": ""},
     )
     assert direct.status_code == 403 and "bound runner" in direct.text
+
+
+@_ONE_ENVIRONMENT
+async def test_organizing_tools_rename_pin_archive_and_manage_projects(auth_client, peers, db_uri):
+    source, target, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+
+    async def tool(tool_name: str, /, **arguments) -> dict:
+        result = await _project_tool(auth_client, source, tool_name, **arguments)
+        assert "error" not in result, result
+        return result
+
+    await tool(
+        "sys_session_update", session_id=target["id"], title="Quarterly report", pinned=True
+    )
+    assert store.get_conversation(target["id"]).title == "Quarterly report"
+    pinned = await tool("sys_project_list", pinned=True)
+    assert [(row["session_id"], row.get("pinned")) for row in pinned["sessions"]] == [
+        (target["id"], True)
+    ]
+    found = await tool("sys_project_list", search="quarterly")
+    assert [row["session_id"] for row in found["sessions"]] == [target["id"]]
+
+    await tool("sys_session_update", session_id=target["id"], project="Drafts")
+    renamed = await tool("sys_project_update", project="Drafts", name="Reports", icon="📊")
+    assert renamed == {
+        "project": "Reports",
+        "status": "updated",
+        "previous_name": "Drafts",
+        "icon": "📊",
+    }
+    (project,) = (await auth_client.get("/v1/projects")).json()["data"]
+    assert project["name"] == "Reports" and project["config"] == {"icon": "📊"}
+    refused = await _project_tool(auth_client, source, "sys_project_delete", project="Reports")
+    assert "project still has sessions" in refused["error"]
+
+    # The calling session is mid-turn; archiving another session must not touch it.
+    # (Listing reconciles live status against the stubbed runner, so set it here.)
+    store.set_session_live_status(source["id"], "running")
+    archived = await tool("sys_session_update", session_id=target["id"], archived=True)
+    assert archived["status"] == "updated"
+    saved = store.get_conversation(target["id"])
+    assert saved.archived is True and saved.project_id == project["id"]
+    assert store.get_conversation(source["id"]).live_status == "running"
+    listed = await tool("sys_project_list", include_archived=True)
+    rows = {row["session_id"]: row for row in listed["sessions"]}
+    assert rows[target["id"]].get("archived") is True and "pinned" not in rows[target["id"]]
+    assert await tool("sys_project_delete", project="Reports") == {
+        "project": "Reports",
+        "status": "deleted",
+    }
+    assert (await auth_client.get("/v1/projects")).json()["data"] == []
+
+    itself = await _project_tool(
+        auth_client, source, "sys_session_update", session_id=source["id"], archived=True
+    )
+    assert "cannot archive itself" in itself["error"]
+    assert store.get_conversation(source["id"]).archived is not True
+
+
+@_ONE_ENVIRONMENT
+async def test_organizing_tools_refuse_a_source_shared_with_edit_access(
+    auth_client, peers, db_uri
+):
+    source, target, _ = peers
+    project_id = await _project(auth_client, "Shared folder")
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    permissions.grant("bob", source["id"], LEVEL_EDIT)
+
+    for name, arguments in (
+        ("sys_session_update", {"session_id": target["id"], "title": "Hijacked"}),
+        ("sys_session_update", {"session_id": target["id"], "pinned": True}),
+        ("sys_session_update", {"session_id": target["id"], "archived": True}),
+        ("sys_project_update", {"project": "Shared folder", "name": "Hijacked"}),
+        ("sys_project_delete", {"project": "Shared folder"}),
+    ):
+        refused = await _project_tool(auth_client, source, name, **arguments)
+        assert "shared with edit access cannot" in refused["error"], (name, refused)
+    saved = SqlAlchemyConversationStore(db_uri).get_conversation(target["id"])
+    assert saved.title != "Hijacked" and saved.archived is not True
+    assert not any(key.startswith("omnigent.pinned") for key in saved.labels)
+    (project,) = (await auth_client.get("/v1/projects")).json()["data"]
+    assert project == {**project, "id": project_id, "name": "Shared folder"}

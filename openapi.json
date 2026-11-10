@@ -6714,6 +6714,11 @@
             "title": "Session Move Source Checks",
             "type": "boolean"
           },
+          "session_organize_source_checks": {
+            "default": false,
+            "title": "Session Organize Source Checks",
+            "type": "boolean"
+          },
           "session_pull_requests": {
             "default": false,
             "title": "Session Pull Requests",

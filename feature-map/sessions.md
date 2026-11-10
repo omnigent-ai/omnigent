@@ -98,6 +98,10 @@ the header menu), and each place is a separate entry point.
   [session orchestration](session-orchestration.md)).
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
+  Agents rename projects, set their emoji, and delete emptied ones with
+  `sys_project_update` and `sys_project_delete`, and rename, pin or archive
+  sessions with `sys_session_update` (see
+  [session orchestration](session-orchestration.md)).
 - `project-show-more`: an expanded project folder lists its five newest
   sessions; each Show more slides five more in until none remain. Re-expanding
   starts at five again, the open session stays listed once the sidebar has

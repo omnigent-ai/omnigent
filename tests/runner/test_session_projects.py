@@ -6,7 +6,12 @@ import httpx
 import pytest
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.runner.session_projects import execute_project_list, execute_session_update
+from omnigent.runner.session_projects import (
+    execute_project_delete,
+    execute_project_list,
+    execute_project_update,
+    execute_session_update,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -221,3 +226,291 @@ async def test_list_pages_projects_and_sessions_until_the_last_page():
     assert seen["projects"][1]["after"] == "1" * 32
     assert last["projects"] == [page_two] and last["sessions"] == []
     assert last["next_cursor"] is None and last["projects_next_cursor"] is None
+
+
+ORGANIZE_INFO = {"session_move_source_checks": True, "session_organize_source_checks": True}
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ({"session_id": SOURCE, "title": "  "}, "title must be non-blank"),
+        ({"session_id": SOURCE, "title": "x" * 201}, "title must be non-blank"),
+        ({"session_id": SOURCE, "pinned": "yes"}, "pinned must be true or false"),
+        ({"session_id": SOURCE, "archived": 1}, "archived must be true or false"),
+        ({"session_id": SOURCE, "archived": True, "pinned": True}, "cannot be pinned"),
+        ({"session_id": SOURCE, "archived": True}, "cannot archive itself"),
+    ],
+)
+async def test_update_rejects_invalid_organizing_fields_before_any_request(args, message):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    async with _client(handler) as client:
+        result = json.loads(await execute_session_update(args, client, SOURCE))
+    assert message in result["error"]
+    assert requests == []
+
+
+async def test_update_of_other_fields_needs_the_organize_source_check():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=CHECKED_INFO)
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update({"session_id": PARENT, "title": "New"}, client, SOURCE)
+        )
+    assert "cannot check the calling session's sharing" in result["error"]
+    assert [(r.method, r.url.path) for r in requests] == [("GET", "/v1/info")]
+
+
+def _organize_server(requests: list[httpx.Request], snapshot: dict):
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=ORGANIZE_INFO)
+        if request.method == "GET":
+            return httpx.Response(200, json=snapshot)
+        return httpx.Response(200, json={})
+
+    return handler
+
+
+async def test_update_renames_pins_and_archives_in_one_patch_with_the_source_header():
+    requests: list[httpx.Request] = []
+    snapshot = {"id": PARENT, "title": "Old", "labels": {}}
+    async with _client(_organize_server(requests, snapshot)) as client:
+        renamed = json.loads(
+            await execute_session_update(
+                {"session_id": PARENT, "title": " Release notes ", "pinned": True},
+                client,
+                SOURCE,
+            )
+        )
+        archived = json.loads(
+            await execute_session_update({"session_id": PARENT, "archived": True}, client, SOURCE)
+        )
+    assert renamed == {
+        "session_id": PARENT,
+        "status": "updated",
+        "title": "Release notes",
+        "pinned": True,
+    }
+    assert archived == {"session_id": PARENT, "status": "updated", "archived": True}
+    first, second = [r for r in requests if r.method == "PATCH"]
+    assert first.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    body = json.loads(first.content)
+    assert body["title"] == "Release notes"
+    assert set(body) == {"title", "labels"} and int(body["labels"]["omnigent.pinned"]) > 0
+    assert json.loads(second.content) == {"archived": True}
+
+
+async def test_update_skips_the_patch_when_nothing_changes():
+    requests: list[httpx.Request] = []
+    snapshot = {
+        "id": PARENT,
+        "title": "Same",
+        "archived": True,
+        "labels": {"omnigent.pinned": "1700000000000"},
+    }
+    async with _client(_organize_server(requests, snapshot)) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": PARENT, "title": "Same", "archived": True},
+                client,
+                SOURCE,
+            )
+        )
+        unpinned = json.loads(
+            await execute_session_update({"session_id": PARENT, "pinned": False}, client, SOURCE)
+        )
+    assert result["status"] == "unchanged"
+    assert unpinned["status"] == "updated"
+    (patched,) = [r for r in requests if r.method == "PATCH"]
+    assert json.loads(patched.content) == {"labels": {"omnigent.pinned": ""}}
+
+
+async def test_update_lets_a_family_member_rename_but_not_refile():
+    requests: list[httpx.Request] = []
+    snapshot = {"id": FAMILY_MEMBER, "family": {"representative_id": PARENT}}
+    async with _client(_organize_server(requests, snapshot)) as client:
+        renamed = json.loads(
+            await execute_session_update(
+                {"session_id": FAMILY_MEMBER, "title": "Mine"}, client, SOURCE
+            )
+        )
+        refiled = json.loads(
+            await execute_session_update(
+                {"session_id": FAMILY_MEMBER, "title": "Mine", "project": "Q3"}, client, SOURCE
+            )
+        )
+    assert renamed["status"] == "updated"
+    assert f"update {PARENT} instead" in refiled["error"]
+    assert len([r for r in requests if r.method == "PATCH"]) == 1
+
+
+def _project_server(requests: list[httpx.Request], *, members: list | None = None, status=200):
+    project = {"id": PROJECT_ID, "name": "Q3", "config": {"icon": "🚀", "model": "fast"}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/info":
+            return httpx.Response(200, json=ORGANIZE_INFO)
+        if path == "/v1/projects":
+            return httpx.Response(200, json={"data": [project]})
+        if path == "/v1/sessions":
+            return httpx.Response(200, json={"data": members or [], "has_more": False})
+        if request.method in ("PATCH", "DELETE") and status != 200:
+            return httpx.Response(status, json={"detail": "refused"})
+        return httpx.Response(200, json={})
+
+    return handler
+
+
+async def test_project_update_renames_and_keeps_other_config_when_changing_the_icon():
+    requests: list[httpx.Request] = []
+    async with _client(_project_server(requests)) as client:
+        result = json.loads(
+            await execute_project_update(
+                {"project": "Q3", "name": "Q3 launch", "icon": "📦"}, client, SOURCE
+            )
+        )
+        cleared = json.loads(
+            await execute_project_update({"project": "Q3", "icon": ""}, client, SOURCE)
+        )
+    assert result == {
+        "project": "Q3 launch",
+        "status": "updated",
+        "previous_name": "Q3",
+        "icon": "📦",
+    }
+    assert cleared == {"project": "Q3", "status": "updated", "icon": None}
+    first, second = [r for r in requests if r.method == "PATCH"]
+    assert first.url.path == f"/v1/projects/{PROJECT_ID}"
+    assert first.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    assert json.loads(first.content) == {
+        "name": "Q3 launch",
+        "config": {"model": "fast", "icon": "📦"},
+    }
+    assert json.loads(second.content) == {"config": {"model": "fast"}}
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ({}, "project must be a project name"),
+        ({"project": " "}, "project must be a project name"),
+        ({"project": "Q3"}, "nothing to update"),
+        ({"project": "Q3", "name": ""}, "name must be non-blank"),
+        ({"project": "Q3", "icon": "x" * 17}, "icon must be one emoji"),
+    ],
+)
+async def test_project_update_rejects_invalid_arguments_before_any_request(args, message):
+    requests: list[httpx.Request] = []
+    async with _client(_project_server(requests)) as client:
+        result = json.loads(await execute_project_update(args, client, SOURCE))
+    assert message in result["error"]
+    assert requests == []
+
+
+async def test_project_update_maps_unknown_projects_and_name_conflicts():
+    requests: list[httpx.Request] = []
+    async with _client(_project_server(requests, status=409)) as client:
+        missing = json.loads(
+            await execute_project_update({"project": "Nope", "name": "X"}, client, SOURCE)
+        )
+        taken = json.loads(
+            await execute_project_update({"project": "Q3", "name": "Taken"}, client, SOURCE)
+        )
+    assert "no project named 'Nope'" in missing["error"]
+    assert taken["error"] == "a project named 'Taken' already exists"
+
+
+async def test_project_delete_refuses_a_project_with_sessions():
+    requests: list[httpx.Request] = []
+    async with _client(_project_server(requests, members=[{"id": PARENT}])) as client:
+        result = json.loads(await execute_project_delete({"project": "Q3"}, client, SOURCE))
+    assert "project still has sessions" in result["error"]
+    (listed,) = [r for r in requests if r.url.path == "/v1/sessions"]
+    assert listed.url.params["project"] == "Q3" and listed.url.params["visibility"] == "mine"
+    assert not [r for r in requests if r.method == "DELETE"]
+
+
+async def test_project_delete_removes_an_empty_project_with_the_source_header():
+    requests: list[httpx.Request] = []
+    async with _client(_project_server(requests)) as client:
+        result = json.loads(await execute_project_delete({"project": "Q3"}, client, SOURCE))
+    assert result == {"project": "Q3", "status": "deleted"}
+    (deleted,) = [r for r in requests if r.method == "DELETE"]
+    assert deleted.url.path == f"/v1/projects/{PROJECT_ID}"
+    assert deleted.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+
+
+@pytest.mark.parametrize("tool", [execute_project_update, execute_project_delete])
+async def test_project_writes_need_the_organize_source_check(tool):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=CHECKED_INFO)
+
+    async with _client(handler) as client:
+        result = json.loads(await tool({"project": "Q3", "name": "New"}, client, SOURCE))
+    assert "cannot check the calling session's sharing" in result["error"]
+    assert [(r.method, r.url.path) for r in requests] == [("GET", "/v1/info")]
+
+
+async def test_list_forwards_search_and_filters_and_marks_pinned_and_archived():
+    seen: list[httpx.QueryParams] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/projects":
+            return httpx.Response(200, json={"data": []})
+        seen.append(request.url.params)
+        rows = [
+            {"id": PARENT, "status": "idle", "labels": {"omnigent.pinned": "1"}},
+            {"id": FAMILY_MEMBER, "status": "idle", "archived": True},
+        ]
+        return httpx.Response(200, json={"data": rows, "has_more": False})
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_project_list(
+                {"search": " release ", "pinned": True, "include_archived": True},
+                client,
+                SOURCE,
+            )
+        )
+        invalid = json.loads(await execute_project_list({"pinned": "yes"}, client, SOURCE))
+    (params,) = seen
+    assert params["search_query"] == "release"
+    assert params["pinned"] == "true" and params["include_archived"] == "true"
+    assert result["sessions"][0]["pinned"] is True and "archived" not in result["sessions"][0]
+    assert result["sessions"][1]["archived"] is True and "pinned" not in result["sessions"][1]
+    assert "pinned and include_archived must be true or false" in invalid["error"]
+
+
+async def test_update_refuses_to_archive_a_session_on_the_callers_runner():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=ORGANIZE_INFO)
+        session = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(200, json={"id": session, "runner_id": "runner-1"})
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update({"session_id": PARENT, "archived": True}, client, SOURCE)
+        )
+    assert "shares the calling session's runner" in result["error"]
+    assert [r.url.path for r in requests if r.method == "GET"][-1] == f"/v1/sessions/{SOURCE}"
+    assert not [r for r in requests if r.method == "PATCH"]

@@ -64,7 +64,7 @@ def require_owned_session(
             if _shared_with_editors(current.id, user_id, permissions):
                 raise OmnigentError(
                     "Sessions shared with edit access cannot send messages, launch "
-                    "independent sessions or move other sessions",
+                    "independent sessions or organize other sessions and projects",
                     code=ErrorCode.FORBIDDEN,
                 )
             if current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
