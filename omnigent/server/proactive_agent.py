@@ -45,6 +45,7 @@ _PROVISION_TIMEOUT_S = 5.0
 _MAX_TIMEZONE_CHARS = 64
 # Each account re-registration leaves one deleted task behind.
 _MAX_TASK_SLOTS = 32
+_ProvisionTask = asyncio.Task[ScheduledTask | None]
 _TASK_ID_NAMESPACE = uuid.UUID("7b6c3e0a-5a7e-4b55-9a3c-2f1d6e9c8b41")
 
 
@@ -140,13 +141,20 @@ class ProactiveProvisioner:
         key = _provision_key(user_id)
         return key not in self._checked and key not in self._running
 
-    def ensure_task(self, store: Any, user_id: str | None, timezone: str) -> ScheduledTask:
+    def ensure_task(
+        self, store: Any, agent_store: Any, user_id: str | None, timezone: str
+    ) -> ScheduledTask | None:
         """Return *user_id*'s proactive task, creating it if missing (database work only).
 
         :param store: The scheduled-task store.
+        :param agent_store: The agent store; no task is created without the built-in agent.
         :param user_id: The owner, or ``None`` in single-user mode.
         :param timezone: IANA timezone a new schedule runs in.
+        :returns: The task, or ``None`` when the built-in agent was not seeded.
         """
+        if agent_store.get(PROACTIVE_AGENT_ID) is None:
+            _logger.info("Proactive task not provisioned: the built-in agent is not seeded")
+            return None
         task_id = _free_task_id(store, user_id)
         if not isinstance(task_id, str):
             return task_id
@@ -167,8 +175,13 @@ class ProactiveProvisioner:
         return task
 
     async def provision(
-        self, store: Any, user_id: str | None, timezone: str, scheduler: Any | None
-    ) -> ScheduledTask:
+        self,
+        store: Any,
+        agent_store: Any,
+        user_id: str | None,
+        timezone: str,
+        scheduler: Any | None,
+    ) -> ScheduledTask | None:
         """Ensure the row off the event loop, then arm the in-process timer on it.
 
         :param scheduler: Legacy in-process scheduler, or ``None`` when persistent
@@ -177,8 +190,8 @@ class ProactiveProvisioner:
         key = _provision_key(user_id)
         self._running.add(key)
         try:
-            task = await asyncio.to_thread(self.ensure_task, store, user_id, timezone)
-            if scheduler is not None:
+            task = await asyncio.to_thread(self.ensure_task, store, agent_store, user_id, timezone)
+            if task is not None and scheduler is not None:
                 # Re-adding replaces the timer, so a row left by a failed attempt is armed too.
                 scheduler.add(task)
             self._checked.add(key)
@@ -187,7 +200,7 @@ class ProactiveProvisioner:
             self._running.discard(key)
 
 
-def start_provisioning(request: Any, user_id: str | None) -> asyncio.Task[ScheduledTask] | None:
+def start_provisioning(request: Any, user_id: str | None) -> _ProvisionTask | None:
     """Start provisioning the caller's proactive task alongside a session create.
 
     Runs inside the request, so a store that creates per-owner authorization
@@ -202,11 +215,14 @@ def start_provisioning(request: Any, user_id: str | None) -> asyncio.Task[Schedu
         return None
 
 
-def _start_provisioning(request: Any, user_id: str | None) -> asyncio.Task[ScheduledTask] | None:
+def _start_provisioning(request: Any, user_id: str | None) -> _ProvisionTask | None:
     state = request.app.state
     provisioner: ProactiveProvisioner | None = getattr(state, "proactive_provisioner", None)
     store = getattr(state, "scheduled_task_store", None)
-    if provisioner is None or store is None or not provisioner.needed(user_id):
+    agent_store = getattr(state, "agent_store", None)
+    if provisioner is None or store is None or agent_store is None:
+        return None
+    if not provisioner.needed(user_id):
         return None
     if not proactive_agent_available(state):
         return None
@@ -218,17 +234,19 @@ def _start_provisioning(request: Any, user_id: str | None) -> asyncio.Task[Sched
     scheduler = None
     if not getattr(state, "scheduled_task_dispatch_enabled", False):
         scheduler = getattr(state, "scheduled_task_scheduler", None)
-    task = asyncio.create_task(provisioner.provision(store, user_id, timezone, scheduler))
+    task = asyncio.create_task(
+        provisioner.provision(store, agent_store, user_id, timezone, scheduler)
+    )
     task.add_done_callback(_log_provisioning_failure)
     return task
 
 
-def _log_provisioning_failure(task: asyncio.Task[ScheduledTask]) -> None:
+def _log_provisioning_failure(task: _ProvisionTask) -> None:
     if not task.cancelled() and task.exception() is not None:
         _logger.warning("Proactive task provisioning failed", exc_info=task.exception())
 
 
-async def finish_provisioning(task: asyncio.Task[ScheduledTask] | None) -> None:
+async def finish_provisioning(task: _ProvisionTask | None) -> None:
     """Wait briefly for provisioning; never fail the session create.
 
     A failure is logged, and the caller's next session create tries again.

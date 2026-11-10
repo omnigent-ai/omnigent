@@ -20,7 +20,7 @@ from omnigent.db.utils import builtin_agent_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import proactive_agent
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
-from omnigent.server.app import _ensure_default_agents, create_app
+from omnigent.server.app import _ensure_default_agents, _ensure_extra_builtin_agents, create_app
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.proactive_agent import (
     PROACTIVE_AGENT_ID,
@@ -42,6 +42,16 @@ from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemySche
 from tests.server.helpers import FakeSandboxLauncher
 
 _BUNDLE = Path(proactive_agent.__file__).parent.parent / "resources" / "proactive" / "bundle"
+
+
+class _SeededAgents:
+    """An agent store in which the built-in proactive agent exists."""
+
+    def get(self, agent_id: str) -> object | None:
+        return object() if agent_id == PROACTIVE_AGENT_ID else None
+
+
+_SEEDED_AGENTS = _SeededAgents()
 
 
 def test_task_id_is_fixed_per_owner() -> None:
@@ -87,6 +97,48 @@ def test_seeded_outside_the_seeded_agents_allowlist(
     assert PROACTIVE_AGENT_NAME not in suppressed
     agent = agents.get(PROACTIVE_AGENT_ID)
     assert agent is not None and agent.name == PROACTIVE_AGENT_NAME
+
+
+def test_an_operator_agent_with_the_name_is_left_alone(db_uri: str, tmp_path: Path) -> None:
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agents = SqlAlchemyAgentStore(db_uri)
+    cache = AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache")
+    operator_id = uuid.uuid4().hex
+    agents.create(operator_id, PROACTIVE_AGENT_NAME, f"{operator_id}/operator")
+
+    _ensure_default_agents(agents, artifacts, cache)
+
+    operator = agents.get(operator_id)
+    assert operator is not None and operator.bundle_location == f"{operator_id}/operator"
+    assert agents.get(PROACTIVE_AGENT_ID) is None
+
+
+def test_an_extra_built_in_cannot_take_the_name(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    extra = tmp_path / f"{PROACTIVE_AGENT_NAME}.yaml"
+    extra.write_text("name: proactive\ninstructions: An operator's agent.\n")
+    monkeypatch.setenv("OMNIGENT_BUILTIN_AGENT_DIRS", str(extra))
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agents = SqlAlchemyAgentStore(db_uri)
+
+    cache = AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache")
+
+    seeded = _ensure_extra_builtin_agents(agents, artifacts, cache)
+
+    assert seeded == frozenset()
+    assert agents.get_by_name(PROACTIVE_AGENT_NAME) is None
+
+
+async def test_nothing_is_provisioned_without_the_built_in_agent(db_uri: str) -> None:
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    provisioner = ProactiveProvisioner()
+
+    task = await provisioner.provision(store, SqlAlchemyAgentStore(db_uri), None, "UTC", None)
+
+    assert task is None
+    assert store.list() == []
+    assert not provisioner.needed(None)
 
 
 async def test_agent_list_never_shows_the_proactive_agent(client: httpx.AsyncClient) -> None:
@@ -137,6 +189,7 @@ def _app(db_uri: str, tmp_path: Path, *, enabled: bool, sandbox: bool = True) ->
 @pytest_asyncio.fixture()
 async def client(db_uri: str, tmp_path: Path) -> AsyncIterator[httpx.AsyncClient]:
     app = _app(db_uri, tmp_path, enabled=True)
+    app.state.seed_builtin_agents()
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as c:
@@ -227,7 +280,7 @@ async def test_provisioning_arms_the_in_process_scheduler(db_uri: str) -> None:
     await scheduler.start()
     provisioner = ProactiveProvisioner()
     try:
-        task = await provisioner.provision(store, None, "UTC", scheduler)
+        task = await provisioner.provision(store, _SEEDED_AGENTS, None, "UTC", scheduler)
 
         assert scheduler.next_run_at(task.id) is not None
         assert not provisioner.needed(None)
@@ -244,11 +297,11 @@ async def test_a_failed_registration_is_retried(db_uri: str) -> None:
     scheduler.add = Mock(side_effect=RuntimeError("timer unavailable"))  # type: ignore[method-assign]
     try:
         with pytest.raises(RuntimeError):
-            await provisioner.provision(store, None, "UTC", scheduler)
+            await provisioner.provision(store, _SEEDED_AGENTS, None, "UTC", scheduler)
         assert provisioner.needed(None)
 
         scheduler.add = real_add  # type: ignore[method-assign]
-        task = await provisioner.provision(store, None, "UTC", scheduler)
+        task = await provisioner.provision(store, _SEEDED_AGENTS, None, "UTC", scheduler)
 
         assert scheduler.next_run_at(task.id) is not None
         assert [t.id for t in store.list()] == [task.id]
@@ -356,7 +409,7 @@ async def test_a_reregistered_account_gets_a_new_task(db_uri: str) -> None:
     old = accounts.create_user_with_password("alice", "test-password-hash")
     checked = ProactiveProvisioner()
     with account_authority_scope("alice", old.account_generation):
-        first = await checked.provision(store, "alice", "UTC", None)
+        first = await checked.provision(store, _SEEDED_AGENTS, "alice", "UTC", None)
         assert not checked.needed("alice")
 
     assert accounts.delete_user("alice") is True
@@ -365,10 +418,10 @@ async def test_a_reregistered_account_gets_a_new_task(db_uri: str) -> None:
 
     with account_authority_scope("alice", new.account_generation):
         # A fresh process meets the deleted row first.
-        fresh = await ProactiveProvisioner().provision(store, "alice", "UTC", None)
+        fresh = await ProactiveProvisioner().provision(store, _SEEDED_AGENTS, "alice", "UTC", None)
         # A process that provisioned the old registration provisions again.
         assert checked.needed("alice")
-        again = await checked.provision(store, "alice", "UTC", None)
+        again = await checked.provision(store, _SEEDED_AGENTS, "alice", "UTC", None)
 
     assert fresh.id != first.id
     assert again.id == fresh.id

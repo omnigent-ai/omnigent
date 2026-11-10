@@ -1212,6 +1212,16 @@ def _ensure_extra_builtin_agents(
         source = Path(entry)
         try:
             name = source.stem if source.is_file() else source.name
+            if name == PROACTIVE_AGENT_NAME:
+                # Its name-derived id is the built-in proactive agent's, which
+                # only framework-owned hidden tasks run.
+                _logger.warning(
+                    "Skipping extra built-in agent %r from %s: the name is reserved. Check %s.",
+                    name,
+                    source,
+                    _EXTRA_BUILTIN_AGENTS_ENV,
+                )
+                continue
             with tempfile.TemporaryDirectory() as tmpdir:
                 bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
                 bundle_bytes = _tar_gz_dir(bundle_dir)
@@ -1529,10 +1539,22 @@ def _ensure_default_proactive_agent(
 
     Always seeded, so a task created while the agent was enabled still finds
     it; always hidden from the picker (see :func:`_ensure_default_agents`).
+    An operator agent that already uses the name is left as it is, and the
+    feature stays off: tasks, hiding, and provisioning all use the built-in id.
     """
     import tempfile
 
+    from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
     from omnigent.spec import materialize_bundle
+
+    existing = agent_store.get_by_name(PROACTIVE_AGENT_NAME)
+    if existing is not None and existing.id != PROACTIVE_AGENT_ID:
+        _logger.warning(
+            "Not seeding the built-in proactive agent: agent %s already uses the name %r",
+            existing.id,
+            PROACTIVE_AGENT_NAME,
+        )
+        return
 
     with tempfile.TemporaryDirectory() as tmpdir:
         bundle_dir = materialize_bundle(_PROACTIVE_BUNDLE_SOURCE, Path(tmpdir) / "bundle")
