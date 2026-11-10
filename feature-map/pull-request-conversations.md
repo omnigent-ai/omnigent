@@ -36,6 +36,8 @@ together in Comments.
   that fades over three seconds. GitHub appears first in the destination selector;
   new comments use the browser's last explicit choice without changing open drafts.
   The full snapshots are sent only when the user submits their chat message.
+  Sent comments show a file/line label and a Markdown preview in chat; IDs and
+  revision coordinates are available under **Comment reference**.
 - `file-controls`: The sidebar **Filter changed files** input (on narrow screens a
   toolbar button opens it above the list; hiding it clears the filter). Escape
   clears it, and **Clear filter** restores the list. Each file header has a
@@ -116,7 +118,9 @@ appear beside the existing chat draft without changing its text or attachments.
 Hover each chip to preview the body and click it to reveal the comment in
 Changes with a brief border highlight. Open another comment and confirm the
 destination choice is remembered, including after a reload. Send the chat message
-and confirm both comment snapshots reach the agent. Switch PRs and sessions to
+and confirm both comment snapshots reach the agent. In the sent message, check
+that formatting in each comment is preserved and **Comment reference** expands
+to show its ID and revision coordinates. Switch PRs and sessions to
 check isolation. After a new commit, verify
 earlier comments retain their old line references. Repeat in split and unified
 layouts and on mobile.
