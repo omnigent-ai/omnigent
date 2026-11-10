@@ -4743,6 +4743,9 @@ def host_sandbox_is_running(
 _resume_locks: dict[str, asyncio.Lock] = {}
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _abandoned_wakes: set[asyncio.Task[None]] = set()
+# Wakes per host that brought it online; tells a forced waker its lock wait ended in recovery.
+# custom-lint: disable-next=workspace-scoped-cache -- host_id counter; collision only skips a wake
+_completed_wakes: dict[str, int] = {}
 
 
 async def resume_managed_host(
@@ -4776,7 +4779,8 @@ async def resume_managed_host(
     for the route path that has already proven this server process has no live
     host tunnel even though the cross-replica DB row is still fresh.
     Single-flight and idempotent: concurrent callers serialize on a per-host
-    lock and re-check liveness under it, so only the first wakes the host.
+    lock and re-check liveness under it, so only the first wakes the host. A
+    forced caller also accepts the fresh row once a wake completes while it waits.
 
     Unlike a launch, a failed wake does NOT tear the sandbox down — the volume
     + workspace are the user's and must survive for a retry. A wake that does
@@ -4882,12 +4886,16 @@ async def _wake_managed_host(
     """Wake the host under its lock, beginning no new step once *abandoned*."""
     # Single-flight per host (see _resume_locks).
     resume_lock = _resume_locks.setdefault(host_id, asyncio.Lock())
+    completed_before = _completed_wakes.get(host_id, 0)
     async with resume_lock:
         if abandoned.is_set():
             return
         # Re-check under the lock: a concurrent waker may have brought the host
-        # online while we waited.
-        if not force and await asyncio.to_thread(host_store.is_online, host_id):
+        # online while we waited, which also supersedes a forced caller's evidence.
+        woken_while_waiting = _completed_wakes.get(host_id, 0) != completed_before
+        if (not force or woken_while_waiting) and await asyncio.to_thread(
+            host_store.is_online, host_id
+        ):
             return
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
@@ -4934,6 +4942,8 @@ async def _wake_managed_host(
             if armed is None:
                 await _settle_stale_wake(launcher, host, host_store, sandbox_id=sandbox_id)
                 return
+            if abandoned.is_set():
+                return
             await _start_sandbox_host(
                 launcher,
                 sandbox_id,
@@ -4949,6 +4959,7 @@ async def _wake_managed_host(
                 agent_name=agent_name,
             )
             await _wait_for_host_online(host_store, host.host_id)
+            _completed_wakes[host_id] = _completed_wakes.get(host_id, 0) + 1
         except SandboxGoneError:
             raise
         except Exception as exc:
@@ -5002,6 +5013,7 @@ async def _resume_preserving_host(
         host.host_id,
         observed_after=claimed.updated_at if claimed.status == "online" else None,
     )
+    _completed_wakes[host.host_id] = _completed_wakes.get(host.host_id, 0) + 1
 
 
 async def _settle_stale_wake(

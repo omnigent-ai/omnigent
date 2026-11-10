@@ -4335,7 +4335,10 @@ async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
 async def test_cancelled_wake_keeps_lock_through_host_start_without_stages(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A cancelled wake holds the host lock until its host start comes online, silently."""
+    """A cancelled wake holds the host lock until its host start comes online, silently.
+
+    A forced retry queued behind it reuses that host instead of starting another.
+    """
     import omnigent.server.managed_hosts as managed
 
     host_store = HostStore(db_uri)
@@ -4378,6 +4381,9 @@ async def test_cancelled_wake_keeps_lock_through_host_start_without_stages(
         wake.cancel()
         with pytest.raises(asyncio.CancelledError):
             await wake
+        retry = asyncio.create_task(
+            resume_managed_host(first.host_id, host_store, config, force=True)
+        )
         resume_lock = managed._resume_locks[first.host_id]
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(resume_lock.acquire(), timeout=0.2)
@@ -4392,10 +4398,55 @@ async def test_cancelled_wake_keeps_lock_through_host_start_without_stages(
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(resume_lock.acquire(), timeout=0.2)
     _register(fake.host_starts[-1])
+    await asyncio.wait_for(retry, timeout=5)
+    assert fake.resumed == ["sb-fake-1"]
+    assert len(fake.host_starts) == 2
+    assert host_store.resolve_launch_token(first.host_id, fake.host_starts[-1].token) is not None
+    assert stages == []
+
+
+async def test_wake_cancelled_while_rearming_starts_no_host(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wake cancelled while re-arming its launch token returns without starting a host."""
+    import omnigent.server.managed_hosts as managed
+
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+    rearm_entered = threading.Event()
+    rearm_unblocked = threading.Event()
+    rearm = host_store.rearm_managed_host
+
+    def _stalled_rearm(*args: Any, **kwargs: Any) -> Any:
+        rearm_entered.set()
+        rearm_unblocked.wait(timeout=30)
+        return rearm(*args, **kwargs)
+
+    monkeypatch.setattr(host_store, "rearm_managed_host", _stalled_rearm)
+    wake = asyncio.create_task(resume_managed_host(first.host_id, host_store, config))
+    try:
+        assert await asyncio.to_thread(rearm_entered.wait, 30)
+        wake.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wake
+    finally:
+        rearm_unblocked.set()
+    resume_lock = managed._resume_locks[first.host_id]
     await asyncio.wait_for(resume_lock.acquire(), timeout=5)
     resume_lock.release()
     assert fake.resumed == ["sb-fake-1"]
-    assert stages == []
+    assert len(fake.host_starts) == 1
 
 
 async def test_resume_threads_agent_name_to_classifying_start_host(db_uri: str) -> None:
