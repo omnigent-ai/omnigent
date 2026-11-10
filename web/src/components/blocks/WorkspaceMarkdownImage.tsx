@@ -90,7 +90,10 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
       className="my-2 max-h-96 max-w-full rounded-md object-contain"
       loading="lazy"
       decoding="async"
-      onError={() => setFailedKey(imageKey)}
+      onError={() => {
+        URL.revokeObjectURL(loaded.url);
+        setFailedKey(imageKey);
+      }}
     />
   );
 }

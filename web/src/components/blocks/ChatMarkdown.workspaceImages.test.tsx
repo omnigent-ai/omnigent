@@ -238,6 +238,7 @@ describe("assistant workspace markdown images", () => {
     renderMarkdown("![Screenshot](shot.png)");
     const zoom = await screen.findByRole("button", { name: "Zoom image: Screenshot" });
     fireEvent.error(zoom.querySelector("img")!);
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:workspace-image-1");
     expect(screen.getByText("shot.png")).toBeVisible();
     expect(document.querySelector("img")).toBeNull();
   });
