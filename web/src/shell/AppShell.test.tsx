@@ -317,7 +317,8 @@ const useHostsMock = vi.mocked(useHosts);
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
 import { forkSession, getSessionSlim } from "@/lib/sessionsApi";
-import type { Session } from "@/lib/types";
+import type { Session, SessionStatus } from "@/lib/types";
+import type { Conversation } from "@/hooks/useConversations";
 import { toast } from "sonner";
 
 const useSessionAgentMock = vi.mocked(useSessionAgent);
@@ -897,7 +898,14 @@ describe("AppShell header", () => {
     },
   );
 
-  it.each([
+  it.each<{
+    source: string;
+    snapshot: SessionStatus;
+    backgroundTasks?: number;
+    bound: SessionStatus | null;
+    row: Partial<Conversation> | null;
+    asks: boolean;
+  }>([
     { source: "the bound live store", snapshot: "idle", bound: "running", row: null, asks: true },
     {
       source: "the snapshot before binding",
@@ -934,9 +942,18 @@ describe("AppShell header", () => {
       row: { status: "idle", pending_elicitations_count: 0, background_work_running: false },
       asks: false,
     },
-  ] as const)(
+    {
+      // A row fetched by id has no background flag until the stream settles it.
+      source: "the snapshot's background tasks under a fetched row",
+      snapshot: "idle",
+      backgroundTasks: 1,
+      bound: null,
+      row: { status: "idle", pending_elicitations_count: 0 },
+      asks: true,
+    },
+  ])(
     "archive confirmation for an off-window session follows $source",
-    async ({ snapshot, bound, row, asks }) => {
+    async ({ snapshot, backgroundTasks = 0, bound, row, asks }) => {
       const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) =>
         Response.json({ id: "conv_off_window", archived: true }),
       );
@@ -954,24 +971,18 @@ describe("AppShell header", () => {
         loadingConversation: bound !== null && row === null,
       });
       useSessionMock.mockReturnValue({
-        session: {
+        session: sessionSnapshot({
           id: "conv_off_window",
           agentId: "ag_owner",
           agentName: "developer",
-          runnerId: null,
           status: snapshot,
           createdAt: 1_700_000_000,
           title: "Off-window owner session",
           archived: false,
-          labels: {},
-          items: [],
+          backgroundTaskCount: backgroundTasks,
           // A stale snapshot still lists an approval the streamed row reports resolved.
           pendingElicitations: snapshot === "running" && row ? [{ id: "elicit_resolved" }] : [],
-          permissionLevel: 4,
-          parentSessionId: null,
-          subAgentName: null,
-          kind: "default",
-        },
+        }),
         isLoading: false,
         error: null,
       });

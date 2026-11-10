@@ -30,6 +30,7 @@ import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useCo
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import type { Session, SessionStatus } from "@/lib/types";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
@@ -242,6 +243,38 @@ function restoredRailOpen(
 
 function resolveTerminalViewKey(stored: string | null, agentKey: string): string {
   return stored !== null && stored !== CHAT_VIEW_STORAGE_VALUE ? stored : agentKey;
+}
+
+/**
+ * Working fields for an off-window session's archive confirmation. The streamed
+ * open-session row decides, or the snapshot until it loads; a row fetched by id
+ * lacks the background flag until the stream settles it, so the snapshot's stands
+ * in. The live store only adds work, since a fresh bind starts idle.
+ */
+function offWindowArchiveState(
+  row: Conversation | null,
+  snapshot: Pick<Session, "status" | "pendingElicitations" | "backgroundTaskCount">,
+  boundStatus: SessionStatus | null,
+  boundBackgroundTaskCount: number,
+): Pick<Conversation, "status" | "pending_elicitations_count" | "background_work_running"> {
+  const snapshotBackground =
+    snapshot.status === "waiting" || (snapshot.backgroundTaskCount ?? 0) > 0;
+  const reportedStatus: string | undefined = row ? row.status : snapshot.status;
+  let status: Conversation["status"] = "idle";
+  if (boundStatus === "running" || reportedStatus === "running") status = "running";
+  else if (reportedStatus === "failed") status = "failed";
+  return {
+    status,
+    pending_elicitations_count: row
+      ? (row.pending_elicitations_count ?? 0)
+      : (snapshot.pendingElicitations?.length ?? 0),
+    // `waiting` is the loop parked on background work, which rows report separately.
+    background_work_running:
+      (row?.background_work_running ?? snapshotBackground) ||
+      reportedStatus === "waiting" ||
+      boundStatus === "waiting" ||
+      boundBackgroundTaskCount > 0,
+  };
 }
 
 export function AppShell() {
@@ -798,9 +831,7 @@ function AppShellImpl() {
   const isKnownTopLevel =
     activeConv != null ||
     (activeSessionMatchesRoute && activeSession != null && activeSession.parentSessionId == null);
-  // Archive's confirmation for an off-window session reads its open-session row,
-  // streamed like a sidebar row (and the only carrier of goal-driven background
-  // work), or the snapshot until that row loads. The live store can only add work.
+  // The off-window archive confirmation's sources; see `offWindowArchiveState`.
   const openSessionRow = useOpenSessionRow(
     !conversationsLoading && !activeConv && isKnownTopLevel && isOwnerLevel(permissionLevel)
       ? (serverConversationId ?? null)
@@ -816,27 +847,6 @@ function AppShellImpl() {
     if (!isKnownTopLevel || !isOwnerLevel(permissionLevel)) return null;
     if (activeConv) return activeConv;
     if (!activeSessionMatchesRoute || !activeSession) return null;
-    const reported = openSessionRow
-      ? {
-          status: openSessionRow.status,
-          pending: openSessionRow.pending_elicitations_count ?? 0,
-          backgroundWork: openSessionRow.background_work_running === true,
-        }
-      : {
-          status: activeSession.status,
-          pending: activeSession.pendingElicitations?.length ?? 0,
-          backgroundWork:
-            activeSession.status === "waiting" || (activeSession.backgroundTaskCount ?? 0) > 0,
-        };
-    // `waiting` is the loop parked on background work, which rows report separately.
-    const status =
-      boundSessionStatus === "running" || reported.status === "running"
-        ? "running"
-        : reported.status === "failed"
-          ? "failed"
-          : "idle";
-    const backgroundWorkRunning =
-      reported.backgroundWork || boundSessionStatus === "waiting" || boundBackgroundTaskCount > 0;
     return {
       id: activeSession.id,
       object: "conversation",
@@ -857,9 +867,12 @@ function AppShellImpl() {
       family: activeSession.family,
       git_branch: activeSession.gitBranch ?? null,
       // `useArchivePrompt` applies `isSessionWorking` to these.
-      status,
-      pending_elicitations_count: reported.pending,
-      background_work_running: backgroundWorkRunning,
+      ...offWindowArchiveState(
+        openSessionRow,
+        activeSession,
+        boundSessionStatus,
+        boundBackgroundTaskCount,
+      ),
     };
   }, [
     activeConv,
