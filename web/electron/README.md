@@ -617,6 +617,20 @@ permission. Approval does not bypass CORS, TLS certificate validation, or the
 browser navigation policy. A helper that rejects this origin through its own CORS
 policy must be configured to allow it; the pane does not rewrite those headers.
 
+### Security keys
+
+Electron draws no WebAuthn UI, so a sign-in page waiting on a security key
+would otherwise sit with nothing on screen. On macOS and Linux, a preload in
+each pane page reports its WebAuthn requests, and the same popover window then
+tells the user to insert and touch their security key. It also says built-in
+biometrics and saved passkeys are unavailable (see
+[Passkeys](#passkeys-webauthn)). **Open in browser** hands the current page to
+the default browser; on macOS the popover also points to the cookie button.
+The popover closes when the request finishes or fails, or when the page navigates.
+The same visible-pane rule applies, and conditional (autofill) requests do not
+open it. Windows already shows its own WebAuthn dialog, so the shell skips this
+notice there.
+
 ### Browser implementation
 
 The browser runs on the user's machine (a native `WebContentsView`); the agent —
@@ -1140,10 +1154,10 @@ reconnect this machine explicitly from the host menu when you want it.
 ## Passkeys (WebAuthn)
 
 External security keys (e.g. a YubiKey) work out of the box: Chromium's
-content layer speaks CTAP to the key directly. That's also why the flow is
-_invisible_ — the passkey sheet you see in Chrome/Safari is browser chrome,
-which Electron doesn't ship. Touching the key completes the ceremony with no
-UI.
+content layer speaks CTAP to the key directly. Electron doesn't ship the passkey
+sheet you see in Chrome/Safari, so touching the key completes the ceremony with
+no Chromium UI. The embedded browser pane shows its own
+[security-key notice](#security-keys) while the request waits.
 
 The shell intentionally does **not** enable Electron's Touch ID platform
 authenticator (`app.configureWebAuthn`). Doing so routes the entire WebAuthn

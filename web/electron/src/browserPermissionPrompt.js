@@ -4,7 +4,10 @@ const { pathToFileURL } = require("node:url");
 
 const PROMPT_WIDTH = 380;
 const PROMPT_HEIGHT = 250;
-const CHOICES = new Set(["allow-once", "always-allow", "deny", "dismiss"]);
+const CHOICES = {
+  permission: new Set(["allow-once", "always-allow", "deny", "dismiss"]),
+  "security-key": new Set(["open-in-browser", "dismiss"]),
+};
 
 function promptBounds(content, anchor) {
   const width = Math.min(PROMPT_WIDTH, content.width);
@@ -17,7 +20,7 @@ function promptBounds(content, anchor) {
   };
 }
 
-/** A trusted child window keeps consent outside both the site and server SPA. */
+/** A trusted child window keeps pane prompts outside both the site and server SPA. */
 function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, preloadPath }) {
   const pageUrl = pathToFileURL(promptPage).href;
   const prompts = new Map();
@@ -40,8 +43,12 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
     prompts.get(parent)?.finish("dismiss");
   }
 
-  function show({ parent, origin, reload, getAnchorBounds, signal }) {
+  function show({ parent, getAnchorBounds, signal, kind = "permission", ...details }) {
     if (!parent || parent.isDestroyed() || signal.aborted) return Promise.resolve("dismiss");
+    // The advisory security-key notice must not discard a pending permission decision.
+    if (kind === "security-key" && prompts.get(parent)?.kind === "permission") {
+      return Promise.resolve("dismiss");
+    }
     dismiss(parent);
     return new Promise((resolve) => {
       const popup = new BrowserWindow({
@@ -92,7 +99,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
         if (!popup.isDestroyed()) popup.destroy();
         resolve(choice);
       }
-      prompts.set(parent, { window: popup, origin, reload, finish });
+      prompts.set(parent, { window: popup, kind, info: { kind, ...details }, finish });
       signal.addEventListener("abort", close, { once: true });
       for (const event of ["closed", "hide", "minimize"]) parent.on(event, close);
       for (const event of ["move", "resize"]) parent.on(event, position);
@@ -115,13 +122,10 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
   }
 
   function registerIpc() {
-    ipcMain.handle("omnigent:browser-permission-info", (event) => {
-      const { origin, reload } = forSender(event);
-      return { origin, reload };
-    });
+    ipcMain.handle("omnigent:browser-permission-info", (event) => forSender(event).info);
     ipcMain.handle("omnigent:browser-permission-choose", (event, choice) => {
       const request = forSender(event);
-      if (!CHOICES.has(choice)) throw new Error("Invalid permission choice");
+      if (!CHOICES[request.kind].has(choice)) throw new Error("Invalid permission choice");
       request.finish(choice);
     });
   }

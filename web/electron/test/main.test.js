@@ -2534,9 +2534,12 @@ describe("browser permission wiring", () => {
         const ses = sessions.get(opts.webPreferences.partition);
         assert.equal(typeof ses.request, "function");
         assert.equal(typeof ses.check, "function");
+        assert.equal(path.basename(opts.webPreferences.preload), "browser_view_preload.js");
         const wc = new EventEmitter();
         let url = "about:blank";
         Object.assign(wc, {
+          ipc: new EventEmitter(),
+          mainFrame: {},
           session: ses,
           getURL: () => url,
           isDestroyed: () => false,
@@ -2570,6 +2573,16 @@ describe("browser permission wiring", () => {
       registry.setSuppressed(true);
       registry.setActive("b");
       assert.equal(h.permissionPromptCalls.dismiss.length, dismissals + 2);
+      registry.setSuppressed(false);
+      registry.setActive("a");
+      a.ipc.emit("omnigent:browser-webauthn-pending", { senderFrame: a.mainFrame }, true);
+      await new Promise((resolve) => {
+        setTimeout(resolve, 400);
+      });
+      assert.equal(prompts.length, 2, "a waiting security-key request shows the notice");
+      assert.equal(prompts[1].kind, "security-key");
+      assert.equal(prompts[1].parent, h.win);
+      assert.equal(prompts[1].origin, "https://login.example");
       assert.equal(h.electron.session.defaultSession.request, undefined);
       assert.equal(h.electron.session.defaultSession.check, undefined);
     } finally {
@@ -2613,6 +2626,8 @@ describe("browser permission wiring", () => {
         partitions.push(opts.webPreferences.partition);
         const wc = Object.assign(new EventEmitter(), {
           id: nextId++,
+          ipc: new EventEmitter(),
+          mainFrame: {},
           setWindowOpenHandler() {},
           loadURL() {},
         });

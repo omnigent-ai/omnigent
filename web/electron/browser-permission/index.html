@@ -128,7 +128,8 @@
         font-size: 13px;
         line-height: 19px;
       }
-      #reload {
+      #reload,
+      #cookie-hint {
         margin-top: 6px;
         font-size: 11px;
         line-height: 16px;
@@ -144,12 +145,14 @@
         font-size: 12px;
         font-weight: 500;
       }
-      #once {
+      #once,
+      #open-in-browser {
         border-color: transparent;
         background: var(--accent);
         color: var(--surface);
       }
-      #once:hover {
+      #once:hover,
+      #open-in-browser:hover {
         background: var(--accent-hover);
       }
       #always {
@@ -181,7 +184,7 @@
           <path d="M8 10V7a4 4 0 0 1 8 0v3" />
         </svg>
         <span id="origin"></span>
-        <button id="close" type="button" aria-label="Dismiss permission request" title="Dismiss">
+        <button id="close" type="button" aria-label="Dismiss" title="Dismiss">
           <svg
             width="14"
             height="14"
@@ -199,8 +202,11 @@
         <h1 id="heading">Allow local network access?</h1>
         <p id="description">Connect to nearby devices and apps on this computer.</p>
         <p id="reload" hidden>Allowing will reload this page.</p>
+        <p id="cookie-hint" hidden>
+          Signed in with Chrome? Use the cookie button in the address bar to sign in here too.
+        </p>
       </section>
-      <footer>
+      <footer id="permission-choices">
         <button
           id="once"
           type="button"
@@ -219,6 +225,16 @@
         </button>
         <button id="deny" type="button" title="Block this site across all conversations" disabled>
           Deny
+        </button>
+      </footer>
+      <footer id="security-key-choices" hidden>
+        <button
+          id="open-in-browser"
+          type="button"
+          title="Continue on this page in your default browser"
+          disabled
+        >
+          Open in browser
         </button>
       </footer>
     </main>

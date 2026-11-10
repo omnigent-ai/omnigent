@@ -127,7 +127,7 @@ describe("browser permission popover", () => {
     popup.emit("ready-to-show");
     assert.equal(popup.visible, true);
     assert.deepEqual(popup.bounds, { x: 638, y: 140, width: 380, height: 250 });
-    assert.deepEqual(h.info(), { origin: ORIGIN, reload: true });
+    assert.deepEqual(h.info(), { kind: "permission", origin: ORIGIN, reload: true });
     assert.deepEqual(popup.openHandler(), { action: "deny" });
     assert.equal(popup.permissionCheck(), false);
     popup.permissionRequest(null, "media", (granted) => assert.equal(granted, false));
@@ -169,8 +169,42 @@ describe("browser permission popover", () => {
     assert.throws(() => h.choose("always-allow", event), /bundled permission UI/);
     event.senderFrame.url = pathToFileURL(PAGE).href;
     assert.throws(() => h.choose("allow-everything"), /Invalid permission choice/);
+    assert.throws(() => h.choose("open-in-browser"), /Invalid permission choice/);
     h.choose("deny");
     assert.equal(await result, "deny");
+  });
+
+  it("shows a security-key notice that can only open the page in a browser or dismiss", async () => {
+    const h = harness();
+    const result = h.controller.show({
+      parent: h.parent,
+      kind: "security-key",
+      origin: ORIGIN,
+      cookieImport: true,
+      getAnchorBounds: () => ({ x: 450, y: 64, width: 540, height: 600 }),
+      signal: h.abort.signal,
+    });
+    h.windows[0].emit("ready-to-show");
+    assert.equal(h.windows[0].visible, true);
+    assert.deepEqual(h.info(), { kind: "security-key", origin: ORIGIN, cookieImport: true });
+    assert.throws(() => h.choose("allow-once"), /Invalid permission choice/);
+    h.choose("open-in-browser");
+    assert.equal(await result, "open-in-browser");
+  });
+
+  it("never lets a security-key notice discard a pending permission decision", async () => {
+    const h = harness();
+    const permission = h.show();
+    assert.equal(await h.show({ kind: "security-key" }), "dismiss");
+    assert.equal(h.windows.length, 1);
+    h.choose("allow-once");
+    assert.equal(await permission, "allow-once");
+
+    const notice = h.show({ kind: "security-key" });
+    const replacement = h.show();
+    assert.equal(await notice, "dismiss");
+    h.choose("deny");
+    assert.equal(await replacement, "deny");
   });
 
   for (const [name, close] of [
@@ -217,6 +251,7 @@ describe("browser permission popover", () => {
     const second = h.show();
     assert.equal(await first, "dismiss");
     assert.deepEqual(h.info(h.event(h.windows[1])), {
+      kind: "permission",
       origin: "https://another.example",
       reload: true,
     });
@@ -242,11 +277,24 @@ describe("browser permission popover", () => {
   });
 });
 
-function pageHarness(info = { origin: ORIGIN, reload: true }) {
+const PAGE_BUTTONS = ["once", "always", "deny", "open-in-browser"];
+
+function pageHarness(info = { kind: "permission", origin: ORIGIN, reload: true }) {
   const elements = new Map();
-  for (const id of ["origin", "reload", "once", "always", "deny", "close"]) {
+  for (const id of [
+    "heading",
+    "description",
+    "origin",
+    "reload",
+    "cookie-hint",
+    "permission-choices",
+    "security-key-choices",
+    "close",
+    ...PAGE_BUTTONS,
+  ]) {
     elements.set(id, {
-      disabled: id !== "close",
+      disabled: PAGE_BUTTONS.includes(id),
+      hidden: ["reload", "cookie-hint", "security-key-choices"].includes(id),
       listeners: {},
       addEventListener(name, fn) {
         this.listeners[name] = fn;
@@ -261,10 +309,9 @@ function pageHarness(info = { origin: ORIGIN, reload: true }) {
   const document = {
     getElementById: (id) => elements.get(id),
     querySelectorAll: (selector) =>
-      (selector === "footer button"
-        ? ["once", "always", "deny"]
-        : ["once", "always", "deny", "close"]
-      ).map((id) => elements.get(id)),
+      (selector === "footer button" ? PAGE_BUTTONS : [...PAGE_BUTTONS, "close"]).map((id) =>
+        elements.get(id),
+      ),
     addEventListener: (name, fn) => {
       events[name] = fn;
     },
@@ -299,6 +346,7 @@ describe("permission popover page", () => {
     ["once", "allow-once"],
     ["always", "always-allow"],
     ["deny", "deny"],
+    ["open-in-browser", "open-in-browser"],
     ["close", "dismiss"],
   ]) {
     it(`maps ${id} to ${choice} and ignores repeated submissions`, async () => {
@@ -319,8 +367,27 @@ describe("permission popover page", () => {
     assert.equal(h.elements.get("close").focused, true);
     h.events.keydown({ key: "Escape" });
     assert.deepEqual(h.choices, ["dismiss"]);
-    const withoutReload = pageHarness({ origin: ORIGIN, reload: false });
+    const withoutReload = pageHarness({ kind: "permission", origin: ORIGIN, reload: false });
     await tick();
     assert.equal(withoutReload.elements.get("reload").hidden, true);
+    assert.equal(withoutReload.elements.get("security-key-choices").hidden, true);
+  });
+
+  it("asks for the security key and offers only the browser handoff", async () => {
+    const html = fs.readFileSync(path.join(__dirname, "../browser-permission/index.html"), "utf8");
+    assert.ok(html.includes("Open in browser"));
+    for (const cookieImport of [true, false]) {
+      const h = pageHarness({ kind: "security-key", origin: ORIGIN, cookieImport });
+      // oxlint-disable-next-line no-await-in-loop -- each page loads its info separately.
+      await tick();
+      assert.equal(h.elements.get("heading").textContent, "Use your security key");
+      assert.match(h.elements.get("description").textContent, /touch it to continue/);
+      assert.equal(h.elements.get("origin").textContent, ORIGIN);
+      assert.equal(h.elements.get("permission-choices").hidden, true);
+      assert.equal(h.elements.get("security-key-choices").hidden, false);
+      assert.equal(h.elements.get("cookie-hint").hidden, !cookieImport);
+      assert.equal(h.elements.get("reload").hidden, true);
+      assert.equal(h.elements.get("close").focused, true);
+    }
   });
 });
