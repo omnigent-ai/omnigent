@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -129,7 +130,7 @@ async def _call_agent(
 async def _call_session(
     client: httpx.AsyncClient,
     arguments: dict[str, object],
-) -> dict[str, object]:
+) -> dict[str, Any]:
     return json.loads(
         await execute_tool(
             tool_name="sys_session_list",
@@ -498,14 +499,17 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     assert received_visibilities == ["mine", "mine"]
 
 
-@pytest.mark.asyncio
-async def test_sys_session_list_include_archived_lists_archived_rows_on_every_page() -> None:
-    """An archive-inclusive listing reaches the server on each page and marks archived rows.
+_VIEWER = "alice@example.com"
+_OTHER_USER = "bob@example.com"
 
-    Trigger automations find the workers they started through this listing, so
-    archiving a worker must not hide it from the next page either.
+
+def _archive_scope_rows() -> list[dict[str, object]]:
+    """The caller's trigger workers interleaved with sessions another user shared.
+
+    Even ids are the caller's and carry the creator label; odd ids are the
+    other user's. Every other row of each owner is archived.
     """
-    rows = [
+    return [
         {
             "id": f"conv_{index:04d}",
             "agent_id": "ag_1",
@@ -514,44 +518,90 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
             "status": "idle",
             "runner_id": None,
             "parent_session_id": None,
-            "archived": index % 2 == 0,
-            "labels": {"omnigent.created_by_session_id": "conv_caller"},
+            "archived": (index // 2) % 2 == 0,
+            "owner": _VIEWER if index % 2 == 0 else _OTHER_USER,
+            "labels": (
+                {"omnigent.created_by_session_id": "conv_caller"} if index % 2 == 0 else {}
+            ),
         }
-        for index in range(150)
+        for index in range(300)
     ]
-    received: list[str | None] = []
+
+
+def _archive_scope_server(
+    rows: list[dict[str, object]],
+    requests: list[tuple[str, dict[str, str]]],
+    *,
+    scoped_archives: bool,
+    me_status: int = 200,
+) -> Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]:
+    """A ``/v1/sessions`` fake with current or older archive semantics.
+
+    An older server ignores ``include_archived`` unless ``visibility=all`` and
+    does not advertise ``session_list_scoped_archives``.
+    """
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+        path = request.url.path
+        if path == "/v1/sessions/conv_caller/child_sessions":
             return httpx.Response(200, json={"data": []})
-        if request.url.path == "/v1/sessions/conv_caller":
+        if path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
-        if request.url.path == "/v1/sessions":
-            received.append(request.url.params.get("include_archived"))
-            return _server_page(request, rows)
-        raise AssertionError(f"unexpected path {request.url.path}")
+        requests.append((path, dict(request.url.params)))
+        if path == "/v1/info":
+            return httpx.Response(
+                200, json={"session_list_scoped_archives": True} if scoped_archives else {}
+            )
+        if path == "/v1/me":
+            return httpx.Response(me_status, json={"user_id": _VIEWER, "is_admin": False})
+        if path == "/v1/sessions":
+            visibility = request.url.params.get("visibility")
+            archived = request.url.params.get("include_archived") == "true"
+            if not scoped_archives and visibility != "all":
+                archived = False
+            scoped = [
+                row
+                for row in rows
+                if (archived or not row["archived"])
+                and (visibility == "all" or (row["owner"] == _VIEWER) == (visibility == "mine"))
+            ]
+            return _server_page(request, scoped)
+        raise AssertionError(f"unexpected path {path}")
+
+    return handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scoped_archives", [True, False], ids=["current-server", "older-server"])
+async def test_sys_session_list_include_archived_lists_archived_rows_on_every_page(
+    scoped_archives: bool,
+) -> None:
+    """An archive-inclusive listing returns the caller's archived rows on every page.
+
+    Trigger automations find the workers they started through this listing, so
+    archiving a worker must not hide it from the next page either. An older
+    server drops archived rows under ``visibility=mine``, so the runner lists
+    everything there and keeps the caller's own rows, never another user's.
+    """
+    rows = _archive_scope_rows()
+    requests: list[tuple[str, dict[str, str]]] = []
+    handler = _archive_scope_server(rows, requests, scoped_archives=scoped_archives)
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
     ) as client:
-
-        async def call(args: dict[str, object]) -> dict[str, object]:
-            return json.loads(
-                await execute_tool(
-                    tool_name="sys_session_list",
-                    arguments=json.dumps(args),
-                    server_client=client,
-                    conversation_id="conv_caller",
-                )
-            )
-
-        first = await call({"limit": 100, "include_archived": True})
+        first = await _call_session(client, {"limit": 100, "include_archived": True})
         cursor = first["page"]["next_cursor"]
-        second = await call({"limit": 100, "include_archived": True, "cursor": cursor})
-        mismatched = await call({"limit": 100, "cursor": cursor})
-        default = await call({"limit": 100})
+        second = await _call_session(
+            client, {"limit": 100, "include_archived": True, "cursor": cursor}
+        )
+        mismatched = await _call_session(client, {"limit": 100, "cursor": cursor})
+        default = await _call_session(client, {"limit": 100})
+        shared = await _call_session(client, {"visibility": "shared", "include_archived": True})
 
-    assert received == ["true", "true", None]
+    owned_ids = [row["id"] for row in rows if row["owner"] == _VIEWER]
+    assert [row["session_id"] for row in first["sessions"] + second["sessions"]] == owned_ids
+    assert second["page"]["has_more"] == {"sessions": False}
     assert first["sessions"][0] == {
         "session_id": "conv_0000",
         "agent_name": "claude",
@@ -565,12 +615,42 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
         "family": None,
     }
     assert first["sessions"][1]["archived"] is False
-    assert second["sessions"][0]["session_id"] == "conv_0100"
     assert second["sessions"][0]["archived"] is True
     # The cursor is bound to the archive filter it was minted with.
     assert mismatched == {"error": "sys_session_list: cursor uses different filter arguments"}
     # Callers that don't ask keep the old row shape.
     assert "archived" not in default["sessions"][0]
+    assert [(row["session_id"], row["owner"]) for row in shared["sessions"]] == [
+        (row["id"], _OTHER_USER) for row in rows if row["owner"] == _OTHER_USER
+    ]
+    listing = "mine" if scoped_archives else "all"
+    shared_listing = "shared" if scoped_archives else "all"
+    assert [
+        (params.get("visibility"), params.get("include_archived"))
+        for path, params in requests
+        if path == "/v1/sessions"
+    ] == [(listing, "true"), (listing, "true"), ("mine", None), (shared_listing, "true")]
+    # Only an older server needs the caller's identity.
+    assert ("/v1/me" in [path for path, _ in requests]) is not scoped_archives
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_archive_fallback_fails_closed_without_identity() -> None:
+    """Without the caller's identity, the older-server fallback lists nothing, not everything."""
+    requests: list[tuple[str, dict[str, str]]] = []
+    handler = _archive_scope_server(
+        _archive_scope_rows(), requests, scoped_archives=False, me_status=503
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        result = await _call_session(client, {"limit": 100, "include_archived": True})
+
+    assert result["sessions"] == []
+    # A failed read keeps its position, so the continuation retries it.
+    assert result["page"]["has_more"] == {"sessions": True}
+    assert "/v1/sessions" not in [path for path, _ in requests]
 
 
 @pytest.mark.asyncio
@@ -596,7 +676,7 @@ async def test_sys_session_list_lists_own_sessions_unless_a_wider_scope_is_asked
         for index in range(2)
         for owner in ("alice", "bob")
     ]
-    received: list[tuple[str | None, str | None]] = []
+    received: list[str | None] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_caller/child_sessions":
@@ -605,7 +685,7 @@ async def test_sys_session_list_lists_own_sessions_unless_a_wider_scope_is_asked
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if request.url.path == "/v1/sessions":
             visibility = request.url.params.get("visibility")
-            received.append((visibility, request.url.params.get("include_archived")))
+            received.append(visibility)
             scoped = [row for row in rows if row["owner"] in owners[visibility or "all"]]
             return _server_page(request, scoped)
         raise AssertionError(f"unexpected path {request.url.path}")
@@ -613,38 +693,20 @@ async def test_sys_session_list_lists_own_sessions_unless_a_wider_scope_is_asked
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
     ) as client:
-
-        async def call(args: dict[str, object]) -> dict[str, Any]:
-            return json.loads(
-                await execute_tool(
-                    tool_name="sys_session_list",
-                    arguments=json.dumps(args),
-                    server_client=client,
-                    conversation_id="conv_caller",
-                )
-            )
-
-        default = await call({})
-        archived = await call({"include_archived": True})
-        shared = await call({"visibility": "shared"})
-        everything = await call({"visibility": "all", "limit": 1})
+        default = await _call_session(client, {})
+        shared = await _call_session(client, {"visibility": "shared"})
+        everything = await _call_session(client, {"visibility": "all", "limit": 1})
         cursor = everything["page"]["next_cursor"]
-        continued = await call({"visibility": "all", "limit": 1, "cursor": cursor})
-        rescoped = await call({"limit": 1, "cursor": cursor})
-        invalid = await call({"visibility": "everyone"})
+        continued = await _call_session(
+            client, {"visibility": "all", "limit": 1, "cursor": cursor}
+        )
+        rescoped = await _call_session(client, {"limit": 1, "cursor": cursor})
+        invalid = await _call_session(client, {"visibility": "everyone"})
 
-    assert received == [
-        ("mine", None),
-        # Workers a trigger automation archived are still the caller's own.
-        ("mine", "true"),
-        ("shared", None),
-        ("all", None),
-        ("all", None),
-    ]
+    assert received == ["mine", "shared", "all", "all"]
     assert [row["session_id"] for row in default["sessions"]] == ["conv_alice_0", "conv_alice_1"]
     # Every default row is the caller's, so the row shape is unchanged.
     assert all("owner" not in row for row in default["sessions"])
-    assert [row["session_id"] for row in archived["sessions"]] == ["conv_alice_0", "conv_alice_1"]
     assert [(row["session_id"], row["owner"]) for row in shared["sessions"]] == [
         ("conv_bob_0", "bob"),
         ("conv_bob_1", "bob"),

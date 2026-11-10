@@ -6579,6 +6579,11 @@ async def _collect_global_sessions(
     runner's request carries the owning user's identity). Best-effort:
     returns ``[]`` on a fetch failure.
 
+    An archive-inclusive ``mine``/``shared`` listing against a server that does
+    not advertise ``session_list_scoped_archives`` lists ``all`` and keeps the
+    rows whose ``owner`` matches the scope (see :func:`_session_row_scope`).
+    It fails closed when the caller's identity cannot be read.
+
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter; applied only when a
         non-empty string.
@@ -6591,7 +6596,28 @@ async def _collect_global_sessions(
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
     """
-    params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": visibility}
+    server_visibility = visibility
+    scope_locally = False
+    viewer_id: str | None = None
+    if (
+        include_archived
+        and visibility != "all"
+        and not await _server_scopes_archives(server_client)
+    ):
+        # An older server drops archived rows under mine/shared, which would
+        # hide a trigger manager's archived workers. List every accessible
+        # session as before and apply the scope here, as the sidebar does.
+        resolved, viewer_id = await _session_list_viewer(server_client)
+        if not resolved:
+            return _DiscoveryPage([], False, failed=True)
+        server_visibility = "all"
+        scope_locally = True
+        limit = _AGENT_LIST_PAGE_LIMIT
+    params: dict[str, str | int] = {
+        "limit": limit,
+        "order": "desc",
+        "visibility": server_visibility,
+    }
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if include_archived:
@@ -6612,6 +6638,8 @@ async def _collect_global_sessions(
     if page.failed:
         return page
     rows = page.rows
+    if scope_locally:
+        rows = [r for r in rows if _session_row_scope(r, viewer_id) == visibility]
     return _DiscoveryPage(
         [
             {
@@ -6645,6 +6673,73 @@ async def _collect_global_sessions(
         page.has_more,
         page.next_after,
     )
+
+
+async def _server_scopes_archives(server_client: httpx.AsyncClient) -> bool:
+    """
+    Whether ``GET /v1/sessions`` applies ``include_archived`` to mine/shared.
+
+    Servers advertise it as ``session_list_scoped_archives`` in ``GET /v1/info``;
+    an unreadable info response counts as unsupported, which only costs the
+    slower local scoping in :func:`_collect_global_sessions`.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``True`` when the server scopes archive-inclusive listings itself.
+    """
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        body = info.json() if info.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return False
+    return isinstance(body, dict) and body.get("session_list_scoped_archives") is True
+
+
+async def _session_list_viewer(
+    server_client: httpx.AsyncClient,
+) -> tuple[bool, str | None]:
+    """
+    Resolve the caller's user id via ``GET /v1/me`` for local scoping.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``(True, user_id)`` on success, where ``user_id`` is ``None`` on
+        a server without authentication; ``(False, None)`` when the identity
+        cannot be read, so the caller fails closed instead of guessing.
+    """
+    try:
+        resp = await server_client.get("/v1/me", timeout=30.0)
+        body = resp.json() if resp.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return False, None
+    if not isinstance(body, dict):
+        return False, None
+    user_id = body.get("user_id")
+    if user_id is not None and (not isinstance(user_id, str) or not user_id):
+        return False, None
+    return True, user_id
+
+
+def _session_row_scope(row: _JsonObject, viewer_id: str | None) -> str:
+    """
+    Classify a ``GET /v1/sessions`` row as the viewer's own or shared.
+
+    Mirrors the web sidebar's ownership inference: the row's ``owner`` decides
+    when both it and the viewer are known, because an admin's elevated
+    permission level does not make another user's session theirs.
+
+    :param row: One ``GET /v1/sessions`` row.
+    :param viewer_id: The caller's user id, or ``None`` without authentication.
+    :returns: ``"mine"`` or ``"shared"``.
+    """
+    from omnigent.server.auth import LEVEL_OWNER
+
+    owner = row.get("owner")
+    if viewer_id is not None and isinstance(owner, str) and owner:
+        return "mine" if owner == viewer_id else "shared"
+    level = row.get("permission_level")
+    if isinstance(level, int) and 0 < level < LEVEL_OWNER:
+        return "shared"
+    # Servers with permissions disabled omit ownership; every row is the caller's.
+    return "mine"
 
 
 def _child_rows_to_entries(
