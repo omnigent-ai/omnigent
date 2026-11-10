@@ -28,6 +28,9 @@ PiMcpServer: TypeAlias = dict[str, object]
 PI_MCP_CONFIG_NAME = "mcp.json"
 # Holds the SHA-256 of the last generated copy, so a copy Pi or the user changed is kept.
 _GENERATED_DIGEST_NAME = ".omnigent-mcp.json.sha256"
+# Pi already loads its own ``mcp.json``; the inventory can list it too, and its
+# entries are in Pi syntax, so re-translating them would double-escape values.
+_HOST_HARNESSES = frozenset({"claude", "codex", "cursor"})
 _PI_SERVER_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PLACEHOLDER = re.compile(r"\$\{([^}]+)\}")
@@ -203,7 +206,8 @@ def pi_mcp_servers_from_host(
     """Translate host-inventory servers into Pi ``mcpServers`` entries.
 
     The first server for a Pi name wins, in inventory order (Claude Code, then
-    Codex, then Cursor). Servers Pi cannot load are left out and logged.
+    Codex, then Cursor). Servers from any other harness, and servers Pi cannot
+    load, are left out; the latter are logged.
     Placeholders resolve against *pi_env*, the environment Pi will run with
     (default ``os.environ``), never against runner auth secrets.
     """
@@ -215,6 +219,8 @@ def pi_mcp_servers_from_host(
     for server in servers:
         name = server.summary["name"]
         harness = server.summary["harness"]
+        if harness not in _HOST_HARNESSES:
+            continue
         if not _PI_SERVER_NAME.match(name) or _pi_server_key(name) in taken:
             continue
         try:

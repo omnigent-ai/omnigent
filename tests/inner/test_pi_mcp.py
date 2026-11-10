@@ -296,6 +296,35 @@ def test_first_server_for_a_pi_name_wins() -> None:
     assert servers == {"search-docs": {"command": "codex-search"}}
 
 
+@pytest.mark.parametrize("harness", ["pi", "opencode"])
+def test_only_claude_codex_and_cursor_servers_are_added(harness: str) -> None:
+    """Pi loads its own ``mcp.json``; an inventory entry from it must not claim the name."""
+    servers = pi_mcp_servers_from_host(
+        [
+            _server("docs", harness, {"command": "pi-docs"}),
+            _server("docs", "claude", {"command": "claude-docs"}),
+        ]
+    )
+    assert servers == {"docs": {"command": "claude-docs"}}
+
+
+def test_inventory_pi_entries_do_not_force_a_generated_copy(
+    home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user's Pi servers listed by the inventory leave the user's file linked."""
+    _write_json(pi_agent / "mcp.json", {"mcpServers": {"mine": {"command": "my-tool"}}})
+    monkeypatch.setattr(
+        pi_mcp,
+        "_host_mcp_servers",
+        lambda: [_server("pi-only", "pi", {"command": "pi-tool"})],
+    )
+
+    managed = _prepare(home, pi_agent)
+
+    assert (managed / "mcp.json").is_symlink()
+    assert (managed / "mcp.json").resolve() == (pi_agent / "mcp.json").resolve()
+
+
 # --- Merging -----------------------------------------------------------------
 
 
