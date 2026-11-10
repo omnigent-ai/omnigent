@@ -24,6 +24,7 @@ def local_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     source = tmp_path / "source"
     source.mkdir()
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)

@@ -190,7 +190,7 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
             host, colon, path = rest.partition(":")
             # SSH aliases are configuration names, not necessarily DNS hostnames.
             # A slash before the colon is a local path to Git, not an SSH alias.
-            if any(character in host for character in "/\\[]"):
+            if host.startswith("-") or any(character in host for character in "/\\[]"):
                 raise ValueError("an SSH repository URL must have an unambiguous host alias")
         if not host or not colon or not path.strip("/"):
             raise ValueError(
