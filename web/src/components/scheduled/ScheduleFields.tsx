@@ -88,6 +88,7 @@ export function ScheduleFields({
   onRecurrenceSelect,
   recurrenceUnsupported = false,
   allowPastEnd = false,
+  embedded = false,
   children,
 }: {
   model: ScheduleModel;
@@ -102,6 +103,8 @@ export function ScheduleFields({
   onRecurrenceSelect?: () => void;
   recurrenceUnsupported?: boolean;
   allowPastEnd?: boolean;
+  /** Remove the outer cards when the fields already live in a menu surface. */
+  embedded?: boolean;
   children?: (fields: { recurrenceFields: ReactNode; endingFields: ReactNode }) => ReactNode;
 }) {
   const errorId = useId();
@@ -291,7 +294,12 @@ export function ScheduleFields({
   );
   const recurrenceFields = (
     <div className="flex min-w-0 flex-col gap-2" data-testid="schedule-fields">
-      <div className="divide-y divide-border rounded-xl border border-border px-4">
+      <div
+        className={cn(
+          "divide-y divide-border px-4",
+          !embedded && "rounded-xl border border-border",
+        )}
+      >
         <div
           className="flex items-center justify-between gap-3 py-3"
           data-testid="schedule-frequency-time-row"
@@ -487,7 +495,7 @@ export function ScheduleFields({
   );
   const endingFields = (
     <div
-      className="space-y-2 rounded-xl border border-border px-4 py-3"
+      className={cn("space-y-2 px-4 py-3", !embedded && "rounded-xl border border-border")}
       data-testid="schedule-ending-fields"
     >
       <div className="flex flex-wrap items-center gap-2 text-muted-foreground">

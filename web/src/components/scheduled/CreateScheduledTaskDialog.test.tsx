@@ -9,7 +9,7 @@ import { testAgent } from "@/test/agentFixtures";
 
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 
-import type React from "react";
+import React from "react";
 import userEvent from "@testing-library/user-event";
 import {
   cleanup,
@@ -126,6 +126,10 @@ vi.mock("@/shell/NewChatDialog", () => ({
     sandboxSelected,
     hasAgents,
     loading,
+    selectedConfigContent,
+    triggerDetails,
+    triggerIcon,
+    open,
   }: {
     onSelectAgent: (a: AvailableAgent) => void;
     onOpenChange?: (open: boolean) => void;
@@ -140,63 +144,156 @@ vi.mock("@/shell/NewChatDialog", () => ({
     sandboxSelected: boolean;
     hasAgents: boolean;
     loading?: boolean;
-  }) => (
-    <fieldset
-      disabled={loading}
-      data-testid="agent-picker-stub"
-      data-effective={effectiveAgentId ?? ""}
-      // Surface the host the dialog feeds the picker for badge computation, so
-      // a test can assert it's populated even when no host is pinned.
-      data-badge-host={host?.host_id ?? ""}
-      data-dropdown-modal={dropdownModal === false ? "false" : "true"}
-      data-content-class={contentClassName}
-      data-harness-entries={harnessEntries.map((agent) => agent.name).join(",")}
-      data-agent-entries={agentEntries.map((agent) => agent.name).join(",")}
-      data-curated-entries={curatedEntries?.map((agent) => agent.name).join(",")}
-      data-sandbox-selected={String(sandboxSelected)}
-    >
-      <span>{hasAgents ? agentLabel : "No agents"}</span>
-      {harnessEntries
-        .filter((agent) => agent.name !== "claude-native-ui")
-        .map((agent) => (
-          <button key={agent.id} type="button" onClick={() => onSelectAgent(agent)}>
-            pick {agent.harness}
-          </button>
-        ))}
+    selectedConfigContent?: React.ReactNode;
+    triggerDetails?: readonly { label: string; value: string }[];
+    triggerIcon?: React.ReactNode;
+    open?: boolean;
+  }) => {
+    const config = React.isValidElement<{
+      models?: {
+        choices: { label: string; checked?: boolean; testId?: string; onSelect?: () => void }[];
+      };
+      efforts?: {
+        choices: { label: string; checked?: boolean; testId?: string; onSelect?: () => void }[];
+      };
+    }>(selectedConfigContent)
+      ? selectedConfigContent.props
+      : null;
+    const [openConfig, setOpenConfig] = React.useState<"model" | "effort" | null>(null);
+    const modelDetail = triggerDetails?.find((detail) => detail.label === "Model");
+    const effortDetail = triggerDetails?.find((detail) => detail.label === "Effort");
+    const openChoices = openConfig === "model" ? config?.models?.choices : config?.efforts?.choices;
+    React.useEffect(() => {
+      if (openConfig === null) return;
+      const closeOnEscape = (event: KeyboardEvent) => {
+        if (event.key === "Escape") setOpenConfig(null);
+      };
+      window.addEventListener("keydown", closeOnEscape);
+      return () => window.removeEventListener("keydown", closeOnEscape);
+    }, [openConfig]);
+    return (
+      <fieldset
+        disabled={loading}
+        data-testid="agent-picker-stub"
+        data-effective={effectiveAgentId ?? ""}
+        // Surface the host the dialog feeds the picker for badge computation, so
+        // a test can assert it's populated even when no host is pinned.
+        data-badge-host={host?.host_id ?? ""}
+        data-dropdown-modal={dropdownModal === false ? "false" : "true"}
+        data-content-class={contentClassName}
+        data-harness-entries={harnessEntries.map((agent) => agent.name).join(",")}
+        data-agent-entries={agentEntries.map((agent) => agent.name).join(",")}
+        data-curated-entries={curatedEntries?.map((agent) => agent.name).join(",")}
+        data-sandbox-selected={String(sandboxSelected)}
+        data-trigger-details={triggerDetails
+          ?.map((detail) => `${detail.label}:${detail.value}`)
+          .join("|")}
+        data-has-trigger-icon={String(triggerIcon != null)}
+        data-has-config={String(selectedConfigContent != null)}
+        data-picker-open={String(open)}
+      >
+        <span>{hasAgents ? agentLabel : "No agents"}</span>
+        {harnessEntries
+          .filter((agent) => agent.name !== "claude-native-ui")
+          .map((agent) => (
+            <button key={agent.id} type="button" onClick={() => onSelectAgent(agent)}>
+              pick {agent.harness}
+            </button>
+          ))}
 
-      <button
-        type="button"
-        data-testid="pick-harness-claude"
-        onClick={() =>
-          onSelectAgent(
-            testAgent("ag_claude_native", "claude-native-ui", {
-              display_name: "Claude Code",
-              harness: "claude-native",
-            }),
-          )
-        }
-      >
-        pick claude harness
-      </button>
-      <button
-        type="button"
-        data-testid="pick-agent-polly"
-        onClick={() =>
-          onSelectAgent(
-            testAgent("ag_1", "polly", { display_name: "Polly", harness: "claude-sdk" }),
-          )
-        }
-      >
-        pick polly
-      </button>
-      <button type="button" data-testid="picker-open" onClick={() => onOpenChange?.(true)}>
-        open
-      </button>
-      <button type="button" data-testid="picker-close" onClick={() => onOpenChange?.(false)}>
-        close
-      </button>
-    </fieldset>
-  ),
+        <button
+          type="button"
+          data-testid="pick-harness-claude"
+          onClick={() =>
+            onSelectAgent(
+              testAgent("ag_claude_native", "claude-native-ui", {
+                display_name: "Claude Code",
+                harness: "claude-native",
+              }),
+            )
+          }
+        >
+          pick claude harness
+        </button>
+        <button
+          type="button"
+          data-testid="pick-agent-polly"
+          onClick={() =>
+            onSelectAgent(
+              testAgent("ag_1", "polly", { display_name: "Polly", harness: "claude-sdk" }),
+            )
+          }
+        >
+          pick polly
+        </button>
+        <button type="button" data-testid="picker-open" onClick={() => onOpenChange?.(true)}>
+          open
+        </button>
+        <button type="button" data-testid="picker-close" onClick={() => onOpenChange?.(false)}>
+          close
+        </button>
+        {modelDetail && (
+          <div data-testid="task-model-effort-field">
+            <button
+              type="button"
+              data-testid="task-model-trigger"
+              disabled={!config?.models}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") setOpenConfig("model");
+              }}
+            >
+              {modelDetail.value}
+            </button>
+            {effortDetail && (
+              <button
+                type="button"
+                data-testid="task-effort-trigger"
+                disabled={!config?.efforts}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") setOpenConfig("effort");
+                }}
+              >
+                {effortDetail.value}
+              </button>
+            )}
+            {openChoices && (
+              <div data-testid={`task-${openConfig}-options`}>
+                {openChoices.map((choice) => (
+                  <button
+                    key={choice.label}
+                    type="button"
+                    role="option"
+                    aria-selected={choice.checked}
+                    onClick={() => {
+                      choice.onSelect?.();
+                      setOpenConfig(null);
+                    }}
+                  >
+                    {choice.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        <div hidden>
+          {[...(config?.models?.choices ?? []), ...(config?.efforts?.choices ?? [])].map(
+            (choice) =>
+              choice.testId && (
+                <button
+                  key={choice.testId}
+                  type="button"
+                  data-testid={`${choice.testId}-mock`}
+                  onClick={choice.onSelect}
+                >
+                  {choice.testId}
+                </button>
+              ),
+          )}
+        </div>
+      </fieldset>
+    );
+  },
 }));
 
 const AGENTS: AvailableAgent[] = [
@@ -248,6 +345,30 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+type AutomationSectionName = "Run setup" | "Schedule" | "Context" | "Controls";
+
+function openAutomationSection(name: AutomationSectionName) {
+  const advancedTrigger = screen.queryByTestId("task-advanced-settings-trigger");
+  if (advancedTrigger?.getAttribute("aria-expanded") === "false") {
+    fireEvent.click(advancedTrigger);
+  }
+  if (name === "Schedule") {
+    const trigger = screen.getByTestId("task-schedule-trigger");
+    if (trigger.getAttribute("aria-expanded") === "false") fireEvent.click(trigger);
+  }
+  if (name === "Context") {
+    const trigger = screen.queryByTestId("task-workspace-trigger");
+    if (trigger?.getAttribute("aria-expanded") === "false") fireEvent.click(trigger);
+  }
+}
+
+function closeTopLevelPopovers() {
+  for (const testId of ["task-schedule-trigger", "task-ending-trigger", "task-workspace-trigger"]) {
+    const trigger = screen.queryByTestId(testId);
+    if (trigger?.getAttribute("aria-expanded") === "true") fireEvent.click(trigger);
+  }
+}
+
 function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } = {}) {
   const view = renderBase(ui, {
     wrapper: ({ children }) => (
@@ -265,9 +386,19 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
     ),
   });
   function expand() {
-    const advanced = screen.queryByRole("button", { name: "Advanced" });
-    if (expandAdvanced && advanced?.getAttribute("aria-expanded") === "false")
-      fireEvent.click(advanced);
+    const advancedTrigger = screen.queryByTestId("task-advanced-settings-trigger");
+    if (advancedTrigger?.getAttribute("aria-expanded") === "false") {
+      fireEvent.click(advancedTrigger);
+    }
+    if (!expandAdvanced) return;
+    for (const testId of [
+      "task-workspace-trigger",
+      "task-ending-trigger",
+      "task-schedule-trigger",
+    ]) {
+      const trigger = screen.queryByTestId(testId);
+      if (trigger?.getAttribute("aria-expanded") === "false") fireEvent.click(trigger);
+    }
   }
   expand();
   return {
@@ -401,16 +532,60 @@ describe("onCreated", () => {
 });
 
 describe("prompt-first automation setup", () => {
-  it("keeps Name visible and required while Advanced is collapsed", async () => {
-    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
+  it("keeps details visible and required while setup controls stay compact", async () => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true },
+          scheduled_task_harness_settings: true,
+          scheduled_task_approval_skipping_modes: true,
+          scheduled_task_worktrees: true,
+          scheduled_task_projects: true,
+          scheduled_task_session_modes: true,
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+      { expandAdvanced: false },
+    );
     const instructions = screen.getByRole("textbox", { name: "Instructions" });
     expect(instructions).toHaveFocus();
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
+    expect(screen.getByTestId("task-host-trigger")).toHaveAccessibleName("Run on");
+    expect(screen.getByTestId("task-agent-picker")).toBeVisible();
+    const advancedTrigger = screen.getByTestId("task-advanced-settings-trigger");
+    expect(advancedTrigger).toHaveAccessibleName("Advanced settings (optional)");
+    expect(advancedTrigger).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByTestId("task-permission-trigger").compareDocumentPosition(advancedTrigger),
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveAccessibleName(
+      "Session continuity",
     );
+    expect(screen.getByTestId("task-schedule-trigger")).toHaveAccessibleName("Schedule");
+    expect(screen.getByTestId("task-ending-trigger")).toHaveAccessibleName("Ends");
+    expect(screen.getByTestId("task-workspace-trigger")).toHaveAccessibleName("Workspace");
+    expect(screen.getByTestId("task-project-trigger")).toHaveAccessibleName("Project");
+    expect(screen.getByTestId("task-permission-trigger")).toHaveAccessibleName("Permissions");
+    fireEvent.click(advancedTrigger);
+    expect(screen.queryByTestId("task-session-mode-trigger")).not.toBeInTheDocument();
+    fireEvent.click(advancedTrigger);
+    expect(screen.queryByRole("button", { name: "Run setup" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Context" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Controls" })).not.toBeInTheDocument();
     expect(screen.getByLabelText("Name")).toBeVisible();
+    expect(screen.queryByLabelText("Frequency")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Schedule ends")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("task-schedule-trigger"));
+    expect(screen.getByLabelText("Frequency")).toBeVisible();
+    expect(screen.getByLabelText("Time", { exact: true })).toBeVisible();
+    expect(screen.getByLabelText("Timezone", { exact: true })).toBeVisible();
+    fireEvent.click(screen.getByTestId("task-schedule-trigger"));
+    fireEvent.click(screen.getByTestId("task-ending-trigger"));
+    expect(screen.getByLabelText("Schedule ends")).toBeVisible();
+    fireEvent.click(screen.getByTestId("task-ending-trigger"));
+
     fireEvent.change(instructions, { target: { value: "Review pull requests" } });
     expect(screen.queryByTestId("task-execution-summary")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Name")).toHaveValue("");
@@ -460,7 +635,7 @@ describe("prompt-first automation setup", () => {
     },
   );
 
-  it("keeps saved names and overrides when editing instructions with Advanced collapsed", async () => {
+  it("keeps saved names and overrides when editing instructions without opening the agent menu", async () => {
     render(
       <CreateScheduledTaskDialog
         open
@@ -473,9 +648,10 @@ describe("prompt-first automation setup", () => {
       />,
       { expandAdvanced: false },
     );
-    const advanced = screen.getByRole("button", { name: "Advanced" });
-    expect(advanced).toHaveAttribute("aria-expanded", "false");
-    expect(advanced).toHaveTextContent("Opus · High");
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute(
+      "data-trigger-details",
+      "Model:Opus|Effort:High",
+    );
     fireEvent.change(screen.getByLabelText("Instructions"), {
       target: { value: "Also summarize CI failures" },
     });
@@ -490,7 +666,7 @@ describe("prompt-first automation setup", () => {
   });
 
   it.each(["COUNT=4", "UNTIL=20991231T235959Z"])(
-    "keeps Advanced collapsed while editing time with %s",
+    "keeps Schedule open while editing time with %s",
     (ending) => {
       render(
         <CreateScheduledTaskDialog
@@ -500,22 +676,23 @@ describe("prompt-first automation setup", () => {
         />,
         { expandAdvanced: false },
       );
-      const advanced = screen.getByRole("button", { name: "Advanced" });
-      expect(advanced).toHaveAttribute("aria-expanded", "false");
+      const scheduleSection = screen.getByRole("button", { name: "Schedule" });
+      expect(scheduleSection).toHaveAttribute("aria-expanded", "false");
+      fireEvent.click(scheduleSection);
       fireEvent.change(screen.getByLabelText("Time"), { target: { value: "9:" } });
       expect(screen.getByTestId("schedule-error")).toHaveTextContent("Enter a valid time");
-      expect(advanced).toHaveAttribute("aria-expanded", "false");
+      expect(scheduleSection).toHaveAttribute("aria-expanded", "true");
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
       fireEvent.change(screen.getByLabelText("Time"), { target: { value: "9:00" } });
-      expect(advanced).toHaveAttribute("aria-expanded", "false");
+      expect(scheduleSection).toHaveAttribute("aria-expanded", "true");
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
       fireEvent.change(screen.getByLabelText("Time"), { target: { value: "9:30" } });
-      expect(advanced).toHaveAttribute("aria-expanded", "false");
+      expect(scheduleSection).toHaveAttribute("aria-expanded", "true");
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     },
   );
 
-  it("reveals an expired ending when rescheduling with Advanced collapsed", () => {
+  it("reveals an expired ending in Ends when rescheduling", () => {
     render(
       <CreateScheduledTaskDialog
         open
@@ -526,29 +703,34 @@ describe("prompt-first automation setup", () => {
       />,
       { expandAdvanced: false },
     );
-    const advanced = screen.getByRole("button", { name: "Advanced" });
-    expect(advanced).toHaveAttribute("aria-expanded", "false");
+    const scheduleSection = screen.getByRole("button", { name: "Schedule" });
+    const endingControl = screen.getByRole("button", { name: "Ends" });
+    expect(scheduleSection).toHaveAttribute("aria-expanded", "false");
+    expect(endingControl).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(scheduleSection);
     fireEvent.change(screen.getByLabelText("Time"), { target: { value: "9:" } });
     expect(screen.getByTestId("schedule-error")).toHaveTextContent("Enter a valid time");
-    expect(advanced).toHaveAttribute("aria-expanded", "false");
+    expect(scheduleSection).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
     fireEvent.change(screen.getByLabelText("Time"), { target: { value: "9:00" } });
-    expect(advanced).toHaveAttribute("aria-expanded", "false");
+    expect(scheduleSection).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     fireEvent.change(screen.getByLabelText("Time"), { target: { value: "10:00" } });
-    expect(advanced).toHaveAttribute("aria-expanded", "true");
+    expect(scheduleSection).toHaveAttribute("aria-expanded", "true");
+    expect(endingControl).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByLabelText("End date")).toBeVisible();
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    fireEvent.click(advanced);
+    fireEvent.click(endingControl);
     expect(screen.queryByLabelText("End date")).not.toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent("Expand Advanced to fix settings");
+    expect(scheduleSection).toHaveTextContent("Needs attention");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    fireEvent.click(advanced);
+    fireEvent.click(endingControl);
     expect(screen.getByLabelText("End date")).toBeVisible();
   });
 
   it("edits time directly and opens only the timezone dropdown", async () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
+    openAutomationSection("Schedule");
     const timeField = screen.getByLabelText("Time", { exact: true });
     expect(screen.getByLabelText("Frequency")).toBeVisible();
     expect(timeField).toBeVisible();
@@ -645,7 +827,10 @@ describe("agent picker readiness (needs-setup badges)", () => {
       </CapabilitiesProvider>,
     );
     expect(screen.getByTestId("pick-harness-claude")).toBeEnabled();
-    expect(picker).toHaveAttribute("data-harness-entries", "claude-native-ui,codex-native-ui");
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute(
+      "data-harness-entries",
+      "claude-native-ui,codex-native-ui",
+    );
   });
 
   it.each([
@@ -701,12 +886,7 @@ describe("agent picker readiness (needs-setup badges)", () => {
           "No agents are available for this automation.",
         );
         expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-        expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-          "aria-expanded",
-          "false",
-        );
       }
-      fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
       const picker = screen.getByTestId("agent-picker-stub");
       expect(picker).toHaveAttribute(
         "data-harness-entries",
@@ -740,10 +920,6 @@ describe("agent picker readiness (needs-setup badges)", () => {
 
   it("shows the model + effort controls for the default (Claude-native) agent", () => {
     renderDialog();
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-      "aria-expanded",
-      "true",
-    );
     // The default effective agent is claude-native-ui (a capable native coding
     // agent), so the model/effort pickers render and the "uses defaults" hint —
     // shown only when the controls are hidden — is absent.
@@ -816,11 +992,14 @@ describe("CreateScheduledTaskDialog validation", () => {
 
   it("pins a workspace on confirmation and waits for reconnection if its host disconnects", () => {
     const onOpenChange = vi.fn();
-    const { rerender } = renderDialog(onOpenChange);
+    const { rerender } = render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />, {
+      expandAdvanced: false,
+    });
     const hostTrigger = screen.getByTestId("task-host-trigger");
     fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
     fireEvent.click(hostTrigger);
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+    openAutomationSection("Context");
 
     fireEvent.click(screen.getByTestId("task-workspace-browse"));
     expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
@@ -829,12 +1008,14 @@ describe("CreateScheduledTaskDialog validation", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
     expect(onOpenChange).not.toHaveBeenCalled();
+    openAutomationSection("Context");
     fireEvent.click(screen.getByTestId("task-workspace-browse"));
 
     fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+    openAutomationSection("Context");
 
     expect(screen.queryByTestId("workspace-picker-dialog")).toBeNull();
-    expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
+    expect(screen.getAllByText("/home/me/repo")).toHaveLength(3);
 
     expect(gitWorkspace.query).toHaveBeenLastCalledWith("host_1", "/home/me/repo");
     fireEvent.click(screen.getByRole("checkbox", { name: "Random worktree" }));
@@ -845,16 +1026,18 @@ describe("CreateScheduledTaskDialog validation", () => {
     } as unknown as ReturnType<typeof hostsHook.useHosts>);
     rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
     expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
+    openAutomationSection("Context");
     expect(screen.getByTestId("task-workspace-browse")).toBeDisabled();
     expect(gitWorkspace.query).toHaveBeenLastCalledWith(null, "/home/me/repo");
     expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Turn off random worktree" })).toBeEnabled();
-    expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
+    expect(screen.getAllByText("/home/me/repo")).toHaveLength(3);
 
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "online" }],
     } as unknown as ReturnType<typeof hostsHook.useHosts>);
     rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+    openAutomationSection("Context");
     expect(screen.getByTestId("task-workspace-browse")).toBeEnabled();
     expect(gitWorkspace.query).toHaveBeenLastCalledWith("host_1", "/home/me/repo");
     expect(screen.getByRole("checkbox", { name: "Random worktree" })).toBeChecked();
@@ -1271,15 +1454,16 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
         expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
         expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
         expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
-        expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
-          "Sonnet · Medium · Accept edits",
+        expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute(
+          "data-trigger-details",
+          "Model:Sonnet|Effort:Medium",
         );
       }
       if (pick !== null) {
         fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
         fireEvent.click(await screen.findByRole("option", { name: pick }));
       }
-      expect(screen.getByRole("dialog")).toBeInTheDocument();
+      expect(screen.getByTestId("create-scheduled-task-dialog")).toBeInTheDocument();
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       const mutation = editing ? updateMutateAsync : mutateAsync;
       await waitFor(() => expect(mutation).toHaveBeenCalledTimes(1));
@@ -1333,6 +1517,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
       openHostSelect();
       fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
       expect(screen.queryByLabelText("Repository")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("task-workspace-trigger"));
       expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("Browse folders");
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
@@ -1442,9 +1627,10 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
 
     await waitFor(() => expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("task-workspace-trigger"));
     const browse = screen.getByTestId("task-workspace-browse");
     expect(browse).toBeDisabled();
-    expect(browse).toHaveAccessibleDescription("Connect your host to select a workspace.");
+    expect(screen.getByText("Connect your host to select a workspace.")).toBeVisible();
     fireEvent.click(browse);
     expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
   });
@@ -1485,6 +1671,7 @@ describe("CreateScheduledTaskDialog submit", () => {
 
   it("keeps an older unpinned task unpinned until a host is picked", async () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
+    openAutomationSection("Run setup");
 
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Most recently active host");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
@@ -1493,29 +1680,19 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("hostId");
   });
 
-  it("keeps Run on and Agent visible before Schedule with Advanced collapsed", () => {
+  it("shows Run on and Agent before the top-level Schedule control", () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    const hostField = screen.getByTestId("task-host-field");
+    const scheduleSection = screen.getByRole("button", { name: "Schedule" });
+    expect(scheduleSection).toHaveAttribute("aria-expanded", "false");
     const hostTrigger = screen.getByTestId("task-host-trigger");
-    expect(hostField).not.toHaveClass("sm:w-64");
-    expect(hostField).toContainElement(hostTrigger);
     expect(hostTrigger).toBeVisible();
-    const agentField = screen.getByTestId("task-agent-field");
     expect(screen.getByTestId("task-agent-picker")).toBeVisible();
-    expect(hostField.nextElementSibling).toBe(agentField);
-    expect(agentField.compareDocumentPosition(screen.getByTestId("schedule-preset-trigger"))).toBe(
+    expect(hostTrigger.compareDocumentPosition(scheduleSection)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
     fireEvent.click(screen.getByTestId("pick-agent-polly"));
     expect(screen.getByTestId("agent-picker-stub")).toHaveTextContent("Polly");
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
+    expect(scheduleSection).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
   });
 
@@ -1990,27 +2167,27 @@ describe("CreateScheduledTaskDialog submit", () => {
 });
 
 describe("CreateScheduledTaskDialog model + effort controls", () => {
-  it("keeps general Advanced settings available without a harness", () => {
+  it("keeps the independent setup controls available without a harness", () => {
     vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
       data: [],
     } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
     renderDialog();
-    expect(screen.getByRole("button", { name: "Advanced" })).toBeVisible();
+    expect(screen.getByTestId("task-host-trigger")).toBeVisible();
+    expect(screen.getByTestId("task-schedule-trigger")).toBeVisible();
+    expect(screen.getByTestId("task-ending-trigger")).toBeVisible();
+    expect(screen.getByTestId("task-workspace-trigger")).toBeVisible();
   });
 
-  it("collapses Advanced again when the dialog reopens", () => {
+  it("closes the agent picker when the dialog reopens", () => {
     const onOpenChange = vi.fn();
     const { rerender } = render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />, {
       expandAdvanced: false,
     });
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    fireEvent.click(screen.getByTestId("picker-open"));
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-picker-open", "true");
     rerender(<CreateScheduledTaskDialog open={false} onOpenChange={onOpenChange} />);
     rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-picker-open", "false");
   });
 
   it("renders model + effort for a capable (Claude-native) agent, hides them for a plain agent", () => {
@@ -2018,24 +2195,11 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     // Default effective agent is the capable claude-native harness → controls show.
     expect(screen.getByTestId("task-model-effort-field")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
-
     // Switch to Polly (claude-sdk, no permissionMode capability) → controls hide.
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
     fireEvent.click(screen.getByTestId("pick-agent-polly"));
-    expect(screen.getByRole("button", { name: "Advanced" })).toBeVisible();
     expect(screen.queryByTestId("task-model-effort-field")).not.toBeInTheDocument();
     expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
     expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
-    // The "uses defaults" hint returns when the controls are hidden.
-    expect(
-      screen.getByText("Uses this agent's default model, effort, and permission settings"),
-    ).toBeInTheDocument();
   });
 
   it("sends the selected model + effort on create for a capable agent", async () => {
@@ -2053,14 +2217,10 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "Accept edits" }));
 
-    // Collapsing and reopening keeps the chosen settings; collapsed settings still save.
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    // The composer-style picker and independent permission control keep the chosen settings.
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
     expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
 
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
@@ -2068,6 +2228,30 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(arg.modelOverride).toBe("opus");
     expect(arg.reasoningEffort).toBe("high");
     expect(arg.permissionMode).toBe("acceptEdits");
+  });
+
+  it("pipes model and effort picks from the composer-style agent picker into create", async () => {
+    renderDialog();
+    const picker = screen.getByTestId("agent-picker-stub");
+    expect(picker).toHaveAttribute("data-has-trigger-icon", "true");
+    expect(picker).toHaveAttribute("data-has-config", "true");
+    expect(picker).toHaveAttribute("data-trigger-details", "Model:Default|Effort:Default");
+
+    fireEvent.click(screen.getByTestId("task-agent-model-opus-mock"));
+    fireEvent.click(screen.getByTestId("task-agent-effort-high-mock"));
+    expect(picker).toHaveAttribute("data-trigger-details", "Model:Opus|Effort:High");
+    // Opening Edit selects the active row again before showing its config.
+    fireEvent.click(screen.getByTestId("pick-harness-claude"));
+    expect(picker).toHaveAttribute("data-trigger-details", "Model:Opus|Effort:High");
+
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({
+      modelOverride: "opus",
+      reasoningEffort: "high",
+    });
   });
 
   it("omits model + effort and starts permission at Auto on create", async () => {
@@ -2196,12 +2380,17 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
             })}
           />
         </CapabilitiesProvider>,
+        { expandAdvanced: false },
       );
 
+      openAutomationSection("Context");
       fireEvent.click(screen.getByTestId("task-workspace-browse"));
       fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
       expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+      closeTopLevelPopovers();
+      fireEvent.keyDown(screen.getByTestId("task-session-mode-trigger"), { key: "Enter" });
       fireEvent.click(screen.getByTestId("task-start-new-session"));
+      fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
       expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
       for (const [field, option] of [
         ["model", "Opus"],
@@ -2214,12 +2403,15 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
         fireEvent.click(screen.getByRole("option", { name: option }));
       }
       if (!reset) {
+        fireEvent.keyDown(screen.getByTestId("task-session-mode-trigger"), { key: "Enter" });
         fireEvent.click(screen.getByTestId("task-start-new-session"));
+        fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
         expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
         expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
         expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Plan");
-        expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
-          "Sonnet · Medium · Plan",
+        expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute(
+          "data-trigger-details",
+          "Model:Sonnet|Effort:Medium",
         );
         for (const field of ["model", "effort", "permission"]) {
           expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
@@ -2322,13 +2514,15 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
             })}
           />
         </CapabilitiesProvider>,
+        { expandAdvanced: false },
       );
       expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
       if (change === "host") {
         fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
         fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
       } else {
-        fireEvent.click(screen.getByRole("switch", { name: "Start each run in a new session" }));
+        fireEvent.keyDown(screen.getByTestId("task-session-mode-trigger"), { key: "Enter" });
+        fireEvent.click(screen.getByRole("menuitemradio", { name: "New session each run" }));
       }
       for (const field of ["model", "effort", "permission"]) {
         expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
@@ -2376,8 +2570,10 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
         </CapabilitiesProvider>,
       );
       // The picker returns an alias; only the server can resolve it to the saved directory.
+      openAutomationSection("Context");
       fireEvent.click(screen.getByTestId("task-workspace-browse"));
       fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+      openAutomationSection("Context");
       expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
       for (const field of ["model", "effort", "permission"]) {
         expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
@@ -2674,14 +2870,30 @@ describe("nested dropdowns do not dismiss the Dialog (isInsidePopper guard)", ()
           <CreateScheduledTaskDialog open onOpenChange={onOpenChange} />
         </CapabilitiesProvider>,
       );
+      for (const testId of [
+        "task-schedule-trigger",
+        "task-ending-trigger",
+        "task-workspace-trigger",
+      ]) {
+        const openTrigger = screen.queryByTestId(testId);
+        if (openTrigger?.getAttribute("aria-expanded") === "true") fireEvent.click(openTrigger);
+      }
       fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Unsaved draft" } });
       const trigger = screen.getByTestId(`task-${field}-trigger`);
       const role = field === "project" ? "menu" : "listbox";
       for (let attempt = 0; attempt < 2; attempt++) {
         fireEvent.keyDown(trigger, { key: "Enter" });
-        expect(screen.getByRole(role)).toBeVisible();
+        if (field === "model" || field === "effort") {
+          expect(screen.getByTestId(`task-${field}-options`)).toBeVisible();
+        } else {
+          expect(screen.getByRole(role)).toBeVisible();
+        }
         fireEvent.keyDown(window, { key: "Escape" });
-        expect(screen.queryByRole(role)).not.toBeInTheDocument();
+        if (field === "model" || field === "effort") {
+          expect(screen.queryByTestId(`task-${field}-options`)).not.toBeInTheDocument();
+        } else {
+          expect(screen.queryByRole(role)).not.toBeInTheDocument();
+        }
         expect(screen.getByLabelText("Name")).toHaveValue("Unsaved draft");
         expect(onOpenChange).not.toHaveBeenCalled();
       }
@@ -2819,8 +3031,12 @@ describe("CreateScheduledTaskDialog session mode", () => {
   }
 
   function chooseContinue() {
-    const toggle = screen.getByRole("switch", { name: "Start each run in a new session" });
-    if (toggle.getAttribute("aria-checked") === "true") fireEvent.click(toggle);
+    closeTopLevelPopovers();
+    const trigger = screen.getByTestId("task-session-mode-trigger");
+    if (!trigger.textContent?.includes("Continue one session")) {
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      fireEvent.click(screen.getByRole("menuitemradio", { name: "Continue one session" }));
+    }
   }
 
   it("hides the Session control on a server that does not accept session modes", () => {
@@ -2835,9 +3051,9 @@ describe("CreateScheduledTaskDialog session mode", () => {
     chooseContinue();
     fireEvent.keyDown(screen.getByLabelText("Run on"), { key: "Enter" });
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
-    expect(
-      screen.getByText("Later runs continue in the same session, keeping its context."),
-    ).toBeVisible();
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "Continue one session",
+    );
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
@@ -2856,6 +3072,8 @@ describe("CreateScheduledTaskDialog session mode", () => {
 
   it("clears the continued session when asked to start a new one on the next run", async () => {
     renderWithSessionModes(scheduledTask({ sessionMode: "continue", sessionId: "conv_1" }));
+    closeTopLevelPopovers();
+    fireEvent.keyDown(screen.getByTestId("task-session-mode-trigger"), { key: "Enter" });
     fireEvent.click(screen.getByTestId("task-start-new-session"));
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
@@ -2878,7 +3096,11 @@ describe("CreateScheduledTaskDialog session mode", () => {
       { placement: "same_host", sessionLink: "https://omni.example.com/c/CONVERSATION_ID" },
     );
     renderWithSessionModes(scheduledTask({ sessionMode: "continue", sessionId: "conv_1", prompt }));
-    expect(screen.queryByTestId("task-session-mode-trigger")).toBeNull();
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "Continue one session",
+    );
+    closeTopLevelPopovers();
+    fireEvent.keyDown(screen.getByTestId("task-session-mode-trigger"), { key: "Enter" });
     fireEvent.click(screen.getByTestId("task-start-new-session"));
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
@@ -2897,7 +3119,9 @@ describe("CreateScheduledTaskDialog session mode", () => {
 
   it("keeps the session choice when editing an automation written by hand", () => {
     renderWithSessionModes(scheduledTask({ sessionMode: "continue", sessionId: "conv_1" }));
-    expect(screen.getByTestId("task-session-mode-trigger")).not.toBeChecked();
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "Continue one session",
+    );
   });
 
   it.each(["connected_host", "managed_sandbox"] as const)(
@@ -2917,23 +3141,25 @@ describe("CreateScheduledTaskDialog session mode", () => {
           managed_sandboxes_enabled: true,
         },
       );
-      fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+      openAutomationSection("Run setup");
       expect(screen.getByTestId("task-host-trigger")).toBeVisible();
       expect(screen.getByTestId("task-session-mode-trigger")).toBeVisible();
       expect(
         screen
-          .getByTestId("task-session-mode-trigger")
-          .compareDocumentPosition(screen.getByTestId("schedule-preset-trigger")),
+          .getByTestId("task-host-trigger")
+          .compareDocumentPosition(screen.getByTestId("task-schedule-trigger")),
       ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
-      expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Interval");
-      expect(screen.getByLabelText("Repeat every")).toHaveValue(10);
-      fireEvent.click(screen.getByTestId("task-session-mode-trigger"));
+      closeTopLevelPopovers();
+      fireEvent.keyDown(screen.getByTestId("task-session-mode-trigger"), { key: "Enter" });
+      fireEvent.click(screen.getByRole("menuitemradio", { name: "New session each run" }));
+      openAutomationSection("Schedule");
       expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Interval");
       expect(screen.getByLabelText("Repeat every")).toHaveValue(10);
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
       expect(screen.getByTestId("schedule-error")).toHaveTextContent(
         "New sandbox sessions require schedules of at least 60 minutes",
       );
+      openAutomationSection("Run setup");
       if (target === "connected_host") {
         fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
         fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
@@ -3155,7 +3381,10 @@ describe("automation trigger type", () => {
     expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Triage the ticket.");
     expect(screen.getByTestId("task-trigger-condition-0-value")).toHaveValue("bug");
     fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
-    fireEvent.click(screen.getByTestId("task-session-mode-trigger"));
+    closeTopLevelPopovers();
+    fireEvent.keyDown(screen.getByTestId("task-session-mode-trigger"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "New session each run" }));
+    openAutomationSection("Schedule");
     await choose("Every day", "schedule-preset-trigger");
     await chooseTimezone("Europe/London");
     await choose("Schedule");
@@ -3164,7 +3393,9 @@ describe("automation trigger type", () => {
     expect(screen.getByLabelText("Timezone", { exact: true })).toHaveTextContent(
       "America/New York",
     );
-    expect(screen.getByTestId("task-session-mode-trigger")).toBeChecked();
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "New session each run",
+    );
     await choose("Jira");
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Every day");
     expect(screen.getByLabelText("Timezone", { exact: true })).toHaveTextContent("Europe/London");
@@ -3359,8 +3590,11 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     fillJira();
     fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
     expect(screen.getByTestId("task-trigger-cadence")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("switch", { name: "Start each run in a new session" }));
+    closeTopLevelPopovers();
+    fireEvent.keyDown(screen.getByTestId("task-session-mode-trigger"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "New session each run" }));
     expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
+    openAutomationSection("Schedule");
     expect(screen.getByTestId("schedule-preset-trigger")).toBeInTheDocument();
     await submittedPrompt();
     expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
@@ -3839,7 +4073,9 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
     // The kept session stays, but the user may now change it.
     expect(screen.getByTestId("task-session-mode-trigger")).toBeEnabled();
-    expect(screen.getByTestId("task-session-mode-trigger")).not.toBeChecked();
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "Continue one session",
+    );
     const editedPrompt = `${prompt.value}\nOnly act on pull requests labeled ready.`;
     fireEvent.change(prompt, { target: { value: editedPrompt } });
     const submitted = await submittedPrompt();
@@ -3866,15 +4102,11 @@ describe("editing template prompts", () => {
       fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" });
       fireEvent.click(await screen.findByRole("option", { name }));
     };
+    openAutomationSection("Run setup");
     expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Polly");
     expect(screen.getByTestId("task-worker-agent-trigger")).toBeVisible();
     expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
     await select("task-worker-agent-trigger", "Claude Code");
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
     await select("task-model-trigger", "Opus");
     await select("task-effort-trigger", "High");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
@@ -3898,11 +4130,11 @@ describe("editing template prompts", () => {
     rerender(
       <CreateScheduledTaskDialog open {...props} editingTask={{ ...task, prompt: input.prompt }} />,
     );
+    openAutomationSection("Run setup");
     expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Claude Code");
-    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
+    openAutomationSection("Run setup");
     await select("task-worker-agent-trigger", "Polly");
     expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
@@ -4076,7 +4308,8 @@ describe("editing template prompts", () => {
     rerender(
       <CreateScheduledTaskDialog open {...props} editingTask={{ ...task, prompt: input.prompt }} />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Edit worker instructions" }));
+    fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
     expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveFocus();
     expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(
       splitTriggerPrompt(input.prompt).systemPrompt,
@@ -4161,8 +4394,7 @@ describe("editing template prompts", () => {
           screen.queryByRole("button", { name: "Edit worker instructions" }),
         ).not.toBeInTheDocument();
       } else {
-        fireEvent.click(screen.getByRole("button", { name: "Edit worker instructions" }));
-        expect(screen.getByRole("textbox", { name: "Instructions" })).toHaveFocus();
+        expect(screen.getByRole("textbox", { name: "Instructions" })).toBeVisible();
       }
     },
   );
@@ -4293,7 +4525,7 @@ describe("editing template prompts", () => {
 });
 
 describe("scheduler capabilities", () => {
-  it("keeps trigger polling errors visible without opening unrelated Advanced fields", async () => {
+  it("opens Schedule for trigger polling errors without opening unrelated sections", async () => {
     const prompt = renderTriggerPrompt(
       "jira",
       { ...emptyTriggerFields("jira"), scope: "ES", instructions: "Triage it." },
@@ -4315,10 +4547,12 @@ describe("scheduler capabilities", () => {
       </CapabilitiesProvider>,
       { expandAdvanced: false },
     );
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "Schedule" })).toHaveAttribute(
       "aria-expanded",
-      "false",
+      "true",
     );
+    expect(screen.getByTestId("task-worker-agent-trigger")).toBeVisible();
+    expect(screen.queryByTestId("task-ending-trigger")).not.toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("polling configuration");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: /Use server default/ }));
@@ -5036,6 +5270,7 @@ describe("automation random worktree", () => {
       );
       if (directoryChanged) {
         gitWorkspace.path = "/ordinary-folder";
+        openAutomationSection("Context");
         fireEvent.click(screen.getByTestId("task-workspace-browse"));
         fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
       }
@@ -5049,6 +5284,7 @@ describe("automation random worktree", () => {
         );
       } else {
         // Reselect the ordinary folder to render the negative discovery result.
+        openAutomationSection("Context");
         fireEvent.click(screen.getByTestId("task-workspace-browse"));
         fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
       }
@@ -5068,8 +5304,10 @@ describe("automation random worktree", () => {
       if (transition === "directory-roundtrip") {
         gitWorkspace.available = true;
         gitWorkspace.path = "/home/me/repo";
+        openAutomationSection("Context");
         fireEvent.click(screen.getByTestId("task-workspace-browse"));
         fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+        openAutomationSection("Context");
         expect(screen.getByRole("checkbox", { name: "Random worktree" })).not.toBeChecked();
       }
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
@@ -5148,8 +5386,10 @@ describe("automation random worktree", () => {
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Review code" } });
     fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+    openAutomationSection("Context");
     fireEvent.click(screen.getByTestId("task-workspace-browse"));
     fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+    openAutomationSection("Context");
     const checkbox = screen.getByRole("checkbox", { name: "Random worktree" });
     expect(checkbox).not.toBeChecked();
     fireEvent.click(checkbox);
