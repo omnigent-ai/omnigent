@@ -2218,6 +2218,13 @@ def test_parse_invalid_config_fails_loud(raw: object, expected_fragment: str) ->
             "git@github.com:org/repo.git",
             RepoWorkspace(url="git@github.com:org/repo.git", branch=None, repo_name="repo"),
         ),
+        *[
+            (
+                f"git@{alias}:team/sample.git",
+                RepoWorkspace(url=f"git@{alias}:team/sample.git", branch=None, repo_name="sample"),
+            )
+            for alias in ["work_git", "bad_.example.com", "café", "-host", "host%name", "a" * 64]
+        ],
         (
             "git@[2001:db8::1]:org/repo.git#main",
             RepoWorkspace(url="git@[2001:db8::1]:org/repo.git", branch="main", repo_name="repo"),
@@ -2260,6 +2267,14 @@ def test_parse_repo_workspace_accepts_url_forms(workspace: str, expected: RepoWo
         # No repo path at all.
         ("https://github.com", "not a usable https repository URL"),
         ("git@github.com", "not a usable ssh repository URL"),
+        ("git@host/path:team/sample.git", "unambiguous host alias"),
+        ("git@host\\path:team/sample.git", "unambiguous host alias"),
+        ("git@host]:team/sample.git", "unambiguous host alias"),
+        ("https://git.example.com/team?secret/value/sample.git", "must not contain a query"),
+        ("https://git.example.com:invalid/team/sample.git", "Port could not be cast"),
+        ("https://git..example.com/team/sample.git", "valid hostname"),
+        ("https://git.example.com/" + "a" * 256, "must be at most"),
+        ("https://git.example.com/team/sample.git#../main", "not a valid git branch name"),
         ("git@[2001:db8::1:org/repo", "must use 'git@[address]:path'"),
         ("git@[2001:db8::1]org/repo", "must use 'git@[address]:path'"),
         ("git@[2001:db8::1]extra:org/repo", "must use 'git@[address]:path'"),

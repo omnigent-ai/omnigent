@@ -1800,7 +1800,7 @@ def create_hosts_router(
             return _clone_error("invalid_input", str(exc), 400)
         conn = host_registry.get(host.host_id)
         if conn is None:
-            return _clone_error("host_offline", "Host is not connected to this server", 409)
+            raise _host_absent_error(host)
         if CAP_CLONE_REPOSITORY not in conn.hello.capabilities:
             return _clone_error("clone_unsupported", "Update this host to clone repositories", 409)
         request_id = secrets.token_hex(8)

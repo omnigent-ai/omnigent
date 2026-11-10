@@ -149,6 +149,17 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
         # Accessing port validates its syntax and range without contacting the host.
         _ = parsed.port
         host = parsed.hostname or ""
+        if ":" in host:
+            ipaddress.IPv6Address(host)
+        elif (
+            not host
+            or len(host) > 253
+            or not all(
+                re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                for label in host.removesuffix(".").split(".")
+            )
+        ):
+            raise ValueError("a repository URL must have a valid hostname")
     elif url.startswith("git@"):
         rest = url[len("git@") :]
         if "@" in rest:
@@ -163,6 +174,10 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
             ipaddress.IPv6Address(host)
         else:
             host, colon, path = rest.partition(":")
+            # SSH aliases are configuration names, not necessarily DNS hostnames.
+            # A slash before the colon is a local path to Git, not an SSH alias.
+            if any(character in host for character in "/\\[]"):
+                raise ValueError("an SSH repository URL must have an unambiguous host alias")
         if not host or not colon or not path.strip("/"):
             raise ValueError(
                 f"'{url}' is not a usable ssh repository URL — expected 'git@<host>:<org>/<repo>'"
@@ -172,17 +187,6 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
             f"'{url}' is not a supported repository URL — use "
             "'https://<host>/<org>/<repo>' or 'git@<host>:<org>/<repo>'"
         )
-    if ":" in host:
-        ipaddress.IPv6Address(host)
-    elif (
-        not host
-        or len(host) > 253
-        or not all(
-            re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
-            for label in host.removesuffix(".").split(".")
-        )
-    ):
-        raise ValueError("a repository URL must have a valid hostname")
     branch = _validate_clone_branch(fragment) if sep else None
     return RepoWorkspace(url=url, branch=branch, repo_name=_derive_repo_name(url))
 
