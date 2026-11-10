@@ -107,7 +107,7 @@ Preconditions: use an isolated test server with `OMNIGENT_FEATURES=sibling_sessi
 for nested creation journeys; peer messaging and standalone creation use the default settings.
 Own both sessions. Same-host creation requires a connected
 owned host/workspace. Managed creation requires a launch-capable provider in the
-server's sandbox configuration (for example, Modal or Daytona). Internal deployments
+server's sandbox configuration (for example, Modal or Daytona). Other deployments
 can supply their own provider through the existing launcher interface.
 
 For `created-by`, extend the creation journey below: open the worker, reload,

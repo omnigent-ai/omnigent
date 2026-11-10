@@ -5,7 +5,6 @@ import base64
 import json
 import logging
 import os
-import sys
 import tempfile
 import threading
 import unittest
@@ -14,8 +13,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.claude_sdk_executor import _to_anthropic_content_blocks
 from omnigent.inner.executor import (
@@ -6760,3 +6757,80 @@ async def test_turn_options_expose_ask_user_question_only_with_its_hook(
     matchers = [m.matcher for m in (options.hooks or {}).get("PreToolUse", [])]
     assert ("AskUserQuestion" in options.tools) is bridge_wired
     assert ("AskUserQuestion" in matchers) is bridge_wired
+
+
+@pytest.mark.parametrize("saved", [False, True])
+@pytest.mark.parametrize("active", [None, [], ["claude"]])
+async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved):
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
+    active = launch_activation(active)
+
+    from omnigent.mcp_disabled_servers import ServerKey, apply_claude_settings, set_disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    if saved:
+        set_disabled(ServerKey("claude", "fixture"), True)
+    original = ' {"other": true} '
+    with (
+        patch(
+            "omnigent.inner.claude_sdk_executor._claude_settings_payload", return_value=original
+        ),
+        patch(
+            "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
+        ) as hook,
+    ):
+        options = await _turn_options(_default_executor(active_harnesses=active))
+    hook.assert_called_once()
+    assert hook.call_args.kwargs == {"executor": "claude-sdk", "active_harnesses": active}
+    if active and saved:
+        assert json.loads(options.settings) == {
+            "other": True,
+            "deniedMcpServers": [{"serverName": "fixture"}],
+        }
+    else:
+        assert options.settings is original
+
+
+@pytest.mark.parametrize(
+    "data,expected",
+    [
+        ({}, ()),
+        ({"mcp_servers": None}, ()),
+        ({"mcp_servers": "invalid"}, ()),
+        ({"mcp_servers": [None, {}, {"name": 1}, {"name": "fixture"}]}, ("fixture",)),
+    ],
+)
+def test_disabled_mcp_init_server_names(data, expected):
+    from omnigent.inner.claude_sdk_executor import _init_mcp_server_names
+
+    assert _init_mcp_server_names(data) == expected
+
+
+@pytest.mark.parametrize("active", [None, ["claude"]])
+async def test_disabled_mcp_sdk_init_reports_loaded_server(tmp_path, monkeypatch, caplog, active):
+    from claude_agent_sdk.types import SystemMessage as SDKSystemMessage
+
+    from omnigent.mcp_disabled_servers import ServerKey, set_disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    set_disabled(ServerKey("claude", "fixture"), True)
+
+    class FakeSDK(_sdk_types()):
+        class ClaudeSDKClient(_SDKClient):
+            async def receive_response(self):
+                yield SDKSystemMessage(
+                    subtype="init",
+                    data={"mcp_servers": [{"name": "fixture"}, {"name": "omnigent"}]},
+                )
+
+        SystemMessage = SDKSystemMessage
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=FakeSDK):
+        executor = _default_executor(active_harnesses=active)
+        try:
+            async for _ in executor.run_turn([{"role": "user", "content": "hello"}], [], ""):
+                pass
+        finally:
+            await executor.close()
+    assert ("mcp_disabled_server_not_applied server=fixture" in caplog.text) == bool(active)
