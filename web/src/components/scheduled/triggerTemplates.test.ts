@@ -256,6 +256,16 @@ describe("triggerFieldsComplete", () => {
       { conditions: [{ field: "custom_field", operator: "empty", name: "Team", value: "" }] },
       true,
     ],
+    [
+      "an unnamed custom field that is empty",
+      { conditions: [{ field: "custom_field", operator: "empty", name: " ", value: "" }] },
+      false,
+    ],
+    [
+      "a custom field with no name set",
+      { conditions: [{ field: "custom_field", operator: "not_empty", value: "" }] },
+      false,
+    ],
     ["empty instructions", { instructions: "" }, false],
     ["instructions at the cap", { instructions: "x".repeat(MAX_INSTRUCTIONS_CHARS) }, true],
     ["instructions over the cap", { instructions: "x".repeat(MAX_INSTRUCTIONS_CHARS + 1) }, false],

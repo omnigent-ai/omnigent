@@ -33,6 +33,10 @@ to customize.
   help text, and hide the Assignee condition; review requests start with link-back off.
   Pull request opened gains an optional Reviewer filter with a hint that it only sees
   reviewers requested before the first check after opening.
+- `jira-custom-field`: Jira's **Add condition → Custom field** row shows a field-name
+  input (a Jira field name or a `cf[10010]` ID) before the operator, which is equals,
+  doesn't equal, is empty, or is set. Create stays disabled and the incomplete-condition
+  hint shows until the row has a name, even for is empty and is set.
 - `link-posting`: a checkbox below the trigger controls posting the session link
   back to Jira, Slack, GitHub, Linear, or PagerDuty (as an incident note). Sessions
   start whether it is checked or not.
