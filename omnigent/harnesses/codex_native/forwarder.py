@@ -8284,6 +8284,8 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :param message_id: Optional live-preview stream finalized by this item.
     :param source_id: Stable native source id for server-side idempotency.
+    :param native_input_receipt: Validated identity and content for a spilled input.
+    :param delivery_attempt_id: Native client ID identifying an ordinary web input.
     :returns: Whether the item was accepted by the server.
     """
     data: _JsonObject = {

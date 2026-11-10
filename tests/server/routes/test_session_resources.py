@@ -11820,6 +11820,7 @@ def _encoded_spilled_content(content: object) -> bytes:
     [
         "owned_multiblock",
         "owned_upload",
+        "ordinary_client_id_conflict",
         "wrong_attempt",
         "same_source_replay",
         "distinct_source_replay",
@@ -11938,6 +11939,8 @@ async def test_spilled_receipt_preserves_exact_queue_ownership(
         wire_identity["delivery_attempt_id"] = "f" * 32
         assert wire_identity["delivery_attempt_id"] != owned_identity["delivery_attempt_id"]
     body = await mirror_body(original, wire_identity, "native_owned")
+    if scenario == "ordinary_client_id_conflict":
+        body.data["delivery_attempt_id"] = older_identity["delivery_attempt_id"]
     if scenario == "metadata_missing":
         body.data.pop("native_input_receipt")
     elif scenario == "metadata_missing_pending":

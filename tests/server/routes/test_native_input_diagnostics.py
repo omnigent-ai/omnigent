@@ -27,12 +27,16 @@ from tests.harnesses.codex_native.forwarder._support import _RecordingClient
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_prompt", [False, True], ids=["file-only", "prompt-first"])
 @pytest.mark.parametrize("failed_append", [False, True])
-async def test_unspilled_file_receipt_preserves_earlier_input_and_upload(
+@pytest.mark.parametrize(
+    "upload_data", [b"small upload", b"x" * 1_100_000], ids=["small", "large"]
+)
+async def test_file_receipt_preserves_earlier_input_and_upload(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     with_prompt: bool,
     failed_append: bool,
+    upload_data: bytes,
 ) -> None:
     """A native client ID settles its input even when file text changes its mirror."""
     store = SqlAlchemyConversationStore(db_uri)
@@ -51,13 +55,15 @@ async def test_unspilled_file_receipt_preserves_earlier_input_and_upload(
             *prompt,
             {
                 **file_block,
-                "file_data": "data:text/plain;base64,"
-                + base64.b64encode(b"small upload").decode(),
+                "file_data": "data:text/plain;base64," + base64.b64encode(upload_data).decode(),
             },
         ],
         tmp_path,
     )
-    assert not hasattr(native_content, "client_message_id")
+    if upload_data == b"small upload":
+        assert not hasattr(native_content, "client_message_id")
+    else:
+        assert native_content.client_message_id.startswith("omnigent-paste-")
     client = _RecordingClient()
     await codex_forwarder._post_user_message(
         client,
@@ -72,6 +78,7 @@ async def test_unspilled_file_receipt_preserves_earlier_input_and_upload(
     )
     [(_url, envelope)] = client.posts
     body = SessionEventInput.model_validate(envelope)
+    assert body.data["delivery_attempt_id"] == attempt
     published = Mock()
     monkeypatch.setattr(session_stream, "publish", published)
     original_append = store.append

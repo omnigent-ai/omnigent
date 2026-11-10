@@ -3218,8 +3218,8 @@ async def _persist_external_conversation_item_unlocked(
         )
         if has_delivery_receipt:
             try:
-                drained = pending_inputs.resolve_native_delivery_attempt(
-                    session_id, body.data["delivery_attempt_id"], hold=True
+                drained = pending_inputs.resolve_delivery_attempt(
+                    session_id, None, body.data["delivery_attempt_id"], hold=True
                 )
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc

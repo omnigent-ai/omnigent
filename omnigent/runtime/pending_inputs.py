@@ -676,28 +676,43 @@ def resolve(
 
 def resolve_delivery_attempt(
     conversation_id: str,
-    pending_id: str,
+    pending_id: str | None,
     delivery_attempt_id: str | None,
     *,
     stable_id: str | None = None,
     hold: bool = False,
 ) -> DrainedInput | None:
-    """Resolve one receipt without using text or consuming older queued inputs."""
+    """Resolve a full receipt or native client ID without consuming older inputs."""
+    if pending_id is None and delivery_attempt_id is None:
+        return None
     identity = {
-        "pending_id": pending_id,
+        **({"pending_id": pending_id} if pending_id is not None else {}),
         **(
             {"delivery_attempt_id": delivery_attempt_id} if delivery_attempt_id is not None else {}
         ),
         **({"input_stable_id": stable_id} if stable_id is not None else {}),
     }
-    if input_attributes(identity) != identity:
+    if input_attributes(identity) != identity or not identity:
+        if pending_id is None:
+            return None
         raise ValueError("Invalid native input receipt identity")
     with _lock:
         _evict_stale_locked(conversation_id, _now())
         entries = _pending.get(conversation_id)
-        entry = entries.get(pending_id) if entries is not None else None
+        if pending_id is None:
+            entry = next(
+                (
+                    candidate
+                    for candidate in (entries or {}).values()
+                    if not candidate.held and candidate.delivery_attempt_id == delivery_attempt_id
+                ),
+                None,
+            )
+        else:
+            entry = entries.get(pending_id) if entries is not None else None
         if entry is None:
             return None
+        pending_id = entry.pending_id
         restored_match = (
             entry.restored
             and entry.delivery_attempt_id is None
@@ -722,35 +737,6 @@ def resolve_delivery_attempt(
             if not entries:
                 _pending.pop(conversation_id, None)
         return replace(_drained_input(entry), strict_restore=hold)
-
-
-def resolve_native_delivery_attempt(
-    conversation_id: str, delivery_attempt_id: object, *, hold: bool = False
-) -> DrainedInput | None:
-    """Resolve an ordinary native client ID through the current strict identity checks."""
-    identity = {"delivery_attempt_id": delivery_attempt_id}
-    if not isinstance(delivery_attempt_id, str) or input_attributes(identity) != identity:
-        return None
-    with _lock:
-        _evict_stale_locked(conversation_id, _now())
-        entry = next(
-            (
-                entry
-                for entry in _pending.get(conversation_id, {}).values()
-                if entry.delivery_attempt_id == delivery_attempt_id
-            ),
-            None,
-        )
-        if entry is None:
-            return None
-        pending_id, stable_id = entry.pending_id, entry.stable_id
-    return resolve_delivery_attempt(
-        conversation_id,
-        pending_id,
-        delivery_attempt_id,
-        stable_id=stable_id,
-        hold=hold,
-    )
 
 
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
