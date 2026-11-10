@@ -39,6 +39,15 @@ interface LiveMcpReconnectTarget {
 // Re-read while a server is still connecting, so the row settles without a reopen.
 const LIVE_MCP_PENDING_POLL_MS = 2_000;
 
+// A server that predates the route answers its generic 404; a missing session names itself.
+const ROUTE_NOT_FOUND_MESSAGES = new Set([
+  "Not found",
+  "Not found.",
+  "Not Found",
+  "404",
+  "404 Not Found",
+]);
+
 export function sessionLiveMcpServersQueryKey(sessionId: string | null) {
   return ["session-live-mcp-servers", sessionId] as const;
 }
@@ -52,9 +61,14 @@ async function fetchSessionLiveMcpServers(
   signal: AbortSignal,
 ): Promise<SessionLiveMcpServers> {
   const response = await authenticatedFetch(sessionLiveMcpServersPath(sessionId), { signal });
-  // A server without this route keeps the panel's inventory-only view.
-  if (response.status === 404) return { live: false, reason: "unsupported", servers: [] };
-  if (!response.ok) throw await apiErrorFromResponse(response);
+  if (!response.ok) {
+    const failure = await apiErrorFromResponse(response);
+    // A server without this route keeps the panel's inventory-only view.
+    if (response.status === 404 && ROUTE_NOT_FOUND_MESSAGES.has(failure.message)) {
+      return { live: false, reason: "unsupported", servers: [] };
+    }
+    throw failure;
+  }
   return (await response.json()) as SessionLiveMcpServers;
 }
 
@@ -96,10 +110,14 @@ export function useReconnectLiveMcpServer(sessionId: string | null) {
   const mutation = useMutation({
     mutationFn: ({ sessionId: target, name }: LiveMcpReconnectTarget) =>
       postLiveMcpReconnect(target, name),
-    onMutate: () => setError(null),
-    onSuccess: (result, { sessionId: target, name }) => {
+    onMutate: ({ sessionId: target }) =>
+      setError((current) => (current?.sessionId === target ? null : current)),
+    onSuccess: async (result, { sessionId: target, name }) => {
       const { reconnect_error: reconnectError, ...snapshot } = result;
-      client.setQueryData(sessionLiveMcpServersQueryKey(target), snapshot);
+      const queryKey = sessionLiveMcpServersQueryKey(target);
+      // A poll that started before the reconnect would overwrite its newer snapshot.
+      await client.cancelQueries({ queryKey });
+      client.setQueryData(queryKey, snapshot);
       if (reconnectError) setError({ sessionId: target, name, message: reconnectError });
     },
     onError: (failure: Error, { sessionId: target, name }) => {

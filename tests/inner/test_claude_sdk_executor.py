@@ -3984,11 +3984,14 @@ async def test_live_mcp_status_and_reconnect_for_the_mcp_panel(
         "wiki": {"status": "connected", "error": "", "scope": 7},
     }
     status_reply = "ok"
+    status_reads = 0
     reconnects: list[str] = []
     fake_sdk = _make_recovery_fake_sdk()
 
     class _McpClient(fake_sdk.ClaudeSDKClient):
         async def get_mcp_status(self) -> dict[str, object]:
+            nonlocal status_reads
+            status_reads += 1
             if status_reply == "hang":
                 await asyncio.Event().wait()
             servers: list[object] = [{"name": n, **fields} for n, fields in live.items()]
@@ -4066,6 +4069,25 @@ async def test_live_mcp_status_and_reconnect_for_the_mcp_panel(
         close.assert_awaited_once_with(first)
         assert "answer to q1" in second.prompts[-1]
         assert await turn("q3") is second
+
+        # A turn that waited on a panel request which then timed out leaves the busy CLI alone.
+        status_file = tmp_path / "mcp-auth-status.json"
+        status_file.write_text(
+            json.dumps({"servers": [{"harness": "claude", "name": "docs", "status": "connected"}]})
+        )
+        monkeypatch.setenv("OMNIGENT_MCP_AUTH_STATUS_FILE", str(status_file))
+        status_reply = "hang"
+        reads_before = status_reads
+        panel = asyncio.create_task(executor.live_mcp_statuses("mcp"))
+        while status_reads == reads_before:
+            await asyncio.sleep(0)
+        third = await turn("q4")
+        with pytest.raises(TimeoutError):
+            await panel
+        assert third is not second
+        close.assert_awaited_with(second)
+        assert status_reads == reads_before + 1
+        assert reconnects == ["plugin:tools:search", "docs"]
 
 
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:

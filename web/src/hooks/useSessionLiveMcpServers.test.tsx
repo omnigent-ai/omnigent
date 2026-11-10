@@ -40,8 +40,13 @@ afterEach(() => {
 });
 
 describe("useSessionLiveMcpServers", () => {
-  it("treats a server without the live route as unsupported, not as a failed read", async () => {
-    authenticatedFetch.mockResolvedValueOnce(json({ detail: "Not Found" }, 404));
+  // An older server answers an unknown route with its generic 404 body.
+  it.each([
+    { detail: "Not Found" },
+    { error: { code: "not_found", message: "Not found" } },
+    { error: { code: "not_found", message: "Not found." } },
+  ])("treats a server without the live route as unsupported: %j", async (body) => {
+    authenticatedFetch.mockResolvedValueOnce(json(body, 404));
     const { result } = renderHook(() => useSessionLiveMcpServers("conv_a", true), {
       wrapper: wrapperFor(client),
     });
@@ -53,15 +58,16 @@ describe("useSessionLiveMcpServers", () => {
     );
   });
 
-  it("still reports a denied read as an error", async () => {
-    authenticatedFetch.mockResolvedValueOnce(
-      json({ error: { code: "forbidden", message: "No access." } }, 403),
-    );
+  it.each([
+    [404, { error: { code: "not_found", message: "Session not found" } }, "Session not found"],
+    [403, { error: { code: "forbidden", message: "No access." } }, "No access."],
+  ])("still reports a %i read as an error", async (status, body, message) => {
+    authenticatedFetch.mockResolvedValueOnce(json(body, status));
     const { result } = renderHook(() => useSessionLiveMcpServers("conv_a", true), {
       wrapper: wrapperFor(client),
     });
     await waitFor(() => expect(result.current.isError).toBe(true));
-    expect(result.current.error?.message).toBe("No access.");
+    expect(result.current.error?.message).toBe(message);
   });
 
   it("asks nothing while disabled and re-reads only while a server is connecting", async () => {
@@ -143,6 +149,53 @@ describe("useReconnectLiveMcpServer", () => {
 
     rerender({ sessionId: "conv_a" });
     expect(result.current.error).toEqual({ name: "docs", message: "still unauthorized" });
+
+    // A reconnect in another session leaves this session's refusal in place.
+    authenticatedFetch.mockResolvedValueOnce(json({ live: true, servers: [] }));
+    rerender({ sessionId: "conv_b" });
+    act(() => result.current.reconnect("wiki"));
+    await waitFor(() =>
+      expect(client.getQueryData(sessionLiveMcpServersQueryKey("conv_b"))).toEqual({
+        live: true,
+        servers: [],
+      }),
+    );
+    rerender({ sessionId: "conv_a" });
+    expect(result.current.error).toEqual({ name: "docs", message: "still unauthorized" });
+  });
+
+  it("keeps the reconnect's snapshot over a read that was already in flight", async () => {
+    let answerRead!: (response: Response) => void;
+    authenticatedFetch
+      .mockResolvedValueOnce(json({ live: true, servers: [{ name: "docs", status: "failed" }] }))
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          answerRead = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(json({ live: true, servers: [{ name: "docs", status: "connected" }] }));
+    const { result } = renderHook(
+      () => ({
+        live: useSessionLiveMcpServers("conv_a", true),
+        reconnect: useReconnectLiveMcpServer("conv_a"),
+      }),
+      { wrapper: wrapperFor(client) },
+    );
+    await waitFor(() => expect(result.current.live.isSuccess).toBe(true));
+    act(() => void result.current.live.refetch());
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(2));
+
+    act(() => result.current.reconnect.reconnect("docs"));
+    await waitFor(() => expect(result.current.live.data?.servers[0]?.status).toBe("connected"));
+    await act(async () => {
+      answerRead(json({ live: true, servers: [{ name: "docs", status: "failed" }] }));
+      // Let the stale read finish parsing and settle, as it would on the wire.
+      await new Promise((resolve) => {
+        setTimeout(resolve, 50);
+      });
+    });
+    expect(result.current.live.data?.servers[0]?.status).toBe("connected");
+    expect(result.current.reconnect.error).toBeNull();
   });
 
   it("re-reads the session's connections after a failed reconnect", async () => {

@@ -568,7 +568,7 @@ async def test_live_mcp_reconnect_maps_each_runner_answer(
         assert response.status_code == status_code, (answer, response.text)
         assert message in response.text, (answer, response.text)
 
-    for body in ({}, {"name": ""}, {"name": "docs", "extra": 1}):
+    for body in ({}, {"name": ""}, {"name": "  "}, {"name": "docs", "extra": 1}):
         invalid = await client.post(url, json=body)
         assert invalid.status_code in (400, 422), invalid.text
     assert answers == []

@@ -2347,6 +2347,9 @@ class ClaudeSDKExecutor(Executor):
         try:
             if signed_in:
                 async with state.mcp_control_lock:
+                    # A panel request may have timed out while this turn waited.
+                    if state.mcp_control_timed_out:
+                        return False
                     retry = await _reconnect_failed_mcp_servers(state.client, signed_in)
             else:
                 retry = set()

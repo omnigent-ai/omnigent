@@ -204,26 +204,27 @@ const MCP_CONNECTION_LABEL: Record<McpServerConnection, string> = {
   unavailable: "Not available to your account",
 };
 
-const MCP_LIVE_LABEL: Record<string, string> = {
-  connected: "Connected",
-  failed: "Failed",
-  "needs-auth": "Needs sign-in",
-  pending: "Connecting…",
-  disabled: "Disabled",
+// Maps, because a harness status such as `constructor` must not match an object key.
+const MCP_LIVE_LABEL = new Map<string, string>([
+  ["connected", "Connected"],
+  ["failed", "Failed"],
+  ["needs-auth", "Needs sign-in"],
+  ["pending", "Connecting…"],
+  ["disabled", "Disabled"],
   // The harness answered without this server: it is not loaded in the session.
-  "not-loaded": "Not loaded",
-};
+  ["not-loaded", "Not loaded"],
+]);
 
-const MCP_LIVE_TONE: Record<string, string> = {
-  failed: "text-destructive",
-  "needs-auth": "text-amber-600 dark:text-amber-500",
-};
+const MCP_LIVE_TONE = new Map<string, string>([
+  ["failed", "text-destructive"],
+  ["needs-auth", "text-amber-600 dark:text-amber-500"],
+]);
 
 /** Live states a Reconnect can change, as in Claude Code's own `/mcp`. */
 const MCP_RECONNECTABLE = new Set(["failed", "needs-auth"]);
 
 function mcpLiveLabel(live: McpLiveConnection): string {
-  const label = MCP_LIVE_LABEL[live.status] ?? live.status;
+  const label = MCP_LIVE_LABEL.get(live.status) ?? live.status;
   return live.status === "failed" && live.error ? `${label}: ${live.error}` : label;
 }
 
@@ -457,7 +458,7 @@ function McpServerRows({
                     data-testid={`mcp-live-status-${server.name}`}
                     className={cn(
                       "break-words text-xs leading-4",
-                      MCP_LIVE_TONE[live.status] ?? "text-muted-foreground",
+                      MCP_LIVE_TONE.get(live.status) ?? "text-muted-foreground",
                     )}
                   >
                     In this session: {mcpLiveLabel(live)}

@@ -5753,6 +5753,7 @@
           "name": {
             "maxLength": 256,
             "minLength": 1,
+            "pattern": "\\S",
             "title": "Name",
             "type": "string"
           }

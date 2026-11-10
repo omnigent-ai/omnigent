@@ -1274,8 +1274,10 @@ class HarnessApp:
         except TimeoutError:
             return _live_mcp_failure(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_reconnect_timeout")
         except Exception as exc:
-            _logger.info("Reconnecting MCP server %r failed: %s", server_name, exc)
+            # The CLI's refusal is shown to the user; the traceback stays in the log.
+            _logger.warning("Reconnecting MCP server %r failed", server_name, exc_info=True)
             reconnect_error = _live_mcp_detail(exc) or "Reconnect failed."
+        body: dict[str, Any]
         try:
             body = _live_mcp_body(await self.live_mcp_statuses())
         except Exception:

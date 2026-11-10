@@ -216,7 +216,8 @@ class ReconnectLiveMCPServerRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=256)
+    # A blank name can never match a server, so reject it before asking the runner.
+    name: str = Field(min_length=1, max_length=256, pattern=r"\S")
 
 
 class MCPServerPatch(BaseModel):
