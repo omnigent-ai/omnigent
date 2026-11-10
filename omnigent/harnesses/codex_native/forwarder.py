@@ -70,6 +70,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -119,6 +120,8 @@ _POST_MAX_ATTEMPTS = 3
 _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_MAX_DELAY_SECONDS = 30.0
 _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+_STATUS_AUTH_RECOVERY_MAX_ATTEMPTS = 5
+_STATUS_RECOVERY_RETRY_DELAY_SECONDS = 1.0
 _DURABLE_ITEM_POST_TIMEOUT_SECONDS = 5.0
 _SOURCE_ID_MAX_CHARS = 256
 # Startup dead-letter replay budget (#1579). Bounded so a large dead-letter file
@@ -2661,6 +2664,8 @@ async def supervise_forwarder(
             codex_client=client,
             child_usage_baseline_dir=bridge_dir,
         )
+        status_deliveries: dict[str, _SessionStatusDelivery] = {}
+        status_delivery_token = _status_deliveries.set(status_deliveries)
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
         # subscribe task park instead of blind-polling ``thread/resume``
@@ -2686,9 +2691,9 @@ async def supervise_forwarder(
             ),
             name="codex-native-forwarder-side-chat",
         )
-        await _sleep(0)
         stream_error: BaseException | None = None
         try:
+            await _sleep(0)
             async for event in client.iter_events():
                 try:
                     superseded_session_id = target.session_id
@@ -2701,6 +2706,8 @@ async def supervise_forwarder(
                         forwarder_state=forwarder_state,
                     )
                     if rotated:
+                        if delivery := status_deliveries.pop(superseded_session_id, None):
+                            await delivery.close()
                         await _clear_superseded_background_work(
                             ap_client, superseded_session_id, forwarder_state
                         )
@@ -2787,6 +2794,7 @@ async def supervise_forwarder(
             # Child lanes run first: their queued handlers use the shared tracker.
             for close in (
                 forwarder_state.close_child_streams,
+                functools.partial(_close_status_deliveries, status_deliveries),
                 target.delta_coalescer.close,
                 target.usage_coalescer.close,
                 target.elicitation_tracker.close,
@@ -2796,6 +2804,7 @@ async def supervise_forwarder(
                     await close()
                 except BaseException as exc:  # noqa: BLE001 - finish all closers, even on cancellation.
                     cleanup_errors.append(exc)
+            _status_deliveries.reset(status_delivery_token)
             for error in cleanup_errors[1 if stream_error is None else 0 :]:
                 _logger.warning(
                     "Codex forwarder cleanup failed",
@@ -8454,6 +8463,127 @@ async def _post_external_item(
     return True
 
 
+class _SessionStatusDelivery:
+    """Retain the latest status through bounded, pre-send credential failures."""
+
+    def __init__(self, client: httpx.AsyncClient, session_id: str) -> None:
+        self.client = client
+        self.session_id = session_id
+        self.pending: _JsonObject | None = None
+        self.lock = asyncio.Lock()
+        self.retry_task: asyncio.Task[None] | None = None
+        self.auth_failures = 0
+        self.closed = False
+
+    async def post(self, data: _JsonObject) -> None:
+        if self.closed:
+            return
+        self.pending = data
+        self.auth_failures = 0
+        try:
+            async with self.lock:
+                if self.pending is data:
+                    await self._attempt(data)
+        except asyncio.CancelledError:
+            if self.pending is data:
+                self.pending = None
+            raise
+        except Exception:
+            if self.pending is data:
+                self.pending = None
+            raise
+        finally:
+            if (
+                not self.closed
+                and self.pending is not None
+                and (self.retry_task is None or self.retry_task.done())
+            ):
+                self.retry_task = asyncio.create_task(
+                    self._retry(), name="codex-native-status-delivery"
+                )
+
+    async def _attempt(self, data: _JsonObject, *, max_attempts: int = _POST_MAX_ATTEMPTS) -> None:
+        for attempt in range(1, max_attempts + 1):
+            if self.pending is not data:
+                return
+            try:
+                response = await _post_session_event(
+                    self.client,
+                    self.session_id,
+                    event_type="external_session_status",
+                    data=data,
+                    max_attempts=1,
+                )
+            except DatabricksAuthError as exc:
+                _note_forward_failure(
+                    "external_session_status",
+                    _PostResult(response=None, transport_error=type(exc).__name__),
+                    self.session_id,
+                )
+                if self.pending is data:
+                    self.auth_failures += 1
+                    if attempt > 1 or self.auth_failures >= _STATUS_AUTH_RECOVERY_MAX_ATTEMPTS:
+                        self.pending = None
+                _logger.warning(
+                    "Codex status delivery needs credentials: session=%s recovery_exhausted=%s; "
+                    "restore server credentials before the next status update",
+                    self.session_id,
+                    self.pending is None,
+                )
+                return
+            _log_failed_session_event_post("external_session_status", response)
+            if response is not None and not _should_retry_post_status(response.status_code):
+                break
+            if attempt < max_attempts:
+                await _sleep(_post_retry_delay(attempt))
+        # An earlier attempt may have committed even if a later one needs credentials.
+        # Background recovery is reserved for a wholly unsent status.
+        if self.pending is data:
+            self.auth_failures = 0
+            self.pending = None
+
+    async def _retry(self) -> None:
+        attempt = 0
+        while self.pending is not None:
+            attempt += 1
+            await _sleep(max(_STATUS_RECOVERY_RETRY_DELAY_SECONDS, _post_retry_delay(attempt)))
+            async with self.lock:
+                data = self.pending
+                if data is None:
+                    return
+                try:
+                    await self._attempt(data, max_attempts=1)
+                except Exception as exc:  # noqa: BLE001 - report and settle this background task.
+                    if self.pending is data:
+                        self.pending = None
+                    _note_forward_failure(
+                        "external_session_status",
+                        _PostResult(response=None, transport_error=type(exc).__name__),
+                        self.session_id,
+                    )
+                    _logger.warning(
+                        "Codex status retry failed: session=%s error_type=%s",
+                        self.session_id,
+                        type(exc).__name__,
+                    )
+
+    async def close(self) -> None:
+        self.closed = True
+        self.pending = None
+        if self.retry_task is not None:
+            self.retry_task.cancel()
+            await asyncio.gather(self.retry_task, return_exceptions=True)
+
+
+_status_deliveries: ContextVar[dict[str, _SessionStatusDelivery] | None] = ContextVar(
+    "codex_status_deliveries", default=None
+)
+
+
+async def _close_status_deliveries(deliveries: dict[str, _SessionStatusDelivery]) -> None:
+    await asyncio.gather(*(delivery.close() for delivery in deliveries.values()))
+
+
 async def _post_status(
     client: httpx.AsyncClient,
     session_id: str,
@@ -8494,6 +8624,14 @@ async def _post_status(
     if compaction_model is not None and selected_model is not None:
         data["compaction_model"] = compaction_model
         data["selected_model"] = selected_model
+    deliveries = _status_deliveries.get()
+    if deliveries is not None:
+        delivery = deliveries.get(session_id)
+        if delivery is None:
+            delivery = _SessionStatusDelivery(client, session_id)
+            deliveries[session_id] = delivery
+        await delivery.post(data)
+        return
     response = await _post_session_event(
         client,
         session_id,
