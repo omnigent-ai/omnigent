@@ -223,16 +223,15 @@ _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, co
 # Cover the default 150 s worktree RPC + 30 s host launch wait, while
 # reporting a timeout before the native relay's 300 s tool-call limit.
 _SESSION_CREATE_TIMEOUT = httpx.Timeout(240.0, connect=10.0)
-# Timeouts that stop the request before the server has all of it.
+# Timeouts before a request can be sent; writes can time out after delivery.
 _SESSION_CREATE_UNSENT_TIMEOUTS: dict[type[httpx.TimeoutException], str] = {
     httpx.ConnectTimeout: "connect",
-    httpx.WriteTimeout: "write",
     httpx.PoolTimeout: "pool",
 }
 
 
 def _session_create_timeout_error(exc: httpx.TimeoutException) -> str:
-    """Error for a timed-out create; only a wait for the response leaves its outcome unknown."""
+    """Report uncertain creation unless the timeout proves the request was not sent."""
     name = type(exc).__name__
     phase = _SESSION_CREATE_UNSENT_TIMEOUTS.get(type(exc))
     if phase is not None:

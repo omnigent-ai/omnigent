@@ -8587,8 +8587,8 @@ async def test_sys_session_create_requires_exactly_one_mode(
         ),
         pytest.param(
             httpx.WriteTimeout(""),
-            "sys_session_create timed out after 240 s (WriteTimeout): "
-            "the request did not complete, so no child was created by it.",
+            "sys_session_create timed out after 240 s (WriteTimeout). "
+            "The child may still have been created; check sys_session_list before retrying.",
             id="write-timeout",
         ),
         pytest.param(
