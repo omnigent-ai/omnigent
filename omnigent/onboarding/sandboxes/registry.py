@@ -142,9 +142,8 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 name="lakebox",
                 launcher_class="omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
             ),
-            # OSS Databricks Sandbox provider over the REST command-execution
-            # API (no SSH). Distinct from `lakebox`, whose launcher ships only
-            # in the internal build.
+            # Databricks Sandbox provider over the REST command-execution API (no
+            # SSH). Distinct from `lakebox`.
             "databricks": SandboxProviderMetadata(
                 name="databricks",
                 launcher_class=(
@@ -218,6 +217,15 @@ def _builtin_contribution() -> SandboxProviderContribution:
                     "omnigent.onboarding.sandboxes.agent_sandbox:AgentSandboxLauncher"
                 ),
                 managed_token_ttl_s=7 * 24 * 3600,
+            ),
+            # No static managed_token_ttl_s: the TTL is derived from the
+            # (operator-overridable) MicroVM lifetime at config-parse time via
+            # lambda_microvm.managed_token_ttl_s(), mirroring cwsandbox/e2b.
+            "lambda_microvm": SandboxProviderMetadata(
+                name="lambda_microvm",
+                launcher_class=(
+                    "omnigent.onboarding.sandboxes.lambda_microvm:LambdaMicroVMSandboxLauncher"
+                ),
             ),
         },
     )

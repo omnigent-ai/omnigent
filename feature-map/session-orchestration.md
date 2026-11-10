@@ -12,6 +12,12 @@ MCP independent creation.
 
 - `message`: sender without edit-level sharing, same owner and workspace; shared destinations are
   allowed and their readers see the message. Normal queue/steering applies.
+- `sender-attribution`: a delivered message starts with `[Message from session <id>]`.
+  The destination's Chat drops that line from the user bubble and shows "From
+  @<sender>" as a session pill that opens the sender; the agent still receives
+  the prefix. The title comes from sessions the sidebar, the viewed session's
+  subagents or the session cache already hold, else one lookup; an unreadable
+  sender reads "From another session". The prefix is a label, not proof of origin.
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
 - `created-by`: independent workers record their creating session. The worker's
@@ -21,6 +27,12 @@ MCP independent creation.
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
   marked `archived`.
+- `list-scope`: `sys_session_list`'s global `sessions` view lists only the
+  caller's own sessions by default, like the sidebar's My view. Sessions other
+  users shared with the caller appear only with `visibility: "shared"` (or
+  `"all"` for both), and those rows carry `owner`. `include_archived` applies to
+  every scope. Runner coverage: `tests/runner/test_discovery_list_pagination.py`;
+  the route's scopes: `tests/server/routes/test_sessions_shared_projects.py`.
 - `kill-switch`: an explicit disable refuses new peer sends and independent
   creates, even if an enable is also listed, and hides the Automations page's
   trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to
@@ -68,7 +80,8 @@ MCP independent creation.
 - As an admin on desktop or mobile web, open Settings → Sharing → Agent
   messaging, or `/settings/sharing`, and toggle **Message other sessions**.
 - In an SDK session's Chat, ask the agent to send a task using
-  `sys_session_message`, then inspect the destination's history.
+  `sys_session_message`, then inspect the destination's history. Its new user
+  bubble shows "From @<sender>"; click the pill to open the sender.
 - In a native session's Chat or agent terminal, ask for the same operation;
   the native MCP relay supplies the tools.
 - In a session with creation tools enabled, ask for a worker with
@@ -100,7 +113,7 @@ Preconditions: use an isolated test server with `OMNIGENT_FEATURES=sibling_sessi
 for nested creation journeys; peer messaging and standalone creation use the default settings.
 Own both sessions. Same-host creation requires a connected
 owned host/workspace. Managed creation requires a launch-capable provider in the
-server's sandbox configuration (for example, Modal or Daytona). Internal deployments
+server's sandbox configuration (for example, Modal or Daytona). Other deployments
 can supply their own provider through the existing launcher interface.
 
 For `created-by`, extend the creation journey below: open the worker, reload,

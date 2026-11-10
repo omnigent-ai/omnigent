@@ -1051,7 +1051,9 @@ def register_resources_routes(
         except HostFsUnavailableError:
             return None
         except HostFsError as exc:
-            if exc.status == 404:
+            # An older host rejects an op it lacks with a 400; report it as a missing route.
+            is_unknown_op = exc.status == 400 and exc.message.startswith("unknown fs op")
+            if exc.status == 404 or is_unknown_op:
                 raise OmnigentError(exc.message, code=ErrorCode.NOT_FOUND) from exc
             if exc.status == 400:
                 # Invalid path is a client error; surface it verbatim like the
@@ -1560,9 +1562,9 @@ def register_resources_routes(
         synthesize-from-body path and predate the gate. The markers
         are client-controlled, so the exemption is narrowed to the
         exact shape those wrappers send — a registered native terminal
-        name with ``session_key`` ``"main"`` — anything else carrying a
-        marker still goes through the declared-name gate (it would
-        otherwise be an arbitrary-terminal bypass).
+        name with ``session_key`` ``"main"`` from a session owner.
+        Other callers still pass the declared-name gate, because the
+        bootstrap path may synthesize a terminal from the request body.
 
         :param session_id: Session/conversation identifier.
         :param request: JSON body with ``terminal`` and
@@ -1579,6 +1581,7 @@ def register_resources_routes(
             bool(body.get("ensure_native_terminal") or body.get("bridge_inject_dir"))
             and native_coding_agent_for_terminal_name(body.get("terminal")) is not None
             and body.get("session_key") == "main"
+            and await _caller_owns_session(session_id, request)
         )
         if not is_native_bootstrap:
             spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
