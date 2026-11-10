@@ -64,17 +64,18 @@ beforeEach(() => {
     });
 });
 afterEach(cleanup);
-function mount(value: SandboxProfileSelection | null = null) {
+function mount(value: SandboxProfileSelection | null = null, remembered: string | null = null) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const onChange = vi.fn();
   function Picker() {
     const [selection, setSelection] = useState(value);
-    const { launchError } = useSandboxProfileCatalog("company", selection);
+    const { launchError } = useSandboxProfileCatalog("company", selection, remembered);
     return (
       <>
         <SandboxProfilePicker
           provider="company"
           value={selection}
+          rememberedProfileId={remembered}
           onChange={(p) => {
             onChange(p);
             setSelection(p);
@@ -114,6 +115,43 @@ it.each([
   expect(await screen.findByRole("button", { name: `Sandbox profile: ${name}` })).toBeTruthy();
   await waitFor(() =>
     expect(screen.getByRole("button", { name: "Start" })).toHaveProperty("disabled", false),
+  );
+});
+
+it.each([
+  ["on the first page", "profile-5", "Build profile 5"],
+  ["beyond the first page", "profile-30", "Build profile 30"],
+])("starts on the profile last launched %s, ahead of the default", async (_where, id, name) => {
+  defaults = { company: "profile-3" };
+  mount(null, id);
+  expect(await screen.findByRole("button", { name: `Sandbox profile: ${name}` })).toBeTruthy();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Start" })).toHaveProperty("disabled", false),
+  );
+});
+
+it("falls back to the provider default when the last launched profile is gone", async () => {
+  defaults = { company: "profile-3" };
+  mount(null, "retired-profile");
+  expect(
+    await screen.findByRole("button", { name: "Sandbox profile: Build profile 3" }),
+  ).toBeTruthy();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Start" })).toHaveProperty("disabled", false),
+  );
+});
+
+it("launches the last launched profile on its current revision", async () => {
+  available = rows.map((p) => (p.id === "profile-5" ? { ...p, revision: "v2" } : p));
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const { result } = renderHook(() => useSandboxProfileCatalog("company", null, "profile-5"), {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+  await waitFor(() => expect(result.current.launchError).toBeNull());
+  expect(result.current.selection).toEqual(
+    expect.objectContaining({ id: "profile-5", revision: "v2" }),
   );
 });
 

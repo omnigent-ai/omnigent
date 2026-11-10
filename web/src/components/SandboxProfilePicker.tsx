@@ -14,9 +14,36 @@ import {
 
 export type SandboxProfileSelection = Pick<SandboxProfile, "id" | "name" | "provider" | "revision">;
 
+/** Find one profile by id: on the first page, else with a lookup that may reach beyond it. */
+function useProfileById(provider: string | null, page: SandboxProfile[], profileId: string | null) {
+  const inPage = page.find((p) => p.id === profileId);
+  const looking = profileId !== null && inPage === undefined;
+  const lookup = useQuery({
+    queryKey: [...SANDBOX_PROFILES_QUERY_KEY, provider, "profile", profileId],
+    queryFn: ({ signal }) =>
+      fetchSandboxProfiles(provider ?? undefined, { profileId: profileId ?? undefined, signal }),
+    enabled: looking,
+    staleTime: 30_000,
+    retry: false,
+  });
+  const profile =
+    inPage ??
+    (looking
+      ? lookup.data?.profiles.find((p) => p.id === profileId && p.provider === provider)
+      : undefined);
+  return {
+    profile,
+    fetching: looking && lookup.isFetching,
+    failed: looking && lookup.isError,
+    // Looked up and not listed: the provider no longer offers this profile.
+    missing: looking && lookup.isSuccess && profile === undefined,
+  };
+}
+
 export function useSandboxProfileCatalog(
   provider: string | null,
   value: SandboxProfileSelection | null,
+  rememberedProfileId: string | null = null,
 ) {
   const enabled = sandboxProfilesEnabled(useServerInfo());
   const query = useQuery({
@@ -30,34 +57,24 @@ export function useSandboxProfileCatalog(
   const required =
     enabled && provider !== null && (query.data?.managed_providers ?? []).includes(provider);
   const explicit = required && value?.provider === provider ? value : null;
-  // With nothing picked, start on the provider's default; it may be beyond the first page.
+  const unpicked = required && explicit === null && provider !== null;
+  // With nothing picked, start on the profile last launched here while the provider still
+  // lists it, else on the provider's default. Either may be beyond the first page.
+  const remembered = useProfileById(provider, profiles, unpicked ? rememberedProfileId : null);
   const defaultProfileId =
-    required && explicit === null && provider !== null
+    unpicked && provider !== null && (rememberedProfileId === null || remembered.missing)
       ? (query.data?.default_profile_ids?.[provider] ?? null)
       : null;
-  const defaultInPage = profiles.find((p) => p.id === defaultProfileId);
-  const defaultQuery = useQuery({
-    queryKey: [...SANDBOX_PROFILES_QUERY_KEY, provider, "default", defaultProfileId],
-    queryFn: ({ signal }) =>
-      fetchSandboxProfiles(provider ?? undefined, {
-        profileId: defaultProfileId ?? undefined,
-        signal,
-      }),
-    enabled: defaultProfileId !== null && defaultInPage === undefined,
-    staleTime: 30_000,
-    retry: false,
-  });
-  const defaultProfile =
-    defaultInPage ??
-    defaultQuery.data?.profiles.find((p) => p.id === defaultProfileId && p.provider === provider);
+  const fallback = useProfileById(provider, profiles, defaultProfileId);
+  const preferred = remembered.profile ?? fallback.profile;
   const selection: SandboxProfileSelection | null =
     explicit ??
-    (defaultProfileId !== null && defaultProfile !== undefined
+    (unpicked && preferred !== undefined
       ? {
-          id: defaultProfile.id,
-          name: defaultProfile.name,
-          provider: defaultProfile.provider,
-          revision: defaultProfile.revision,
+          id: preferred.id,
+          name: preferred.name,
+          provider: preferred.provider,
+          revision: preferred.revision,
         }
       : null);
   const selectedQuery = useQuery({
@@ -84,12 +101,14 @@ export function useSandboxProfileCatalog(
       ? null
       : query.isPending ||
           query.isFetching ||
-          (defaultProfileId !== null && defaultInPage === undefined && defaultQuery.isFetching) ||
+          remembered.fetching ||
+          fallback.fetching ||
           (selection && (selectedQuery.isPending || selectedQuery.isFetching))
         ? "Loading sandbox profiles…"
         : query.isError ||
             (selection && selectedQuery.isError) ||
-            (defaultProfileId !== null && defaultInPage === undefined && defaultQuery.isError)
+            remembered.failed ||
+            fallback.failed
           ? "Could not load sandbox profiles. Try again."
           : stale
             ? "This profile changed or is unavailable. Choose a profile again before launching."
@@ -116,11 +135,14 @@ export function SandboxProfilePicker({
   value,
   onChange,
   id,
+  rememberedProfileId = null,
 }: {
   provider: string | null;
   value: SandboxProfileSelection | null;
   onChange: (profile: SandboxProfileSelection | null) => void;
   id?: string;
+  /** Profile id to start on when nothing is picked, ahead of the provider default. */
+  rememberedProfileId?: string | null;
 }) {
   const {
     enabled,
@@ -132,7 +154,7 @@ export function SandboxProfilePicker({
     current,
     stale,
     launchError,
-  } = useSandboxProfileCatalog(provider, value);
+  } = useSandboxProfileCatalog(provider, value, rememberedProfileId);
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
