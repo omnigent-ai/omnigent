@@ -238,6 +238,69 @@ async function recordUsage(handlers, timestamp, input, output, cost) {
 """
 
 
+@pytest.mark.parametrize("outcome", ["recovered", "exhausted", "cancelled", "legacy-web-stop"])
+def test_native_turn_waits_for_pi_retry_settlement(outcome: str) -> None:
+    """Intermediate model errors do not fail a turn Pi is still recovering."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("requires Node")
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+  const outcome = OUTCOME;
+  const cancelled = ["cancelled", "legacy-web-stop"].includes(outcome);
+  let pollInbox, aborts = 0;
+  if (outcome === "legacy-web-stop") {
+    global.setInterval = handler => { pollInbox = handler; return {fakeInterval: true}; };
+    ctx.abort = () => { aborts++; };
+    ctx.isIdle = () => false;
+    await handlers.session_start({}, ctx);
+  }
+  const errors = () => postedEvents.filter(event => event.data?.item_type === "error");
+  const terminals = () => postedEvents.filter(event => event.data?.turn_outcome);
+  const failure = text => ({role: "assistant", stopReason: "error", errorMessage: text,
+    timestamp: Date.now(), content: []});
+  await handlers.agent_start({}, ctx);
+  await handlers.message_end({message: failure("upstream stream aborted")}, ctx);
+  await handlers.agent_end({messages: []}, ctx);
+  assert.deepEqual(errors(), [], "a retryable model attempt became a durable error");
+  assert.deepEqual(terminals(), [], "agent_end settled a still-recovering native turn");
+  if (!cancelled) {
+    await handlers.agent_start({}, ctx);
+    const message = outcome === "recovered"
+      ? {role: "assistant", stopReason: "stop", content: [{type: "text", text: "RECOVERED"}]}
+      : failure("OpenAI Responses stream ended before a terminal response event");
+    await handlers.message_end({message}, ctx);
+    await handlers.agent_end({messages: [message]}, ctx);
+    assert.deepEqual(terminals(), [], "the last attempt is not the settlement boundary");
+  }
+  if (outcome === "legacy-web-stop") {
+    fs.writeFileSync(path.join(inboxDir, "stop.json"), JSON.stringify({type: "interrupt"}));
+    pollInbox();
+    await new Promise(setImmediate);
+    assert.equal(aborts, 1);
+  }
+  // Pi 0.84.2 supplies neither event.aborted nor ctx.signal during backoff.
+  await handlers.agent_settled(outcome === "legacy-web-stop" ? {} : {aborted: cancelled}, ctx);
+  assert.equal(terminals().length, 1);
+  const result = terminals()[0].data;
+  assert.equal(result.status, outcome === "exhausted" ? "failed" : "idle");
+  assert.equal(result.turn_outcome, outcome === "recovered" ? "completed"
+    : outcome === "exhausted" ? "failed" : "cancelled");
+  assert.equal(errors().length, outcome === "exhausted" ? 1 : 0);
+  if (outcome === "exhausted") {
+    assert.match(errors()[0].data.item_data.message, /OpenAI Responses stream ended/);
+    assert.equal(result.failure_detail, errors()[0].data.item_data.message);
+  }
+  if (outcome === "recovered") assert.equal(result.output, "RECOVERED");
+  if (cancelled) assert.equal(result.output, "");
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script.replace("OUTCOME", json.dumps(outcome)))
+
+
 def test_message_end_posts_external_session_usage(tmp_path: Path) -> None:
     """A ``message_end`` with Pi usage POSTs ``external_session_usage``.
 
@@ -1236,13 +1299,15 @@ def test_unconsumed_prompts_reset_when_pi_goes_idle(tmp_path: Path) -> None:
   await handlers.input({text: 'discarded prompt', source: 'interactive'}, ctx);
   await handlers.agent_start({}, ctx);
   await handlers.agent_end({}, ctx);
+  await handlers.agent_settled({}, ctx);
   await handlers.message_start({message: {role: 'user',
     content: [{type: 'text', text: 'later prompt'}]}}, ctx);
-  // A queued follow-up at agent_end is still pending, so it is not forgotten.
+  // A queued follow-up at settlement is still pending, so it is not forgotten.
   await handlers.input({text: 'queued follow-up', source: 'interactive'}, ctx);
   await handlers.agent_start({}, ctx);
   ctx.hasPendingMessages = () => true;
   await handlers.agent_end({}, ctx);
+  await handlers.agent_settled({}, ctx);
   await handlers.message_start({message: {role: 'user',
     content: [{type: 'text', text: 'queued follow-up'}]}}, ctx);
   await handlers.session_shutdown();
@@ -1743,7 +1808,7 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
       content: mode === 'empty' ? [] : [{type: 'text', text: 'current result'}],
     }}, ctx);
   }
-  const finished = handlers.agent_end({}, ctx);
+  const finished = handlers.agent_settled({}, ctx);
   await settleHistory();
   if (!['empty', 'no-response', 'early-abort'].includes(mode)) {
     assert.equal(completionAttempts, 0);
@@ -1811,7 +1876,7 @@ def test_ending_turn_does_not_wait_for_later_input_or_retry_after_supersession(
   await handlers.message_end({message: {role: 'assistant', timestamp: 1,
     content: [{type: 'text', text: 'first answer'}], stopReason: 'stop'}}, ctx);
   let finished = false;
-  const ending = handlers.agent_end({}, ctx).then(() => { finished = true; });
+  const ending = handlers.agent_settled({}, ctx).then(() => { finished = true; });
   await settleHistory();
   if (mode === 'superseded-history') await handlers.agent_start({}, ctx);
   await handlers.input({text: 'next prompt', source: 'extension'}, ctx);
@@ -4834,7 +4899,7 @@ def test_send_delivery_falls_back_to_agent_loop_state() -> None:
     Without ``isIdle()`` the delivery mode follows the agent loop state.
 
     Older Pi SDKs expose no ``isIdle()``; the poller must then steer between
-    ``agent_start`` and ``agent_end`` and fall back to follow-up delivery once
+    ``agent_start`` and ``agent_settled`` and fall back to follow-up delivery once
     the loop has ended -- the same fallback ``requestInterrupt`` uses.
     """
     node = shutil.which("node")
@@ -4853,6 +4918,7 @@ def test_send_delivery_falls_back_to_agent_loop_state() -> None:
   await drain();
 
   await handlers.agent_end({}, ctx);
+  await handlers.agent_settled({}, ctx);
   enqueue("after-loop");
   await drain();
 
@@ -4919,6 +4985,7 @@ const statuses = () => posted.filter(e => e.type === "external_session_status");
   assert.deepEqual(sends, [], "same-poll messages must stay in the inbox");
   if (callbacks) {
     await handlers.agent_end({}, ctx);
+    await handlers.agent_settled({}, ctx);
     for (let n = 0; n < 6; n++) await drain();
     assert.deepEqual(sends, [], "waiting must not consume delivery attempts");
     assert.equal(statuses().at(-1).data.status, "running");
@@ -4931,6 +4998,7 @@ const statuses = () => posted.filter(e => e.type === "external_session_status");
       assert.equal(statuses().at(-1).data.status, "running");
       const nextResponseId = statuses().at(-1).data.response_id;
       await handlers.agent_end({}, ctx);
+      await handlers.agent_settled({}, ctx);
       assert.equal(statuses().at(-1).data.response_id, nextResponseId);
     } else if (outcome === "complete") callbacks.onComplete();
     else callbacks.onError(new Error("compaction failed"));
@@ -4939,6 +5007,7 @@ const statuses = () => posted.filter(e => e.type === "external_session_status");
     // Failed before Pi interrupted the original turn: keep that turn busy.
     assert.equal(statuses().at(-1).data.status, "running");
     await handlers.agent_end({}, ctx);
+    await handlers.agent_settled({}, ctx);
   }
   if (outcome === "complete" || outcome === "error") {
     assert.equal(statuses().at(-1).data.status, "idle", "runner must leave the busy state");
@@ -5012,6 +5081,7 @@ const originalError = "API key auth failed for provider omnigent: " +
       role: "assistant", provider: "omnigent", stopReason: "error", errorMessage: originalError,
       content: [],
     }}, ctx);
+    await handlers.agent_settled({}, ctx);
     await delivery;
     await new Promise(setImmediate);
     const error = postedEvents.find(e => e.data && e.data.item_type === "error");
@@ -5032,6 +5102,7 @@ const originalError = "API key auth failed for provider omnigent: " +
         content: [], timestamp: Date.now(),
       }}, ctx);
       await new Promise(setImmediate);
+      await handlers.agent_settled({}, ctx);
       const nextError = postedEvents.find(e => e.data && e.data.item_type === "error");
       assert.equal(nextError.data.item_data.code, "RuntimeError");
     }

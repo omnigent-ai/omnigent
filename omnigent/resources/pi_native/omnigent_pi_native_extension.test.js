@@ -431,7 +431,7 @@ async function testExistingTaskToolIsMirroredWithoutConflict() {
 // The web store only clears its local "streaming" flag when a turn's `idle`
 // status edge carries the same response_id as the `running` edge that opened
 // it. A fresh id per edge left the composer stuck queueing until a tab switch
-// reset the store. Assert agent_start/agent_end share one id.
+// reset the store. Assert agent_start/agent_settled share one id.
 async function testRunningIdleShareResponseId() {
   const h = makeHarness({ captureEvents: true });
   const ctx = makeCtx({ idle: false });
@@ -441,6 +441,7 @@ async function testRunningIdleShareResponseId() {
     message: { role: "assistant", stopReason: "stop", content: [] },
   }, ctx);
   await h.handlers.agent_end({ messages: [] }, ctx);
+  await h.handlers.agent_settled({}, ctx);
 
   const edges = statusEdges(h.postedEvents);
   const running = edges.find((e) => e.status === "running");
@@ -452,7 +453,7 @@ async function testRunningIdleShareResponseId() {
     JSON.stringify(running),
   );
   assert(
-    "agent_end posts an idle edge with a response_id",
+    "agent_settled posts an idle edge with a response_id",
     idle !== undefined && typeof idle.responseId === "string" && idle.responseId.length > 0,
     JSON.stringify(idle),
   );
@@ -468,6 +469,7 @@ async function testRunningIdleShareResponseId() {
     message: { role: "assistant", stopReason: "stop", content: [] },
   }, ctx);
   await h.handlers.agent_end({ messages: [] }, ctx);
+  await h.handlers.agent_settled({}, ctx);
   const edges2 = statusEdges(h.postedEvents);
   const running2 = edges2.filter((e) => e.status === "running");
   const idle2 = edges2.filter((e) => e.status === "idle");
@@ -665,7 +667,7 @@ async function testSessionStartMarksInputReady() {
   );
 }
 
-async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
+async function testQueuedPromptDuringStartupStaysRunningUntilSettlement() {
   const h = makeHarness({ captureEvents: true });
   const ctx = makeCtx({ idle: true });
   ctx.sessionManager = { getSessionId: () => "queued-native-session" };
@@ -711,9 +713,10 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
       message: { role: "assistant", stopReason: "stop", content: [] },
     }, ctx);
     await h.handlers.agent_end({ messages: [] }, ctx);
+    await h.handlers.agent_settled({}, ctx);
     const afterEnd = statusEdges(h.postedEvents);
     assert(
-      "only agent_end completes the queued prompt with the same response_id",
+      "only agent_settled completes the queued prompt with the same response_id",
       afterEnd.length === 2 &&
         afterEnd[0].status === "running" &&
         afterEnd[1].status === "idle" &&
@@ -731,7 +734,7 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
   try {
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
-    await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
+    await testQueuedPromptDuringStartupStaysRunningUntilSettlement();
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();
     await testExistingTaskToolIsMirroredWithoutConflict();
