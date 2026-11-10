@@ -71,7 +71,11 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.llms.errors import detect_request_size_overflow
-from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    failure_log_attributes,
+    normalize_failure_context,
+)
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -1868,6 +1872,23 @@ def create_runner_app(
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
         if status == "failed":
+            transcript_context: FailureContext | None = None
+            with contextlib.suppress(Exception):
+                from omnigent.harnesses.claude_native.bridge import (
+                    bridge_dir_for_conversation_id,
+                )
+                from omnigent.harnesses.claude_native.forwarder import (
+                    consume_transcript_api_error_for_current_prompt,
+                )
+
+                retained = consume_transcript_api_error_for_current_prompt(
+                    bridge_dir_for_conversation_id(session_id),
+                    not_before=resource_registry.session_activity_recorded_at(session_id),
+                )
+                if not failure_detail and retained is not None:
+                    transcript_context = retained
+                    raw_detail = retained.get("native_error_message")
+                    failure_detail = raw_detail if isinstance(raw_detail, str) else None
             # A lost terminal hook may still leave a cause in the program-status report.
             event["error"] = {
                 "code": "native_failure_detail_unavailable",
@@ -1883,9 +1904,15 @@ def create_runner_app(
                 )
 
                 raw_context: dict[str, object] = {
-                    **claude_failure_context({}, error_text=failure_detail),
+                    **(
+                        transcript_context
+                        if transcript_context is not None
+                        else claude_failure_context({}, error_text=failure_detail)
+                    ),
                     "failure_source": "claude_program_status",
-                    "detail_source": "program_status_error",
+                    "detail_source": "current_prompt_transcript"
+                    if transcript_context is not None
+                    else "program_status_error",
                 }
                 # An API error envelope decodes to its cause; the raw report is only the fallback.
                 raw_context.setdefault("native_error_message", failure_detail)

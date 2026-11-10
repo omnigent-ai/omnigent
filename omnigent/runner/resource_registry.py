@@ -623,6 +623,7 @@ class SessionResourceRegistry:
         # under ``self._lock``.
         self._last_session_status: dict[str, str] = {}
         self._session_activity_epoch: dict[str, int] = {}
+        self._session_activity_recorded_at: dict[str, float] = {}
         self._active_session_turns: set[str] = set()
         # Bumped each time a session's turn becomes active, so a watcher can
         # tell a new turn from the one it was timing.
@@ -776,6 +777,7 @@ class SessionResourceRegistry:
             self._session_activity_epoch[session_id] = (
                 self._session_activity_epoch.get(session_id, 0) + 1
             )
+            self._session_activity_recorded_at[session_id] = time.time()
         if status in {"idle", "failed"}:
             self._active_session_turns.discard(session_id)
         self._last_session_status[session_id] = status
@@ -932,6 +934,11 @@ class SessionResourceRegistry:
         """Whether an explicitly observed turn is unfinished, excluding pane repaints."""
         with self._lock:
             return session_id in self._active_session_turns
+
+    def session_activity_recorded_at(self, session_id: str) -> float | None:
+        """Return the latest explicit turn activity time in host Unix seconds."""
+        with self._lock:
+            return self._session_activity_recorded_at.get(session_id)
 
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
@@ -2508,6 +2515,9 @@ class SessionResourceRegistry:
                         self._session_activity_epoch[target_session_id] = (
                             self._session_activity_epoch.get(target_session_id, 0) + 1
                         )
+                        recorded_at = self._session_activity_recorded_at.get(source_session_id)
+                        if recorded_at is not None:
+                            self._session_activity_recorded_at[target_session_id] = recorded_at
                 self._active_session_turns.discard(source_session_id)
                 self._session_turn_generation.pop(source_session_id, None)
                 if role == CLAUDE_NATIVE_TERMINAL_ROLE:
@@ -2565,6 +2575,7 @@ class SessionResourceRegistry:
         self._take_session_status_memo(session_id)
         with self._lock:
             self._session_activity_epoch.pop(session_id, None)
+            self._session_activity_recorded_at.pop(session_id, None)
             self._session_turn_generation.pop(session_id, None)
             self._client_surfaces.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)

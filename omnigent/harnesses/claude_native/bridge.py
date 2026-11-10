@@ -3222,6 +3222,10 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
             )
         )
         if identity_allowed:
+            if event_name == "UserPromptSubmit":
+                state["active_prompt_submitted_at"] = envelope["recorded_at"]
+            elif event_name in {"SessionStart", "Stop", "StopFailure"}:
+                state.pop("active_prompt_submitted_at", None)
             if isinstance(transcript_path, str) and transcript_path:
                 state["transcript_path"] = transcript_path
             if isinstance(claude_session_id, str) and claude_session_id:
@@ -3279,6 +3283,36 @@ def read_claude_session_id(bridge_dir: Path) -> str | None:
     if not isinstance(raw, str) or not raw:
         return None
     return raw
+
+
+def read_active_prompt_submit(bridge_dir: Path) -> tuple[str, float] | None:
+    """Read the active parent session ID and submit time in Unix seconds."""
+    state = _read_json_file(bridge_dir / _STATE_FILE)
+    if not isinstance(state, dict):
+        return None
+    session_id = state.get("claude_session_id")
+    submitted_at = state.get("active_prompt_submitted_at")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(submitted_at, (int, float))
+        or isinstance(submitted_at, bool)
+    ):
+        return None
+    return session_id, float(submitted_at)
+
+
+def consume_active_prompt_submit(bridge_dir: Path, prompt: tuple[str, float]) -> bool:
+    """Clear a failed prompt marker without clearing a newer submit."""
+    with _bridge_metadata_write_lock(bridge_dir):
+        if read_active_prompt_submit(bridge_dir) != prompt:
+            return False
+        state = _read_json_file(bridge_dir / _STATE_FILE)
+        if not isinstance(state, dict):
+            return False
+        state.pop("active_prompt_submitted_at", None)
+        _write_json_file(bridge_dir / _STATE_FILE, state)
+        return True
 
 
 def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
@@ -11005,7 +11039,13 @@ def _assistant_transcript_items_from_entry(
                     text=content,
                     is_api_error=is_api_error,
                     failure_context=(
-                        claude_failure_context(entry, error_text=content) if is_api_error else None
+                        claude_failure_context(
+                            entry,
+                            error_text=content,
+                            recorded_at=_transcript_timestamp(entry.get("timestamp")),
+                        )
+                        if is_api_error
+                        else None
                     ),
                 )
             )
@@ -11036,7 +11076,11 @@ def _assistant_transcript_items_from_entry(
                         text=text,
                         is_api_error=is_api_error,
                         failure_context=(
-                            claude_failure_context(entry, error_text=text)
+                            claude_failure_context(
+                                entry,
+                                error_text=text,
+                                recorded_at=_transcript_timestamp(entry.get("timestamp")),
+                            )
                             if is_api_error
                             else None
                         ),

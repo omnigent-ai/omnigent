@@ -19,6 +19,140 @@ from omnigent.native.failure_telemetry import FailureContext
     "scenario",
     [
         "current_error",
+        "newer_submit_before_transcript",
+        "new_activity_without_submit",
+        "unknown_activity",
+        "submit_during_lookup",
+        "missing_submit",
+        "missing_timestamp",
+        "malformed_timestamp",
+        "future_timestamp",
+        "foreign_error",
+        "subagent_error",
+        "settled_error",
+        "between_responses",
+        "session_restart",
+        "terminal_stop",
+        "terminal_failure",
+        "child_submit",
+        "foreign_submit",
+    ],
+)
+@pytest.mark.asyncio
+async def test_lost_failure_hook_only_uses_current_prompt_api_error(
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newer prompt may be recorded before its transcript has been forwarded."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    prompt = {"hook_event_name": "UserPromptSubmit", "session_id": "native-session"}
+    if scenario != "missing_submit":
+        with monkeypatch.context() as patch:
+            patch.setattr(bridge.time, "time", lambda: 1000.0)
+            bridge.record_hook_event(bridge_dir, prompt)
+    error = {
+        "type": "assistant",
+        "uuid": "current-error",
+        "timestamp": "1970-01-01T00:16:41Z",
+        "sessionId": "foreign" if scenario == "foreign_error" else "native-session",
+        "isApiErrorMessage": True,
+        "message": {"role": "assistant", "content": "Prompt is too long"},
+    }
+    if scenario == "missing_timestamp":
+        error.pop("timestamp")
+    elif scenario == "malformed_timestamp":
+        error["timestamp"] = "not-a-timestamp"
+    elif scenario == "future_timestamp":
+        error["timestamp"] = "9999-01-01T00:00:00Z"
+    elif scenario == "subagent_error":
+        error["agentId"] = "child"
+    transcript_path.write_text(json.dumps(error) + "\n")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(202, json={})),
+        base_url="http://test",
+    ) as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_synthetic",
+            bridge_dir=bridge_dir,
+            agent_name="test-agent",
+            state=forwarder.TranscriptForwardState(transcript_path, 0),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+    if scenario in {"newer_submit_before_transcript", "child_submit", "foreign_submit"}:
+        later_prompt = dict(prompt)
+        if scenario == "child_submit":
+            later_prompt["agent_id"] = "child"
+        elif scenario == "foreign_submit":
+            later_prompt["session_id"] = "foreign"
+        with monkeypatch.context() as patch:
+            patch.setattr(bridge.time, "time", lambda: 1002.0)
+            bridge.record_hook_event(bridge_dir, later_prompt)
+    elif scenario == "settled_error":
+        forwarder._write_forward_state(
+            bridge_dir, replace(state, pending_settled_response_id=state.api_error_response_id)
+        )
+    elif scenario == "between_responses":
+        forwarder._write_forward_state(bridge_dir, replace(state, current_response_id=None))
+    elif scenario in {"session_restart", "terminal_stop", "terminal_failure"}:
+        event_name = {
+            "session_restart": "SessionStart",
+            "terminal_stop": "Stop",
+            "terminal_failure": "StopFailure",
+        }[scenario]
+        bridge.record_hook_event(
+            bridge_dir, {"hook_event_name": event_name, "session_id": "native-session"}
+        )
+    elif scenario == "submit_during_lookup":
+        match_error = forwarder._transcript_api_error_for_hook
+
+        def submit_before_return(*args: object, **kwargs: object):
+            result = match_error(*args, **kwargs)
+            bridge.record_hook_event(bridge_dir, prompt)
+            return result
+
+        monkeypatch.setattr(forwarder, "_transcript_api_error_for_hook", submit_before_return)
+    # Read the checkpoint afresh, as a restarted runner's status callback does.
+    not_before = (
+        None
+        if scenario == "unknown_activity"
+        else 1002.0
+        if scenario == "new_activity_without_submit"
+        else 999.0
+    )
+    context = forwarder.consume_transcript_api_error_for_current_prompt(
+        bridge_dir, not_before=not_before
+    )
+    if scenario in {"current_error", "child_submit", "foreign_submit"}:
+        assert context is not None
+        assert context["native_error_message"] == "Prompt is too long"
+        assert context["native_recorded_at"] == 1001.0
+    else:
+        assert context is None
+    if scenario == "submit_during_lookup":
+        assert bridge.read_active_prompt_submit(bridge_dir) is not None
+    else:
+        assert bridge.read_active_prompt_submit(bridge_dir) is None
+    assert (
+        forwarder.consume_transcript_api_error_for_current_prompt(bridge_dir, not_before=999.0)
+        is None
+    )
+    if scenario == "current_error":
+        # Another turn can fail before its submit hook arrives. A newer error's
+        # timestamp alone must not resurrect the consumed prompt ownership.
+        later_error = {**(state.api_error_context or {}), "native_recorded_at": 1003.0}
+        forwarder._write_forward_state(bridge_dir, replace(state, api_error_context=later_error))
+        assert (
+            forwarder.consume_transcript_api_error_for_current_prompt(bridge_dir, not_before=999.0)
+            is None
+        )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "current_error",
         "multiple_error_blocks",
         "recovered_turn",
         "failed_item_after_error",

@@ -1193,7 +1193,9 @@ async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -> None:
+async def test_pane_publishes_no_status_while_the_file_owns_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """An active file poller is the only status source; the pane publishes none.
 
     Claude redraws its prompt after a turn and blinks a cursor, so the pane
@@ -1209,7 +1211,14 @@ async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -
     poller.active = True
 
     initial_activity = registry.session_activity_epoch("conv_file_owns")
-    poller.emit("running")
+    with monkeypatch.context() as patch:
+        patch.setattr("omnigent.runner.resource_registry.time.time", lambda: 1000.0)
+        poller.emit("running")
+    assert registry.session_activity_recorded_at("conv_file_owns") == 1000.0
+    with monkeypatch.context() as patch:
+        patch.setattr("omnigent.runner.resource_registry.time.time", lambda: 1002.0)
+        poller.emit("running")
+    assert registry.session_activity_recorded_at("conv_file_owns") == 1002.0
     callbacks["on_activity"]()  # pane redraws mid-turn — no second edge
     await asyncio.sleep(0)
     assert statuses == ["running"]
@@ -1219,6 +1228,7 @@ async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -
     callbacks["on_idle"]()  # nor does a quiet pane re-assert idle
     await asyncio.sleep(0)
     assert statuses == ["running", "idle"]
+    assert registry.session_activity_recorded_at("conv_file_owns") == 1002.0
 
     assert registry.session_activity_epoch("conv_file_owns") > initial_activity
 
@@ -2719,9 +2729,11 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
     """
     del tmp_path
     registry = SessionResourceRegistry()
+    assert registry.session_activity_recorded_at("conv_cleanup") is None
     registry.note_session_turn_started("conv_cleanup")
     assert "conv_cleanup" in registry._last_session_status
     assert registry.session_activity_epoch("conv_cleanup") > 0
+    assert registry.session_activity_recorded_at("conv_cleanup") is not None
     assert registry.session_turn_is_active("conv_cleanup")
     assert registry._active_turn_generation("conv_cleanup") == 1
 
@@ -2729,6 +2741,7 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
 
     assert "conv_cleanup" not in registry._last_session_status
     assert registry.session_activity_epoch("conv_cleanup") == 0
+    assert registry.session_activity_recorded_at("conv_cleanup") is None
     assert "conv_cleanup" not in registry._session_turn_generation
     assert not registry.session_turn_is_active("conv_cleanup")
 
@@ -2776,6 +2789,7 @@ async def test_transfer_terminal_moves_status_memo(
         resource_role=CODEX_NATIVE_TERMINAL_ROLE,
     )
     registry.note_session_turn_started("conv_src")
+    source_activity_at = registry.session_activity_recorded_at("conv_src")
 
     moved = await registry.transfer_terminal("conv_src", "conv_dst", view.id)
 
@@ -2785,6 +2799,7 @@ async def test_transfer_terminal_moves_status_memo(
     assert not registry.session_turn_is_active("conv_src")
     assert registry.session_turn_is_active("conv_dst")
     assert registry.session_activity_epoch("conv_dst") > 0
+    assert registry.session_activity_recorded_at("conv_dst") == source_activity_at
     assert "conv_src" not in registry._session_turn_generation
 
 

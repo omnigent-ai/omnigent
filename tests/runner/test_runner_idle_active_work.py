@@ -511,9 +511,20 @@ _PANE_FAILURE_DETAILS = {
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "status_source", ["forwarder", "pane", "pane_detail", "pane_envelope", "pane_overflow"]
+    "status_source",
+    [
+        "forwarder",
+        "pane",
+        "pane_detail",
+        "pane_envelope",
+        "pane_overflow",
+        "pane_transcript",
+        "pane_stale_transcript",
+    ],
 )
-async def test_native_failed_status_releases_idle_pin(status_source: str) -> None:
+async def test_native_failed_status_releases_idle_pin(
+    status_source: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A native ``failed`` edge settles the turn for the watchdog."""
     from tests.runner.conftest import _runner_client
 
@@ -522,11 +533,48 @@ async def test_native_failed_status_releases_idle_pin(status_source: str) -> Non
     async with _runner_client(app) as client:
         created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
         assert created.status_code == 201, created.text
-        await _post_status(client, conv_id, "running")
+        if status_source in {"pane_transcript", "pane_stale_transcript"}:
+            with monkeypatch.context() as patch:
+                patch.setattr("omnigent.runner.resource_registry.time.time", lambda: 999.0)
+                await _post_status(client, conv_id, "running")
+        else:
+            await _post_status(client, conv_id, "running")
         assert app.state.has_active_work() is True
         if status_source.startswith("pane"):
             from omnigent.runner.app import _session_event_queues_ref
 
+            if status_source in {"pane_transcript", "pane_stale_transcript"}:
+                from omnigent.harnesses.claude_native import bridge, forwarder
+
+                monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+                bridge_dir = bridge.bridge_dir_for_conversation_id(conv_id)
+                with monkeypatch.context() as patch:
+                    patch.setattr(bridge.time, "time", lambda: 1000.0)
+                    bridge.record_hook_event(
+                        bridge_dir,
+                        {"hook_event_name": "UserPromptSubmit", "session_id": "native-session"},
+                    )
+                forwarder._write_forward_state(
+                    bridge_dir,
+                    forwarder.TranscriptForwardState(
+                        tmp_path / "session.jsonl",
+                        1,
+                        current_response_id="response",
+                        api_error_response_id="response",
+                        api_error_context={
+                            "native_api_error_message": True,
+                            "native_error_message": "Prompt is too long",
+                            "native_session_id": "native-session",
+                            "native_recorded_at": 1001.0,
+                        },
+                    ),
+                )
+                if status_source == "pane_stale_transcript":
+                    # The new working episode arrives before its submit hook or
+                    # transcript. Its failure cannot inherit the old episode's cause.
+                    with monkeypatch.context() as patch:
+                        patch.setattr(bridge.time, "time", lambda: 1002.0)
+                        await _post_status(client, conv_id, "running")
             queue = _session_event_queues_ref[conv_id]
             while not queue.empty():
                 queue.get_nowait()
@@ -560,13 +608,16 @@ async def test_native_failed_status_releases_idle_pin(status_source: str) -> Non
                 assert context["native_error_message"] == _API_ERROR_CAUSE
                 assert context["http_status"] == 500
                 assert context["failure_source"] == "claude_program_status"
-            elif status_source == "pane_overflow":
+            elif status_source in {"pane_overflow", "pane_transcript"}:
                 assert failures[0]["error"]["code"] == "context_length_exceeded"
                 assert failures[0]["error"]["message"].startswith("Context limit reached")
                 assert "/compact" in failures[0]["error"]["message"]
                 context = failures[0]["failure_context"]
                 assert context["native_error_message"] == "Prompt is too long"
                 assert context["failure_source"] == "claude_program_status"
+                if status_source == "pane_transcript":
+                    assert context["detail_source"] == "current_prompt_transcript"
+                    assert context["native_session_id"] == "native-session"
             else:
                 assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
                 assert "Open the terminal" in failures[0]["error"]["message"]

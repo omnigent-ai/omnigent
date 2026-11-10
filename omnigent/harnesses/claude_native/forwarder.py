@@ -35,6 +35,8 @@ from omnigent.harnesses.claude_native.bridge import (
     _transcript_items_from_entry,
     _transcript_timestamp,
     compute_transcript_cumulative_cost,
+    consume_active_prompt_submit,
+    read_active_prompt_submit,
     read_active_session_id,
     read_bridge_id,
     read_claude_context_state,
@@ -3832,6 +3834,38 @@ def _transcript_api_error_for_hook(
     if owner is not None and response_id is not None and owner != response_id:
         return None, "response_mismatch", None
     return context, "matched", owner
+
+
+def consume_transcript_api_error_for_current_prompt(
+    bridge_dir: Path, *, not_before: float | None
+) -> FailureContext | None:
+    """Consume a failed prompt marker, recovering only its own explicit API error."""
+    prompt = read_active_prompt_submit(bridge_dir)
+    if prompt is None:
+        return None
+    native_session_id, submitted_at = prompt
+    state = _read_forward_state(bridge_dir)
+    context: FailureContext | None = None
+    if state is not None and state.current_response_id is not None:
+        retained, _, owner = _transcript_api_error_for_hook(
+            bridge_dir,
+            ClaudeHookRecord(0, 0, None, claude_session_id=native_session_id),
+            state.current_response_id,
+        )
+        recorded_at = retained.get("native_recorded_at") if retained is not None else None
+        # Both timestamps originate on the host. Old evidence must not follow a newer
+        # submit whose transcript has not reached the forwarder yet.
+        if (
+            owner == state.current_response_id
+            and not_before is not None
+            and isinstance(recorded_at, (int, float))
+            and not isinstance(recorded_at, bool)
+            and max(submitted_at, not_before) < recorded_at <= time.time()
+        ):
+            context = retained
+    # A terminal fallback consumes even an unclassified failure's marker, so later
+    # activity without a fresh submit hook cannot reuse the previous turn's evidence.
+    return context if consume_active_prompt_submit(bridge_dir, prompt) else None
 
 
 def _is_subagent_hook_record(
