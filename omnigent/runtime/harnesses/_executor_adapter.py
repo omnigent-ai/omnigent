@@ -747,6 +747,7 @@ class ExecutorAdapter(HarnessApp):
                 continue
             if ctx.cancelled.is_set():
                 return
+            uncertainty_error: dict[str, str] | None = None
             try:
                 with (
                     input_delivery_scope(
@@ -763,9 +764,14 @@ class ExecutorAdapter(HarnessApp):
                             self._session_key, content
                         )
                         outcome = "executor_accepted" if accepted else "executor_refused"
-                    except InjectionDeliveryAmbiguous:
+                    except InjectionDeliveryAmbiguous as exc:
                         # The harness may already hold the message; resending could duplicate it.
                         accepted, outcome = True, "executor_ambiguous"
+                        uncertainty_error = {
+                            "code": exc.code,
+                            "message": str(exc)
+                            or "Native message delivery could not be confirmed.",
+                        }
                     except BaseException as exc:
                         log_input_event(
                             _logger,
@@ -802,6 +808,10 @@ class ExecutorAdapter(HarnessApp):
                     InjectionConsumedEvent(
                         type="injection.consumed",
                         injection_id=injection_id,
+                        delivery_outcome=(
+                            "delivery_unconfirmed" if uncertainty_error is not None else None
+                        ),
+                        error=uncertainty_error,
                     )
                 )
 

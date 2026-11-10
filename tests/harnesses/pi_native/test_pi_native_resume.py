@@ -1086,3 +1086,39 @@ async def test_fetch_paginates(tmp_path: Path) -> None:
         items = await fetch_all_session_items_for_pi_resume(client, "conv_abc")
     assert calls["n"] == 2
     assert [i["id"] for i in items] == ["u1", "a1"]
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+@pytest.mark.parametrize("mirrored", [False, True])
+def test_unconfirmed_input_never_enters_rebuilt_history(
+    tmp_path: Path, compacted: bool, mirrored: bool
+) -> None:
+    """Saved authored uncertainty stays separate from accepted native context."""
+    original: dict[str, Any] = {
+        "id": "original",
+        "type": "message",
+        "role": "user",
+        "status": "incomplete",
+        "response_id": "native_input_unconfirmed",
+        "content": [{"type": "input_text", "text": "perform the saved action"}],
+    }
+    items: list[dict[str, object]] = [original]
+    if mirrored:
+        items.append(
+            {**original, "id": "native", "status": "completed", "response_id": "native_turn"}
+        )
+    if compacted:
+        items = [
+            {
+                "id": "compact",
+                "type": "compaction",
+                "summary": "prior context",
+                "token_count": 10,
+                "compacted_messages": items,
+            }
+        ]
+    records = pi_session_records_from_session_items(
+        items, session_id="conv", external_session_id=_EXTERNAL_ID, cwd=tmp_path
+    )
+    assert json.dumps(records).count("perform the saved action") == int(mirrored)
+    assert original["response_id"] == "native_input_unconfirmed"

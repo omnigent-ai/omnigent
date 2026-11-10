@@ -75,8 +75,8 @@ Limitations (identical to :mod:`pending_elicitations`):
   slice. Session events are already process-affine (``session_stream``
   is in-process with no replay, and a session's runner relay + SSE
   subscribers live on one process), so this rides the same affinity.
-* Ordinary native entries do not survive a server restart. Durable startup
-  entries are restored from conversation items when a transcript arrives.
+* Ordinary native entries do not survive a server restart. Explicitly saved
+  uncertain inputs and durable startup entries retain receipt correlation.
 * At most :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries per
   conversation; :func:`record` evicts the oldest unheld entries beyond that
   and never the entry it just recorded. Entries a persist in progress has
@@ -250,6 +250,8 @@ class DrainedInput:
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
     uncertain: bool = False
+    # Matching text cannot establish delivery of an already-saved authored input.
+    receipt_only: bool = False
 
 
 @dataclass
@@ -307,6 +309,8 @@ class _Entry:
         pending, is left out of the snapshot, and a later match that jumps over
         it must not call it undelivered. A mirror of its own text still drains
         it normally: the agent did record it.
+    :param receipt_only: Saved uncertain input; hidden from the optimistic queue
+        and ineligible for positional matching or automatic replay.
     """
 
     pending_id: str
@@ -319,6 +323,7 @@ class _Entry:
     created_at: float = field(default_factory=lambda: _now())
     held: bool = False
     uncertain: bool = False
+    receipt_only: bool = False
     interrupted: bool = False
     input_enqueued_at_ms: int | None = field(default_factory=lambda: int(time.time() * 1000))
     delivery_attempt_id: str | None = field(default_factory=lambda: uuid.uuid4().hex)
@@ -376,6 +381,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    receipt_only: bool = False,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -399,6 +405,7 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param receipt_only: Retain correlation for an already-saved uncertain input.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -422,6 +429,8 @@ def record(
             created_by=created_by,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
+            receipt_only=receipt_only,
+            uncertain=receipt_only,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -500,6 +509,14 @@ def delivery_attributes_for(conversation_id: str, pending_id: str) -> dict[str, 
         entry = _pending.get(conversation_id, {}).get(pending_id)
         snapshot = copy.copy(entry) if entry is not None else None
     return delivery_attributes(snapshot) if snapshot is not None else {}
+
+
+def peek(conversation_id: str, pending_id: str) -> DrainedInput | None:
+    """Copy one pending input without changing its hold or queue position."""
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        return _drained_input(entry) if entry is not None else None
 
 
 def mark_delivery_stage(
@@ -682,7 +699,11 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
             return None
         # Insertion order = FIFO; the first live, unheld key is the oldest entry.
         oldest_id = next(
-            (pid for pid, entry in entries.items() if not entry.held and not entry.interrupted),
+            (
+                pid
+                for pid, entry in entries.items()
+                if not entry.held and not entry.interrupted and not entry.receipt_only
+            ),
             None,
         )
         if oldest_id is None:
@@ -758,6 +779,15 @@ def mark_interrupted(conversation_id: str, ids: Iterable[str]) -> None:
                 entry.interrupted = True
 
 
+def mark_receipt_only(conversation_id: str, pending_id: str) -> None:
+    """Hide an already-saved uncertain input while retaining exact receipt correlation."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is not None:
+            entry.receipt_only = True
+            entry.uncertain = True
+
+
 def restore(conversation_id: str, drained: DrainedInput) -> None:
     """
     Put a drained entry back into the pending queue.
@@ -786,6 +816,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,
         uncertain=drained.uncertain,
+        receipt_only=drained.receipt_only,
         input_enqueued_at_ms=drained.input_enqueued_at_ms,
         delivery_attempt_id=drained.delivery_attempt_id,
         last_delivery_stage=drained.last_delivery_stage,
@@ -887,21 +918,27 @@ def resolve_matching_text(
         # the executor pastes one generated marker line per file block ahead
         # of the text, so drop exactly that many from the mirror and compare
         # with the entry's own text — typed marker-like text still counts.
-        interrupted = [entry.interrupted for _pid, entry in ordered]
+        marker_matches: list[int] = []
+        for index, (_pid, entry) in enumerate(ordered):
+            attachments = 0 if shell_command else _attachment_count(entry.content)
+            if attachments == 0 or not texts[index]:
+                continue
+            if _collapse_whitespace(_strip_generated_markers(text, attachments)) == texts[index]:
+                marker_matches.append(index)
+        candidates = [index for index, value in enumerate(texts) if value == exact_needle]
+        # A delayed mirror cannot distinguish a saved uncertain input from its live twin.
+        if {ordered[index][1].receipt_only for index in [*candidates, *marker_matches]} == {
+            False,
+            True,
+        }:
+            return MatchedDrain(
+                matched=None, skipped=[], match_method="unconfirmed_input_ambiguity"
+            )
+        interrupted = [entry.interrupted or entry.receipt_only for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
         if match_index is None:
             match_method = "attachment_normalized_text"
-            marker_matches: list[int] = []
-            for index, (_pid, entry) in enumerate(ordered):
-                attachments = 0 if shell_command else _attachment_count(entry.content)
-                if attachments == 0 or not texts[index]:
-                    continue
-                if (
-                    _collapse_whitespace(_strip_generated_markers(text, attachments))
-                    == texts[index]
-                ):
-                    marker_matches.append(index)
             match_index = _prefer_live(marker_matches, interrupted)
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
@@ -928,6 +965,7 @@ def resolve_matching_text(
             if (
                 entry.uncertain
                 or entry.interrupted
+                or entry.receipt_only
                 or _is_command_entry(entry, claude_commands=claude_commands)
             ):
                 uncertain.append(_drained_input(entry))
@@ -954,7 +992,10 @@ def has_pending(conversation_id: str) -> bool:
     """
     with _lock:
         _evict_stale_locked(conversation_id, _now())
-        return any(not entry.interrupted for entry in _pending.get(conversation_id, {}).values())
+        return any(
+            not entry.interrupted and not entry.receipt_only
+            for entry in _pending.get(conversation_id, {}).values()
+        )
 
 
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
@@ -998,7 +1039,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
             }
             for entry in entries.values()
-            if not entry.interrupted
+            if not entry.interrupted and not entry.receipt_only
         ]
 
 
@@ -1011,6 +1052,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         stable_id=entry.stable_id,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,
+        receipt_only=entry.receipt_only,
         uncertain=entry.uncertain,
         input_enqueued_at_ms=entry.input_enqueued_at_ms,
         delivery_attempt_id=entry.delivery_attempt_id,

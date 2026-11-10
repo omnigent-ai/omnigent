@@ -1188,6 +1188,14 @@ A failed transcript append restores pending inputs with their prior delivery
 uncertainty, including entries that expired while persistence was in flight.
 A later mirror cannot report a possibly recorded input as definitely undelivered.
 
+An explicit native delivery uncertainty retains the original authored message,
+attachments and author as an incomplete `native_input_unconfirmed` history item,
+alongside the visible error. This saved disposition survives pending-input expiry
+and server restart, is never startup work, and an exact retry with the same stable
+id is not dispatched again. A separately mirrored native message does not clear
+this uncertainty without a server identity link. Ordinary inputs lost in an AP
+crash before an uncertainty event reaches the server remain an existing gap.
+
 **Interrupt is dual-path on purpose.** Posting `{"type": "interrupt"}`
 is exposed as an event for API uniformity, but it does NOT enter the
 queue — the route invokes the loop's `cancel_loop` directly so the

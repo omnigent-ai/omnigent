@@ -13160,3 +13160,39 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
     dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
 
     assert claude_native.resolve_native_claude_config(spec=spec, refresh_models=False) is None
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+@pytest.mark.parametrize("mirrored", [False, True])
+def test_unconfirmed_input_never_enters_rebuilt_history(
+    tmp_path: Path, compacted: bool, mirrored: bool
+) -> None:
+    """Saved authored uncertainty stays separate from accepted native context."""
+    original: dict[str, Any] = {
+        "id": "original",
+        "type": "message",
+        "role": "user",
+        "status": "incomplete",
+        "response_id": "native_input_unconfirmed",
+        "content": [{"type": "input_text", "text": "perform the saved action"}],
+    }
+    items: list[dict[str, object]] = [original]
+    if mirrored:
+        items.append(
+            {**original, "id": "native", "status": "completed", "response_id": "native_turn"}
+        )
+    if compacted:
+        items = [
+            {
+                "id": "compact",
+                "type": "compaction",
+                "summary": "prior context",
+                "token_count": 10,
+                "compacted_messages": items,
+            }
+        ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items, session_id="conv", external_session_id="native", cwd=tmp_path, bridge_dir=tmp_path
+    )
+    assert json.dumps(records).count("perform the saved action") == int(mirrored)
+    assert original["response_id"] == "native_input_unconfirmed"

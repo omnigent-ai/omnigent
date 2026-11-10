@@ -1,4 +1,4 @@
-"""Content-free correlation for web messages delivered to native harnesses."""
+"""Content-free identity and saved disposition for native harness inputs."""
 
 from __future__ import annotations
 
@@ -7,6 +7,15 @@ import logging
 import re
 from collections.abc import Iterator, Mapping
 from contextvars import ContextVar
+
+# Authored history with unknown native delivery; never model input or replayable work.
+UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID = "native_input_unconfirmed"
+
+
+def is_unconfirmed_native_input(item: Mapping[str, object]) -> bool:
+    """Whether a saved input lacks the evidence required for model-history reconstruction."""
+    return item.get("response_id") == UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID
+
 
 _IDENTIFIERS = {
     "input_stable_id": re.compile(r"[0-9a-f]{32}"),

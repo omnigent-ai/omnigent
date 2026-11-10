@@ -653,6 +653,10 @@ class InjectionDeliveryAmbiguous(Exception):
     to a submission it may have accepted was lost.
     """
 
+    def __init__(self, message: str, *, code: str = "native_delivery_unconfirmed") -> None:
+        super().__init__(message)
+        self.code = code
+
 
 class Executor:
     """Abstract interface for LLM backends and agent harnesses.

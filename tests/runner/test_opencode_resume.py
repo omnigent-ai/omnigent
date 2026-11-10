@@ -62,6 +62,12 @@ def test_render_transcript_extracts_user_assistant_text() -> None:
 def test_render_transcript_skips_non_message_and_other_roles() -> None:
     items = [
         {"type": "reasoning", "text": "ignored"},
+        {
+            "type": "message",
+            "role": "user",
+            "response_id": "native_input_unconfirmed",
+            "content": [{"text": "uncertain"}],
+        },
         {"type": "message", "role": "tool", "content": [{"text": "ignored"}]},
         {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
     ]

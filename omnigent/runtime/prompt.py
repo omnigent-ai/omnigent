@@ -15,6 +15,7 @@ from omnigent.entities import (
     NativeToolData,
 )
 from omnigent.inner.native_attachments import expand_framework_notices
+from omnigent.native.input_diagnostics import is_unconfirmed_native_input
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.runtime.tool_result_replay import (
     image_omitted_placeholder,
@@ -372,6 +373,8 @@ def history_to_input_items(
     result: list[dict[str, Any]] = []
 
     for item in items:
+        if is_unconfirmed_native_input({"response_id": item.response_id}):
+            continue
         if item.type == "message":
             assert isinstance(item.data, MessageData)
             # Pass content blocks through, stripping annotations

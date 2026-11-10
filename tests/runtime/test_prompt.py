@@ -460,3 +460,23 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
     result = build_instructions_nullable(spec, None, [])
     assert result == SUBAGENT_WAKE_NOTICE_INSTRUCTION
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
+
+
+def test_unconfirmed_input_is_not_model_context() -> None:
+    original = ConversationItem(
+        id="original",
+        type="message",
+        status="incomplete",
+        response_id="native_input_unconfirmed",
+        created_at=1,
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "saved original"}]),
+    )
+    mirror = original.model_copy(
+        update={"id": "native", "status": "completed", "response_id": "native_turn"}
+    )
+    assert isinstance(mirror.data, MessageData)
+    assert history_to_input_items([original]) == []
+    assert history_to_input_items([original, mirror]) == [
+        {"role": "user", "content": mirror.data.content}
+    ]
+    assert original.response_id == "native_input_unconfirmed"

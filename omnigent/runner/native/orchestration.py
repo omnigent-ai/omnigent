@@ -76,6 +76,7 @@ from omnigent.native.failure_telemetry import (
     exception_code_origin,
     normalize_failure_context,
 )
+from omnigent.native.input_diagnostics import is_unconfirmed_native_input
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
@@ -2424,7 +2425,11 @@ def _render_opencode_transcript_text(items: list[object]) -> str:
     """
     lines: list[str] = []
     for item in items:
-        if not isinstance(item, dict) or item.get("type") != "message":
+        if (
+            not isinstance(item, dict)
+            or is_unconfirmed_native_input(item)
+            or item.get("type") != "message"
+        ):
             continue
         role = item.get("role")
         content = item.get("content")
@@ -7934,7 +7939,7 @@ def _cursor_fork_history_preamble(items: list[_JsonObject]) -> str:
     """
     turns: list[str] = []
     for item in items:
-        if item.get("type") != "message":
+        if is_unconfirmed_native_input(item) or item.get("type") != "message":
             continue
         role = item.get("role")
         if role not in _CURSOR_FORK_ROLE_LABELS:

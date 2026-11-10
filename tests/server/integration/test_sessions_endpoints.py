@@ -765,16 +765,32 @@ async def test_native_transcript_preserves_browser_title_preference(
 
 
 @pytest.mark.parametrize(
-    "harness,message_text,rejected_auth,active_turn",
+    "harness,message_text,rejected_auth,active_turn,durability",
     [
-        ("claude-native", "set up the worktree", False, False),
-        ("claude-native", "/login", True, False),
-        ("claude-native", "/logout", True, False),
-        ("claude-native", " \n/login workspace", True, False),
-        ("claude-native", "/login-help", False, False),
-        ("claude-native", "Explain /login", False, False),
-        ("codex-native", "/login", False, False),
-        ("claude-native", "/login", True, True),
+        ("claude-native", "set up the worktree", False, False, None),
+        pytest.param(
+            "claude-native",
+            "keep this uncertain prompt",
+            False,
+            False,
+            "turn",
+            id="uncertain-input-durability",
+        ),
+        pytest.param(
+            "claude-native",
+            "keep this uncertain steer",
+            False,
+            False,
+            "steer",
+            id="uncertain-steer-durability",
+        ),
+        ("claude-native", "/login", True, False, None),
+        ("claude-native", "/logout", True, False, None),
+        ("claude-native", " \n/login workspace", True, False, None),
+        ("claude-native", "/login-help", False, False, None),
+        ("claude-native", "Explain /login", False, False, None),
+        ("codex-native", "/login", False, False, None),
+        ("claude-native", "/login", True, True, None),
     ],
 )
 async def test_native_message_repeat_with_same_stable_id_forwards_once(
@@ -785,6 +801,8 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
     message_text: str,
     rejected_auth: bool,
     active_turn: bool,
+    durability: str | None,
+    db_uri: str,
 ) -> None:
     """
     A resend that reuses the web client's stable message id is answered with
@@ -892,6 +910,64 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
             assert second.json()["pending_id"] == first.json()["pending_id"]
             assert message_forwards() == 1
             assert len(pending_inputs.snapshot_for(session_id)) == 1
+            if durability:
+                from omnigent.server.routes._sessions.orchestration import _relay_runner_stream
+                from omnigent.server.startup_inputs import restore_pending_inputs
+                from tests.server.routes.test_session_resources import (
+                    _FakeStreamingRunnerClient,
+                    _sse_frame,
+                )
+
+                store = SqlAlchemyConversationStore(db_uri)
+                failure = {
+                    "type": "response.failed",
+                    **{
+                        key: forwarded_body[key]
+                        for key in ("input_stable_id", "pending_id", "delivery_attempt_id")
+                        if key in forwarded_body
+                    },
+                    "response": {
+                        "id": "resp_uncertain",
+                        "error": {
+                            "code": "claude_delivery_unconfirmed",
+                            "message": "The paste may still be queued; inspect the terminal.",
+                        },
+                    },
+                }
+                if durability == "steer":
+                    sessions_module._publish_status(session_id, "running", response_id="resp_main")
+                    failure = {
+                        **failure,
+                        "type": "session.input.unconfirmed",
+                        "response_id": "resp_uncertain",
+                        "error": failure["response"]["error"],
+                    }
+                await _relay_runner_stream(
+                    session_id,
+                    _FakeStreamingRunnerClient([_sse_frame(failure), "data: [DONE]\n\n"]),
+                    store,
+                )
+                now = pending_inputs._now()
+                monkeypatch.setattr(
+                    pending_inputs, "_now", lambda: now + pending_inputs._TTL_S + 1
+                )
+                pending_inputs.snapshot_for(session_id)
+                pending_inputs.reset_for_tests()
+                restarted_store = SqlAlchemyConversationStore(db_uri)
+                await restore_pending_inputs(restarted_store, session_id)
+                snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+                authored = [item for item in snapshot["items"] if item["type"] == "message"]
+                assert len(authored) == 1, "The original authored input vanished after TTL/restart"
+                assert authored[0]["id"] == message["data"]["stable_id"]
+                assert authored[0]["data"]["content"] == message["data"]["content"]
+                assert authored[0]["response_id"] == "native_input_unconfirmed"
+                assert any(item["type"] == "error" for item in snapshot["items"])
+                if durability == "steer":
+                    assert snapshot["status"] == "running"
+                assert restarted_store.list_pending_inputs(session_id) == []
+                repeated = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+                assert repeated.status_code == 202, repeated.text
+                assert message_forwards() == 1, "Uncertain input became replayable after restart"
         finally:
             for pending in pending_inputs.snapshot_for(session_id):
                 pending_inputs.resolve(session_id, pending["pending_id"])

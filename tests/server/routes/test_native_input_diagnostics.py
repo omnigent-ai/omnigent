@@ -12,6 +12,8 @@ from omnigent.runtime import pending_inputs, session_stream
 from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
     _record_native_input_lifecycle,
+    _restore_unconfirmed_native_inputs,
+    _settle_unconfirmed_native_input,
     _settle_undelivered_native_input,
 )
 from omnigent.server.schemas import SessionEventInput
@@ -391,3 +393,132 @@ async def test_uncertain_or_interrupted_input_does_not_report_missing_message(
     assert all(item.type != "error" for item in saved.values())
     assert "item_id" not in attrs and "error_item_id" not in attrs
     assert pending_inputs.snapshot_for(conv.id) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_append", [False, True])
+@pytest.mark.parametrize("same_text", [False, True])
+async def test_uncertain_input_retains_authored_content_and_cannot_be_replayed(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_append: bool,
+    same_text: bool,
+) -> None:
+    from omnigent.stores.conversation_store import UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "claude-native-ui"})
+    content = [
+        {"type": "input_file", "file_id": "original-file", "filename": "notes.txt"},
+        {"type": "input_text", "text": "keep the exact authored message"},
+    ]
+    pending_id = pending_inputs.record(
+        conv.id,
+        content,
+        stable_id="c" * 32,
+        created_by="alice@example.com",
+    )
+    identity = pending_inputs.delivery_attributes_for(conv.id, pending_id)
+    event = {"type": "response.failed", **identity}
+    published = Mock()
+    monkeypatch.setattr(session_stream, "publish", published)
+    append = store.append
+    if fail_append:
+        monkeypatch.setattr(store, "append", Mock(side_effect=RuntimeError("store unavailable")))
+        with pytest.raises(RuntimeError, match="store unavailable"):
+            await _settle_unconfirmed_native_input(store, conv.id, event)
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [
+            pending_id
+        ]
+        assert store.list_items(conv.id).data == []
+        monkeypatch.setattr(store, "append", append)
+    await _settle_unconfirmed_native_input(store, conv.id, event)
+    await _settle_unconfirmed_native_input(store, conv.id, event)
+    [saved] = store.list_items(conv.id).data
+    assert saved.id == "c" * 32
+    assert saved.status == "incomplete"
+    assert saved.response_id == UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID
+    assert saved.data.content == content
+    assert saved.created_by == "alice@example.com"
+    assert store.list_pending_inputs(conv.id) == []
+    assert pending_inputs.snapshot_for(conv.id) == []
+    assert not pending_inputs.has_pending(conv.id)
+    [saved_event] = [
+        call.args[1]
+        for call in published.call_args_list
+        if call.args[1]["type"] == "session.input.consumed"
+    ]
+    assert saved_event["data"]["delivery_outcome"] == "delivery_unconfirmed"
+    assert pending_inputs.resolve_oldest(conv.id) is None
+
+    pending_inputs.reset_for_tests()
+    store = SqlAlchemyConversationStore(db_uri)
+    later = pending_inputs.record(
+        conv.id,
+        [
+            {
+                "type": "input_text",
+                "text": "keep the exact authored message" if same_text else "newer input",
+            }
+        ],
+        stable_id="d" * 32,
+    )
+    await _restore_unconfirmed_native_inputs(store, conv.id)
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [later]
+    mirror_id = await _persist_external_conversation_item(
+        conv.id,
+        conv,
+        SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "keep the exact authored message"}],
+                },
+                "source_id": "native:independent-user-record",
+                "response_id": "resp_native",
+            },
+        ),
+        store,
+    )
+    assert mirror_id != saved.id
+    still_uncertain = store.get_item(conv.id, saved.id)
+    assert still_uncertain is not None
+    assert still_uncertain.response_id == UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID
+    assert still_uncertain.data.content == content
+    assert still_uncertain.created_by == "alice@example.com"
+    [native] = [item for item in store.list_items(conv.id).data if item.id == mirror_id]
+    assert native.created_by is None
+    assert native.data.content == [
+        {"type": "input_text", "text": "keep the exact authored message"}
+    ]
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [later]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mismatch",
+    ["pending_id", "delivery_attempt_id", "input_stable_id", "missing_attempt", "malformed"],
+)
+async def test_uncertain_disposition_requires_consistent_original_input_identity(
+    db_uri: str,
+    mismatch: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test")
+    pending_id = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "do not attribute a stale failure"}],
+        stable_id="e" * 32,
+    )
+    event = dict(pending_inputs.delivery_attributes_for(conv.id, pending_id))
+    if mismatch == "missing_attempt":
+        del event["delivery_attempt_id"]
+    elif mismatch == "malformed":
+        event["input_stable_id"] = "invalid"
+    else:
+        event[mismatch] = "pending_" + "f" * 32 if mismatch == "pending_id" else "f" * 32
+    await _settle_unconfirmed_native_input(store, conv.id, event)
+    assert store.list_items(conv.id).data == []
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [pending_id]

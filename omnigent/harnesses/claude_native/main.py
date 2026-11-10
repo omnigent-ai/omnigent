@@ -140,6 +140,7 @@ from omnigent.models.claude_model_vocabulary import (
     served_canonical_overrides,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
+from omnigent.native.input_diagnostics import is_unconfirmed_native_input
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
 from omnigent.native.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -6141,6 +6142,8 @@ def _claude_transcript_record_from_session_item(
     :returns: Claude transcript record, or ``None`` for unsupported or
         empty Omnigent items.
     """
+    if is_unconfirmed_native_input(item):
+        return None
     item_type = item.get("type")
     message: _JsonObject | None = None
     record_type: str | None = None

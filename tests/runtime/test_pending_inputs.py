@@ -1168,3 +1168,41 @@ def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost(
     [skipped] = match.skipped
     assert skipped.content == [_text_block(older)]
     assert match.uncertain == []
+
+
+@pytest.mark.parametrize("hold", [False, True])
+@pytest.mark.parametrize("receipt_first", [False, True])
+@pytest.mark.parametrize("matching", ["normalized", "attachment", "mixed"])
+def test_unconfirmed_same_text_is_not_attributed_to_another_input(
+    hold: bool, receipt_first: bool, matching: str
+) -> None:
+    text = "same request"
+    mirror = " same\n request "
+    receipt_content = [_text_block(text)]
+    live_content = [_text_block(text)]
+    if matching != "normalized":
+        mirror = "[Attached: /tmp/x.png]\n\nsame request"
+        live_content.insert(0, {"type": "input_image", "url": "img://live"})
+        if matching == "attachment":
+            receipt_content.insert(0, {"type": "input_image", "url": "img://original"})
+        else:
+            receipt_content = [_text_block(mirror)]
+    inputs = [(True, receipt_content), (False, live_content)]
+    if not receipt_first:
+        inputs.reverse()
+    identities = {}
+    for receipt_only, content in inputs:
+        pending_id = pending_inputs.record("ambiguity", content)
+        identities[receipt_only] = pending_id
+        if receipt_only:
+            pending_inputs.mark_receipt_only("ambiguity", pending_id)
+    result = pending_inputs.resolve_matching_text("ambiguity", mirror, hold=hold)
+    assert result.match_method == "unconfirmed_input_ambiguity"
+    assert result.matched is None
+    assert result.skipped == []
+    assert result.uncertain == []
+    assert pending_inputs.peek("ambiguity", identities[True]) is not None
+    assert pending_inputs.peek("ambiguity", identities[False]) is not None
+    # A refused text attribution neither consumes nor holds the live input.
+    live = pending_inputs.resolve_oldest("ambiguity")
+    assert live is not None and live.pending_id == identities[False]

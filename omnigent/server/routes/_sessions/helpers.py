@@ -1829,14 +1829,16 @@ def _publish_input_consumed(
     session_id: str,
     item: ConversationItem,
     cleared_pending_id: str | None = None,
+    *,
+    delivery_outcome: Literal["delivery_unconfirmed"] | None = None,
 ) -> None:
     """
     Publish a ``session.input.consumed`` event for a just-persisted
     conversation item.
 
     Mirrors the wire shape consumers depend on for rendering the
-    input (user message bubble, tool-result block, etc.) at the
-    moment of acceptance.
+    input (user message bubble, tool-result block, etc.) after persistence.
+    A saved uncertain input explicitly carries its unconfirmed disposition.
 
     :param session_id: The session/conversation identifier whose
         stream should receive the event.
@@ -1862,6 +1864,7 @@ def _publish_input_consumed(
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
             cleared_pending_id=cleared_pending_id,
+            delivery_outcome=delivery_outcome,
         ),
     )
     session_stream.publish(session_id, event.model_dump())

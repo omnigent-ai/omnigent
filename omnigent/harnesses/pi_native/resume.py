@@ -45,6 +45,7 @@ from typing import cast
 import httpx
 
 from omnigent.host.daemon_launch import error_text
+from omnigent.native.input_diagnostics import is_unconfirmed_native_input
 from omnigent.native.native_terminal import url_component
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -344,6 +345,8 @@ def pi_session_records_from_session_items(
         group = None
 
     for index, item in enumerate(items):
+        if is_unconfirmed_native_input(item):
+            continue
         response_id = item.get("response_id")
         item_type = item.get("type")
         item_call_id = item.get("call_id")
@@ -437,6 +440,8 @@ def _compaction_snapshot_items(item: _JsonObject) -> list[_JsonObject]:
     for index, message in enumerate(snapshot):
         if not isinstance(message, dict):
             return []
+        if is_unconfirmed_native_input(message):
+            continue
         if message.get("type") == "message":
             content = message.get("content")
             api_type = "output_text" if message.get("role") == "assistant" else "input_text"

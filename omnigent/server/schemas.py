@@ -4273,6 +4273,7 @@ class SessionInputConsumedPayload(BaseModel):
     data: dict[str, Any]
     created_by: str | None = None
     cleared_pending_id: str | None = None
+    delivery_outcome: Literal["delivery_unconfirmed"] | None = None
 
     model_config = ConfigDict(extra="ignore")
 
@@ -4301,6 +4302,18 @@ class SessionInputConsumedEvent(_SSEEventBase):
 
     type: Literal["session.input.consumed"]
     data: SessionInputConsumedPayload
+
+
+class SessionInputUnconfirmedEvent(_SSEEventBase):
+    """One native input has uncertain delivery; the running turn is unaffected."""
+
+    type: Literal["session.input.unconfirmed"]
+    input_stable_id: str | None = None
+    pending_id: str | None = None
+    delivery_attempt_id: str | None = None
+    input_enqueued_at_ms: int | None = None
+    response_id: str | None = None
+    error: dict[str, str] = Field(default_factory=dict)
 
 
 class SessionInterruptedPayload(BaseModel):
@@ -4625,6 +4638,8 @@ class InjectionConsumedEvent(_SSEEventBase):
 
     type: Literal["injection.consumed"]
     injection_id: str
+    delivery_outcome: Literal["delivery_unconfirmed"] | None = None
+    error: dict[str, str] | None = None
 
 
 class OutputFileDoneEvent(_SSEEventBase):
@@ -5481,6 +5496,7 @@ ServerStreamEvent = Annotated[
     | SessionMcpStartupEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
+    | SessionInputUnconfirmedEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent
     | SessionSupersededEvent

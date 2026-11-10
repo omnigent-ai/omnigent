@@ -13711,3 +13711,46 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.thread_id == "thread_after_signin"
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+@pytest.mark.parametrize("mirrored", [False, True])
+def test_unconfirmed_input_never_enters_rebuilt_history(
+    tmp_path: Path, compacted: bool, mirrored: bool
+) -> None:
+    """Saved authored uncertainty stays separate from accepted native context."""
+    original: dict[str, Any] = {
+        "id": "original",
+        "type": "message",
+        "role": "user",
+        "status": "incomplete",
+        "response_id": "native_input_unconfirmed",
+        "content": [{"type": "input_text", "text": "perform the saved action"}],
+    }
+    items: list[dict[str, object]] = [original]
+    if mirrored:
+        items.append(
+            {**original, "id": "native", "status": "completed", "response_id": "native_turn"}
+        )
+    if compacted:
+        items = [
+            {
+                "id": "compact",
+                "type": "compaction",
+                "summary": "prior context",
+                "token_count": 10,
+                "compacted_messages": items,
+            }
+        ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv",
+        external_session_id="native",
+        cwd=tmp_path,
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    assert json.dumps(records).count("perform the saved action") == int(mirrored) * (
+        1 if compacted else 2
+    )
+    assert original["response_id"] == "native_input_unconfirmed"

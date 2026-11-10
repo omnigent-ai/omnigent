@@ -421,6 +421,7 @@ from omnigent.stores.conversation_store import (
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID,
     ConversationNotFoundError,
     NameAlreadyExistsError,
     pinned_label_key,
@@ -3140,6 +3141,8 @@ async def _persist_external_conversation_item_unlocked(
             return existing.id
     if drains_pending_inputs and STARTUP_LABEL in conv.labels:
         await restore_pending_inputs(conversation_store, session_id)
+    if drains_pending_inputs:
+        await _restore_unconfirmed_native_inputs(conversation_store, session_id)
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry and fold the entry's file
     # blocks (image / file) into the item BEFORE persisting. The transcript
@@ -3194,7 +3197,20 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
+        receipt_only_match = matched.match_method == "unconfirmed_input_ambiguity" or (
+            drained is not None and drained.receipt_only
+        )
+        if drained is not None and drained.receipt_only:
+            # Matching text cannot establish which server attempt produced the native row.
+            uncertain_pending.append(drained)
+            drained = None
+            match_method = None
+        if (
+            drained is None
+            and not receipt_only_match
+            and not agent_message_candidate
+            and not _is_kiro_native_session(conv)
+        ):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
                 match_method = "fifo_fallback"
@@ -3244,6 +3260,11 @@ async def _persist_external_conversation_item_unlocked(
         drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
         if drained is not None:
             cleared_pending_id = drained.pending_id
+    if drained is not None and drained.receipt_only:
+        uncertain_pending.append(drained)
+        drained = None
+        match_method = None
+        cleared_pending_id = None
     if drained is not None:
         item = item.model_copy(update={"replaces_pending_id": drained.stable_id})
     # Build the batch: skipped entries first (their positions must precede
@@ -3660,6 +3681,97 @@ async def _settle_undelivered_native_input(
             ),
         )
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
+
+
+async def _restore_unconfirmed_native_inputs(
+    conversation_store: ConversationStore,
+    session_id: str,
+) -> None:
+    """Restore correlation for saved uncertain input without queueing it for delivery."""
+    reader = getattr(conversation_store, "list_unconfirmed_native_inputs", None)
+    if reader is None:
+        return
+    saved = await asyncio.to_thread(reader, session_id)
+    for item in reversed(saved):
+        if not isinstance(item.data, MessageData):
+            continue
+        pending_id = pending_inputs.make_pending_id(session_id, item.id)
+        if pending_inputs.peek(session_id, pending_id) is None:
+            pending_inputs.restore(
+                session_id,
+                pending_inputs.DrainedInput(
+                    pending_id=pending_id,
+                    stable_id=item.id,
+                    content=item.data.content,
+                    created_by=item.created_by,
+                    background_titles_enabled=False,
+                    receipt_only=True,
+                    uncertain=True,
+                ),
+            )
+
+
+async def _settle_unconfirmed_native_input(
+    conversation_store: ConversationStore | None,
+    session_id: str,
+    event: Mapping[str, Any],
+) -> None:
+    """Save an identity-linked uncertain input as authored history, never as replayable work."""
+    if conversation_store is None:
+        return
+    identity = input_attributes(event)
+    keys = ("input_stable_id", "pending_id", "delivery_attempt_id")
+    if any(key in event and key not in identity for key in keys):
+        return
+    stable_id, pending_id, attempt = (identity.get(key) for key in keys)
+    if (pending_id is None) != (attempt is None):
+        return
+    if pending_id is None and isinstance(stable_id, str):
+        pending_id = pending_inputs.pending_id_for_stable_id(session_id, stable_id)
+    if not isinstance(pending_id, str):
+        return
+    async with _native_mirror_lock(session_id):
+        original = pending_inputs.peek(session_id, pending_id)
+        if original is None:
+            return
+        original_identity = pending_inputs.delivery_attributes(original)
+        if any(identity[key] != original_identity.get(key) for key in keys if key in identity):
+            return
+        input_id = (
+            original.stable_id
+            or uuid.uuid5(
+                uuid.NAMESPACE_URL, f"omnigent-unconfirmed-native-user:{session_id}:{pending_id}"
+            ).hex
+        )
+        item = NewConversationItem(
+            type="message",
+            response_id=UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID,
+            status="incomplete",
+            stable_id=input_id,
+            replaces_pending_id=original.stable_id,
+            data=MessageData(role="user", content=original.content, user_authored=True),
+            created_by=original.created_by,
+        )
+        [saved] = await asyncio.to_thread(conversation_store.append, session_id, [item])
+        if saved.response_id != UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID:
+            return
+        pending_inputs.mark_receipt_only(session_id, pending_id)
+        if not saved.deduplicated:
+            log_input_event(
+                _logger,
+                "native_input_settled",
+                session_id=session_id,
+                attributes=original_identity,
+                outcome="delivery_unconfirmed",
+                item_id=saved.id,
+                response_id=saved.response_id,
+            )
+            _publish_input_consumed(
+                session_id,
+                saved,
+                cleared_pending_id=pending_id,
+                delivery_outcome="delivery_unconfirmed",
+            )
 
 
 def _restore_drained_inputs(
@@ -8390,6 +8502,22 @@ async def _dispatch_session_event_to_runner_impl(
             isinstance(content, list) and bool(content) and not opens_side_chat and not is_btw
         )
         if queues_message and web_stable_id is not None:
+            saved_input = await asyncio.to_thread(
+                conversation_store.get_item, session_id, web_stable_id
+            )
+            if (
+                saved_input is not None
+                and saved_input.response_id == UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID
+            ):
+                candidate = _build_new_item(
+                    body, generate_task_id(), created_by=created_by, adopt_stable_id=True
+                )
+                if _stable_id_reuse_is_exact_retry(saved_input, candidate):
+                    return _SessionEventDispatchResult(item_id=saved_input.id, pending_id=None)
+                body = body.model_copy(
+                    update={"data": {**body.data, "stable_id": uuid.uuid4().hex}}
+                )
+                web_stable_id = body.data["stable_id"]
             repeated_pending_id = pending_inputs.pending_id_for_stable_id(
                 session_id, web_stable_id
             )
@@ -9475,6 +9603,21 @@ async def _relay_runner_stream_once(
                             ready.set()
                         continue
 
+                    if evt_type == "session.input.unconfirmed":
+                        await _settle_unconfirmed_native_input(
+                            conversation_store, session_id, event
+                        )
+                        uncertain_error = _error_item_from_sse(
+                            {"type": "response.failed", "error": event.get("error")},
+                            response_id=event.get("response_id"),
+                        )
+                        if uncertain_error is not None:
+                            await _relay_persist_error_once(
+                                conversation_store, session_id, uncertain_error
+                            )
+                        session_stream.publish(session_id, event)
+                        continue
+
                     _record_native_input_lifecycle(session_id, event)
 
                     # A pane-inferred reason only annotates a running turn. Publishing it
@@ -9839,6 +9982,15 @@ async def _relay_runner_stream_once(
                             "response.failed": "failed",
                             "response.cancelled": "cancelled",
                         }.get(evt_type, "completed")
+
+                    if evt_type == "response.failed" and _native_input_reason_code(event) in {
+                        "claude_delivery_unconfirmed",
+                        "codex_delivery_unconfirmed",
+                        "native_delivery_unconfirmed",
+                    }:
+                        await _settle_unconfirmed_native_input(
+                            conversation_store, session_id, event
+                        )
 
                     if evt_type == "response.failed" and _failed_event_undelivered(event):
                         # The runner could not hand this turn to a native

@@ -6771,6 +6771,39 @@ def create_runner_app(
                                                 _turn_pending_ids.setdefault(conv_id, set()).add(
                                                     _pending_id
                                                 )
+                                            if (
+                                                event.get("delivery_outcome")
+                                                == "delivery_unconfirmed"
+                                            ):
+                                                raw_error = event.get("error")
+                                                uncertainty_error = (
+                                                    {
+                                                        key: value
+                                                        for key, value in raw_error.items()
+                                                        if key in {"code", "message"}
+                                                        and isinstance(value, str)
+                                                    }
+                                                    if isinstance(raw_error, dict)
+                                                    else {}
+                                                )
+                                                uncertainty_error.setdefault(
+                                                    "code", "native_delivery_unconfirmed"
+                                                )
+                                                uncertainty_error.setdefault(
+                                                    "message",
+                                                    "Native message delivery "
+                                                    "could not be confirmed.",
+                                                )
+                                                _publish_event(
+                                                    conv_id,
+                                                    {
+                                                        "type": "session.input.unconfirmed",
+                                                        **_input_identity(_m),
+                                                        "response_id": _response_id,
+                                                        "error": uncertainty_error,
+                                                    },
+                                                )
+                                                continue
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
                                                     "type": "message",

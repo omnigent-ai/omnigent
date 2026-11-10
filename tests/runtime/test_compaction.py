@@ -2010,3 +2010,40 @@ def test_route_bare_model_preserves_databricks_and_prefixed_ids() -> None:
         assert _route_bare_model_for_compaction(LLMConfig(model=prefixed)).model == prefixed
     # Bare gpt-* is correctly OpenAI already — unchanged.
     assert _route_bare_model_for_compaction(LLMConfig(model="gpt-4o")).model == "gpt-4o"
+
+
+def test_compaction_snapshot_does_not_promote_unconfirmed_input() -> None:
+    snapshot = [
+        {
+            "type": "message",
+            "role": "user",
+            "response_id": "native_input_unconfirmed",
+            "content": [{"type": "input_text", "text": "saved original"}],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "response_id": "native_turn",
+            "content": [{"type": "input_text", "text": "accepted mirror"}],
+        },
+    ]
+    compaction = ConversationItem(
+        id="compact",
+        type="compaction",
+        status="completed",
+        response_id="compact_turn",
+        created_at=1,
+        data=CompactionData(
+            summary="prior context",
+            last_item_id="original",
+            model="test",
+            token_count=1,
+            compacted_messages=snapshot,
+        ),
+    )
+    items = compaction_to_history_items(compaction)
+    [accepted] = items
+    assert isinstance(accepted.data, MessageData)
+    assert accepted.data.content == snapshot[1]["content"]
+    assert isinstance(compaction.data, CompactionData)
+    assert compaction.data.compacted_messages == snapshot

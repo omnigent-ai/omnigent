@@ -12,6 +12,7 @@ from typing import Any, Protocol, cast
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.native.input_diagnostics import is_unconfirmed_native_input
 from omnigent.runner.app_support import (
     _resolve_forwarded_message_content,
     _SpecEntry,
@@ -194,7 +195,7 @@ def build_session_history(
             c = items[compaction_idx]
             _compacted = cast(list[_JsonObject] | None, c.get("compacted_messages"))
             if _compacted:
-                result.extend(_compacted)
+                result.extend(item for item in _compacted if not is_unconfirmed_native_input(item))
             else:
                 result.append(
                     {
@@ -230,6 +231,8 @@ def build_session_history(
 
         _skipped_types: list[str] = []
         for item in remaining:
+            if is_unconfirmed_native_input(item):
+                continue
             item_type = item.get("type")
             if item_type not in (
                 "message",

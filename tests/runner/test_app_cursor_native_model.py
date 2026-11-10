@@ -109,6 +109,7 @@ class TestCursorForkHistoryPreamble:
             {"type": "function_call", "name": "sys_os_write"},  # tool call -> skipped
             _msg("assistant", ""),  # empty text -> skipped
             {"type": "message", "role": "system", "content": [{"text": "x"}]},  # system
+            {**_msg("user", "uncertain"), "response_id": "native_input_unconfirmed"},
             _msg("user", "real"),
         ]
         assert _cursor_fork_history_preamble(items) == "You: real"

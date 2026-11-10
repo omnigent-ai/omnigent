@@ -15,6 +15,9 @@ from omnigent.entities import (
     NewConversationItem,
     PagedList,
 )
+from omnigent.native.input_diagnostics import (
+    UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID as UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID,
+)
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
 # Pending inputs share the item store, but are not harness transcript history yet.
@@ -506,6 +509,13 @@ class ConversationStore(ABC):
             items.extend(page)
             if after is None:
                 return items
+
+    def list_unconfirmed_native_inputs(
+        self,
+        conversation_id: str,  # noqa: ARG002
+    ) -> list[ConversationItem]:
+        """Return saved uncertain inputs for receipt correlation, never for dispatch."""
+        return []
 
     def transition_pending_input(
         self,

@@ -90,6 +90,7 @@ from omnigent.inner._subprocess_lifecycle import (
     terminate_direct_subprocess,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
+from omnigent.native.input_diagnostics import is_unconfirmed_native_input
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
 from omnigent.native.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -2302,6 +2303,8 @@ def _codex_rollout_records_from_session_items(
                 replacement_history: list[object] = []
                 for message in compacted_msgs:
                     if isinstance(message, dict):
+                        if is_unconfirmed_native_input(message):
+                            continue
                         if message.get("type") == "message" and "content" in message:
                             message = {
                                 **message,
@@ -2665,6 +2668,8 @@ def _codex_response_item_from_session_item(item: _JsonObject) -> _JsonObject | N
     :returns: Responses-style item payload, or ``None`` for unsupported
         or empty Omnigent items.
     """
+    if is_unconfirmed_native_input(item):
+        return None
     payload = _codex_response_item_payload(item)
     if payload is None:
         return None

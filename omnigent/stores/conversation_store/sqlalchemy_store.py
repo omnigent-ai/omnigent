@@ -111,6 +111,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
+    UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -2736,6 +2737,23 @@ class SqlAlchemyConversationStore(ConversationStore):
         decoded = self._decode_item_data_batch([row.data for row in rows])
         items = [_to_item(row, data) for row, data in zip(rows, decoded, strict=True)]
         return items, rows[-1].position if more else None
+
+    def list_unconfirmed_native_inputs(self, conversation_id: str) -> list[ConversationItem]:
+        """Bound late-receipt correlation to the most recent saved uncertain inputs."""
+        query = select(SqlConversationItem).where(
+            SqlConversationItem.workspace_id == current_workspace_id(),
+            SqlConversationItem.conversation_id == conversation_id,
+            SqlConversationItem.response_id == UNCONFIRMED_NATIVE_INPUT_RESPONSE_ID,
+        )
+        with self._conv_session("list_unconfirmed_native_inputs") as session:
+            rows = list(
+                session.scalars(
+                    query.order_by(SqlConversationItem.position.desc()).limit(MAX_PENDING_INPUTS)
+                )
+            )
+        rows.reverse()
+        decoded = self._decode_item_data_batch([row.data for row in rows])
+        return [_to_item(row, data) for row, data in zip(rows, decoded, strict=True)]
 
     def transition_pending_input(
         self,

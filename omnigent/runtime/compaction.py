@@ -34,6 +34,7 @@ from omnigent.llms.summarize import (
     build_summarization_prompt,
     extract_summary_text,
 )
+from omnigent.native.input_diagnostics import is_unconfirmed_native_input
 from omnigent.spec.types import CompactionConfig
 
 _logger = logging.getLogger(__name__)
@@ -529,6 +530,8 @@ def compaction_to_history_items(
     if data.compacted_messages:
         items: list[ConversationItem] = []
         for i, msg in enumerate(data.compacted_messages):
+            if is_unconfirmed_native_input(msg):
+                continue
             items.append(
                 ConversationItem(
                     id=f"{compaction_item.id}_compacted_{i}",

@@ -2717,6 +2717,9 @@ class _ScriptedInjectionExecutor:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "ambiguity_code", ["native_delivery_unconfirmed", "claude_delivery_unconfirmed"]
+)
+@pytest.mark.parametrize(
     ("outcome", "consumed", "logged"),
     [
         (True, True, "executor_accepted"),
@@ -2731,6 +2734,7 @@ async def test_watch_injections_marks_ambiguous_delivery_consumed(
     consumed: bool,
     logged: str,
     caplog: pytest.LogCaptureFixture,
+    ambiguity_code: str,
 ) -> None:
     """An injection the harness may already hold is marked consumed, so it is never resent."""
     import asyncio as _aio
@@ -2741,7 +2745,9 @@ async def test_watch_injections_marks_ambiguous_delivery_consumed(
     from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
 
     executor = _ScriptedInjectionExecutor(
-        InjectionDeliveryAmbiguous("reply lost") if outcome is None else outcome
+        InjectionDeliveryAmbiguous("reply lost", code=ambiguity_code)
+        if outcome is None
+        else outcome
     )
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
     ctx = _OneInjectionCtx(
@@ -2774,6 +2780,11 @@ async def test_watch_injections_marks_ambiguous_delivery_consumed(
     assert finished == [logged]
     markers = [event for event in ctx.emitted if isinstance(event, InjectionConsumedEvent)]
     assert [marker.injection_id for marker in markers] == (["inj_x"] if consumed else [])
+    if outcome is None:
+        assert markers[0].delivery_outcome == "delivery_unconfirmed"
+        assert markers[0].error == {"code": ambiguity_code, "message": "reply lost"}
+    else:
+        assert all(marker.delivery_outcome is None and marker.error is None for marker in markers)
 
 
 @pytest.mark.asyncio
