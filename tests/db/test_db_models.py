@@ -15,7 +15,7 @@ import time
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import make_url
-from sqlalchemy.dialects import mysql, postgresql, sqlite
+from sqlalchemy.dialects import mysql, sqlite
 from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
 
 from omnigent.db.db_models import (
@@ -742,20 +742,17 @@ class TestSqlSessionPermission:
 
 
 class TestSqlComment:
-    def test_model_schema_bounds_anchor_bytes(self) -> None:
+    def test_anchor_writes_enforce_stored_byte_limit(self) -> None:
         assert "anchor_metadata" not in sa.inspect(SqlComment).columns
-        postgres_ddl = str(
-            sa.schema.CreateTable(SqlComment.__table__).compile(dialect=postgresql.dialect())
-        )
-        assert "ck_comments_anchor_metadata_bytes" in postgres_ddl
-        assert "octet_length(anchor_metadata) <= 16383" in postgres_ddl
-        assert "CAST(anchor_metadata AS BLOB)" not in postgres_ddl
+        table = SqlComment.__table__
+        assert table.c.anchor_metadata.type.max_stored_bytes == 1_024
+        anchor = '{"pr_url":"https://example.com/repo/pull/1","side":"LEFT","line":9}'
         engine = sa.create_engine("sqlite://")
         try:
-            SqlComment.__table__.create(engine)
+            table.create(engine)
             with engine.begin() as connection:
                 connection.execute(
-                    SqlComment.__table__.insert().values(
+                    table.insert().values(
                         id="cccccccccccccccccccccccccccccc01",
                         conversation_id="a9930027fd3e2e979e65844f7af7bf88",
                         path="main.py",
@@ -765,16 +762,16 @@ class TestSqlComment:
                         status=encode_comment_status("draft"),
                         created_at=0,
                         updated_at=0,
+                        anchor_metadata=anchor,
                     )
                 )
-                connection.execute(
-                    sa.text("UPDATE comments SET anchor_metadata = :value"),
-                    {"value": b"x" * 16_383},
+                assert (
+                    connection.execute(sa.select(table.c.anchor_metadata)).scalar_one() == anchor
                 )
-            with pytest.raises(IntegrityError), engine.begin() as connection:
+            oversized_anchor = "".join(random.Random(0).choices(string.ascii_letters, k=2_048))
+            with pytest.raises(StatementError, match="size limit"), engine.begin() as connection:
                 connection.execute(
-                    sa.text("UPDATE comments SET anchor_metadata = :value"),
-                    {"value": b"x" * 16_384},
+                    table.update().values(anchor_metadata=oversized_anchor),
                 )
         finally:
             engine.dispose()

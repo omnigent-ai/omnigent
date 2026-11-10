@@ -2,10 +2,12 @@
 
 Revision `f9b3e6c2a401`, following `1ad1db53f99d`, adds nullable
 `comments.anchor_metadata`. It stores compressed provider-specific coordinates
-with a database-enforced 16,383-byte stored limit. Existing rows remain NULL. There is no default,
-backfill, index, or application consumer in this change.
+with a 1,024-byte stored limit, including compression framing, enforced by the
+`CompressedText` type on application writes. There is no database CHECK for this
+limit. Existing rows remain NULL. There is no default, backfill, index, or
+application consumer in this change.
 
-The table metadata also includes this column and its CHECK without an ORM
+The table metadata also includes this column and its bounded type without an ORM
 property. Fresh CockroachDB databases bootstrap from table metadata and stamp
 the current migration head; omitting it would silently create an incomplete
 schema. Ordinary ORM comment queries still omit the column in this release.
@@ -49,8 +51,11 @@ production removal requires the staged deprecation procedure in
 `uv run --no-sync pytest tests/db/test_migration_comment_anchor_metadata.py
 tests/db/test_migration_connections.py` verifies the migration chain has one
 head, preserves existing comments, accepts old writers, round-trips compressed
-anchors, rejects raw and reflected writes of 16,384 bytes, and preserves comment
-bodies on downgrade. SQLite/D1 use a byte-length CHECK in ADD COLUMN; PostgreSQL,
-CockroachDB, and MySQL use an octet-length CHECK. The lifecycle runs on SQLite;
-DDL tests cover all five dialect names. Deployment CI exercises the migration on
-the other configured database engines.
+anchors, and preserves comment bodies on downgrade. The lifecycle runs on SQLite;
+deployment CI exercises the migration on the other configured database engines.
+
+`uv run --no-sync pytest tests/db/test_db_models.py::TestSqlComment
+tests/db/test_compression.py -k 'SqlComment or max_stored_bytes'` verifies typed
+anchor writes reject values over 1,024 stored bytes and the codec accepts values
+exactly at its configured limit. Raw SQL and reflected writes bypass the codec
+and are not subject to the application limit.
