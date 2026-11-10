@@ -3,7 +3,7 @@
 const { spawn } = require("node:child_process");
 const { buildConnectArgs, describeConnectFailure, resolveArcaPath } = require("./arca");
 
-// Cold start plus the Isaac workspace and Omnigent browser sign-ins.
+// Allows time for the first start and both browser sign-ins.
 const SETUP_TIMEOUT_MS = 15 * 60 * 1000;
 
 /** Prepare both remote sign-ins during initial onboarding. */
@@ -12,7 +12,7 @@ function buildSetupArgs(serverUrl) {
   // A piped SSH command has no TTY even when --non-interactive is omitted.
   args.splice(1, 0, "-tt");
   args.splice(args.indexOf("--non-interactive"), 1);
-  // Remote command shells need not load Companion's BROWSER environment.
+  // Remote non-login shells don't set BROWSER, so set it for the sign-in.
   args.splice(args.indexOf("isaac"), 0, "env", 'BROWSER="$HOME/.arca-client/tools/www-browser"');
   return args;
 }

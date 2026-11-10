@@ -71,7 +71,7 @@ def test_upgrade_matches_models_and_downgrade_drops_tables(tmp_path: Path) -> No
     for index in inspector.get_indexes(_ENTRIES):
         assert index["column_names"][-2:] == ["position", "created_at"], index["name"]
 
-    _migrate(uri, engine, "f1c7a9e2b406", down=True)
+    _migrate(uri, engine, "1ad1db53f99d", down=True)
     assert not {_ENTRIES, _HEADS} & set(sa.inspect(engine).get_table_names())
     engine.dispose()
     clear_engine_cache()

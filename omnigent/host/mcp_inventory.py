@@ -241,6 +241,28 @@ def configured_mcp_servers() -> list[ConfiguredMcpServer]:
     return out
 
 
+def find_configured_server(
+    harness: str,
+    name: str,
+    plugin: str | None = None,
+    source_id: str | None = None,
+    *,
+    servers: list[ConfiguredMcpServer] | None = None,
+) -> ConfiguredMcpServer:
+    """Resolve one inventory identity, rejecting stale or ambiguous sources."""
+    matches = [
+        server
+        for server in (configured_mcp_servers() if servers is None else servers)
+        if server.summary["harness"] == harness
+        and server.summary["name"] == name
+        and server.summary.get("plugin") == plugin
+        and (source_id is None or server.summary.get("source_id") == source_id)
+    ]
+    if len(matches) != 1:
+        raise LookupError("MCP server unavailable or ambiguous")
+    return matches[0]
+
+
 def discover_mcp_servers() -> list[McpServerSummary]:
     return [server.summary for server in configured_mcp_servers()]
 
@@ -327,6 +349,28 @@ def apply_auth_status(
     return servers
 
 
+def apply_enabled_status(servers: list[McpServerSummary]) -> list[McpServerSummary]:
+    """Overlay saved preferences without altering the harness configuration."""
+    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS, ServerKey, read_disabled_servers
+
+    disabled = read_disabled_servers()
+    managed_names = {
+        (server["harness"], server["name"])
+        for server in servers
+        if server.get("managed") == "true"
+    }
+    for server in servers:
+        harness = server["harness"]
+        if harness not in HARNESS_EXECUTORS:
+            continue
+        locked = (harness, server["name"]) in managed_names
+        server["locked"] = str(locked).lower()
+        server["enabled"] = str(
+            locked or ServerKey(harness, server["name"], server.get("plugin")) not in disabled
+        ).lower()
+    return servers
+
+
 class HostMcpInventory:
     """Cache the inventory briefly and serialize scans off the event loop."""
 
@@ -343,4 +387,4 @@ class HostMcpInventory:
                 result = discover_mcp_servers()
                 self._cached = (time.monotonic() + MCP_INVENTORY_CACHE_TTL_SECONDS, result)
                 servers = [dict(server) for server in result]
-        return apply_auth_status(servers, _auth_status_overlay())
+        return apply_enabled_status(apply_auth_status(servers, _auth_status_overlay()))

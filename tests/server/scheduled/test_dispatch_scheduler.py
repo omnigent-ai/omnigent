@@ -60,6 +60,18 @@ def _task(
     return store.get(task.id)
 
 
+def _create_tasks_half_past_the_hour(monkeypatch) -> None:
+    """Pin task creation to half past an hour.
+
+    ``store.create`` schedules from the wall clock, so a test clock a minute past
+    ``created_at`` reaches the next hourly occurrence whenever the test runs in the
+    last minute of an hour, and that occurrence fires beside the run under test.
+    """
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_800_000_000 + 30 * 60)
+
+
 def _events(caplog, event_name: str) -> list[dict]:
     return [
         {**record.attributes, "session_id": getattr(record, "session_id", None)}
@@ -2083,7 +2095,8 @@ async def test_run_now_records_a_manual_run_that_the_next_poll_starts(store) -> 
     assert store.get(task.id).next_run_at is None
 
 
-async def test_run_now_waits_for_the_host_owner_to_start_it(store) -> None:
+async def test_run_now_waits_for_the_host_owner_to_start_it(store, monkeypatch) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
     task = _task(store)
     clock = FakeClock(task.created_at + 60)
     owned = False
@@ -2195,10 +2208,11 @@ async def test_run_now_moves_to_the_new_host_owner_after_a_target_change(store) 
 
 
 async def test_a_continue_task_runs_where_its_session_host_is_not_the_workspace_owner(
-    store,
+    store, monkeypatch
 ) -> None:
     """Replica A holds the session's host and B owns the workspace key. Once the
     first run records the session, its host is pinned, so A claims every run."""
+    _create_tasks_half_past_the_hour(monkeypatch)
     task = _task(store, "continue_unpinned", session_mode="continue")
     assert task.host_id is None
     session_host = uuid.uuid4().hex

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shlex
 import threading
@@ -537,6 +538,53 @@ def _record_resolved_prs(
             _pending_lookups.discard((session_id, observation_id))
 
 
+def _resolve_directory(current: str | None, argument: str) -> str | None:
+    """Return the absolute directory a ``cd``-style *argument* names, if known statically."""
+    if "$" in argument or "`" in argument or argument == "-":
+        return None
+    path = os.path.expanduser(argument)
+    if not os.path.isabs(path):
+        if current is None:
+            return None
+        path = os.path.join(current, path)
+    return os.path.normpath(path)
+
+
+def _git_checkouts(
+    tool_name: str, arguments: dict[str, object], result: object, cwd: str | None
+) -> list[str]:
+    """Return the directories a shell call ran ``git`` in, following ``cd`` and ``git -C``.
+
+    *cwd* is where the call started, when the caller knows it. ``sys_os_shell``
+    may run under a sandbox that hides other directories, so only the directory
+    it reports running in counts.
+    """
+    if tool_name not in SHELL_TOOLS and tool_name not in {"exec_command", "run_command"}:
+        return []
+    command = arguments.get("command", arguments.get("cmd"))
+    if not isinstance(command, str) or len(command) > 100_000:
+        return []
+    segments = _shell_segments(command)
+    if tool_name == "sys_os_shell":
+        reported = result.get("cwd") if isinstance(result, dict) else None
+        runs_git = any(os.path.basename(s.invocation_tokens[0]) == "git" for s in segments)
+        return [reported] if runs_git and isinstance(reported, str) and reported else []
+    workdir = arguments.get("workdir")
+    current = _resolve_directory(cwd, workdir) if isinstance(workdir, str) and workdir else cwd
+    found: dict[str, None] = {}
+    for segment in segments:
+        tokens = segment.invocation_tokens
+        if tokens[0] in {"cd", "pushd"}:
+            current = _resolve_directory(current, tokens[1] if len(tokens) > 1 else "~")
+        elif os.path.basename(tokens[0]) == "git":
+            directory = current
+            if len(tokens) > 2 and tokens[1] == "-C":
+                directory = _resolve_directory(current, tokens[2])
+            if directory is not None:
+                found[directory] = None
+    return list(found)[:4]
+
+
 def observe_tool_completion(
     session_id: str,
     *,
@@ -546,10 +594,26 @@ def observe_tool_completion(
     call_id: str = "",
     source: str = "tool",
     successful: bool = True,
+    cwd: str | None = None,
 ) -> None:
-    """Best-effort observer; failures never change execution or tool results."""
+    """Best-effort observer; failures never change execution or tool results.
+
+    *cwd* is the directory a shell call started in, when the caller knows it.
+    """
     if not successful or not session_id:
         return
+    try:
+        from omnigent.runner.pr_resource import infer_checkout_pr
+
+        # A checkout's branch PR is inferred from its state, whatever pushed it.
+        for checkout in _git_checkouts(
+            tool_name, arguments, _shell_result(tool_name, result), cwd
+        ):
+            _lookup_pool.submit(infer_checkout_pr, session_id, checkout)
+    except Exception:
+        _logger.warning(
+            "Failed to infer session PRs", extra={"session_id": session_id}, exc_info=True
+        )
     try:
         references, created = extract_prs(tool_name, arguments, result)
         SessionPrRegistry(session_id).record(
@@ -605,7 +669,7 @@ def observe_hook(session_id: str, payload: dict[str, object]) -> None:
     name, arguments = payload.get("tool_name"), payload.get("tool_input")
     if not isinstance(name, str) or not isinstance(arguments, dict):
         return
-    call_id = payload.get("tool_use_id")
+    call_id, cwd = payload.get("tool_use_id"), payload.get("cwd")
     observe_tool_completion(
         session_id,
         tool_name=name,
@@ -613,4 +677,5 @@ def observe_hook(session_id: str, payload: dict[str, object]) -> None:
         result=payload.get("tool_response", payload.get("tool_output")),
         call_id=call_id if isinstance(call_id, str) else "",
         source="native_hook",
+        cwd=cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None,
     )
