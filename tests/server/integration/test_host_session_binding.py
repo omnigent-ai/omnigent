@@ -1712,7 +1712,7 @@ async def test_resume_reports_a_stuck_managed_wake_as_failed(
 
     monkeypatch.setattr(fake, "resume", _unreachable_resume)
     monkeypatch.setattr(managed_hosts, "MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S", 2.0)
-    monkeypatch.setattr(managed_hosts, "MANAGED_WAKE_TIMEOUT_S", 0.5, raising=False)
+    monkeypatch.setattr(managed_hosts, "MANAGED_WAKE_TIMEOUT_S", 0.5)
     stages: list[tuple[str, str | None]] = []
     monkeypatch.setattr(
         sessions_module,
