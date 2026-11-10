@@ -4,22 +4,22 @@ import { readLastSandboxProfile, writeLastSandboxProfile } from "./sandboxProfil
 afterEach(() => localStorage.clear());
 
 it("remembers the last profile per provider", () => {
-  expect(readLastSandboxProfile("arclet")).toBeNull();
-  writeLastSandboxProfile("arclet", "arm");
-  writeLastSandboxProfile("company", "build");
-  writeLastSandboxProfile("arclet", "x86");
-  expect(readLastSandboxProfile("arclet")).toBe("x86");
-  expect(readLastSandboxProfile("company")).toBe("build");
+  expect(readLastSandboxProfile("company")).toBeNull();
+  writeLastSandboxProfile("company", "small");
+  writeLastSandboxProfile("other", "build");
+  writeLastSandboxProfile("company", "large");
+  expect(readLastSandboxProfile("company")).toBe("large");
+  expect(readLastSandboxProfile("other")).toBe("build");
   expect(readLastSandboxProfile(null)).toBeNull();
 });
 
 it("ignores a malformed stored value", () => {
   localStorage.setItem("omnigent:last-sandbox-profile-by-provider", "[1,2]");
-  expect(readLastSandboxProfile("arclet")).toBeNull();
+  expect(readLastSandboxProfile("company")).toBeNull();
   localStorage.setItem(
     "omnigent:last-sandbox-profile-by-provider",
-    JSON.stringify({ arclet: 7, company: "build" }),
+    JSON.stringify({ company: 7, other: "build" }),
   );
-  expect(readLastSandboxProfile("arclet")).toBeNull();
-  expect(readLastSandboxProfile("company")).toBe("build");
+  expect(readLastSandboxProfile("company")).toBeNull();
+  expect(readLastSandboxProfile("other")).toBe("build");
 });

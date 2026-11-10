@@ -141,6 +141,22 @@ it("falls back to the provider default when the last launched profile is gone", 
   );
 });
 
+it("falls back to the provider default when looking up the last launched profile fails", async () => {
+  defaults = { company: "profile-3" };
+  const listPage = vi.mocked(fetchSandboxProfiles).getMockImplementation()!;
+  vi.mocked(fetchSandboxProfiles).mockImplementation(async (provider, options) => {
+    if (options?.profileId === "profile-30") throw new Error("lookup failed");
+    return listPage(provider, options);
+  });
+  mount(null, "profile-30");
+  expect(
+    await screen.findByRole("button", { name: "Sandbox profile: Build profile 3" }),
+  ).toBeTruthy();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Start" })).toHaveProperty("disabled", false),
+  );
+});
+
 it("launches the last launched profile on its current revision", async () => {
   available = rows.map((p) => (p.id === "profile-5" ? { ...p, revision: "v2" } : p));
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -155,11 +171,11 @@ it("launches the last launched profile on its current revision", async () => {
   );
 });
 
-it("keeps an explicit choice over the provider default", async () => {
+it("keeps an explicit choice over the last launched profile and the default", async () => {
   defaults = { company: "profile-3" };
-  const { onChange } = mount();
-  await screen.findByRole("button", { name: "Sandbox profile: Build profile 3" });
-  await open("Build profile 3");
+  const { onChange } = mount(null, "profile-4");
+  await screen.findByRole("button", { name: "Sandbox profile: Build profile 4" });
+  await open("Build profile 4");
   fireEvent.click(screen.getByRole("option", { name: /Build profile 5/ }));
   expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ id: "profile-5" }));
   expect(

@@ -59,10 +59,13 @@ export function useSandboxProfileCatalog(
   const explicit = required && value?.provider === provider ? value : null;
   const unpicked = required && explicit === null && provider !== null;
   // With nothing picked, start on the profile last launched here while the provider still
-  // lists it, else on the provider's default. Either may be beyond the first page.
+  // lists it, else on the provider's default. Either may be beyond the first page. The
+  // remembered one is only a preference, so failing to find it falls back too.
   const remembered = useProfileById(provider, profiles, unpicked ? rememberedProfileId : null);
   const defaultProfileId =
-    unpicked && provider !== null && (rememberedProfileId === null || remembered.missing)
+    unpicked &&
+    provider !== null &&
+    (rememberedProfileId === null || remembered.missing || remembered.failed)
       ? (query.data?.default_profile_ids?.[provider] ?? null)
       : null;
   const fallback = useProfileById(provider, profiles, defaultProfileId);
@@ -105,10 +108,7 @@ export function useSandboxProfileCatalog(
           fallback.fetching ||
           (selection && (selectedQuery.isPending || selectedQuery.isFetching))
         ? "Loading sandbox profiles…"
-        : query.isError ||
-            (selection && selectedQuery.isError) ||
-            remembered.failed ||
-            fallback.failed
+        : query.isError || (selection && selectedQuery.isError) || fallback.failed
           ? "Could not load sandbox profiles. Try again."
           : stale
             ? "This profile changed or is unavailable. Choose a profile again before launching."

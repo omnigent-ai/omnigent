@@ -1,11 +1,4 @@
-// Persisted, app-global preference for the sandbox profile the new-session
-// composer starts on, keyed by sandbox provider.
-//
-// Mirrors readLastSandboxProvider / readLastSandboxRepos: written when a session
-// starts, read to seed the profile picker on the next visit. Only the profile id
-// is stored. The picker resolves it against the provider's live catalog, so it
-// launches on the profile's current revision, and a profile that is no longer
-// listed falls back to the provider default.
+// Remembers the last started profile id per provider for the new-session composer.
 
 const STORAGE_KEY = "omnigent:last-sandbox-profile-by-provider";
 
