@@ -6752,6 +6752,7 @@
             "session.created": "#/components/schemas/SessionCreatedEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
+            "session.input.unconfirmed": "#/components/schemas/SessionInputUnconfirmedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
@@ -6825,6 +6826,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionInputConsumedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionInputUnconfirmedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionInterruptedEvent"
@@ -8126,6 +8130,19 @@
             "title": "Data",
             "type": "object"
           },
+          "delivery_outcome": {
+            "anyOf": [
+              {
+                "const": "delivery_unconfirmed",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Delivery Outcome"
+          },
           "item_id": {
             "description": "Stable identifier of the conversation item just persisted, e.g. `\"item_abc123\"`.",
             "title": "Item Id",
@@ -8143,6 +8160,102 @@
           "data"
         ],
         "title": "SessionInputConsumedPayload",
+        "type": "object"
+      },
+      "SessionInputUnconfirmedEvent": {
+        "description": "One native input has uncertain delivery; the running turn is unaffected.",
+        "properties": {
+          "delivery_attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Delivery Attempt Id"
+          },
+          "error": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Error",
+            "type": "object"
+          },
+          "input_enqueued_at_ms": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Input Enqueued At Ms"
+          },
+          "input_stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Input Stable Id"
+          },
+          "pending_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Pending Id"
+          },
+          "response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Response Id"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.input.unconfirmed",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionInputUnconfirmedEvent",
         "type": "object"
       },
       "SessionInterruptedEvent": {

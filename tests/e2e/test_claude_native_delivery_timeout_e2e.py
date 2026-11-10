@@ -76,64 +76,82 @@ _DELIVERY_BOUND_S = _SUBMIT_VERIFY_TIMEOUT_S + 5.0
 # argv[2] seconds -- stdin queues in the pty, exactly like a CPU-starved TUI
 # at submit time -- then recovers and processes the queued submit Enter, which
 # moves the draft into the transcript and clears the input box.
-_FAKE_CLAUDE_TUI = """\
-import os, sys, termios, time, tty
+_FAKE_CLAUDE_TUI = r"""
+import os
+import re
+import sys
+import termios
+import time
+import tty
 
-PROMPT_GLYPH = "\\u276f"
-RULE = "\\u2500" * 30
-STALL_TRIGGER = sys.argv[1]
-STALL_S = float(sys.argv[2])
+sys.path.insert(0, REPOSITORY_ROOT)
+from tests.harnesses.claude_native.test_claude_native_shell_mode_draft import _InputBox
+
+STALL_TRIGGER = sys.argv[1] if len(sys.argv) > 1 else ""
+STALL_S = float(sys.argv[2]) if len(sys.argv) > 2 else 0
+box = _InputBox("prompt", "")
 
 
-def render(draft, transcript):
-    sys.stdout.write("\\x1b[2J\\x1b[H")
-    for line in transcript:
-        sys.stdout.write(line + "\\r\\n")
-    sys.stdout.write(RULE + "\\r\\n")
-    sys.stdout.write(PROMPT_GLYPH + " " + draft + "\\r\\n")
-    sys.stdout.write(RULE + "\\r\\n")
+def render():
+    transcript = "\n".join("sent: " + text for _, text in box.submitted)
+    screen = (transcript + "\n" if transcript else "") + box.pane()
+    sys.stdout.write("\x1b[H\x1b[2J" + screen.replace("\n", "\r\n"))
     sys.stdout.flush()
+
+
+def insert(text):
+    box.draft = box.draft[:box.cursor] + text + box.draft[box.cursor:]
+    box.cursor += len(text)
 
 
 def main():
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setraw(fd)
-    chars = []
-    transcript = []
+    sys.stdout.write("\x1b[?2004h")
+    render()
+    pending = b""
     stalled = False
-    render("", transcript)
     try:
         while True:
-            data = os.read(fd, 1)
+            data = os.read(fd, 65536)
             if not data:
                 break
-            byte = data[0]
-            if byte == 3:  # Ctrl-C tears the pane down cleanly on teardown
-                break
-            if byte == 13:  # Enter submits a non-empty draft
-                if chars:
-                    transcript.append("sent: " + "".join(chars))
-                    chars = []
-                    render("", transcript)
-                continue
-            if byte < 0x20:
-                # Other control bytes (Escape, Ctrl-A/Ctrl-K, the ESC of
-                # bracketed-paste markers) are swallowed.
-                continue
-            chars.append(chr(byte))
-            render("".join(chars), transcript)
-            if not stalled and STALL_TRIGGER in "".join(chars):
-                # The draft has visibly committed; go unresponsive past the
-                # legacy fixed submit window while input queues in the pty.
-                stalled = True
-                time.sleep(STALL_S)
+            pending += data
+            while pending:
+                if pending.startswith(b"\x1b[200~"):
+                    if b"\x1b[201~" not in pending:
+                        break
+                    pasted, pending = pending[6:].split(b"\x1b[201~", 1)
+                    insert(pasted.decode().replace("\r", "\n"))
+                else:
+                    match = re.match(rb"\x1b\[\d+;5u", pending)
+                    if match:
+                        box.key(match[0].decode())
+                        pending = pending[len(match[0]):]
+                    elif pending.startswith(b"\x1b[") and len(pending) < 6:
+                        break
+                    else:
+                        byte, pending = pending[0], pending[1:]
+                        if byte == 3:
+                            return
+                        if byte == 13:
+                            if box.draft.strip():
+                                box.key("Enter")
+                        elif byte == 21:
+                            box.key("C-u")
+                        elif byte >= 32:
+                            insert(chr(byte))
+                render()
+                if not stalled and STALL_TRIGGER and STALL_TRIGGER in box.draft:
+                    stalled = True
+                    time.sleep(STALL_S)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 main()
-"""
+""".replace("REPOSITORY_ROOT", repr(str(Path(__file__).resolve().parents[2])))
 
 
 @pytest.fixture
