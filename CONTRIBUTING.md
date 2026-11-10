@@ -156,6 +156,11 @@ commit and push (`just ensure` does this as part of setup):
 just hooks            # or: uv run --no-sync pre-commit install
 ```
 
+Lockfiles: `uv.lock` follows the lock format of the uv version CI pins
+(`.github/actions/setup-uv`). The scheduled lockfile job migrates it when that
+pin moves, and Dependabot PRs get their lockfiles repaired automatically; a
+maintainer can still comment `/regen` on any same-repo PR to force it.
+
 Common checks:
 
 Pyrefly is the canonical Python type checker for the repository.

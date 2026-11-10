@@ -29,7 +29,10 @@ implements them separately, so a fix for one harness does not reach the others.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
-  an Omnigent session behind it.
+  an Omnigent session behind it. With `OMNIGENT_SESSION_ENV_PASSTHROUGH=NAME,...`
+  the named shell variables reach only the new runner that command launches; a
+  reused live runner keeps its launch values, and a later server-driven restart
+  starts without them.
 - `gateway-attribution`: Unity Gateway requests name the coding agent and the
   interface that created its session: desktop app, web UI, mobile, or CLI.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,
@@ -1238,6 +1241,12 @@ prompt and tool turn, then reload Chat: each persisted item appears once.
 Stall a history POST and confirm policy ALLOW/DENY still runs. A result must
 wait for its call to be accepted. Retries retain item IDs; repeated tool/message
 callbacks coalesce, while a repeated input callback is a separate prompt.
+A terminal prompt appears in Chat as soon as Pi accepts it, before turn
+routing or a pending settings change completes, and a queued steer stays
+visible while the current tool runs. A prompt Pi consumes without an `input`
+callback still appears once; an expanded skill or prompt template does not
+appear a second time, and prompts Pi discarded before consuming them do not
+hide later ones.
 For a Pi child, stall final-answer delivery: idle may update, but the parent
 must receive no completion until the answer is saved. Exhaust delivery and
 expect a failed result instead of an old answer. A later prompt must not extend
