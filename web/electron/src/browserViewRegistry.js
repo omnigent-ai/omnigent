@@ -26,6 +26,7 @@ const {
   isProxyAddress,
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
+const { recordNavigation } = require("./browserSystemHandoff");
 
 const DEFAULT_CAP = 10;
 
@@ -183,6 +184,12 @@ function createBrowserViewRegistry({
       // Last URL we EXPLICITLY requested (not getURL(), which drifts as the page
       // navigates) — lets openOrNavigate skip reissuing loadURL on a re-mount.
       lastRequestedUrl: "",
+      // Main-frame URLs, including redirect hops, since the last explicit
+      // navigation; the system-browser handoff reads it.
+      navigationTrail: [],
+      // Bumped on each main-frame navigation so a pending handoff can tell
+      // the tab moved on even when its committed URL didn't change.
+      navigationGeneration: 0,
       // Enables navigation guards; renderer IPC always sets it.
       navigationPolicyEnforced: false,
       agentContext: null,
@@ -221,8 +228,23 @@ function createBrowserViewRegistry({
     installWindowOpenPolicy(entry);
     attachViewContextMenu(entry);
     attachAgentNavGuard(conversationId, entry);
+    attachNavigationTrail(entry);
     attachRecentSessionInput(entry);
     return { ok: true, entry, created: true };
+  }
+
+  // Redirect hops never commit, so did-navigate alone would miss the sign-in
+  // URLs that name the page a blocked Google sign-in was heading to.
+  function attachNavigationTrail(entry) {
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.on !== "function") return;
+    const record = (details, url, isInPlace, isMainFrame) => {
+      if (!(details?.isMainFrame ?? isMainFrame) || (details?.isSameDocument ?? isInPlace)) return;
+      entry.navigationGeneration += 1;
+      recordNavigation(entry.navigationTrail, details?.url ?? url);
+    };
+    wc.on("did-start-navigation", record);
+    wc.on("did-redirect-navigation", record);
   }
 
   // Popups stay in this view: an agent-visited page opening the user's system
@@ -414,6 +436,15 @@ function createBrowserViewRegistry({
       allowLocalhost: allowsLocalhost(agentContext),
       partition: agentPartition(partitionScope, conversationId),
     });
+  }
+
+  // Trail URLs are page-controlled, and the trail can hold hops the guard
+  // cancelled, so a policy-enforced view hands off only URLs it could load.
+  async function checkSystemBrowserUrl(conversationId, url) {
+    const entry = get(conversationId);
+    if (!entry) return { ok: false, error: "No browser view" };
+    if (!entry.navigationPolicyEnforced) return { ok: true };
+    return checkAgentNavigationFor(conversationId, url, entry.agentContext);
   }
 
   function entryForWebContents(webContentsId) {
@@ -609,6 +640,9 @@ function createBrowserViewRegistry({
       // drifts with in-page nav — stops a re-mount from refreshing to the initial URL.
       if (created || force || entry.lastRequestedUrl !== url) {
         entry.lastRequestedUrl = url;
+        entry.navigationGeneration += 1;
+        entry.navigationTrail = [];
+        recordNavigation(entry.navigationTrail, url);
         try {
           entry.view.webContents.loadURL(url);
         } catch (e) {
@@ -747,6 +781,7 @@ function createBrowserViewRegistry({
     needsAgentViewRevocation,
     revokeAgentView,
     checkAgentNavigation: checkAgentNavigationFor,
+    checkSystemBrowserUrl,
     shouldCancelAgentRequest,
     agentRequestHeaders,
     shouldCancelAgentResponse,

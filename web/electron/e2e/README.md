@@ -37,6 +37,12 @@ backend — no real provider creds.
   with a cookie-carrying redirect follower, so it runs on macOS and Linux. Covers
   connect, silent renewal, relaunch, and sign-out, and asserts the app window
   never loads the IdP.
+- `desktop_system_browser_handoff.e2e.js` — the browser pane's "Continue in
+  browser" notice on Google's access-blocked page and its "Open in browser"
+  toolbar button. A preloaded https handler stands in for Google's redirect
+  chain, and `shell.openExternal` opens a window showing the URL it received.
+  Its clips are temporary unless you keep them outside the tracked tree, e.g.
+  `OMNIGENT_DESKTOP_RECORD_DIR=/tmp/handoff-clips node --test e2e/desktop_system_browser_handoff.e2e.js`.
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.

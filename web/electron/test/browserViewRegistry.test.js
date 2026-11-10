@@ -446,6 +446,7 @@ function makeEventCapturingRegistry(extra = {}) {
     },
     fireContextMenu: (params) => handlers["context-menu"]({}, params),
     windowOpen: (url) => windowOpenHandler({ url }),
+    emit: (event, ...args) => handlers[event](...args),
   };
 }
 
@@ -1326,6 +1327,86 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     const alias = { webContentsId, url: "http://lvh.me:5173/", ip: "127.0.0.1" };
     assert.equal(await registry.shouldCancelAgentRequest(alias), true);
     assert.equal(await registry.shouldCancelAgentResponse(alias), true);
+  });
+});
+
+describe("browserViewRegistry — navigation trail", () => {
+  const mainFrame = (url) => ({ url, isMainFrame: true, isSameDocument: false });
+
+  it("records main-frame starts and redirect hops since the last explicit navigation", () => {
+    const { registry, emit } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://docs.google.com/document/d/1");
+    const opened = registry.get("conv_1").navigationGeneration;
+    emit("did-redirect-navigation", mainFrame("https://accounts.google.com/ServiceLogin"));
+    emit("did-start-navigation", {
+      url: "https://ads.example/frame",
+      isMainFrame: false,
+      isSameDocument: false,
+    });
+    emit("did-start-navigation", {
+      url: "https://accounts.google.com/ServiceLogin#step",
+      isMainFrame: true,
+      isSameDocument: true,
+    });
+    emit("did-redirect-navigation", mainFrame("https://access.workspace.google.com/remediate"));
+    assert.deepEqual(registry.get("conv_1").navigationTrail, [
+      "https://docs.google.com/document/d/1",
+      "https://accounts.google.com/ServiceLogin",
+      "https://access.workspace.google.com/remediate",
+    ]);
+    // Only the two main-frame hops count as navigations.
+    assert.equal(registry.get("conv_1").navigationGeneration, opened + 2);
+
+    registry.openOrNavigate("conv_1", "https://example.com/");
+    assert.deepEqual(registry.get("conv_1").navigationTrail, ["https://example.com/"]);
+    assert.equal(registry.get("conv_1").navigationGeneration, opened + 3);
+  });
+
+  it("accepts the deprecated positional navigation arguments", () => {
+    const { registry, emit } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/");
+    emit("did-start-navigation", {}, "https://example.com/next", false, true);
+    emit("did-start-navigation", {}, "https://example.com/frame", false, false);
+    emit("did-start-navigation", {}, "https://example.com/next#hash", true, true);
+    assert.deepEqual(registry.get("conv_1").navigationTrail, [
+      "https://example.com/",
+      "https://example.com/next",
+    ]);
+  });
+});
+
+describe("browserViewRegistry — system-browser handoff policy", () => {
+  it("applies the view's own navigation policy only when it is enforced", async () => {
+    const { registry } = makeNetworkGuardRegistry({
+      allowsLocalhost: (context) => context?.hostIsThisMachine === true,
+    });
+    registry.openOrNavigate("agent", "https://example.com/", undefined, { agent: true });
+    registry.openOrNavigate("local", "https://example.com/", undefined, {
+      agent: true,
+      agentContext: { hostIsThisMachine: true },
+    });
+    registry.openOrNavigate("user", "https://example.com/");
+
+    assert.deepEqual(await registry.checkSystemBrowserUrl("agent", "https://example.com/doc"), {
+      ok: true,
+    });
+    const refused = ["http://192.168.1.1/", "http://lvh.me:5173/", "https://unresolved.test/"];
+    const verdicts = await Promise.all(
+      refused.map((url) => registry.checkSystemBrowserUrl("agent", url)),
+    );
+    assert.deepEqual(
+      verdicts.map((verdict) => verdict.ok),
+      [false, false, false],
+    );
+    assert.equal(
+      (await registry.checkSystemBrowserUrl("local", "http://127.0.0.1:5173/")).ok,
+      true,
+    );
+    assert.equal((await registry.checkSystemBrowserUrl("user", "http://192.168.1.1/")).ok, true);
+    assert.deepEqual(await registry.checkSystemBrowserUrl("missing", "https://example.com/"), {
+      ok: false,
+      error: "No browser view",
+    });
   });
 });
 

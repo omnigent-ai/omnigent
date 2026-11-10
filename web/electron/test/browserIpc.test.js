@@ -465,7 +465,12 @@ function nonceFromScripts(scripts) {
 /** Build a registry stub around one entry keyed by conversationId. */
 function makeRegistry(conversationId, webContents) {
   const entries = new Map();
-  if (conversationId) entries.set(conversationId, { view: { webContents } });
+  const makeEntry = (wc) => ({
+    view: { webContents: wc },
+    navigationGeneration: 0,
+    navigationTrail: [],
+  });
+  if (conversationId) entries.set(conversationId, makeEntry(webContents));
   const suppressedCalls = []; // booleans passed to setSuppressed, in order
   const recentSessionSupportCalls = [];
   let recentSessionCancelCount = 0;
@@ -474,9 +479,10 @@ function makeRegistry(conversationId, webContents) {
     has: (id) => entries.has(id),
     beginAgentNavigation: () => () => true,
     checkAgentNavigation: allowAgentNavigation,
+    checkSystemBrowserUrl: allowAgentNavigation,
     openOrNavigate: (id) => {
       const wc = makeWebContents();
-      const entry = { view: { webContents: wc } };
+      const entry = makeEntry(wc);
       entries.set(id, entry);
       return { ok: true, created: true, entry };
     },
@@ -510,6 +516,7 @@ function setup({
   platform = "darwin",
   confirmCookieImport = async () => true,
   getWindowForEvent = () => null,
+  openExternal = async () => {},
 } = {}) {
   const ipcMain = makeIpcMain();
   const wc = webContents ?? makeWebContents();
@@ -524,16 +531,15 @@ function setup({
     platform,
     confirmCookieImport,
     getWindowForEvent,
+    openExternal,
   });
   return { ipcMain, registry, wc, sent, event };
 }
 
 it("restores URL, title and history state for the requested browser tab only", () => {
   const viewId = "browser-tab:conv_1:tab-two";
-  const { ipcMain, event } = setup({
-    conversationId: viewId,
-    webContents: makeWebContents({ canBack: true, title: "Restored page" }),
-  });
+  const webContents = makeWebContents({ canBack: true, title: "Restored page" });
+  const { ipcMain, event } = setup({ conversationId: viewId, webContents });
   assert.deepEqual(ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId }), {
     exists: true,
     hostIsThisMachine: false,
@@ -541,7 +547,14 @@ it("restores URL, title and history state for the requested browser tab only", (
     title: "Restored page",
     canGoBack: true,
     canGoForward: false,
+    googleAccessBlocked: false,
   });
+  webContents.getURL = () => "https://access.workspace.google.com/remediate?flow=caa";
+  assert.equal(
+    ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId })
+      .googleAccessBlocked,
+    true,
+  );
   assert.deepEqual(
     ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: "conv_1" }),
     { exists: false },
@@ -639,6 +652,7 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-go-forward",
       "omnigent:browser-reload",
       "omnigent:open-browser-devtools",
+      "omnigent:browser-open-in-system-browser",
       "omnigent:browser-enable-design-mode",
       "omnigent:browser-disable-design-mode",
       "omnigent:browser-signal-design-result",
@@ -656,6 +670,7 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-go-forward",
       "omnigent:browser-reload",
       "omnigent:open-browser-devtools",
+      "omnigent:browser-open-in-system-browser",
       "omnigent:browser-perform-action",
       "omnigent:browser-execute",
       "omnigent:browser-chrome-cookie-preview",
@@ -1130,6 +1145,137 @@ describe("browserIpc — Chrome cookie import", () => {
   });
 });
 
+describe("browserIpc — open in system browser", () => {
+  const BLOCKED = "https://access.workspace.google.com/remediate?continue=x";
+
+  function setupHandoff({ url, requestedUrl, navigationTrail, openExternal }) {
+    const opened = [];
+    const wc = makeWebContents();
+    wc.getURL = () => url;
+    const ctx = setup({
+      webContents: wc,
+      openExternal:
+        openExternal ??
+        (async (target) => {
+          opened.push(target);
+        }),
+    });
+    if (navigationTrail) ctx.registry.get("conv_1").navigationTrail = navigationTrail;
+    if (requestedUrl) ctx.registry.get("conv_1").lastRequestedUrl = requestedUrl;
+    const invoke = (conversationId = "conv_1") =>
+      ctx.ipcMain.invoke("omnigent:browser-open-in-system-browser", ctx.event, {
+        conversationId,
+      });
+    return { ...ctx, opened, invoke };
+  }
+
+  it("opens the tab's current page", async () => {
+    const { invoke, opened } = setupHandoff({ url: "https://example.com/page" });
+    assert.deepEqual(await invoke(), { ok: true, url: "https://example.com/page" });
+    assert.deepEqual(opened, ["https://example.com/page"]);
+  });
+
+  it("opens the page the blocked sign-in was continuing to", async () => {
+    const { invoke, opened } = setupHandoff({
+      url: BLOCKED,
+      requestedUrl: "https://docs.google.com/document/d/1",
+      navigationTrail: [
+        "https://docs.google.com/document/d/1",
+        "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fdocs.google.com%2Fdocument%2Fd%2F1",
+        BLOCKED,
+      ],
+    });
+    const result = await invoke();
+    assert.equal(result.ok, true);
+    assert.deepEqual(opened, ["https://docs.google.com/document/d/1"]);
+  });
+
+  it("skips hosts the view's policy refuses, checking each host once", async () => {
+    const DOC = "https://docs.google.com/document/d/1";
+    const NEWER_DOC = "https://docs.google.com/document/d/2";
+    const ctx = setupHandoff({
+      url: BLOCKED,
+      requestedUrl: DOC,
+      navigationTrail: [DOC, NEWER_DOC, BLOCKED],
+    });
+    const checked = [];
+    ctx.registry.checkSystemBrowserUrl = async (_conversationId, candidate) => {
+      checked.push(candidate);
+      return new URL(candidate).hostname === "docs.google.com"
+        ? { ok: false, error: "navigation blocked" }
+        : { ok: true };
+    };
+    assert.deepEqual(await ctx.invoke(), { ok: true, url: BLOCKED });
+    assert.deepEqual(checked, [NEWER_DOC, BLOCKED]);
+
+    ctx.registry.checkSystemBrowserUrl = async () => ({ ok: false, error: "navigation blocked" });
+    assert.deepEqual(await ctx.invoke(), { ok: false, error: "navigation blocked" });
+    assert.deepEqual(ctx.opened, [BLOCKED]);
+  });
+
+  it("opens nothing when the tab moves on or closes during the policy check", async () => {
+    const ctx = setupHandoff({ url: "https://example.com/page" });
+    const entry = ctx.registry.get("conv_1");
+    const wc = entry.view.webContents;
+    const changed = { ok: false, error: "The page changed. Try again." };
+    ctx.registry.checkSystemBrowserUrl = async () => {
+      wc.getURL = () => "https://example.com/next";
+      return { ok: true };
+    };
+    assert.deepEqual(await ctx.invoke(), changed);
+
+    // A navigation that hasn't committed leaves the URL as it was.
+    wc.getURL = () => "https://example.com/page";
+    let allow;
+    ctx.registry.checkSystemBrowserUrl = () =>
+      new Promise((resolve) => {
+        allow = resolve;
+      });
+    const pending = ctx.invoke();
+    await new Promise(setImmediate);
+    entry.navigationGeneration += 1;
+    allow({ ok: true });
+    assert.deepEqual(await pending, changed);
+
+    ctx.registry.checkSystemBrowserUrl = async () => {
+      wc.getURL = () => {
+        throw new Error("Object has been destroyed");
+      };
+      return { ok: true };
+    };
+    assert.deepEqual(await ctx.invoke(), changed);
+
+    // The pane reopened the tab with a fresh view at the same URL.
+    wc.getURL = () => "https://example.com/page";
+    ctx.registry.checkSystemBrowserUrl = async () => {
+      ctx.registry.openOrNavigate("conv_1").entry.view.webContents.getURL = wc.getURL;
+      return { ok: true };
+    };
+    assert.deepEqual(await ctx.invoke(), changed);
+    assert.deepEqual(ctx.opened, []);
+  });
+
+  it("refuses a missing view or a tab with no web page", async () => {
+    const { invoke, opened } = setupHandoff({ url: "about:blank" });
+    assert.deepEqual(await invoke("conv_missing"), { ok: false, error: "No browser view" });
+    assert.deepEqual(await invoke(), { ok: false, error: "This tab has no web page to open." });
+    assert.deepEqual(opened, []);
+  });
+
+  it("reports a failure to launch the browser", async () => {
+    const { invoke } = setupHandoff({
+      url: "https://example.com/",
+      openExternal: async () => {
+        throw new Error("no handler");
+      },
+    });
+    assert.deepEqual(await invoke(), {
+      ok: false,
+      error: "Couldn't open your browser.",
+    });
+  });
+});
+
 describe("browserIpc — devtools toggle", () => {
   it("opens devtools docked bottom when closed, closes when open", async () => {
     const wc = makeWebContents();
@@ -1161,6 +1307,7 @@ describe("browserIpc — url live-tracking", () => {
       conversationId: viewId,
       url: "https://example.com/after-redirect",
       title: "Redirected page",
+      googleAccessBlocked: false,
     });
     assert.equal(navEvents.length, 1);
     assert.equal(navEvents[0].payload.conversationId, viewId);
@@ -1168,7 +1315,12 @@ describe("browserIpc — url live-tracking", () => {
     wc.emit("page-title-updated", "Changed title");
     assert.deepEqual(sent.at(-1), {
       channel: "browser-url-changed",
-      payload: { conversationId: viewId, url: wc.getURL(), title: "Changed title" },
+      payload: {
+        conversationId: viewId,
+        url: wc.getURL(),
+        title: "Changed title",
+        googleAccessBlocked: false,
+      },
     });
 
     wc.getURL = () => "https://example.com/untitled";
@@ -1176,8 +1328,13 @@ describe("browserIpc — url live-tracking", () => {
     wc.emit("did-finish-load");
     assert.deepEqual(sent.at(-1), {
       channel: "browser-url-changed",
-      payload: { conversationId: viewId, url: wc.getURL(), title: "" },
+      payload: { conversationId: viewId, url: wc.getURL(), title: "", googleAccessBlocked: false },
     });
+
+    wc.getURL = () => "https://access.workspace.google.com/remediate?flow=caa";
+    wc.emit("did-navigate", wc.getURL());
+    const blockedEvents = sent.filter((s) => s.channel === "browser-url-changed");
+    assert.equal(blockedEvents.at(-1).payload.googleAccessBlocked, true);
   });
 
   it("did-navigate-in-page only emits for the main frame", async () => {
