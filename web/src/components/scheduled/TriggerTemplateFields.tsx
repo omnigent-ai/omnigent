@@ -24,6 +24,7 @@ import {
   TRIGGER_SCOPE_OPERATOR_LABELS,
   TRIGGER_TEMPLATES,
   triggerConditionFields,
+  triggerConditionFilledIn,
   triggerEvent,
   triggerEventDescription,
   triggerOperatorLabel,
@@ -274,6 +275,16 @@ export function TriggerTemplateFields({
                     ))}
                   </SelectContent>
                 </Select>
+                {field.namePlaceholder !== undefined && (
+                  <Input
+                    value={condition.name ?? ""}
+                    placeholder={field.namePlaceholder}
+                    aria-label={`${field.label} name`}
+                    data-testid={`task-trigger-condition-${index}-name`}
+                    className={cn(CHIP, "w-36 placeholder:text-primary/50")}
+                    onChange={(e) => setCondition(index, { ...condition, name: e.target.value })}
+                  />
+                )}
                 {field.operators.length > 1 ? (
                   <Select
                     value={condition.operator}
@@ -364,9 +375,7 @@ export function TriggerTemplateFields({
             </Button>
           </div>
         </div>
-        {fields.conditions.some(
-          (c) => !VALUELESS_OPERATORS.has(c.operator) && c.value.trim() === "",
-        ) && (
+        {!fields.conditions.every(triggerConditionFilledIn) && (
           <p className="text-sm text-muted-foreground" data-testid="task-trigger-empty-condition">
             Fill in or remove each condition.
           </p>
