@@ -2721,9 +2721,12 @@ function NewChatLandingContent({
   const effectiveSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
   // The profile last picked on this provider seeds the picker, like the last provider.
+  // Reread after each pick, so a composer reset in place (another project) starts on it.
+  const [sandboxProfilePicks, setSandboxProfilePicks] = useState(0);
   const rememberedSandboxProfileId = useMemo(
     () => readLastSandboxProfile(effectiveSandboxProvider),
-    [effectiveSandboxProvider],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- a pick changes the stored value
+    [effectiveSandboxProvider, sandboxProfilePicks],
   );
   const { launchError: sandboxProfileError, selection: selectedSandboxProfile } =
     useSandboxProfileCatalog(
@@ -6843,7 +6846,10 @@ function NewChatLandingContent({
             onChange={(profile) => {
               setSandboxProfile(profile);
               // Saved on pick, like the agent, harness and sandbox provider.
-              if (profile) writeLastSandboxProfile(profile.provider, profile.id);
+              if (profile) {
+                writeLastSandboxProfile(profile.provider, profile.id);
+                setSandboxProfilePicks((picks) => picks + 1);
+              }
             }}
             rememberedProfileId={rememberedSandboxProfileId}
           />

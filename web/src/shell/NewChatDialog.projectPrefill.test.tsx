@@ -663,17 +663,15 @@ describe("NewChatLandingScreen project prefill", () => {
     rerender(<NewChatLandingScreen />);
 
     // The sticky host pick re-selects the sandbox, but Alpha's staged repo
-    // is gone.
+    // is gone. The profile picked in Alpha is the last picked, so Beta starts on it.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("Repository"),
     );
-    const picker = screen.getByRole("button", { name: "Sandbox profile: Choose profile" });
+    expect(
+      await screen.findByRole("button", { name: "Sandbox profile: Large workspace" }),
+    ).toBeVisible();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
-    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
-    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    expect(authenticatedFetch).not.toHaveBeenCalled();
-    fireEvent.click(picker);
-    fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
     const body = await submitAndReadBody();
     expect(body.host_type).toBe("managed");
     // No repos carried over → an empty workspaces list; workspace stays pinned
