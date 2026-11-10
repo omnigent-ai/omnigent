@@ -217,6 +217,12 @@ async def test_worker_project_override_requires_standalone_mode(
     assert SqlAlchemyConversationStore(db_uri).get_conversation(source["id"]).family_id is None
 
 
+# The project tools do not depend on the sibling-sessions environment.
+_ONE_ENVIRONMENT = pytest.mark.parametrize(
+    "orchestration_environment", [True], indirect=True, ids=["nested"]
+)
+
+
 @pytest.fixture
 async def peers(auth_client, db_uri, monkeypatch):
     source = await _create_session_as(auth_client, "", "alice")
@@ -238,6 +244,7 @@ async def _project_tool(client, source, tool_name, **arguments):
     )
 
 
+@_ONE_ENVIRONMENT
 async def test_project_tools_list_and_bulk_move_running_sessions(auth_client, peers, db_uri):
     source, target, captured = peers
     store = SqlAlchemyConversationStore(db_uri)
@@ -247,7 +254,6 @@ async def test_project_tools_list_and_bulk_move_running_sessions(auth_client, pe
 
     listed = await _project_tool(auth_client, source, "sys_project_list")
     assert {"name": "Release prep", "id": existing_id} in listed["projects"]
-    assert {"name": "Legacy folder", "id": None} in listed["projects"]
     rows = {row["session_id"]: row for row in listed["sessions"]}
     assert rows[source["id"]]["project"] is None and rows[source["id"]]["this_session"]
     assert rows[target["id"]]["project"] == "Legacy folder"
@@ -287,6 +293,7 @@ async def test_project_tools_list_and_bulk_move_running_sessions(auth_client, pe
     assert store.get_conversation(target["id"]).project_id is None
 
 
+@_ONE_ENVIRONMENT
 async def test_project_move_refuses_sessions_per_session(auth_client, peers, db_uri):
     source, target, _ = peers
     store = SqlAlchemyConversationStore(db_uri)
@@ -306,7 +313,7 @@ async def test_project_move_refuses_sessions_per_session(auth_client, peers, db_
     )
     errors = {r["session_id"]: r.get("error", "") for r in moved["results"]}
     assert "not found" in errors[others["id"]]
-    assert "follow their parent" in errors[child.id]
+    assert f"follow their parent; move {source['id']} instead" in errors[child.id]
     assert f"move {target['id']} instead" in errors[family_member["id"]]
     assert errors["not-a-session"] == "invalid session ID"
     assert moved["results"][-1]["status"] == "moved"
@@ -320,6 +327,7 @@ async def test_project_move_refuses_sessions_per_session(auth_client, peers, db_
     assert store.get_conversation(family_member["id"]).project_id is not None
 
 
+@_ONE_ENVIRONMENT
 async def test_project_move_refuses_a_source_shared_with_edit_access(auth_client, peers, db_uri):
     source, target, _ = peers
     permissions = SqlAlchemyPermissionStore(db_uri)

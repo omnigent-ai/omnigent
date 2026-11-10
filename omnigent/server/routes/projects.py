@@ -18,7 +18,7 @@ import asyncio
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
@@ -35,6 +35,9 @@ from omnigent.server.session_orchestration import require_named_source_private
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
+
+_DEFAULT_PROJECT_PAGE = 50
+_MAX_PROJECT_PAGE = 200
 
 
 def _to_response(project: Project) -> dict[str, Any]:
@@ -105,14 +108,43 @@ def create_projects_router(
         return _to_response(project)
 
     @router.get("/projects")
-    async def list_projects(request: Request) -> dict[str, Any]:
+    async def list_projects(
+        request: Request,
+        limit: int | None = Query(default=None, ge=1, le=_MAX_PROJECT_PAGE),
+        after: str | None = None,
+    ) -> dict[str, Any]:
         """List the caller's projects.
 
+        Without ``limit`` or ``after`` this returns every project in the
+        caller's display order, as the sidebar needs. With either, it returns
+        one creation-ordered page.
+
         :param request: The incoming request, used to identify the user.
-        :returns: ``{"object": "list", "data": [...]}``.
-        :raises OmnigentError: 401 if unauthenticated in multi-user mode.
+        :param limit: Page size, e.g. ``50``.
+        :param after: The previous page's ``last_id``.
+        :returns: ``{"object": "list", "data": [...]}``, plus ``first_id``,
+            ``last_id`` and ``has_more`` for a page.
+        :raises OmnigentError: 401 if unauthenticated in multi-user mode, 400
+            for an unknown ``after``.
         """
         user_id = require_user(request, auth_provider)
+        if limit is not None or after is not None:
+            try:
+                page, has_more = await asyncio.to_thread(
+                    project_store.list_page,
+                    user_id=user_id,
+                    limit=limit or _DEFAULT_PROJECT_PAGE,
+                    after_id=after,
+                )
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            return {
+                "object": "list",
+                "data": [_to_response(p) for p in page],
+                "first_id": page[0].id if page else None,
+                "last_id": page[-1].id if page else None,
+                "has_more": has_more,
+            }
 
         def read_projects() -> list[Project]:
             return apply_project_order(

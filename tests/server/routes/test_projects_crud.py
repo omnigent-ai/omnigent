@@ -117,6 +117,40 @@ async def test_list_projects(project_client: httpx.AsyncClient) -> None:
     assert {p["name"] for p in body["data"]} == {"A", "B"}
 
 
+async def test_list_projects_pages_in_creation_order(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """A ``limit``/``after`` request pages the caller's own projects without gaps."""
+    for name in ("First", "Second", "Third"):
+        await multi_user_client.post("/v1/projects", json={"name": name}, headers=_as_user(ALICE))
+    bob = await multi_user_client.post("/v1/projects", json={"name": "Bob"}, headers=_as_user(BOB))
+
+    first = await multi_user_client.get(
+        "/v1/projects", params={"limit": 2}, headers=_as_user(ALICE)
+    )
+    assert first.status_code == 200, first.text
+    page = first.json()
+    assert len(page["data"]) == 2
+    assert page["has_more"] is True and page["last_id"] == page["data"][-1]["id"]
+
+    rest = await multi_user_client.get(
+        "/v1/projects", params={"limit": 2, "after": page["last_id"]}, headers=_as_user(ALICE)
+    )
+    assert rest.json()["has_more"] is False
+    paged = [p["name"] for p in page["data"] + rest.json()["data"]]
+    # Projects created in the same second fall back to id order.
+    assert sorted(paged) == ["First", "Second", "Third"]
+
+    foreign = await multi_user_client.get(
+        "/v1/projects", params={"after": bob.json()["id"]}, headers=_as_user(ALICE)
+    )
+    assert foreign.status_code == 400
+    oversized = await multi_user_client.get(
+        "/v1/projects", params={"limit": 201}, headers=_as_user(ALICE)
+    )
+    assert oversized.status_code == 422
+
+
 async def test_get_project(project_client: httpx.AsyncClient) -> None:
     """A created project can be fetched by id; unknown ids 404."""
     created = (await project_client.post("/v1/projects", json={"name": "X"})).json()

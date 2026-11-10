@@ -17,12 +17,14 @@ class SysProjectListTool(Tool):
     @classmethod
     def description(cls) -> str:
         return (
-            "List the user's projects (the sidebar folders, in display order) and their "
-            "own sessions with each session's current project, most recently updated "
-            "first. A session whose project is null is unfiled; this_session marks the "
-            'session calling the tool. Filter by project name, or pass project "" for '
-            "unfiled sessions only. A session with moves_with is in a family and moves "
-            "with that session. Use sys_session_move to file sessions into a project."
+            "List the user's projects, oldest first, and their own sessions with each "
+            "session's current project, most recently updated first. Both lists are "
+            "paged by limit: pass next_cursor as after for more sessions and "
+            "projects_next_cursor as projects_after for more projects. A session whose "
+            "project is null is unfiled; this_session marks the session calling the "
+            'tool. Filter sessions by project name, or pass project "" for unfiled '
+            "sessions only. A session with moves_with is in a family and moves with "
+            "that session. Use sys_session_move to file sessions into a project."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -46,11 +48,20 @@ class SysProjectListTool(Tool):
                             "type": "integer",
                             "minimum": 1,
                             "maximum": MAX_LISTED_SESSIONS,
-                            "description": "Maximum sessions to return (default 50).",
+                            "description": (
+                                "Maximum sessions, and separately projects, to return "
+                                "(default 50)."
+                            ),
                         },
                         "after": {
                             "type": "string",
-                            "description": "next_cursor from a previous call, for the next page.",
+                            "description": "next_cursor from a previous call, for more sessions.",
+                        },
+                        "projects_after": {
+                            "type": "string",
+                            "description": (
+                                "projects_next_cursor from a previous call, for more projects."
+                            ),
                         },
                     },
                     "additionalProperties": False,

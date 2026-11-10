@@ -69,17 +69,20 @@ MCP independent creation.
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
   kept session starts one worker per match (`docs/AUTOMATIONS.md`).
-- `projects`: `sys_project_list` lists the owner's projects in sidebar order and
-  their own sessions with each one's project, marking the calling session.
+- `projects`: `sys_project_list` pages the owner's projects oldest first and
+  their own sessions with each one's project, marking the calling session; a
+  legacy label folder shows only as a session's project.
   `sys_session_move` files up to 100 of those sessions into a project by name,
-  creating a missing project, or unfiles them with `""`, through the sidebar's
-  move request. An open sidebar regroups without a reload; a collapsed folder
-  stays collapsed. Moving changes only folder membership,
-  so running sessions, including the caller, keep their turn. Sub-agents follow
-  their parent and a family moves through its representative (`moves_with`);
-  each session gets its own result. An edit-shared caller cannot move sessions
-  or create a project through the move, while listing stays an ordinary owner
-  read. `tool_groups.projects: false` drops both tools. Covered by
+  creating a missing project only when some session can move, or unfiles them
+  with `""`, through the sidebar's move request. An open sidebar regroups
+  without a reload; a collapsed folder stays collapsed. Moving changes only
+  folder membership, so running sessions, including the caller, keep their
+  turn. Sub-agents follow their parent and a family moves through its
+  representative; each refusal names the session to move instead, and each
+  session gets its own result. An edit-shared caller cannot move sessions or
+  create a project through the move, while listing stays an ordinary owner
+  read. Moves refuse to run against a server that does not advertise
+  `session_move_source_checks` in `/v1/info`. `tool_groups.projects: false` drops both tools. Covered by
   `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_bulk_move_running_sessions`
   and the browser journeys in
   `tests/e2e_ui/sessions/test_agent_moves_sessions_to_project.py`.
