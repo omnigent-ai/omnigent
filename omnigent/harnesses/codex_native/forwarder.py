@@ -13,10 +13,11 @@ import shlex
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
@@ -5213,28 +5214,32 @@ async def _handle_terminal_turn_boundary_inner(
         params,
         forwarder_state=forwarder_state,
     )
-    if delta_coalescer is not None:
-        await delta_coalescer.flush()
-    # Safety net: if a compaction was reported in progress but Codex never
-    # emitted a completion signal we recognize (e.g. a protocol-spelling
-    # drift), force the spinner closed at the turn boundary so it can't hang.
-    if forwarder_state is not None and forwarder_state.compaction_status_posted == "in_progress":
-        await _post_compaction_status(
-            client, session_id, "completed", forwarder_state=forwarder_state
+    with _turn_status_publication_scope(session_id, terminal.edge, phase="before_status"):
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        # Safety net: if a compaction was reported in progress but Codex never
+        # emitted a completion signal we recognize (e.g. a protocol-spelling
+        # drift), force the spinner closed at the turn boundary so it can't hang.
+        if (
+            forwarder_state is not None
+            and forwarder_state.compaction_status_posted == "in_progress"
+        ):
+            await _post_compaction_status(
+                client, session_id, "completed", forwarder_state=forwarder_state
+            )
+        await _maybe_persist_interrupted_partial_text(
+            client,
+            session_id=session_id,
+            method=method,
+            params=params,
+            forwarder_state=forwarder_state,
         )
-    await _maybe_persist_interrupted_partial_text(
-        client,
-        session_id=session_id,
-        method=method,
-        params=params,
-        forwarder_state=forwarder_state,
-    )
-    await _flush_turn_diff(
-        client,
-        session_id=session_id,
-        params=params,
-        forwarder_state=forwarder_state,
-    )
+        await _flush_turn_diff(
+            client,
+            session_id=session_id,
+            params=params,
+            forwarder_state=forwarder_state,
+        )
     terminal_turn_id = _terminal_turn_id_from_params(params)
     if forwarder_state is not None and terminal_turn_id is not None:
         forwarder_state.forget_user_message_copies(terminal_turn_id)
@@ -8553,16 +8558,49 @@ async def _post_turn_status_edge(
             output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
         elif output == _CODEX_OUTPUT_LIMIT_ERROR:
             output = f"{output}\n\n{_CODEX_OUTPUT_LIMIT_HINT}"
-    await _post_status(
-        client,
-        session_id,
-        edge.status,
-        response_id=response_id,
-        output=output,
-        reauth_required=reauth_required,
-        compaction_model=edge.compaction_model,
-        selected_model=edge.selected_model,
-    )
+    with _turn_status_publication_scope(session_id, edge, phase="status_post"):
+        await _post_status(
+            client,
+            session_id,
+            edge.status,
+            response_id=response_id,
+            output=output,
+            reauth_required=reauth_required,
+            compaction_model=edge.compaction_model,
+            selected_model=edge.selected_model,
+        )
+
+
+@contextlib.contextmanager
+def _turn_status_publication_scope(
+    session_id: str,
+    edge: _CodexTurnStatusEdge | None,
+    *,
+    phase: Literal["before_status", "status_post"],
+) -> Iterator[None]:
+    """Record exceptions before or during a derived turn status publication."""
+    try:
+        yield
+    except Exception as exc:
+        if edge is not None:
+            _logger.warning(
+                "Codex turn status publication failed: status=%s phase=%s",
+                edge.status,
+                phase,
+                extra=debug_event(
+                    "codex_turn_status_publication_failed",
+                    session_id=session_id,
+                    turn_id=edge.turn_id,
+                    intended_status=edge.status,
+                    protocol_source=edge.source[:128],
+                    delivery_phase=phase,
+                    exception_type=type(exc).__name__,
+                    exception_cause_type=(
+                        type(exc.__cause__).__name__ if exc.__cause__ is not None else None
+                    ),
+                ),
+            )
+        raise
 
 
 async def _post_external_elicitation_resolved(
