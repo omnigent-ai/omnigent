@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -17,6 +19,12 @@ from omnigent.native._native_supersession import clear_replacement_create_body
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.managed_hosts import (
+    ManagedLaunchTracker,
+    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
+    read_managed_repo_workspaces,
+)
 from omnigent.server.routes._session_create_validation import (
     resolve_project_session_create,
 )
@@ -29,6 +37,7 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.server.helpers import build_agent_bundle
@@ -105,6 +114,76 @@ async def test_omitted_values_are_filled_and_membership_is_immediate(
     assert body["agent_id"] == CUSTOM_AGENT_ID
     assert body["workspace"] == "/work/project"
     assert body["project_id"] == project_id
+
+
+@pytest.mark.parametrize("multipart", [False, True], ids=["json", "multipart"])
+async def test_managed_project_defaults_reach_launch(
+    project_create_client: httpx.AsyncClient,
+    project_create_app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    multipart: bool,
+) -> None:
+    from omnigent.server.routes.sessions import routes_core
+
+    project_create_app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://server.example.com",
+            provider="provider",
+            launcher_factory=lambda: pytest.fail("managed launch is stubbed"),
+            token_ttl_s=3600,
+        )
+    )
+    project_create_app.state.host_store = HostStore(db_uri)
+    project_create_app.state.managed_launches = ManagedLaunchTracker()
+    launched = asyncio.get_running_loop().create_future()
+
+    async def capture_launch(**kwargs: Any) -> None:
+        kwargs["tracker"].finish(kwargs["session_id"])
+        launched.set_result(kwargs)
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", capture_launch)
+    project_id = await _project(
+        project_create_client,
+        {
+            "agent_id": CUSTOM_AGENT_ID,
+            "host_id": "__sandbox__",
+            "sandbox_provider": "provider",
+            "repository": {"url": "https://git.example.com/team/sample.git", "branch": "release"},
+        },
+    )
+    payload = {"project_id": project_id, "host_type": "managed"}
+    response = await project_create_client.post(
+        "/v1/sessions",
+        headers=_headers(),
+        **(
+            {
+                "data": {"metadata": json.dumps(payload)},
+                "files": {
+                    "bundle": (
+                        "agent.tar.gz",
+                        build_agent_bundle(name="project-upload"),
+                        "application/gzip",
+                    )
+                },
+            }
+            if multipart
+            else {"json": payload}
+        ),
+    )
+    assert response.status_code == 201, response.text
+    launch = await asyncio.wait_for(launched, timeout=2)
+    assert launch["provider"] == "provider"
+    assert [(repo.url, repo.branch) for repo in launch["repos"]] == [
+        ("https://git.example.com/team/sample.git", "release")
+    ]
+    session = await project_create_client.get(
+        f"/v1/sessions/{launch['session_id']}", headers=_headers()
+    )
+    assert session.json()["project_id"] == project_id
+    assert read_managed_repo_workspaces(session.json()["labels"]) == [
+        "https://git.example.com/team/sample.git#release"
+    ]
 
 
 async def test_explicit_values_are_not_overridden(

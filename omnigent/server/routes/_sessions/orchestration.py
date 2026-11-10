@@ -11696,7 +11696,7 @@ async def _create_session_from_existing_agent(
     project_store: ProjectStore | None = None,
     created_by_session_id: str | None = None,
     created_by_project_id: str | None = None,
-) -> tuple[SessionResponse, Conversation]:
+) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
     """
     Create a session bound to an already-registered agent.
 
@@ -11728,7 +11728,7 @@ async def _create_session_from_existing_agent(
     :param created_by_session_id: Server-authorized source of an independent worker.
     :param created_by_project_id: That source's project. A worker whose request names
         no project is filed there, so it sits beside the session that started it.
-    :returns: The newly created session snapshot and its conversation row.
+    :returns: The new session snapshot, conversation row, and resolved create request.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
         fails authorization.
@@ -12647,7 +12647,7 @@ async def _create_session_from_existing_agent(
         conversation=conv,
         request=request,
     )
-    return response, conv
+    return response, conv, body
 
 
 def _create_session_from_bundle(
