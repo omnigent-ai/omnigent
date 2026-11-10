@@ -39,8 +39,9 @@ from omnigent.stores.inbox_item_store import (
 )
 
 _OPEN_STATE_CODES = frozenset(encode_inbox_item_state(state) for state in ("unread", "read"))
-# Retries after a concurrent post took the same session slot.
-_SLOT_RETRIES = 3
+# Each lost slot means a concurrent post filled one of the session's slots, so
+# after this many the session is full; one more covers replacing an expired key.
+_SLOT_RETRIES = INBOX_ITEMS_PER_SESSION + 1
 _T = TypeVar("_T")
 
 
