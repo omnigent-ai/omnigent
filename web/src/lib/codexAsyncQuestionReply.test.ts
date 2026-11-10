@@ -26,6 +26,10 @@ describe("codexAsyncQuestionReplyText", () => {
       "an entry for another tool",
       reply([{ answer: "Blue", questionItemId: '["other","call_abc",0]' }]),
     ],
+    [
+      "a malformed question id",
+      reply([{ answer: "Blue", questionItemId: '["request_user_input_async",broken' }]),
+    ],
     ["no answers", reply([{ answer: "", questionItemId: item(0) }])],
   ])("leaves %s unchanged", (_name, text) => {
     expect(codexAsyncQuestionReplyText(text)).toBe(text);

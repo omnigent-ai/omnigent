@@ -1,16 +1,29 @@
-/**
- * Codex answers a ``request_user_input_async`` question with a user message
- * that holds only a tagged JSON reply, e.g.
- * ``<send_user_message_question_reply>[{"answer":"Blue",...}]</send_user_message_question_reply>``.
- * Omnigent sends its card answers the same way, so the transcript stores the
- * tagged text and the chat shows just the answers.
- */
 const REPLY_PATTERN =
   /^\s*<send_user_message_question_reply>\s*([\s\S]*?)\s*<\/send_user_message_question_reply>\s*$/;
-const QUESTION_ITEM_PREFIX = '["request_user_input_async",';
+
+/** Whether ``id`` names an async question, e.g. ``'["request_user_input_async","call_abc",0]'``. */
+function isAsyncQuestionItemId(id: unknown): boolean {
+  if (typeof id !== "string") return false;
+  let parts: unknown;
+  try {
+    parts = JSON.parse(id);
+  } catch {
+    return false;
+  }
+  return (
+    Array.isArray(parts) &&
+    parts.length === 3 &&
+    parts[0] === "request_user_input_async" &&
+    typeof parts[1] === "string" &&
+    parts[1] !== "" &&
+    Number.isInteger(parts[2])
+  );
+}
 
 /**
- * The answers in a Codex async question reply, or the text unchanged.
+ * The answers in a Codex async question reply, or the text unchanged. Codex
+ * and Omnigent's answer card both reply with a user message holding only
+ * ``<send_user_message_question_reply>[{"answer":"Blue",...}]</send_user_message_question_reply>``.
  *
  * @param text - A user message's text.
  * @returns One answer per line, e.g. ``"Blue"``, when the whole message is a
@@ -30,9 +43,7 @@ export function codexAsyncQuestionReplyText(text: string): string {
   for (const entry of entries) {
     if (typeof entry !== "object" || entry === null) return text;
     const { answer, questionItemId } = entry as Record<string, unknown>;
-    if (typeof questionItemId !== "string" || !questionItemId.startsWith(QUESTION_ITEM_PREFIX)) {
-      return text;
-    }
+    if (!isAsyncQuestionItemId(questionItemId)) return text;
     if (typeof answer === "string" && answer) answers.push(answer);
   }
   return answers.length > 0 ? answers.join("\n") : text;
