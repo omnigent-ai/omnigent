@@ -72,6 +72,7 @@ def _row(**overrides: object) -> dict[str, object]:
         "body_md": b"b",
         "links": b"[]",
         "actions": b"[]",
+        "media": b"[]",
         "topic": "x",
         "dedupe_key": "v1:x",
         "state": 1,
@@ -109,9 +110,11 @@ def test_sqlite_rejects_values_outside_the_column_bounds(
     _migrate(uri, engine, _REVISION)
     insert = sa.text(
         "INSERT INTO inbox_items (workspace_id, id, user_id, source_session_id, session_slot, "
-        "agent_id, kind, title, body_md, links, actions, topic, dedupe_key, state, resolution, "
+        "agent_id, kind, title, body_md, links, actions, media, topic, dedupe_key, state, "
+        "resolution, "
         "created_at) VALUES (:workspace_id, :id, :user_id, :source_session_id, :session_slot, "
-        ":agent_id, :kind, :title, :body_md, :links, :actions, :topic, :dedupe_key, :state, "
+        ":agent_id, :kind, :title, :body_md, :links, :actions, :media, :topic, :dedupe_key, "
+        ":state, "
         ":resolution, :created_at)"
     )
     with engine.begin() as conn:

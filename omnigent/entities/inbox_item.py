@@ -25,8 +25,8 @@ class InboxItem:
         "ref": ..., "label": ...}``; the first is the primary link.
     :param actions: Agent-defined actions, each ``{"label": ..., "prompt": ...}``.
         Choosing one opens a new session prefilled with its prompt.
-    :param chart: A chart drawn on the card (see :mod:`omnigent.server.inbox_chart`),
-        or ``None``.
+    :param media: Typed rich-content blocks drawn on the card, such as
+        ``{"type": "chart", "chart": {...}}``; see :mod:`omnigent.server.inbox_media`.
     :param primary_link: Canonical form of the first link, or ``None``.
     :param topic: The agent's short slug for what the item is about,
         e.g. ``"rampup-flag"``.
@@ -56,7 +56,7 @@ class InboxItem:
     body_md: str
     links: list[dict[str, Any]]
     actions: list[dict[str, str]]
-    chart: dict[str, Any] | None
+    media: list[dict[str, Any]]
     primary_link: str | None
     topic: str
     dedupe_key: str
