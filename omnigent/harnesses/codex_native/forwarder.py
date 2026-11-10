@@ -3043,9 +3043,21 @@ async def _create_thread_replacement_session(
     if CODEX_NATIVE_BRIDGE_ID_LABEL_KEY not in labels:
         labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
 
+    persisted_settings = {
+        key: old[key]
+        for key in (
+            "workspace",
+            "terminal_launch_args",
+            "model_override",
+            "reasoning_effort",
+        )
+        if old.get(key) is not None
+    }
     create_body = clear_replacement_create_body(old, agent_id=agent_id, labels=labels)
+    create_body.update(persisted_settings)
     create_resp = await client.post("/v1/sessions", json=create_body)
     if (unfiled_body := unfiled_clear_replacement_body(create_body, create_resp)) is not None:
+        unfiled_body.update(persisted_settings)
         create_resp = await client.post("/v1/sessions", json=unfiled_body)
     create_resp.raise_for_status()
     created = create_resp.json()

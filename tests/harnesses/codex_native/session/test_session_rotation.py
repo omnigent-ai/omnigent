@@ -81,8 +81,64 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
     assert state.thread_id == "thread_old"
 
 
+@pytest.mark.parametrize("project_available", [True, False], ids=["project", "project-removed"])
+@pytest.mark.parametrize(
+    ("session_settings", "expected_settings"),
+    [
+        pytest.param({}, {}, id="legacy-snapshot"),
+        pytest.param(
+            {
+                "workspace": None,
+                "terminal_launch_args": None,
+                "model_override": None,
+                "reasoning_effort": None,
+            },
+            {},
+            id="default-settings",
+        ),
+        pytest.param(
+            {"terminal_launch_args": []},
+            {"terminal_launch_args": []},
+            id="cleared-launch-args",
+        ),
+        pytest.param(
+            {
+                "workspace": "/work/project",
+                "terminal_launch_args": ["-s", "read-only", "-a", "never"],
+            },
+            {
+                "workspace": "/work/project",
+                "terminal_launch_args": ["-s", "read-only", "-a", "never"],
+            },
+            id="launch-options",
+        ),
+        pytest.param(
+            {"model_override": "gpt-5.4-mini", "reasoning_effort": "high"},
+            {"model_override": "gpt-5.4-mini", "reasoning_effort": "high"},
+            id="model-and-effort",
+        ),
+        pytest.param(
+            {
+                "workspace": "/work/project",
+                "terminal_launch_args": ["--model", "gpt-5.4-mini"],
+                "model_override": "gpt-5.4-mini",
+                "reasoning_effort": "high",
+            },
+            {
+                "workspace": "/work/project",
+                "terminal_launch_args": ["--model", "gpt-5.4-mini"],
+                "model_override": "gpt-5.4-mini",
+                "reasoning_effort": "high",
+            },
+            id="combined-settings",
+        ),
+    ],
+)
 def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     tmp_path: Path,
+    session_settings: dict[str, Any],
+    expected_settings: dict[str, Any],
+    project_available: bool,
 ) -> None:
     """
     Native Codex thread switches create a replacement Omnigent session.
@@ -122,9 +178,13 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                     },
                     "title": "Fix login flow",
                     "project_id": "proj_alpha",
+                    **session_settings,
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions":
+            assert isinstance(body, dict)
+            if not project_available and "project_id" in body:
+                return httpx.Response(404, json={"detail": "Project not found"})
             return httpx.Response(200, json={"id": "conv_new"})
         if request.method == "PATCH" and request.url.path in {
             "/v1/sessions/conv_new",
@@ -234,21 +294,28 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         ("thread/resume", {"threadId": "thread_old", "excludeTurns": True}),
         ("thread/resume", {"threadId": "thread_new", "excludeTurns": True}),
     ]
-    assert (
-        "POST",
-        "/v1/sessions",
+    expected_metadata = {
+        "agent_id": "ag_codex",
+        "labels": {
+            "omnigent.wrapper": "codex-native-ui",
+            "omnigent.codex_native.bridge_id": "bridge_shared",
+        },
+        "title": "Fix login flow",
+    }
+    expected_creates = [
         {
-            "agent_id": "ag_codex",
-            "labels": {
-                "omnigent.wrapper": "codex-native-ui",
-                "omnigent.codex_native.bridge_id": "bridge_shared",
-            },
-            "title": "Fix login flow",
+            **expected_metadata,
             "project_id": "proj_alpha",
             "workspace": None,
             "git": None,
-        },
-    ) in requests
+            **expected_settings,
+        }
+    ]
+    if not project_available:
+        expected_creates.append({**expected_metadata, **expected_settings})
+    assert [
+        body for method, path, body in requests if method == "POST" and path == "/v1/sessions"
+    ] == expected_creates
     assert (
         "POST",
         "/v1/sessions/conv_old/resources/terminals/terminal_codex_main/transfer",
