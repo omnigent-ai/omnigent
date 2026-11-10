@@ -112,6 +112,7 @@ from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_terminal_failure,
 )
+from omnigent.runner.live_mcp_routes import register_live_mcp_routes
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
@@ -8413,6 +8414,7 @@ def create_runner_app(
     _opencode_native_model_options = _native_controls.opencode_native_model_options
     _teardown_session_terminals = _native_controls.teardown_session_terminals
 
+    register_live_mcp_routes(app, process_manager=process_manager)
     register_model_option_routes(
         app,
         _claude_model_options_rows=_claude_model_options_rows,
