@@ -205,6 +205,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     copilot: "Copilot",
     grok: "Grok Build",
   }),
+  useFileMentionHarnesses: () => new Set<string>(),
 }));
 vi.mock("@/lib/goalApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GoalApiModule>()),
