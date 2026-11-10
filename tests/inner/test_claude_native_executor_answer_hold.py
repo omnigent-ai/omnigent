@@ -244,11 +244,21 @@ async def test_the_hold_ends_with_the_refusal_when_nobody_answers(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        True,
+        ClaudeInputBoxOccupied(_SHELL_MODE, surface="the detailed transcript"),
+        ClaudeInputBoxOccupied(_SHELL_MODE, surface="the side-chat history"),
+    ],
+    ids=["question", "transcript", "side-chat-history"],
+)
 async def test_stopping_a_held_turn_keeps_the_pane(
-    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: bool | Exception
 ) -> None:
     """Stop during the hold cancels the wait; it neither types nor reaps the pane."""
     monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_POLL_S", 0.01, raising=False)
+    pane.refusals = [refusal]
     pane.pending_polls = 10**6
     turn = asyncio.create_task(_run(tmp_path))
     for _ in range(200):
@@ -388,14 +398,22 @@ async def test_stopping_a_turn_held_for_the_input_box_keeps_the_pane(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["shell mode", "the prompt-history search"])
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "shell mode",
+        "the prompt-history search",
+        "the detailed transcript",
+        "the side-chat history",
+    ],
+)
 async def test_a_message_an_occupied_input_box_refused_waits_for_chat_input(
     pane: _Pane, tmp_path: Path, surface: str
 ) -> None:
     """
     The turn holds the message until the box takes chat input again, then delivers it once.
 
-    Shell mode or the prompt-history search owns the box when the message arrives;
+    An input mode or read-only viewer owns the box when the message arrives;
     nothing was typed, so the refusal is a wait rather than a failed turn.
     """
     pane.refusals = [ClaudeInputBoxOccupied(_SHELL_MODE, surface=surface)]

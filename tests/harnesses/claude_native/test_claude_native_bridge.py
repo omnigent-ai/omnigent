@@ -12569,6 +12569,92 @@ _SHORTCUTS_PANEL_PANE = """\
   / for commands          shift + tab to auto-accept edits
 """
 
+_DETAILED_TRANSCRIPT_PANE = """\
+⏺ The investigation is complete.
+✻ Finished for 1m 37s
+─────────────────────────────────────────────────────────────────────────────
+  Showing detailed transcript · ctrl+o to toggle · ? for shortcuts      verbose
+"""
+_CLIPPED_SIDE_CHAT_HISTORY_PANE = """\
+      The earlier answer is still visible here.
+    ⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close
+"""
+_READ_ONLY_VIEWER_PANES = [
+    pytest.param(_DETAILED_TRANSCRIPT_PANE, "the detailed transcript", id="transcript"),
+    pytest.param(
+        _DETAILED_TRANSCRIPT_PANE.replace("ctrl+o to toggle", "ctrl+o to\ntoggle"),
+        "the detailed transcript",
+        id="wrapped-transcript",
+    ),
+    pytest.param(
+        _CLIPPED_SIDE_CHAT_HISTORY_PANE, "the side-chat history", id="clipped-side-chat-history"
+    ),
+    pytest.param(
+        _CLIPPED_SIDE_CHAT_HISTORY_PANE.replace("Esc to close", "Esc to\nclose"),
+        "the side-chat history",
+        id="wrapped-side-chat-history",
+    ),
+]
+
+
+@pytest.mark.parametrize(("pane", "surface"), _READ_ONLY_VIEWER_PANES)
+def test_read_only_viewers_occupy_the_input_until_the_person_closes_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str, surface: str
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    _fake_tmux(monkeypatch, [pane])
+
+    assert _occupying_surface(pane) == surface
+    assert not claude_native_bridge.claude_pane_ready(bridge_dir)
+    assert _occupying_surface(pane + _READY_PANE) is None
+    assert _claude_prompt_rendered(pane + _READY_PANE)
+
+
+@pytest.mark.parametrize(("pane", "surface"), _READ_ONLY_VIEWER_PANES)
+@pytest.mark.parametrize("operation", ["message", "settings"])
+def test_a_read_only_viewer_receives_no_injected_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str, surface: str, operation: str
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [pane])
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_: claude_native_bridge._ClaudePaneState(True),
+    )
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 0)
+
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied) as refused:
+        if operation == "message":
+            inject_user_message(bridge_dir, content="hello from the web")
+        else:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert refused.value.surface == surface
+    assert sends == []
+
+
+@pytest.mark.parametrize(("pane", "surface"), _READ_ONLY_VIEWER_PANES)
+def test_a_read_only_viewer_opened_during_readiness_holds_the_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str, surface: str
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [pane])
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_: claude_native_bridge._ClaudePaneState(True),
+    )
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 0)
+
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied) as refused:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock", "claude:0.0", timeout_s=1.0, bridge_dir=bridge_dir
+        )
+
+    assert refused.value.surface == surface
+    assert sends == []
+
 
 def _picker_bridge_dir(tmp_path: Path) -> Path:
     """
