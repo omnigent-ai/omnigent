@@ -22,7 +22,6 @@ from omnigent.db.db_models import INBOX_ITEMS_PER_SESSION
 from omnigent.entities import InboxItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
-from omnigent.server.inbox_chart import InboxChartV1
 from omnigent.server.inbox_dedupe import (
     DedupeInputs,
     InvalidLinkError,
@@ -32,6 +31,7 @@ from omnigent.server.inbox_dedupe import (
     log_post_decision,
     normalize_topic,
 )
+from omnigent.server.inbox_media import MAX_MEDIA_BLOCKS, InboxMediaBlock, stored_media
 from omnigent.server.routes._agent_origin import require_agent_origin
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
@@ -101,7 +101,7 @@ class CreateInboxItemRequest(BaseModel):
     body_md: str = Field(min_length=1, max_length=8000)
     links: list[InboxItemLink] = Field(default_factory=list, max_length=10)
     actions: list[InboxItemAction] = Field(default_factory=list, max_length=MAX_ACTIONS_PER_ITEM)
-    chart: InboxChartV1 | None = None
+    media: list[InboxMediaBlock] = Field(default_factory=list, max_length=MAX_MEDIA_BLOCKS)
     topic: str = Field(min_length=1, max_length=100)
     expires_at: int | None = Field(default=None, gt=0, le=MAX_EPOCH)
 
@@ -238,6 +238,10 @@ def create_inbox_items_router(
         log_post_decision(inputs, match)
         if match.existing is not None:
             return {"item": _item_json(match.existing), "duplicate": True}
+        try:
+            media = stored_media(body.media)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         new_item = NewInboxItem(
             user_id=owner,
             source_session_id=source_session_id,
@@ -248,7 +252,7 @@ def create_inbox_items_router(
             body_md=body.body_md,
             links=links,
             actions=[action.model_dump() for action in body.actions],
-            chart=body.chart.stored() if body.chart is not None else None,
+            media=media,
             primary_link=inputs.primary_link,
             topic=inputs.topic,
             dedupe_key=dedupe_key(inputs),
@@ -270,7 +274,7 @@ def create_inbox_items_router(
             ) from exc
         except InboxItemTooLargeError as exc:
             raise OmnigentError(
-                "The item's body, links, actions, or chart are too large to store",
+                "The item's body, links, actions, or media are too large to store",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
         return {"item": _item_json(item), "duplicate": False}

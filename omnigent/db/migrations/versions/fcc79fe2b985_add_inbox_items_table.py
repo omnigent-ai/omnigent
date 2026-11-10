@@ -48,7 +48,7 @@ _SQLITE_CHECKS: tuple[tuple[str, str], ...] = (
     ("body_md IS NULL OR length(CAST(body_md AS BLOB)) <= 16383", "ck_inbox_items_body_md_bytes"),
     ("links IS NULL OR length(CAST(links AS BLOB)) <= 16383", "ck_inbox_items_links_bytes"),
     ("actions IS NULL OR length(CAST(actions AS BLOB)) <= 16383", "ck_inbox_items_actions_bytes"),
-    ("chart IS NULL OR length(CAST(chart AS BLOB)) <= 16383", "ck_inbox_items_chart_bytes"),
+    ("media IS NULL OR length(CAST(media AS BLOB)) <= 16383", "ck_inbox_items_media_bytes"),
     (
         "feedback_text IS NULL OR length(CAST(feedback_text AS BLOB)) <= 16383",
         "ck_inbox_items_feedback_text_bytes",
@@ -96,7 +96,8 @@ def upgrade() -> None:
         sa.Column("body_md", sa.LargeBinary(), nullable=False),
         sa.Column("links", sa.LargeBinary(), nullable=False),
         sa.Column("actions", sa.LargeBinary(), nullable=False),
-        sa.Column("chart", sa.LargeBinary(), nullable=True),
+        # A JSON list of typed rich-content blocks, such as a chart.
+        sa.Column("media", sa.LargeBinary(), nullable=False),
         sa.Column("primary_link", sa.String(2048), nullable=True),
         sa.Column("topic", sa.String(128), nullable=False),
         sa.Column("dedupe_key", sa.String(128), nullable=False),

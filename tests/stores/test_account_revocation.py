@@ -956,7 +956,7 @@ def _inbox_item(user_id: str) -> NewInboxItem:
         body_md="Only the account that got it may read it.",
         links=[],
         actions=[],
-        chart=None,
+        media=[],
         primary_link=None,
         topic="private",
         dedupe_key="v1:private",
