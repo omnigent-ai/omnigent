@@ -25,10 +25,12 @@ import {
   TRIGGER_TEMPLATES,
   triggerConditionFields,
   triggerEvent,
+  triggerEventDescription,
   triggerOperatorLabel,
   triggerScope,
   triggerScopeEntries,
   triggerScopeOperators,
+  triggerTargetValid,
   triggerServiceName,
   VALUELESS_OPERATORS,
   withTriggerEvent,
@@ -67,7 +69,13 @@ export function TriggerTemplateFields({
   const [warningsOpen, setWarningsOpen] = useState(false);
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
-  const { authorAction } = triggerEvent(source, fields.event);
+  const { authorAction, target } = triggerEvent(source, fields.event);
+  const targetInvalid = !triggerTargetValid(fields, source);
+  // Reviewers added after the pull request opens never match the opened event.
+  const reviewerOnOpen =
+    source === "github" &&
+    fields.event === "pr" &&
+    fields.conditions.some((c) => c.field === "reviewer");
   const scope = triggerScope(source, fields.event);
   const conditionFields = triggerConditionFields(source, fields.event);
   const scopeEntries = triggerScopeEntries(source, fields);
@@ -95,9 +103,8 @@ export function TriggerTemplateFields({
     <div className="flex flex-col gap-4" data-testid="task-trigger-fields">
       <div className="flex flex-col gap-1.5">
         <Label>Trigger</Label>
-        <p className="text-sm text-muted-foreground">
-          Runs your automation on all new {template.itemPlural} that match these conditions. Older{" "}
-          {template.itemPlural} are skipped, even if they are edited to match later.
+        <p className="text-sm text-muted-foreground" data-testid="task-trigger-description">
+          {triggerEventDescription(source, fields.event)}
         </p>
         <div
           className="flex flex-col gap-2 rounded-lg border border-border p-3"
@@ -131,6 +138,23 @@ export function TriggerTemplateFields({
               <span className={cn(CHIP, "flex items-center")} data-testid="task-trigger-event">
                 {template.events[0].label}
               </span>
+            )}
+            {target && (
+              <>
+                <span className="text-muted-foreground">{target.word}</span>
+                <Input
+                  value={fields.target ?? ""}
+                  placeholder={target.placeholder}
+                  aria-label={target.label}
+                  data-testid="task-trigger-target"
+                  className={cn(CHIP, "min-w-16 placeholder:text-primary/50")}
+                  // Fit the placeholder or value so neither is cut off.
+                  style={{
+                    width: `calc(${Math.max((fields.target ?? "").length, target.placeholder.length) + 2}ch + 1rem)`,
+                  }}
+                  onChange={(e) => onChange({ ...fields, target: e.target.value })}
+                />
+              </>
             )}
             <span className="text-muted-foreground">where {scope.label}</span>
             {!scope.isGroup && (
@@ -185,6 +209,15 @@ export function TriggerTemplateFields({
               />
             </span>
           </div>
+
+          {targetInvalid && target?.hint && (
+            <p
+              className="pl-6 text-sm text-muted-foreground"
+              data-testid="task-trigger-target-hint"
+            >
+              {target.hint}
+            </p>
+          )}
 
           {scope.isGroup && scopeEntries.length > 0 && scopeEntries.length < 2 && (
             <p className="pl-6 text-sm text-muted-foreground" data-testid="task-trigger-group-hint">
@@ -306,6 +339,16 @@ export function TriggerTemplateFields({
             );
           })}
 
+          {reviewerOnOpen && (
+            <p
+              className="pl-6 text-sm text-muted-foreground"
+              data-testid="task-trigger-reviewer-hint"
+            >
+              Only matches reviewers requested before the next check after the pull request opens.
+              To catch later requests and re-requests, choose Review requested.
+            </p>
+          )}
+
           <div className="pl-6">
             <Button
               type="button"
@@ -332,7 +375,9 @@ export function TriggerTemplateFields({
           <Checkbox
             id="task-trigger-link-back"
             checked={fields.linkBack}
-            onCheckedChange={(checked) => onChange({ ...fields, linkBack: checked === true })}
+            onCheckedChange={(checked) =>
+              onChange({ ...fields, linkBack: checked === true, linkBackTouched: true })
+            }
             data-testid="task-trigger-link-back"
             componentId="tasks.scheduled.trigger_link_back"
           />
