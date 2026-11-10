@@ -52,7 +52,7 @@ export function isValidSandboxRepoUrl(url: string): boolean {
         return false;
       }
     }
-    return true;
+    return !hostname.startsWith("-");
   }
   return (
     hostname.length <= 253 &&
