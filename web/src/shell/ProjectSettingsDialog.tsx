@@ -222,6 +222,7 @@ export function ProjectSettingsDialog({
     if (!stored?.repository) {
       if (hostId !== NONE) config.host_id = hostId;
       else delete config.host_id;
+      if (hostId !== SANDBOX_HOST_CHOICE) delete config.sandbox_provider;
       // A workspace is host-relative and only meaningful with a concrete host —
       // don't persist a stale path from a since-cleared host, and drop it for the
       // sandbox (a sandbox create provisions its own workspace and ignores this).
