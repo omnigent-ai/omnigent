@@ -1,6 +1,6 @@
 "use strict";
 
-const { describe, it } = require("node:test");
+const { describe, it, mock } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { pathToFileURL } = require("node:url");
@@ -8,6 +8,11 @@ const path = require("node:path");
 const fs = require("node:fs");
 const vm = require("node:vm");
 const { createBrowserPermissionPrompt, promptBounds } = require("../src/browserPermissionPrompt");
+const {
+  attachSecurityKeyNotice,
+  PENDING_CHANNEL,
+  SHOW_DELAY_MS,
+} = require("../src/browserSecurityKeyNotice");
 
 const PAGE = "/app/browser-permission/index.html";
 const ORIGIN = "https://login.example.com";
@@ -207,6 +212,60 @@ describe("browser permission popover", () => {
     assert.equal(await notice, "suppressed");
     h.choose("deny");
     assert.equal(await replacement, "deny");
+  });
+
+  it("keeps only the newest security-key notice open in a window", async () => {
+    const h = harness();
+    const replaced = h.show({ kind: "security-key" });
+    h.show({ kind: "security-key" });
+    assert.equal(await replaced, "suppressed");
+    assert.deepEqual(
+      h.windows.map((popup) => popup.destroyed),
+      [true, false],
+    );
+  });
+
+  it("brings back a security-key notice the app hid, but not one the user dismissed", async () => {
+    mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      const h = harness();
+      const contents = Object.assign(new EventEmitter(), {
+        ipc: new EventEmitter(),
+        mainFrame: {},
+        getURL: () => `${ORIGIN}/verify`,
+      });
+      let visible = true;
+      attachSecurityKeyNotice(contents, {
+        canPrompt: () => visible,
+        showPrompt: (options) => h.show(options),
+        openExternal: () => {},
+        cookieImport: false,
+      });
+      const wait = async () => {
+        mock.timers.tick(SHOW_DELAY_MS);
+        await tick();
+      };
+      contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, true);
+      await wait();
+      assert.equal(h.windows.length, 1);
+      for (const hide of [() => h.controller.dismiss(h.parent), () => h.parent.emit("minimize")]) {
+        visible = false;
+        hide();
+        await wait();
+        assert.equal(h.windows.at(-1).destroyed, true);
+        const shown = h.windows.length;
+        visible = true;
+        await wait();
+        assert.equal(h.windows.length, shown + 1, "the pane is back while the request waits");
+      }
+      h.windows.at(-1).emit("blur");
+      await wait();
+      await wait();
+      assert.equal(h.windows.at(-1).destroyed, true);
+      assert.equal(h.windows.length, 3);
+    } finally {
+      mock.timers.reset();
+    }
   });
 
   for (const [name, close] of [

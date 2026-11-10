@@ -8,7 +8,7 @@ const THIS_MACHINE_HOST_ID = "a".repeat(32);
 
 // Launch with a live daemon enrolled for this machine; only `backend.sessionId`
 // reports this host ID, every other session reports a remote host.
-async function launchThisMachineDesktop({ backend, scratch, recordDir, preload = [], env = {} }) {
+async function launchThisMachineDesktop({ backend, scratch, recordDir, preload = [] }) {
   const machineHome = path.join(scratch, "machine");
   const stateDir = path.join(machineHome, ".omnigent");
   fs.mkdirSync(path.join(stateDir, "daemons"), { recursive: true });
@@ -30,7 +30,7 @@ async function launchThisMachineDesktop({ backend, scratch, recordDir, preload =
   const desktop = await launchDesktop({
     serverUrl: backend.serverUrl,
     recordDir,
-    env: { HOME: machineHome, OMNIGENT_CONFIG_HOME: stateDir, ...env },
+    env: { HOME: machineHome, OMNIGENT_CONFIG_HOME: stateDir },
     preload,
   });
   let sessionIsLocal = true;

@@ -90,9 +90,11 @@ describe("embedded browser WebAuthn observer", () => {
     const rejections = [];
     const onRejection = (reason) => rejections.push(reason);
     process.on("unhandledRejection", onRejection);
+    let reports = 0;
     try {
       const { realm } = loadObserver({
         report: () => {
+          reports += 1;
           throw new Error("bridge gone");
         },
       });
@@ -103,6 +105,7 @@ describe("embedded browser WebAuthn observer", () => {
     } finally {
       process.off("unhandledRejection", onRejection);
     }
+    assert.equal(reports, 2);
     assert.deepEqual(rejections, []);
   });
 
@@ -130,12 +133,15 @@ describe("embedded browser WebAuthn observer", () => {
     const reads = vm.runInContext(
       `let reads = 0;
       const options = { get publicKey() { reads += 1; return {}; } };
-      credentials.get(options);
-      credentials.get(Object.create(options));
+      const mediation = { publicKey: {}, get mediation() { reads += 1; return "required"; } };
+      for (const request of [options, mediation]) {
+        credentials.get(request);
+        credentials.get(Object.create(request));
+      }
       reads`,
       realm,
     );
-    assert.equal(reads, 2, "only the native call runs page getters");
+    assert.equal(reads, 4, "only the native call runs page getters");
     const request = vm.runInContext(
       `credentials.get(new Proxy({ publicKey: {} }, {
         getOwnPropertyDescriptor() { throw new Error("trap"); },

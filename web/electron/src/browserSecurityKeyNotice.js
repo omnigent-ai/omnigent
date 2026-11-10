@@ -49,7 +49,9 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
         const url = contents.getURL();
         if (choice !== "open-in-browser" || pageOrigin(url) !== origin) return;
         // The page is still waiting if the system browser fails to open, so offer the notice again.
-        return Promise.resolve(openExternal(url)).catch(show);
+        return Promise.resolve()
+          .then(() => openExternal(url))
+          .catch(() => show());
       })
       .catch(() => {
         if (shown === controller) shown = null;

@@ -8,6 +8,9 @@ const CHOICES = {
   permission: new Set(["allow-once", "always-allow", "deny", "dismiss"]),
   "security-key": new Set(["open-in-browser", "dismiss"]),
 };
+// A security-key notice the app closes is "suppressed" so it can return; only the user's
+// dismissal is final.
+const appClosedChoice = (kind) => (kind === "security-key" ? "suppressed" : "dismiss");
 
 function promptBounds(content, anchor) {
   const width = Math.min(PROMPT_WIDTH, content.width);
@@ -40,7 +43,8 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
   }
 
   function dismiss(parent) {
-    prompts.get(parent)?.finish("dismiss");
+    const current = prompts.get(parent);
+    current?.finish(appClosedChoice(current.kind));
   }
 
   function show({ parent, getAnchorBounds, signal, kind = "permission", ...details }) {
@@ -51,7 +55,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
     if (kind === "security-key" && current?.kind === "permission") {
       return current.result.then(() => "suppressed");
     }
-    current?.finish(current.kind === "security-key" ? "suppressed" : "dismiss");
+    current?.finish(appClosedChoice(current.kind));
     const result = new Promise((resolve) => {
       const popup = new BrowserWindow({
         parent,
@@ -80,6 +84,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
       if (process.platform === "darwin") popup.excludedFromShownWindowsMenu = true;
       let finished = false;
       const close = () => finish("dismiss");
+      const hidden = () => finish(appClosedChoice(kind));
       const position = () => {
         if (!parent.isDestroyed() && !popup.isDestroyed()) {
           popup.setBounds(promptBounds(parent.getContentBounds(), getAnchorBounds()));
@@ -93,7 +98,8 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
         finished = true;
         if (prompts.get(parent)?.window === popup) prompts.delete(parent);
         signal.removeEventListener("abort", close);
-        for (const event of ["closed", "hide", "minimize"]) parent.removeListener(event, close);
+        parent.removeListener("closed", close);
+        for (const event of ["hide", "minimize"]) parent.removeListener(event, hidden);
         for (const event of ["move", "resize"]) parent.removeListener(event, position);
         if (!parent.webContents.isDestroyed()) {
           parent.webContents.removeListener("did-start-navigation", onNavigation);
@@ -103,7 +109,8 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
       }
       prompts.set(parent, { window: popup, kind, info: { kind, ...details }, finish });
       signal.addEventListener("abort", close, { once: true });
-      for (const event of ["closed", "hide", "minimize"]) parent.on(event, close);
+      parent.on("closed", close);
+      for (const event of ["hide", "minimize"]) parent.on(event, hidden);
       for (const event of ["move", "resize"]) parent.on(event, position);
       parent.webContents.on("did-start-navigation", onNavigation);
       popup.on("closed", close);

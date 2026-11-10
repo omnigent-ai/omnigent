@@ -42,7 +42,6 @@ async function until(condition, label, deadline = Date.now() + 1000) {
   await until(condition, label, deadline);
 }
 const urlHelpers = require("../src/url");
-const { SHOW_DELAY_MS } = require("../src/browserSecurityKeyNotice");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
@@ -2581,10 +2580,7 @@ describe("browser permission wiring", () => {
       registry.setSuppressed(false);
       registry.setActive("a");
       a.ipc.emit("omnigent:browser-webauthn-pending", { senderFrame: a.mainFrame }, true);
-      await new Promise((resolve) => {
-        setTimeout(resolve, SHOW_DELAY_MS + 100);
-      });
-      assert.equal(prompts.length, 2, "a waiting security-key request shows the notice");
+      await until(() => prompts.length === 2, "a waiting security-key request shows the notice");
       assert.equal(prompts[1].kind, "security-key");
       assert.equal(prompts[1].parent, h.win);
       assert.equal(prompts[1].origin, "https://login.example");

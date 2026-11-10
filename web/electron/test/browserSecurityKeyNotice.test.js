@@ -99,15 +99,25 @@ describe("security-key notice for embedded browser pages", () => {
     assert.equal(h.prompts.length, 2);
   });
 
-  it("offers the notice again when the system browser fails to open", async () => {
-    const h = harness({ launch: () => Promise.reject(new Error("no default browser")) });
-    h.report(true);
-    await h.wait();
-    h.prompts[0].choose("open-in-browser");
-    await flush();
-    assert.deepEqual(h.opened, [PAGE]);
-    assert.equal(h.prompts.length, 2);
-  });
+  for (const [name, launch] of [
+    ["rejects", () => Promise.reject(new Error("no default browser"))],
+    [
+      "throws",
+      () => {
+        throw new Error("no default browser");
+      },
+    ],
+  ]) {
+    it(`offers the notice again when opening the system browser ${name}`, async () => {
+      const h = harness({ launch });
+      h.report(true);
+      await h.wait();
+      h.prompts[0].choose("open-in-browser");
+      await flush();
+      assert.deepEqual(h.opened, [PAGE]);
+      assert.equal(h.prompts.length, 2);
+    });
+  }
 
   it("does not hand a different site to the system browser", async () => {
     const h = harness();
@@ -195,7 +205,6 @@ describe("security-key notice for embedded browser pages", () => {
   });
 
   for (const [name, options, frame] of [
-    ["a background or covered pane", { canPrompt: () => false }],
     ["a non-web page", { url: "file:///tmp/verify.html" }],
     ["a subframe report", {}, { url: "https://frame.example/" }],
   ]) {

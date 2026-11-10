@@ -116,9 +116,9 @@ it(
     } finally {
       try {
         if (desktop) {
-          await desktop.window.unrouteAll({ behavior: "wait" });
-          await desktop.electronApp.close();
-          await desktop.stopDisplayCapture();
+          await desktop.window.unrouteAll({ behavior: "wait" }).catch(() => {});
+          await desktop.electronApp.close().catch(() => {});
+          await desktop.stopDisplayCapture().catch(() => {});
           console.log(saveRecording(recordDir, "browser-webauthn-prompt"));
           fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
         }
