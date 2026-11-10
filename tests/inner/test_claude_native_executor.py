@@ -578,11 +578,13 @@ async def test_enqueue_session_message_rejects_stale_session_after_clear(
         (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_old"}')
         ready_for_lock = asyncio.Event()
 
-        def content_to_text(_content: object, _bridge_dir: Path) -> str:
-            ready_for_lock.set()
-            return "old steering"
+        session_is_active = claude_native_executor._session_is_active
 
-        monkeypatch.setattr(claude_native_executor, "_content_to_text", content_to_text)
+        def admission_started(bridge_dir: Path, request_session_id: str | None) -> bool:
+            ready_for_lock.set()
+            return session_is_active(bridge_dir, request_session_id)
+
+        monkeypatch.setattr(claude_native_executor, "_session_is_active", admission_started)
         async with executor._inject_lock:
             pending = asyncio.create_task(executor.enqueue_session_message("main", "old steering"))
             await ready_for_lock.wait()
