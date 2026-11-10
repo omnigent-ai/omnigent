@@ -38,6 +38,7 @@ import type { AutomationSourceSession } from "@/lib/automationFromSession";
 import { MemoryRouter } from "react-router-dom";
 import {
   emptyTriggerFields,
+  readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
@@ -3349,6 +3350,49 @@ describe("automation trigger type", () => {
       const input = updateMutateAsync.mock.calls[0][0].input;
       expect(input.prompt).toBe(slackPrompt);
       expect(input).not.toHaveProperty("sessionId");
+    });
+
+    it("keeps a worker harness chosen while switched when switching back", async () => {
+      render(dialog({ editingTask: slackTask }));
+      await choose("Jira");
+      await choose("Polly", "task-worker-agent-trigger");
+      await choose("Slack");
+      expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Polly");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(triggerPromptSource(input.prompt)).toBe("slack");
+      expect(readTriggerWorkerSettings(input.prompt)).toMatchObject({ agentId: "ag_1" });
+      expect(splitTriggerPrompt(input.prompt).userPrompt).toBe("Answer the question.");
+      expect(input).not.toHaveProperty("sessionId");
+    });
+
+    it("keeps sandboxed workers beside a host poller on the new source", async () => {
+      const managedPrompt = slackPrompt.replace('placement "same_host"', 'placement "managed"');
+      render(dialog({ editingTask: { ...slackTask, prompt: managedPrompt } }));
+      await choose("Jira");
+      type("task-trigger-scope", "ES");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
+      expect(triggerPromptSource(prompt)).toBe("jira");
+      expect(readTriggerWorkerPlacement(prompt)).toBe("managed");
+    });
+
+    it("always starts a new polling session after a switch, even when edited as a prompt", async () => {
+      render(dialog({ editingTask: slackTask }));
+      await choose("Jira");
+      type("task-trigger-scope", "ES");
+      fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
+      const startNewSession = screen.getByTestId("task-start-new-session");
+      expect(startNewSession).toBeChecked();
+      expect(startNewSession).toBeDisabled();
+      fireEvent.click(startNewSession);
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(triggerPromptSource(input.prompt)).toBe("jira");
+      expect(input).toMatchObject({ sessionId: null });
     });
   });
 });

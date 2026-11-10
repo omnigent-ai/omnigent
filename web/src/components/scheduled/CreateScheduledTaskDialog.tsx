@@ -5,7 +5,7 @@ import { useScheduleEscape } from "./useScheduleEscape";
 
 import { cn } from "@/lib/utils";
 import { pickerTriggerClass } from "./pickerStyles";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ChevronDownIcon, ClockIcon, FolderOpenIcon, TriangleAlertIcon } from "lucide-react";
 import {
   Dialog,
@@ -57,6 +57,7 @@ import {
   type TriggerFields,
   type TriggerWorkerSettings,
   type TriggerSource,
+  type WorkerPlacement,
 } from "@/components/scheduled/triggerTemplates";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
@@ -131,6 +132,77 @@ function TriggerTypeOption({ type }: { type: AutomationTriggerType }) {
       {triggerServiceName(type)}
     </>
   );
+}
+
+/** The Trigger type field; create mode offers a schedule, a trigger edit only integrations. */
+function TriggerTypeSelect<Type extends AutomationTriggerType>({
+  value,
+  types,
+  isTypeDisabled,
+  onChange,
+  onOpenChange,
+  disabled,
+  children,
+}: {
+  value: Type;
+  types: readonly Type[];
+  isTypeDisabled?: (type: Type) => boolean;
+  onChange: (type: Type) => void;
+  onOpenChange: (isOpen: boolean) => void;
+  disabled: boolean;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <Label htmlFor="task-trigger-type">Trigger type</Label>
+      <Select
+        value={value}
+        onValueChange={(next) => onChange(next as Type)}
+        onOpenChange={onOpenChange}
+        disabled={disabled}
+        componentId="tasks.scheduled.trigger_type"
+      >
+        <SelectTrigger id="task-trigger-type" data-testid="task-trigger-type" className="w-full">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent position="popper" align="start">
+          {types.map((type) => (
+            <SelectItem
+              key={type}
+              value={type}
+              disabled={isTypeDisabled?.(type) ?? false}
+              data-testid={`task-trigger-type-${type}`}
+            >
+              <TriggerTypeOption type={type} />
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {children}
+    </div>
+  );
+}
+
+/** Restore a saved trigger prompt, applying worker settings changed while switched away. */
+function restoreSourcePrompt(
+  userPrompt: string,
+  systemPrompt: string | null,
+  workerSettings: TriggerWorkerSettings | null,
+): { userPrompt: string; systemPrompt: string | null } {
+  const restored = { userPrompt, systemPrompt };
+  if (workerSettings === null || systemPrompt === null) return restored;
+  const combined = combineTriggerPrompt(userPrompt, systemPrompt);
+  const saved = readTriggerWorkerSettings(combined);
+  if (
+    saved === null ||
+    (saved.agentId === workerSettings.agentId &&
+      saved.model === workerSettings.model &&
+      saved.effort === workerSettings.effort)
+  ) {
+    return restored;
+  }
+  const updated = updateTriggerWorkerSettings(combined, workerSettings);
+  return updated === null ? restored : splitTriggerPrompt(updated);
 }
 
 interface AutomationTypeDraft {
@@ -425,6 +497,8 @@ export function CreateScheduledTaskDialog({
   const editSourceDrafts = useRef<Partial<Record<TriggerSource, TriggerFields>>>({});
   const [switchedWorkerSettings, setSwitchedWorkerSettings] =
     useState<TriggerWorkerSettings | null>(null);
+  const [switchedWorkerPlacement, setSwitchedWorkerPlacement] =
+    useState<WorkerPlacement | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
   const defaultTriggerSchedule = useMemo(
@@ -452,6 +526,7 @@ export function CreateScheduledTaskDialog({
       savedSourcePrompt.current = null;
       editSourceDrafts.current = {};
       setSwitchedWorkerSettings(null);
+      setSwitchedWorkerPlacement(null);
       setTriggerType(sourceSession ? "schedule" : (initialTrigger ?? "schedule"));
       resetMenus();
       setAdvancedOpen(false);
@@ -635,11 +710,13 @@ export function CreateScheduledTaskDialog({
         ? switchedWorkerSettings
         : readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt));
   }
-  // A switched source renders its workers beside the poller, like a new template.
-  const workerPlacement =
-    editingWorkerSettings && trigger === null
-      ? readTriggerWorkerPlacement(combineTriggerPrompt(prompt, systemPrompt))
-      : null;
+  let workerPlacement: WorkerPlacement | null = null;
+  if (editingWorkerSettings) {
+    workerPlacement =
+      trigger !== null
+        ? switchedWorkerPlacement
+        : readTriggerWorkerPlacement(combineTriggerPrompt(prompt, systemPrompt));
+  }
   const workerSandboxMode = workerPlacement === "managed" || sandboxMode;
   const workerAgent = agents?.find(
     (agent) => agent.id === (workerSettings?.agentId ?? editingTask?.agentId),
@@ -810,8 +887,8 @@ export function CreateScheduledTaskDialog({
     trigger !== null && triggerFieldsComplete(triggerFields, trigger)
       ? renderTriggerPrompt(trigger, triggerFields, {
           // Workers run where the manager runs: beside it on a connected host,
-          // or each in its own sandbox.
-          placement: sandboxMode ? "managed" : "same_host",
+          // or each in its own sandbox. A switched edit keeps sandboxed workers.
+          placement: workerSandboxMode ? "managed" : "same_host",
           sessionLink,
           pollingIntervalMinutes:
             schedule.preset === "custom" && schedule.customFreq === "minutely"
@@ -933,6 +1010,9 @@ export function CreateScheduledTaskDialog({
   // The source an edited trigger watches now: its open form, or its prompt's opening line.
   const editedTriggerSource =
     trigger ?? triggerPromptSource(effectivePrompt) ?? editingTriggerSource;
+  // The polling session's state tracks the saved source's items, so a switch always resets it.
+  const triggerSourceSwitched =
+    editingTriggerSource !== null && editedTriggerSource !== editingTriggerSource;
 
   /** Edit only: watch another integration, or restore the saved prompt for the original one. */
   function handleEditTriggerSourceChange(next: TriggerSource) {
@@ -952,20 +1032,25 @@ export function CreateScheduledTaskDialog({
     if (next === editingTriggerSource) {
       const saved = savedSourcePrompt.current;
       savedSourcePrompt.current = null;
-      setPrompt(
+      const restored = restoreSourcePrompt(
         saved.systemPrompt !== null && instructions.trim() !== "" ? instructions : saved.prompt,
+        saved.systemPrompt,
+        trigger !== null ? switchedWorkerSettings : null,
       );
-      setSystemPrompt(saved.systemPrompt);
+      setPrompt(restored.userPrompt);
+      setSystemPrompt(restored.systemPrompt);
       setStartNewSession(saved.startNewSession);
       setTrigger(null);
     } else {
-      if (trigger === null) setSwitchedWorkerSettings(workerSettings);
+      if (trigger === null) {
+        setSwitchedWorkerSettings(workerSettings);
+        setSwitchedWorkerPlacement(workerPlacement);
+      }
       setTriggerFields({
         ...(editSourceDrafts.current[next] ?? emptyTriggerFields(next)),
         instructions,
       });
       setTrigger(next);
-      // The polling session's state tracks the old source's items.
       setStartNewSession(true);
     }
     setSystemPromptOpen(false);
@@ -1064,7 +1149,9 @@ export function CreateScheduledTaskDialog({
             ...input,
             ...overrides,
             ...projectInput,
-            ...(sessionMode === "continue" && startNewSession && editingTask.sessionId !== null
+            ...(sessionMode === "continue" &&
+            (startNewSession || triggerSourceSwitched) &&
+            editingTask.sessionId !== null
               ? { sessionId: null }
               : {}),
             // Only on a real switch: sending the unchanged agent is a server-side
@@ -1175,79 +1262,37 @@ export function CreateScheduledTaskDialog({
             />
           )}
           {!isEdit && !fromSession && (
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="task-trigger-type">Trigger type</Label>
-              <Select
-                value={triggerType}
-                onValueChange={(value) => handleTriggerTypeChange(value as AutomationTriggerType)}
-                onOpenChange={handleSelectOpenChange}
-                disabled={curationPending || mutationPending}
-                componentId="tasks.scheduled.trigger_type"
-              >
-                <SelectTrigger
-                  id="task-trigger-type"
-                  data-testid="task-trigger-type"
-                  className="w-full"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  {AUTOMATION_TRIGGER_TYPES.map((type) => (
-                    <SelectItem
-                      key={type}
-                      value={type}
-                      disabled={type !== "schedule" && !triggersSupported}
-                      data-testid={`task-trigger-type-${type}`}
-                    >
-                      <TriggerTypeOption type={type} />
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+            <TriggerTypeSelect
+              value={triggerType}
+              types={AUTOMATION_TRIGGER_TYPES}
+              isTypeDisabled={(type) => type !== "schedule" && !triggersSupported}
+              onChange={handleTriggerTypeChange}
+              onOpenChange={handleSelectOpenChange}
+              disabled={curationPending || mutationPending}
+            >
               {!curationPending && !triggersSupported && (
                 <p className="text-sm text-muted-foreground">
                   Integration triggers aren't available on this server.
                 </p>
               )}
-            </div>
+            </TriggerTypeSelect>
           )}
           {editingTriggerSource !== null && editedTriggerSource !== null && triggersSupported && (
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="task-trigger-type">Trigger type</Label>
-              <Select
-                value={editedTriggerSource}
-                onValueChange={(value) => handleEditTriggerSourceChange(value as TriggerSource)}
-                onOpenChange={handleSelectOpenChange}
-                disabled={curationPending || mutationPending}
-                componentId="tasks.scheduled.trigger_type"
-              >
-                <SelectTrigger
-                  id="task-trigger-type"
-                  data-testid="task-trigger-type"
-                  className="w-full"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  {TRIGGER_SOURCES.map((source) => (
-                    <SelectItem
-                      key={source}
-                      value={source}
-                      data-testid={`task-trigger-type-${source}`}
-                    >
-                      <TriggerTypeOption type={source} />
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {editedTriggerSource !== editingTriggerSource && (
+            <TriggerTypeSelect
+              value={editedTriggerSource}
+              types={TRIGGER_SOURCES}
+              onChange={handleEditTriggerSourceChange}
+              onOpenChange={handleSelectOpenChange}
+              disabled={curationPending || mutationPending}
+            >
+              {triggerSourceSwitched && (
                 <p className="text-sm text-muted-foreground" data-testid="task-trigger-type-note">
                   Saving replaces the {triggerServiceName(editingTriggerSource)} trigger. The next
                   run starts a new polling session that watches{" "}
                   {triggerServiceName(editedTriggerSource)}.
                 </p>
               )}
-            </div>
+            </TriggerTypeSelect>
           )}
           <ScheduleFields
             timezone={timezone}
@@ -1515,7 +1560,8 @@ export function CreateScheduledTaskDialog({
                           <div className="flex items-center gap-2">
                             <Checkbox
                               id="task-start-new-session"
-                              checked={startNewSession}
+                              checked={startNewSession || triggerSourceSwitched}
+                              disabled={triggerSourceSwitched}
                               onCheckedChange={(checked) => setStartNewSession(checked === true)}
                               data-testid="task-start-new-session"
                               componentId="tasks.scheduled.start_new_session"
