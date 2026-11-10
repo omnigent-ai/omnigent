@@ -259,6 +259,9 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockImplementation(() => result(convs));
 }
 
+/** Server info with automations on, which the Automations nav row requires. */
+const AUTOMATIONS_INFO: ServerInfo = { ...FALLBACK_SERVER_INFO, automations_enabled: true };
+
 function renderSidebar(
   open = true,
   initialEntry = "/",
@@ -1346,7 +1349,7 @@ describe("Sidebar session list", () => {
 
   it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar();
+    renderSidebar(true, "/", undefined, AUTOMATIONS_INFO);
 
     const scheduled = screen.getByTestId("scheduled-tasks-nav");
     // Full-width nav ROW (a link), labeled "Automations", pointing at /tasks —
@@ -1392,9 +1395,17 @@ describe("Sidebar session list", () => {
     );
   });
 
+  it("hides the 'Automations' nav row when automations are off for the caller", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/", undefined, { ...AUTOMATIONS_INFO, automations_enabled: false });
+
+    expect(screen.queryByTestId("scheduled-tasks-nav")).toBeNull();
+    expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
+  });
+
   it("marks the 'Automations' nav row active when on /tasks", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar(true, "/tasks");
+    renderSidebar(true, "/tasks", undefined, AUTOMATIONS_INFO);
 
     // Active/selected state uses the SAME shared active-highlight as the sibling
     // nav rows (New session / Inbox) — the `--sidebar-active` pill, not an
@@ -1429,7 +1440,7 @@ describe("Sidebar session list", () => {
 
   it("leaves the primary nav unchanged for an empty extension catalog", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar();
+    renderSidebar(true, "/", undefined, AUTOMATIONS_INFO);
 
     expect(screen.queryByTestId(/^extension-nav-/)).toBeNull();
     expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
@@ -1439,7 +1450,7 @@ describe("Sidebar session list", () => {
 
   it("marks Automations active (not New session) on /tasks/:taskId (detail route)", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar(true, "/tasks/task_abc123");
+    renderSidebar(true, "/tasks/task_abc123", undefined, AUTOMATIONS_INFO);
 
     // Automations is highlighted on the detail route — same pill as the list page.
     expect(screen.getByTestId("scheduled-tasks-nav").className).toContain(
@@ -2864,6 +2875,34 @@ describe("Sidebar project sections", () => {
     openProjectsMenu();
     fireEvent.click(screen.getByTestId("projects-select-sessions"));
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+  });
+
+  it("bulk-deletes a folder session as its lists last fetched it", () => {
+    projectsMock.push("Alpha");
+    const fetched = (labels: Record<string, string>) => {
+      const row = conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha", ...labels } });
+      mockConversations([row, conv("conv_loose", "Claude Code")]);
+      projectSessionsMock.current.Alpha = [row];
+    };
+    fetched({ "omnigent.scheduled_task_source": "st_1" });
+    const view = renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    openProjectsMenu();
+    fireEvent.click(screen.getByTestId("projects-select-sessions"));
+    fireEvent.click(within(screen.getByText("Alpha").closest("section")!).getByText("conv_a"));
+
+    fireEvent.click(screen.getByTestId("bulk-delete"));
+    expect(
+      screen.getByRole("heading", { name: "Delete 1 session and 1 automation?" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    // The automation is deleted, and the lists refetch the row without its label.
+    fetched({});
+    view.refresh();
+    fireEvent.click(screen.getByTestId("bulk-delete"));
+    expect(screen.getByRole("heading", { name: "Delete 1 session(s)?" })).toBeInTheDocument();
+    expect(screen.queryByTestId("bulk-automation-source-delete-notice")).toBeNull();
   });
 
   it("deletes a project (and all its sessions) from the folder kebab after confirming", async () => {

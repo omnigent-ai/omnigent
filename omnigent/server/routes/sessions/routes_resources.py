@@ -1051,7 +1051,9 @@ def register_resources_routes(
         except HostFsUnavailableError:
             return None
         except HostFsError as exc:
-            if exc.status == 404:
+            # An older host rejects an op it lacks with a 400; report it as a missing route.
+            is_unknown_op = exc.status == 400 and exc.message.startswith("unknown fs op")
+            if exc.status == 404 or is_unknown_op:
                 raise OmnigentError(exc.message, code=ErrorCode.NOT_FOUND) from exc
             if exc.status == 400:
                 # Invalid path is a client error; surface it verbatim like the

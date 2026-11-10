@@ -64,12 +64,15 @@ export function TriggerWorkerHarnessField({
 export function TriggerWorkerSettingsFields({
   value,
   settings,
+  taskSession = false,
   disabled,
   onChange,
   onSelectOpenChange,
 }: {
   value: TriggerWorkerSettings;
   settings: ReturnType<typeof useScheduledHarnessSettings>;
+  /** Every match goes to one task session, so changes wait for the next one. */
+  taskSession?: boolean;
   disabled: boolean;
   onChange: (value: TriggerWorkerSettings) => void;
   onSelectOpenChange: (open: boolean) => void;
@@ -101,8 +104,10 @@ export function TriggerWorkerSettingsFields({
         </p>
       )}
       <p className="text-sm text-muted-foreground">
-        Applies to new sessions started for matching items. Existing sessions, including the polling
-        session, keep their settings. Default uses the selected harness&apos;s configuration.
+        {taskSession
+          ? "Applies to the next task session. The current task session and the polling session keep their settings; archive the task session so the next match starts one with these. "
+          : "Applies to new sessions started for matching items. Existing sessions, including the polling session, keep their settings. "}
+        Default uses the selected harness&apos;s configuration.
       </p>
     </div>
   );
