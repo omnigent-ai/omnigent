@@ -1444,6 +1444,20 @@ def create_hosts_router(
                         workspace,
                         git_branch,
                     )
+                from omnigent.server.routes._sessions.helpers import (
+                    _drop_claude_launch_args_from_another_host,
+                )
+
+                bound = await asyncio.to_thread(
+                    conversation_store.get_conversation, body.session_id
+                )
+                if bound is not None:
+                    await asyncio.to_thread(
+                        _drop_claude_launch_args_from_another_host,
+                        conversation_store,
+                        bound,
+                        host_id,
+                    )
 
             persist_task = asyncio.create_task(persist_binding())
             try:

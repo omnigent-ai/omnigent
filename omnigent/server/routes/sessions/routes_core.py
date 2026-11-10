@@ -185,7 +185,6 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_cache,
     _session_status_from_cache,
     _set_read_state,
-    _split_claude_permission_launch_args,
     _start_managed_launch_task,
     _surface_model_change_forward_failure,
     _title_content_from_item,
@@ -4534,23 +4533,6 @@ def register_core_routes(
                     f"invalid terminal_launch_args: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
-        # Launch args a Claude Code session stores come from whatever started it
-        # on its own machine (say openui's ``--mcp-config`` file), and Claude
-        # exits at startup when such a file is missing. A managed fork always
-        # starts on a fresh sandbox, so it carries only the permission mode;
-        # Omnigent adds its own launch setup on every host.
-        drop_host_launch_args = (
-            not launch_args_set
-            and not switching_agent
-            and body.host_type == "managed"
-            and source.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-            == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
-            and bool(source.terminal_launch_args)
-        )
-        if drop_host_launch_args:
-            _, override_launch_args = _split_claude_permission_launch_args(
-                list(source.terminal_launch_args or ())
-            )
 
         # Permission mode lives BOTH in launch args (``--permission-mode``) and
         # as a copied label — and the label wins when both are present. So when
@@ -4811,7 +4793,7 @@ def register_core_routes(
                 override_reasoning_effort=None if clear_override_effort else override_effort,
                 override_reasoning_effort_set=effort_set,
                 override_terminal_launch_args=override_launch_args,
-                override_terminal_launch_args_set=launch_args_set or drop_host_launch_args,
+                override_terminal_launch_args_set=launch_args_set,
                 dropped_label_keys=dropped_label_keys,
                 extra_labels=extra_labels,
                 # Launch flags are CLI-specific. On an agent switch the fork may

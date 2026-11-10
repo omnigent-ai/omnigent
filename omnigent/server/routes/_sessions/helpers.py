@@ -180,6 +180,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_UI_LABEL_KEY,
     _CLAUDE_NATIVE_UI_LABEL_VALUE,
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
     _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
@@ -324,6 +325,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
+    FORK_SOURCE_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -3035,48 +3037,40 @@ def _merge_codex_permission_launch_args(
     return [*merged, *permission_args]
 
 
-def _split_claude_permission_launch_args(args: list[str]) -> tuple[list[str], list[str]]:
-    """
-    Split Claude launch args into permission-mode selectors and everything else.
-
-    The selectors are ``--permission-mode`` (space- or ``=``-joined) and the
-    standalone ``--dangerously-skip-permissions``, which Claude treats as
-    ``--permission-mode bypassPermissions``.
-
-    :param args: Launch args, e.g. ``["--model", "opus", "--permission-mode", "plan"]``.
-    :returns: ``(other_args, selector_args)``, each in order, e.g.
-        ``(["--model", "opus"], ["--permission-mode", "plan"])``.
-    """
-    other: list[str] = []
-    selectors: list[str] = []
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        index += 1
-        if arg == "--dangerously-skip-permissions" or arg.startswith("--permission-mode="):
-            selectors.append(arg)
-        elif arg == "--permission-mode":
-            selectors.append(arg)
-            if index < len(args) and not args[index].startswith("-"):
-                selectors.append(args[index])
-                index += 1
-        else:
-            other.append(arg)
-    return other, selectors
-
-
 def _strip_claude_permission_launch_arg(args: list[str]) -> tuple[list[str], bool]:
     """
     Drop every permission-mode selector from Claude launch args.
 
-    Leaving ``--dangerously-skip-permissions`` next to a pinned mode would
-    resume the session in bypass under a restricted label.
+    Removes ``--permission-mode`` (space- or ``=``-joined) and the standalone
+    ``--dangerously-skip-permissions``, which Claude treats as
+    ``--permission-mode bypassPermissions``; leaving that flag next to a pinned
+    mode would resume the session in bypass under a restricted label.
 
     :param args: Launch args, e.g. ``["--model", "opus", "--permission-mode", "plan"]``.
     :returns: The remaining args in order, and whether a selector was present.
     """
-    stripped, selectors = _split_claude_permission_launch_args(args)
-    return stripped, bool(selectors)
+    stripped: list[str] = []
+    had_flag = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dangerously-skip-permissions":
+            had_flag = True
+            index += 1
+            continue
+        if arg == "--permission-mode":
+            had_flag = True
+            index += 1
+            if index < len(args) and not args[index].startswith("-"):
+                index += 1
+            continue
+        if arg.startswith("--permission-mode="):
+            had_flag = True
+            index += 1
+            continue
+        stripped.append(arg)
+        index += 1
+    return stripped, had_flag
 
 
 def _merge_claude_permission_launch_args(
@@ -3101,6 +3095,43 @@ def _merge_claude_permission_launch_args(
     if not had_flag and not add_if_missing:
         return existing_args
     return [*stripped, "--permission-mode", mode]
+
+
+def _drop_claude_launch_args_from_another_host(
+    conversation_store: ConversationStore, conv: Conversation, host_id: str
+) -> Conversation:
+    """
+    Drop a forked Claude Code session's stored launch args when it binds to another host.
+
+    A session stores the launch args whatever started it passed, such as
+    openui's ``--mcp-config`` file under that machine's home directory, and
+    every launch replays them. A fork copies them, so a fork bound to a host
+    other than its source's would replay paths that aren't there, and Claude
+    exits at startup on a missing config file. Only the permission mode
+    Omnigent recorded for the session is kept; it is rebuilt from the label
+    rather than parsed out of the args, so no stored value can become a flag.
+    Omnigent adds its own launch setup on every host.
+
+    :param conversation_store: Store holding the session and its source.
+    :param conv: The session row just bound.
+    :param host_id: The host it was bound to, e.g. ``"host_a1b2c3d4..."``.
+    :returns: The session row, updated when its args were dropped.
+    """
+    source_id = conv.labels.get(FORK_SOURCE_LABEL_KEY)
+    if (
+        not source_id
+        or not conv.terminal_launch_args
+        or conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
+    ):
+        return conv
+    source = conversation_store.get_conversation(source_id)
+    if source is None or source.host_id is None or source.host_id == host_id:
+        return conv
+    mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    kept = ["--permission-mode", mode] if mode in _CLAUDE_NATIVE_PERMISSION_MODES else []
+    if conv.terminal_launch_args == kept:
+        return conv
+    return conversation_store.update_conversation(conv.id, terminal_launch_args=kept) or conv
 
 
 def _pin_claude_permission_launch_args(
@@ -12585,6 +12616,7 @@ __all__ = [
     "_devin_subagent_labels_from_body",
     "_discovery_key",
     "_dispatch_skill_slash_command_to_runner",
+    "_drop_claude_launch_args_from_another_host",
     "_emit_server_routing_decision",
     "_error_item_from_sse",
     "_evaluate_output_policy",
@@ -12741,7 +12773,6 @@ __all__ = [
     "_signal_terminal_resolved_harness_elicitation",
     "_spec_config_flag_explicitly_disabled",
     "_spec_harness",
-    "_split_claude_permission_launch_args",
     "_start_managed_launch_task",
     "_stop_session_host_runner",
     "_stop_session_via_runner",

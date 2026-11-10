@@ -212,6 +212,76 @@ async def test_launch_runner_writes_host_id_and_runner_id(
     assert updated.host_id == _HOST_ID, "host_id should be written to session row"
 
 
+async def test_launch_runner_drops_launch_args_a_fork_copied_from_another_host(
+    binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A fork launched on a host other than its source's leaves the launcher's args behind.
+
+    openui starts Claude Code sessions with an ``--mcp-config`` file under the
+    laptop's home directory, and a fork copies it. Launched on another host,
+    Claude would exit at startup on the missing file, so the binding keeps
+    only the permission mode Omnigent recorded for the session.
+    """
+    app, registry, _hs, conv_store = binding_app
+    comm = await _connect_host(app, registry)
+    source = conv_store.create_conversation(
+        agent_id=None,
+        host_id="1a2b3c4d5e6f40718293a4b5c6d7e8f9",
+        workspace="/Users/someone/repo",
+        terminal_launch_args=[
+            "--mcp-config",
+            "/Users/someone/.openui/mcp-inject.json",
+            "--permission-mode",
+            "plan",
+        ],
+        labels={
+            "omnigent.wrapper": "claude-code-native-ui",
+            "omnigent.claude_native.permission_mode": "plan",
+        },
+    )
+    fork = conv_store.fork_conversation(source_conversation_id=source.id)
+
+    async def _respond_launched() -> None:
+        """Answer the host's launch frame."""
+        for _ in range(20):
+            output = await comm.receive_output(timeout=10.0)
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostLaunchRunnerFrame):
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostLaunchRunnerResultFrame(
+                                request_id=frame.request_id,
+                                status="launched",
+                                runner_id="runner_token_test",
+                            )
+                        ),
+                    }
+                )
+                return
+
+    responder = asyncio.create_task(_respond_launched())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/v1/hosts/{_HOST_ID}/runners",
+            json={"session_id": fork.id, "workspace": "/tmp"},
+        )
+    await responder
+
+    assert resp.status_code == 200, resp.text
+    updated = conv_store.get_conversation(fork.id)
+    assert updated is not None
+    assert updated.host_id == _HOST_ID
+    assert updated.terminal_launch_args == ["--permission-mode", "plan"]
+    # The source keeps its own args for its own machine.
+    kept = conv_store.get_conversation(source.id)
+    assert kept is not None
+    assert kept.terminal_launch_args == source.terminal_launch_args
+
+
 async def test_sandbox_fork_cannot_launch_on_ordinary_host(
     binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
     monkeypatch: pytest.MonkeyPatch,
@@ -1781,7 +1851,7 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
 
     session_id = "3f3aa440b7274531a889fa4c25f4bb1b"
     host_id = "b4e372ad19634c62966a2c56aab8cfab"
-    conv = SimpleNamespace(id=session_id)
+    conv = SimpleNamespace(id=session_id, labels={}, terminal_launch_args=None)
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
     stages: list[tuple[str, str | None]] = []
@@ -1859,7 +1929,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
 
     session_id = "d3a6e13f0dbf4b6ea4b6e37f4a76f2a9"
     host_id = "9e6cf6f52ebb4a2c9c9a1a5f8e8f5f42"
-    conv = SimpleNamespace(id=session_id)
+    conv = SimpleNamespace(id=session_id, labels={}, terminal_launch_args=None)
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
     terminated: list[object] = []
