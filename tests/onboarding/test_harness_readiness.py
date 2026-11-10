@@ -1044,7 +1044,7 @@ def test_claude_ready_via_managed_gateway_without_provider_or_cli_login(
 ) -> None:
     """Claude reads ready from its own managed-settings gateway alone.
 
-    The enterprise state (`isaac configure claude`): nothing in omnigent's
+    The enterprise state (a Claude setup): nothing in omnigent's
     config, no subscription login the probe can see, but Claude Code's managed
     settings pin a Unity Gateway + apiKeyHelper and the CLI applies them itself.
     This is the exact "Claude Code isn't configured on <host>" dead end — the

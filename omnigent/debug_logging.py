@@ -7,8 +7,8 @@ Delta table through the ZeroBus REST ingest endpoint, so a whole session's logs
 can be queried in one place (see the Omnigent Debuggability Plan, OMNI-4198).
 
 By default, the sink is enabled only when the ``OMNIGENT_DEBUG_LOG_*``
-environment variables are present -- the internal ``omni`` config CLI sets them
-for internal users, so the feature is off by default for OSS users and
+environment variables are present -- the ``omni`` config CLI sets them
+for managed deployments, so the feature is off by default for OSS users and
 customers. Integrations can instead provide their own batch-send function.
 Delivery is best-effort and fully non-blocking: records are queued and flushed
 by a daemon thread, and any failure drops rows rather than disrupting the
@@ -1503,7 +1503,7 @@ def debug_sink_enabled() -> bool:
 
     A cheap gate for opt-in, table-only logging (e.g. the SSE-event stream):
     callers skip building records entirely when the sink is off, so the feature
-    adds no cost for OSS / non-internal users who never enabled it.
+    adds no cost for OSS users who never enabled it.
     """
     # Intentionally lock-free: a single global-object read is atomic under the
     # GIL, and this is a best-effort gate — a stale read only mis-times one

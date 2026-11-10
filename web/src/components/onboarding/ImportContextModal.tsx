@@ -28,6 +28,7 @@ import {
   type HarnessInventoryContext,
   type HarnessInventoryStatus,
   type InventoryAssetKind,
+  type InventoryHarness,
 } from "@/hooks/useHarnessInventory";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { Link } from "@/lib/routing";
@@ -96,7 +97,7 @@ function countLabel(count: number | undefined, noun: string): string | undefined
 
 /** The harness's non-empty asset lists, in MCPs → Skills → Plugins order. */
 function assetLists(context: ImportContext, harness: ImportHarness): AssetList[] {
-  const own = <T extends { harness: ImportHarness }>(items: T[]) =>
+  const own = <T extends { harness: InventoryHarness }>(items: T[]) =>
     items.filter((item) => item.harness === harness);
   const lists: AssetList[] = [
     {
@@ -166,7 +167,7 @@ function unavailableNotice(unavailable: InventoryAssetKind[]): string | null {
 
 /** Harnesses with a credential or any asset, in the shared brand order. */
 function detectedHarnesses(context: ImportContext): ImportHarness[] {
-  const found = new Set<ImportHarness>(
+  const found = new Set<InventoryHarness>(
     [...context.credentials, ...context.mcps, ...context.skills, ...context.plugins].map(
       (item) => item.harness,
     ),

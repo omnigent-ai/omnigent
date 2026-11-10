@@ -11,6 +11,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
+import { isSessionWorking } from "@/hooks/useSessionState";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   readDeleteWorktreesOnArchive,
@@ -25,23 +26,26 @@ interface PendingPrompt {
   choose: (deleteWorktrees: boolean) => void;
 }
 
+interface PendingRunningPrompt {
+  runningCount: number;
+  sessionCount: number;
+  confirm: () => void;
+}
+
 /**
- * Gate an archive on the "Delete worktrees for archived sessions" preference.
- *
- * `requestArchive` proceeds immediately when no session has a worktree or the
- * user has already chosen; otherwise it opens the returned `dialog`, which the
- * caller must render. Dismissing the dialog cancels the archive. Servers that
- * predate worktree cleanup always archive only.
+ * Confirm archiving working sessions, then apply the worktree preference.
+ * Callers render `dialog`; dismissing either prompt cancels the archive.
  */
-export function useArchiveWorktreePrompt(): {
+export function useArchivePrompt(): {
   requestArchive: (conversations: readonly Conversation[], proceed: ProceedFn) => void;
   dialog: ReactNode;
 } {
   const [pending, setPending] = useState<PendingPrompt | null>(null);
+  const [pendingRunning, setPendingRunning] = useState<PendingRunningPrompt | null>(null);
   const serverInfo = useServerInfo();
   const cleanupSupported = serverInfo !== "loading" && serverInfo.archive_worktree_cleanup === true;
 
-  const requestArchive = useCallback(
+  const requestWorktreeChoice = useCallback(
     (conversations: readonly Conversation[], proceed: ProceedFn) => {
       const worktreeIds = new Set(
         conversations.filter((c) => c.git_branch != null).map((c) => c.id),
@@ -63,19 +67,121 @@ export function useArchiveWorktreePrompt(): {
     [cleanupSupported],
   );
 
+  const requestArchive = useCallback(
+    (conversations: readonly Conversation[], proceed: ProceedFn) => {
+      const runningCount = conversations.filter(isSessionWorking).length;
+      if (runningCount === 0) {
+        requestWorktreeChoice(conversations, proceed);
+        return;
+      }
+      setPendingRunning({
+        runningCount,
+        sessionCount: conversations.length,
+        confirm: () => requestWorktreeChoice(conversations, proceed),
+      });
+    },
+    [requestWorktreeChoice],
+  );
+
   const dialog = (
-    <ArchiveWorktreeDialog
-      pending={pending}
-      onChoose={(deleteWorktrees, remember) => {
-        if (remember) writeDeleteWorktreesOnArchive(deleteWorktrees);
-        const current = pending;
-        setPending(null);
-        current?.choose(deleteWorktrees);
-      }}
-      onCancel={() => setPending(null)}
-    />
+    <>
+      <ArchiveRunningDialog
+        pending={pendingRunning}
+        onConfirm={() => {
+          const current = pendingRunning;
+          setPendingRunning(null);
+          current?.confirm();
+        }}
+        onCancel={() => setPendingRunning(null)}
+      />
+      <ArchiveWorktreeDialog
+        pending={pending}
+        onChoose={(deleteWorktrees, remember) => {
+          if (remember) writeDeleteWorktreesOnArchive(deleteWorktrees);
+          const current = pending;
+          setPending(null);
+          current?.choose(deleteWorktrees);
+        }}
+        onCancel={() => setPending(null)}
+      />
+    </>
   );
   return { requestArchive, dialog };
+}
+
+function runningPromptCopy({ runningCount, sessionCount }: PendingRunningPrompt): {
+  title: string;
+  description: string;
+} {
+  if (sessionCount === 1) {
+    return {
+      title: "Archive running session?",
+      description:
+        "This session's agent is still working. Archiving stops it. You can unarchive the session later.",
+    };
+  }
+  const one = runningCount === 1;
+  return {
+    title: one ? "Archive a running session?" : `Archive ${runningCount} running sessions?`,
+    description: `${runningCount} of the ${sessionCount} sessions you're archiving ${
+      one ? "has an agent" : "have agents"
+    } still working. Archiving stops ${one ? "it" : "them"}. You can unarchive sessions later.`,
+  };
+}
+
+function ArchiveRunningDialog({
+  pending,
+  onConfirm,
+  onCancel,
+}: {
+  pending: PendingRunningPrompt | null;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const open = pending !== null;
+  const copy = pending ? runningPromptCopy(pending) : null;
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) onCancel();
+      }}
+    >
+      {copy && (
+        <DialogContent
+          className="sm:max-w-md"
+          // Keep dialog clicks off a surrounding sidebar row Link.
+          onClick={(e) => e.stopPropagation()}
+          data-testid="archive-running-dialog"
+        >
+          <DialogHeader>
+            <DialogTitle>{copy.title}</DialogTitle>
+            <DialogDescription>{copy.description}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="border-t-0 bg-transparent">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={onCancel}
+              data-testid="archive-running-cancel"
+              componentId="archive.running_prompt.cancel"
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={onConfirm}
+              data-testid="archive-running-confirm"
+              componentId="archive.running_prompt.archive"
+            >
+              Archive
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      )}
+    </Dialog>
+  );
 }
 
 function ArchiveWorktreeDialog({

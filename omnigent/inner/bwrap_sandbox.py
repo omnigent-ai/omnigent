@@ -189,7 +189,7 @@ _ALLOWED_SOCKET_FAMILIES = (
 # Vetted outer sandboxes; see _should_bind_host_proc for isolation requirements.
 _PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"lakebox", "phoenix-kubernetes"})
 
-# Marker directory the Databricks Lakebox runtime seeds inside every
+# Marker directory the Lakebox runtime seeds inside every
 # microVM. Used to autodetect lakebox when the launcher hasn't declared the
 # backend via :data:`HOST_SANDBOX_BACKEND_ENV`.
 _LAKEBOX_MARKER = Path("/run/lakebox")
