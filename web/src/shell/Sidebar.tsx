@@ -15,6 +15,7 @@ import {
   useProjectFolderCollapse,
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
+import { useSessionRowQuickActions } from "@/lib/sessionRowQuickActionsPreferences";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
@@ -198,7 +199,7 @@ import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
-import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import { useArchivePrompt } from "./ArchivePrompt";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
@@ -4571,6 +4572,7 @@ function ConversationMenuItems({
       )
     : [];
   const { forkDisabledReason } = useSessionActionRestrictions(conversation.id, conversation);
+  const showQuickActions = useSessionRowQuickActions();
   // Mobile lacks the horizontal room for a side-opening submenu, so the
   // project picker replaces the menu body in place instead of flying out
   // to the side. `view` swaps between the main actions and that sub-view;
@@ -4640,9 +4642,6 @@ function ConversationMenuItems({
           <C.Separator />
         </>
       )}
-      {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
-          hover-revealed quick-pin button. Archived rows omit it (archive
-          outranks pin). */}
       {!isArchived && gridOptions.length > 0 && (
         <C.Sub>
           <C.SubTrigger className="mobile-touch-target">Open in grid</C.SubTrigger>
@@ -4659,11 +4658,13 @@ function ConversationMenuItems({
           </C.SubContent>
         </C.Sub>
       )}
+      {/* Desktop pins from the hover button unless Settings hides it; archived
+          rows omit Pin (archive outranks pin). */}
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
           disabled={pinSaving || (!isPinned && atPinCap)}
-          className="mobile-touch-target md:hidden"
+          className={cn("mobile-touch-target", showQuickActions && "md:hidden")}
           onSelect={() => onTogglePinned(conversation.id)}
         >
           {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -5391,7 +5392,9 @@ function ConversationRowImpl({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt();
+  const archivePrompt = useArchivePrompt();
+  // Settings → Appearance can keep Pin and Archive in the menus only.
+  const showQuickActions = useSessionRowQuickActions();
   const leave = useLeaveSession();
   const moveToProject = useMoveToProject();
   // The kebab's user-facing "Stop session" action. Archiving does NOT go
@@ -5731,7 +5734,7 @@ function ConversationRowImpl({
       runUnarchive();
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+    archivePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
       archiveNow(deleteWorktreeIds.has(conversation.id)),
     );
   }
@@ -6179,7 +6182,7 @@ function ConversationRowImpl({
             >
               {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
-              {!isArchived && (
+              {showQuickActions && !isArchived && (
                 <Tooltip disableHoverableContent>
                   <TooltipContent
                     shortcut={
@@ -6235,7 +6238,7 @@ function ConversationRowImpl({
               {/* Archive is owner-only, same as the kebab's Archive item; non-owners
               don't get the quick affordance and instead see that item disabled
               with an explanation. */}
-              {isOwner && (
+              {showQuickActions && isOwner && (
                 <Tooltip disableHoverableContent>
                   <TooltipContent
                     shortcut={
@@ -6437,7 +6440,7 @@ function ConversationRowImpl({
           </DialogContent>
         )}
       </Dialog>
-      {archiveWorktreePrompt.dialog}
+      {archivePrompt.dialog}
       <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
         {leaveOpen && (
           <DialogContent
@@ -7299,7 +7302,7 @@ function BulkActionBar({
   const queryClient = useQueryClient();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt();
+  const archivePrompt = useArchivePrompt();
   const bulkDelete = useBulkDeleteConversations();
   const bulkMove = useBulkMoveToProject();
   const { data: projects = [] } = useProjects();
@@ -7439,7 +7442,7 @@ function BulkActionBar({
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
     const toArchive = nonArchivedSelected;
-    archiveWorktreePrompt.requestArchive(toArchive, (deleteWorktreeIds) =>
+    archivePrompt.requestArchive(toArchive, (deleteWorktreeIds) =>
       archiveNow(toArchive, deleteWorktreeIds),
     );
   }
@@ -7487,7 +7490,7 @@ function BulkActionBar({
 
   return (
     <>
-      {archiveWorktreePrompt.dialog}
+      {archivePrompt.dialog}
       <div className="mt-1 mb-1 flex flex-col gap-1.5">
         <div className="flex items-center gap-2 rounded-lg border border-border bg-transparent p-1.5">
           <Tooltip>

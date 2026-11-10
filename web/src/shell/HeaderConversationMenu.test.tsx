@@ -407,6 +407,19 @@ describe("HeaderConversationMenu", () => {
     });
   });
 
+  it("asks before archiving a running session, and Cancel keeps it open", () => {
+    renderMenu({ conversation: { ...CONVERSATION, status: "running" } });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+    expect(screen.getByRole("dialog", { name: "Archive running session?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mocks.archive).not.toHaveBeenCalled();
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+  });
+
   it("offers Unarchive on an archived session and unarchives in place", () => {
     // An archived session reopened by URL must not be re-offered the action
     // that was already taken; the item flips like the sidebar row's menu.
@@ -883,6 +896,19 @@ describe("HeaderConversationMenu desktop menu commands", () => {
       id: "conv-1",
       archived: true,
       deleteWorktree: true,
+    });
+  });
+
+  it("confirms a running session before Session → Archive reaches the worktree prompt", () => {
+    renderMenu({ conversation: { ...CONVERSATION, status: "running" } });
+    act(() => sendCommand({ command: "archive-session", browserViewId: null }));
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+    expect(mocks.archive).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "No, archive only" }));
+    expect(mocks.archive).toHaveBeenCalledWith({
+      id: "conv-1",
+      archived: true,
+      deleteWorktree: false,
     });
   });
 
