@@ -8,6 +8,9 @@ from typing import Any
 
 from omnigent.entities import InboxItem
 
+# Items one session may post.
+INBOX_ITEMS_PER_SESSION = 10
+
 
 class DuplicateInboxItemError(Exception):
     """Raised when an insert collides with an existing item's duplicate key."""
@@ -88,8 +91,10 @@ class InboxItemStore(ABC):
     def create(self, item: NewInboxItem, *, retire_item_id: str | None = None) -> InboxItem:
         """Insert *item* as an unread item, in one transaction with its admission checks.
 
-        Each session may hold :data:`~omnigent.db.db_models.INBOX_ITEMS_PER_SESSION`
-        items; concurrent posts cannot exceed it.
+        Each session may hold :data:`INBOX_ITEMS_PER_SESSION` items. The count
+        and the insert share one write transaction, which serializes them on
+        SQLite; on databases with concurrent writers, posts racing for the last
+        place can each commit, so the cap is a bound, not an exact limit.
 
         :param item: The item's fields.
         :param retire_item_id: An expired item holding the same key; its key is
@@ -143,10 +148,9 @@ class InboxItemStore(ABC):
     ) -> InboxItem | None:
         """Apply the owner's response to an item.
 
-        Moving out of ``unread`` stamps ``read_at`` once. Setting a resolution
-        other than ``"none"`` stamps ``acted_at``. Without a resolution, *state*
-        changes only an open (unread or read) item, so a late read mark cannot
-        reopen a resolved one.
+        Setting a resolution other than ``"none"`` stamps ``resolved_at``.
+        Without a resolution, *state* changes only an open (unread or read)
+        item, so a late read mark cannot reopen a resolved one.
 
         :param item_id: Hex UUID of the item.
         :param user_id: The owner the item must belong to.

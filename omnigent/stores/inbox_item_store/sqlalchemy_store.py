@@ -6,22 +6,15 @@ import heapq
 import uuid
 from collections.abc import Callable
 from functools import partial
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from sqlalchemy import ColumnElement, Select, and_, func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
-from omnigent.db.db_models import INBOX_ITEMS_PER_SESSION, SqlInboxItem, current_workspace_id
-from omnigent.db.enum_codecs import (
-    decode_inbox_item_kind,
-    decode_inbox_item_resolution,
-    decode_inbox_item_state,
-    encode_inbox_item_kind,
-    encode_inbox_item_resolution,
-    encode_inbox_item_state,
-)
+from omnigent.db.db_models import SqlInboxItem, current_workspace_id
+from omnigent.db.enum_codecs import decode_inbox_item_state, encode_inbox_item_state
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -30,6 +23,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import InboxItem
 from omnigent.stores.inbox_item_store import (
+    INBOX_ITEMS_PER_SESSION,
     DuplicateInboxItemError,
     InboxItemStore,
     InboxItemTooLargeError,
@@ -38,38 +32,56 @@ from omnigent.stores.inbox_item_store import (
 )
 
 _OPEN_STATE_CODES = frozenset(encode_inbox_item_state(state) for state in ("unread", "read"))
-# Each lost slot means a concurrent post filled one of the session's slots, so
-# after this many the session is full; one more covers replacing an expired key.
-_SLOT_RETRIES = INBOX_ITEMS_PER_SESSION + 1
 _T = TypeVar("_T")
+
+
+def _answer(stored: dict[str, Any] | None) -> tuple[str, int | None, str | None]:
+    """Unpack a stored resolution envelope into its reason, action index, and comment."""
+    if stored is None:
+        return "none", None, None
+    return stored.get("reason", "none"), stored.get("action"), stored.get("text")
+
+
+def _resolution_envelope(
+    reason: str, action: int | None, text: str | None
+) -> dict[str, Any] | None:
+    """The stored resolution, or ``None`` while the owner has not answered."""
+    if reason == "none" and text is None:
+        return None
+    stored: dict[str, Any] = {"reason": reason}
+    if action is not None:
+        stored["action"] = action
+    if text is not None:
+        stored["text"] = text
+    return stored
 
 
 def _to_entity(row: SqlInboxItem) -> InboxItem:
     """Convert an ORM row to an :class:`InboxItem`."""
     content = row.content
+    reason, action, text = _answer(row.resolution)
     return InboxItem(
         id=row.id,
         user_id=row.user_id,
         source_session_id=row.source_session_id,
         agent_id=row.agent_id,
         prompt_version=row.prompt_version,
-        kind=decode_inbox_item_kind(row.kind),
+        kind=content["kind"],
         title=content["title"],
         body_md=content["body_md"],
         links=content["links"],
         actions=content["actions"],
-        media=row.media,
+        media=content["media"],
         primary_link=content["primary_link"],
         topic=content["topic"],
         dedupe_key=row.dedupe_key,
         state=decode_inbox_item_state(row.state),
-        resolution=decode_inbox_item_resolution(row.resolution),
-        feedback_text=row.feedback["text"] if row.feedback is not None else None,
+        resolution=reason,
+        feedback_text=text,
         created_at=row.created_at,
-        read_at=row.read_at,
-        acted_at=row.acted_at,
+        resolved_at=row.resolved_at,
         expires_at=row.expires_at,
-        resolution_action=row.resolution_action,
+        resolution_action=action,
     )
 
 
@@ -142,25 +154,24 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
 
     def create(self, item: NewInboxItem, *, retire_item_id: str | None = None) -> InboxItem:
         """See base class."""
-        for attempt in range(_SLOT_RETRIES + 1):
+        for attempt in range(2):
             try:
                 return _sized(partial(self._insert, item, retire_item_id))
             except InboxSessionCapError:
-                # A concurrent post with the same key may have taken the last slot.
+                # A full session reports a repeat of one of its items as a duplicate.
                 if self._live_duplicate(item, retire_item_id) is not None:
                     raise DuplicateInboxItemError(item.dedupe_key) from None
                 raise
             except IntegrityError as exc:
-                # A concurrent post took our slot, or another item holds the key.
+                # Another item holds the key.
                 holder = self.get_by_dedupe_key(item.user_id, item.dedupe_key)
-                if holder is not None and holder.id != retire_item_id:
-                    if not _expired(holder):
-                        raise DuplicateInboxItemError(item.dedupe_key) from exc
-                    # The holder expired, so this post replaces it, even when it
-                    # was inserted after the caller's duplicate check.
-                    retire_item_id = holder.id
-                if attempt == _SLOT_RETRIES:
+                if holder is None or holder.id == retire_item_id or attempt == 1:
                     raise
+                if not _expired(holder):
+                    raise DuplicateInboxItemError(item.dedupe_key) from exc
+                # The holder expired, so this post replaces it, even when it was
+                # inserted after the caller's duplicate check.
+                retire_item_id = holder.id
         raise AssertionError("unreachable")
 
     def _live_duplicate(self, item: NewInboxItem, retire_item_id: str | None) -> InboxItem | None:
@@ -173,21 +184,22 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
     def _insert(self, item: NewInboxItem, retire_item_id: str | None) -> InboxItem:
         item_id = uuid.uuid4().hex
         created_at = now_epoch()
-        used_slots = (
-            select(SqlInboxItem.session_slot)
+        # Counting stops at the cap, so a session's row count never grows the query.
+        posted = (
+            select(SqlInboxItem.id)
             .where(
                 SqlInboxItem.workspace_id == current_workspace_id(),
                 SqlInboxItem.user_id == item.user_id,
                 SqlInboxItem.source_session_id == item.source_session_id,
             )
             .limit(INBOX_ITEMS_PER_SESSION)
+            .subquery()
         )
+        count_posted = select(func.count()).select_from(posted)
 
         def write(session: Session) -> InboxItem:
             require_active_account(session, item.user_id)
-            taken = set(session.execute(used_slots).scalars())
-            free = [slot for slot in range(INBOX_ITEMS_PER_SESSION) if slot not in taken]
-            if not free:
+            if session.execute(count_posted).scalar_one() >= INBOX_ITEMS_PER_SESSION:
                 raise InboxSessionCapError(item.source_session_id)
             if retire_item_id is not None:
                 retired = self._owned_row(session, retire_item_id, item.user_id, for_update=True)
@@ -198,22 +210,20 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
                 id=item_id,
                 user_id=item.user_id,
                 source_session_id=item.source_session_id,
-                session_slot=free[0],
                 agent_id=item.agent_id,
                 prompt_version=item.prompt_version,
-                kind=encode_inbox_item_kind(item.kind),
+                dedupe_key=item.dedupe_key,
+                state=encode_inbox_item_state("unread"),
                 content={
+                    "kind": item.kind,
                     "title": item.title,
                     "body_md": item.body_md,
                     "links": item.links,
                     "actions": item.actions,
                     "topic": item.topic,
                     "primary_link": item.primary_link,
+                    "media": item.media,
                 },
-                media=item.media,
-                dedupe_key=item.dedupe_key,
-                state=encode_inbox_item_state("unread"),
-                resolution=encode_inbox_item_resolution("none"),
                 created_at=created_at,
                 expires_at=item.expires_at,
             )
@@ -332,21 +342,18 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
             row = self._owned_row(session, item_id, user_id, for_update=True)
             if row is None:
                 return None
-            if state is not None:
-                new_code = encode_inbox_item_state(state)
-                if new_code != encode_inbox_item_state("unread") and row.read_at is None:
-                    row.read_at = now
-                # A read or unread mark never reopens a resolved item; only a
-                # resolution of "none" does, and it sets the state itself.
-                if resolution is not None or row.state in _OPEN_STATE_CODES:
-                    row.state = new_code
+            reason, action, text = _answer(row.resolution)
+            # A read or unread mark never reopens a resolved item; only a
+            # resolution of "none" does, and it sets the state itself.
+            if state is not None and (resolution is not None or row.state in _OPEN_STATE_CODES):
+                row.state = encode_inbox_item_state(state)
             if resolution is not None:
-                row.resolution = encode_inbox_item_resolution(resolution)
-                row.resolution_action = resolution_action
+                reason, action = resolution, resolution_action
                 if resolution != "none":
-                    row.acted_at = now
+                    row.resolved_at = now
             if feedback_text is not None:
-                row.feedback = {"text": feedback_text}
+                text = feedback_text
+            row.resolution = _resolution_envelope(reason, action, text)
             session.flush()
             return _to_entity(row)
 

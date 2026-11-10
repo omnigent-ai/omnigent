@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import random
 from collections.abc import Iterator
 
 import pytest
 import sqlalchemy as sa
 
 from omnigent.db import envelope
+from omnigent.db.compression import encode
 from omnigent.db.envelope import (
     ENVELOPE_FORMAT,
     EnvelopeCipherUnavailableError,
@@ -74,8 +76,24 @@ def test_readers_handle_both_variants_once_a_cipher_is_configured() -> None:
 
 @pytest.mark.parametrize(
     "stored",
-    [b"", b"\x01", b"\x02\x00{}", b"\x01\x09{}", b"\x01\x01\x00"],
-    ids=["empty", "no-variant", "unknown-format", "unknown-variant", "truncated-metadata"],
+    [
+        b"",
+        b"\x01",
+        b"\x02\x00{}",
+        b"\x01\x09{}",
+        b"\x01\x01\x00",
+        b"\x01\x00",
+        bytes((ENVELOPE_FORMAT, 0x00)) + (encode("") or b""),
+    ],
+    ids=[
+        "empty",
+        "no-variant",
+        "unknown-format",
+        "unknown-variant",
+        "truncated-metadata",
+        "header-only-plaintext",
+        "empty-plaintext",
+    ],
 )
 def test_unknown_or_truncated_envelopes_are_rejected(stored: bytes) -> None:
     with pytest.raises(ValueError):
@@ -98,6 +116,17 @@ def test_column_type_round_trips_and_bounds_the_stored_size() -> None:
         assert bytes(raw)[:2] == bytes((ENVELOPE_FORMAT, 0x00))
         assert conn.execute(sa.select(table.c.value)).scalar_one() == {"a": [1, 2]}
     with pytest.raises(sa.exc.StatementError) as caught, engine.begin() as conn:
-        # Random-looking text compresses poorly, so the envelope exceeds 64 bytes.
-        conn.execute(table.insert(), {"id": 2, "value": {"a": envelope.__doc__}})
+        # Random text compresses poorly, so the envelope exceeds 64 bytes.
+        noise = random.Random(0).randbytes(64).hex()
+        conn.execute(table.insert(), {"id": 2, "value": {"a": noise}})
     assert isinstance(caught.value.orig, ValueError)
+
+
+def test_values_readers_would_refuse_are_not_written() -> None:
+    # The JSON text of {"a": "..."} is 8 bytes plus the string.
+    at_limit = {"a": "x" * (envelope._MAX_DECODED_BYTES - 8)}
+    assert open_envelope(seal(at_limit)) == at_limit
+
+    over = {"a": "x" * (envelope._MAX_DECODED_BYTES - 7)}
+    with pytest.raises(ValueError, match="exceeds"):
+        seal(over)

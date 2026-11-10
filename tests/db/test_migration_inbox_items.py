@@ -34,6 +34,21 @@ def test_upgrade_creates_table_and_downgrade_drops_it(tmp_path: Path) -> None:
         "id",
     ]
     assert inspector.get_foreign_keys("inbox_items") == []
+    assert [column["name"] for column in inspector.get_columns("inbox_items")] == [
+        "workspace_id",
+        "id",
+        "user_id",
+        "source_session_id",
+        "agent_id",
+        "prompt_version",
+        "dedupe_key",
+        "state",
+        "content",
+        "resolution",
+        "created_at",
+        "resolved_at",
+        "expires_at",
+    ]
     indexes = {
         index["name"]: (index["column_names"], bool(index["unique"]))
         for index in inspector.get_indexes("inbox_items")
@@ -44,11 +59,8 @@ def test_upgrade_creates_table_and_downgrade_drops_it(tmp_path: Path) -> None:
             ["workspace_id", "user_id", "state", "created_at", "id"],
             False,
         ),
+        "ix_inbox_items_session": (["workspace_id", "user_id", "source_session_id"], False),
         "uq_inbox_items_user_dedupe_key": (["workspace_id", "user_id", "dedupe_key"], True),
-        "uq_inbox_items_session_slot": (
-            ["workspace_id", "user_id", "source_session_id", "session_slot"],
-            True,
-        ),
     }
     # The application supplies every value on this new table.
     assert all(column["default"] is None for column in inspector.get_columns("inbox_items"))
@@ -66,14 +78,11 @@ def _row(**overrides: object) -> dict[str, object]:
         "id": bytes(16),
         "user_id": "alice",
         "source_session_id": bytes(range(16)),
-        "session_slot": 0,
         "agent_id": bytes(range(1, 17)),
-        "kind": 1,
-        "content": b"\x01\x00{}",
-        "media": b"\x01\x00[]",
         "dedupe_key": "v1:x",
         "state": 1,
-        "resolution": 0,
+        "content": b"\x01\x00{}",
+        "resolution": None,
         "created_at": 1,
     }
     row.update(overrides)
@@ -81,10 +90,10 @@ def _row(**overrides: object) -> dict[str, object]:
 
 
 _INSERT = sa.text(
-    "INSERT INTO inbox_items (workspace_id, id, user_id, source_session_id, session_slot, "
-    "agent_id, kind, content, media, dedupe_key, state, resolution, created_at) VALUES "
-    "(:workspace_id, :id, :user_id, :source_session_id, :session_slot, :agent_id, :kind, "
-    ":content, :media, :dedupe_key, :state, :resolution, :created_at)"
+    "INSERT INTO inbox_items (workspace_id, id, user_id, source_session_id, agent_id, "
+    "dedupe_key, state, content, resolution, created_at) VALUES "
+    "(:workspace_id, :id, :user_id, :source_session_id, :agent_id, :dedupe_key, :state, "
+    ":content, :resolution, :created_at)"
 )
 
 
@@ -101,28 +110,26 @@ def engine(tmp_path: Path) -> Iterator[sa.Engine]:
 
 
 def _second(**overrides: object) -> dict[str, object]:
-    """A row distinct from the fixture's in id, duplicate key, and session slot."""
-    return _row(**{"id": bytes([1] * 16), "dedupe_key": "v1:y", "session_slot": 1, **overrides})
+    """A row distinct from the fixture's in id and duplicate key."""
+    return _row(**{"id": bytes([1] * 16), "dedupe_key": "v1:y", **overrides})
 
 
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"dedupe_key": "\u00e9" * 256 + "k"},
+        {"dedupe_key": "é" * 256 + "k"},
         {"created_at": "x" * 16_384},
-        {"session_slot": 0.5},
-        {"session_slot": 10},
+        {"state": 5},
         {"content": b"c" * 16_384},
-        {"media": b"m" * 16_384},
+        {"resolution": b"r" * 16_384},
         {"source_session_id": b"short"},
     ],
     ids=[
         "multibyte-dedupe-key-one-byte-over",
         "text-timestamp",
-        "fractional-slot",
-        "slot-past-cap",
+        "unknown-state",
         "content-one-byte-over",
-        "media-one-byte-over",
+        "resolution-one-byte-over",
         "bad-uuid",
     ],
 )
@@ -136,12 +143,12 @@ def test_sqlite_rejects_values_outside_the_column_bounds(
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"dedupe_key": "\u00e9" * 256},
+        {"dedupe_key": "é" * 256},
         {"content": b"c" * 16_383},
-        {"media": b"m" * 16_383},
-        {"session_slot": 9},
+        {"resolution": b"r" * 16_383},
+        {"state": 4},
     ],
-    ids=["multibyte-dedupe-key-at-limit", "content-at-limit", "media-at-limit", "last-slot"],
+    ids=["multibyte-dedupe-key-at-limit", "content-at-limit", "resolution-at-limit", "last-state"],
 )
 def test_sqlite_accepts_values_at_the_column_bounds(
     engine: sa.Engine, overrides: dict[str, object]
@@ -155,17 +162,10 @@ def test_sqlite_accepts_values_at_the_column_bounds(
     [
         ({"dedupe_key": "v1:x"}, False),
         ({"dedupe_key": "v1:x", "user_id": "bob"}, True),
-        ({"session_slot": 0}, False),
-        ({"session_slot": 0, "source_session_id": bytes(range(2, 18))}, True),
     ],
-    ids=[
-        "same-owner-duplicate-key",
-        "other-owner-same-key",
-        "same-session-slot",
-        "other-session-same-slot",
-    ],
+    ids=["same-owner-duplicate-key", "other-owner-same-key"],
 )
-def test_unique_indexes_scope_keys_and_slots(
+def test_unique_index_scopes_keys_to_their_owner(
     engine: sa.Engine, overrides: dict[str, object], allowed: bool
 ) -> None:
     if allowed:
