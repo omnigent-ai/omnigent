@@ -18,7 +18,7 @@ An automation is a saved instruction that fires an agent session on a recurring 
 
 There are three surfaces, all writing the same rows.
 
-**Web UI.** Open the `/tasks` page (sidebar: _Automations_, or the command palette: _Go to Automations_). The create dialog takes the schedule, the agent, the prompt, and optionally a model, a reasoning effort, and a project to file each run's session into (pick one or type a new name to create it). A new automation runs on a host you pick, starting with your first online host; when the server supports managed sandboxes, the host picker also offers a new sandbox for each run. An automation saved without a host (over the API or by an agent) runs on your most recently active live host, and the UI shows it as _Most recently active host_ until you pick one. Each row shows the schedule and, when armed, a live relative next-run time. The API exposes the last run's status as `last_run_status`; the row does not display it.
+**Web UI.** Open the `/tasks` page (sidebar: *Automations*, or the command palette: *Go to Automations*). The create dialog takes the schedule, the agent, the prompt, and optionally a model, a reasoning effort, and a project to file each run's session into (pick one or type a new name to create it). A new automation runs on a host you pick, starting with your first online host; when the server supports managed sandboxes, the host picker also offers a new sandbox for each run. An automation saved without a host (over the API or by an agent) runs on your most recently active live host, and the UI shows it as *Most recently active host* until you pick one. Each row shows the schedule and, when armed, a live relative next-run time. The API exposes the last run's status as `last_run_status`; the row does not display it.
 
 **REST API.** `POST /v1/scheduled-tasks`. Required: `name`, `prompt`, `rrule`, `agent_id`. Optional: `timezone` (defaults to `UTC`), `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `session_mode` (`new` or `continue`, defaults to `new`), `session_id`, `source_session_id`, `workspace`, `host_id`, `execution_target` (defaults to `connected_host`), and `project_id`. Unknown fields are rejected. For `connected_host`, the two optional targeting fields are not independent: sending a `workspace` without a `host_id` is a 400 (`host_id required when workspace is set`), because only a host can resolve a path. Sending neither is fine -- the fire resolves both. Existing managed sandbox hosts cannot be pinned or automatically selected for connected-host runs.
 
@@ -34,7 +34,7 @@ To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox
   "agent_id": "ag_...",
   "timezone": "Asia/Tokyo",
   "permission_mode": "acceptEdits",
-  "max_cost_usd": 2.0,
+  "max_cost_usd": 2.00
 }
 ```
 
@@ -50,14 +50,14 @@ Modes that skip approval (Claude Code `bypassPermissions` and `dontAsk`, Codex `
 
 When first firings overlap, the first session recorded on the automation wins. Each other firing deletes its unused session and delivers its original prompt into the recorded session through the normal continuation path. Each firing keeps its own run record. If the session cannot be recorded or continued, the run fails with one of the codes below; a session that exists but cannot take the prompt is never silently replaced. The one exception is a session that was deleted: the next firing (or **Run now**) starts a new session, records it as the automation's `session_id`, and continues in it. For a `managed_sandbox` task, the sandbox is provisioned again when no earlier session on it is known.
 
-| Situation                                                                                                                                                                                                                             | Run      | `error_code`                        |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ----------------------------------- |
-| The session is archived                                                                                                                                                                                                               | `failed` | `continued_session_archived`        |
-| The owner no longer owns the session                                                                                                                                                                                                  | `failed` | `continued_session_forbidden`       |
-| The automation has a budget, and the session already has a cost cap it did not set, such as another automation's or one from before this release                                                                                      | `failed` | `continued_session_budget_conflict` |
-| The automation's cost cap could not be set on the session; any cap it already had stays                                                                                                                                               | `failed` | `continued_session_budget_failed`   |
-| A first run could not record its new session on the automation                                                                                                                                                                        | `failed` | `session_record_failed`             |
-| The session runs a different agent, on a different host or workspace than the task pins, in a sandbox when the task targets a connected host (or the reverse), or, for a `managed_sandbox` task, outside the sandbox the task started | `failed` | `continued_session_incompatible`    |
+| Situation | Run | `error_code` |
+| --- | --- | --- |
+| The session is archived | `failed` | `continued_session_archived` |
+| The owner no longer owns the session | `failed` | `continued_session_forbidden` |
+| The automation has a budget, and the session already has a cost cap it did not set, such as another automation's or one from before this release | `failed` | `continued_session_budget_conflict` |
+| The automation's cost cap could not be set on the session; any cap it already had stays | `failed` | `continued_session_budget_failed` |
+| A first run could not record its new session on the automation | `failed` | `session_record_failed` |
+| The session runs a different agent, on a different host or workspace than the task pins, in a sandbox when the task targets a connected host (or the reverse), or, for a `managed_sandbox` task, outside the sandbox the task started | `failed` | `continued_session_incompatible` |
 
 Send `session_id: null` in a `PATCH` (**Start a new session on the next run** in the edit dialog) so the next firing creates a new session that later firings continue. A `PATCH` that changes `agent_id`, `host_id`, `workspace`, or `execution_target` without sending `session_id` does the same, since the old session cannot follow the change, and switching to `session_mode: "new"` clears `session_id`.
 
@@ -120,12 +120,12 @@ continued sessions, or an hourly minimum for new sandbox sessions.
 
 A schedule is an [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545) recurrence rule evaluated in the task's IANA timezone.
 
-| Intent                                                         | `rrule`                                                |
-| -------------------------------------------------------------- | ------------------------------------------------------ |
-| Every 10 minutes (connected host or continued sandbox session) | `FREQ=MINUTELY;INTERVAL=10`                            |
-| Every hour                                                     | `FREQ=HOURLY`                                          |
-| Daily at 09:00 local                                           | `FREQ=DAILY;BYHOUR=9;BYMINUTE=0`                       |
-| Weekdays at 09:00 local                                        | `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0` |
+| Intent | `rrule` |
+| --- | --- |
+| Every 10 minutes (connected host or continued sandbox session) | `FREQ=MINUTELY;INTERVAL=10` |
+| Every hour | `FREQ=HOURLY` |
+| Daily at 09:00 local | `FREQ=DAILY;BYHOUR=9;BYMINUTE=0` |
+| Weekdays at 09:00 local | `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0` |
 
 The rule is anchored at midnight of the local day, which gives occurrences a deterministic wall-clock phase: an hourly rule fires on the hour, a daily rule at its `BYHOUR`/`BYMINUTE`.
 
@@ -151,7 +151,6 @@ Two timing caveats are worth knowing:
 5. **The runner launches and the prompt is dispatched**, so the agent actually works. A seeded prompt with no launched runner would just sit in history. A `managed_sandbox` fire saves the prompt in the session first, records the run, and then provisions the sandbox in the background. The prompt is delivered when the sandbox host connects, even after a server restart or on another replica. A launch failure fails the run with `error_code` `launch_failed`.
 
    The message a run sends is the prompt followed by a short note: an automation sent it, no one is watching, and the agent should work toward the goal without asking questions, waiting for confirmation or requesting permission. The note asks the agent to make only reversible assumptions within the user's authorization, recording each assumption, its basis and how easily it can be changed. Decisions that are hard to reverse, involve significant trade-offs or would likely surprise the user are deferred with options and a recommendation, while independent work continues. Actions that are denied or require unavailable approval are skipped with an explanation of the blocker. The agent should continue independent work and permitted alternatives, without changing permission settings to get past the restriction. If the agent has the journal tools, the note also asks it to read its [session journal](session-journal.md) first, write a plan if the session has none, and write a status for each step it worked on before its final reply. The final reply leads with unresolved decisions and assumptions the user is most likely to want to change, followed by completed and unfinished work. The transcript hides the tagged note while the agent receives it and stored messages retain it. The automation keeps the prompt as written, so the automation pages and the API show it without the note. The note is guidance, not a permission setting: a tool call that still needs approval waits for the approval timeout as before.
-
 6. **The run is recorded** in `scheduled_task_runs`, and `last_run_at` and `last_run_conversation_id` are stamped on the task.
 
 For a `continue` task with a `session_id`, steps 2 to 4 are replaced: the session is checked as described in [Continuing in the same session](#creating-an-automation), its runner is woken the way a user message would wake it, and the prompt is dispatched into it with the same note. The run is recorded as `succeeded` once the prompt is delivered, so its status says the prompt went in, not that the turn finished. A `continue` task's first firing runs every step and records the new session as the task's `session_id` once it exists and its owner is granted. If the task was edited while that first firing ran, the firing keeps its session to itself and the next firing starts the one later firings continue. With `automations_v2`, a `continue` task's runs are routed by its pinned connected host, or for `managed_sandbox` by one host id derived from the task, so every run reaches the server holding that sandbox's connection. A dead sandbox is relaunched under the same host id, the way a user message relaunches it.
@@ -166,12 +165,12 @@ The transcript hides only the exact tagged unattended-run note appended by the s
 
 Each run carries `status`, `scheduled_at`, `fired_at`, `finished_at`, `conversation_id`, and `error_code`. The free-text `error` blob is deliberately not returned; `error_code` is the queryable classification.
 
-| `status`    | Meaning                                                                                     |
-| ----------- | ------------------------------------------------------------------------------------------- |
-| `running`   | Dispatched; the turn is in flight.                                                          |
-| `succeeded` | The dispatched turn finished, or, for a continued session, the prompt was delivered.        |
-| `failed`    | The firing or the turn failed; see `error_code`.                                            |
-| `skipped`   | The firing was deliberately not attempted -- for example an unsupported `execution_target`. |
+| `status` | Meaning |
+| --- | --- |
+| `running` | Dispatched; the turn is in flight. |
+| `succeeded` | The dispatched turn finished, or, for a continued session, the prompt was delivered. |
+| `failed` | The firing or the turn failed; see `error_code`. |
+| `skipped` | The firing was deliberately not attempted -- for example an unsupported `execution_target`. |
 
 `ScheduledTaskRun` also declares `scheduled` and `starting` statuses. The default scheduler creates runs at dispatch with status `running`. With `automations_v2` enabled, Run now records `scheduled` until a server claims the request. The persistent scheduler then records `starting` while it prepares a run, and `running` once the prompt is sent, or saved with its sandbox's host bound. A continued session's run goes straight to `succeeded` once its prompt is delivered.
 
@@ -191,15 +190,15 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 
 ## API reference
 
-| Method   | Path                            | Purpose                         |
-| -------- | ------------------------------- | ------------------------------- |
-| `POST`   | `/v1/scheduled-tasks`           | Create a task.                  |
-| `GET`    | `/v1/scheduled-tasks`           | List tasks.                     |
-| `GET`    | `/v1/scheduled-tasks/{id}`      | Read one task.                  |
-| `PATCH`  | `/v1/scheduled-tasks/{id}`      | Update fields, or pause/resume. |
-| `DELETE` | `/v1/scheduled-tasks/{id}`      | Delete a task.                  |
-| `POST`   | `/v1/scheduled-tasks/{id}/run`  | Run now (202).                  |
-| `GET`    | `/v1/scheduled-tasks/{id}/runs` | Run history.                    |
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/scheduled-tasks` | Create a task. |
+| `GET` | `/v1/scheduled-tasks` | List tasks. |
+| `GET` | `/v1/scheduled-tasks/{id}` | Read one task. |
+| `PATCH` | `/v1/scheduled-tasks/{id}` | Update fields, or pause/resume. |
+| `DELETE` | `/v1/scheduled-tasks/{id}` | Delete a task. |
+| `POST` | `/v1/scheduled-tasks/{id}/run` | Run now (202). |
+| `GET` | `/v1/scheduled-tasks/{id}/runs` | Run history. |
 
 A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `session_mode`, `session_id`, `source_session_id`, `workspace`, `host_id`, `execution_target`, `project_id`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
 
