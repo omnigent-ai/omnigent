@@ -397,6 +397,8 @@ class HostLaunchRunnerFrame:
         falls back to stopping every runner launched for ``session_id``; an
         empty tuple stops none, e.g. after /clear moved the old runner to
         another session.
+    :param policy_modules: Server-configured ``policy_modules`` dotted paths the runner
+        registers before validating bundles. ``None`` for an older server.
     :param session_env_handoff_id: Opaque ID of the launching CLI's local
         forwarded-environment handoff, e.g. ``"3qA0x_7Kp2..."``. ``None`` when
         no CLI handed values to this launch, as for a server-driven restart.
@@ -412,6 +414,7 @@ class HostLaunchRunnerFrame:
     scheduled_run: ScheduledRunLogContext | None = None
     mcp_disabled_servers_active_harnesses: list[str] | None = None
     session_env_handoff_id: str | None = None
+    policy_modules: list[str] | None = None
 
 
 @dataclass
@@ -1736,6 +1739,8 @@ def encode_host_frame(frame: HostFrame) -> str:
             payload["mcp_disabled_servers_active_harnesses"] = (
                 frame.mcp_disabled_servers_active_harnesses
             )
+        if frame.policy_modules is not None:
+            payload["policy_modules"] = list(frame.policy_modules)
         if frame.scheduled_run is not None:
             payload["scheduled_run"] = frame.scheduled_run.model_dump()
         if frame.superseded_runner_ids is not None:
@@ -2874,6 +2879,9 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
             tuple(_optional_str_list(msg, "superseded_runner_ids"))
             if "superseded_runner_ids" in msg
             else None
+        ),
+        policy_modules=(
+            _optional_str_list(msg, "policy_modules") if "policy_modules" in msg else None
         ),
         session_env_handoff_id=_optional_nullable_str(msg, "session_env_handoff_id"),
     )

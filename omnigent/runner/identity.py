@@ -54,6 +54,9 @@ RUNNER_LAUNCH_HARNESS_ENV_VAR = "OMNIGENT_RUNNER_LAUNCH_HARNESS"
 RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR = (
     "OMNIGENT_RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES"
 )
+# JSON list of the server's configured ``policy_modules``, registered by the runner
+# so bundle validation accepts the same custom handlers the server does.
+RUNNER_POLICY_MODULES_ENV_VAR = "OMNIGENT_RUNNER_POLICY_MODULES"
 # JSON-encoded ordered shell inventory discovered by the host daemon. The
 # runner uses this exact snapshot for native wrapper terminal declarations.
 RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"
@@ -123,6 +126,23 @@ def runner_mcp_disabled_servers_active_harnesses(
     from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS
 
     return [harness for harness in HARNESS_EXECUTORS if harness in decoded]
+
+
+def runner_policy_modules(env: Mapping[str, str] | None = None) -> list[str]:
+    """Decode the operator-configured policy modules; absent or malformed stamps yield none."""
+    source = os.environ if env is None else env
+    raw = source.get(RUNNER_POLICY_MODULES_ENV_VAR)
+    if raw is None:
+        return []
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, RecursionError):
+        logging.getLogger(__name__).warning("ignoring malformed %s", RUNNER_POLICY_MODULES_ENV_VAR)
+        return []
+    if not isinstance(decoded, list) or not all(isinstance(item, str) for item in decoded):
+        logging.getLogger(__name__).warning("ignoring malformed %s", RUNNER_POLICY_MODULES_ENV_VAR)
+        return []
+    return decoded
 
 
 def touch_connect_marker(env: Mapping[str, str] | None = None) -> None:

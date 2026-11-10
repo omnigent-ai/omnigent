@@ -623,10 +623,12 @@ class HostRegistry:
         *,
         mcp_disabled_servers: McpDisabledServersGate = False,
         feature_flags: FeatureFlags | None = None,
+        policy_modules: list[str] | None = None,
     ) -> None:
         """Initialize an empty host registry with fail-closed launch activation."""
         self._mcp_disabled_servers = mcp_disabled_servers
         self._feature_flags = feature_flags or FeatureFlags()
+        self._policy_modules = list(policy_modules or [])
         self._lock = threading.RLock()
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
@@ -642,6 +644,10 @@ class HostRegistry:
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
+
+    def launch_policy_modules(self) -> list[str]:
+        """Operator-configured policy modules every launched runner must register."""
+        return list(self._policy_modules)
 
     def mcp_disabled_servers_active_harnesses(self) -> list[str] | None:
         """Resolve launch activation; omit the wire field when no harness is active."""

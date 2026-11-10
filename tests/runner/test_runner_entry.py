@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import importlib
 import io
+import json
 import logging
 import os
 import queue
@@ -15,7 +16,7 @@ import tarfile
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -25,8 +26,10 @@ import httpx
 import pytest
 
 from omnigent.errors import OmnigentError
+from omnigent.host.connect import _build_runner_env
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.native import native_terminal
+from omnigent.policies.registry import load_registry
 from omnigent.runner import subagent_work
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
@@ -56,14 +59,18 @@ from omnigent.runner._entry import (
     _runner_workspace_from_env,
     _RunnerDatabricksAuth,
     _server_url_from_env,
+    _SessionSpecWorkdirs,
     _work_still_active,
     main,
 )
+from omnigent.runner.app import create_runner_app
 from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
+    RUNNER_POLICY_MODULES_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
+    runner_policy_modules,
 )
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -76,6 +83,7 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_REJECTION_PREFIX,
     RunnerTunnelAuthRejectedError,
 )
+from omnigent.spec.tar_utils import ExtractionError
 from omnigent.util import event_loop_watchdog as watchdog
 from tests._helpers.session import bundle_files
 from tests.budgets import budget
@@ -3268,11 +3276,10 @@ async def test_resolve_agent_spec_keeps_loop_responsive_during_bundle_load(
 
 
 @pytest.mark.asyncio
-async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
+async def test_resolve_agent_spec_from_server_extracts_each_fetch_separately(
     tmp_path: Path,
 ) -> None:
-    """An unchanged bundle reuses its extracted directory; another bundle under the
-    same version (an agent removed and added again restarts at 1) gets its own.
+    """Each fetch extracts into its own directory, including repeated identical bundles.
 
     :param tmp_path: Temporary spec cache root.
     :returns: None.
@@ -3305,8 +3312,9 @@ async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
     ]
     assert requested_paths == ["/v1/sessions/conv_test/agent/contents"] * 3
     assert resolved[0] is not None and resolved[1] is not None
-    assert resolved[0].workdir == resolved[1].workdir
+    assert resolved[0].workdir != resolved[1].workdir
     assert sorted(path.name.startswith("ag_cached-v1-") for path in tmp_path.iterdir()) == [
+        True,
         True,
         True,
     ]
@@ -3317,7 +3325,7 @@ async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
     [None, b"name: truncated-agent\n", b"spec_version: [\n", b"\xff"],
     ids=["missing", "missing-version", "invalid-yaml", "invalid-encoding"],
 )
-async def test_resolve_agent_spec_rebuilds_damaged_cache(
+async def test_resolve_agent_spec_ignores_damaged_prior_extraction(
     tmp_path: Path, cached_config: bytes | None
 ) -> None:
     cache = _AgentSpecCache(tmp_path)
@@ -3350,10 +3358,10 @@ async def test_resolve_agent_spec_rebuilds_damaged_cache(
 
     assert repaired is not None
     assert repaired.spec.name == "cached-agent"
-    assert repaired.workdir == original.workdir
+    assert repaired.workdir != original.workdir
     assert (repaired.workdir / "config.yaml").is_file()
     assert not (repaired.workdir / "partial.txt").exists()
-    assert list(tmp_path.iterdir()) == [repaired.workdir]
+    assert (original.workdir / "partial.txt").exists()
 
 
 async def test_resolve_agent_spec_keeps_cache_when_downloaded_bundle_is_invalid(
@@ -3458,6 +3466,7 @@ async def test_resolve_agent_spec_serializes_concurrent_cache_publication(
         transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
         base_url="http://server.test",
     ) as client:
+        original = None
         if repair:
             original = await _resolve_agent_spec_from_server(client, cache, "ag_cached", "conv")
             assert original is not None
@@ -3490,13 +3499,21 @@ async def test_resolve_agent_spec_serializes_concurrent_cache_publication(
     assert second_spec is not None and not isinstance(second_spec, BaseException)
     assert (second_spec.workdir / "config.yaml").is_file()
     assert second_spec.spec.name == "cached-agent"
+    # Each resolution extracts separately; a cancelled or failed extraction leaves nothing.
     if first_outcome == "completed":
         assert first_spec is not None and not isinstance(first_spec, BaseException)
-        assert first_spec.workdir == second_spec.workdir
+        assert first_spec.workdir != second_spec.workdir
+        assert first_spec.workdir.is_dir()
     else:
         assert isinstance(first_spec, asyncio.CancelledError)
-    assert list(tmp_path.iterdir()) == [second_spec.workdir]
-    assert extractions == (2 if first_outcome == "cancelled_error" else 1)
+    retained = set(tmp_path.iterdir())
+    assert second_spec.workdir in retained
+    assert retained == (
+        {second_spec.workdir}
+        | ({first_spec.workdir} if first_outcome == "completed" else set())
+        | ({original.workdir} if repair else set())
+    )
+    assert extractions == 2
 
 
 async def test_pending_spec_loads_leave_executor_capacity_for_runner_controls(
@@ -4162,7 +4179,7 @@ async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path
         [],
         [],
     ]
-    assert len({result.workdir for result in results}) == 1
+    assert len({result.workdir for result in results}) == 3
     assert "registry" not in (results[0].workdir / "config.yaml").read_text()
 
 
@@ -4189,10 +4206,10 @@ async def test_resolve_agent_spec_rejects_unregistered_handler_in_tenant_bundle(
             )
 
 
-async def test_resolve_agent_spec_keeps_custom_handler_for_operator_bundle(
+async def test_resolve_agent_spec_rejects_unregistered_handler_in_operator_bundle(
     tmp_path: Path,
 ) -> None:
-    """An operator-authored bundle keeps its custom handlers."""
+    """Operator-authored bundles are also checked against the handler registry."""
     bundle = bundle_files({"config.yaml": _UNREGISTERED_HANDLER_CONFIG.encode()})
 
     async with httpx.AsyncClient(
@@ -4203,9 +4220,176 @@ async def test_resolve_agent_spec_keeps_custom_handler_for_operator_bundle(
         ),
         base_url="http://server.test",
     ) as client:
+        with pytest.raises(OmnigentError, match="not a registered policy handler"):
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_operator", session_id="conv_test"
+            )
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_resolve_agent_spec_ignores_mutated_named_cache(tmp_path: Path) -> None:
+    """A workload-writable cache directory under the bundle's name is never parsed."""
+    bundle = _spec_bundle("original")
+    digest = hashlib.sha256(bundle).hexdigest()[:16]
+    previous = _agent_cache_dest(tmp_path, "ag_mutated", f"1-{digest}")
+    previous.mkdir()
+    (previous / "config.yaml").write_text("name: [unparseable", encoding="utf-8")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=bundle, headers={"X-Agent-Version": "1"})
+        ),
+        base_url="http://server.test",
+    ) as client:
         resolved = await _resolve_agent_spec_from_server(
-            client, _AgentSpecCache(tmp_path), "ag_operator", session_id="conv_test"
+            client, _AgentSpecCache(tmp_path), "ag_mutated", session_id="conv_test"
         )
 
     assert resolved is not None
-    assert resolved.spec.name == "handler-agent"
+    assert resolved.spec.name == "original"
+    assert resolved.workdir != previous
+    assert (previous / "config.yaml").read_text(encoding="utf-8") == "name: [unparseable"
+
+
+async def test_session_spec_workdirs_release_only_their_session(tmp_path: Path) -> None:
+    """Releasing one session removes its extractions and leaves other sessions' alone."""
+    workdirs = _SessionSpecWorkdirs()
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    assert await workdirs.retain("first", workdirs.lease("first"), first)
+    assert await workdirs.retain("second", workdirs.lease("second"), second)
+
+    await workdirs.release("first")
+
+    assert not first.exists()
+    assert second.exists()
+    await workdirs.release("second")
+    assert not second.exists()
+
+
+async def test_stale_lease_cannot_join_a_reused_session(tmp_path: Path) -> None:
+    """A resolution finishing after its session was released discards its extraction."""
+    workdirs = _SessionSpecWorkdirs()
+    stale_lease = workdirs.lease("session")
+    await workdirs.release("session")
+    current_lease = workdirs.lease("session")
+    stale = tmp_path / "stale"
+    current = tmp_path / "current"
+    stale.mkdir()
+    current.mkdir()
+
+    assert not await workdirs.retain("session", stale_lease, stale)
+    assert await workdirs.retain("session", current_lease, current)
+    await workdirs.release("session")
+
+    assert not stale.exists()
+    assert not current.exists()
+
+
+async def test_session_resolution_is_removed_on_session_delete(tmp_path: Path) -> None:
+    """Deleting a session through the runner API releases its extracted bundle."""
+    released: list[str] = []
+
+    async def cleanup(session_id: str) -> None:
+        released.append(session_id)
+
+    async with httpx.AsyncClient(
+        base_url="https://server.invalid",
+        transport=httpx.MockTransport(lambda _: httpx.Response(404)),
+    ) as server_client:
+        app = create_runner_app(server_client=server_client, spec_workdir_cleanup=cleanup)
+        async with httpx.AsyncClient(
+            base_url="https://runner.invalid", transport=httpx.ASGITransport(app=app)
+        ) as runner_client:
+            response = await runner_client.delete("/v1/sessions/session")
+
+    assert response.status_code == 200
+    assert released == ["session"]
+
+
+async def test_invalid_bundle_leaves_no_partial_extraction(tmp_path: Path) -> None:
+    """A bundle that fails to load is removed rather than left in the extraction root."""
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=b"not a tarball")),
+        base_url="http://server.test",
+    ) as client:
+        with pytest.raises(ExtractionError):
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_bad", session_id="conv_test"
+            )
+    assert list(tmp_path.iterdir()) == []
+
+
+# Handlers this module declares as an operator-configured policy module.
+POLICY_REGISTRY = [{"handler": "example_org.policies.configured_gate"}]
+
+
+def _policy_bundle(handler: str) -> bytes:
+    config = (
+        "spec_version: 1\nname: policy-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+        "guardrails:\n  policies:\n    gate:\n      type: function\n      on: [tool_call]\n"
+        f"      function:\n        path: {handler}\n        arguments: {{}}\n"
+    )
+    return bundle_files({"config.yaml": config.encode()})
+
+
+@pytest.fixture
+def restored_policy_registry() -> Iterator[None]:
+    yield
+    load_registry()
+
+
+async def test_runner_accepts_bundle_handler_from_configured_policy_module(
+    tmp_path: Path, restored_policy_registry: None
+) -> None:
+    """A handler declared by a configured policy module loads in the runner."""
+    env = {RUNNER_POLICY_MODULES_ENV_VAR: json.dumps([__name__])}
+    load_registry(extra_modules=runner_policy_modules(env))
+    bundle = _policy_bundle("example_org.policies.configured_gate")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        resolved = await _resolve_agent_spec_from_server(
+            client, _AgentSpecCache(tmp_path), "ag_policy", session_id="conv_test"
+        )
+
+    assert resolved is not None
+    assert resolved.spec.name == "policy-agent"
+
+
+async def test_runner_rejects_bundle_handler_that_is_not_configured(
+    tmp_path: Path, restored_policy_registry: None
+) -> None:
+    """Without a configured policy module, an unregistered handler is rejected."""
+    load_registry(extra_modules=runner_policy_modules({}))
+    bundle = _policy_bundle("example_org.policies.unconfigured_gate")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        with pytest.raises(OmnigentError, match="not a registered policy handler"):
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_policy", session_id="conv_test"
+            )
+
+
+def test_host_launch_stamps_policy_modules_for_the_runner() -> None:
+    """The host passes the server's configured modules to the runner environment."""
+    env = _build_runner_env(
+        {},
+        server_url="http://server.test",
+        runner_id="runner_test",
+        binding_token="token",
+        workspace=str(Path.cwd()),
+        parent_pid=0,
+        policy_modules=[__name__],
+    )
+
+    assert runner_policy_modules(env) == [__name__]
+    assert runner_policy_modules({}) == []
+    assert runner_policy_modules({RUNNER_POLICY_MODULES_ENV_VAR: "not json"}) == []

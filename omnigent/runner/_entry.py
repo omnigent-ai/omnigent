@@ -24,7 +24,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import mkdtemp
 from typing import TYPE_CHECKING, cast
 
 import httpx
@@ -1397,6 +1397,29 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     return dest
 
 
+class _SessionSpecWorkdirs:
+    """Extraction directories leased by each session, removed when the session is deleted."""
+
+    def __init__(self) -> None:
+        self._workdirs: dict[str, set[Path]] = {}
+
+    def lease(self, session_id: str) -> set[Path]:
+        return self._workdirs.setdefault(session_id, set())
+
+    async def retain(self, session_id: str, lease: set[Path], workdir: Path) -> bool:
+        """Keep *workdir* for *session_id*; discard it if the session was released meanwhile."""
+        if self._workdirs.get(session_id) is not lease:
+            await asyncio.to_thread(shutil.rmtree, workdir, ignore_errors=True)
+            return False
+        lease.add(workdir)
+        return True
+
+    async def release(self, session_id: str) -> None:
+        workdirs = self._workdirs.pop(session_id, set())
+        for workdir in workdirs:
+            await asyncio.to_thread(shutil.rmtree, workdir, ignore_errors=True)
+
+
 # The server waits 10s for session init, so throttled spec fetches retry well inside that.
 _SPEC_FETCH_429_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
 _SPEC_FETCH_MAX_RETRY_AFTER_S = 2.0
@@ -1411,26 +1434,36 @@ class _AgentSpecCache:
         self._lock = threading.Lock()
         self._closed = False
 
-    async def resolve(
-        self, response: httpx.Response, agent_id: str, session_id: str
-    ) -> ResolvedSpec:
+    async def resolve(self, response: httpx.Response, agent_id: str) -> ResolvedSpec:
         """Queue before occupying a worker, and retain admission through cancellation."""
         await self._admission.acquire()
-        worker = asyncio.create_task(asyncio.to_thread(self._load, response, agent_id, session_id))
+        worker = asyncio.create_task(asyncio.to_thread(self._load, response, agent_id))
         worker.add_done_callback(self._load_finished)
-        return await asyncio.shield(worker)
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            worker.add_done_callback(self._discard_cancelled_result)
+            raise
 
     def _load_finished(self, worker: asyncio.Task[ResolvedSpec]) -> None:
         self._admission.release()
         if not worker.cancelled():
             worker.exception()
 
-    def _load(self, response: httpx.Response, agent_id: str, session_id: str) -> ResolvedSpec:
+    def _discard_cancelled_result(self, worker: asyncio.Task[ResolvedSpec]) -> None:
+        """Remove the extraction of a resolution whose caller was cancelled."""
+        if worker.cancelled() or worker.exception() is not None:
+            return
+        resolved = worker.result()
+        if resolved.workdir is not None:
+            shutil.rmtree(resolved.workdir, ignore_errors=True)
+
+    def _load(self, response: httpx.Response, agent_id: str) -> ResolvedSpec:
         """Keep cache mutation owned until the worker ends, even after cancellation."""
         with self._lock:
             if self._closed:
                 raise RuntimeError("spec_resolver: agent bundle cache is closed")
-            return _load_agent_spec_bundle(self.root, response, agent_id, session_id)
+            return _load_agent_spec_bundle(self.root, response, agent_id)
 
     def close(self) -> None:
         """Retire the cache before deleting it so queued workers cannot recreate it."""
@@ -1440,9 +1473,9 @@ class _AgentSpecCache:
 
 
 def _load_agent_spec_bundle(
-    spec_cache_root: Path, resp: httpx.Response, agent_id: str, session_id: str
+    spec_cache_root: Path, resp: httpx.Response, agent_id: str
 ) -> ResolvedSpec:
-    """Hash, load and publish a validated bundle while its cache lock is held."""
+    """Extract and load a fresh bundle while the runner's worker lock is held."""
     from omnigent.automations_availability import AUTOMATIONS_HEADER, without_scheduled_task_tools
     from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
     from omnigent.runner.native import ResolvedSpec
@@ -1452,50 +1485,31 @@ def _load_agent_spec_bundle(
     # Missing or unknown provenance stays tenant-scoped.
     session_scoped_header = resp.headers.get("X-Agent-Session-Scoped", "true").strip().lower()
     expand_env = session_scoped_header == "false"
-    # The digest keeps a reused agent/version id off a previous bundle's directory.
+    # The bundle identity names the directory for diagnostics only. Every fetch
+    # extracts into a new directory, so files left by earlier resolutions are never parsed.
     version = resp.headers.get("X-Agent-Version", "0")
     digest = hashlib.sha256(resp.content).hexdigest()[:16]
-    dest = _agent_cache_dest(spec_cache_root, agent_id, f"{version}-{digest}")
-    # An older runner may not support sub-agents validated by a newer server.
+    cache_key = _agent_cache_dest(spec_cache_root, agent_id, f"{version}-{digest}")
+    spec_cache_root.mkdir(parents=True, exist_ok=True)
+    dest = Path(mkdtemp(prefix=f"{cache_key.name}-", dir=spec_cache_root))
     try:
+        # An older runner may not support sub-agents validated by a newer server.
+        # Provenance controls environment expansion, never handler authority.
         spec = load(
-            dest,
+            resp.content,
+            dest=dest,
             expand_env=expand_env,
-            enforce_handler_allowlist=not expand_env,
+            enforce_handler_allowlist=True,
             prune_invalid_sub_agents=True,
         )
-    except Exception:  # noqa: BLE001 — the downloaded bundle must validate before replacement
-        # Cached files can be missing, truncated, or malformed. Validate the
-        # downloaded bundle privately before replacing any cached files.
-        spec_cache_root.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(prefix=".spec-", dir=spec_cache_root) as staging_dir:
-            staging = Path(staging_dir)
-            load(
-                resp.content,
-                dest=staging,
-                expand_env=expand_env,
-                enforce_handler_allowlist=not expand_env,
-                prune_invalid_sub_agents=True,
-            )
-            if dest.exists():
-                shutil.rmtree(dest)
-                _logger.warning(
-                    "Rebuilding incomplete agent bundle cache for %s",
-                    agent_id,
-                    extra={"session_id": session_id},
-                )
-            staging.rename(dest)
-        spec = load(
-            dest,
-            expand_env=expand_env,
-            enforce_handler_allowlist=not expand_env,
-            prune_invalid_sub_agents=True,
-        )
-    spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
-    # Older servers send no header; keep the tools there, as before.
-    if resp.headers.get(AUTOMATIONS_HEADER) == "0":
-        spec = without_scheduled_task_tools(spec)
-    _apply_host_interactive_shells(spec)
+        spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
+        # Older servers send no header; keep the tools there, as before.
+        if resp.headers.get(AUTOMATIONS_HEADER) == "0":
+            spec = without_scheduled_task_tools(spec)
+        _apply_host_interactive_shells(spec)
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
     return ResolvedSpec(spec=spec, workdir=dest)
 
 
@@ -1550,7 +1564,7 @@ async def _resolve_agent_spec_from_server(
         return None
     if resp.status_code != 200:
         raise RuntimeError(f"spec_resolver: GET {path} failed with HTTP {resp.status_code}")
-    return await spec_cache.resolve(resp, agent_id, session_id)
+    return await spec_cache.resolve(resp, agent_id)
 
 
 def create_app(
@@ -1649,18 +1663,14 @@ def create_app(
         server_client=server_client,
     )
 
-    # Stable extraction root for spec_resolver; bundles get
-    # extracted under here keyed by agent id + version. Lives for
-    # the runner's lifetime (cleaned up in the shutdown handler
-    # below) so AgentSpec path references (skills, bundled files,
-    # etc.) stay valid after spec_resolver returns. Earlier impl
-    # used ``tempfile.TemporaryDirectory()`` inside spec_resolver,
-    # which deleted the dir on return, leaving downstream tools
-    # (terminal dispatch, skill resolution) holding broken Path
-    # references.
+    # Each resolution extracts into a fresh directory under this runner-lifetime
+    # root. Session teardown removes a session's directories after its resources
+    # stop; shutdown clears any leftovers. A temporary root inside spec_resolver
+    # would break AgentSpec Path references after return.
     import tempfile
 
     _spec_cache = _AgentSpecCache(Path(tempfile.mkdtemp(prefix=f"runner-specs-{_runner_id}-")))
+    _session_spec_workdirs = _SessionSpecWorkdirs()
 
     async def spec_resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec | None:
         """
@@ -1683,12 +1693,22 @@ def create_app(
         :returns: The parsed :class:`AgentSpec`, or ``None`` if
             the server doesn't have the agent.
         """
-        return await _resolve_agent_spec_from_server(
+        lease = _session_spec_workdirs.lease(session_id) if session_id is not None else None
+        resolved = await _resolve_agent_spec_from_server(
             server_client,
             _spec_cache,
             agent_id,
             session_id=session_id,
         )
+        if (
+            resolved is not None
+            and resolved.workdir is not None
+            and lease is not None
+            and session_id is not None
+        ):
+            if not await _session_spec_workdirs.retain(session_id, lease, resolved.workdir):
+                return None
+        return resolved
 
     host_owns_global_cleanup = _runner_host_owns_global_cleanup_from_env()
 
@@ -1727,6 +1747,7 @@ def create_app(
     app = create_runner_app(
         process_manager=pm,
         spec_resolver=spec_resolver,
+        spec_workdir_cleanup=_session_spec_workdirs.release,
         server_client=server_client,
         terminal_registry=_terminal_registry,
         runner_workspace=runner_workspace,
@@ -1937,6 +1958,11 @@ async def _run_tunnel_from_env() -> None:
 
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
+    # Register the operator's configured policy modules before any bundle is validated.
+    from omnigent.policies.registry import load_registry
+    from omnigent.runner.identity import runner_policy_modules
+
+    load_registry(extra_modules=runner_policy_modules())
     app = create_app(auth_token_factory=auth_token_factory, auth_resolved=True)
     from omnigent.native._native_forwarder_health import (
         last_post_at as native_forwarder_last_post_at,

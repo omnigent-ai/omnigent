@@ -6641,6 +6641,7 @@ async def _launch_runner_on_host_locked(
                 # (agent not resolvable) skips the host-side check — fail open.
                 harness=_resolve_harness(conv),
                 mcp_disabled_servers_active_harnesses=host_registry.mcp_disabled_servers_active_harnesses(),
+                policy_modules=host_registry.launch_policy_modules(),
                 inference_config=(
                     conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
                 ),

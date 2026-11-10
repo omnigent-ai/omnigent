@@ -1925,7 +1925,9 @@ def create_app(
         on_work_dispatched=managed_host_keepalive.record_work_dispatched,
     )
     host_registry = HostRegistry(
-        mcp_disabled_servers=app_mcp_disabled_servers, feature_flags=resolved_feature_flags
+        mcp_disabled_servers=app_mcp_disabled_servers,
+        feature_flags=resolved_feature_flags,
+        policy_modules=policy_modules,
     )
     runner_router = RunnerRouter(
         registry=tunnel_registry,
