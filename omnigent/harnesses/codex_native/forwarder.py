@@ -57,6 +57,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_effort,
     read_codex_config_model,
     read_mcp_startup,
+    record_acknowledged_turn_id,
     record_child_usage_baseline,
     settle_pending_mcp_startup,
     update_active_turn_id,
@@ -6657,7 +6658,8 @@ async def _send_codex_async_question_reply(
     :param answered: Whether Codex has since echoed an answer to the
         question, which ends the retries.
     :returns: Whether Codex accepted the reply or already has an answer;
-        ``False`` when every send failed or one went unacknowledged.
+        ``False`` when every send failed or one went unacknowledged and
+        Codex has not echoed an answer.
     """
     for attempt in range(len(_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S) + 1):
         if attempt:
@@ -6680,7 +6682,7 @@ async def _send_codex_async_question_reply(
             _logger.warning(
                 "Codex async question answer unacknowledged: item=%s", question.item_id
             )
-            return False
+            return answered()
         except Exception:
             _logger.warning(
                 "Codex async question answer not delivered: item=%s attempt=%d",
@@ -6688,7 +6690,7 @@ async def _send_codex_async_question_reply(
                 attempt + 1,
                 exc_info=True,
             )
-    return False
+    return answered()
 
 
 async def _send_codex_async_question_reply_once(
@@ -6728,6 +6730,9 @@ async def _send_codex_async_question_reply_once(
                 raise
         if tracked_bridge_dir is not None:
             clear_active_turn_id_if_matches(tracked_bridge_dir, expected_turn_id)
+    start_state = read_bridge_state(tracked_bridge_dir) if tracked_bridge_dir is not None else None
+    if start_state is not None and start_state.thread_id != thread_id:
+        start_state = None
     # A turn started meanwhile absorbs this input instead of starting another.
     response = await codex_client.request(
         "turn/start",
@@ -6736,9 +6741,14 @@ async def _send_codex_async_question_reply_once(
     result = response.get("result")
     turn = result.get("turn") if isinstance(result, dict) else None
     turn_id = turn.get("id") if isinstance(turn, dict) else None
-    if tracked_bridge_dir is not None and isinstance(turn_id, str) and turn_id:
+    if (
+        tracked_bridge_dir is not None
+        and start_state is not None
+        and isinstance(turn_id, str)
+        and turn_id
+    ):
         try:
-            update_active_turn_id(tracked_bridge_dir, turn_id)
+            record_acknowledged_turn_id(tracked_bridge_dir, start_state, turn_id)
         except OSError:
             # Codex already accepted the reply, so a retry would send it twice.
             _logger.warning("Codex async question turn not recorded: %s", turn_id, exc_info=True)

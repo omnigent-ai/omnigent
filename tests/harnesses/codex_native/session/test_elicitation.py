@@ -23,6 +23,7 @@ from tests.harnesses.codex_native.session._support import (
     _FakeCodexAppServerClient,
     _forwarder_context,
     _plan_delta_event,
+    _started_event,
     _usage_coalescer,
     _write_forwarder_bridge,
 )
@@ -1082,6 +1083,91 @@ def test_forwarder_starts_turn_for_codex_async_question_answer_when_idle(
     assert state.active_turn_id == "turn_reply"
 
 
+def test_forwarder_keeps_turn_started_while_codex_async_question_turn_start_is_pending(
+    tmp_path: Path,
+) -> None:
+    """
+    A turn that starts before Codex acknowledges the answer's ``turn/start`` stays tracked.
+
+    Codex folds the answer into that turn and acknowledges a turn id that never
+    starts. Recording the acknowledged id would keep the bridge busy after the
+    real turn completes.
+    """
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
+    fake_client = _FakeCodexAppServerClient()
+    start_sent = asyncio.Event()
+    real_turn_started = asyncio.Event()
+    tracked_turn_ids: list[str | None] = []
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Acknowledge ``turn/start`` only after another turn has started.
+
+        :param method: JSON-RPC method.
+        :param params: JSON-RPC params.
+        :returns: JSON-RPC response envelope.
+        """
+        fake_client.requests.append((method, params))
+        start_sent.set()
+        await real_turn_started.wait()
+        return {"result": {"turn": {"id": "turn_reply"}}}
+
+    fake_client.request = fake_request  # type: ignore[method-assign]
+
+    async def run_real_turn(client: httpx.AsyncClient, context: dict[str, Any]) -> None:
+        """
+        Start a turn while the answer's ``turn/start`` is pending, then complete it.
+
+        :param client: Forwarder HTTP client.
+        :param context: Forwarder event-handling context.
+        :returns: None.
+        """
+
+        async def handle(event: dict[str, Any]) -> None:
+            """
+            Forward one Codex event.
+
+            :param event: App-server event payload.
+            :returns: None.
+            """
+            await codex_native_forwarder._handle_event(
+                client,
+                **context,
+                event=event,
+                codex_client=fake_client,  # type: ignore[arg-type]
+            )
+
+        await asyncio.wait_for(start_sent.wait(), timeout=30.0)
+        await handle(_started_event("turn_real"))
+        real_turn_started.set()
+        await asyncio.wait_for(context["elicitation_tracker"].drain(), timeout=30.0)
+        tracked_turn_ids.append(_active_turn_id(tmp_path))
+        await handle(_completed_event("turn_real", thread_id="thread_123"))
+        tracked_turn_ids.append(_active_turn_id(tmp_path))
+
+    _answer_async_question(
+        tmp_path,
+        fake_client,
+        [httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}})],
+        while_delivering=run_real_turn,
+    )
+
+    assert [method for method, _params in fake_client.requests] == ["turn/start"]
+    assert tracked_turn_ids == ["turn_real", None]
+
+
+def _active_turn_id(bridge_dir: Path) -> str | None:
+    """
+    Read the active Codex turn the bridge records.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: Active turn id, or ``None`` when Codex is idle.
+    """
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    return state.active_turn_id
+
+
 @pytest.mark.parametrize(
     "hook_response",
     [httpx.Response(200, json={"answers": {}}), httpx.Response(200)],
@@ -1327,6 +1413,15 @@ def test_forwarder_retries_undelivered_codex_async_question_answer(
 
 
 @pytest.mark.parametrize(
+    ("send_error", "echoing_send"),
+    [
+        (ConnectionResetError, 1),
+        (TimeoutError, 1),
+        (ConnectionResetError, 4),
+    ],
+    ids=["refused", "unacknowledged", "final_attempt"],
+)
+@pytest.mark.parametrize(
     "echoed_reply",
     [_TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"), _TUI_ASYNC_QUESTION_REPLY],
     ids=["tui_answer", "own_reply"],
@@ -1335,6 +1430,8 @@ def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     echoed_reply: str,
+    send_error: type[Exception],
+    echoing_send: int,
 ) -> None:
     """
     An answer Codex echoes during a failed send ends the retries.
@@ -1344,42 +1441,44 @@ def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
     forwarder neither sends it again nor reopens the card.
 
     :param echoed_reply: Tagged reply text in the echoed ``userMessage``.
+    :param send_error: Failure from every send; ``TimeoutError`` is how an
+        unacknowledged send ends.
+    :param echoing_send: Send, counting from 1, during which Codex echoes.
     """
     monkeypatch.setattr(
         codex_native_forwarder, "_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S", (0.0, 0.0, 0.0)
     )
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient(response={"result": {}})
-    first_send_started = asyncio.Event()
+    echoing_send_started = asyncio.Event()
     reply_echoed = asyncio.Event()
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
-        Fail the first send once Codex has echoed an answer.
+        Fail every send, the echoing one only after Codex has echoed an answer.
 
         :param method: JSON-RPC method.
         :param params: JSON-RPC params.
-        :returns: JSON-RPC response envelope.
-        :raises ConnectionResetError: For the first send.
+        :returns: Never; every send fails.
+        :raises Exception: ``send_error`` for every send.
         """
         fake_client.requests.append((method, params))
-        if len(fake_client.requests) == 1:
-            first_send_started.set()
+        if len(fake_client.requests) == echoing_send:
+            echoing_send_started.set()
             await reply_echoed.wait()
-            raise ConnectionResetError("app-server connection lost")
-        return {"result": {}}
+        raise send_error("app-server send failed")
 
     fake_client.request = fake_request  # type: ignore[method-assign]
 
     async def echo_answer(client: httpx.AsyncClient, context: dict[str, Any]) -> None:
         """
-        Echo an answer from Codex while the first send is in flight.
+        Echo an answer from Codex while the echoing send is in flight.
 
         :param client: Forwarder HTTP client.
         :param context: Forwarder event-handling context.
         :returns: None.
         """
-        await asyncio.wait_for(first_send_started.wait(), timeout=30.0)
+        await asyncio.wait_for(echoing_send_started.wait(), timeout=30.0)
         await codex_native_forwarder._handle_event(
             client,
             **context,
@@ -1395,16 +1494,20 @@ def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
         while_delivering=echo_answer,
     )
 
-    assert fake_client.requests == [
-        (
-            "turn/steer",
-            {
-                "threadId": "thread_123",
-                "expectedTurnId": "turn_123",
-                "input": [{"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY}],
-            },
-        )
-    ]
+    assert (
+        fake_client.requests
+        == [
+            (
+                "turn/steer",
+                {
+                    "threadId": "thread_123",
+                    "expectedTurnId": "turn_123",
+                    "input": [{"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY}],
+                },
+            )
+        ]
+        * echoing_send
+    )
     assert len(hook_bodies) == 1
     assert _undelivered_answer_notices(posted_events) == []
 
