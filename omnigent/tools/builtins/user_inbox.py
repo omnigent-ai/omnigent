@@ -75,7 +75,7 @@ class SysUserInboxPostTool(Tool):
                                     "type": {"type": "string", "enum": ["session", "pr", "url"]},
                                     "ref": {
                                         "type": "string",
-                                        "description": "Session id or URL.",
+                                        "description": ("Session id, or a full http(s) URL."),
                                     },
                                     "label": {"type": "string"},
                                 },

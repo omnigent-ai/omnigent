@@ -50,6 +50,8 @@ UNREAD_COUNT_LIMIT = 100
 _POST_ACTION = "Inbox posts"
 _ITEM_ID = re.compile(r"[0-9a-f]{32}")
 _CURSOR = re.compile(r"([0-9]{1,19}):([0-9a-f]{32})")
+# Largest value a signed 64-bit (BIGINT) timestamp column holds.
+MAX_EPOCH = 2**63 - 1
 # Matches the ``topic`` column, measured after normalization.
 MAX_TOPIC_CHARS = 128
 
@@ -101,7 +103,7 @@ class CreateInboxItemRequest(BaseModel):
     actions: list[InboxItemAction] = Field(default_factory=list, max_length=MAX_ACTIONS_PER_ITEM)
     chart: InboxChartV1 | None = None
     topic: str = Field(min_length=1, max_length=100)
-    expires_at: int | None = Field(default=None, gt=0)
+    expires_at: int | None = Field(default=None, gt=0, le=MAX_EPOCH)
 
 
 class UpdateInboxItemRequest(BaseModel):
@@ -136,7 +138,7 @@ def _parse_cursor(after: str | None) -> tuple[int, str] | None:
     if after is None:
         return None
     match = _CURSOR.fullmatch(after)
-    if match is None:
+    if match is None or int(match.group(1)) > MAX_EPOCH:
         raise OmnigentError("Invalid Inbox cursor", code=ErrorCode.INVALID_INPUT)
     return int(match.group(1)), match.group(2)
 
@@ -277,7 +279,7 @@ def create_inbox_items_router(
     async def list_inbox_items(
         request: Request,
         state: Annotated[list[InboxItemState] | None, Query()] = None,
-        created_after: int | None = Query(default=None, ge=0),
+        created_after: int | None = Query(default=None, ge=0, le=MAX_EPOCH),
         after: str | None = Query(default=None, max_length=64),
         limit: int = Query(default=50, ge=1, le=100),
     ) -> dict[str, Any]:
