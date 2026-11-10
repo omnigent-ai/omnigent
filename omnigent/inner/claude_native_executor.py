@@ -23,6 +23,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
+    ClaudeSessionChanged,
     ClaudeSignInPending,
     ClaudeTerminalDialog,
     ClaudeTerminalExited,
@@ -187,6 +188,10 @@ class ClaudeNativeExecutor(Executor):
                 await self._inject_prompt(text, framework_notices(content))
         except ClaudeDeliveryUnconfirmed as exc:
             raise InjectionDeliveryAmbiguous(str(exc), code="claude_delivery_unconfirmed") from exc
+        except ClaudeSessionChanged as exc:
+            if not exc.undelivered:
+                raise InjectionDeliveryAmbiguous(str(exc)) from exc
+            return False
         except RuntimeError:
             return False
         return True
@@ -216,7 +221,8 @@ class ClaudeNativeExecutor(Executor):
                         command=f"/model {wanted_model_arg}",
                         auto_confirm=True,
                         confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-                    )
+                    ),
+                    user_input=False,
                 )
                 # Track the routed id, not the alias: the next turn's
                 # comparison is against what routing asked for.
@@ -565,6 +571,18 @@ class ClaudeNativeExecutor(Executor):
                 preserve_session=True,
             )
             return
+        except ClaudeSessionChanged as exc:
+            _logger.warning(
+                "claude-native: conversation changed during message delivery",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(
+                message=str(exc),
+                code=None if exc.undelivered else "native_delivery_unconfirmed",
+                undelivered=exc.undelivered,
+                preserve_session=True,
+            )
+            return
         except RuntimeError as exc:
             _logger.exception(
                 "claude-native: failed to deliver message to harness",
@@ -574,10 +592,15 @@ class ClaudeNativeExecutor(Executor):
             return
         yield TurnComplete(response=None)
 
-    async def _inject(self, operation: Callable[[], None]) -> None:
+    async def _inject(self, operation: Callable[[], None], *, user_input: bool = True) -> None:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
         cancelled = threading.Event()
-        with cancellable_injection(cancelled):
+        with cancellable_injection(
+            cancelled,
+            bridge_dir=self._bridge_dir,
+            request_session_id=self._request_session_id,
+            user_input=user_input,
+        ):
             worker = asyncio.create_task(asyncio.to_thread(operation))
         try:
             await asyncio.shield(worker)
@@ -593,8 +616,17 @@ class ClaudeNativeExecutor(Executor):
 
     def _reap_failed_turn(self, *, expected_close: bool = False) -> str | None:
         """Kill the Claude pane before a delivery timeout becomes ``failed``."""
+        if not _session_is_active(self._bridge_dir, self._request_session_id):
+            return None
         try:
-            kill_session(self._bridge_dir, timeout_s=1.0, expected_close=expected_close)
+            with cancellable_injection(
+                threading.Event(),
+                bridge_dir=self._bridge_dir,
+                request_session_id=self._request_session_id,
+            ):
+                kill_session(self._bridge_dir, timeout_s=1.0, expected_close=expected_close)
+        except ClaudeSessionChanged:
+            return None
         except TmuxSessionNotAdvertised:
             _logger.debug(
                 "claude-native: timed-out session already disappeared",

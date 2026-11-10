@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -109,6 +110,8 @@ while True:
         "stale-shell-frame",
         "pre-draft-stall",
         "pre-draft-stall-multiline",
+        "rotation-after-ready",
+        "rotation-after-paste",
     ],
 )
 @pytest.mark.timeout(20)
@@ -156,6 +159,9 @@ def test_first_message_survives_slow_terminal_startup(
             bridge_dir=bridge_dir,
             extend_for_slow_boot=extend_for_slow_boot,
         )
+        if startup == "rotation-after-ready":
+            assert bridge_dir is not None
+            bridge.write_active_session_id(bridge_dir, "new-session")
         if startup == "exit-after-ready":
             subprocess.run(
                 ["tmux", "-S", socket_path, "kill-server"],
@@ -212,7 +218,25 @@ def test_first_message_survives_slow_terminal_startup(
                     time.sleep(0.05)
             bridge_dir = tmp_path / "bridge"
             bridge.write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="main")
-            if startup == "slow":
+            if startup.startswith("rotation-"):
+                (bridge_dir / "bridge.json").write_text('{"active_session_id": "old-session"}')
+                original_tmux = bridge._run_tmux
+
+                def rotate_after_paste(socket_path: str, *args: str, **kwargs: object) -> None:
+                    original_tmux(socket_path, *args, **kwargs)
+                    if startup == "rotation-after-paste" and args[0] == "paste-buffer":
+                        bridge.write_active_session_id(bridge_dir, "new-session")
+
+                monkeypatch.setattr(bridge, "_run_tmux", rotate_after_paste)
+                with bridge.cancellable_injection(
+                    threading.Event(), bridge_dir=bridge_dir, request_session_id="old-session"
+                ):
+                    with pytest.raises(bridge.ClaudeSessionChanged) as caught:
+                        bridge.inject_user_message(bridge_dir, content="OLD_INPUT", timeout_s=0.3)
+                assert caught.value.undelivered is (startup == "rotation-after-ready")
+                assert not delivered.exists(), "The stale worker submitted into the new session."
+                assert bridge._claude_pane_state(str(socket_path), "main").alive
+            elif startup == "slow":
                 bridge.inject_user_message(
                     bridge_dir, content="FIRST_PROMPT_DELIVERED", timeout_s=0.3
                 )

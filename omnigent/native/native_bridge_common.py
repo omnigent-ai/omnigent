@@ -58,7 +58,8 @@ def native_bridge_data_dir() -> Path:
     return Path(os.path.abspath(os.fspath(data_dir())))
 
 
-def _bridge_dir_lock(bridge_dir: Path) -> FileLock:
+def bridge_dir_lock(bridge_dir: Path) -> FileLock:
+    """Return the stable lock shared by metadata writes, preparation and cleanup."""
     """Return the stable cross-process lock for one bridge directory."""
     lock_dir = bridge_dir.parent / _LOCK_DIR_NAME
     lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -68,14 +69,14 @@ def _bridge_dir_lock(bridge_dir: Path) -> FileLock:
 @contextmanager
 def bridge_dir_preparation_lock(bridge_dir: Path) -> Iterator[None]:
     """Prevent orphan cleanup while a runner prepares a bridge directory."""
-    with _bridge_dir_lock(bridge_dir):
+    with bridge_dir_lock(bridge_dir):
         yield
 
 
 @contextmanager
 def _try_bridge_dir_cleanup_lock(bridge_dir: Path) -> Iterator[bool]:
     """Try to exclude bridge preparation without ever blocking cleanup."""
-    lock = _bridge_dir_lock(bridge_dir)
+    lock = bridge_dir_lock(bridge_dir)
     try:
         lock.acquire(timeout=0)
     except FileLockTimeout:
