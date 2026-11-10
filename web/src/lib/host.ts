@@ -148,6 +148,14 @@ export interface OmnigentHostConfig {
    */
   resolveWebSocketUrl?: (path: string) => string;
   /**
+   * Maps a web API path (e.g. a workspace file with `?download=true`) to a URL
+   * the browser can load directly as `<video src>`, carrying in the URL any
+   * auth the host's `fetcher` would add as headers. Set it when the host page's
+   * CSP blocks `blob:` media. When omitted, media is fetched through `fetcher`
+   * and played from an object URL.
+   */
+  resolveMediaUrl?: (path: string) => string;
+  /**
    * Turns a relative share-link path (basename already included, e.g.
    * `<basename>/c/:id`) into the full absolute share URL — the host prepends
    * its origin and adds any query params it needs. When omitted (standalone),
@@ -345,6 +353,11 @@ export function resolveWebSocketUrl(path: string): string {
   }
   const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${scheme}//${window.location.host}${withBasePath(path)}`;
+}
+
+/** The host's directly loadable media URL for an API path, or null to fetch through `fetcher`. */
+export function resolveMediaUrl(path: string): string | null {
+  return hostConfig.resolveMediaUrl ? hostConfig.resolveMediaUrl(path) : null;
 }
 
 /**

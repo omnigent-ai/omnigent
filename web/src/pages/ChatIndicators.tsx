@@ -53,14 +53,7 @@ export function SandboxActionBanner() {
   );
 }
 
-/**
- * Failure band for a managed-sandbox session whose background launch
- * died. Renders the recorded reason so a dead launch explains itself
- * instead of presenting a silent dead chat. In-flight launch progress
- * does NOT render here — it shares the in-thread
- * :func:`RunnerStartingIndicator` spot so all launch states live on
- * one consistent line.
- */
+/** The recorded launch failure, shared by the chat and terminal surfaces. */
 export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
   return (
     <div
@@ -90,11 +83,13 @@ export function ConnectionIndicator({
   const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
 
   if (sandboxStatus !== null) {
-    // A failed launch owns this band with its reason. An IN-FLIGHT
-    // launch renders in the chat thread (RunnerStartingIndicator)
-    // instead — but still suppresses the liveness bands below, which
-    // would misread the not-yet-bound session as stranded.
-    if (sandboxStatus.stage === "failed") {
+    // Chat renders all launch states in the transcript. The terminal surface
+    // has no transcript, so its connection band still carries launch failures.
+    if (
+      sandboxStatus.stage === "failed" &&
+      terminalFirst?.isTerminalFirst &&
+      terminalFirst.view === "terminal"
+    ) {
       return <SandboxFailedIndicator status={sandboxStatus} />;
     }
     return null;
@@ -171,10 +166,10 @@ export function ConnectionIndicator({
 
 /**
  * Main-pane managed-sandbox launch indicator. Shows the current pipeline
- * stage ("Provisioning sandbox…", "Cloning repository…", …) for any session
- * type. Ordinary terminal startup uses the standard Working indicator.
+ * stage or recorded failure for any session type. Ordinary terminal startup
+ * uses the standard Working indicator.
  *
- * Self-gates to null when neither applies. `hero` is the centered
+ * Renders nothing without a launch status. `hero` is the centered
  * empty-state placeholder (no bubbles yet); `row` is the in-thread
  * spinner beneath the user's first message (the create-then-send path
  * renders that bubble immediately, so the empty state never shows
@@ -182,13 +177,12 @@ export function ConnectionIndicator({
  */
 export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }) {
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
-  // `ready` never reaches the store (cleared) and `failed` renders the
-  // destructive band in ConnectionIndicator — only in-flight stages
-  // with known copy show here.
+  if (sandboxStatus?.stage === "failed") {
+    return <SandboxFailedIndicator status={sandboxStatus} />;
+  }
+  // `ready` clears the store; only in-flight stages have progress copy.
   const sandboxLabel =
-    sandboxStatus !== null && sandboxStatus.stage !== "failed"
-      ? SANDBOX_STAGE_LABELS[sandboxStatus.stage]
-      : undefined;
+    sandboxStatus !== null ? SANDBOX_STAGE_LABELS[sandboxStatus.stage] : undefined;
   if (sandboxLabel === undefined) return null;
   const line = `${sandboxLabel}…`;
   // role=status + aria-live so assistive tech announces the transient wait;

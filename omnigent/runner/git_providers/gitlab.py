@@ -1,4 +1,4 @@
-"""GitLab MR panel adapter, authenticated by glab on the execution host."""
+"""GitLab MR panel adapter, authenticated by glab or an execution-host token."""
 
 from __future__ import annotations
 
@@ -182,7 +182,10 @@ def _resolved(
 
 
 def _base_info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
-    repo = reference or next(iter(_remotes(root)), None)
+    from omnigent.runner.gitlab_client import env_token_for_host
+
+    remotes = _remotes(root) if reference is None else []
+    repo = reference or (_source_remote(root, remotes) if remotes else None)
     host = repo.host if repo else "gitlab.com"
     return {
         "object": INFO_OBJECT,
@@ -198,8 +201,15 @@ def _base_info(root: str, reference: PullRequestRef | None = None) -> dict[str, 
         "warnings": [],
         "auth": {
             "authenticated": False,
-            "hint": f"Run GITLAB_HOST={host} glab auth login on the execution host.",
-            "cli": {"name": "glab", "available": shutil.which("glab") is not None},
+            "hint": (
+                f"Run GITLAB_HOST={host} glab auth login, or set GITLAB_HOST={host} "
+                "and GITLAB_TOKEN on the execution host."
+            ),
+            "cli": (
+                None
+                if env_token_for_host(host)
+                else {"name": "glab", "available": shutil.which("glab") is not None}
+            ),
             "accounts": None,
             "selected_account": None,
         },
@@ -278,6 +288,16 @@ def _pr_payload(
     }
     refs = _object(mr.get("diff_refs"))
     author = _object(mr.get("author"))
+    source_project = mr.get("source_project_id")
+    head_repository_url = None
+    if source_project == mr.get("target_project_id"):
+        head_repository_url = ref.url.rsplit("/-/merge_requests/", 1)[0]
+    elif isinstance(source_project, int):
+        try:
+            web_url = client.object(f"projects/{source_project}").get("web_url")
+            head_repository_url = web_url if isinstance(web_url, str) and web_url else None
+        except ValueError:
+            warnings.append("GitLab source project is unavailable; file links are hidden.")
     return {
         "number": ref.number,
         "url": ref.url,
@@ -290,6 +310,7 @@ def _pr_payload(
         "head_ref": mr.get("source_branch"),
         "head_sha": refs.get("head_sha") or mr.get("sha"),
         "base_sha": refs.get("base_sha"),
+        "head_repository_url": head_repository_url,
         "body": mr.get("description"),
         "comments": comments,
         "comments_partial": comments_partial,
@@ -301,7 +322,7 @@ def _info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
     info = _base_info(root, reference)
     if reference is None and _git(root, ["rev-parse", "--show-toplevel"])[0] != 0:
         return {**info, "available": False, "reason": "not_a_git_repo"}
-    if not info["auth"]["cli"]["available"]:
+    if (cli := info["auth"]["cli"]) is not None and not cli["available"]:
         return info
     try:
         resolved = _resolved(root, reference)
@@ -398,8 +419,12 @@ class GitLabPullRequests:
     mcp_prs = staticmethod(gitlab_observer.mcp_prs)
 
     def titles_available(self, root: str) -> bool:
+        from omnigent.runner.gitlab_client import env_token_for_host
+
         del root
-        return shutil.which("glab") is not None
+        return shutil.which("glab") is not None or any(
+            env_token_for_host(host) for host in GitLabProvider().authorities(EnvInstances())
+        )
 
     def pr_title(
         self, root: str, reference: PullRequestRef, deadline: float

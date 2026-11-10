@@ -21,6 +21,8 @@ const {
   checkAgentNavigation,
   isAgentConnectionAllowed,
   isAgentNavigationAllowed,
+  isDirectOnly,
+  isLocalhostSubdomain,
   isProxyAddress,
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
@@ -452,13 +454,22 @@ function createBrowserViewRegistry({
     };
   }
 
+  function hostnameOf(url) {
+    return URL.canParse(url) ? new URL(url).hostname : "";
+  }
+
   // Resolve named hosts in the owning partition before any request is sent.
-  // IP literals and eligible exact-loopback hosts need only the URL check.
+  // IP literals and exact loopback names need only the URL check; `*.localhost`
+  // must also be on a direct route so a proxy never receives the request.
   async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
-    const verdict = await checkAgentNavigationWithPolicy(policyUrl, policy);
+    let verdict = await checkAgentNavigationWithPolicy(policyUrl, policy);
+    const hostname = hostnameOf(policyUrl);
+    if (verdict.ok && isLocalhostSubdomain(hostname)) {
+      verdict = await checkDirectLocalhostRoute(url, hostname, policy.partition);
+    }
     if (verdict.ok) return false;
     if (policy.conversationId) {
       sendToRenderer("browser-nav-blocked", {
@@ -492,8 +503,21 @@ function createBrowserViewRegistry({
     return { requestHeaders: { ...headers, "Cache-Control": [...directives.values()].join(", ") } };
   }
 
-  // IP-less WebSocket upgrades repeat the partition DNS check, not endpoint
-  // verification; DNS may change between the check and connection.
+  // Chromium pins `*.localhost` to loopback, so only a proxy could send it
+  // anywhere else; an unknown route counts as proxied. WebSockets keep their
+  // ws(s) URL here because Chromium picks their proxy by that scheme.
+  async function checkDirectLocalhostRoute(requestUrl, hostname, partition) {
+    const blocked = {
+      ok: false,
+      error: `navigation blocked: host "${hostname}" may be routed through a proxy`,
+    };
+    try {
+      return isDirectOnly(await resolveProxy(requestUrl, partition)) ? { ok: true } : blocked;
+    } catch {
+      return blocked;
+    }
+  }
+
   async function shouldCancelAgentResponse(
     { webContentsId, url, ip, resourceType, statusCode },
     partition,
@@ -501,17 +525,32 @@ function createBrowserViewRegistry({
     const policy = requestPolicyFor(webContentsId, partition);
     if (!policy) return false;
     const policyUrl = httpUrlForWebSocket(url);
-    const verdict =
-      !ip && resourceType === "webSocket" && statusCode === 101
-        ? await checkAgentNavigationWithPolicy(policyUrl, policy)
-        : isAgentConnectionAllowed(policyUrl, ip, policy);
+    const hostname = hostnameOf(policyUrl);
+    const localhostSubdomain = isLocalhostSubdomain(hostname);
+    // WebSocket upgrades omit the connected IP.
+    const ipLessUpgrade = !ip && resourceType === "webSocket" && statusCode === 101;
+    let verdict;
+    if (policy.allowLocalhost && localhostSubdomain) {
+      // A loopback IP may be a local proxy's, so `*.localhost` also needs a direct route.
+      verdict = ipLessUpgrade ? { ok: true } : isAgentConnectionAllowed(policyUrl, ip, policy);
+      if (verdict.ok) {
+        verdict = await checkDirectLocalhostRoute(url, hostname, policy.partition);
+      }
+    } else if (ipLessUpgrade) {
+      // Repeating the DNS check cannot rule out a DNS change before the connection.
+      verdict = await checkAgentNavigationWithPolicy(policyUrl, policy);
+    } else {
+      verdict = isAgentConnectionAllowed(policyUrl, ip, policy);
+    }
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
-    // (same-IP limit documented on isProxyAddress).
+    // (same-IP limit documented on isProxyAddress). A proxy would resolve
+    // `*.localhost` on its own network, so those must connect to loopback.
     const proxied =
       !!ip &&
-      (await isProxyAddress(ip, await resolveProxy(policyUrl, policy.partition), (hostname) =>
-        resolveHost(hostname, policy.partition),
+      !localhostSubdomain &&
+      (await isProxyAddress(ip, await resolveProxy(policyUrl, policy.partition), (proxyHost) =>
+        resolveHost(proxyHost, policy.partition),
       ));
     if (proxied) return false;
     if (policy.conversationId) {

@@ -1009,7 +1009,7 @@ def test_parse_app_host_non_apps_urls_yield_nothing() -> None:
     # Managed service (dbc-<hash> host), localhost, a custom domain, and empty
     # input carry no parseable Databricks Apps identity.
     assert dl._parse_databricks_app_host(
-        "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
+        "https://dbc-12345678-abcd.cloud.databricks.com/omnigent"
     ) == (None, None)
     assert dl._parse_databricks_app_host("http://localhost:8000") == (None, None)
     assert dl._parse_databricks_app_host("https://omnigent.example.com") == (None, None)
@@ -1057,7 +1057,7 @@ def test_process_identity_managed_service_is_none(monkeypatch: pytest.MonkeyPatc
     # Managed service: no DATABRICKS_* env and the server URL is a dbc-<hash> host,
     # not an Apps URL. Identity arrives per-record, so the process constant is empty.
     monkeypatch.setenv(
-        dl.SERVER_URL_ENV_VAR, "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
+        dl.SERVER_URL_ENV_VAR, "https://dbc-12345678-abcd.cloud.databricks.com/omnigent"
     )
     assert dl._process_identity() == (None, None)
 
@@ -1743,3 +1743,15 @@ def test_near_deadline_auth_rejection_does_not_start_a_new_mint(_configured_env:
 
     assert client.mints == 1
     assert client.inserts == 1
+
+
+def test_stage_timings_split_wall_time_into_marked_stages() -> None:
+    """Each mark closes the stage since the previous one; repeats accumulate."""
+    moments = iter([0.0, 0.010, 0.250, 0.300, 0.400])
+    timings = dl.StageTimings(clock=lambda: next(moments))
+
+    timings.mark("config")
+    timings.mark("catalog")
+    timings.mark("config")
+
+    assert timings.attributes() == {"config_ms": 60, "catalog_ms": 240, "total_ms": 400}

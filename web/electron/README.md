@@ -88,12 +88,14 @@ adds native niceties:
   > Electron's bundled Chromium does **not** ship. Electron therefore uses the
   > **server-side dictation fallback** instead: when the connected server has
   > the `dictation` extra and models installed (`GET /v1/info` reports
-  > `dictation_available`), a take that fails with Web Speech's `network`
-  > error falls back to streaming audio to `WS /v1/dictation/stream` and
-  > transcribing on the server — no cloud, no Chrome dependency. See
-  > `designs/server-dictation.md`. Without the server extra, the button still
-  > renders (the constructor exists) but shows "Dictation unavailable" when
-  > clicked, as before.
+  > `dictation_available`), a take streams audio to `WS /v1/dictation/stream`
+  > and is transcribed on the server — no cloud, no Chrome dependency. See
+  > `designs/server-dictation.md`. Without the server extra, macOS builds hand
+  > the mic to macOS Dictation (the Edit > Start Dictation… action, via
+  > `omnigent:start-system-dictation`), which types into the focused message
+  > box. Windows and Linux builds offer no mic button at all: with no working
+  > Web Speech backend, a button there could only fail with "Voice input isn't
+  > available on this device."
 
 ## How it works (zero UI duplication)
 
@@ -267,7 +269,7 @@ logs separately.
 - `phase: 'workspace landing'` means the bridge redirected and the status came
   from the destination page; it is not a rejection from the session-create endpoint.
 - For a direct `403 PERMISSION_DENIED`, give the request ID and custom client ID
-  to the Databricks platform owner to check the denial reason (client enablement,
+  to the workspace administrator to check the denial reason (client enablement,
   token scope, or workspace permissions). Do not infer the cause from status alone.
 
 ## OIDC sign-in through the system browser
@@ -391,7 +393,7 @@ electron/
   about/index.html         # bundled About UI opened from the macOS app menu
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
   icons/                   # app icons
-  docs/managed-preferences.md # public MDM configuration contract
+  docs/managed-preferences.md # MDM configuration reference
 ```
 
 Native niceties beyond notifications/badge: a right-click context menu
@@ -497,9 +499,11 @@ sequenceDiagram
 ### Browser previews on this machine
 
 Sessions running on this desktop machine can open HTTP(S) `localhost`,
-`127.0.0.1`, and `[::1]` through the address bar, opted-in chat/file links,
-and the agent's browser tools. Start the app locally, open **+** > **Browser**,
-and enter its URL. `localhost` always names the desktop machine.
+`127.0.0.1`, `[::1]`, and `*.localhost` subdomains such as
+`spog.dev.localhost` through the address bar, opted-in chat/file links, and
+the agent's browser tools. Start the app locally, open **+** > **Browser**,
+and enter its URL. `localhost` and its subdomains always name the desktop
+machine; the page still receives the subdomain in its `Host` header.
 
 Main verifies this machine's current host identity and a live host daemon
 record enrolled with the window's server. That enrollment is the trust boundary:
@@ -519,9 +523,14 @@ Other remote and unknown sessions have public-only **document** access. Use a
 public preview URL or your regular browser.
 
 Eligibility is per view: a public page in an eligible view can frame loopback
-documents too. Private networks, link-local/metadata addresses, `*.localhost`,
-`0.0.0.0`, and DNS aliases resolving to loopback remain blocked. Normal TLS,
-CORS, authentication, and local-network permission rules still apply.
+documents too. A `*.localhost` request is sent only on a direct route and must
+connect to a loopback address. Chromium already sends these names around
+ordinary system and PAC proxies; a proxy rule that removes that bypass
+(`<-loopback>`) leaves the page blank. Private networks,
+link-local/metadata addresses, `0.0.0.0`, trailing-dot or empty-label forms
+such as `app.localhost.`, and DNS aliases resolving to loopback remain blocked.
+Normal TLS, CORS, authentication, and local-network permission rules still
+apply.
 
 Hide/reopen the Workspace or switch tabs to retain a page without reloading.
 Closing the tab destroys it. User-created Browser tabs are separate from the
@@ -530,12 +539,11 @@ session's agent browser view and are not targeted by the agent relay.
 ### Agent previews on Arca
 
 The verified Arca exception also applies to the address bar and chat/file links.
-Companion or another external tool must forward the remote app's port to the
-desktop first.
+The remote app's port must be forwarded to the desktop first.
 
-On a Databricks-managed server with internal desktop features enabled, an
-Arca session's agent can open and inspect an app through Companion forwarding
-using the existing browser tools and tool approval or autoapproval policy.
+On a managed server with the managed features enabled, an Arca session's agent
+can open and inspect an app through a forwarded port using the existing browser
+tools and tool approval or autoapproval policy.
 Provide the actual forwarded URL to the agent; its local port may differ from
 the app's remote port. Omnigent does not establish or verify forwarding or
 prove that the local endpoint belongs to the Arca host.
@@ -546,7 +554,7 @@ source session on that host, or a subagent inheriting that host, is eligible.
 An older CLI or an unrecognized, failed, or missing identity leaves localhost
 navigation denied; the remembered host-picker label alone does not grant it.
 Eligibility is scoped to the selected server/workspace, not all sessions on
-a Databricks server.
+the server.
 
 After restarting the desktop, launch-time auto-connect restores this identity
 for users who opted into it. Otherwise, the first loopback preview request with
@@ -563,8 +571,9 @@ A decline briefly suppresses repeat prompts, while failed runs remain retryable.
 **Run on Arca** is hidden for an online remembered host only when the desktop
 advertises preview recovery; older shells keep the action visible.
 
-The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
-redirects and links that would open a new window (which stay in the same pane).
+The exception covers HTTP(S) `localhost`, `127.0.0.1`, `[::1]`, and
+`*.localhost` subdomains, including redirects and links that would open a new
+window (which stay in the same pane).
 Other loopback addresses, private-network and metadata destinations, hostnames
 that resolve to any of them, and non-web schemes remain restricted. Existing
 tool approvals are unchanged; whether a tool call asks for approval depends on
@@ -630,7 +639,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
   "Copy Link Address".
 - `src/browserUrlPolicy.js` — the browser navigation policy: http(s) only, and
   no private, link-local, metadata, or other non-public address in
-  any literal form, except exact loopback hosts for eligible views. A
+  any literal form, except loopback names for eligible views. A
   hostname is resolved through the view's Chromium session and refused if it
   does not resolve or any address is non-public. `main.js` also applies the
   policy to every HTTP(S) and WebSocket request of a policy-enforced view through
@@ -641,8 +650,13 @@ including the address bar, chat links, and agent actions, enforces this policy.
   tab makes sibling service-worker requests public-only until it navigates
   with an eligible context. Every guarded request to a named host resolves DNS
   through its partition before sending, including GET/HEAD subresources and
-  WebSockets. IP literals use the URL check without DNS. Exact loopback hosts
-  remain available to eligible Arca and this-machine sessions. Enforcement cancels requests and
+  WebSockets. IP literals use the URL check without DNS. Loopback names
+  (`localhost`, `127.0.0.1`, `[::1]`, and `*.localhost`) remain available to
+  eligible Arca and this-machine sessions without DNS. A `*.localhost` request
+  is cancelled before sending unless the partition's proxy lookup returns
+  `DIRECT` alone, and its response must come from a loopback address on a
+  route that is still direct, since a local proxy also answers from loopback.
+  Enforcement cancels requests and
   keeps the view open.
   Guarded HTTP requests skip cache reads to obtain connected-address metadata;
   a response whose address is missing
@@ -651,7 +665,11 @@ including the address bar, chat links, and agent actions, enforces this policy.
   network round trips and may increase latency and bandwidth. WebSocket upgrades
   can omit the connected IP; those repeat the partition DNS check at the 101
   response. This is not connected-IP verification and cannot rule out a DNS
-  change between check and connection. Limits: a DNS
+  change between check and connection. An IP-less `*.localhost` upgrade
+  repeats the direct-route check instead, because Chromium pins those names to
+  loopback and only a proxy could route them elsewhere. The route lookup uses
+  the WebSocket's own `ws:`/`wss:` URL, because Chromium can pick a different
+  proxy for it (an `https=` rule) than for plain HTTP. Limits: a DNS
   change between preflight and connection can still send a request to a private
   address; the HTTP response check prevents the page from reading its response.
   Pages restored from the back-forward cache and navigations answered by a service worker make no
@@ -754,9 +772,9 @@ the native view); no server flag.
 All renderer IPC navigation uses the same URL policy, including the URL bar.
 A renderer's `agent: false` flag does not exempt a tab from address checks.
 Main-owned eligibility for sessions on this machine and verified Arca sessions
-applies to exact loopback hosts. Other internal sites must be opened in a
-separate browser; this also keeps later redirects in these tabs under the same
-policy.
+applies to loopback names, including `*.localhost`. Other internal sites must
+be opened in a separate browser; this also keeps later redirects in these tabs
+under the same policy.
 
 **Importing cookies from Chrome (macOS).** Sites that reject embedded browsers
 (Google sign-in is the common one) can't be signed in from this pane, so the
@@ -880,6 +898,18 @@ server (see below), Connect, and you're in.
 > **not** run the Vite dev server. To develop the web UI itself with hot
 > reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
 
+### Close shortcut
+
+Cmd/Ctrl+W closes what has focus: the focused workspace tab (a file confirms
+unsaved edits first), or the open session, which returns to the new-session
+page. On the new-session page it asks in an in-app dialog before closing the
+window. The page reports which menu commands it can act on (see
+`src/desktopCommands.js`); until it does, or while it is unresponsive, Cmd/Ctrl+W
+closes the window directly. Cmd/Ctrl+Shift+W always closes the window.
+
+Verify on each supported desktop OS with focus inside an embedded browser:
+Cmd/Ctrl+W must close only its tab, and Cmd/Ctrl+Shift+W must close the window.
+
 ### Test desktop updates
 
 To override the current version used by development update checks, launch the
@@ -916,9 +946,9 @@ install production desktop updates. `build:mac:release` retains
 cross-platform publishing and update-feed checklist, see [the desktop release
 runbook](RELEASING.md).
 
-macOS apps, including unpackaged development, default to V2 onboarding only when the MDM preference
+macOS apps, including unpackaged development, default to V2 onboarding only when the managed preference
 `databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.
-Public macOS users and Windows/Linux keep the legacy
+Other users and Windows/Linux keep the legacy
 default. The setup-page switch still persists an explicit choice on every
 platform, and `OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved
 choice. A saved server still reconnects on launch.

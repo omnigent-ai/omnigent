@@ -241,6 +241,8 @@ async def test_proxy_recovers_tool_delivery(
                 events.append(queue.get_nowait())
 
     execute.assert_awaited_once()
+    # SDK harnesses reach sys_call_async through this path, so its results must be able to wake.
+    assert callable(execute.await_args.kwargs["wake_on_async_result"])
     assert len(deliveries) == min(failures + 1, 2)
     assert all(item == deliveries[0] for item in deliveries)
     failed = [
