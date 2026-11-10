@@ -17,11 +17,17 @@ persistence.
 
 from __future__ import annotations
 
+import json
 import re
+import time
 import uuid
 
 import httpx
+import pytest
 from playwright.sync_api import Locator, Page, expect
+
+from tests._helpers.session import send_user_text
+from tests.e2e_ui.conftest import configure_mock_llm
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -130,3 +136,77 @@ def test_click_pinned_project_session_keeps_project_collapsed(
     # reappeared.
     expect(folder_header).to_have_attribute("aria-expanded", "false")
     expect(_section(page, project).locator(f'a[href="/c/{session_b}"]')).to_have_count(0)
+
+
+def _wait_for_reply(base_url: str, session_id: str, text: str) -> None:
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        resp = httpx.get(
+            f"{base_url}/v1/sessions/{session_id}/items",
+            params={"order": "desc", "limit": 10},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        if text in json.dumps(resp.json()):
+            return
+        time.sleep(0.25)
+    raise AssertionError(f"mock reply {text!r} never landed in {session_id}")
+
+
+def test_collapsing_project_of_open_session_stays_collapsed(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+    seeded_session_pair: tuple[str, str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """Collapsing the open session's project sticks through pinned-session activity.
+
+    The open session stays visible as a single held row under the collapsed
+    header until the user navigates to another session.
+    """
+    base_url, pinned_id = seeded_session
+    _, member_id, outside_id = seeded_session_pair
+    nonce = uuid.uuid4().hex[:6]
+    project = f"e2e-collapse-{nonce}"
+    _set_title(base_url, pinned_id, f"pinned-{nonce}")
+    _set_title(base_url, member_id, f"member-{nonce}")
+    _set_title(base_url, outside_id, f"outside-{nonce}")
+    _file_into_project(base_url, member_id, project)
+    reply = f"pinned reply {nonce}"
+    configure_mock_llm(
+        mock_llm_server_url, [{"text": reply}] * 3, match=f"pinned-activity-{nonce}"
+    )
+
+    page: Page = request.getfixturevalue("page")
+    page.goto(f"{base_url}/c/{member_id}")
+    pinned_row = _row(page, pinned_id)
+    expect(pinned_row).to_be_visible()
+    pinned_row.hover()
+    pinned_row.get_by_test_id("quick-pin-conversation").click()
+    pinned_link = _section(page, "Pinned").locator(f'a[href="/c/{pinned_id}"]')
+    pinned_link.click()
+    expect(page).to_have_url(re.compile(rf"/c/{pinned_id}$"))
+
+    folder_header = page.get_by_role("button", name=project, exact=True)
+    expect(folder_header).to_have_attribute("aria-expanded", "true")
+    _section(page, project).locator(f'a[href="/c/{member_id}"]').click()
+    expect(page).to_have_url(re.compile(rf"/c/{member_id}$"))
+    folder_header.click()
+    expect(folder_header).to_have_attribute("aria-expanded", "false")
+
+    with httpx.Client(base_url=base_url) as client:
+        send_user_text(client, session_id=pinned_id, text=f"pinned-activity-{nonce}")
+    _wait_for_reply(base_url, pinned_id, reply)
+    # The unread marker shows once the sidebar has applied the pinned session's update.
+    expect(pinned_link).to_contain_text("(unread)", timeout=30_000)
+
+    expect(folder_header).to_have_attribute("aria-expanded", "false")
+    assert project not in json.loads(
+        page.evaluate("localStorage.getItem('omnigent:expanded-project-sections') ?? '[]'")
+    )
+    expect(_section(page, project).locator(f'a[href="/c/{member_id}"]')).to_have_count(1)
+
+    page.locator(f'a[href="/c/{outside_id}"]').first.click()
+    expect(page).to_have_url(re.compile(rf"/c/{outside_id}$"))
+    expect(_section(page, project).locator(f'a[href="/c/{member_id}"]')).to_have_count(0)
+    expect(folder_header).to_have_attribute("aria-expanded", "false")

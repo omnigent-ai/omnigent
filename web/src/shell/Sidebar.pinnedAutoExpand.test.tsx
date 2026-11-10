@@ -10,10 +10,12 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // reachable from the Pinned section, so the effect must skip pinned targets.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { sessionNumberAriaShortcut } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { sidebarConfig } from "@/lib/sidebarConfig";
 import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "@/shell/sidebarNav";
 
 // Server-authoritative pinned set for the mock; tests push the pinned conv here.
@@ -56,11 +58,11 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockReturnValue(conversationPage(convs, { first_id: null, last_id: null }));
 }
 
-function renderAt(initialEntry: string) {
+function renderAt(initialEntry: string, config = sidebarConfig) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const tree = () => (
     <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
+      <SidebarDataProvider config={config}>
         <TooltipProvider>
           <MemoryRouter initialEntries={[initialEntry]}>
             <Routes>
@@ -70,8 +72,14 @@ function renderAt(initialEntry: string) {
           </MemoryRouter>
         </TooltipProvider>
       </SidebarDataProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const result = render(tree());
+  return { ...result, rerenderSidebar: () => result.rerender(tree()) };
+}
+
+function expandedProjects(): unknown {
+  return JSON.parse(localStorage.getItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY) ?? "[]");
 }
 
 beforeEach(() => {
@@ -136,5 +144,68 @@ describe("sidebar auto-expand vs. pinned sessions (#2506)", () => {
     expect(JSON.parse(localStorage.getItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY) ?? "[]")).toEqual(
       ["Repro 2506"],
     );
+  });
+});
+
+describe("collapsing the project that holds the open session", () => {
+  function openFiledSession() {
+    pinnedRef.current = [conv("pinned_x")];
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([]));
+    mockConversations([conv("pinned_x"), conv("sibling_b", "Repro 2506")]);
+  }
+
+  it("stays collapsed when a pinned session's row updates", () => {
+    openFiledSession();
+    const { rerenderSidebar } = renderAt("/c/sibling_b");
+    const header = screen.getByRole("button", { name: "Repro 2506" });
+    expect(header).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(header);
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(expandedProjects()).toEqual([]);
+
+    pinnedRef.current = [{ ...conv("pinned_x"), status: "working", updated_at: 1 }];
+    act(() => rerenderSidebar());
+
+    expect(screen.getByRole("button", { name: "Repro 2506" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(expandedProjects()).toEqual([]);
+  });
+
+  it("stays collapsed after the click when pins exclude shared sessions", () => {
+    openFiledSession();
+    renderAt("/c/sibling_b", { ...sidebarConfig, pinsIncludeShared: false });
+    const header = screen.getByRole("button", { name: "Repro 2506" });
+    expect(header).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(header);
+
+    expect(screen.getByRole("button", { name: "Repro 2506" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(expandedProjects()).toEqual([]);
+  });
+
+  it("keeps the open session's row under the collapsed header until navigating away", () => {
+    openFiledSession();
+    renderAt("/c/sibling_b");
+
+    fireEvent.click(screen.getByRole("button", { name: "Repro 2506" }));
+
+    expect(screen.getByRole("button", { name: "Repro 2506" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getAllByRole("link", { name: /sibling_b/ })).toHaveLength(1);
+    // The held row keeps its numbered hotkey, after the pinned row's.
+    expect(screen.getByRole("link", { name: /sibling_b/ })).toHaveAttribute(
+      "aria-keyshortcuts",
+      sessionNumberAriaShortcut("2"),
+    );
+    fireEvent.click(screen.getByRole("link", { name: /pinned_x/ }));
+    expect(screen.queryByRole("link", { name: /sibling_b/ })).not.toBeInTheDocument();
   });
 });
