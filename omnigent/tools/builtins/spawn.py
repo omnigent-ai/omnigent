@@ -502,7 +502,7 @@ def _resolve_parent_conversation_id(ctx: ToolContext) -> str:
 
 class SysSessionListTool(Tool):
     """
-    List sub-agents under this conversation, plus accessible sessions.
+    List sub-agents under this conversation, plus the caller's sessions.
 
     Returns two views:
 
@@ -512,9 +512,10 @@ class SysSessionListTool(Tool):
       ``sys_session_send`` continues rather than spawns) and to grab each
       child's ``conversation_id`` for ``sys_session_get_history`` /
       ``sys_session_get_info`` / ``sys_session_close``.
-    - ``sessions`` — a **global** view of every session the caller can
-      access (bounded by the server's per-user permission model), each
-      with its status and runner connectivity. An optional
+    - ``sessions`` — a **global** view of the sessions the caller owns,
+      matching the web sidebar's own-sessions list, each with its status
+      and runner connectivity. ``visibility="all"`` also lists sessions
+      other users shared with the caller. An optional
       ``agent_name`` filter narrows this list. This powers
       orchestration: discovering sessions to inspect
       (``sys_agent_get`` / ``sys_session_get_info``) or drive
@@ -538,15 +539,15 @@ class SysSessionListTool(Tool):
             "(agent, title) children under this conversation (and your "
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
-            "every session "
-            "you can access, each with status, runner connectivity and "
+            "the sessions you own, each with status, runner connectivity and "
             "created_by_session_id (creation origin for independent workers). "
             "Match that field to your session ID to find workers you created. "
             "Inspect via sys_agent_get / sys_session_get_info; use sys_session_send "
             "for children or sys_session_message for independent sessions. "
             "Pass agent_name to filter the global list to "
-            "sessions running that agent, and include_archived to also list "
-            "archived sessions (marked archived). Calls without pagination keep "
+            "sessions running that agent, include_archived to also list "
+            "archived sessions (marked archived), and visibility 'all' to also "
+            "list sessions other users shared with you. Calls without pagination keep "
             "the complete result while it fits the tool-output budget; "
             "larger global session lists return a page with has_more "
             "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
@@ -584,6 +585,15 @@ class SysSessionListTool(Tool):
                                 "Optional: also list archived sessions in the "
                                 "global 'sessions' view; each row then carries "
                                 "'archived'. Defaults to false."
+                            ),
+                        },
+                        "visibility": {
+                            "type": "string",
+                            "enum": ["mine", "all"],
+                            "description": (
+                                "Optional: 'mine' (default) lists only sessions "
+                                "you own in 'sessions'; 'all' also lists "
+                                "sessions other users shared with you."
                             ),
                         },
                         "limit": {

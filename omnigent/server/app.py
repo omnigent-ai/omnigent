@@ -290,6 +290,9 @@ class ServerInfoResponse(BaseModel):
     archive_worktree_cleanup: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
     session_search_scope: bool = True
+    # GET /v1/sessions?visibility=mine honors ``include_archived``; older servers
+    # drop archived rows from that scope.
+    session_list_owned_archives: bool = True
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True

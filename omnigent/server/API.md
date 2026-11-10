@@ -725,8 +725,10 @@ Clients should always send `visibility` explicitly: `mine` lists owned
 active sessions, `shared` lists accessible active sessions owned by someone
 else, `archived` lists accessible archived sessions, and `all` lists all
 accessible active sessions. `include_archived=true` also includes archived
-sessions with `visibility=all`; the other modes determine archive filtering
-themselves. The server still defaults to `all` for older clients. Without
+sessions with `visibility=all` or `visibility=mine` (servers that advertise
+`session_list_owned_archives` in `GET /v1/info`; older ones ignore it for
+`mine`); `shared` and `archived` determine archive filtering themselves.
+The server still defaults to `all` for older clients. Without
 authentication, `mine` and `shared` behave like `all`.
 
 The `kind` filter scopes which conversation kinds are listed:

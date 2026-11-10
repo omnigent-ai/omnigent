@@ -2160,7 +2160,7 @@ def register_core_routes(
             Pagination cursors refer to the original filtered page.
         :param visibility: Ownership/archive filter for the sidebar tabs.
             ``"mine"`` returns only sessions the caller owns (owner-level
-            grant). ``"shared"`` returns only sessions accessible but not
+            grant), archived ones too with ``include_archived``. ``"shared"`` returns only sessions accessible but not
             owned. ``"archived"`` returns only archived sessions; with
             ``project``, only owned sessions are returned so first-class
             project names resolve within the caller's projects.
@@ -2184,7 +2184,7 @@ def register_core_routes(
         normalized_query = search_query if search_query else None
         # Map the visibility filter to store-level ACL params.
         # "mine": only sessions the caller owns — no accessible_by needed
-        #   because owner-level implies access.
+        #   because owner-level implies access. Honors include_archived.
         # "shared": sessions accessible but not owned — shared_only=True
         #   computes the set difference (accessible − owned).
         # "all": all accessible sessions (legacy default). A project folder
@@ -2201,7 +2201,7 @@ def register_core_routes(
             accessible_by_param: str | None = None
             owned_by_param: str | None = user_id
             shared_only_param = False
-            include_archived_param = False
+            include_archived_param = include_archived
             archived_only_param = False
         elif effective_visibility == "shared":
             accessible_by_param = user_id

@@ -147,6 +147,10 @@ def test_shared_session_still_visible_in_flat_list(db_uri: str) -> None:
     [
         ({"visibility": "mine", "project": "Bob Project"}, {"owned_active"}),
         (
+            {"visibility": "mine", "include_archived": "true"},
+            {"owned_active", "owned_archived", "owned_archived_first_class"},
+        ),
+        (
             {"visibility": "archived", "include_archived": "true"},
             {"owned_archived", "owned_archived_first_class", "shared_archived"},
         ),

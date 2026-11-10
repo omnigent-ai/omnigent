@@ -473,35 +473,52 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
     ) as client:
-        first = json.loads(
-            await execute_tool(
-                tool_name="sys_session_list",
-                arguments=json.dumps({"limit": 100}),
-                server_client=client,
-                conversation_id="conv_caller",
+
+        async def call(args: dict[str, object]) -> dict[str, object]:
+            return json.loads(
+                await execute_tool(
+                    tool_name="sys_session_list",
+                    arguments=json.dumps(args),
+                    server_client=client,
+                    conversation_id="conv_caller",
+                )
             )
-        )
-        second = json.loads(
-            await execute_tool(
-                tool_name="sys_session_list",
-                arguments=json.dumps({"limit": 100, "cursor": first["page"]["next_cursor"]}),
-                server_client=client,
-                conversation_id="conv_caller",
-            )
-        )
+
+        first = await call({"limit": 100})
+        cursor = first["page"]["next_cursor"]
+        second = await call({"limit": 100, "cursor": cursor})
+        widened = await call({"limit": 100, "visibility": "all", "cursor": cursor})
+        shared = await call({"limit": 100, "visibility": "all"})
+        invalid = await call({"visibility": "shared"})
 
     assert first["sessions"][0]["session_id"] == "conv_0000"
     assert second["sessions"][0]["session_id"] == "conv_0100"
-    assert received_afters == [None, "conv_0099"]
-    assert received_visibilities == ["all", "all"]
+    assert shared["sessions"][0]["session_id"] == "conv_0000"
+    assert received_afters == [None, "conv_0099", None]
+    assert received_visibilities == ["mine", "mine", "all"]
+    # The cursor is bound to the visibility it was minted with.
+    assert widened == {"error": "sys_session_list: cursor uses different filter arguments"}
+    assert invalid == {"error": "sys_session_list: 'visibility' must be one of ['all', 'mine']"}
 
 
 @pytest.mark.asyncio
-async def test_sys_session_list_include_archived_lists_archived_rows_on_every_page() -> None:
+@pytest.mark.parametrize(
+    ("info_status", "info_body", "expected_visibility"),
+    [
+        (200, {"session_list_owned_archives": True}, "mine"),
+        (200, {}, "all"),
+        (404, {"detail": "Not Found"}, "all"),
+    ],
+    ids=["owned-archives", "older-server", "unreadable-info"],
+)
+async def test_sys_session_list_include_archived_lists_archived_rows_on_every_page(
+    info_status: int, info_body: dict[str, object], expected_visibility: str
+) -> None:
     """An archive-inclusive listing reaches the server on each page and marks archived rows.
 
     Trigger automations find the workers they started through this listing, so
-    archiving a worker must not hide it from the next page either.
+    archiving a worker must not hide it from the next page either. Servers whose
+    ``mine`` scope drops archived rows keep getting the earlier ``all`` query.
     """
     rows = [
         {
@@ -517,15 +534,21 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
         }
         for index in range(150)
     ]
-    received: list[str | None] = []
+    received: list[tuple[str | None, str | None]] = []
+    info_requests: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_caller/child_sessions":
             return httpx.Response(200, json={"data": []})
         if request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.url.path == "/v1/info":
+            info_requests.append(request.url.path)
+            return httpx.Response(info_status, json=info_body)
         if request.url.path == "/v1/sessions":
-            received.append(request.url.params.get("include_archived"))
+            received.append(
+                (request.url.params.get("include_archived"), request.url.params.get("visibility"))
+            )
             return _server_page(request, rows)
         raise AssertionError(f"unexpected path {request.url.path}")
 
@@ -549,7 +572,13 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
         mismatched = await call({"limit": 100, "cursor": cursor})
         default = await call({"limit": 100})
 
-    assert received == ["true", "true", None]
+    assert received == [
+        ("true", expected_visibility),
+        ("true", expected_visibility),
+        (None, "mine"),
+    ]
+    # Only archive-inclusive pages check the server's capability.
+    assert len(info_requests) == 2
     assert first["sessions"][0] == {
         "session_id": "conv_0000",
         "agent_name": "claude",

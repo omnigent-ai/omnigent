@@ -652,6 +652,8 @@ _AGENT_LIST_PAGE_LIMIT = 1000
 _RUNNER_ONLINE_SIZING_PLACEHOLDER = False
 # Max concurrent ``GET /v1/runners/{id}/status`` lookups per ``sys_session_list``.
 _RUNNER_STATUS_CONCURRENCY = 8
+# ``sys_session_list`` scopes, forwarded as ``GET /v1/sessions?visibility=``.
+_SESSION_LIST_VISIBILITIES = ("all", "mine")
 
 _DISCOVERY_LIST_MAX_LIMIT = 100
 # Match the existing default ceiling for ``sys_os_shell`` output. Discovery
@@ -5272,11 +5274,16 @@ async def _execute_session_query_tool(
     if tool_name == "sys_session_list":
         agent_name = args.get("agent_name")
         include_archived = args.get("include_archived") is True
+        visibility = args.get("visibility", "mine")
+        if visibility not in _SESSION_LIST_VISIBILITIES:
+            return json.dumps(
+                {"error": "sys_session_list: 'visibility' must be one of ['all', 'mine']"}
+            )
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            _session_list_filters(agent_name, include_archived),
+            _session_list_filters(agent_name, include_archived, visibility),
         )
         if isinstance(window, str):
             return window
@@ -5286,6 +5293,7 @@ async def _execute_session_query_tool(
             server_client,
             agent_name,
             include_archived=include_archived,
+            visibility=visibility,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -6211,23 +6219,46 @@ def _project_agent_list(
     }
 
 
-def _session_list_filters(agent_name: object, include_archived: bool) -> _JsonObject:
+def _session_list_filters(
+    agent_name: object, include_archived: bool, visibility: str
+) -> _JsonObject:
     """
     The ``sys_session_list`` filters a continuation cursor is bound to.
 
     ``include_archived`` is recorded only when set, so cursors issued before
-    the flag existed still match a call that omits it.
+    the flag existed still match a call that omits it. ``visibility`` is
+    always recorded: older cursors continued a listing of every accessible
+    session, which the default no longer is.
 
     :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
     :param include_archived: Whether archived sessions are listed.
-    :returns: The filter mapping, e.g. ``{"agent_name": None}``.
+    :param visibility: ``"mine"`` or ``"all"``.
+    :returns: The filter mapping, e.g. ``{"agent_name": None, "visibility": "mine"}``.
     """
     filters: _JsonObject = {
-        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None
+        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
+        "visibility": visibility,
     }
     if include_archived:
         filters["include_archived"] = True
     return filters
+
+
+async def _server_lists_owned_archives(server_client: httpx.AsyncClient) -> bool:
+    """
+    Whether ``GET /v1/sessions?visibility=mine`` honors ``include_archived``.
+
+    Older servers silently drop archived rows from that scope; an unreadable
+    ``/v1/info`` counts as unsupported.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``True`` when the server advertises ``session_list_owned_archives``.
+    """
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        return info.status_code < 400 and info.json().get("session_list_owned_archives") is True
+    except (httpx.HTTPError, ValueError):
+        return False
 
 
 async def _session_list_via_rest(
@@ -6236,6 +6267,7 @@ async def _session_list_via_rest(
     agent_name: object = None,
     *,
     include_archived: bool = False,
+    visibility: str = "mine",
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -6245,11 +6277,11 @@ async def _session_list_via_rest(
 
     ``sub_agents`` is the caller's named-sub-agent view (children, plus
     parent/siblings when the caller is itself a child) — see
-    :func:`_collect_sub_agents`. ``sessions`` is the **global**,
-    permission-bounded list of every session the caller can access, each
-    annotated with status + runner connectivity, optionally filtered by
-    ``agent_name`` — see :func:`_collect_global_sessions`. Both are
-    best-effort: a failure in either view yields an empty list for it
+    :func:`_collect_sub_agents`. ``sessions`` is the **global** list of the
+    caller's own sessions, or of every session it can access with
+    ``visibility="all"``, each annotated with status + runner connectivity,
+    optionally filtered by ``agent_name`` — see :func:`_collect_global_sessions`.
+    Both are best-effort: a failure in either view yields an empty list for it
     rather than failing the whole call.
 
     :param conversation_id: The caller session id, e.g. ``"conv_root1"``.
@@ -6257,6 +6289,8 @@ async def _session_list_via_rest(
     :param agent_name: Optional agent-name filter for the global
         ``sessions`` view; ignored for ``sub_agents``.
     :param include_archived: Also list archived sessions in the global view.
+    :param visibility: ``"mine"`` for owned sessions or ``"all"`` to also
+        include sessions shared with the caller.
     :param limit: Optional maximum rows returned from the global sessions view. When
         omitted, the complete legacy result is preserved while it fits.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -6264,24 +6298,32 @@ async def _session_list_via_rest(
         bounded page with continuation metadata.
     """
     sub_agents = await _collect_sub_agents(conversation_id, server_client)
-    sessions_page = (
-        _DiscoveryPage([], False)
-        if cursor_state["sessions"][0] == _DISCOVERY_END
-        else await _collect_global_sessions(
+    if cursor_state["sessions"][0] == _DISCOVERY_END:
+        sessions_page = _DiscoveryPage([], False)
+    else:
+        server_visibility = visibility
+        if (
+            include_archived
+            and visibility == "mine"
+            and not await _server_lists_owned_archives(server_client)
+        ):
+            # Keep archived owned sessions listable on servers whose "mine" scope drops them.
+            server_visibility = "all"
+        sessions_page = await _collect_global_sessions(
             server_client,
             agent_name,
             include_archived=include_archived,
+            visibility=server_visibility,
             after=cursor_state["sessions"][1],
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
         )
-    )
     result = _bounded_discovery_result(
         {"sub_agents": cast(list[_JsonObject], sub_agents), "sessions": sessions_page.rows},
         limit=limit,
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters=_session_list_filters(agent_name, include_archived),
+        filters=_session_list_filters(agent_name, include_archived, visibility),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
@@ -6534,13 +6576,14 @@ async def _collect_global_sessions(
     agent_name: object,
     *,
     include_archived: bool = False,
+    visibility: str = "mine",
     after: str | None,
     limit: int,
 ) -> _DiscoveryPage:
     """
     Fetch the global session list via ``GET /v1/sessions``.
 
-    Projects each accessible session to ``{session_id, agent_name, title,
+    Projects each listed session to ``{session_id, agent_name, title,
     status, runner_id, runner_online, parent_session_id}``.
     ``runner_online`` holds :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER` until
     :func:`_fill_returned_runner_online` resolves it for the rows that
@@ -6554,11 +6597,12 @@ async def _collect_global_sessions(
         non-empty string.
     :param include_archived: Also return archived sessions, each marked
         ``archived``.
+    :param visibility: The server ``visibility`` scope, ``"mine"`` or ``"all"``.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
     """
-    params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": "all"}
+    params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": visibility}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if include_archived:

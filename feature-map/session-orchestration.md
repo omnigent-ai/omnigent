@@ -26,7 +26,8 @@ MCP independent creation.
   another session". `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
-  marked `archived`.
+  marked `archived`. Its `sessions` view lists only the caller's own sessions,
+  like the sidebar; `visibility: "all"` adds sessions other users shared.
 - `kill-switch`: an explicit disable refuses new peer sends and independent
   creates, even if an enable is also listed, and hides the Automations page's
   trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to

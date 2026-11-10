@@ -160,6 +160,35 @@ async def test_runner_is_trusted_for_other_owned_sessions_it_hosts(auth_client, 
     )
 
 
+async def test_session_list_defaults_to_owned_sessions(auth_client, peers, db_uri):
+    source, target, _ = peers
+    shared = await _create_session_as(auth_client, "", "bob")
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("alice")
+    permissions.grant("alice", shared["id"], LEVEL_READ)
+    SqlAlchemyConversationStore(db_uri).update_conversation(target["id"], archived=True)
+
+    async def listed(arguments):
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_list",
+                arguments=json.dumps(arguments),
+                server_client=auth_client,
+                conversation_id=source["id"],
+            )
+        )
+        return {row["session_id"] for row in result["sessions"]}
+
+    assert await listed({}) == {source["id"]}
+    assert await listed({"include_archived": True}) == {source["id"], target["id"]}
+    assert await listed({"visibility": "all"}) == {source["id"], shared["id"]}
+    assert await listed({"visibility": "all", "include_archived": True}) == {
+        source["id"],
+        target["id"],
+        shared["id"],
+    }
+
+
 @pytest.mark.parametrize("batch", [False, True])
 async def test_peer_message_tracks_runner_startup(auth_client, peers, monkeypatch, batch):
     from omnigent.server.routes import sessions
