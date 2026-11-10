@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import ntpath
 import re
 import threading
 import uuid
@@ -4402,6 +4403,52 @@ async def test_filesystem_read_proxies_to_runner(
     assert resp.json()["content"] == "hello world"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("windows_single_slash", [True, False])
+@pytest.mark.parametrize(
+    ("path", "query", "status"),
+    [
+        ("", {"scope": "workspace"}, 200),
+        ("", {"scope": "workspace", "base": "host"}, 400),
+        ("/sample.png", {"scope": "workspace", "base": "host"}, 400),
+        ("/C:/workspace/sample.png", {"scope": "workspace"}, 400),
+        ("/sample.png", {"scope": "reach"}, 422),
+    ],
+)
+async def test_filesystem_workspace_scope_validates_the_request(
+    client: httpx.AsyncClient,
+    path: str,
+    query: dict[str, str],
+    status: int,
+    windows_single_slash: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not windows_single_slash:
+        # Python 3.13+ does not consider a single leading slash Windows-absolute.
+        original_isabs = ntpath.isabs
+        monkeypatch.setattr(
+            ntpath,
+            "isabs",
+            lambda path: (
+                original_isabs(path) and not (path.startswith("/") and not path.startswith("//"))
+            ),
+        )
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    response = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        f"/filesystem{path}",
+        params=query,
+    )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.headers["X-Omnigent-File-Scope"] == "workspace"
+        assert response.headers["Access-Control-Expose-Headers"] == "X-Omnigent-File-Scope"
+    else:
+        assert fake_runner.calls == []
+        assert "X-Omnigent-File-Scope" not in response.headers
+
+
 @contextlib.asynccontextmanager
 async def _runner_app_client(runner: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     """Route session resources to a stub runner app over a real httpx client.
@@ -4430,9 +4477,11 @@ _DOWNLOAD_URL = (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scope", [None, "workspace"])
 async def test_filesystem_download_streams_runner_attachment(
     client: httpx.AsyncClient,
     tmp_path: Path,
+    scope: str | None,
 ) -> None:
     """``?download=true`` forwards the runner's attachment and headers verbatim.
 
@@ -4462,14 +4511,15 @@ async def test_filesystem_download_streams_runner_attachment(
         )
 
     async with _runner_app_client(runner):
-        resp = await client.get(_DOWNLOAD_URL)
+        resp = await client.get(_DOWNLOAD_URL + (f"&scope={scope}" if scope else ""))
 
     assert resp.status_code == 200
     assert resp.content == payload
     assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
     assert resp.headers["content-length"] == str(len(payload))
     assert resp.headers["cache-control"] == "no-store"
-    assert seen == [("data/big.bin", True, "reach")]
+    assert resp.headers.get("X-Omnigent-File-Scope") == scope
+    assert seen == [("data/big.bin", True, scope or "reach")]
 
 
 @pytest.mark.asyncio
@@ -10052,6 +10102,42 @@ async def offline_env_client(offline_env_app: FastAPI) -> AsyncIterator[httpx.As
 
 
 @pytest.mark.asyncio
+async def test_workspace_scope_keeps_host_fallback_confined(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "sample.txt").write_text("workspace content")
+    (tmp_path / "other.txt").write_text("outside content")
+    (workspace / "linked.txt").symlink_to(tmp_path / "other.txt")
+    reader = WorkspaceReader(workspace)
+
+    async def read_from_host(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["workspace"] == _OFFLINE_WORKSPACE
+        assert kwargs["op"] == "list_or_read"
+        try:
+            return reader.list_or_read(**kwargs["params"])
+        except WorkspaceReaderError as exc:
+            raise _host_filesystem.HostFsError(exc.status, exc.code, exc.message) from exc
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read_from_host)
+    prefix = f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default/filesystem"
+    response = await offline_env_client.get(f"{prefix}/sample.txt?scope=workspace")
+    assert response.status_code == 200, response.text
+    assert response.json()["content"] == "workspace content"
+    assert response.headers["X-Omnigent-File-Scope"] == "workspace"
+
+    denied = await offline_env_client.get(f"{prefix}/linked.txt?scope=workspace")
+    assert denied.status_code == 400, denied.text
+    assert "X-Omnigent-File-Scope" not in denied.headers
+
+
+@pytest.mark.asyncio
 async def test_offline_environment_advertises_the_same_reach_as_the_runner(
     offline_env_client: httpx.AsyncClient,
 ) -> None:
@@ -10738,6 +10824,57 @@ async def test_selected_pr_reaches_offline_host(
         else:
             assert captured["params"]["head_sha"] == "a" * 40
             assert captured["params"]["base_sha"] == "b" * 40
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource", "params", "op", "host_error", "status"),
+    [
+        (
+            "/commits",
+            {"head_sha": "a" * 40},
+            "github_commits",
+            "unknown fs op: 'github_commits'",
+            404,
+        ),
+        (
+            "/commit-diff",
+            {"commit_sha": "c" * 40},
+            "github_commit_diff",
+            "unknown fs op: 'github_commit_diff'",
+            404,
+        ),
+        (
+            "/commits",
+            {"head_sha": "a" * 40},
+            "github_commits",
+            "Expected head_sha to be a full commit SHA",
+            400,
+        ),
+    ],
+)
+async def test_offline_host_predating_commit_ops_reports_not_found(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+    params: dict[str, str],
+    op: str,
+    host_error: str,
+    status: int,
+) -> None:
+    """An older host's 400 for an op it lacks reads as a missing route."""
+    from omnigent.server.routes import _host_filesystem
+
+    async def read(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["op"] == op
+        raise _host_filesystem.HostFsError(400, "invalid_request", host_error)
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
+    response = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}",
+        params={"pr_url": "https://github.com/example/second/pull/42", **params},
+    )
+    assert response.status_code == status, response.text
 
 
 async def test_pr_attachment_uses_bound_session_when_runner_offline(
