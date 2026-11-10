@@ -647,17 +647,16 @@ def _render_agent_rule(instructions: str, session_id: str) -> str:
 
 
 def write_devin_agent_rule(workspace: Path, instructions: str | None, *, session_id: str) -> bool:
-    """Deliver a custom agent's instructions to Devin as an always-on rule.
+    """Deliver session startup instructions to Devin as an always-on rule.
 
     Writes ``<workspace>/.windsurf/rules/omnigent-agent-instructions.md`` with the
     ``trigger: always_on`` frontmatter Devin requires to load a rule into every
-    turn's system prompt. Idempotent: called with ``None`` (a plain Devin agent,
-    no instructions) it removes any rule a prior custom-agent launch left, so the
+    turn's system prompt. Called with ``None``, it removes a prior owned rule so the
     workspace never carries stale instructions.
 
     :param workspace: The session's workspace directory (Devin reads rules
         relative to its CWD, which is this workspace).
-    :param instructions: The verbatim ``AgentSpec.instructions``, or ``None``.
+    :param instructions: Author instructions and stable framework guidance, or ``None``.
     :param session_id: The Omnigent conversation id, stamped as the rule's owner.
     :returns: ``True`` when the instructions are live in the rule file. ``False``
         means the caller must deliver them another way (see

@@ -892,6 +892,7 @@ function renderItem(
         >
           <FilePathAwareMessageResponse
             className="chat-markdown text-message"
+            allowWorkspaceImages
             mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
             isStreaming={isTextStreaming}
           >

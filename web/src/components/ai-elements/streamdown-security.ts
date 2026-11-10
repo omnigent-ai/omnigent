@@ -32,6 +32,11 @@ export const STREAMDOWN_PLUGINS = {
 };
 export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(false);
 export const FILE_LINK_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(true);
+export const WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(
+  true,
+  false,
+  true,
+);
 export const GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(
   false,
   true,
@@ -49,6 +54,8 @@ const PARKED_GITHUB_IMAGE_TAG = "omnigent-github-image";
 // Attribute carrying the workspace path a file link names, percent-decoded
 // from its (unhardened) href so it matches the real filename on disk.
 export const WORKSPACE_FILE_LINK_ATTR = "data-omnigent-file";
+export const WORKSPACE_IMAGE_ATTR = "data-omnigent-image";
+const PARKED_WORKSPACE_IMAGE_TAG = "omnigent-workspace-image";
 
 // A protocol, protocol-relative or in-page href, never a workspace file. A `:12`
 // position is a file citation; a `:12-18` range only after a file extension
@@ -260,6 +267,37 @@ function restoreGitHubAttachmentImages() {
   };
 }
 
+/** Preserve local image paths for authenticated rendering, never as browser URLs. */
+function parkWorkspaceImages() {
+  return (tree: HastElement) => {
+    visitElements(tree, (node) => {
+      const src = node.properties?.src;
+      if (node.tagName !== "img" || typeof src !== "string" || !src) return;
+      let path: string;
+      try {
+        path = decodeURIComponent(src);
+      } catch {
+        return;
+      }
+      if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(path.trim()) || /[?#\\]/.test(path)) return;
+      node.tagName = PARKED_WORKSPACE_IMAGE_TAG;
+      node.properties = {
+        [WORKSPACE_IMAGE_ATTR]: path,
+        alt: node.properties?.alt,
+        title: node.properties?.title,
+      };
+    });
+  };
+}
+
+function restoreWorkspaceImages() {
+  return (tree: HastElement) => {
+    visitElements(tree, (node) => {
+      if (node.tagName === PARKED_WORKSPACE_IMAGE_TAG) node.tagName = "img";
+    });
+  };
+}
+
 function visitElements(node: HastElement, visitor: (node: HastElement) => void): void {
   if (node.type === "element") visitor(node);
   for (const child of node.children ?? []) {
@@ -285,6 +323,7 @@ function isHardenOptions(value: unknown): value is StreamdownHardenOptions {
 function createStreamdownRehypePlugins(
   markFileLinks: boolean,
   allowGitHubAttachmentImages = false,
+  allowWorkspaceImages = false,
 ): StreamdownRehypePlugins {
   const plugins: StreamdownRehypePlugins = [];
   let sawSanitize = false;
@@ -308,6 +347,7 @@ function createStreamdownRehypePlugins(
       plugins.push(markWorkspaceFileLinks);
     }
     if (allowGitHubAttachmentImages) plugins.push(parkGitHubAttachmentImages);
+    if (allowWorkspaceImages) plugins.push(parkWorkspaceImages);
 
     if (!isStreamdownHardenPlugin(plugin)) {
       throw new Error("Streamdown harden plugin must be a [plugin, options] tuple");
@@ -318,10 +358,11 @@ function createStreamdownRehypePlugins(
       { ...plugin[1], allowedImagePrefixes: [] },
     ] satisfies StreamdownPluginTuple);
     if (allowGitHubAttachmentImages) plugins.push(restoreGitHubAttachmentImages);
+    if (allowWorkspaceImages) plugins.push(restoreWorkspaceImages);
   }
 
   // Sanitize must run first: it drops raw HTML that could forge a parked image.
-  if ((markFileLinks || allowGitHubAttachmentImages) && !sawSanitize) {
+  if ((markFileLinks || allowGitHubAttachmentImages || allowWorkspaceImages) && !sawSanitize) {
     throw new Error("Streamdown default rehype plugins carry no sanitize step");
   }
 

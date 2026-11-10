@@ -2895,8 +2895,8 @@ async def _auto_create_pi_terminal(
         workspace=launch_config.workspace,
         server_client=server_client,
     )
-    raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
-    instructions_path = write_agent_instructions(bridge_dir, raw_instructions)
+    startup_instructions = _native_startup_instructions_from_spec(agent_spec)
+    instructions_path = write_agent_instructions(bridge_dir, startup_instructions)
     pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     context_files = True
     system_prompt_mode = "append"
@@ -4219,17 +4219,15 @@ async def _auto_create_devin_terminal(
     workspace = str(workspace_path)
     bridge_dir = prepare_bridge_dir(session_id)
 
-    # Deliver a custom agent's instructions as an always-on Windsurf rule (the
-    # only channel Devin applies to every turn); a plain agent clears any stale
-    # rule a prior custom-agent launch left in this workspace. Where that rule
-    # would not be session-scoped — a home-directory workspace Devin reads from
-    # every cwd, or one another agent's live rule already owns — the instructions
-    # ride the first message instead, which is weaker but stays in this session.
-    raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
-    rule_is_live = write_devin_agent_rule(workspace_path, raw_instructions, session_id=session_id)
-    if raw_instructions and not rule_is_live:
-        write_agent_instructions_preamble(bridge_dir, raw_instructions)
-    elif rule_is_live:
+    # Use a session-owned Windsurf rule, falling back to a first-message preamble
+    # when the workspace is shared or machine-global.
+    startup_instructions = _native_startup_instructions_from_spec(agent_spec)
+    rule_is_live = write_devin_agent_rule(
+        workspace_path, startup_instructions, session_id=session_id
+    )
+    if not rule_is_live:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
+    else:
         # Record the workspace so the SessionEnd hook can remove this rule when
         # the session ends, rather than leaving it to load into a later Devin run.
         write_devin_workspace_hint(bridge_dir, workspace_path)
@@ -5796,7 +5794,7 @@ async def _auto_create_codex_terminal(
         "\n\n".join(
             x
             for x in [
-                _native_startup_raw_instructions_from_spec(agent_spec),
+                _native_startup_instructions_from_spec(agent_spec),
                 _codex_routing_note,
             ]
             if x
@@ -7742,41 +7740,36 @@ def _opencode_session_instructions_from_spec(
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
-    :returns: The composed text, or ``None`` when there is no spec.
+    :returns: The composed text, or stable image guidance when there is no spec.
     """
-    from omnigent.runtime.prompt import build_instructions_nullable
+    from omnigent.runtime.prompt import (
+        build_instructions_nullable,
+        build_native_startup_instructions,
+    )
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     if spec is None:
-        return None
+        return build_native_startup_instructions(None)
     return build_instructions_nullable(spec, None, [])
 
 
-def _native_startup_raw_instructions_from_spec(
+def _native_startup_instructions_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
-) -> str | None:
-    """Read raw author instructions for a native harness's startup-additive channel.
+) -> str:
+    """Compose native startup instructions without turn-bound framework metadata.
 
     Shared by Claude/Pi native's ``--append-system-prompt`` and Codex native's
-    ``developer_instructions``. Returns the verbatim ``AgentSpec.instructions``
-    text only — never the fully framework-composed per-turn string. Terminal
-    launch is not tied to any one turn, while the composed string is
-    assembled per conversation for the turn about to run (late-bound
-    framework text like ``SHARED_SESSION_AUTHORSHIP_INSTRUCTION`` is
-    selected per conversation), so a startup channel carrying one turn's
-    composition would address every later turn with it.
+    ``developer_instructions``. The shared composer preserves author text and
+    adds only guidance that applies throughout the native session.
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
-    :returns: The original resolved instructions text, or ``None`` when
-        absent/whitespace-only.
+    :returns: Author instructions followed by stable framework guidance.
     """
-    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.runtime.prompt import build_native_startup_instructions
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    if spec is None:
-        return None
-    return raw_author_instructions(spec)
+    return build_native_startup_instructions(spec)
 
 
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
@@ -9845,9 +9838,7 @@ async def _auto_create_claude_terminal(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
-            x
-            for x in [_native_startup_raw_instructions_from_spec(agent_spec), routed_spawn_note]
-            if x
+            x for x in [_native_startup_instructions_from_spec(agent_spec), routed_spawn_note] if x
         )
         or None,
         allowed_tools=routed_spawn_tools,

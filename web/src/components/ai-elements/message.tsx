@@ -47,6 +47,7 @@ import {
   GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS,
   SECURE_STREAMDOWN_REHYPE_PLUGINS,
   STREAMDOWN_PLUGINS,
+  WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS,
 } from "./streamdown-security";
 
 export type MessageProps = HTMLAttributes<HTMLDivElement> & {
@@ -328,6 +329,8 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
   markFileLinks?: boolean;
   /** Show images hosted as GitHub attachments, e.g. in a PR description; others stay blocked. */
   allowGitHubAttachmentImages?: boolean;
+  /** Preserve workspace images for a session-aware, authenticated component override. */
+  allowWorkspaceImages?: boolean;
   /** The text is still growing, so its last code fence may be open. */
   isStreaming?: boolean;
 };
@@ -707,6 +710,7 @@ export const MessageResponse = memo(
     controls,
     markFileLinks = false,
     allowGitHubAttachmentImages = false,
+    allowWorkspaceImages = false,
     isStreaming = false,
     ...props
   }: MessageResponseProps) => {
@@ -742,11 +746,13 @@ export const MessageResponse = memo(
             mermaid={mermaidOptions}
             // Block remote image fetches that can exfiltrate data through URLs.
             rehypePlugins={
-              markFileLinks
-                ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
-                : allowGitHubAttachmentImages
-                  ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
-                  : SECURE_STREAMDOWN_REHYPE_PLUGINS
+              allowWorkspaceImages
+                ? WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS
+                : markFileLinks
+                  ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
+                  : allowGitHubAttachmentImages
+                    ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
+                    : SECURE_STREAMDOWN_REHYPE_PLUGINS
             }
           />
         </StreamingTextContext.Provider>
