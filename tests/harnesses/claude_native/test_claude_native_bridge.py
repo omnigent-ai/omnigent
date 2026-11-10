@@ -16826,7 +16826,7 @@ def test_btw_overlay_present_false_on_bare_composer(quoted_overlay: str) -> None
                 "    /btw q",
                 "    /btw q",
                 "",
-                "      ✻ Answering…",
+                "      ✢ Answering…",
                 "",
                 "    ⇧←/→ to browse · x to clear history · Esc to close",
             ),
@@ -16859,6 +16859,18 @@ def test_btw_overlay_present_false_on_bare_composer(quoted_overlay: str) -> None
             False,
             id="copied",
         ),
+        pytest.param(
+            _btw_pane(
+                "    /btw what does ✻ Answering… mean?",
+                "",
+                "      * Answering… is the spinner.",
+                "",
+                "    ⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close",
+            ),
+            False,
+            id="settled-text-mentions-answering",
+        ),
+        pytest.param(_btw_pane("    /btw q", "", "      A", ""), False, id="torn-footer"),
         pytest.param("", False, id="failed-capture"),
     ],
 )

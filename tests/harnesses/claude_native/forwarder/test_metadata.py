@@ -1018,15 +1018,26 @@ async def test_forward_pane_signals_captures_once_and_relays_both(
 
 
 @pytest.mark.asyncio
-async def test_forward_pane_signals_relays_a_repeated_btw_after_the_overlay_closes(
+@pytest.mark.parametrize(
+    ("later_frames", "relays"),
+    [
+        pytest.param(["closed", "second", "second", "second"], 2, id="closed"),
+        pytest.param(["answering", "second", "second", "second"], 2, id="answering"),
+        pytest.param(["torn", "first", "first", "first"], 1, id="torn-capture"),
+    ],
+)
+async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    later_frames: list[str],
+    relays: int,
 ) -> None:
     """
-    Asking the same /btw again after closing the overlay relays it again.
+    The same /btw is relayed again once the overlay closes or answers anew.
 
     Claude Code keeps /btw history, so the second ask lists the first above it
-    and settles on the same question and answer.
+    and settles on the same question and answer. One torn capture that loses
+    the footer does not end the display.
     """
     scrollback = [f"scrollback line {n}" for n in range(30)]
     border, question, answer = "▔" * 80, "    /btw hello", "      Hi! How can I help?"
@@ -1041,7 +1052,6 @@ async def test_forward_pane_signals_relays_a_repeated_btw_after_the_overlay_clos
             "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
         ]
     )
-    closed = "\n".join([*scrollback, "─" * 80, "❯ ", "─" * 80, "  ? for shortcuts"])
     second_ask = "\n".join(
         [
             *scrollback,
@@ -1054,7 +1064,25 @@ async def test_forward_pane_signals_relays_a_repeated_btw_after_the_overlay_clos
             "    ⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close",
         ]
     )
-    frames = [first_ask, first_ask, first_ask, closed, second_ask, second_ask, second_ask]
+    named_frames = {
+        "first": first_ask,
+        "second": second_ask,
+        "closed": "\n".join([*scrollback, "─" * 80, "❯ ", "─" * 80, "  ? for shortcuts"]),
+        "answering": "\n".join(
+            [
+                *scrollback,
+                border,
+                question,
+                question,
+                "",
+                "      ✻ Answering…",
+                "",
+                "    ⇧←/→ to browse · x to clear history · Esc to close",
+            ]
+        ),
+        "torn": "\n".join([*scrollback, border, question, "", answer, ""]),
+    }
+    frames = [first_ask] * 3 + [named_frames[name] for name in later_frames]
     write_tmux_target(tmp_path, socket_path=tmp_path / "tmux.sock", tmux_target="claude:0.0")
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_args: frames.pop(0))
     monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.0)
@@ -1072,7 +1100,7 @@ async def test_forward_pane_signals_relays_a_repeated_btw_after_the_overlay_clos
 
     relayed = [c["data"] for c in calls if c["type"] == "external_btw_sidechat"]
     exchange = {"question": "/btw hello", "answer": "Hi! How can I help?", "truncated": False}
-    assert relayed == [exchange, exchange]
+    assert relayed == [exchange] * relays
 
 
 @pytest.mark.asyncio

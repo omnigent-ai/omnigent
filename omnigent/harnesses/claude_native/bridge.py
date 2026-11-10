@@ -5637,6 +5637,8 @@ _BTW_FOOTER_HISTORY_HINTS = ("←/→toswitch", "←/→tobrowse")
 # shows in the region. Both conditions gate "the exchange is complete".
 _BTW_FOOTER_COMPLETE_HINTS = ("ctocopy", "ftofork")
 _BTW_ANSWERING_HINT = "Answering"
+# The generating overlay's status row: a spinner glyph, then the hint.
+_BTW_ANSWERING_ROW = re.compile(rf"^\S\s+{_BTW_ANSWERING_HINT}")
 _BTW_QUESTION_PREFIX = "/btw"
 # Read-only capture cannot tell a complete tall answer from one the pane
 # clipped (both end in a blank + footer), so an overlay whose border→footer
@@ -5682,7 +5684,7 @@ class PaneSignals:
         ``"auto"``, or ``None`` when no mode footer is visible.
     :param btw_overlay: A settled ``/btw`` side-chat overlay, or ``None``
         when none is shown / it is still generating.
-    :param btw_display_ended: True when a readable capture shows the ``/btw``
+    :param btw_display_ended: True when the capture shows the ``/btw``
         overlay closed or generating a new answer, so the next settled
         exchange is a new one even if its text repeats an earlier answer.
     """
@@ -5804,24 +5806,56 @@ def _btw_overlay_present(pane: str) -> bool:
     return any(_BTW_ANSWERING_HINT in line for line in region)
 
 
+def _btw_answering(pane: str) -> bool:
+    """
+    Report whether a captured pane shows the ``/btw`` overlay generating.
+
+    Matches the spinner status row directly above a footer offering neither
+    copy nor fork, so question or answer text mentioning it does not count.
+    The first answer's footer reads only ``Esc to close``, which
+    :func:`_btw_overlay_parts` does not accept, so it is not required here.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: True when the overlay shows its answering status row.
+    """
+    lines = pane.splitlines()
+    border_idx = next(
+        (
+            index
+            for index in range(len(lines) - 1, -1, -1)
+            if _BTW_OVERLAY_BORDER_GLYPH in lines[index]
+        ),
+        None,
+    )
+    if border_idx is None:
+        return False
+    rows = [line.strip() for line in lines[border_idx + 1 :] if line.strip()]
+    status_idx = next(
+        (index for index in range(len(rows) - 1, -1, -1) if _BTW_ANSWERING_ROW.match(rows[index])),
+        None,
+    )
+    if status_idx is None:
+        return False
+    footer = "".join("".join(rows[status_idx + 1 :]).split())
+    return footer.endswith(_BTW_FOOTER_CLOSE_HINT) and not any(
+        hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS
+    )
+
+
 def _btw_display_ended(pane: str) -> bool:
     """
     Report whether a captured pane ends the previous ``/btw`` display.
 
-    True when the overlay is closed or answering a new question. History
-    browsing and the copy indicator keep the overlay up, so they do not end
-    it. An empty capture (tmux failed) is unknown and returns False.
+    True only on positive evidence: the overlay is answering anew, or the live
+    input box it hides is back. A torn, failed or unrecognized capture shows
+    neither, and history browsing or the copy indicator keep the overlay up.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: True when a later settled exchange is a new display.
     """
-    if not pane.strip():
-        return False
-    parts = _btw_overlay_parts(pane)
-    if parts is None:
+    if _btw_answering(pane):
         return True
-    region, _footer = parts
-    return any(_BTW_ANSWERING_HINT in line for line in region)
+    return _btw_overlay_parts(pane) is None and _composer_row(pane) is not None
 
 
 def _dedent_overlay_lines(overlay_lines: list[str]) -> str:

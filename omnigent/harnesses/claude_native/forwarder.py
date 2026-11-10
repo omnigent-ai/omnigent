@@ -948,14 +948,7 @@ class _ForwardDedupeState:
     # whose ``PreCompact`` was missed from later hijacking an unrelated
     # genuine compaction's token.
     pending_compaction_dismiss_seq: int | None = None
-    # /btw side-chat relay. The overlay is never persisted (transcript,
-    # deltas and hooks are all empty for it), so it is scraped read-only from
-    # the shared pane capture. ``posted_btw_keys`` rings the (question, answer)
-    # hashes relayed during the current overlay display so the persistent,
-    # history-stacking overlay isn't re-posted every poll; it empties once the
-    # overlay closes or answers anew. ``btw_pending_key`` requires the same
-    # exchange on two consecutive reads before posting, so a torn capture
-    # can't relay a partial answer.
+    # /btw side-chat relay state, scraped from the pane; see ``_relay_btw_overlay``.
     btw_pending_key: str | None = None
     posted_btw_keys: dict[str, None] = field(default_factory=dict)
     # Session already logged as moved off this runner, so the notice is not
