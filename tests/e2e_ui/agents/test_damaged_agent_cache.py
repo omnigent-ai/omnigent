@@ -4,6 +4,7 @@ Chat once, damage the extracted config.yaml, restart the server, then chat again
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -92,7 +93,9 @@ def test_damaged_cache_entry_rebuilds_from_intact_bundle(
 
         # The session must still hydrate from the intact stored bundle.
         page.reload()
-        load_error = page.get_by_role("heading", name="Conversation not found")
+        load_error = page.get_by_role(
+            "heading", name=re.compile("Conversation not found|Couldn't load this conversation")
+        )
         composer = page.get_by_placeholder("Send a message…")
         expect(composer.or_(load_error).first).to_be_visible(timeout=30_000)
         assert load_error.count() == 0, (

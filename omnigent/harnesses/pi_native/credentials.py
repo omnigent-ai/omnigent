@@ -129,8 +129,8 @@ _DATABRICKS_ANTHROPIC_GATEWAY_PATH = "/ai-gateway/anthropic"
 
 # The Databricks Unity Gateway exposes one surface per protocol under the same
 # workspace origin: Codex/OpenAI-Responses at ``/codex/v1`` and Anthropic
-# Messages at ``/anthropic``. ``isaac configure codex`` writes the Codex
-# base_url; pi-native rewrites it to the Anthropic surface Pi speaks natively.
+# Messages at ``/anthropic``. The Codex base_url comes from a wrapper's
+# Codex setup; pi-native rewrites it to the Anthropic surface Pi speaks natively.
 _DATABRICKS_GATEWAY_CODEX_SUFFIX = "/codex/v1"
 _DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX = "/anthropic"
 
@@ -1349,10 +1349,10 @@ def _with_configured_default_limits(
 def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
     """Resolve a Codex ``cli-config`` Databricks-gateway provider into Pi config.
 
-    The common enterprise setup: ``isaac configure codex`` writes a custom
-    ``[model_providers.X]`` table (base_url + token-printing ``auth`` command)
-    into ``~/.codex/config.toml`` and ``omnigent setup`` adopts it as a
-    ``cli-config`` provider. Codex-native routes through that table; pi-native
+    The common enterprise setup: a custom ``[model_providers.X]`` table
+    (base_url + token-printing ``auth`` command) in ``~/.codex/config.toml``,
+    which ``omnigent setup`` adopts as a ``cli-config`` provider. Codex-native
+    routes through that table; pi-native
     used to return ``None`` here — silently falling back to Pi's own
     ``/login`` (often stale creds) — which is the bug this fixes.
 

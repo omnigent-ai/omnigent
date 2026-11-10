@@ -36,6 +36,7 @@ import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
 import { useContext, useMemo } from "react";
 import {
   CheckIcon,
+  ChevronRightIcon,
   ClipboardListIcon,
   ClockIcon,
   ExternalLinkIcon,
@@ -46,13 +47,20 @@ import {
 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
+import {
+  APPROVE_KEYS,
+  DECLINE_KEYS,
+  useApprovalPromptOnScreen,
+  useApprovesOnHotkey,
+} from "@/hooks/useApproveHotkey";
 import { useDescendantSession } from "@/hooks/useChildSessions";
 import {
   type AskUserQuestionPayload,
-  castAskUserQuestionPayload,
+  askUserQuestionPayloadOf,
   exitPlanModePlan,
-  parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
 import { askUserQuestionSignature } from "@/lib/askUserQuestionDrafts";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
@@ -60,7 +68,8 @@ import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import { Link, useLocation } from "@/lib/routing";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
-import type { AgyPermission, CodexPersistMode, RememberScope } from "@/lib/types";
+import { type FileEditDiff, getFileEditDiff } from "@/lib/toolEditDiff";
+import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { childPrimaryLabel } from "@/shell/subagentLabel";
 import { useChatStore } from "@/store/chatStore";
@@ -77,6 +86,8 @@ import {
   schemaFields,
 } from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+import { FileEditDiffView } from "./FileEditBody";
+import { ToolValueView } from "./ToolValueView";
 
 const AUTO_RESOLVED_DETAIL =
   "This request was answered outside this view, for example in the " +
@@ -144,6 +155,35 @@ export interface SubagentRequester {
  * Names and links the sub-agent behind a mirrored prompt, so the card is not
  * read as a request from the session being viewed.
  */
+/** A gated edit as a diff, with its full arguments on demand. */
+function FileEditApproval({
+  diff,
+  toolInput,
+}: {
+  diff: FileEditDiff;
+  toolInput: Record<string, unknown>;
+}) {
+  return (
+    <div className="flex flex-col gap-2">
+      {diff.replacesAll && (
+        <p className="text-sm font-medium">
+          Replaces every occurrence of the matched text; the diff shows one.
+        </p>
+      )}
+      <FileEditDiffView diff={diff} />
+      <Collapsible className="group text-sm">
+        <CollapsibleTrigger className="flex cursor-pointer items-center gap-1 text-muted-foreground hover:text-foreground">
+          <ChevronRightIcon className="size-3 transition-transform group-data-[state=open]:rotate-90" />
+          Show request
+        </CollapsibleTrigger>
+        <CollapsibleContent className="pt-2">
+          <ToolValueView value={toolInput} />
+        </CollapsibleContent>
+      </Collapsible>
+    </div>
+  );
+}
+
 function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequester) {
   const child = useDescendantSession(ancestorSessionId, sessionId);
   const search = sessionNavigationSearch(useLocation().search);
@@ -165,6 +205,8 @@ function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequest
 }
 
 interface ApprovalCardProps {
+  /** Shown in the open chat, where Esc declines it; not its copy in Inbox. */
+  inChat?: boolean;
   nativeDelivery?: NativePermissionDelivery;
   elicitationId: string;
   message: string;
@@ -201,6 +243,8 @@ interface ApprovalCardProps {
    * plan-review actions. Optional/null for other elicitations.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** The full file-edit tool call; when it describes a change, the card shows it as a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Structured Codex command approval details. When present, the
    * card renders command metadata instead of the raw JSON preview.
@@ -254,6 +298,11 @@ interface ApprovalCardProps {
   onSubmit?: SubmitApprovalFn;
   /** Set when the prompt was mirrored up from a sub-agent session. */
   requester?: SubagentRequester | null;
+  /**
+   * Whether keys pressed outside this card drive its question form. Only the
+   * question the chat answers from the keyboard sets this.
+   */
+  keyboardActive?: boolean;
   /** Extra classes for the card container, e.g. to drop its border when embedded. */
   className?: string;
 }
@@ -261,6 +310,7 @@ interface ApprovalCardProps {
 const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
 export function ApprovalCard({
+  inChat = false,
   nativeDelivery,
   elicitationId,
   message,
@@ -273,6 +323,7 @@ export function ApprovalCard({
   response,
   askUserQuestion,
   exitPlanMode,
+  fileEdit,
   codexCommand,
   allowAllEdits,
   allowAutoMode,
@@ -282,8 +333,14 @@ export function ApprovalCard({
   agyPermission,
   onSubmit,
   requester,
+  keyboardActive,
   className,
 }: ApprovalCardProps) {
+  // Only the prompt that ⌘↵ and Esc act on names them on its buttons.
+  const hotkeyTarget = useApprovesOnHotkey(elicitationId, status === "pending");
+  useApprovalPromptOnScreen(elicitationId, inChat && status === "pending");
+  const approveKeys = hotkeyTarget ? APPROVE_KEYS : undefined;
+  const declineKeys = hotkeyTarget && inChat ? DECLINE_KEYS : undefined;
   // In a side-chat pane this resolves to the child id, so the verdict targets
   // the child's elicitation rather than the main conversation's. null (the main
   // transcript) leaves submitApproval on its active-conversation default.
@@ -368,8 +425,7 @@ export function ApprovalCard({
   // JSON for backwards compatibility with elicitations published
   // before the structured field was added.
   const askPayload: AskUserQuestionPayload | null = useMemo(
-    () =>
-      castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview),
+    () => askUserQuestionPayloadOf({ askUserQuestion, contentPreview }),
     [askUserQuestion, contentPreview],
   );
   // Remount the question form when the same elicitation carries new questions.
@@ -410,13 +466,22 @@ export function ApprovalCard({
   const showPhase = phase !== "" && !isNativePolicy;
   const askUserQuestionTitle = questionPromptTitle(policyName, phase);
 
+  const fileEditDiff = useMemo(
+    () => (fileEdit ? getFileEditDiff(fileEdit.toolName, fileEdit.toolInput) : null),
+    [fileEdit],
+  );
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
   // button mode (the buttons render the choices). Codex command
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
   const formattedPreview =
-    isAskUserQuestion || isExitPlanMode || isMultiChoice || isSchemaForm || isCodexCommandApproval
+    isAskUserQuestion ||
+    isExitPlanMode ||
+    isMultiChoice ||
+    isSchemaForm ||
+    isCodexCommandApproval ||
+    fileEditDiff !== null
       ? ""
       : formatPreview(contentPreview);
   const execPolicyAmendment =
@@ -462,15 +527,17 @@ export function ApprovalCard({
     : undefined;
   const binaryButtons = (
     <div className={cn("flex flex-wrap gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}>
-      <Button
-        size="sm"
-        className={MOBILE_CHOICE_CLASS}
-        onClick={() => submitBinary("accept")}
-        componentId="approval.approve"
-      >
-        <CheckIcon className="mr-1 size-3.5" />
-        Approve
-      </Button>
+      <KeyboardShortcutTooltip label="Approve" keys={approveKeys}>
+        <Button
+          size="sm"
+          className={MOBILE_CHOICE_CLASS}
+          onClick={() => submitBinary("accept")}
+          componentId="approval.approve"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve
+        </Button>
+      </KeyboardShortcutTooltip>
       {agyPermission?.alwaysAllowPattern && (
         <>
           <Button
@@ -585,16 +652,18 @@ export function ApprovalCard({
           Approve &amp; don't ask again for {rememberTarget}
         </Button>
       )}
-      <Button
-        size="sm"
-        variant="outline"
-        className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
-        onClick={() => submitBinary("decline")}
-        componentId="approval.reject"
-      >
-        <XIcon className="mr-1 size-3.5" />
-        Reject
-      </Button>
+      <KeyboardShortcutTooltip label="Reject" keys={declineKeys}>
+        <Button
+          size="sm"
+          variant="outline"
+          className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
+          onClick={() => submitBinary("decline")}
+          componentId="approval.reject"
+        >
+          <XIcon className="mr-1 size-3.5" />
+          Reject
+        </Button>
+      </KeyboardShortcutTooltip>
     </div>
   );
   const codexCommandButtons = (
@@ -602,15 +671,17 @@ export function ApprovalCard({
       className={cn("flex flex-wrap items-center gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}
       data-testid="codex-command-actions"
     >
-      <Button
-        size="sm"
-        className={MOBILE_CHOICE_CLASS}
-        onClick={() => submitBinary("accept")}
-        componentId="approval.approve_command"
-      >
-        <CheckIcon className="mr-1 size-3.5" />
-        Approve
-      </Button>
+      <KeyboardShortcutTooltip label="Approve" keys={approveKeys}>
+        <Button
+          size="sm"
+          className={MOBILE_CHOICE_CLASS}
+          onClick={() => submitBinary("accept")}
+          componentId="approval.approve_command"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve
+        </Button>
+      </KeyboardShortcutTooltip>
       {execPolicyAmendment && (
         <Button
           size="sm"
@@ -623,15 +694,17 @@ export function ApprovalCard({
           Approve and remember
         </Button>
       )}
-      <Button
-        size="sm"
-        variant="outline"
-        className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
-        onClick={() => submitBinary("decline")}
-      >
-        <XIcon className="mr-1 size-3.5" />
-        Reject
-      </Button>
+      <KeyboardShortcutTooltip label="Reject" keys={declineKeys}>
+        <Button
+          size="sm"
+          variant="outline"
+          className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
+          onClick={() => submitBinary("decline")}
+        >
+          <XIcon className="mr-1 size-3.5" />
+          Reject
+        </Button>
+      </KeyboardShortcutTooltip>
     </div>
   );
 
@@ -660,6 +733,9 @@ export function ApprovalCard({
             <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
               {formattedPreview}
             </pre>
+          )}
+          {fileEditDiff && fileEdit && (
+            <FileEditApproval diff={fileEditDiff} toolInput={fileEdit.toolInput} />
           )}
           {unconfirmed && nativeDelivery.action && (
             <div className="flex flex-wrap gap-2">
@@ -902,6 +978,7 @@ export function ApprovalCard({
               onAcceptAuto={submitAllowAllEdits}
               onAccept={() => submitBinary("accept")}
               onReject={submitPlanRejection}
+              acceptKeys={approveKeys}
             />
           </>
         ) : isAskUserQuestion ? (
@@ -911,6 +988,7 @@ export function ApprovalCard({
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}
+            keyboardActive={keyboardActive}
           />
         ) : isCodexCommandApproval ? (
           <>
@@ -945,6 +1023,9 @@ export function ApprovalCard({
               <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
                 {formattedPreview}
               </pre>
+            )}
+            {fileEditDiff && fileEdit && (
+              <FileEditApproval diff={fileEditDiff} toolInput={fileEdit.toolInput} />
             )}
             {directoryScope}
             {isExternalUrl ? (
@@ -999,9 +1080,12 @@ export function ApprovalCard({
 export function ElicitationCard({
   item,
   onSubmit,
+  keyboardActive,
 }: {
   item: Extract<RenderItem, { kind: "elicitation" }>;
   onSubmit?: SubmitApprovalFn;
+  /** Whether keys pressed outside the card drive its question form. */
+  keyboardActive?: boolean;
 }) {
   // A sub-agent's prompt is mirrored into its ancestors' streams with
   // ``targetSessionId`` naming the sub-agent that asked.
@@ -1012,6 +1096,7 @@ export function ElicitationCard({
       : null;
   return (
     <ApprovalCard
+      inChat
       elicitationId={item.elicitationId}
       nativeDelivery={item.nativeDelivery}
       message={item.message}
@@ -1024,6 +1109,7 @@ export function ElicitationCard({
       response={item.response}
       askUserQuestion={item.askUserQuestion}
       exitPlanMode={item.exitPlanMode}
+      fileEdit={item.fileEdit}
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
       allowAutoMode={item.allowAutoMode}
@@ -1033,6 +1119,7 @@ export function ElicitationCard({
       agyPermission={item.agyPermission}
       onSubmit={onSubmit}
       requester={requester}
+      keyboardActive={keyboardActive}
     />
   );
 }

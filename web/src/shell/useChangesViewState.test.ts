@@ -32,6 +32,20 @@ describe("useChangesViewState", () => {
     }
   });
 
+  it("keeps the dismissed reset head across remounts and isolates PRs", () => {
+    const prUrl = "https://github.com/o/r/pull/3";
+    const first = renderHook(() => useChangesViewState("view-state-dismiss", prUrl));
+    act(() => first.result.current.setDismissedResetHead("head2"));
+    first.unmount();
+
+    const remounted = renderHook(() => useChangesViewState("view-state-dismiss", prUrl));
+    expect(remounted.result.current.dismissedResetHead).toBe("head2");
+    const otherPr = renderHook(() =>
+      useChangesViewState("view-state-dismiss", "https://github.com/o/r/pull/4"),
+    );
+    expect(otherPr.result.current.dismissedResetHead).toBeNull();
+  });
+
   it("clears a reveal with stable actions", () => {
     const { result } = renderHook(() => useChangesViewState("view-state-c", "pr"));
     const { reveal } = result.current;
@@ -39,5 +53,27 @@ describe("useChangesViewState", () => {
     expect(result.current.reveal).toBe(reveal);
     act(() => result.current.clearReveal("a.ts"));
     expect(result.current.revealedPaths.has("a.ts")).toBe(false);
+  });
+});
+
+describe("useChangesViewState commit mode", () => {
+  it("opens a commit, leaves it for the commit list, and keeps the mode across remounts", () => {
+    const prUrl = "https://github.com/o/r/pull/9";
+    const { result, unmount } = renderHook(() => useChangesViewState("view-commits", prUrl));
+    expect(result.current.mode).toBe("changes");
+
+    act(() => result.current.setMode("commits"));
+    act(() => result.current.openCommit("c".repeat(40)));
+    expect(result.current.mode).toBe("commit");
+    expect(result.current.commitSha).toBe("c".repeat(40));
+    unmount();
+
+    const remounted = renderHook(() => useChangesViewState("view-commits", prUrl)).result.current;
+    expect([remounted.mode, remounted.commitSha]).toEqual(["commit", "c".repeat(40)]);
+
+    act(() => remounted.setMode("commits"));
+    expect(
+      renderHook(() => useChangesViewState("view-commits", prUrl)).result.current,
+    ).toMatchObject({ mode: "commits", commitSha: null });
   });
 });

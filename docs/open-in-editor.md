@@ -15,17 +15,15 @@ policy does not need to allow editor protocol schemes.
 Remote controls require the host to be online. The UI infers standard SSH
 aliases from the existing host list: provider
 `databricks-arca` uses `arca.ssh`, and provider `arclet` uses
-`arclet_<host.name>.ssh`. Arclet names follow Arclet's existing validation:
-1–64 ASCII letters, digits, underscores, or hyphens; a letter or digit first;
-and no `arclet_` or `arclet-` prefix. The alias must exist in your local SSH
-configuration; Arca Companion creates these aliases for Arclets.
-For user-connected hosts without a sandbox provider, the UI reads
-`/etc/metric_proxy/labels/default` through the existing authenticated session
-file API. A unique `arca_type arca` label selects `arca.ssh`. For
-`arca_type arclet`, it reads `/opt/arclet/arclet-name` and uses the validated
-canonical name for `arclet_<name>.ssh`. Display names, including IP-based
-hostnames and custom names, do not determine the machine type. Other types,
-including `isaac-arca`, are not treated as personal Arcas.
+`arclet_<host.name>.ssh`. Arclet names must be 1–64 ASCII letters, digits,
+underscores, or hyphens, start with a letter or digit, and not start with
+`arclet_` or `arclet-`. The alias must exist in your local SSH configuration.
+For user-connected hosts without a sandbox provider, the UI reads the host's
+machine-type label through the existing authenticated session file API. A
+unique `arca_type arca` label selects `arca.ssh`. For `arca_type arclet`, it
+uses the validated canonical Arclet name for `arclet_<name>.ssh`. Display names,
+including IP-based hostnames and custom names, do not determine the machine
+type. Other types, including `isaac-arca`, are not treated as personal Arcas.
 Discovery is cached per session and host for five minutes and shared by the
 folder and file controls. Clicking Open performs no metadata request.
 Remote links currently support POSIX paths, including Arca and Arclet workspaces.
