@@ -1203,7 +1203,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
             {canEdit && (
               <MessageAction
-                tooltip="Edit"
+                tooltip="Edit and resend"
                 size="icon-xxs"
                 className="[@media(pointer:coarse)]:size-8"
                 onClick={() =>

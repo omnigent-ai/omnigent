@@ -173,7 +173,7 @@ describe("editing a sent side-chat message", () => {
     });
     renderPane(<SideChatPane childId={childId} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit and resend" }));
 
     const input = screen.getByTestId("side-chat-input");
     await waitFor(() => expect(input).toHaveValue(withMention));
@@ -195,7 +195,7 @@ describe("editing a sent side-chat message", () => {
     useChatStore.setState({ sideChatComposers: { [childId]: draft } });
     renderPane(<SideChatPane childId={childId} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit and resend" }));
     fireEvent.click(
       within(await screen.findByRole("dialog", { name: "Replace your draft?" })).getByRole(
         "button",
@@ -205,7 +205,7 @@ describe("editing a sent side-chat message", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(useChatStore.getState().sideChatComposers[childId]?.quotes).toEqual(draft.quotes);
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit and resend" }));
     const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
     fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
 
@@ -220,7 +220,7 @@ describe("editing a sent side-chat message", () => {
     seedSentMessage();
     renderPane(<SideChatPane childId={childId} readOnly />);
     expect(screen.getByText("Why did this build fail?")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit and resend" })).toBeNull();
   });
 });
 

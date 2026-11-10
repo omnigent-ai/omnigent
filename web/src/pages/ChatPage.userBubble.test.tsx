@@ -581,7 +581,7 @@ describe("UserBubble edit button", () => {
     ];
     const editMessage = renderEditable(userBubble("", { content }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit and resend" }));
 
     // The composer turns the sent mention markers back into tags.
     expect(editMessage).toHaveBeenCalledWith({
@@ -595,12 +595,12 @@ describe("UserBubble edit button", () => {
     renderEditable(
       userBubble("", { content: [{ type: "input_image", file_id: "img_1", filename: "a.png" }] }),
     );
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit and resend" })).toBeNull();
   });
 
   it("is absent without a composer to take the message", () => {
     renderBubble(userBubble("hello"));
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit and resend" })).toBeNull();
   });
 
   const pendingSend = (posted: boolean, sentMidTurn = true) =>
@@ -618,24 +618,24 @@ describe("UserBubble edit button", () => {
 
   it("is absent until the server accepts the message", () => {
     renderEditable(pendingSend(false, false));
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit and resend" })).toBeNull();
     cleanup();
     // Sent mid-turn, but the send request hasn't succeeded yet.
     renderEditable(pendingSend(false));
     expect(screen.getByText("The agent will read this after its current step")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit and resend" })).toBeNull();
   });
 
   it("offers Edit on a mid-turn message the agent hasn't read yet", () => {
     const onEdit = renderEditable(pendingSend(true));
     expect(screen.getByText("The agent will read this after its current step")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit and resend" }));
     expect(onEdit).toHaveBeenCalledWith({ text: "hello" });
   });
 
   it("offers Edit on an accepted send that started a turn", () => {
     renderEditable(pendingSend(true, false));
-    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit and resend" })).toBeInTheDocument();
   });
 
   describe("with a signed-in viewer", () => {
@@ -648,7 +648,7 @@ describe("UserBubble edit button", () => {
 
     it("is offered on the viewer's own attributed message", () => {
       renderEditable(userBubble("hello", { createdBy: "me@example.com" }), { shared: true });
-      expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Edit and resend" })).toBeInTheDocument();
     });
 
     // Grid panes and sub-agent tabs render without the shared-session context.
@@ -656,7 +656,7 @@ describe("UserBubble edit button", () => {
       "is absent on another contributor's message (session shared: %s)",
       (shared) => {
         renderEditable(userBubble("hello", { createdBy: "teammate@example.com" }), { shared });
-        expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+        expect(screen.queryByRole("button", { name: "Edit and resend" })).toBeNull();
       },
     );
   });

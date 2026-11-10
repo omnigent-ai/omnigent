@@ -35,7 +35,7 @@ def _user_bubble(page: Page | Locator, text: str) -> Locator:
 def _click_edit(bubble: Locator) -> None:
     """Hover the bubble so its action row shows, then click its Edit button."""
     bubble.hover()
-    edit = bubble.get_by_role("button", name="Edit", exact=True)
+    edit = bubble.get_by_role("button", name="Edit and resend", exact=True)
     expect(edit).to_be_visible()
     edit.click()
 
