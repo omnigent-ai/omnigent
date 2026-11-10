@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -279,94 +280,33 @@ def _codex_mcp_persist_modes(params: dict[str, Any]) -> set[str]:
     return {value for value in values if isinstance(value, str) and value in {"session", "always"}}
 
 
-def _execpolicy_amendment(value: Any) -> list[str] | None:
-    """
-    Validate a Codex ``ExecPolicyAmendment`` value.
-
-    Codex's v2 app-server schema defines ``ExecPolicyAmendment`` as a
-    non-empty array of command-prefix strings. Return ``None`` only
-    when the value is absent; malformed present values fail loudly.
-
-    :param value: Candidate amendment, e.g.
-        ``[".venv/bin/python", "-m", "pytest"]``.
-    :returns: The amendment as a list of strings, or ``None``.
-    :raises OmnigentError: If ``value`` is present but not a
-        non-empty list of non-empty strings.
-    """
-    if value is None:
-        return None
-    if not isinstance(value, list) or not value:
-        raise OmnigentError(
-            "Codex execpolicy amendment must be a non-empty list of strings.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not all(isinstance(entry, str) and entry for entry in value):
-        raise OmnigentError(
-            "Codex execpolicy amendment must be a non-empty list of strings.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return list(value)
-
-
-def _decision_execpolicy_amendment(decision: Any) -> list[str] | None:
-    """
-    Extract an execpolicy amendment from one Codex decision option.
-
-    :param decision: One entry from ``availableDecisions``, e.g.
-        ``{"acceptWithExecpolicyAmendment": {"execpolicy_amendment":
-        ["pytest"]}}``.
-    :returns: The offered amendment, or ``None`` when this decision
-        is not an ``acceptWithExecpolicyAmendment`` option.
-    """
-    if not isinstance(decision, dict):
-        return None
-    wrapped = decision.get("acceptWithExecpolicyAmendment")
-    if wrapped is None:
-        return None
-    if not isinstance(wrapped, dict):
-        raise OmnigentError(
-            "Codex acceptWithExecpolicyAmendment decision must be an object.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return _execpolicy_amendment(wrapped.get("execpolicy_amendment"))
-
-
 def _codex_available_execpolicy_amendment(params: dict[str, Any]) -> list[str] | None:
-    """
-    Return the execpolicy amendment Codex offered for this request.
-
-    Codex documents ``availableDecisions`` as the exact set of choices
-    clients should expose, so this helper only reads that field.
-
-    :param params: Codex command approval params, e.g.
-        ``{"availableDecisions": [...]}``.
-    :returns: Offered amendment, or ``None`` when no such decision is
-        available.
-    """
+    """Return the command prefix in Codex's offered persistent decision."""
     available = params.get("availableDecisions")
     if not isinstance(available, list):
         return None
     for decision in available:
-        amendment = _decision_execpolicy_amendment(decision)
-        if amendment is not None:
-            return amendment
+        if not isinstance(decision, dict):
+            continue
+        offered = decision.get("acceptWithExecpolicyAmendment")
+        if not isinstance(offered, dict):
+            continue
+        amendment = offered.get("execpolicy_amendment")
+        if (
+            isinstance(amendment, list)
+            and amendment
+            and all(isinstance(entry, str) and entry for entry in amendment)
+        ):
+            return list(amendment)
     return None
 
 
-def _result_execpolicy_amendment(
-    content: dict[str, str | int | float | bool | list[str] | None] | None,
-) -> list[str] | None:
-    """
-    Extract a user-selected execpolicy amendment from Omnigent content.
-
-    :param content: MCP ``ElicitResult.content`` submitted through the
-        session approval event, e.g. ``{"execpolicy_amendment":
-        ["pytest"]}``.
-    :returns: Selected amendment, or ``None`` for ordinary accepts.
-    """
-    if not isinstance(content, dict):
-        return None
-    return _execpolicy_amendment(content.get("execpolicy_amendment"))
+def _codex_command_approval_fingerprint(method: str, params: dict[str, Any]) -> str:
+    """Bind a remembered rule to the command request shown by the web client."""
+    canonical = json.dumps(
+        {"method": method, "params": params}, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _codex_command_approval_response(
@@ -386,33 +326,49 @@ def _codex_command_approval_response(
 
     :param result: Web-submitted elicitation result.
     :param method: Codex app-server request method.
-    :param params: Original Codex request params. Used to verify any
-        requested execpolicy amendment against Codex's offered
-        decisions, e.g. ``{"availableDecisions": [...]}``.
+    :param params: Original Codex request params, including offered decisions.
     :returns: Codex command approval response payload.
     """
+    content = result.content if isinstance(result.content, dict) else {}
+    if "execpolicy_amendment" in content:
+        raise OmnigentError(
+            "A command approval cannot supply its own execpolicy amendment.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    remember = content.get("remember")
+    if remember is not None and remember is not True:
+        raise OmnigentError("Invalid command persistence choice.", code=ErrorCode.INVALID_INPUT)
     decision: str | dict[str, dict[str, list[str]]]
     if method == _CODEX_COMMAND_EXECUTION_REQUEST_APPROVAL_METHOD:
-        amendment = _result_execpolicy_amendment(result.content)
-        if result.action == "accept" and amendment is not None:
-            allowed = _codex_available_execpolicy_amendment(params)
-            if allowed != amendment:
+        if remember:
+            if result.action != "accept":
                 raise OmnigentError(
-                    "Codex execpolicy amendment approval did not match an available decision.",
+                    "Only an approval can be remembered.", code=ErrorCode.INVALID_INPUT
+                )
+            if content.get("request_fingerprint") != _codex_command_approval_fingerprint(
+                method, params
+            ):
+                raise OmnigentError(
+                    "This command approval changed. Refresh it before remembering a rule.",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            decision = {
-                "acceptWithExecpolicyAmendment": {
-                    "execpolicy_amendment": amendment,
-                }
-            }
+            amendment = _codex_available_execpolicy_amendment(params)
+            if amendment is None:
+                raise OmnigentError(
+                    "Codex did not offer a persistent rule for this command.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            decision = {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": amendment}}
         else:
-            decision = {
-                "accept": "accept",
-                "decline": "decline",
-                "cancel": "cancel",
-            }[result.action]
+            decision = {"accept": "accept", "decline": "decline", "cancel": "cancel"}[
+                result.action
+            ]
     elif method == _CODEX_EXEC_COMMAND_APPROVAL_METHOD:
+        if remember:
+            raise OmnigentError(
+                "Legacy Codex command approvals do not offer persistent rules.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         decision = {
             "accept": "approved",
             "decline": "denied",
@@ -651,10 +607,15 @@ def _codex_command_approval_params(
     item_id = params.get("itemId")
     call_id = params.get("callId")
     approval_id = params.get("approvalId")
-    execpolicy_amendment = _codex_available_execpolicy_amendment(params)
+    execpolicy_amendment = (
+        _codex_available_execpolicy_amendment(params)
+        if method == _CODEX_COMMAND_EXECUTION_REQUEST_APPROVAL_METHOD
+        else None
+    )
     extras: dict[str, Any] = {
         "codex_method": method,
         "codex_request_id": request_id,
+        "approval_request_fingerprint": _codex_command_approval_fingerprint(method, params),
     }
     if isinstance(command, str) and command:
         extras["command"] = command

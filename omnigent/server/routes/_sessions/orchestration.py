@@ -2463,6 +2463,46 @@ async def _resolve_elicitation(
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
     elicitation_id = data.get("elicitation_id", "")
+    content = data.get("content")
+    if (
+        isinstance(elicitation_id, str)
+        and isinstance(content, dict)
+        and content.get("remember") is True
+    ):
+        pending_entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        request_params = pending_entry[1].get("params") if pending_entry is not None else None
+        if not isinstance(request_params, dict):
+            if "request_fingerprint" in content:
+                raise OmnigentError(
+                    "This command approval is no longer pending.", code=ErrorCode.INVALID_INPUT
+                )
+        elif request_params.get("phase") == "codex_command_approval":
+            displayed_fingerprint = content.get("request_fingerprint")
+            current_fingerprint = request_params.get("approval_request_fingerprint")
+            parked = _harness_parked_elicitations.get(elicitation_id)
+            try:
+                pending_fingerprint = _harness_elicitation_request_fingerprint(
+                    ElicitationRequestParams.model_validate(request_params)
+                )
+            except ValidationError as err:
+                raise OmnigentError(
+                    "Invalid command approval request.", code=ErrorCode.INVALID_INPUT
+                ) from err
+            if (
+                not isinstance(current_fingerprint, str)
+                or displayed_fingerprint != current_fingerprint
+                or (
+                    parked is not None
+                    and (
+                        _harness_elicitation_owners.get(elicitation_id) != session_id
+                        or parked.request_fingerprint != pending_fingerprint
+                    )
+                )
+            ):
+                raise OmnigentError(
+                    "This command approval changed. Refresh it before remembering a rule.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
     if isinstance(elicitation_id, str) and await _resolve_native_delivery(
         session_id, elicitation_id, data, conversation_store
     ):

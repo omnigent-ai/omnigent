@@ -161,6 +161,7 @@ export type RenderItem =
         cwd: string | null;
         reason: string | null;
         execPolicyAmendment: string[] | null;
+        requestFingerprint?: string | null;
       } | null;
       allowAllEdits?: boolean;
       allowAutoMode?: boolean;

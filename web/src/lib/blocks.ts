@@ -711,6 +711,7 @@ export interface ElicitationBlock {
     cwd: string | null;
     reason: string | null;
     execPolicyAmendment: string[] | null;
+    requestFingerprint?: string | null;
   } | null;
   /**
    * Claude-native edit-tool prompts only: when true, the card renders

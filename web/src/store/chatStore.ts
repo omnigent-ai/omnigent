@@ -3611,7 +3611,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         blocks: s.blocks.map((b) =>
           b.type === "elicitation" &&
           b.elicitationId === elicitationId &&
-          (!b.nativeDelivery || (b.status === "pending" && b.response === responseValue))
+          b.response === responseValue
             ? {
                 ...b,
                 status: "pending",
@@ -6049,6 +6049,17 @@ function reconcileElicitationBlocks(
       return { ...currentDelivery, ctx: b.ctx };
     }
     if (
+      currentDelivery !== undefined &&
+      !b.nativeDelivery &&
+      preGapCards.get(b.elicitationId) === b &&
+      currentDelivery.codexCommand?.requestFingerprint &&
+      currentDelivery.codexCommand.requestFingerprint !== b.codexCommand?.requestFingerprint
+    ) {
+      // A reused id now carries a different Codex command request.
+      changed = true;
+      return { ...currentDelivery, ctx: b.ctx };
+    }
+    if (
       b.status === "pending" &&
       preGapPendingIds.has(b.elicitationId) &&
       !pendingNow.has(b.elicitationId)
@@ -7492,6 +7503,20 @@ function revivePendingElicitationBlock(
       const updated = { ...incoming, ctx: target.ctx };
       return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
     }
+    // A reused id carrying a different Codex command request replaces the card,
+    // including a pending card or one with an in-flight verdict for the old request.
+    const changedCodexRequest =
+      incoming.codexCommand?.requestFingerprint &&
+      incoming.codexCommand.requestFingerprint !== target.codexCommand?.requestFingerprint;
+    if (changedCodexRequest) {
+      const updated: ElicitationBlock = {
+        ...incoming,
+        ctx: target.ctx,
+        status: "pending",
+        response: null,
+      };
+      return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
+    }
     if (!isRevivableElicitation(target)) return {};
     // Rebuilt from the incoming request: a recurring id can carry a different
     // request, and the reopened card must show what an answer would approve.
@@ -7716,16 +7741,15 @@ export async function pumpStreamEvents(
       // not persisted items), so the dedupe above can't see them. The
       // server re-publishes the same id whenever a severed harness wait
       // re-parks (hook retries reuse their id), so an already-rendered
-      // id must not append a second card: a pending card (or one
-      // carrying an in-flight user verdict) stays untouched, and a
-      // responded card is revived to answerable in place.
+      // id must not append a second card. A re-publish replaces a
+      // buffered card; a rendered card is revived or refreshed in place.
       if (block.type === "elicitation") {
         const eid = block.elicitationId;
         const buffered = buffer.findIndex(
           (b) => b.type === "elicitation" && b.elicitationId === eid,
         );
         if (buffered !== -1) {
-          if (block.nativeDelivery) buffer[buffered] = { ...block, ctx: buffer[buffered].ctx };
+          buffer[buffered] = { ...block, ctx: buffer[buffered].ctx };
           continue;
         }
         if (get().blocks.some((b) => b.type === "elicitation" && b.elicitationId === eid)) {
