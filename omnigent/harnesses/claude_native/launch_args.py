@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+# Permission modes that never approve a tool call on their own, so keeping one
+# while other stored args (an ``--disallowedTools`` restriction, say) are left
+# out cannot let a tool run unasked. ``acceptEdits``, ``auto`` and
+# ``bypassPermissions`` each approve some calls themselves.
+CLAUDE_PERMISSION_MODES_THAT_ASK = frozenset({"default", "plan", "dontAsk"})
+
 
 def split_claude_permission_launch_args(args: Sequence[str]) -> tuple[list[str], list[str]]:
     """
@@ -37,3 +43,30 @@ def split_claude_permission_launch_args(args: Sequence[str]) -> tuple[list[str],
         else:
             other.append(arg)
     return other, permission
+
+
+def claude_permission_mode(permission_args: Sequence[str]) -> str | None:
+    """
+    The permission mode a set of Claude permission selectors launches into.
+
+    :param permission_args: Selectors from :func:`split_claude_permission_launch_args`,
+        e.g. ``["--permission-mode", "plan"]``.
+    :returns: The last selector's mode, e.g. ``"plan"``; ``"bypassPermissions"``
+        for ``--dangerously-skip-permissions``; ``None`` when there is none or
+        it has no value.
+    """
+    mode: str | None = None
+    index = 0
+    while index < len(permission_args):
+        arg = permission_args[index]
+        index += 1
+        if arg == "--dangerously-skip-permissions":
+            mode = "bypassPermissions"
+        elif arg.startswith("--permission-mode="):
+            mode = arg.partition("=")[2] or None
+        elif arg == "--permission-mode":
+            mode = None
+            if index < len(permission_args) and not permission_args[index].startswith("-"):
+                mode = permission_args[index]
+                index += 1
+    return mode

@@ -5120,16 +5120,24 @@ async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failin
 
     queued_events: list[dict[str, Any]] = []
 
-    async def settle() -> None:
-        for _ in range(200):
+    async def wait_for(done: Callable[[], bool]) -> None:
+        for _ in range(1000):
             queued_events.extend(
                 _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
             )
+            if done():
+                return
             await asyncio.sleep(0)
+        raise AssertionError("the exit was neither relaunched nor reported")
+
+    def handled() -> bool:
+        # Done once the relaunch ran (and, when it failed, its failure was released)
+        # or the exit was reported without one.
+        return bool(pm.released) or (bool(relaunches) and relaunch_starts)
 
     try:
         publish_exit(startup_exit())
-        await settle()
+        await wait_for(handled)
         if closed_outside_omnigent:
             assert relaunches == []
             assert len(failed(queued_events)) == 1
@@ -5146,7 +5154,7 @@ async def test_claude_startup_exit_with_stored_args_relaunches_instead_of_failin
         # replacement's own startup exit fails the session.
         assert resource_registry.claude_launch_args(conv_id, stored_args) == ([], True)
         publish_exit(startup_exit())
-        await settle()
+        await wait_for(lambda: bool(pm.released))
     finally:
         _session_event_queues_ref.pop(conv_id, None)
         subagent_work.unregister_child_session(conv_id)

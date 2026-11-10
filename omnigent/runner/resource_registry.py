@@ -243,12 +243,10 @@ class _SkippedClaudeLaunchArgs:
     """Stored Claude args a startup exit ruled out for a session on this runner.
 
     :param other_args: The non-permission stored args the failed launch replayed.
-    :param permission_args: The permission-mode args stored at that launch.
     :param notice_owed: Whether the chat has not been told yet.
     """
 
     other_args: list[str]
-    permission_args: list[str]
     notice_owed: bool = True
 
 
@@ -609,9 +607,9 @@ class SessionResourceRegistry:
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
-        # Stored Claude args the live pane was launched with (other args,
-        # permission args), and those a startup exit has since ruled out.
-        self._claude_saved_args_launches: dict[str, tuple[list[str], list[str]]] = {}
+        # Non-permission stored Claude args the live pane was launched with,
+        # and those a startup exit has since ruled out.
+        self._claude_saved_args_launches: dict[str, list[str]] = {}
         self._claude_saved_args_skipped: dict[str, _SkippedClaudeLaunchArgs] = {}
         self._is_alive_cache: TTLCache[str, TerminalInstance] = TTLCache(
             maxsize=_IS_ALIVE_CACHE_MAX,
@@ -1043,11 +1041,11 @@ class SessionResourceRegistry:
         Choose the stored args a Claude launch replays.
 
         Stored args that made Claude exit during startup on this runner are left
-        out, permission mode included, so the launch starts like a new session
-        and never keeps a stored bypass while dropping a stored restriction. A
-        permission mode set after that exit (a pick in the web UI, or the mode
-        the recovered pane reported) is a current choice and is kept. Any other
-        change to the stored args is a new set, tried again.
+        out, so the launch starts like a new session. The session's current
+        permission mode stays when it is one that always asks before a tool
+        runs; any other mode is reset too, so a mode that approves calls itself
+        is never kept while a stored restriction is left out. A different set
+        of stored args is tried again.
 
         :param session_id: Session/conversation identifier.
         :param stored_args: The session's stored launch args, e.g.
@@ -1056,6 +1054,8 @@ class SessionResourceRegistry:
             stored args were left out.
         """
         from omnigent.harnesses.claude_native.launch_args import (
+            CLAUDE_PERMISSION_MODES_THAT_ASK,
+            claude_permission_mode,
             split_claude_permission_launch_args,
         )
 
@@ -1068,10 +1068,13 @@ class SessionResourceRegistry:
             failed = self._claude_saved_args_skipped.get(session_id)
             if failed is not None and failed.other_args == other:
                 self._claude_saved_args_launches.pop(session_id, None)
-                kept = permission if permission != failed.permission_args else []
+                mode = claude_permission_mode(permission)
+                kept = (
+                    ["--permission-mode", mode] if mode in CLAUDE_PERMISSION_MODES_THAT_ASK else []
+                )
                 return kept, True
             self._claude_saved_args_skipped.pop(session_id, None)
-            self._claude_saved_args_launches[session_id] = (other, permission)
+            self._claude_saved_args_launches[session_id] = other
             return list(stored_args), False
 
     def skip_claude_saved_args_after_startup_exit(self, session_id: str) -> bool:
@@ -1093,7 +1096,7 @@ class SessionResourceRegistry:
             if replayed is None:
                 return False
             self._claude_saved_args_skipped[session_id] = _SkippedClaudeLaunchArgs(
-                other_args=replayed[0], permission_args=replayed[1]
+                other_args=replayed
             )
             return True
 

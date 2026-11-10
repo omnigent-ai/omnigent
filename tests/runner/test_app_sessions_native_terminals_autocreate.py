@@ -6794,14 +6794,15 @@ async def test_auto_create_claude_terminal_launches_without_stored_args_after_st
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Stored args a startup exit ruled out are left off later launches, all of them.
+    Stored args a startup exit ruled out are left off the launch, and the chat is told once.
 
     A launcher can store args that only work on its own machine, such as an
     ``--mcp-config`` file a fork onto a sandbox does not have. The first launch
     replays them; once Claude exits during startup the runner launches like a
-    fresh session. The stored permission mode goes too, so a stored bypass is
-    never kept while a stored tool restriction is dropped. The chat is told
-    once, with a fixed notice that repeats no stored token.
+    fresh session, without the stored restriction or the bypass beside it
+    (the permission rules themselves are covered in
+    ``test_claude_saved_launch_args.py``). The chat is told once, with a fixed
+    notice that repeats no stored token.
     """
     from omnigent.runner.native.orchestration import CLAUDE_SAVED_LAUNCH_ARGS_SKIPPED_NOTICE
 
@@ -6862,58 +6863,6 @@ async def test_auto_create_claude_terminal_launches_without_stored_args_after_st
     third_args = await launch()
     assert missing_config not in third_args
     assert len(server_client.posted_events) == 1
-
-    # A mode picked after recovery is the user's current choice and survives.
-    server_client._snapshot = {
-        "terminal_launch_args": [*stored_args[:-2], "--permission-mode", "plan"]
-    }
-    picked_args = await launch()
-    assert missing_config not in picked_args
-    assert picked_args[picked_args.index("--permission-mode") + 1] == "plan"
-
-    # Different stored args are a new set, tried again.
-    server_client._snapshot = {"terminal_launch_args": ["--mcp-config", "/elsewhere.json"]}
-    changed_args = await launch()
-    assert "/elsewhere.json" in changed_args
-
-
-@pytest.mark.asyncio
-async def test_auto_create_claude_terminal_stored_permission_mode_alone_is_not_retried(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A session whose only stored arg is its permission mode keeps it after a startup exit.
-
-    Omnigent stores the mode itself and Claude starts with any valid one, so a
-    startup exit there has another cause and is reported, not retried.
-    """
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
-    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
-    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
-    )
-    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
-    captured: dict[str, Any] = {}
-    registry = _RecordingClaudeRegistry(captured)
-    await _auto_create_claude_terminal(
-        session_id,
-        registry,
-        lambda _sid, _evt: None,
-        server_client=_ResumeSnapshotServerClient(  # type: ignore[arg-type]
-            f"/v1/sessions/{session_id}",
-            {"terminal_launch_args": ["--permission-mode", "plan"]},
-        ),
-    )
-
-    launched_args = list(captured["spec"].args)
-    assert launched_args[launched_args.index("--permission-mode") + 1] == "plan"
-    assert registry.skip_claude_saved_args_after_startup_exit(session_id) is False
 
 
 class _DeadPane:

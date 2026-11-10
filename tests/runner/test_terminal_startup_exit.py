@@ -188,6 +188,8 @@ async def test_observed_exit_before_input_ready_records_redacted_pane(
 ) -> None:
     """A native agent dying before its input is ready keeps its last pane in telemetry."""
     resources = SessionResourceRegistry(terminal_registry=TerminalRegistry())
+    published: list[TerminalExitEvent] = []
+    resources.set_terminal_exit_publisher(published.append)
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     secret = "private-startup-token-" * 20
     instance._remember_pane_snapshot(f"Authorization: Bearer {secret}\n{pane}" if pane else "")
@@ -221,3 +223,6 @@ async def test_observed_exit_before_input_ready_records_redacted_pane(
     if reached_input_ready:
         # A normal exit after the session was usable is not a startup failure.
         assert "terminal_exit_during_startup" not in attributes
+    # The runner's exit handler sees the same verdict on the published event.
+    [event] = published
+    assert event.exited_during_startup is (not reached_input_ready)

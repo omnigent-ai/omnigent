@@ -2157,10 +2157,7 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        # A Claude that never finished starting may have been stopped by a
-        # stored launch arg, which every relaunch would replay. Relaunch once
-        # without the stored args rather than failing a session that cannot
-        # come back; a second startup exit is reported as usual.
+        # Retry startup once without saved launch args; report a second exit normally.
         if (
             event.exited_during_startup
             and event.terminal_name == "claude"
