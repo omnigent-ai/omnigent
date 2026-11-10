@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ElicitationBlock } from "@/lib/blocks";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
@@ -48,6 +49,24 @@ function errorBubble(code = "rate_limit_exceeded"): Extract<Bubble, { kind: "ass
         code,
       },
     ],
+  };
+}
+
+function questionCard(extra: Partial<ElicitationBlock> = {}): ElicitationBlock {
+  return {
+    type: "elicitation",
+    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_failed", itemId: null },
+    elicitationId: "elic_question",
+    targetSessionId: null,
+    message: "Codex needs input",
+    phase: "codex_request_user_input",
+    policyName: "codex_native_request_user_input",
+    contentPreview: "{}",
+    requestedSchema: {},
+    url: null,
+    status: "pending",
+    response: null,
+    ...extra,
   };
 }
 
@@ -552,6 +571,22 @@ describe("AssistantBubble error retry", () => {
     });
   });
 
+  it("continues past a pending question card the agent keeps working through", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
+    useChatStore.setState({ blocks: [questionCard({ isBlocking: false })] });
+    render(<BubbleView bubble={errorBubble("connection_error")} isLastAssistant />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_retry/events");
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: continuation }] },
+    });
+  });
+
   it("coalesces retry clicks from separate rate-limit cards in the same turn", async () => {
     let finishRetry: ((response: Response) => void) | undefined;
     fetchMock.mockImplementationOnce(
@@ -623,6 +658,7 @@ describe("AssistantBubble error retry", () => {
         },
       ],
     },
+    { blocks: [questionCard()] },
   ])("does not queue a continuation while the session is busy: %o", async (state) => {
     useChatStore.setState(state);
     render(<BubbleView bubble={errorBubble()} isLastAssistant />);

@@ -792,8 +792,7 @@ export function hasPendingOwnElicitation(
   return blocks.some(
     (b) =>
       b.type === "elicitation" &&
-      b.status === "pending" &&
-      !(blockingOnly && b.isBlocking === false) &&
+      (blockingOnly ? isPendingBlockingElicitation(b) : b.status === "pending") &&
       (b.targetSessionId == null || b.targetSessionId === sessionId),
   );
 }

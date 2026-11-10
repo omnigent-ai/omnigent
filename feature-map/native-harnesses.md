@@ -359,9 +359,10 @@ and leaves the composer usable. Answer it in Chat or Inbox; the transcript
 shows only the answer, and Codex's next turn uses it. Cancel dismisses the card
 without stopping Codex. Answering in the terminal closes the card and stops
 any retries of a web answer. If Codex still hasn't received a web answer after
-about 30 seconds of retries, a notice is posted and the card reopens; if the
-forwarder stops first, only the notice is posted. An open question is not
-restored after the forwarder reconnects.
+about 30 seconds of retries, a notice is posted and the card reopens. A send
+Codex doesn't acknowledge within 30 seconds is not retried; it gets the same
+notice and reopened card. If the forwarder stops first, only the notice is
+posted. An open question is not restored after the forwarder reconnects.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -608,13 +609,18 @@ Cross-harness journeys:
   `tests/harnesses/codex_native/session/test_elicitation.py` (the
   `*codex_async_question*` tests) drives the forwarder with a fake app-server
   client: the card, answers steering or starting a turn, terminal answers,
-  retries, teardown, and the undelivered notice with its reopened card.
+  retries, unacknowledged sends, teardown, and the undelivered notice with its
+  reopened card.
   `tests/server/integration/test_sessions_permission_request_hook.py::test_codex_request_user_input_decline_interrupts_only_blocking_questions`
   and `::test_codex_async_question_delivery_round_reopens_answered_card` cover
-  Cancel and reopening on the server. `web/src/lib/blockStream.test.ts`,
-  `web/src/lib/blocks.test.ts` and `web/src/pages/ChatPage.composer.test.tsx`
-  cover the non-blocking card, working indicator and composer. No test drives
-  a real Codex CLI, the browser, Inbox, or a child thread.
+  Cancel and reopening on the server, and
+  `tests/server/integration/test_sessions_endpoints.py::test_external_native_marker_leaves_pending_input_for_real_message`
+  keeps an answer echo from taking a queued message's upload.
+  `web/src/lib/blockStream.test.ts`, `web/src/lib/blocks.test.ts`,
+  `web/src/pages/ChatPage.composer.test.tsx` and
+  `web/src/components/chat/chatBubbleParts.test.tsx` cover the non-blocking
+  card, working indicator, composer and Retry. No test drives a real Codex CLI,
+  the browser, Inbox, or a child thread.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus

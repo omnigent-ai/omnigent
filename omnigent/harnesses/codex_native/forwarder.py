@@ -294,6 +294,8 @@ _CODEX_ASYNC_QUESTION_REPLY_OPEN_PATTERN = re.compile(rf"<{_CODEX_ASYNC_QUESTION
 _CODEX_ASYNC_QUESTION_REPLY_CLOSE_PATTERN = re.compile(rf"\s*</{_CODEX_ASYNC_QUESTION_REPLY_TAG}>")
 # Waits before each retry of an answer Codex refused or never received.
 _CODEX_ASYNC_QUESTION_RETRY_DELAYS_S = (5.0, 10.0, 15.0)
+# Codex acknowledges turn input before running it; a send unanswered this long is stuck.
+_CODEX_ASYNC_QUESTION_SEND_TIMEOUT_S = 30.0
 _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
     {
         _CODEX_MCP_ELICITATION_REQUEST_METHOD,
@@ -6639,7 +6641,8 @@ async def _send_codex_async_question_reply(
     :param text: Tagged reply text from :func:`_async_question_reply_text`.
     :param answered: Whether Codex has since echoed an answer to the
         question, which ends the retries.
-    :returns: Whether Codex accepted the reply or already has an answer.
+    :returns: Whether Codex accepted the reply or already has an answer;
+        ``False`` when every send failed or one went unacknowledged.
     """
     for attempt in range(len(_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S) + 1):
         if attempt:
@@ -6650,12 +6653,19 @@ async def _send_codex_async_question_reply(
             state = read_bridge_state(bridge_dir) if bridge_dir is not None else None
             if state is not None and state.thread_id != question.thread_id:
                 state = None
-            await _send_codex_async_question_reply_once(
-                codex_client, bridge_dir=bridge_dir, state=state, question=question, text=text
-            )
+            async with asyncio.timeout(_CODEX_ASYNC_QUESTION_SEND_TIMEOUT_S):
+                await _send_codex_async_question_reply_once(
+                    codex_client, bridge_dir=bridge_dir, state=state, question=question, text=text
+                )
             return True
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            # Codex may have taken the unacknowledged send, so resending could duplicate it.
+            _logger.warning(
+                "Codex async question answer unacknowledged: item=%s", question.item_id
+            )
+            return False
         except Exception:
             _logger.warning(
                 "Codex async question answer not delivered: item=%s attempt=%d",
@@ -8099,7 +8109,8 @@ async def _post_user_message(
     :param source_id: Stable native item id used for server-side deduplication.
     :returns: Whether the item was accepted by the server.
     """
-    text = _async_question_reply_display_text(_user_message_text(item))
+    raw_text = _user_message_text(item)
+    text = _async_question_reply_display_text(raw_text)
     # An image/file-only message has no text but must still be posted: the
     # server drains its optimistic pending-input entry (FIFO) and folds the
     # image in by file_id (``_merge_pending_file_blocks``). Bailing here would
@@ -8131,6 +8142,8 @@ async def _post_user_message(
         item_data=item_data,
         response_id=_response_id(params),
         source_id=source_id or _source_id(params, item),
+        # An async question answer was never queued from the web composer.
+        agent_message_candidate=next(_async_question_replies(raw_text), None) is not None,
     )
 
 
@@ -8762,6 +8775,7 @@ async def _post_external_item(
     response_id: str,
     message_id: str | None = None,
     source_id: str | None = None,
+    agent_message_candidate: bool = False,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -8777,6 +8791,8 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :param message_id: Optional live-preview stream finalized by this item.
     :param source_id: Stable native source id for server-side idempotency.
+    :param agent_message_candidate: Whether the server may settle a queued
+        web message with this user message only by exact text match.
     :returns: Whether the item was accepted by the server.
     """
     data: _JsonObject = {
@@ -8788,6 +8804,8 @@ async def _post_external_item(
         data["message_id"] = message_id
     if source_id is not None:
         data["source_id"] = _bounded_source_id(source_id)
+    if agent_message_candidate:
+        data["agent_message_candidate"] = True
 
     async def _post() -> httpx.Response | None:
         return await _post_session_event(

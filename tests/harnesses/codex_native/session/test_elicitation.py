@@ -1131,7 +1131,8 @@ def test_forwarder_clears_codex_async_question_answered_in_native_tui(
     The TUI answers with a tagged ``userMessage``. The forwarder must
     resolve the card and abandon its hook wait; a repeated ``item/completed``
     for the question must not publish a second card. The transcript shows
-    only the answer.
+    only the answer, flagged so the server does not pair it with a queued web
+    message.
 
     :param reply_text: Tagged reply text the Codex TUI sends.
     :param answer_text: Answer the mirrored user message shows.
@@ -1200,11 +1201,11 @@ def test_forwarder_clears_codex_async_question_answered_in_native_tui(
         }
     ]
     assert [
-        event["data"]["item_data"]["content"]
+        (event["data"]["item_data"]["content"], event["data"].get("agent_message_candidate"))
         for event in posted_events
         if event["type"] == "external_conversation_item"
         and event["data"]["item_data"].get("role") == "user"
-    ] == [[{"type": "input_text", "text": answer_text}]]
+    ] == [([{"type": "input_text", "text": answer_text}], True)]
     assert fake_client.requests == []
 
 
@@ -1628,3 +1629,49 @@ def test_forwarder_reopens_codex_async_question_card_when_answer_is_undelivered(
         if second_answer_source == "tui"
         else []
     )
+
+
+def test_forwarder_reopens_codex_async_question_card_when_codex_never_acknowledges_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An answer send Codex never acknowledges is not resent; its card reopens.
+
+    Codex may already have the answer, so the user decides whether to send it
+    again.
+    """
+    monkeypatch.setattr(codex_native_forwarder, "_CODEX_ASYNC_QUESTION_SEND_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(
+        codex_native_forwarder, "_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S", (0.0, 0.0, 0.0)
+    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    fake_client = _FakeCodexAppServerClient()
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Record the send and never answer it.
+
+        :param method: JSON-RPC method.
+        :param params: JSON-RPC params.
+        :returns: Never returns.
+        """
+        fake_client.requests.append((method, params))
+        return await asyncio.Future()
+
+    fake_client.request = fake_request  # type: ignore[method-assign]
+
+    hook_bodies, posted_events = _answer_async_question(
+        tmp_path,
+        fake_client,
+        [
+            httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}}),
+            httpx.Response(200, json={"answers": {}}),
+        ],
+    )
+
+    assert [method for method, _params in fake_client.requests] == ["turn/steer"]
+    assert [
+        notice["data"]["source_id"] for notice in _undelivered_answer_notices(posted_events)
+    ] == ["async-question-undelivered-call-async-1-0"]
+    assert [body["params"].get("deliveryRound") for body in hook_bodies] == [None, 1]

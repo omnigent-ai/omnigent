@@ -74,6 +74,7 @@ async def test_post_user_message_text_posts_input_text() -> None:
     assert len(client.posts) == 1
     _url, body = client.posts[0]
     assert body["data"]["item_data"]["content"] == [{"type": "input_text", "text": "hello"}]
+    assert "agent_message_candidate" not in body["data"]
 
 
 @pytest.mark.asyncio

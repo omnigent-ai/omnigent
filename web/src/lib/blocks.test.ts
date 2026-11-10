@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AnyBlock, ElicitationBlock, ImageContentBlock, MessageContentBlock } from "./blocks";
 import {
   attachmentLabel,
+  hasPendingOwnElicitation,
   imagePreview,
   isPendingBlockingElicitation,
   isTextBlock,
@@ -245,7 +246,7 @@ describe("isTextBlock", () => {
   });
 });
 
-describe("isPendingBlockingElicitation", () => {
+describe("pending elicitation checks", () => {
   const card: ElicitationBlock = {
     type: "elicitation",
     ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
@@ -261,12 +262,19 @@ describe("isPendingBlockingElicitation", () => {
     response: null,
   };
 
-  it("counts only a pending card the turn waits on", () => {
+  it("isPendingBlockingElicitation counts only a pending card the turn waits on", () => {
     expect(isPendingBlockingElicitation(card)).toBe(true);
     expect(isPendingBlockingElicitation({ ...card, isBlocking: false })).toBe(false);
     expect(isPendingBlockingElicitation({ ...card, status: "responded" })).toBe(false);
     const responseEnd = { type: "response_end", ctx: card.ctx, status: "pending", response: null };
     expect(isPendingBlockingElicitation(responseEnd as AnyBlock)).toBe(false);
+  });
+
+  it("hasPendingOwnElicitation skips a non-blocking own card only when blockingOnly is set", () => {
+    const asyncCard: ElicitationBlock = { ...card, isBlocking: false };
+    expect(hasPendingOwnElicitation([asyncCard], "conv_1", { blockingOnly: true })).toBe(false);
+    expect(hasPendingOwnElicitation([asyncCard], "conv_1")).toBe(true);
+    expect(hasPendingOwnElicitation([card], "conv_1", { blockingOnly: true })).toBe(true);
   });
 });
 

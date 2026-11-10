@@ -3353,12 +3353,13 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
 
 
 @pytest.mark.parametrize(
-    ("marker_text", "source_id", "is_meta"),
+    ("marker_text", "source_id", "is_meta", "agent_message_candidate"),
     [
-        ("[Request interrupted by user]", None, False),
-        ("[Request interrupted by user for tool use]", None, False),
-        ("[System: Message from another session]", "peer-input:0:peer_message_wake", False),
-        ("[System: Message from another session]", "peer-input:0:peer_message_wake", True),
+        ("[Request interrupted by user]", None, False, False),
+        ("[Request interrupted by user for tool use]", None, False, False),
+        ("[System: Message from another session]", "peer-input:0:peer_message_wake", False, False),
+        ("[System: Message from another session]", "peer-input:0:peer_message_wake", True, False),
+        ("Blue", "async-question-answer", False, True),
     ],
 )
 async def test_external_native_marker_leaves_pending_input_for_real_message(
@@ -3367,6 +3368,7 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
     marker_text: str,
     source_id: str | None,
     is_meta: bool,
+    agent_message_candidate: bool,
 ) -> None:
     """
     Regression: steering with an upload must not feed it to a native marker.
@@ -3382,7 +3384,8 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
     its file blocks are gone). Assert the marker persists bare and the
     steering message keeps the image.
 
-    Bridge-generated peer labels also have no pending input of their own.
+    Bridge-generated peer labels also have no pending input of their own, and
+    neither does a question answer flagged as an ``agent_message_candidate``.
     """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes._sessions.orchestration import _drains_pending_inputs
@@ -3399,9 +3402,9 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
         [{"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"}],
     )
     try:
-        for text, item_source_id, item_is_meta in (
-            (marker_text, source_id, is_meta),
-            ("[Attached: /tmp/uploads/shot.png]", None, False),
+        for text, item_source_id, item_is_meta, item_candidate in (
+            (marker_text, source_id, is_meta, agent_message_candidate),
+            ("[Attached: /tmp/uploads/shot.png]", None, False, False),
         ):
             item_data = MessageData(
                 role="user", content=[{"type": "input_text", "text": text}], is_meta=item_is_meta
@@ -3422,6 +3425,7 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
                         "item_data": item_data.model_dump(),
                         "response_id": "native_turn_1",
                         **({"source_id": item_source_id} if item_source_id else {}),
+                        **({"agent_message_candidate": True} if item_candidate else {}),
                     },
                 },
             )
