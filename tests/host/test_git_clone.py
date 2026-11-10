@@ -10,12 +10,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-import psutil
 import pytest
 
 from omnigent.host.frames import HostCloneRepositoryFrame
 from omnigent.host.git_clone import clone_repository, validate_clone_path
 from omnigent.host.git_worktree import create_worktree
+from omnigent.inner import _proc
+from tests._helpers.polling import poll_until
 
 REPOSITORY_URL = "https://git.example.com/team/sample.git"
 
@@ -188,6 +189,13 @@ def test_clone_rejects_invalid_path(path: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "path", [r"C:\work\checkout", r"\\files.example.com\share\checkout", r"~\checkout"]
+)
+def test_clone_accepts_windows_path_syntax(path: str) -> None:
+    assert validate_clone_path(path) == path
+
+
+@pytest.mark.parametrize(
     "url,branch",
     [
         ("https://user:secret@git.example.com/team/sample.git", None),
@@ -227,10 +235,8 @@ def test_clone_timeout_stops_process_tree(tmp_path: Path, monkeypatch: pytest.Mo
     assert result.error_code == "clone_timeout"
     assert not destination.exists()
     process_id = int(child_pid.read_text())
-    assert (
-        not psutil.pid_exists(process_id)
-        or psutil.Process(process_id).status() == psutil.STATUS_ZOMBIE
-    )
+    # SIGKILL delivery is asynchronous; the child is still sleeping for 30s if it survived.
+    poll_until(lambda: not _proc.process_alive(process_id), timeout_s=5, interval_s=0.05)
 
 
 def test_failed_clone_does_not_delete_replacement(

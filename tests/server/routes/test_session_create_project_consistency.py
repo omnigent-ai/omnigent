@@ -40,7 +40,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
-from tests.server.helpers import build_agent_bundle
+from tests.server.helpers import FakeSandboxLauncher, build_agent_bundle
 
 pytestmark = pytest.mark.asyncio
 
@@ -130,7 +130,7 @@ async def test_managed_project_defaults_reach_launch(
         ManagedSandboxConfig(
             server_url="https://server.example.com",
             provider="provider",
-            launcher_factory=lambda: pytest.fail("managed launch is stubbed"),
+            launcher_factory=FakeSandboxLauncher,
             token_ttl_s=3600,
         )
     )
@@ -690,13 +690,18 @@ async def test_import_with_unowned_or_unknown_project_is_404(
 
 @pytest.mark.parametrize("metadata", [False, True], ids=["json", "multipart"])
 @pytest.mark.parametrize(
-    "explicit,expected_repos,expected_provider",
+    "explicit,expected_repos,expected_provider,project_placement",
     [
-        ({}, ["https://git.example.com/team/sample.git#release"], "provider"),
-        ({"workspaces": []}, [], "provider"),
-        ({"workspace": None}, None, "provider"),
-        ({"workspaces": None}, None, "provider"),
-        ({"sandbox_provider": None}, ["https://git.example.com/team/sample.git#release"], None),
+        ({}, ["https://git.example.com/team/sample.git#release"], "provider", None),
+        ({"workspaces": []}, [], "provider", None),
+        ({"workspace": None}, None, "provider", None),
+        ({"workspaces": None}, None, "provider", None),
+        (
+            {"sandbox_provider": None},
+            ["https://git.example.com/team/sample.git#release"],
+            None,
+            None,
+        ),
         (
             {
                 "sandbox_provider": "other",
@@ -704,9 +709,16 @@ async def test_import_with_unowned_or_unknown_project_is_404(
             },
             ["https://git.example.com/team/other.git"],
             "other",
+            None,
         ),
-        ({"sibling_source_id": "source"}, None, None),
-        ({"host_type": "external"}, None, None),
+        ({"sibling_source_id": "source"}, None, None, None),
+        ({"host_type": "external"}, None, None, None),
+        (
+            {},
+            ["https://git.example.com/team/sample.git#release"],
+            None,
+            {"host_id": "connected-host", "workspace": "/work/project"},
+        ),
     ],
 )
 async def test_managed_repository_project_defaults_respect_presence(
@@ -715,6 +727,7 @@ async def test_managed_repository_project_defaults_respect_presence(
     explicit: dict[str, object],
     expected_repos: list[str] | None,
     expected_provider: str | None,
+    project_placement: dict[str, object] | None,
 ) -> None:
     from omnigent.server.schemas import SessionCreateMetadata
 
@@ -724,8 +737,7 @@ async def test_managed_repository_project_defaults_respect_presence(
         "Repository",
         ALICE,
         {
-            "host_id": "__sandbox__",
-            "sandbox_provider": "provider",
+            **(project_placement or {"host_id": "__sandbox__", "sandbox_provider": "provider"}),
             "repository": {"url": "https://git.example.com/team/sample.git", "branch": "release"},
         },
     )
