@@ -2144,6 +2144,14 @@
             ],
             "title": "Max Cost Usd"
           },
+          "mcp_services": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Mcp Services",
+            "type": "array"
+          },
           "model_override": {
             "anyOf": [
               {
@@ -6853,6 +6861,11 @@
           "scheduled_task_inbox": {
             "default": false,
             "title": "Scheduled Task Inbox",
+            "type": "boolean"
+          },
+          "scheduled_task_mcp_services": {
+            "default": true,
+            "title": "Scheduled Task Mcp Services",
             "type": "boolean"
           },
           "scheduled_task_projects": {
@@ -13007,6 +13020,21 @@
               }
             ],
             "title": "Max Cost Usd"
+          },
+          "mcp_services": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 40,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Services"
           },
           "model_override": {
             "anyOf": [
