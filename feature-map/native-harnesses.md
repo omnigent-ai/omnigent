@@ -616,11 +616,11 @@ Cross-harness journeys:
   Cancel and reopening on the server, and
   `tests/server/integration/test_sessions_endpoints.py::test_external_native_marker_leaves_pending_input_for_real_message`
   keeps an answer echo from taking a queued message's upload.
-  `web/src/lib/blockStream.test.ts`, `web/src/lib/blocks.test.ts`,
-  `web/src/pages/ChatPage.composer.test.tsx` and
-  `web/src/components/chat/chatBubbleParts.test.tsx` cover the non-blocking
-  card, working indicator, composer and Retry. No test drives a real Codex CLI,
-  the browser, Inbox, or a child thread.
+  `web/src/lib/blockStream.test.ts` and `web/src/lib/blocks.test.ts` cover the
+  non-blocking card, `web/src/pages/ChatPage.composer.test.tsx` the composer,
+  `web/src/pages/ChatPage.indicators.test.tsx` the working indicator's terminal
+  guidance, and `web/src/components/chat/chatBubbleParts.test.tsx` Retry. No
+  test drives a real Codex CLI, the browser, Inbox, or a child thread.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus

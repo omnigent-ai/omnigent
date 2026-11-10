@@ -779,20 +779,15 @@ export function isPendingBlockingElicitation(block: AnyBlock): boolean {
   return block.type === "elicitation" && block.status === "pending" && block.isBlocking !== false;
 }
 
-/**
- * Whether a pending card answers `sessionId`'s own prompt, not a mirrored sub-agent's.
- *
- * @param options.blockingOnly - Skip cards the agent keeps working past.
- */
+/** Whether a pending blocking card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
 export function hasPendingOwnElicitation(
   blocks: readonly AnyBlock[],
   sessionId: string | null,
-  { blockingOnly = false } = {},
 ): boolean {
   return blocks.some(
     (b) =>
       b.type === "elicitation" &&
-      (blockingOnly ? isPendingBlockingElicitation(b) : b.status === "pending") &&
+      isPendingBlockingElicitation(b) &&
       (b.targetSessionId == null || b.targetSessionId === sessionId),
   );
 }

@@ -6543,13 +6543,16 @@ def _async_question_reply_text(
     return f"<{tag}>\n{body}\n</{tag}>"
 
 
-def _async_question_replies(text: str) -> Iterator[tuple[int, int, list[object]]]:
+def _async_question_replies(text: str) -> Iterator[tuple[int, int, list[_JsonObject]]]:
     """
     Find the tagged async question replies in a Codex user message.
 
+    A tagged block counts only when every entry names the async question it
+    answers, so a malformed or partial example stays ordinary text.
+
     :param text: Codex ``userMessage`` text.
-    :returns: Iterator of ``(start, end, entries)`` for each well-formed
-        reply, where ``text[start:end]`` spans its tags.
+    :returns: Iterator of ``(start, end, entries)`` for each reply, where
+        ``text[start:end]`` spans its tags.
     """
     decoder = json.JSONDecoder()
     position = 0
@@ -6564,7 +6567,34 @@ def _async_question_replies(text: str) -> Iterator[tuple[int, int, list[object]]
         if closing is None or not isinstance(entries, list):
             continue
         position = closing.end()
-        yield opening.start(), closing.end(), entries
+        if entries and all(_async_question_reply_entry_item_id(entry) for entry in entries):
+            yield opening.start(), closing.end(), entries
+
+
+def _async_question_reply_entry_item_id(entry: object) -> str | None:
+    """
+    Return the async question item one reply entry answers.
+
+    :param entry: Decoded reply entry whose ``questionItemId`` is a JSON
+        string, e.g. ``'["request_user_input_async","call_abc",0]'``.
+    :returns: The ``agentMessage`` item id, e.g. ``"call_abc"``, or ``None``
+        when the entry does not name an async question.
+    """
+    question_item_id = entry.get("questionItemId") if isinstance(entry, dict) else None
+    try:
+        parts = json.loads(question_item_id) if isinstance(question_item_id, str) else None
+    except ValueError:
+        return None
+    if (
+        isinstance(parts, list)
+        and len(parts) == 3
+        and parts[0] == _CODEX_ASYNC_QUESTION_TOOL
+        and isinstance(parts[1], str)
+        and parts[1]
+        and type(parts[2]) is int
+    ):
+        return parts[1]
+    return None
 
 
 def _async_question_reply_display_text(text: str) -> str:
@@ -6578,7 +6608,7 @@ def _async_question_reply_display_text(text: str) -> str:
     parts: list[str] = []
     position = 0
     for start, end, entries in _async_question_replies(text):
-        answers = [entry.get("answer") for entry in entries if isinstance(entry, dict)]
+        answers = [entry.get("answer") for entry in entries]
         answer_texts = [answer for answer in answers if isinstance(answer, str) and answer]
         if answer_texts:
             parts.extend((text[position:start], "\n".join(answer_texts)))
@@ -6597,19 +6627,9 @@ def _async_question_reply_item_ids(text: str) -> list[str]:
     item_ids: list[str] = []
     for _start, _end, entries in _async_question_replies(text):
         for entry in entries:
-            question_item_id = entry.get("questionItemId") if isinstance(entry, dict) else None
-            try:
-                parts = json.loads(question_item_id) if isinstance(question_item_id, str) else None
-            except ValueError:
-                continue
-            if (
-                isinstance(parts, list)
-                and len(parts) == 3
-                and parts[0] == _CODEX_ASYNC_QUESTION_TOOL
-                and isinstance(parts[1], str)
-                and parts[1] not in item_ids
-            ):
-                item_ids.append(parts[1])
+            item_id = _async_question_reply_entry_item_id(entry)
+            if item_id is not None and item_id not in item_ids:
+                item_ids.append(item_id)
     return item_ids
 
 

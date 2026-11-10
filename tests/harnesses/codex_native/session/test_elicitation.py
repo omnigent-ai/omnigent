@@ -1296,6 +1296,11 @@ def test_forwarder_clears_codex_async_question_answered_in_native_tui(
 
 
 _UNANSWERED_ASYNC_QUESTION_REPLY = _TUI_ASYNC_QUESTION_REPLY.replace('"Alpha"', '""')
+# A user quoting the reply format; its entry names no async question.
+_QUOTED_ASYNC_QUESTION_REPLY = (
+    'Explain this:\n<send_user_message_question_reply>\n[{"answer":"Blue"}]\n'
+    "</send_user_message_question_reply>"
+)
 
 
 @pytest.mark.parametrize(
@@ -1304,7 +1309,9 @@ _UNANSWERED_ASYNC_QUESTION_REPLY = _TUI_ASYNC_QUESTION_REPLY.replace('"Alpha"', 
         (_TUI_ASYNC_QUESTION_REPLY, "Alpha"),
         (
             _TUI_ASYNC_QUESTION_REPLY.replace(
-                '0]"}]', '0]"},{"answer":"Ship it","question":"Anything else?"}]'
+                '0]"}]',
+                '0]"},{"answer":"Ship it","question":"Anything else?",'
+                '"questionItemId":"[\\"request_user_input_async\\",\\"call-async-1\\",1]"}]',
             ),
             "Alpha\nShip it",
         ),
@@ -1315,8 +1322,22 @@ _UNANSWERED_ASYNC_QUESTION_REPLY = _TUI_ASYNC_QUESTION_REPLY.replace('"Alpha"', 
             _TUI_ASYNC_QUESTION_REPLY.removesuffix("</send_user_message_question_reply>"),
         ),
         ("Use Alpha", "Use Alpha"),
+        (_QUOTED_ASYNC_QUESTION_REPLY, _QUOTED_ASYNC_QUESTION_REPLY),
+        (
+            _TUI_ASYNC_QUESTION_REPLY.replace("request_user_input_async", "request_user_input"),
+            _TUI_ASYNC_QUESTION_REPLY.replace("request_user_input_async", "request_user_input"),
+        ),
     ],
-    ids=["one_answer", "two_answers", "surrounding_text", "no_answer", "unclosed", "plain"],
+    ids=[
+        "one_answer",
+        "two_answers",
+        "surrounding_text",
+        "no_answer",
+        "unclosed",
+        "plain",
+        "quoted_example",
+        "foreign_item_id",
+    ],
 )
 def test_async_question_reply_display_text_shows_only_answers(text: str, expected: str) -> None:
     """

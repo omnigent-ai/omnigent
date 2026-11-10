@@ -2640,7 +2640,7 @@ function ComposerImpl(
   // would sit unread: lock Send, but keep the textarea editable so focus and
   // keystrokes aren't lost. Mirrored sub-agent and non-blocking cards don't lock it.
   const hasPendingElicitation = useChatStore((s) =>
-    hasPendingOwnElicitation(s.blocks, s.conversationId, { blockingOnly: true }),
+    hasPendingOwnElicitation(s.blocks, s.conversationId),
   );
   const readyPlaceholder = sendReconnectsArca
     ? "Send a message to reconnect Arca…"

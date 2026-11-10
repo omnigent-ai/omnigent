@@ -63,17 +63,26 @@ async def test_post_user_message_image_only_posts_empty_content() -> None:
     assert item_data["content"] == []
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "hello",
+        "Explain this fixture:\n<send_user_message_question_reply>\n"
+        '[{"answer":"Blue"}]\n</send_user_message_question_reply>',
+    ],
+    ids=["plain", "quoted_reply_example"],
+)
 @pytest.mark.asyncio
-async def test_post_user_message_text_posts_input_text() -> None:
-    """A text ``userMessage`` posts an ``input_text`` block (unchanged path)."""
+async def test_post_user_message_text_posts_input_text(text: str) -> None:
+    """A text ``userMessage`` posts its text unchanged, as an ordinary message."""
     client = _RecordingClient()
-    item = {"type": "userMessage", "content": [{"type": "text", "text": "hello"}]}
+    item = {"type": "userMessage", "content": [{"type": "text", "text": text}]}
 
     await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
 
     assert len(client.posts) == 1
     _url, body = client.posts[0]
-    assert body["data"]["item_data"]["content"] == [{"type": "input_text", "text": "hello"}]
+    assert body["data"]["item_data"]["content"] == [{"type": "input_text", "text": text}]
     assert "agent_message_candidate" not in body["data"]
 
 

@@ -270,11 +270,12 @@ describe("pending elicitation checks", () => {
     expect(isPendingBlockingElicitation(responseEnd as AnyBlock)).toBe(false);
   });
 
-  it("hasPendingOwnElicitation skips a non-blocking own card only when blockingOnly is set", () => {
-    const asyncCard: ElicitationBlock = { ...card, isBlocking: false };
-    expect(hasPendingOwnElicitation([asyncCard], "conv_1", { blockingOnly: true })).toBe(false);
-    expect(hasPendingOwnElicitation([asyncCard], "conv_1")).toBe(true);
-    expect(hasPendingOwnElicitation([card], "conv_1", { blockingOnly: true })).toBe(true);
+  it("hasPendingOwnElicitation counts only this session's own blocking card", () => {
+    expect(hasPendingOwnElicitation([card], "conv_1")).toBe(true);
+    expect(hasPendingOwnElicitation([{ ...card, isBlocking: false }], "conv_1")).toBe(false);
+    expect(hasPendingOwnElicitation([{ ...card, targetSessionId: "conv_child" }], "conv_1")).toBe(
+      false,
+    );
   });
 });
 
