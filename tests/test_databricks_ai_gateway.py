@@ -32,18 +32,17 @@ _GW = "https://dbc-1.cloud.databricks.com/ai-gateway/anthropic"
         ("android", "omnigent-mobile"),
         ("mobile", "omnigent-mobile"),
         ("cli", "omnigent-cli"),
+        (None, None),
         ("unknown", None),
         ("desktop\r\ninjected: value", None),
     ],
 )
 def test_gateway_attribution_names_the_creating_interface(
-    client_surface: str,
+    client_surface: str | None,
     qualified_surface: str | None,
     via_ug: bool,
 ) -> None:
-    expected = ["omnigent"]
-    if qualified_surface is not None:
-        expected.append(qualified_surface)
+    expected = [qualified_surface or "omnigent"]
     if via_ug:
         expected.append("ug")
     assert gateway_attribution_headers("codex", via_ug=via_ug, client_surface=client_surface) == {
@@ -71,27 +70,46 @@ def test_header_pairs_keep_repeated_headers_and_replace_attribution() -> None:
         ("anthropic-beta", "one"),
         ("anthropic-beta", "two"),
         ("Databricks-Custom-Coding-Agent", "claude-code"),
-        ("Databricks-Custom-Client-Surfaces", "omnigent, omnigent-desktop, inner, ug"),
+        ("Databricks-Custom-Client-Surfaces", "omnigent-desktop, inner, ug"),
     ]
 
 
-def test_explicit_surface_replaces_stale_launch_identity() -> None:
+@pytest.mark.parametrize(
+    ("client_surface", "surface"),
+    [
+        ("desktop", "omnigent-desktop"),
+        ("web", "omnigent-web"),
+        ("ios", "omnigent-mobile"),
+        ("android", "omnigent-mobile"),
+        ("mobile", "omnigent-mobile"),
+        ("cli", "omnigent-cli"),
+        (None, "omnigent"),
+    ],
+)
+def test_explicit_surface_replaces_stale_launch_identity(
+    client_surface: str | None, surface: str
+) -> None:
     original = {
-        "databricks-custom-client-surfaces": "omnigent, omnigent-cli, omnigent-web, ug, inner",
+        "databricks-custom-client-surfaces": (
+            " OMNIGENT , omnigent, omnigent-cli, omnigent-web, ug, inner"
+        ),
         "X-Trace": "keep",
     }
     expected = {
         "X-Trace": "keep",
         "Databricks-Custom-Coding-Agent": "claude-code",
-        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-desktop, ug, inner",
+        "Databricks-Custom-Client-Surfaces": f"{surface}, ug, inner",
     }
-    result = with_gateway_attribution(original, "claude-code", _GW, client_surface="desktop")
+    result = with_gateway_attribution(original, "claude-code", _GW, client_surface=client_surface)
     assert result == expected
-    assert with_gateway_attribution(result, "claude-code", _GW, client_surface="desktop") == result
+    assert (
+        with_gateway_attribution(result, "claude-code", _GW, client_surface=client_surface)
+        == result
+    )
     block = with_gateway_attribution_lines(
         "\n".join(f"{name}: {value}" for name, value in original.items()),
         "claude-code",
-        client_surface="desktop",
+        client_surface=client_surface,
     )
     assert block.splitlines() == [f"{name}: {value}" for name, value in expected.items()]
 
@@ -245,7 +263,7 @@ def test_ci_tags_merge_with_existing_headers_and_survive_child_env(
         "run_attempt": "2",
     }
     assert json.loads(mapped[REQUEST_TAGS_HEADER]) == expected
-    surfaces = "omnigent, omnigent-desktop" if client_surface else "omnigent"
+    surfaces = "omnigent-desktop" if client_surface else "omnigent"
     assert mapped["Databricks-Custom-Client-Surfaces"] == surfaces
     assert REQUEST_TAGS_HEADER.lower() not in mapped
     parsed_lines = dict(line.split(": ", 1) for line in lines.splitlines())

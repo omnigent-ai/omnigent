@@ -6,9 +6,11 @@ from playwright.sync_api import Page, expect
 from tests.browser_ui.chat.session_contract import model_option
 
 # Tooltip surface properties the host chip shares with the model pill.
+# Right padding is left out: a tooltip that lists a shortcut tightens it around the keys.
 _SURFACE_STYLE = """el => {
   const s = getComputedStyle(el);
-  return [s.backgroundColor, s.color, s.fontSize, s.padding, s.borderRadius, s.boxShadow];
+  return [s.backgroundColor, s.color, s.fontSize, s.paddingTop, s.paddingBottom,
+          s.paddingLeft, s.borderRadius, s.boxShadow];
 }"""
 
 

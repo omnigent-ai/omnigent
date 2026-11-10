@@ -167,6 +167,25 @@ def test_filtered_server_env_honors_runner_passthrough(
     assert "UNLISTED_SECRET" not in env
 
 
+def test_filtered_server_env_keeps_variables_forwarded_for_the_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(
+        "OMNIGENT_RUNNER_SESSION_ENV_NAMES", "ARCATERM_CAPABILITY,ARCATERM_EMPTY,OPENCODE_CONFIG"
+    )
+    monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-1")
+    monkeypatch.setenv("ARCATERM_EMPTY", "")
+    monkeypatch.setenv("OPENCODE_CONFIG", "/home/user/.config/opencode/opencode.json")
+    monkeypatch.setenv("UNLISTED_SECRET", "nope")
+
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+
+    assert env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
+    assert env["ARCATERM_EMPTY"] == ""
+    assert "OPENCODE_CONFIG" not in env
+    assert "UNLISTED_SECRET" not in env
+
+
 def test_filtered_server_env_drops_global_opencode_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -8,7 +8,7 @@ CLI sign-in reads the request. The panel identifies Azure requests with `!`.
 
 - `summary`: organization/project/repository, request title, description and status.
 - `comments`: request comments on their own tab, whose label shows the count.
-- `changes`: local file diff and expanded context pinned to displayed revisions.
+- `changes`: local file diff and expanded context pinned to displayed revisions, with a path filter and copy-path and open actions. Find searches the fetched patch from the toolbar search button, or Cmd/Ctrl+F while focus is in the Changes tab.
 - `associations`: link, select and unlink a request from another repository.
 - `partial`: retain loaded results and explain incomplete data or unavailable diffs.
 - `auth`: an authenticated PAT works without the Azure CLI; account switching is absent.

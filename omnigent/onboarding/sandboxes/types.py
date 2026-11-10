@@ -94,6 +94,11 @@ class SandboxCapabilities:
         handed a multi-repo request; providers opt in explicitly.
     :param git_clone_options: Provider honors ``RepoWorkspace.git_clone``
         when creating checkouts. Custom materializers must opt in.
+    :param resume_preserves_host: Resuming a stopped sandbox brings back the
+        running ``omnigent host`` process itself, still holding its launch
+        token, so the wake path keeps that token and does not restart the host
+        (a second host would race the thawed one). Only meaningful alongside
+        ``resume_stopped``.
     """
 
     cli_bootstrap: bool = False
@@ -110,6 +115,7 @@ class SandboxCapabilities:
     snapshot_restore: bool = False
     multi_repo: bool = False
     git_clone_options: bool = False
+    resume_preserves_host: bool = False
 
 
 @dataclass(frozen=True)
