@@ -21,8 +21,18 @@ export interface DefaultPolicy {
 
 const QUERY_KEY = ["default-policies"];
 
+/**
+ * Thrown when the server forbids listing global policies (HTTP 403). A backend
+ * may restrict the surface to an allowlist, so the caller can distinguish "not
+ * permitted" from a transient error and hide the section instead of erroring.
+ */
+export class PoliciesForbiddenError extends Error {}
+
 async function fetchDefaultPolicies(): Promise<DefaultPolicy[]> {
   const res = await authenticatedFetch("/v1/policies");
+  if (res.status === 403) {
+    throw new PoliciesForbiddenError("Not permitted to list default policies");
+  }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as { object: string; data: DefaultPolicy[] };
   return body.data;
