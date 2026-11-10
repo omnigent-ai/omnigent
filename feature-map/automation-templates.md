@@ -160,7 +160,8 @@ to customize.
   by default; use Trigger type to select an integration and reveal its conditions
   and session instructions. Returning to Schedule restores the schedule draft.
   Choose Run on, Agent, and session mode above Repeat. Expand Advanced to change
-  model, effort, permissions, or an ending. With `automations_v2` on a server
+  model, effort, permissions, or an ending; for an integration trigger it also has
+  **Start a new session for each match**. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
