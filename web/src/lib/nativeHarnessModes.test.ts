@@ -15,7 +15,7 @@ describe("nativePermissionOptions", () => {
       ["default", "ask-for-approval", "approve-for-me", "full-access", "read-only", "bypass"],
     ],
     ["cursor-native", ["default", "auto-review", "plan", "ask", "yolo"]],
-    ["antigravity-native", ["default", "skip"]],
+    ["antigravity-native", ["default", "accept-edits", "plan", "skip"]],
     ["devin-native", ["normal", "accept-edits", "smart", "dangerous"]],
     ["unknown-harness", []],
     [null, []],
@@ -41,6 +41,8 @@ describe("permissionModeConcept", () => {
   it("supports native harness aliases", () => {
     expect(permissionModeConcept("native-codex", "read-only")).toBe("read-only");
     expect(permissionModeConcept("native-agy", "skip")).toBe("full-access");
+    expect(permissionModeConcept("native-agy", "accept-edits")).toBe("edit-automatic");
+    expect(permissionModeConcept("native-agy", "plan")).toBe("read-only");
   });
 
   it("canonicalizes reversed native harness aliases", () => {

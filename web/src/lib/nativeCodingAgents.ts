@@ -222,9 +222,9 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Antigravity",
     iconKind: "antigravity",
     sortRank: 45,
-    // agy's only pre-emptive control is the all-or-nothing
-    // `--dangerously-skip-permissions`, so it gets a two-value toggle rather
-    // than Claude's graded permissionMode selector.
+    // agy takes `--mode <mode>` and `--dangerously-skip-permissions`, not
+    // Claude's `--permission-mode`, so it gets its own selector rather than
+    // Claude's permissionMode selector.
     capabilities: ["skipPermissions"],
   },
   {

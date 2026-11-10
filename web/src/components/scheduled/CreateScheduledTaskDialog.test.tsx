@@ -4963,11 +4963,12 @@ describe("automation harness settings", () => {
           />
         </CapabilitiesProvider>,
       );
-      // Without the mode the picker has nothing to offer, so it is hidden.
+      // A refused skip mode falls back to the harness default; agy's other modes stay offered.
+      const trigger = screen.getByTestId("task-permission-trigger");
       if (accepted) {
-        expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Skip permissions");
+        expect(trigger).toHaveTextContent("Skip permissions");
       } else {
-        expect(screen.queryByTestId("task-permission-trigger")).toBeNull();
+        expect(trigger).not.toHaveTextContent("Skip permissions");
       }
       fireEvent.change(screen.getByLabelText("Instructions"), {
         target: { value: "Review again" },
