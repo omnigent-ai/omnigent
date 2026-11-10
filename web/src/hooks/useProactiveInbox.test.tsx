@@ -44,7 +44,7 @@ const item: Suggestion = {
   bodyMd: "b",
   links: [],
   actions: [],
-  chart: null,
+  media: [],
   sourceSessionId: "s",
   state: "unread",
   resolution: "none",

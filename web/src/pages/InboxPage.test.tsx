@@ -1730,7 +1730,7 @@ describe("agent suggestions", () => {
         { label: "Ramp to 50%", prompt: "Ramp the flag to 50%" },
         { label: "Check metrics", prompt: "Check the flag's metrics" },
       ],
-      chart: null,
+      media: [],
       sourceSessionId: "sess_src",
       state: "unread",
       resolution: "none",

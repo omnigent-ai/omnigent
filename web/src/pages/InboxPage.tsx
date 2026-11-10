@@ -66,7 +66,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
-import { SuggestionChart } from "@/components/inbox/SuggestionChart";
+import { SuggestionMedia } from "@/components/inbox/SuggestionMedia";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -595,7 +595,7 @@ export function InboxPage() {
           <FileViewerContext.Provider value={null}>
             <FilePathAwareMessageResponse>{item.bodyMd}</FilePathAwareMessageResponse>
           </FileViewerContext.Provider>
-          <SuggestionChart chart={item.chart} />
+          <SuggestionMedia media={item.media} />
           <SuggestionLinks item={item} />
           <InboxActions>
             <DropdownMenu>

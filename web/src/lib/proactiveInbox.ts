@@ -22,6 +22,16 @@ export interface SuggestionAction {
 }
 
 /** One suggestion an agent posted to the viewer's Inbox. Times are epoch seconds. */
+/**
+ * One rich-content block on a suggestion, such as `{type: "chart", chart: {...}}`.
+ * Its content is unvalidated; the block's renderer checks it and skips what it
+ * cannot draw.
+ */
+export interface SuggestionMediaBlock {
+  type: string;
+  [field: string]: unknown;
+}
+
 export interface Suggestion {
   id: string;
   kind: SuggestionKind;
@@ -29,8 +39,8 @@ export interface Suggestion {
   bodyMd: string;
   links: SuggestionLink[];
   actions: SuggestionAction[];
-  /** The agent's declarative chart, unvalidated; see `parseSuggestionChart`. */
-  chart: unknown;
+  /** Rich content drawn on the card, in order. */
+  media: SuggestionMediaBlock[];
   sourceSessionId: string;
   state: SuggestionState;
   resolution: SuggestionResolution;
@@ -44,7 +54,7 @@ interface SuggestionWire {
   body_md: string;
   links?: SuggestionLink[];
   actions?: SuggestionAction[];
-  chart?: unknown;
+  media?: unknown;
   source_session_id: string;
   state: SuggestionState;
   resolution?: SuggestionResolution;
@@ -88,7 +98,12 @@ export function suggestionFromWire(wire: SuggestionWire): Suggestion {
     actions: (wire.actions ?? []).filter(
       (action) => typeof action?.label === "string" && typeof action?.prompt === "string",
     ),
-    chart: wire.chart ?? null,
+    media: Array.isArray(wire.media)
+      ? wire.media.filter(
+          (block): block is SuggestionMediaBlock =>
+            typeof block === "object" && block !== null && typeof block.type === "string",
+        )
+      : [],
     sourceSessionId: wire.source_session_id,
     state: wire.state,
     resolution: wire.resolution ?? "none",

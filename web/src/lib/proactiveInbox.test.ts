@@ -33,7 +33,7 @@ const wire = {
   body_md: "Body",
   links: [{ type: "pr", ref: "https://github.com/acme/app/pull/7" }],
   actions: [{ label: "Ramp up", prompt: "Ramp it" }, { label: 3 }],
-  chart: { version: 1 },
+  media: [{ type: "chart", chart: { version: 1 } }, { type: 3 }, "x"],
   source_session_id: "sess",
   state: "unread",
   resolution: "none",
@@ -48,7 +48,7 @@ function item(overrides: Partial<Suggestion> = {}): Suggestion {
     bodyMd: "b",
     links: [],
     actions: [],
-    chart: null,
+    media: [],
     sourceSessionId: "s",
     state: "unread",
     resolution: "none",
@@ -84,6 +84,8 @@ describe("API calls", () => {
     });
     expect(result.data[0]).toMatchObject({ id: "sug_1", bodyMd: "Body", sourceSessionId: "sess" });
     expect(result.data[0].actions).toEqual([{ label: "Ramp up", prompt: "Ramp it" }]);
+    // Blocks without a string type are dropped; the rest pass through for their renderer.
+    expect(result.data[0].media).toEqual([{ type: "chart", chart: { version: 1 } }]);
   });
 
   it("asks for the next page of one state", async () => {
