@@ -63,6 +63,11 @@ async def test_subagent_cost_is_forwarded_without_new_transcript_items_and_retri
     )
     cache: dict[Path, forwarder._TranscriptCostCacheEntry] = {}
     retries = forwarder._PostRetryTracker(max_permanent_attempts=1)
+    cost_rejections: set[str] = set()
+    failures: list[str] = []
+    monkeypatch.setattr(
+        forwarder, "_note_forward_failure", lambda key, *_args, **_kwargs: failures.append(key)
+    )
     attempts: list[dict[str, Any]] = []
     clock = [100.0]
     monkeypatch.setattr(forwarder.time, "monotonic", lambda: clock[0])
@@ -91,6 +96,7 @@ async def test_subagent_cost_is_forwarded_without_new_transcript_items_and_retri
                 item_retry_tracker=forwarder._PostRetryTracker(),
                 status_retry_tracker=retries,
                 cost_cache=cache,
+                cost_rejections=cost_rejections,
             )
 
         await poll()
@@ -99,6 +105,15 @@ async def test_subagent_cost_is_forwarded_without_new_transcript_items_and_retri
         assert len(attempts) == 1
         clock[0] += 100
         await poll()
+        if failure_status == 400:
+            assert len(attempts) == 1
+            assert not failures
+            assert cost_rejections == {"conv_child"}
+            # A new forwarder process probes server support again.
+            cost_rejections.clear()
+            await poll()
+        else:
+            assert failures == ["subagent_cost:conv_child"]
         assert attempts == [{"attributed_cost_usd": pytest.approx(0.08)}] * 2
         assert state.subagents["child"].posted_cost_usd == pytest.approx(0.08)
 

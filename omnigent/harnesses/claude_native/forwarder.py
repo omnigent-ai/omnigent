@@ -1118,7 +1118,6 @@ class _PostRetryTracker:
         *,
         session_id: str,
         max_transient_attempts: int | None = None,
-        retry_permanent: bool = False,
     ) -> _PostRetryDecision:
         """
         Record one failed post and compute the next retry action.
@@ -1128,7 +1127,6 @@ class _PostRetryTracker:
         :param session_id: Session targeted by the failed post.
         :param max_transient_attempts: Optional batch budget before splitting
             into individual requests. Individual transient failures have no limit.
-        :param retry_permanent: Keep optional metadata retrying across server upgrades.
         :returns: Retry decision for this failure.
         """
         # Count every failed post (transient or permanent) so a sustained
@@ -1142,7 +1140,7 @@ class _PostRetryTracker:
         permanent = _is_permanent_http_error(exc)
         not_confirmed = _is_subagent_delivery_not_confirmed(exc)
         give_up = (
-            (permanent and not retry_permanent and entry.attempts >= self._max_permanent_attempts)
+            (permanent and entry.attempts >= self._max_permanent_attempts)
             or (not_confirmed and entry.attempts >= self._max_not_confirmed_attempts)
             or (
                 not permanent
@@ -1352,6 +1350,7 @@ async def forward_claude_transcript_to_session(
     session_event_batch_capability = _SessionEventBatchCapability()
     delta_batch_capability = _SessionEventBatchCapability()
     subagent_status_capability = _SubagentStatusCapability()
+    subagent_cost_rejections: set[str] = set()
     # Dedupe: Claude rewrites the same usage block every poll until
     # the next assistant entry; only POST on real change. Mutated in
     # place by ``_forward_available_items`` and carried across polls.
@@ -1648,6 +1647,7 @@ async def forward_claude_transcript_to_session(
                                         batch_capability=session_event_batch_capability,
                                         status_capability=subagent_status_capability,
                                         cost_cache=cost_cache,
+                                        cost_rejections=subagent_cost_rejections,
                                     ),
                                     timeout=_FORWARD_LOOP_STALL_DEADLINE_S,
                                 ),
@@ -2315,6 +2315,7 @@ async def _forward_one_subagent(
     batch_capability: _SessionEventBatchCapability,
     status_capability: _SubagentStatusCapability,
     cost_cache: dict[Path, _TranscriptCostCacheEntry] | None = None,
+    cost_rejections: set[str] | None = None,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches."""
     retry_prefixes = (
@@ -2550,8 +2551,13 @@ async def _forward_one_subagent(
         if stop_after_batch:
             break
 
+    if cost_rejections is None:
+        cost_rejections = set()
     cost_retry_key = f"subagent_cost:{entry.child_conversation_id}"
-    if status_retry_tracker.retry_delay_s(cost_retry_key) is None:
+    if (
+        entry.child_conversation_id not in cost_rejections
+        and status_retry_tracker.retry_delay_s(cost_retry_key) is None
+    ):
         cost = await asyncio.to_thread(
             _transcript_cost_size_cached,
             jsonl_path,
@@ -2568,15 +2574,20 @@ async def _forward_one_subagent(
                     usage={"attributed_cost_usd": cost},
                 )
             except httpx.HTTPError as exc:
-                status_retry_tracker.record_failure(
-                    cost_retry_key,
-                    exc,
-                    session_id=entry.child_conversation_id,
-                    retry_permanent=True,
-                )
-                _logger.warning(
-                    "Failed to forward Claude subagent cost; child=%s", entry.child_conversation_id
-                )
+                if _is_permanent_http_error(exc):
+                    cost_rejections.add(entry.child_conversation_id)
+                    _logger.info(
+                        "Server rejected optional subagent cost; skipping until restart; child=%s",
+                        entry.child_conversation_id,
+                    )
+                else:
+                    status_retry_tracker.record_failure(
+                        cost_retry_key, exc, session_id=entry.child_conversation_id
+                    )
+                    _logger.warning(
+                        "Failed to forward Claude subagent cost; child=%s",
+                        entry.child_conversation_id,
+                    )
             else:
                 status_retry_tracker.clear(cost_retry_key)
                 new_entry = replace(new_entry, posted_cost_usd=cost)
@@ -2825,6 +2836,7 @@ async def _forward_available_subagents(
     batch_capability: _SessionEventBatchCapability | None = None,
     status_capability: _SubagentStatusCapability | None = None,
     cost_cache: dict[Path, _TranscriptCostCacheEntry] | None = None,
+    cost_rejections: set[str] | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
@@ -2858,6 +2870,7 @@ async def _forward_available_subagents(
     :param status_capability: Process-local cache of whether the server accepts
         idle observations. A new cache is created for direct callers that omit it.
     :param cost_cache: Transcript pricing cache shared with the parent cost reporter.
+    :param cost_rejections: Child cost posts permanently rejected during this process.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
@@ -2868,6 +2881,8 @@ async def _forward_available_subagents(
         batch_capability = _SessionEventBatchCapability()
     if status_capability is None:
         status_capability = _SubagentStatusCapability()
+    if cost_rejections is None:
+        cost_rejections = set()
 
     # ── Register newly-appeared sub-agents ──────────────
     # ``glob`` is sync; offload to a thread so we don't stat the
@@ -3071,6 +3086,7 @@ async def _forward_available_subagents(
                 batch_capability=batch_capability,
                 status_capability=status_capability,
                 cost_cache=cost_cache,
+                cost_rejections=cost_rejections,
             )
 
     entries = list(updated.subagents.values())
