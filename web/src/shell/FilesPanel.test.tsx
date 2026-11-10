@@ -352,11 +352,13 @@ describe("FilesPanel working folder directory", () => {
 
 describe("FilesPanel header role", () => {
   it("keeps the header above the tree and preview without remounting the tree", () => {
+    const onClosePreview = vi.fn();
     const { rerender } = renderPanel({
       conversationId: "conv_header_split",
       files: [file("README.md"), file("other.md")],
       workingDir: "/home/user/project",
     });
+    expect(screen.queryByRole("button", { name: /^Close file$/ })).not.toBeInTheDocument();
     const fileButton = screen.getByRole("button", { name: "README.md" });
     const tree = screen.getByTestId("workspace-file-tree-column");
     expect(tree.style.width).toBe("");
@@ -368,8 +370,11 @@ describe("FilesPanel header role", () => {
         selectedFilePath: "README.md",
         treeColumnWidth: 200,
         filePreview: <div data-testid="preview">File content</div>,
+        onClosePreview,
       }),
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Close file$/ }));
+    expect(onClosePreview).toHaveBeenCalledOnce();
     const split = screen.getByTestId("workspace-files-split");
     const header = screen
       .getByRole("button", { name: "Refresh files" })
@@ -392,6 +397,7 @@ describe("FilesPanel header role", () => {
       "true",
     );
     expect(screen.queryByTestId("preview")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Close file$/ })).not.toBeInTheDocument();
   });
 
   it("omits the redundant Working folder heading in the standalone card", () => {

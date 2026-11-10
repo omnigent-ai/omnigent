@@ -75,6 +75,7 @@ vi.mock("./FilesPanel", () => ({
     treeColumnWidth,
     treeResizeHandle,
     filePreview,
+    onClosePreview,
   }: {
     flatView: boolean;
     conversationId: string;
@@ -84,6 +85,7 @@ vi.mock("./FilesPanel", () => ({
     treeColumnWidth?: number;
     treeResizeHandle?: ReactNode;
     filePreview?: ReactNode;
+    onClosePreview?: () => void;
   }) => (
     <div
       data-testid="files-panel-stub"
@@ -95,6 +97,11 @@ vi.mock("./FilesPanel", () => ({
       <button type="button" onClick={() => (onFileOpenInTree ?? onFileSelect)("src/a.md")}>
         Open tree file
       </button>
+      {onClosePreview && (
+        <button type="button" onClick={onClosePreview}>
+          Close file
+        </button>
+      )}
       {treeResizeHandle}
       {filePreview}
     </div>
@@ -376,6 +383,7 @@ function renderWorkspace(
     },
     openFileViewer,
     openFileInTree,
+    onCloseTreePreview,
     onCloseFile,
     onRightRailTabChange,
     onClosePanel,
@@ -3333,6 +3341,29 @@ describe("WorkspacePanel file tree split", () => {
     expect(tree).not.toHaveAttribute("data-tree-width");
     expect(tree).toHaveAttribute("data-selected-file", "");
     expect(screen.queryByTestId("file-viewer-stub")).not.toBeInTheDocument();
+  });
+
+  it("closes the preview from the header only after unsaved-edit approval", () => {
+    const allowLeaving: (() => void)[] = [];
+    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+      allowLeaving.push(commit);
+    });
+    const { onCloseTreePreview, rerender } = renderWorkspace({
+      fileTreeSplitEnabled: true,
+      treePreviewPath: "src/a.md",
+      fileGuard,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Close file" }));
+    expect(fileGuard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
+    expect(onCloseTreePreview).not.toHaveBeenCalled();
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/a.md");
+    fireEvent.click(screen.getByRole("button", { name: "Close file" }));
+    act(() => allowLeaving[1]!());
+    expect(onCloseTreePreview).toHaveBeenCalledOnce();
+    rerender({ treePreviewPath: null });
+    expect(screen.queryByRole("button", { name: "Close file" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("file-viewer-stub")).not.toBeInTheDocument();
+    expect(screen.getByTestId("files-panel-stub")).not.toHaveAttribute("data-tree-width");
   });
 
   it.each(["flag off", "setting", "narrow", "mobile", "changes"])(

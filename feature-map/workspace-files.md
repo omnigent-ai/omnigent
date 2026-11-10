@@ -13,7 +13,10 @@ want a standalone view.
 - `selection`: the previewed file stays highlighted in the tree and file-name
   search results, so users can see which file is open beside them.
 - `header`: folder navigation and actions span the full Files panel above both
-  columns; file-name search stays with the tree below that header.
+  columns; file-name search stays with the tree below that header. While a file
+  preview is visible, **Close file** replaces the folder's IDE controls.
+- `close`: **Close file** returns to the full-width tree and restores the folder's
+  IDE controls; unsaved edits must be saved or discarded before closing.
 - `tabs`: Cmd-click on macOS, Ctrl-click elsewhere, middle-click, or the file's
   **Open in new tab** context-menu action opens a standalone file tab.
 - `resize`: drag the divider or focus it and use the arrow keys; the tree width
@@ -61,8 +64,12 @@ Expand a folder and click two files. Confirm the first click reveals the split,
 the preview changes without adding tabs, and the current file is highlighted.
 Search for that file by name and confirm its search result stays highlighted.
 The folder header should span both columns while search stays in the tree.
-Narrow the panel until the split disappears and confirm a file click now opens
-a standalone tab. Repeat in full screen.
+Choose **Close file** in that header: the preview and divider should disappear,
+the tree should fill the panel, and the folder's IDE controls should return.
+Open a file again, make unsaved edits, and choose **Close file**: **Keep editing**
+should preserve the draft and preview; **Discard changes** should close it.
+Reopen a file, then narrow the panel until the split disappears and confirm a
+file click now opens a standalone tab. Repeat in full screen.
 
 For Settings, turn **Always open files in a new tab** on and return to Files:
 the tree should fill the panel and clicks should create tabs. Reload to check

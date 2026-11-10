@@ -301,9 +301,9 @@ def test_tree_minimum_width_keeps_controls_separate_and_persists(
             box.bottom <= other.top || other.bottom <= box.top));
     }""")
     expect(header.get_by_test_id("files-host-served-badge")).to_be_visible()
-    header.get_by_role("button", name="Choose app to open in", exact=True).click()
-    expect(page.get_by_role("menuitem", name="VS Code", exact=True)).to_be_visible()
-    page.keyboard.press("Escape")
+    expect(header.get_by_role("button", name="Close file", exact=True)).to_be_visible()
+    expect(header.get_by_role("button", name="Choose app to open in", exact=True)).to_have_count(0)
+    expect(header.get_by_role("button", name="Open in IDE", exact=True)).to_have_count(0)
     expect(
         header.get_by_role("button", name="Copy folder path: workspace", exact=True)
     ).to_be_visible()
@@ -322,9 +322,22 @@ def test_tree_minimum_width_keeps_controls_separate_and_persists(
     expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text(
         _FILES["src/app.md"]
     )
+    header.get_by_role("button", name="Close file", exact=True).click()
+    expect(page.get_by_test_id("workspace-files-split")).to_have_count(0)
+    expect(handle).to_have_count(0)
+    expect(page.locator('[data-testid="file-viewer"]:visible')).to_have_count(0)
+    expect(tree.get_by_text("app.md", exact=True)).to_be_visible()
+    expect(tree.locator('button[aria-current="true"]')).to_have_count(0)
+    tree_box, header_box = tree.bounding_box(), header.bounding_box()
+    assert tree_box is not None and header_box is not None
+    assert abs(tree_box["width"] - header_box["width"]) <= 1
+    expect(header.get_by_role("button", name="Close file", exact=True)).to_have_count(0)
+    header.get_by_role("button", name="Choose app to open in", exact=True).click()
+    expect(page.get_by_role("menuitem", name="VS Code", exact=True)).to_be_visible()
+    page.keyboard.press("Escape")
 
 
-@pytest.mark.parametrize("destination", ["file", "close-panel"])
+@pytest.mark.parametrize("destination", ["file", "close-panel", "close-preview"])
 def test_inline_tree_navigation_guards_unsaved_markdown(
     page: Page, seeded_session: BrowserSession, destination: str
 ) -> None:
@@ -359,6 +372,10 @@ def test_inline_tree_navigation_guards_unsaved_markdown(
     for decision in ("Keep editing", "Discard changes"):
         if destination == "file":
             tree.get_by_text("guide.md", exact=True).click()
+        elif destination == "close-preview":
+            page.locator("[data-files-header]").get_by_role(
+                "button", name="Close file", exact=True
+            ).click()
         else:
             page.get_by_role("button", name="Close Files", exact=True).click()
         expect(dialog).to_be_visible()
@@ -371,6 +388,15 @@ def test_inline_tree_navigation_guards_unsaved_markdown(
             expect(editor).to_have_text(draft)
         elif destination == "file":
             expect(editor).to_have_text(_FILES["src/guide.md"])
+        elif destination == "close-preview":
+            expect(viewer).to_have_count(0)
+            expect(page.get_by_test_id("workspace-files-split")).to_have_count(0)
+            expect(tree.get_by_text("app.md", exact=True)).to_be_visible()
+            expect(
+                page.locator("[data-files-header]").get_by_role(
+                    "button", name="Close file", exact=True
+                )
+            ).to_have_count(0)
         else:
             expect(viewer).to_have_count(0)
             expect(page.get_by_role("button", name="Close Files", exact=True)).to_have_count(0)

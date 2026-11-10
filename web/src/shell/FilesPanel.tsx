@@ -64,6 +64,7 @@ interface FilesPanelProps {
   treeColumnWidth?: number;
   treeResizeHandle?: ReactNode;
   filePreview?: ReactNode;
+  onClosePreview?: () => void;
   /**
    * Which scope this panel renders: false = full folder tree, true =
    * changed-files-only flat list. Fixed by the caller (the Files vs Changes
@@ -296,6 +297,7 @@ export function FilesPanel({
   treeColumnWidth,
   treeResizeHandle,
   filePreview,
+  onClosePreview,
   flatView,
   showHidden,
   onShowHiddenChange,
@@ -676,7 +678,25 @@ export function FilesPanel({
               <XIcon className="size-4" />
             </button>
           )}
-          {!flatView && workingDir && (
+          {onClosePreview ? (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Close file"
+                    className="shrink-0 text-muted-foreground hover:text-foreground"
+                    onClick={onClosePreview}
+                  >
+                    <XIcon />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Close file</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : !flatView && workingDir ? (
             <>
               <span
                 className={cn(
@@ -710,7 +730,7 @@ export function FilesPanel({
                 </DropdownMenu>
               )}
             </>
-          )}
+          ) : null}
         </div>
       </div>
       {/* Content */}

@@ -2207,6 +2207,9 @@ function WorkspacePanelImpl({
                 onFileSelect={openFileViewer}
                 onFileOpenInTree={canSplitFiles ? openFileInTree : undefined}
                 selectedFilePath={splitFiles ? treePreviewPath : null}
+                onClosePreview={
+                  splitFiles ? () => leaveFileRef.current(null, onCloseTreePreview) : undefined
+                }
                 showOpenInTab={fileTreeSplitEnabled && !isMobile}
                 compactTreeControls={fileTreeSplitEnabled && !isMobile && rightRailTab === "files"}
                 flatView={rightRailTab === "changes"}
