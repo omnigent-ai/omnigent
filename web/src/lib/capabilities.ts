@@ -297,7 +297,7 @@ export interface ServerInfo {
   session_pull_requests?: boolean;
   /**
    * True when the server keeps session journals (``/v1/sessions/{id}/journal`` and
-   * ``session.journal.appended``), which the Activity tab shows; absent on older servers (off).
+   * ``session.journal.appended``), which the Tasks tab shows; absent on older servers (off).
    */
   session_journal?: boolean;
   /**

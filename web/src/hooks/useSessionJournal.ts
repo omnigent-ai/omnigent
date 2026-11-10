@@ -1,4 +1,4 @@
-// A session's journal for the Activity tab: one page of the newest entries,
+// A session's journal for the Tasks tab: one page of the newest entries,
 // older pages only on request, kept live by `session.journal.appended` and
 // caught up when the stream reopens. Every read is one bounded page; when
 // older pages exist, the newest plan and statuses are read too, so every step

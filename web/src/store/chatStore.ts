@@ -9496,7 +9496,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }
       return;
     case "session_journal_appended":
-      // A new journal entry for the Activity tab; the cache drops duplicates by ID.
+      // A new journal entry for the Tasks tab; the cache drops duplicates by ID.
       if (queryClient) applyJournalEntry(queryClient, event.conversationId, event.entry);
       return;
     case "session_changed_files_invalidated":
