@@ -80,13 +80,12 @@ export function useSandboxProfileCatalog(
     staleTime: 30_000,
     retry: false,
   });
+  const rememberedCurrent = rememberedCheck.data?.profiles.find(
+    (p) => p.id === remembered.profile?.id && p.provider === provider,
+  );
   const rememberedRejected =
     remembered.profile !== undefined &&
-    (rememberedCheck.isError ||
-      (rememberedCheck.isSuccess &&
-        rememberedCheck.data.profiles.find(
-          (p) => p.id === remembered.profile?.id && p.provider === provider,
-        )?.revision !== remembered.profile.revision));
+    (rememberedCheck.isError || (rememberedCheck.isSuccess && rememberedCurrent === undefined));
   const defaultProfileId =
     unpicked &&
     provider !== null &&
@@ -94,7 +93,9 @@ export function useSandboxProfileCatalog(
       ? (query.data?.default_profile_ids?.[provider] ?? null)
       : null;
   const fallback = useProfileById(provider, profiles, defaultProfileId);
-  const preferred = (rememberedRejected ? undefined : remembered.profile) ?? fallback.profile;
+  const preferred =
+    (rememberedRejected ? undefined : (rememberedCurrent ?? remembered.profile)) ??
+    fallback.profile;
   const selection: SandboxProfileSelection | null =
     explicit ??
     (unpicked && preferred !== undefined

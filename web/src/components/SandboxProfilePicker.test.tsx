@@ -181,7 +181,13 @@ it.each([
 );
 
 it("launches the last picked profile on its current revision", async () => {
-  available = rows.map((p) => (p.id === "profile-5" ? { ...p, revision: "v2" } : p));
+  // The first page still lists v1; the profile's own check returns v2.
+  const listPage = vi.mocked(fetchSandboxProfiles).getMockImplementation()!;
+  vi.mocked(fetchSandboxProfiles).mockImplementation(async (provider, options) => {
+    const page = await listPage(provider, options);
+    if (options?.profileId !== "profile-5") return page;
+    return { ...page, profiles: page.profiles.map((p) => ({ ...p, revision: "v2" })) };
+  });
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const { result } = renderHook(() => useSandboxProfileCatalog("company", null, "profile-5"), {
     wrapper: ({ children }: { children: ReactNode }) => (
