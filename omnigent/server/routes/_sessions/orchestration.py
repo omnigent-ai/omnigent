@@ -4669,6 +4669,7 @@ async def _run_managed_launch(
             session_id,
             user_id=owner,
             host_id=relaunch_host.host_id if relaunch_host is not None else None,
+            bind_host=False,
         )
         if profile is not None:
             sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
@@ -4758,6 +4759,7 @@ async def _run_managed_launch(
             tunnel_registry=tunnel_registry,
             relaunch_host=relaunch_host,
             sandbox_profiles=sandbox_profiles,
+            sandbox_profile=profile,
         )
 
 
@@ -4773,6 +4775,7 @@ async def _bind_and_launch_managed_runner(
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
     sandbox_profiles: Any = None,
+    sandbox_profile: dict[str, Any] | None = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -4809,7 +4812,7 @@ async def _bind_and_launch_managed_runner(
     from omnigent.server.managed_hosts import terminate_managed_host
 
     def persist_binding() -> Conversation:
-        snapshot = (
+        snapshot = sandbox_profile or (
             sandbox_profiles.get_session_snapshot(session_id)
             if sandbox_profiles is not None
             else None

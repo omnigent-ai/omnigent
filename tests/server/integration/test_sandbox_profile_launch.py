@@ -27,8 +27,12 @@ from omnigent.server.sandbox_profiles import SandboxProfileCatalog
 from omnigent.server.scheduled.fire import (
     _STAGED_LAUNCH_ERRORS,
     FireDeps,
+    _continued_host_binding,
     _make_managed_sandbox_start,
+    _session_labels,
 )
+from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.helpers import (
     HostStartInvocation,
     register_test_runner,
@@ -234,15 +238,25 @@ async def test_default_profile_is_authorized_like_an_explicit_selection(env):
     assert env.recording.allocations == []
 
 
-async def test_scheduled_fresh_sandbox_takes_the_default_profile(env):
+@pytest.mark.parametrize(
+    ("env", "reset"),
+    [
+        ("provider", "repo-change"),
+        ("controller", "repo-change"),
+        ("controller", "deleted-session"),
+        ("provider", "revoked"),
+        ("controller", "revoked"),
+    ],
+    indirect=["env"],
+)
+async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, reset, db_uri):
     _with_default_profile(env, "build")
     response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
     assert response.status_code == 201, response.text
     session_id = response.json()["id"]
     conversation = env.conversations.get_conversation(session_id)
     assert conversation is not None
-    schedules = Mock()
-    schedules.get_running_run_by_conversation.return_value = SimpleNamespace(id="profile-run")
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
     deps = FireDeps(
         scheduled_task_store=schedules,
         agent_store=env.app.state.agent_store,
@@ -254,24 +268,68 @@ async def test_scheduled_fresh_sandbox_takes_the_default_profile(env):
         managed_launches=env.app.state.managed_launches,
         app_state=env.app.state,
     )
-    _make_managed_sandbox_start(deps)(
-        conversation,
-        SimpleNamespace(
-            user_id=_OWNER,
-            agent_id=env.agent_id,
-            execution_target="managed_sandbox",
-            workspace=None,
-        ),
-        uuid.uuid4().hex,
-        _STAGED_LAUNCH_ERRORS,
+    task = schedules.create(
+        scheduled_task_id=str(uuid.uuid4()),
+        name="Profile automation",
+        prompt="Check the repository",
+        rrule="FREQ=HOURLY",
+        timezone="UTC",
+        user_id=_OWNER,
+        agent_id=env.agent_id,
+        execution_target="managed_sandbox",
+        session_mode="continue",
+    )
+    env.conversations.set_labels(session_id, _session_labels(task))
+    host_id = continued_sandbox_host_id(task.id, task.workspace_id)
+    launching = _make_managed_sandbox_start(deps)(
+        conversation, task, host_id, _STAGED_LAUNCH_ERRORS
     )
     launch = env.app.state.managed_launches.get(session_id)
     assert launch is not None
-    await asyncio.wait_for(launch.settled.wait(), timeout=10)
+    await asyncio.wait_for(launching, timeout=10)
     assert launch.error is None, launch.error
     snapshot = env.catalog.get_session_snapshot(session_id)
     assert snapshot is not None and snapshot["id"] == "build"
     assert env.recording.allocations == [_PROVIDER_CONFIG]
+
+    # A changed default must not replace the continued host's accepted profile.
+    _with_default_profile(env, "other-default")
+    deps = dataclasses.replace(deps, sandbox_config=env.app.state.sandbox_config)
+    task = dataclasses.replace(
+        task,
+        last_run_conversation_id=session_id,
+        workspace=None
+        if reset == "deleted-session"
+        else "https://example.test/org/another-repo.git",
+    )
+    if reset == "deleted-session":
+        await env.conversations.delete_conversation(session_id)
+    if reset == "revoked":
+        env.recording.allowed_users.clear()
+    assert await _continued_host_binding(deps, task) is None
+
+    response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
+    assert response.status_code == 201, response.text
+    replacement_id = response.json()["id"]
+    replacement = env.conversations.get_conversation(replacement_id)
+    assert replacement is not None and replacement.host_id is None
+    launching = _make_managed_sandbox_start(deps)(
+        replacement, task, host_id, _STAGED_LAUNCH_ERRORS
+    )
+    launch = env.app.state.managed_launches.get(replacement_id)
+    assert launch is not None
+    await asyncio.wait_for(launching, timeout=10)
+    if reset == "revoked":
+        assert launch.error is not None
+        assert "access denied" in launch.error.lower()
+        assert env.catalog.get_session_snapshot(replacement_id) is None
+        assert env.conversations.get_conversation(replacement_id).host_id is None
+        assert env.recording.allocations == [_PROVIDER_CONFIG]
+    else:
+        assert launch.error is None, launch.error
+        assert env.catalog.get_session_snapshot(replacement_id) == snapshot
+        assert env.conversations.get_conversation(replacement_id).host_id == host_id
+        assert env.recording.allocations == [_PROVIDER_CONFIG, _PROVIDER_CONFIG]
 
 
 @pytest.mark.parametrize("mode", ["profile", "ordinary", "flag-off", "legacy-managed"])

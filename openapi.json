@@ -6202,6 +6202,14 @@
       },
       "SandboxProfilesResponse": {
         "properties": {
+          "default_profile_ids": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "title": "Default Profile Ids",
+            "type": "object"
+          },
           "managed_providers": {
             "items": {
               "type": "string"

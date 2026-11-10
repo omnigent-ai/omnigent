@@ -537,7 +537,7 @@ class SandboxProfileCatalog:
         sandbox_provider: str | None = None,
         user_id: str | None = None,
         allow_unprofiled_runner: bool = False,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """After host ownership checks, inherit or match the host's accepted profile."""
         host = self._host_store.get_host(host_id) if self._host_store else None
         if host is not None:
@@ -572,7 +572,7 @@ class SandboxProfileCatalog:
                 status_code=409, detail="Session and host sandbox profiles do not match"
             )
         if not bind:
-            return
+            return session_snapshot or host_snapshot
         if session_snapshot is None and host_snapshot is not None:
             conversations = self._store.conversations
             binding = conversations.get_profile_host_binding(session_id)
@@ -590,3 +590,4 @@ class SandboxProfileCatalog:
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return session_snapshot or host_snapshot
