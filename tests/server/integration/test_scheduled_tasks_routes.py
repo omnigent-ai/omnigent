@@ -832,7 +832,9 @@ async def test_permission_save_requires_resolved_harness(
     assert cleared.json()["permission_mode"] is None
 
 
-@pytest.mark.parametrize("permission_mode", ["unknown-permission-mode", "--danger", "Auto"])
+@pytest.mark.parametrize(
+    "permission_mode", ["unknown-permission-mode", "--danger", "Auto", "null"]
+)
 async def test_create_rejects_invalid_permission_mode(
     auth_client: httpx.AsyncClient, db_uri: str, permission_mode: str
 ) -> None:
@@ -844,6 +846,9 @@ async def test_create_rejects_invalid_permission_mode(
     )
     assert resp.status_code == 400, resp.text
     assert "Unsupported permission_mode" in resp.text
+    # The caller must learn the valid values and how to ask for the agent default.
+    assert "claude-native: default, auto, acceptEdits" in resp.text
+    assert "JSON null (not the string 'null') for the agent default" in resp.text
 
 
 async def test_create_rejects_relative_workspace(
@@ -1418,7 +1423,8 @@ async def test_create_rejects_permission_mode_for_non_claude_agent(
         headers=_headers(),
     )
     assert resp.status_code == 400, resp.text
-    assert "permission_mode" in resp.text
+    assert "permission_mode 'acceptEdits' is not supported for 'codex-native'" in resp.text
+    assert "'codex-native' accepts 'default', 'ask-for-approval'" in resp.text
 
 
 async def test_update_clears_permission_mode_with_explicit_null(

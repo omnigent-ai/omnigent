@@ -9,8 +9,11 @@ from typing import Any
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.native.permission_modes import (
+    AGENT_DEFAULT_PERMISSION_HINT,
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
+    describe_harness_permission_modes,
+    describe_permission_modes,
 )
 
 _logger = logging.getLogger(__name__)
@@ -27,7 +30,11 @@ def validate_scheduled_permission_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
     if not any(mode in modes for modes in PERMISSION_LAUNCH_ARGS.values()):
-        raise OmnigentError(f"Unsupported permission_mode: {mode!r}", code=ErrorCode.INVALID_INPUT)
+        raise OmnigentError(
+            f"Unsupported permission_mode: {mode!r}. Use a mode of the agent's harness "
+            f"({describe_permission_modes()}), or {AGENT_DEFAULT_PERMISSION_HINT}.",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return mode
 
 
@@ -94,6 +101,7 @@ async def validate_scheduled_permission_support(
         )
     if permission_mode not in PERMISSION_LAUNCH_ARGS.get(harness, {}):
         raise OmnigentError(
-            f"permission_mode {permission_mode!r} is not supported for {harness!r}",
+            f"permission_mode {permission_mode!r} is not supported for {harness!r}: "
+            f"{describe_harness_permission_modes(harness)}.",
             code=ErrorCode.INVALID_INPUT,
         )

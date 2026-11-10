@@ -63,3 +63,24 @@ APPROVAL_SKIPPING_PERMISSION_MODES: frozenset[str] = frozenset(
         "dangerous",  # devin-native
     }
 )
+
+# Shared by the permission_mode value rejections. Agents that call the tool before
+# loading its schema send the string "null", so the hint names JSON null exactly.
+AGENT_DEFAULT_PERMISSION_HINT = "JSON null (not the string 'null') for the agent default"
+
+
+def describe_harness_permission_modes(harness: str) -> str:
+    """Name the task permission modes ``harness`` accepts, for a rejection message."""
+    modes = PERMISSION_LAUNCH_ARGS.get(harness)
+    if not modes:
+        return f"{harness!r} has no task permission modes; send {AGENT_DEFAULT_PERMISSION_HINT}"
+    names = ", ".join(repr(mode) for mode in modes)
+    return f"{harness!r} accepts {names}, or {AGENT_DEFAULT_PERMISSION_HINT}"
+
+
+def describe_permission_modes() -> str:
+    """Every harness's task permission modes, for a rejection made before the harness is known."""
+    known = "; ".join(
+        f"{harness}: {', '.join(modes)}" for harness, modes in PERMISSION_LAUNCH_ARGS.items()
+    )
+    return f"{known}; other harnesses, including claude-sdk, have none"

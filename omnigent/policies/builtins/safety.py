@@ -13,7 +13,10 @@ import json as _json
 import re as _re
 from typing import Literal
 
-from omnigent.native.permission_modes import APPROVAL_SKIPPING_PERMISSION_MODES
+from omnigent.native.permission_modes import (
+    AGENT_DEFAULT_PERMISSION_HINT,
+    APPROVAL_SKIPPING_PERMISSION_MODES,
+)
 from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
@@ -466,7 +469,7 @@ def scheduled_task_review_error(
         hint = (
             "List the task and retry with its full prompt and permission_mode."
             if action == "update"
-            else "Retry with prompt and permission_mode (null for the agent default)."
+            else f"Retry with prompt and permission_mode; use {AGENT_DEFAULT_PERMISSION_HINT}."
         )
         return f"Missing review fields ({', '.join(missing)}). {hint}"
     if "prompt" in args or action == "create":
@@ -475,8 +478,13 @@ def scheduled_task_review_error(
             return "The automation prompt must be a non-empty string."
     if "permission_mode" in args:
         mode = args["permission_mode"]
-        if mode is not None and (not isinstance(mode, str) or not mode.strip()):
-            return "permission_mode must be a non-empty string or null for the agent default."
+        # The server rejects the string "null"; catch it before the user is asked to approve.
+        if mode is not None and (
+            not isinstance(mode, str) or not mode.strip() or mode.strip().lower() == "null"
+        ):
+            return (
+                f"permission_mode must be a non-empty string, or {AGENT_DEFAULT_PERMISSION_HINT}."
+            )
     if action == "update" and not args.get("scheduled_task_id"):
         return "Provide the scheduled_task_id of the automation to update."
     return None

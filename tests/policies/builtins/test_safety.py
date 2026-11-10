@@ -926,7 +926,7 @@ def test_ask_on_scheduled_task_change_denies_missing_arguments() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [("prompt", value) for value in [None, "", " \n\t", 1, ["instructions"]]]
-    + [("permission_mode", value) for value in ["", " \n\t", 1, ["auto"]]],
+    + [("permission_mode", value) for value in ["", " \n\t", 1, ["auto"], "null", " NULL "]],
 )
 def test_scheduled_task_approval_denies_invalid_review_values(
     action: str, field: str, value: object
@@ -949,6 +949,32 @@ def test_scheduled_task_approval_denies_invalid_review_values(
     )
     assert result["result"] == "DENY"
     assert f"{field} must be a non-empty string" in result["reason"]
+    if field == "permission_mode":
+        assert result["reason"].endswith(
+            "or JSON null (not the string 'null') for the agent default."
+        )
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_hint"),
+    [
+        ("create", "use JSON null (not the string 'null') for the agent default."),
+        ("update", "List the task and retry with its full prompt and permission_mode."),
+    ],
+)
+def test_scheduled_task_review_error_names_json_null_for_missing_mode(
+    action: str, expected_hint: str
+) -> None:
+    """Runners require both review fields; the create hint must say how to pick the default."""
+    from omnigent.policies.builtins.safety import scheduled_task_review_error
+
+    error = scheduled_task_review_error(
+        {"scheduled_task_id": "0123456789abcdef0123456789abcdef", "prompt": "Review."},
+        action=action,
+    )
+    assert error is not None
+    assert error.startswith("Missing review fields (permission_mode). ")
+    assert error.endswith(expected_hint)
 
 
 @pytest.mark.parametrize(
