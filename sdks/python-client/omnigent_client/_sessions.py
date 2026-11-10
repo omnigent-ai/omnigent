@@ -775,9 +775,10 @@ class SessionsNamespace:
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"`` or
             ``"updated_at"``.
-        :param include_archived: With ``visibility="all"``, include
-            archived sessions alongside active ones when ``True``.
-            Defaults to ``False``. Other visibility modes determine
+        :param include_archived: With ``visibility="all"`` or
+            ``"mine"``, include archived sessions alongside active ones
+            when ``True``. Defaults to ``False``. Older servers drop
+            archived rows from ``"mine"``; the other modes determine
             archive filtering themselves.
         :param visibility: ``"all"`` (default) returns all accessible
             sessions. ``"mine"`` returns owned active sessions, and

@@ -5305,7 +5305,7 @@ async def _execute_session_query_tool(
             agent_name,
             include_archived=include_archived,
             visibility=visibility,
-            server_visibility=server_visibility if continued else None,
+            server_visibility=server_visibility,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -6288,7 +6288,7 @@ async def _session_list_via_rest(
     *,
     include_archived: bool = False,
     visibility: str = "mine",
-    server_visibility: str | None = None,
+    server_visibility: str,
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -6312,8 +6312,8 @@ async def _session_list_via_rest(
     :param include_archived: Also list archived sessions in the global view.
     :param visibility: ``"mine"`` for owned sessions or ``"all"`` to also
         include sessions shared with the caller.
-    :param server_visibility: The scope a continued listing sends to the
-        server; ``None`` negotiates it with the server on the first page.
+    :param server_visibility: The scope sent to the server: ``visibility``
+        on a first page, which may still widen, or the scope a cursor recorded.
     :param limit: Optional maximum rows returned from the global sessions view. When
         omitted, the complete legacy result is preserved while it fits.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -6324,15 +6324,14 @@ async def _session_list_via_rest(
     if cursor_state["sessions"][0] == _DISCOVERY_END:
         sessions_page = _DiscoveryPage([], False)
     else:
-        if server_visibility is None:
-            server_visibility = visibility
-            if (
-                include_archived
-                and visibility == "mine"
-                and not await _server_lists_owned_archives(server_client)
-            ):
-                # Keep archived owned sessions listable on servers whose "mine" scope drops them.
-                server_visibility = "all"
+        if (
+            not continued
+            and include_archived
+            and server_visibility == "mine"
+            and not await _server_lists_owned_archives(server_client)
+        ):
+            # Keep archived owned sessions listable on servers whose "mine" scope drops them.
+            server_visibility = "all"
         sessions_page = await _collect_global_sessions(
             server_client,
             agent_name,
