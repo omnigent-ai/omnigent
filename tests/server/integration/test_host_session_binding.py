@@ -249,6 +249,10 @@ async def test_launch_runner_drops_launch_args_a_fork_copied_from_another_host(
                 continue
             frame = decode_host_frame(output["text"])
             if isinstance(frame, HostLaunchRunnerFrame):
+                # The runner reads the args as it starts, so they must already be clean.
+                at_launch = conv_store.get_conversation(fork.id)
+                assert at_launch is not None
+                launch_args_at_launch.append(at_launch.terminal_launch_args)
                 await comm.send_input(
                     {
                         "type": "websocket.receive",
@@ -263,6 +267,7 @@ async def test_launch_runner_drops_launch_args_a_fork_copied_from_another_host(
                 )
                 return
 
+    launch_args_at_launch: list[list[str] | None] = []
     responder = asyncio.create_task(_respond_launched())
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
@@ -270,6 +275,7 @@ async def test_launch_runner_drops_launch_args_a_fork_copied_from_another_host(
             json={"session_id": fork.id, "workspace": "/tmp"},
         )
     await responder
+    assert launch_args_at_launch == [["--permission-mode", "plan"]]
 
     assert resp.status_code == 200, resp.text
     updated = conv_store.get_conversation(fork.id)

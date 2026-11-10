@@ -101,7 +101,6 @@ from omnigent.server.routes._session_create_validation import (
 from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
 from omnigent.server.routes._sessions.helpers import (
     _announce_session_added,
-    _drop_claude_launch_args_from_another_host,
     _session_status_from_cache,
 )
 from omnigent.server.scheduled.dispatch_scheduler import (
@@ -1921,12 +1920,6 @@ async def _copy_source_session_for_run(
         try:
             conv = await asyncio.to_thread(
                 deps.conversation_store.set_host_id, conv.id, task.host_id, workspace, git_branch
-            )
-            conv = await asyncio.to_thread(
-                _drop_claude_launch_args_from_another_host,
-                deps.conversation_store,
-                conv,
-                task.host_id,
             )
         except Exception:
             # The caller never receives this session, so its cleanup can't delete it.
