@@ -9,6 +9,7 @@ from typing import Any
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.native.permission_modes import (
+    AGENT_DEFAULT_PERMISSION_MODE_HINT,
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
 )
@@ -22,12 +23,36 @@ INHERITED_APPROVAL_SKIPPING_MESSAGE = (
 )
 
 
+def _permission_mode_choices(harness: str | None) -> str:
+    """Name the values a task may send for ``harness``, or for every harness when unknown."""
+    if harness is None:
+        vocabularies = "; ".join(
+            f"{name}: {', '.join(map(repr, modes))}"
+            for name, modes in PERMISSION_LAUNCH_ARGS.items()
+        )
+        return (
+            f"Use a mode from the agent's native harness ({vocabularies}), or "
+            f"{AGENT_DEFAULT_PERMISSION_MODE_HINT}; other harnesses, such as claude-sdk, "
+            "have no automation permission modes"
+        )
+    modes = PERMISSION_LAUNCH_ARGS.get(harness)
+    if not modes:
+        return (
+            f"{harness!r} has no automation permission modes; "
+            f"use {AGENT_DEFAULT_PERMISSION_MODE_HINT}"
+        )
+    return f"Use one of {', '.join(map(repr, modes))}, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}"
+
+
 def validate_scheduled_permission_mode(mode: str | None) -> str | None:
     """Validate the vocabulary before resolving the bound agent's harness."""
     if mode is None:
         return None
     if not any(mode in modes for modes in PERMISSION_LAUNCH_ARGS.values()):
-        raise OmnigentError(f"Unsupported permission_mode: {mode!r}", code=ErrorCode.INVALID_INPUT)
+        raise OmnigentError(
+            f"Unsupported permission_mode: {mode!r}. {_permission_mode_choices(None)}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return mode
 
 
@@ -94,6 +119,7 @@ async def validate_scheduled_permission_support(
         )
     if permission_mode not in PERMISSION_LAUNCH_ARGS.get(harness, {}):
         raise OmnigentError(
-            f"permission_mode {permission_mode!r} is not supported for {harness!r}",
+            f"permission_mode {permission_mode!r} is not supported for {harness!r}. "
+            f"{_permission_mode_choices(harness)}",
             code=ErrorCode.INVALID_INPUT,
         )
