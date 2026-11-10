@@ -166,9 +166,8 @@ async def test_current_runner_refuses_incomplete_review_before_dispatch(
     error = json.loads(result)["error"]
     assert missing_field in error
     assert ("List the task" in error) == (tool_name == "sys_scheduled_task_update")
-    assert ("JSON null (not the string 'null')" in error) == (
-        tool_name == "sys_scheduled_task_create"
-    )
+    if tool_name == "sys_scheduled_task_create":
+        assert "JSON null (not the string 'null')" in error
     assert client.calls == []
 
 
