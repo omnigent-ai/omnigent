@@ -31,8 +31,8 @@ from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from omnigent.db.bounded_binary import BoundedBinary
 from omnigent.db.compression import CompressedText
-from omnigent.db.envelope import EnvelopedJSON
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
@@ -1788,16 +1788,14 @@ class SqlScheduledTaskRun(OmnigentBase):
 
 # Largest stored (compressed) value for a new column, per the database guide.
 _INBOX_MAX_STORED_BYTES = 16_383
-# Items one session may post; each takes one ``session_slot``.
-INBOX_ITEMS_PER_SESSION = 10
 
 
 class SqlInboxItem(OmnigentBase):
     """Agent-posted Inbox suggestions, scoped to a workspace and owner.
 
     Agent and session relationships are maintained by application code (no DB
-    foreign key, Rule R032). ``session_slot`` numbers a session's items from 0
-    so a unique index enforces the per-session cap under concurrent posts.
+    foreign key, Rule R032). What the agent wrote and how the owner answered are
+    two storage envelopes; the other columns route, order, and deduplicate.
     """
 
     __tablename__ = "inbox_items"
@@ -1810,52 +1808,32 @@ class SqlInboxItem(OmnigentBase):
         default=current_workspace_id,
     )
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
-    # The reserved "local" user in single-user mode, so the unique indexes apply there too.
+    # The reserved "local" user in single-user mode, so the unique index applies there too.
     user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     source_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
-    session_slot: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     agent_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    # Content hash of the agent bundle that posted the item, for comparing prompts.
     prompt_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # INBOX_ITEM_KIND code.
-    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    # The agent's content, which a deployment may encrypt, as one storage
-    # envelope (see omnigent.db.envelope): {"title", "body_md", "links",
-    # "actions", "topic", "primary_link"}. Always read and written together.
-    content: Mapped[dict[str, Any]] = mapped_column(
-        EnvelopedJSON(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
-    )
-    # JSON list of typed rich-content blocks, such as a chart (see
-    # omnigent.server.inbox_media), in its own envelope so it has its own size
-    # budget. A new block type needs no schema change.
-    media: Mapped[list[dict[str, Any]]] = mapped_column(
-        EnvelopedJSON(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
-    )
     # Versioned duplicate key: a hash of the kind, primary link, and topic.
     dedupe_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    # INBOX_ITEM_STATE and INBOX_ITEM_RESOLUTION codes.
+    # INBOX_ITEM_STATE code.
     state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    resolution: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    # Index into the content's actions of the action the owner took; NULL otherwise.
-    resolution_action: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    # The owner's comment, {"text": ...}, in its own envelope since it is updated alone.
-    feedback: Mapped[dict[str, Any] | None] = mapped_column(
-        EnvelopedJSON(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=True
+    # What the agent posted, which a deployment may encrypt, as one storage
+    # envelope: {"kind", "title", "body_md", "links", "actions", "topic",
+    # "primary_link", "media"}. Always read and written together.
+    content: Mapped[bytes] = mapped_column(BoundedBinary(_INBOX_MAX_STORED_BYTES), nullable=False)
+    # How the owner answered, in its own envelope since it is written alone:
+    # {"reason", "action", "text"}. NULL until the owner answers.
+    resolution: Mapped[bytes | None] = mapped_column(
+        BoundedBinary(_INBOX_MAX_STORED_BYTES), nullable=True
     )
     # Unix epoch seconds.
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    read_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    acted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    resolved_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
-        CheckConstraint("kind IN (1, 2, 3)", name="ck_inbox_items_kind"),
         CheckConstraint("state IN (1, 2, 3, 4)", name="ck_inbox_items_state"),
-        CheckConstraint("resolution IN (0, 1, 2, 3, 4, 5, 6)", name="ck_inbox_items_resolution"),
-        # A discrete set, so SQLite cannot store fractional slots past the cap.
-        CheckConstraint(
-            f"session_slot IN ({', '.join(str(slot) for slot in range(INBOX_ITEMS_PER_SESSION))})",
-            name="ck_inbox_items_session_slot",
-        ),
         # SQLite enforces neither declared lengths nor types; these bound what it stores.
         CheckConstraint(
             "user_id IS NULL OR length(CAST(user_id AS BLOB)) <= 512",
@@ -1874,12 +1852,8 @@ class SqlInboxItem(OmnigentBase):
             name="ck_inbox_items_content_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
-            "media IS NULL OR length(CAST(media AS BLOB)) <= 16383",
-            name="ck_inbox_items_media_bytes",
-        ).ddl_if(callable_=_on_sqlite_family),
-        CheckConstraint(
-            "feedback IS NULL OR length(CAST(feedback AS BLOB)) <= 16383",
-            name="ck_inbox_items_feedback_bytes",
+            "resolution IS NULL OR length(CAST(resolution AS BLOB)) <= 16383",
+            name="ck_inbox_items_resolution_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
             "workspace_id IS NULL OR typeof(workspace_id) = 'integer'",
@@ -1890,20 +1864,12 @@ class SqlInboxItem(OmnigentBase):
             name="ck_inbox_items_created_at_integer",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
-            "read_at IS NULL OR typeof(read_at) = 'integer'",
-            name="ck_inbox_items_read_at_integer",
-        ).ddl_if(callable_=_on_sqlite_family),
-        CheckConstraint(
-            "acted_at IS NULL OR typeof(acted_at) = 'integer'",
-            name="ck_inbox_items_acted_at_integer",
+            "resolved_at IS NULL OR typeof(resolved_at) = 'integer'",
+            name="ck_inbox_items_resolved_at_integer",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
             "expires_at IS NULL OR typeof(expires_at) = 'integer'",
             name="ck_inbox_items_expires_at_integer",
-        ).ddl_if(callable_=_on_sqlite_family),
-        CheckConstraint(
-            "resolution_action IS NULL OR typeof(resolution_action) = 'integer'",
-            name="ck_inbox_items_resolution_action_integer",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
             "length(CAST(id AS BLOB)) = 16",
@@ -1928,19 +1894,13 @@ class SqlInboxItem(OmnigentBase):
             "created_at",
             "id",
         ),
+        # Bounded count of the items one session posted, for the per-session cap.
+        Index("ix_inbox_items_session", "workspace_id", "user_id", "source_session_id"),
         Index(
             "uq_inbox_items_user_dedupe_key",
             "workspace_id",
             "user_id",
             "dedupe_key",
-            unique=True,
-        ),
-        Index(
-            "uq_inbox_items_session_slot",
-            "workspace_id",
-            "user_id",
-            "source_session_id",
-            "session_slot",
             unique=True,
         ),
     )
