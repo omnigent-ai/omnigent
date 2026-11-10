@@ -2067,11 +2067,30 @@ def create_runner_app(
             message = f"{message}\n\nLast captured terminal output:\n{pane}"
         return message
 
+    def _terminal_exit_still_owns_session(
+        event: TerminalExitEvent, turn_epoch: int | None
+    ) -> bool:
+        registry = resource_registry.terminal_registry
+        current = (
+            registry.get(event.session_id, event.terminal_name, event.session_key)
+            if registry is not None
+            else None
+        )
+        return _turn_bind_epoch.get(event.session_id) == turn_epoch and (
+            current is None or current.diagnostic_id == event.terminal_instance_id
+        )
+
     def _release_required_terminal_session(
-        session_id: str, *, grace_s: float = _TERMINAL_EXIT_RELEASE_GRACE_S
+        event: TerminalExitEvent, *, grace_s: float = _TERMINAL_EXIT_RELEASE_GRACE_S
     ) -> None:
         if process_manager is None:
             return
+        session_id = event.session_id
+        expected_client = process_manager.registered_client(session_id)
+        turn_epoch = _turn_bind_epoch.get(session_id)
+
+        def _still_owns_session() -> bool:
+            return _terminal_exit_still_owns_session(event, turn_epoch)
 
         async def _release() -> None:
             # Let a live turn stream converge first (bounded): the harness's own
@@ -2079,9 +2098,17 @@ def create_runner_app(
             # sever the stream carrying it.
             deadline = time.monotonic() + grace_s
             while session_id in _live_response_id and time.monotonic() < deadline:
+                if not _still_owns_session():
+                    return
                 await asyncio.sleep(0.05)
+            if not _still_owns_session():
+                return
             try:
-                await process_manager.release(session_id)
+                await process_manager.release(
+                    session_id,
+                    expected_client=expected_client,
+                    can_release=_still_owns_session,
+                )
             except Exception:
                 _logger.exception(
                     "Failed to release harness subprocess after required terminal exit: "
@@ -2126,16 +2153,23 @@ def create_runner_app(
             # Should the release still sever the stream before that error lands,
             # the drop reports this closed pane and its output, not the transport.
             _required_terminal_exit_errors[event.session_id] = _build_delivery_timeout_error(event)
-            _release_required_terminal_session(
-                event.session_id, grace_s=_EXPECTED_CLOSE_RELEASE_GRACE_S
-            )
+            _release_required_terminal_session(event, grace_s=_EXPECTED_CLOSE_RELEASE_GRACE_S)
             return
 
         # A required terminal exit ends the session. Tear down any registered
         # Codex app-server alongside it; this is a no-op for other harnesses.
-        _teardown_task = asyncio.create_task(
-            _native_runtime.teardown_codex_native_app_server(event.session_id)
-        )
+        exit_turn_epoch = _turn_bind_epoch.get(event.session_id)
+        exited_app_server = _native_runtime._AUTO_CODEX_APP_SERVERS.get(event.session_id)
+
+        async def _teardown_after_exit() -> None:
+            if (
+                _terminal_exit_still_owns_session(event, exit_turn_epoch)
+                and _native_runtime._AUTO_CODEX_APP_SERVERS.get(event.session_id)
+                is exited_app_server
+            ):
+                await _native_runtime.teardown_codex_native_app_server(event.session_id)
+
+        _teardown_task = asyncio.create_task(_teardown_after_exit())
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
 
@@ -2157,7 +2191,7 @@ def create_runner_app(
                 event.session_id
             )
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
-            _release_required_terminal_session(event.session_id)
+            _release_required_terminal_session(event)
             return
 
         # Record the exit before release severs its stream, preserving the cause.
@@ -2172,7 +2206,7 @@ def create_runner_app(
         _required_terminal_exit_errors[event.session_id] = error
 
         if event.session_was_idle:
-            _release_required_terminal_session(event.session_id)
+            _release_required_terminal_session(event)
             return
 
         if _shutting_down.is_set():
@@ -2185,7 +2219,7 @@ def create_runner_app(
                 event.session_id,
                 extra={"session_id": event.session_id},
             )
-            _release_required_terminal_session(event.session_id)
+            _release_required_terminal_session(event)
             return
 
         exit_log = debug_event("required_terminal_exited", session_id=event.session_id)
@@ -2230,7 +2264,7 @@ def create_runner_app(
             status="failed",
             output=error["message"],
         )
-        _release_required_terminal_session(event.session_id)
+        _release_required_terminal_session(event)
 
     resource_registry.set_terminal_exit_publisher(_publish_terminal_exit)
 
