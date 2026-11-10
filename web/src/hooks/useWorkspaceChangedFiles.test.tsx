@@ -38,7 +38,9 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
+  useWorkspaceServeable,
 } from "./useWorkspaceChangedFiles";
+import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
 
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -179,9 +181,27 @@ function FileSearchProbe({
 function FileSearchTruncatedProbe({ id, query }: { id: string; query: string }) {
   const { data } = useWorkspaceFileSearch(id, query);
   return (
-    <output data-testid="truncated">
-      {data === undefined ? "pending" : String(data.truncated)}
-    </output>
+    <>
+      <output data-testid="truncated">
+        {data === undefined ? "pending" : String(data.truncated)}
+      </output>
+      <output data-testid="has-more">
+        {data === undefined ? "pending" : String(data.hasMore)}
+      </output>
+    </>
+  );
+}
+
+/** Go to File's status for a live search, as its dialog derives it. */
+function GoToFileStatusProbe({ id, query }: { id: string; query: string }) {
+  const search = useWorkspaceFileSearch(id, query);
+  const serveable = useWorkspaceServeable(id);
+  const state = goToFileSearchState({ ...search, query, searchedQuery: query, serveable });
+  return (
+    <>
+      <output data-testid="phase">{state.phase}</output>
+      <output data-testid="message">{goToFileStatusMessage(state, query, 0)}</output>
+    </>
   );
 }
 
@@ -777,6 +797,71 @@ describe("useWorkspaceFileSearch truncation", () => {
     );
 
     await waitFor(() => expect(screen.getByTestId("truncated")).toHaveTextContent("true"));
+    expect(screen.getByTestId("has-more")).toHaveTextContent("false");
+  });
+
+  it("reports has_more separately, so a full result page isn't shown as complete", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(
+      jsonResponse({ object: "list", data: [], has_more: true, truncated: false }),
+    );
+
+    render(
+      <Wrap>
+        <FileSearchTruncatedProbe id="conv_live" query="src" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("has-more")).toHaveTextContent("true"));
+    expect(screen.getByTestId("truncated")).toHaveTextContent("false");
+  });
+});
+
+describe("Go to File status from a live search", () => {
+  // Liveness can lag: the runner may be gone, or the session may have no OS
+  // environment, while the health signal still reads online or unknown.
+  const unavailableText = "This session's files aren't available right now.";
+
+  it("says the files are unavailable, not that nothing matched, on a 404 while online", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(new Response(null, { status: 404 }));
+
+    render(
+      <Wrap>
+        <GoToFileStatusProbe id="conv_live" query="readme" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("phase")).toHaveTextContent("unavailable"));
+    expect(screen.getByTestId("message")).toHaveTextContent(unavailableText);
+  });
+
+  it("says the files are unavailable on a runner_unavailable 503 while liveness is unknown", async () => {
+    onlineMock.mockReturnValue(undefined);
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    render(
+      <Wrap>
+        <GoToFileStatusProbe id="conv_live" query="readme" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("phase")).toHaveTextContent("unavailable"));
+    expect(screen.getByTestId("message")).toHaveTextContent(unavailableText);
+  });
+
+  it("says nothing matched only when the workspace answered with no files", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <GoToFileStatusProbe id="conv_live" query="readme" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("phase")).toHaveTextContent("settled"));
+    expect(screen.getByTestId("message")).toHaveTextContent("No files match “readme”.");
   });
 });
 
