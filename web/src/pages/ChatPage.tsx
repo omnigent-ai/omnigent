@@ -3364,6 +3364,8 @@ function ComposerImpl(
       const joined = appendReplyDraft(draft, restoreReplyDraft(merged.text, merged.replyDraft));
       replaceText(serializeReplyDraft(joined), snapshotReplyDraft(joined));
       restoreTaggedMentionsRef.current(merged.mentions);
+      if (failed.files.length > 0)
+        attachmentsRef.current.replaceFiles([...filesRef.current, ...failed.files]);
       dirtyRef.current = true;
       return;
     }

@@ -3090,8 +3090,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(sentOnScreen ? {} : { offScreen: true }),
         });
       }
-      const callerHandlesError = heldForHost || opts?.onError !== undefined;
-      if (!heldForHost) opts?.onError?.(message);
+      // A queued send's callback would requeue a copy of what the composer now holds.
+      const callerHandlesError = heldForHost || (!returnedByStop && opts?.onError !== undefined);
+      if (!heldForHost && !returnedByStop) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right

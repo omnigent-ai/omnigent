@@ -6732,6 +6732,35 @@ describe("Composer failed-send attachment restore", () => {
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
+  it("adds steers returned by Stop, attachments included, after the composer's input", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "newer" } });
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["mine"], "mine.txt", { type: "text/plain" })] },
+    });
+    const notes = new File(["notes"], "notes.txt", { type: "text/plain" });
+
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "change of plan",
+          files: [notes],
+          returnedParts: [
+            { tempId: "pend_1", pendingId: "pending_1", text: "change of plan", files: [] },
+            { tempId: "pend_2", pendingId: "pending_2", text: "", files: [notes] },
+          ],
+          recovered: true,
+        },
+      }),
+    );
+
+    expect(textarea()).toHaveValue("newer\n\nchange of plan");
+    expect(screen.getByText("mine.txt")).toBeTruthy();
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
   it("clears the failed-send rejection notice once the user types", () => {
     render(<Composer {...composerProps()} />);
     act(() =>

@@ -7673,7 +7673,13 @@ describe("chatStore — stop", () => {
       readEarly: false,
       answer: "offline",
     },
-  ])("returns a steer still posting at Stop, $outcome", async ({ readEarly, answer }) => {
+    { outcome: "kept, not requeued, when its queued Steer fails", answer: "failed", queued: true },
+    {
+      outcome: "kept, not requeued, when its queued Steer finds the host offline",
+      answer: "offline",
+      queued: true,
+    },
+  ])("returns a steer still posting at Stop, $outcome", async ({ readEarly, answer, queued }) => {
     let answerPost: ((response: Response) => void) | null = null;
     fetchMock.mockImplementation((input, init) => {
       const url = String(input);
@@ -7689,18 +7695,31 @@ describe("chatStore — stop", () => {
         });
       return defaultFetchHandler(input, init);
     });
+    const notes = new File(["notes"], "notes.txt");
     useChatStore.setState({
       conversationId: "conv_existing",
+      boundAgentId: "agent_xyz",
       abortController: new AbortController(),
       isNativeTerminalSession: true,
       sessionStatus: "running",
       status: "streaming",
       pendingUserMessages: [],
-      queuedMessages: [],
+      queuedMessages: queued
+        ? [
+            {
+              queueId: "q_late",
+              text: "late steer",
+              files: [notes],
+              conversationId: "conv_existing",
+            },
+          ]
+        : [],
     });
-    const notes = new File(["notes"], "notes.txt");
 
-    const sending = useChatStore.getState().send("late steer", "agent_xyz", [notes]);
+    if (queued) useChatStore.getState().steerMessage("q_late");
+    const sending = queued
+      ? null
+      : useChatStore.getState().send("late steer", "agent_xyz", [notes]);
     useChatStore.getState().stop();
     const returned = useChatStore.getState().failedSendDraft;
     expect(returned).toMatchObject({
@@ -7717,7 +7736,8 @@ describe("chatStore — stop", () => {
       failed: () => mockResponse({ error: "boom" }, { ok: false, status: 500 }),
     };
     answerPost!(responses[answer as keyof typeof responses]());
-    await sending;
+    await (sending ??
+      vi.waitFor(() => expect(useChatStore.getState().blocks.at(-1)?.type).toBe("error")));
 
     if (answer === "accepted" && !readEarly) {
       expect(useChatStore.getState().failedSendDraft?.returnedParts).toEqual([
