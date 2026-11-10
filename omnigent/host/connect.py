@@ -128,6 +128,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSetMcpServerEnabledFrame,
+    HostSetMcpServerEnabledResultFrame,
     HostSkillContentFrame,
     HostSkillContentResultFrame,
     HostSkillsFrame,
@@ -207,6 +209,7 @@ from omnigent.runner.identity import (
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
+    RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -631,8 +634,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
         # Forge CLI config selectors must agree across CLI, daemon, and runner.
-        # Forward paths only; bearer-token environment variables remain excluded.
+        # Forward paths and hosts; bearer-token environment variables remain excluded.
         "GLAB_CONFIG_DIR",
+        "GITLAB_HOST",
+        "GLAB_HOST",
         "GH_CONFIG_DIR",
         "XDG_CONFIG_HOME",
         "XDG_CONFIG_DIRS",
@@ -718,7 +723,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # launcher registered in the ``omnigent.claude_launcher`` group (e.g.
         # ``isaac``). Read by omnigent.claude_launcher.resolve_claude_launch in
         # the managed-host runner (``_auto_create_claude_terminal``) to wrap the
-        # Claude launch through a downstream binary (e.g. Databricks' isaac).
+        # Claude launch through a downstream binary.
         # The daemon→runner env strip would otherwise drop it, leaving the
         # runner on the default launch. Safe to propagate: not a secret, just a
         # plugin name.
@@ -961,6 +966,7 @@ def _build_runner_env(
     initial_auth_token: str | None = None,
     host_id: str | None = None,
     harness: str | None = None,
+    mcp_disabled_servers_active_harnesses: list[str] | None = None,
     interactive_shells: list[str] | None = None,
     host_owns_global_cleanup: bool = False,
     harness_tmp_parent: Path | None = None,
@@ -1061,6 +1067,10 @@ def _build_runner_env(
         env[RUNNER_SLICE_KEY_ENV_VAR] = host_id
     if harness:
         env[RUNNER_LAUNCH_HARNESS_ENV_VAR] = harness
+    if mcp_disabled_servers_active_harnesses is not None:
+        env[RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR] = json.dumps(
+            mcp_disabled_servers_active_harnesses
+        )
     if interactive_shells is not None:
         env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
     return env
@@ -2070,10 +2080,16 @@ class HostProcess:
             and (binding_for_harness(frame.inference_config, frame.harness) is not None)
         )
         if has_binding:
-            from omnigent.onboarding.harness_install import missing_harness_cli
+            from omnigent.onboarding.harness_install import (
+                READINESS_CLI_PROBE_TIMEOUT_S,
+                missing_harness_cli,
+            )
 
             assert frame.harness is not None
-            harness_ready = (await asyncio.to_thread(missing_harness_cli, frame.harness)) is None
+            missing = await asyncio.to_thread(
+                missing_harness_cli, frame.harness, READINESS_CLI_PROBE_TIMEOUT_S
+            )
+            harness_ready = missing is None
         else:
             harness_ready = frame.harness is None or await asyncio.to_thread(
                 harness_is_configured, frame.harness
@@ -2164,6 +2180,7 @@ class HostProcess:
             initial_auth_token=initial_auth_token,
             host_id=self._identity.host_id,
             harness=frame.harness,
+            mcp_disabled_servers_active_harnesses=frame.mcp_disabled_servers_active_harnesses,
             interactive_shells=self._interactive_shells,
             host_owns_global_cleanup=self._maintenance_janitor is not None,
             harness_tmp_parent=self._harness_tmp_parent,
@@ -4017,6 +4034,50 @@ class HostProcess:
             )
         return HostSkillContentResultFrame(request_id=frame.request_id, status="ok", skill=skill)
 
+    def _handle_set_mcp_server_enabled(
+        self, frame: HostSetMcpServerEnabledFrame
+    ) -> HostSetMcpServerEnabledResultFrame:
+        from omnigent.host.mcp_inventory import configured_mcp_servers, find_configured_server
+        from omnigent.mcp_disabled_servers import (
+            HARNESS_EXECUTORS,
+            DisabledServerWriteError,
+            ServerKey,
+            set_disabled,
+        )
+
+        def rejected(message: str) -> HostSetMcpServerEnabledResultFrame:
+            return HostSetMcpServerEnabledResultFrame(
+                frame.request_id, "failed", error=message, error_code="invalid_server"
+            )
+
+        if frame.harness not in HARNESS_EXECUTORS or frame.server == "omnigent":
+            return rejected("This MCP server cannot be toggled")
+        servers = configured_mcp_servers()
+        if any(
+            server.summary["harness"] == frame.harness
+            and server.summary["name"] == frame.server
+            and server.summary.get("managed") == "true"
+            for server in servers
+        ):
+            return rejected("Managed MCP servers cannot be toggled")
+        try:
+            server = find_configured_server(
+                frame.harness, frame.server, frame.plugin, frame.source_id, servers=servers
+            )
+        except LookupError:
+            return rejected("MCP server no longer exists or its source changed; refresh inventory")
+        try:
+            set_disabled(ServerKey(frame.harness, frame.server, frame.plugin), not frame.enabled)
+        except DisabledServerWriteError as exc:
+            return HostSetMcpServerEnabledResultFrame(
+                frame.request_id,
+                "failed",
+                error=str(exc),
+                error_code="io" if exc.code == "io" else "invalid_server",
+            )
+        summary = {**server.summary, "enabled": str(frame.enabled).lower(), "locked": "false"}
+        return HostSetMcpServerEnabledResultFrame(frame.request_id, "ok", server=summary)
+
     async def _handle_mcp_tools(self, frame: HostMcpToolsFrame) -> HostMcpToolsResultFrame:
         try:
             result = await self._mcp_tools.probe(
@@ -4368,6 +4429,18 @@ class HostProcess:
                 cast("str | None", params.get("pr_url")),
                 head_sha=cast("str | None", params.get("head_sha")),
                 base_sha=cast("str | None", params.get("base_sha")),
+            )
+        if op == "github_commits":
+            return r.github_commits(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+            )
+        if op == "github_commit_diff":
+            return r.github_commit_diff(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                commit_sha=cast("str | None", params.get("commit_sha")),
             )
         if op == "github_labels":
             return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
@@ -6030,6 +6103,9 @@ class HostProcess:
         elif isinstance(frame, HostSkillContentFrame):
             content_result = await asyncio.to_thread(self._handle_skill_content, frame)
             await self._send_text(ws, self._encode_frame(content_result))
+        elif isinstance(frame, HostSetMcpServerEnabledFrame):
+            enabled_result = await asyncio.to_thread(self._handle_set_mcp_server_enabled, frame)
+            await self._send_text(ws, self._encode_frame(enabled_result))
         elif isinstance(frame, HostMcpToolsFrame):
             tools_result = await self._handle_mcp_tools(frame)
             await self._send_text(ws, self._encode_frame(tools_result))

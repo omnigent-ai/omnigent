@@ -60,6 +60,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
+    humanize_mention_markers,
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
@@ -6560,6 +6561,7 @@ async def _launch_runner_on_host_locked(
                 # same configuration check it does at create-time launch. None
                 # (agent not resolvable) skips the host-side check — fail open.
                 harness=_resolve_harness(conv),
+                mcp_disabled_servers_active_harnesses=host_registry.mcp_disabled_servers_active_harnesses(),
                 inference_config=(
                     conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
                 ),
@@ -7470,6 +7472,16 @@ async def _persist_native_policy_notice(
     # one-shot flag already prevents re-surfacing; this dedups a same-turn
     # retry against an already-recorded notice).
     if persisted == "persisted":
+        _logger.warning(
+            "%s",
+            error.message,
+            extra=debug_event(
+                _NATIVE_POLICY_NOT_ENFORCED_CODE,
+                session_id=session_id,
+                code=error.code,
+                source=error.source,
+            ),
+        )
         _publish_error_event(session_id, error)
 
 
@@ -8122,8 +8134,8 @@ async def _dispatch_skill_slash_command_to_runner(
     response id:
 
     * a visible ``slash_command`` item for the UI transcript;
-    * a hidden ``message`` item with ``is_meta=True`` containing the
-      full skill instructions for runner history replay.
+    * a hidden ``message`` item with ``is_meta=True`` and ``user_authored=True``
+      containing the full skill instructions for runner history replay.
 
     Only the hidden message is sent to the runner as input. The visible
     command is published as ``response.output_item.done`` after the
@@ -8184,6 +8196,7 @@ async def _dispatch_skill_slash_command_to_runner(
             role="user",
             content=meta_content,
             is_meta=True,
+            user_authored=True,
         ),
         created_by=created_by,
     )
@@ -10300,6 +10313,7 @@ async def _remove_session_worktree_best_effort(
     host_registry: Any,
     reason: str,
     conversation_store: ConversationStore | None = None,
+    host_store: HostStore | None = None,
     exclude_conversation_id: str | None = None,
     fail_if_unavailable: bool = False,
     expected_root_fingerprint: str | None = None,
@@ -10349,6 +10363,13 @@ async def _remove_session_worktree_best_effort(
     )
     from omnigent.server.routes._workspace_validation import _is_subpath_of
 
+    if host_store is not None:
+        host = await asyncio.to_thread(host_store.get_host, host_id, include_deleted=True)
+        if host is not None and host.sandbox_provider is not None:
+            # Shared sandbox files live until last-binding teardown, including
+            # admissions racing this optional worktree cleanup.
+            return
+
     # A fork reusing the source's directory, or several sessions attached to
     # one existing worktree, all run in the same cwd. Removing it under them
     # leaves their runners on a deleted directory, so leave a shared worktree
@@ -10368,10 +10389,11 @@ async def _remove_session_worktree_best_effort(
             workspace=cleanup_root,
             exclude_conversation_id=exclude_conversation_id,
             include_subdirectories=True,
+            include_archived=True,
         )
         if shared:
             _logger.info(
-                "Keeping worktree %s (%s): another live session still runs there",
+                "Keeping worktree %s (%s): another session still uses it",
                 worktree_path,
                 reason,
             )
@@ -10901,13 +10923,19 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
+        FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
 
+    if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in labels):
+        raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        # Deleting a session also deletes the automation this label names.
+        SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
     ):
@@ -11048,6 +11076,7 @@ def _persist_stored_session_bundle(
     runner_id: str | None = None,
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
+    git_branch: str | None = None,
     created_by: str | None = None,
 ) -> CreatedSessionResponse:
     """
@@ -11089,6 +11118,7 @@ def _persist_stored_session_bundle(
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
             workspace=metadata.workspace,
+            git_branch=git_branch,
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
@@ -11147,6 +11177,7 @@ def _persist_session_for_uploaded_agent(
     runner_id: str | None = None,
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
+    git_branch: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist a top-level session bound to the agent row of an earlier, identical upload.
@@ -11169,6 +11200,7 @@ def _persist_session_for_uploaded_agent(
             runner_id=runner_id,
             host_id=metadata.host_id,
             workspace=metadata.workspace,
+            git_branch=git_branch,
             terminal_launch_args=metadata.terminal_launch_args,
             project_id=metadata.project_id,
             inference_snapshot=inference_snapshot,
@@ -11422,7 +11454,9 @@ def _latest_message_preview(
         for block in item.data.content:
             block_type = block.get("type")
             text = block.get("text")
-            if block_type in ("input_text", "output_text") and isinstance(text, str):
+            if block_type == "input_text" and isinstance(text, str):
+                parts.append(humanize_mention_markers(text))
+            elif block_type == "output_text" and isinstance(text, str):
                 parts.append(text)
         collapsed = " ".join(" ".join(parts).split())
         if not collapsed:

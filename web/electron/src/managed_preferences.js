@@ -1,13 +1,13 @@
 "use strict";
 
-/** Public macOS Managed Preferences key in the ai.omnigent.desktop domain. */
+/** macOS Managed Preferences key in the ai.omnigent.desktop domain. */
 const SERVER_URLS_KEY = "serverUrls";
 
 /** Optional query parameter on a serverUrls entry naming that server. */
 const SERVER_NAME_PARAM = "omnigentServerName";
 
 /**
- * Managed Preferences key gating Databricks-internal features (e.g. the Arca
+ * Managed Preferences key gating managed features (e.g. the Arca
  * host option). Boolean; anything but an explicit true reads as disabled.
  */
 const DATABRICKS_INTERNAL_FEATURES_KEY = "databricksInternalFeaturesEnabled";
@@ -80,7 +80,7 @@ function parseManagedServerUrls(value) {
 }
 
 /**
- * Read effective macOS preferences. MDM-forced values and ordinary defaults
+ * Read effective macOS preferences. Forced values and ordinary defaults
  * share NSUserDefaults' effective-value API; callers treat the result as
  * read-only and never copy the configured list into settings.json.
  *
@@ -120,7 +120,7 @@ function getManagedServerNames(options) {
 }
 
 /**
- * Read the Databricks-internal-features flag from effective macOS preferences.
+ * Read the managed-features flag from effective macOS preferences.
  * Fails closed: any missing value, wrong type, non-darwin platform, or read
  * error reads as disabled. Like the managed server list, the value is read on
  * demand and never persisted, so removing the profile disables it immediately.

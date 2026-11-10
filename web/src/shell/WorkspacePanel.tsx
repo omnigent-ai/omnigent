@@ -4,16 +4,12 @@ import {
   CheckIcon,
   ChevronDownIcon,
   FileIcon,
-  FolderTreeIcon,
-  FileDiffIcon,
-  GitPullRequestIcon,
   GlobeIcon,
   Loader2Icon,
   MaximizeIcon,
   MessagesSquareIcon,
   MinimizeIcon,
   PlusIcon,
-  SearchIcon,
   TerminalIcon,
   XIcon,
 } from "lucide-react";
@@ -34,12 +30,9 @@ import {
 import { cn } from "@/lib/utils";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
-  ARIA_MOD_KEY,
   CompactShortcutKeys,
-  MOD_KEY,
   NEW_BROWSER_TAB_KEYS,
   NEW_TERMINAL_KEYS,
-  SHIFT_KEY,
   workspaceTabAriaShortcut,
   workspaceTabShortcutKeys,
 } from "@/components/KeyboardShortcut";
@@ -70,6 +63,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
+import { requestSandboxWake } from "@/hooks/useSandboxAutoWake";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -91,10 +85,11 @@ import {
   terminalTabKey,
   useCreateTerminal,
   useTerminals,
+  type TerminalInfo,
 } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
-import { WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
+import { scrollTabIntoView, WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
@@ -103,19 +98,17 @@ import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
-import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
+import type { RightRailTab } from "./railTabs";
+import {
+  WORKSPACE_PANEL_TABS,
+  type WorkspacePanelTab,
+  workspacePanelTabPresentation,
+} from "./workspacePanelTabs";
 import { Button } from "../components/ui/button";
 
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
 );
-const workspacePanels = {
-  "content-search": { label: "Content search", icon: SearchIcon },
-  files: { label: "Files", icon: FolderTreeIcon },
-  changes: { label: "Changes", icon: FileDiffIcon },
-  github: { label: "Pull Requests", icon: GitPullRequestIcon },
-  subagents: { label: "Agents", icon: BotIcon },
-};
 
 function WorkspaceMenuShortcut({
   keys,
@@ -223,7 +216,8 @@ function NewTabMenu({
   onCreateStart?: () => void;
   /** Called when the shell create POST fails, so the caller can disarm the
    *  focus snapshot armed by ``onCreateStart``. */
-  onCreateError?: () => void;
+  /** The create failed; *opened* is the shell tab opened early, if any. */
+  onCreateError?: (opened?: TerminalInfo) => void;
   /** Open session's derived liveness — drives the "Shell" item's connect
    *  affordance. Absent is treated as ready. */
   liveness?: SessionLiveness;
@@ -259,9 +253,9 @@ function NewTabMenu({
     // (runner-asleep) session the POST can lag the tab's arrival by seconds;
     // ``onOpenTerminal`` on success is a backstop for when it's already open.
     onCreateStart?.();
-    create.mutate(name, {
-      onSuccess: (info) => onOpenTerminal(terminalTabKey(info)),
-      onError: () => onCreateError?.(),
+    create.launch(name, {
+      onOpen: (info) => onOpenTerminal(terminalTabKey(info)),
+      onError: (_error, opened) => onCreateError?.(opened),
     });
   };
 
@@ -337,7 +331,7 @@ function NewTabMenu({
         <SuppressBrowserView />
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
         {panels.map((tab) => {
-          const { label, icon: Icon } = workspacePanels[tab];
+          const { label, icon: Icon } = WORKSPACE_PANEL_TABS[tab];
           return (
             <DropdownMenuItem
               key={tab}
@@ -442,12 +436,10 @@ function FileTabsStrip({
   onCloseFile: (path: string) => void;
 }) {
   // Scroll the active tab into view when it changes (e.g. a newly opened file
-  // appended past the visible edge). `inline: "nearest"` scrolls whichever
-  // ancestor is the scroller — the outer strip (<500px) or the file-tabs
-  // region (≥500px) — without us hard-coding which one.
+  // appended past the visible edge).
   const activeTabRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeTabRef.current);
   }, [activeFilePath]);
   // Render nothing (not an empty flex row) when there are no files — an empty
   // wrapper would still consume a slot in the parent's gap-0.5 and leave a
@@ -559,7 +551,7 @@ function TerminalTabsStrip({
 }) {
   const activeTabRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeTabRef.current);
   }, [activeTerminalKey]);
   // Render nothing (not an empty flex row) when there are no shells — an empty
   // wrapper would still consume a slot in the parent's gap-0.5 and leave a
@@ -802,7 +794,7 @@ interface WorkspacePanelProps {
   onShellCreateStart?: () => void;
   /** Called when the shell create POST fails, so the focus snapshot armed by
    *  ``onShellCreateStart`` is disarmed and can't grab an unrelated shell. */
-  onShellCreateFailed?: () => void;
+  onShellCreateFailed?: (opened?: TerminalInfo) => void;
   /** Whether the mobile side-chats drawer is open. The rail is hidden on
    *  phones, so side chats render in this drawer instead. */
   mobileSideChatsOpen?: boolean;
@@ -993,7 +985,7 @@ function WorkspacePanelImpl({
   };
   const activeBrowserRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeBrowserRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeBrowserRef.current);
   }, [browsers.selected, rightRailTab]);
   const browserSelected =
     rightRailTab === "browser" &&
@@ -1112,7 +1104,7 @@ function WorkspacePanelImpl({
   const clearSideChatToOpen = useChatStore((s) => s.clearSideChatToOpen);
   const activeSideChatRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeSideChatRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeSideChatRef.current);
   }, [sideChats.selected, rightRailTab]);
   // Pending tabs awaiting a real child id, in submit order. Only Codex uses this
   // queue — its child arrives asynchronously via session_created with no id to
@@ -1416,7 +1408,7 @@ function WorkspacePanelImpl({
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
   const activePanelRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
-    activePanelRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activePanelRef.current);
   }, [rightRailTab]);
   const showOpenTabs =
     !pending &&
@@ -1454,6 +1446,11 @@ function WorkspacePanelImpl({
     return index === -1 ? undefined : String(index + 1);
   };
   const selectPermanentTab = (tab: RightRailTab) => {
+    // Files, Changes and Pull Requests need the session's host, so picking one wakes
+    // an asleep sandbox.
+    if ((tab === "files" || tab === "changes" || tab === "github") && conversationId) {
+      requestSandboxWake(conversationId);
+    }
     onRightRailTabChange(tab);
   };
   const tabAriaShortcut = (tab: RightRailTab) => {
@@ -1501,7 +1498,7 @@ function WorkspacePanelImpl({
   const panelOptions = [
     ...[...visiblePermanentTabs, ...visibleOpenPanels].map((tab) => ({
       key: tab,
-      label: workspacePanels[tab].label,
+      label: WORKSPACE_PANEL_TABS[tab].label,
       active:
         selectedFilePath === null &&
         selectedTerminalKey === null &&
@@ -1546,100 +1543,36 @@ function WorkspacePanelImpl({
       disabled: false,
     })),
   ];
-  const tabTriggers = {
-    "content-search": showContentSearch && showFilesPanel && (
-      <WorkspaceTabTooltip
-        key="content-search"
-        label="Content search"
-        shortcut={[MOD_KEY, SHIFT_KEY, "F"]}
-      >
+  const renderTabTrigger = (tab: WorkspacePanelTab) => {
+    const presentation = workspacePanelTabPresentation(WORKSPACE_PANEL_TABS[tab], {
+      pending,
+      showFilesPanel,
+      showGithubTab,
+      showContentSearch,
+      changedCount,
+      agentCount,
+      subagentsWorking,
+      digit: shortcutFor(tab),
+      digitAriaShortcut: tabAriaShortcut(tab),
+    });
+    if (presentation === null) return null;
+    const { label, icon: Icon, badge } = presentation;
+    return (
+      <WorkspaceTabTooltip key={tab} label={label} shortcut={presentation.tooltipShortcut}>
         <TabsTrigger
-          value="content-search"
-          aria-label="Content search"
-          aria-keyshortcuts={`${ARIA_MOD_KEY}+Shift+F ${tabAriaShortcut("content-search") ?? ""}`.trim()}
-          data-workspace-tab="content-search"
+          value={tab}
+          aria-label={presentation.ariaLabel}
+          aria-keyshortcuts={presentation.ariaKeyShortcuts}
+          data-workspace-tab={tab}
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
         >
-          <SearchIcon />
-          <span className="sr-only">Content search</span>
+          <Icon />
+          <span className="sr-only">{label}</span>
+          {badge && <span className={badge.className}>{badge.text}</span>}
         </TabsTrigger>
       </WorkspaceTabTooltip>
-    ),
-    files: (pending || showFilesPanel) && (
-      <WorkspaceTabTooltip key="files" label="Files" shortcut={shortcutFor("files")}>
-        <TabsTrigger
-          value="files"
-          aria-label="Files"
-          aria-keyshortcuts={tabAriaShortcut("files")}
-          data-workspace-tab="files"
-          disabled={pending}
-          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-        >
-          <FolderTreeIcon />
-          <span className="sr-only">Files</span>
-        </TabsTrigger>
-      </WorkspaceTabTooltip>
-    ),
-    changes: (pending || showFilesPanel) && (
-      <WorkspaceTabTooltip key="changes" label="Changes" shortcut={shortcutFor("changes")}>
-        <TabsTrigger
-          value="changes"
-          aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
-          aria-keyshortcuts={tabAriaShortcut("changes")}
-          data-workspace-tab="changes"
-          disabled={pending}
-          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-        >
-          <FileDiffIcon />
-          <span className="sr-only">Changes</span>
-          {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
-        </TabsTrigger>
-      </WorkspaceTabTooltip>
-    ),
-    github: (pending || showGithubTab) && (
-      <WorkspaceTabTooltip key="github" label="Pull Requests" shortcut={shortcutFor("github")}>
-        <TabsTrigger
-          value="github"
-          aria-label="Pull Requests"
-          aria-keyshortcuts={tabAriaShortcut("github")}
-          data-workspace-tab="github"
-          disabled={pending}
-          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-        >
-          <GitPullRequestIcon />
-          <span className="sr-only">Pull Requests</span>
-        </TabsTrigger>
-      </WorkspaceTabTooltip>
-    ),
-    subagents: (
-      <WorkspaceTabTooltip key="subagents" label="Agents" shortcut={shortcutFor("subagents")}>
-        <TabsTrigger
-          value="subagents"
-          disabled={pending}
-          aria-keyshortcuts={tabAriaShortcut("subagents")}
-          data-workspace-tab="subagents"
-          aria-label={
-            subagentsWorking > 0
-              ? `Agents ${subagentsWorking}/${agentCount}`
-              : `Agents ${agentCount}`
-          }
-          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-        >
-          <BotIcon />
-          <span className="sr-only">Agents</span>
-          <span
-            className={cn(
-              TAB_BADGE_BASE,
-              "sr-only",
-              subagentsWorking > 0 ? "text-success" : "text-muted-foreground",
-            )}
-          >
-            {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
-          </span>
-        </TabsTrigger>
-      </WorkspaceTabTooltip>
-    ),
+    );
   };
   // The selected tab's view, beneath any open file or shell tab.
   const scopeView =
@@ -1927,7 +1860,7 @@ function WorkspacePanelImpl({
               componentId="chat.right_rail.tabs"
             >
               <TabsList variant="pill" className="gap-1">
-                {visiblePermanentTabs.map((tab) => tabTriggers[tab])}
+                {visiblePermanentTabs.map(renderTabTrigger)}
               </TabsList>
             </Tabs>
           )}
@@ -1946,7 +1879,7 @@ function WorkspacePanelImpl({
               {/* Open tabs fill the space before the pinned trailing controls. */}
               <WorkspaceTabsScroller>
                 {visibleOpenPanels.map((tab) => {
-                  const { label, icon: Icon } = workspacePanels[tab];
+                  const { label, icon: Icon } = WORKSPACE_PANEL_TABS[tab];
                   const active =
                     rightRailTab === tab &&
                     selectedFilePath === null &&
@@ -1968,7 +1901,7 @@ function WorkspacePanelImpl({
                         aria-label={label}
                         aria-selected={active}
                         className="flex items-center gap-1"
-                        onClick={() => onRightRailTabChange(tab)}
+                        onClick={() => selectPermanentTab(tab)}
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();

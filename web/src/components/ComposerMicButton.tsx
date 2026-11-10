@@ -6,10 +6,10 @@ import { showToast } from "@/components/ui/toast";
 import { useVoiceDictationHotkey, VOICE_DICTATION_KEYS } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
-import { isElectronShell } from "@/lib/nativeBridge";
+import { isElectronShell, startSystemDictation, supportsSystemDictation } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { Loader2Icon, MicIcon, SquareIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 
 // Local-only types; speech-input.tsx already augments Window globally.
 interface SpeechRecognitionLike {
@@ -68,6 +68,15 @@ const BAR_BINS: readonly (readonly [number, number])[] = [
 
 const BAR_BASELINE = 0.2;
 
+// Browsers end a Web Speech take on their own after a pause (Android after
+// ~1–2 s, even with `continuous`), so a live take restarts the recognizer until
+// the user stops it. It gives up after this long without any recognized speech.
+const WEB_SPEECH_IDLE_LIMIT_MS = 60_000;
+// A recognizer that ends this soon after starting, with no speech, is failing
+// rather than hearing silence; this many in a row ends the take with an error.
+const WEB_SPEECH_QUICK_END_MS = 1_000;
+const WEB_SPEECH_MAX_QUICK_ENDS = 3;
+
 export interface ComposerMicButtonProps {
   onTranscript: (text: string) => void;
   className?: string;
@@ -94,6 +103,10 @@ export interface ComposerMicButtonProps {
   /** Called when a take starts or ends listening; while listening, Enter and Esc
    *  belong to dictation. */
   onListeningChange?: (listening: boolean) => void;
+  /** The composer's text box. macOS Dictation types into the focused field, so
+   *  the desktop app's macOS fallback focuses this first; without it there is no
+   *  fallback. */
+  inputRef?: RefObject<HTMLTextAreaElement | null>;
 }
 
 /** getUserMedia permission failures, distinct from transport failures. */
@@ -111,18 +124,24 @@ export const ComposerMicButton = ({
   onVoiceStart,
   onVoiceDiscard,
   onListeningChange,
+  inputRef,
 }: ComposerMicButtonProps) => {
-  // Web Speech is primary whenever the browser has the constructor
-  // (Chrome/Safari, unchanged behavior); with no constructor at all
-  // (Firefox) takes use server dictation when GET /v1/info advertises it.
-  // A constructor is no guarantee of a backend — Electron and plain
-  // Chromium error at runtime with "network" — so a failed Web Speech
-  // take falls back to the server per take (see handleError). Per-take,
-  // not sticky: a transient blip in real Chrome must not permanently
-  // downgrade the page to the local model.
+  // Web Speech is primary wherever its constructor exists; a take that dies with
+  // "network" falls back to the server for that take only (see handleError).
+  // Electron has the constructor but never a backend, so there only the server can serve,
+  // and on macOS a server without dictation hands the take to macOS Dictation.
   const [Ctor] = useState(getRecognitionCtor);
+  const electron = isElectronShell();
+  const [systemDictationBridge] = useState(supportsSystemDictation);
   const serverInfo = useServerInfo();
   const serverAvailable = serverInfo !== "loading" && serverInfo.dictation_available;
+  const systemDictation =
+    electron &&
+    systemDictationBridge &&
+    inputRef !== undefined &&
+    serverInfo !== "loading" &&
+    !serverAvailable;
+  const canDictate = serverAvailable || (Ctor !== null && !electron) || systemDictation;
   // Mirrored into a ref so the mount-time recognition handlers (closed
   // over [Ctor, lang]) see the current probe result.
   const serverAvailableRef = useRef(serverAvailable);
@@ -175,6 +194,15 @@ export const ComposerMicButton = ({
   // was spoken instead of blanking it. Set on each partial, cleared on final,
   // and reset when a take starts so a stale partial can't resurrect.
   const interimRef = useRef("");
+  // Web Speech take the user has started and not stopped. While set, a
+  // recognizer that ends on its own is restarted rather than ending the take.
+  const webSpeechTakeRef = useRef<{
+    lastSpeechAt: number;
+    recognizerStartedAt: number;
+    quickEnds: number;
+    restarting: boolean;
+    started: boolean;
+  } | null>(null);
 
   // Surface a failure both in the button (tooltip + red tint) and as a toast,
   // so a failed take is an explained error rather than a silent flash back to
@@ -188,10 +216,11 @@ export const ComposerMicButton = ({
   const barRefs = useRef<(HTMLSpanElement | null)[]>(BAR_BINS.map(() => null));
 
   useEffect(() => {
-    if (!Ctor) return;
+    // Electron never starts a Web Speech take, so skip the dead recognizer.
+    if (!Ctor || electron) return;
 
     const recognition = new Ctor();
-    // Keep listening until the user clicks stop — no auto-stop on silence.
+    // Ask for one long take; handleEnd restarts browsers that end it anyway.
     recognition.continuous = true;
     recognition.interimResults = false;
     recognition.lang = lang;
@@ -204,21 +233,65 @@ export const ComposerMicButton = ({
     const handleStart = () => {
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
+      const take = webSpeechTakeRef.current;
+      // No take: the user stopped while a restart was starting; end follows.
+      if (!take) return;
+      take.started = true;
+      if (take.restarting) {
+        // A restart continues the same take: keep the Esc snapshot and state.
+        take.restarting = false;
+        return;
+      }
       discardingRef.current = false;
       setError(null);
       setIsListening(true);
       // Snapshot point: let the parent record the text so Esc can revert to it.
       onVoiceStartRef.current?.();
     };
+    // Restart the recognizer when it ends on its own mid-take. Returns false
+    // when the take should end instead.
+    const restartTake = (): boolean => {
+      const take = webSpeechTakeRef.current;
+      // Only a take that reached "start" is listening; a hidden page can't
+      // reacquire the mic, so let the take end rather than fail noisily.
+      if (!take?.started || disabledRef.current || discardingRef.current) return false;
+      if (document.hidden) return false;
+      const now = Date.now();
+      if (now - take.lastSpeechAt >= WEB_SPEECH_IDLE_LIMIT_MS) return false;
+      const heardNothing = take.lastSpeechAt <= take.recognizerStartedAt;
+      if (heardNothing && now - take.recognizerStartedAt < WEB_SPEECH_QUICK_END_MS) {
+        take.quickEnds += 1;
+        if (take.quickEnds >= WEB_SPEECH_MAX_QUICK_ENDS) {
+          reportError("Voice input stopped unexpectedly. Please try again.");
+          return false;
+        }
+      } else {
+        take.quickEnds = 0;
+      }
+      take.restarting = true;
+      take.recognizerStartedAt = now;
+      try {
+        recognition.start();
+      } catch {
+        return false;
+      }
+      return true;
+    };
     const handleEnd = () => {
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
+      if (restartTake()) return;
+      webSpeechTakeRef.current = null;
       setIsListening(false);
     };
     const handleError = (event: Event) => {
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
       const err = (event as SpeechRecognitionErrorEventLike).error;
+      // "no-speech" is the browser's silence timeout: the end event that
+      // follows restarts a live take. Any other error ends it.
+      if (err === "no-speech" && webSpeechTakeRef.current) return;
+      webSpeechTakeRef.current = null;
       // An unavailable or blocked speech service can still use client mic
       // capture with server transcription. getUserMedia checks mic permission.
       if (
@@ -251,7 +324,9 @@ export const ComposerMicButton = ({
         }
       }
       const trimmed = finalTranscript.trim();
-      if (trimmed) onTranscriptRef.current(trimmed);
+      if (!trimmed) return;
+      if (webSpeechTakeRef.current) webSpeechTakeRef.current.lastSpeechAt = Date.now();
+      onTranscriptRef.current(trimmed);
     };
 
     recognition.addEventListener("start", handleStart);
@@ -265,10 +340,11 @@ export const ComposerMicButton = ({
       recognition.removeEventListener("end", handleEnd);
       recognition.removeEventListener("error", handleError);
       recognition.removeEventListener("result", handleResult);
+      webSpeechTakeRef.current = null;
       recognition.stop();
       recognitionRef.current = null;
     };
-  }, [Ctor, lang, reportError]);
+  }, [Ctor, electron, lang, reportError]);
 
   // Auto-stop if the composer goes disabled mid-dictation. Stops the
   // recognizer; the disabledRef guard in handleResult catches any final
@@ -284,6 +360,7 @@ export const ComposerMicButton = ({
       onInterimRef.current?.("");
       return;
     }
+    webSpeechTakeRef.current = null;
     try {
       recognitionRef.current?.stop();
     } catch {
@@ -447,6 +524,18 @@ export const ComposerMicButton = ({
   }, [reportError]);
   toggleServerRef.current = toggleServer;
 
+  // macOS owns this take: its own indicator shows listening, and its text
+  // reaches the composer as typing, so none of the take state above is used.
+  const startMacDictation = useCallback(() => {
+    const input = inputRef?.current;
+    if (!input) return;
+    input.focus();
+    void startSystemDictation().then((started) => {
+      if (started) setError(null);
+      else reportError("Voice input isn't available on this device.");
+    });
+  }, [inputRef, reportError]);
+
   const toggle = useCallback(() => {
     // An active (or starting) server take is owned by the server path,
     // whichever mode started it.
@@ -454,13 +543,11 @@ export const ComposerMicButton = ({
       void toggleServer();
       return;
     }
-    // In Electron the SpeechRecognition constructor exists but has no backend,
-    // so a Web Speech take always fails with "network" and only THEN falls back
-    // to the server — a visible ~1s "fail then recover" on every first take.
-    // When the server can serve, go straight to it and skip the doomed attempt.
-    // (Real browsers keep Web Speech primary; it genuinely works there.)
-    if (!Ctor || (serverAvailable && isElectronShell())) {
+    // Electron's SpeechRecognition has no backend, so a Web Speech take there
+    // always fails: go straight to the server, else to macOS Dictation.
+    if (!Ctor || electron) {
       if (serverAvailable) void toggleServer();
+      else if (systemDictation) startMacDictation();
       return;
     }
     // Guard against rapid clicks landing before start/end event fires.
@@ -469,19 +556,40 @@ export const ComposerMicButton = ({
     if (!recognition) return;
     transitionRef.current = true;
     try {
-      if (isListening) recognition.stop();
-      else recognition.start();
+      if (isListening) {
+        webSpeechTakeRef.current = null;
+        recognition.stop();
+      } else {
+        const now = Date.now();
+        webSpeechTakeRef.current = {
+          lastSpeechAt: now,
+          recognizerStartedAt: now,
+          quickEnds: 0,
+          restarting: false,
+          started: false,
+        };
+        recognition.start();
+      }
     } catch {
       // InvalidStateError from a double-call — drop the guard so the
       // user can try again, and let the next event reconcile state.
       transitionRef.current = false;
+      if (!isListening) webSpeechTakeRef.current = null;
     }
-  }, [isListening, Ctor, serverAvailable, toggleServer]);
+  }, [
+    isListening,
+    Ctor,
+    electron,
+    serverAvailable,
+    systemDictation,
+    startMacDictation,
+    toggleServer,
+  ]);
 
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
-  // whenever dictation could run (Web Speech OR the server path) and the
-  // composer isn't disabled, so the chord is inert when it can't do anything.
-  const hotkeyEnabled = enableHotkey && (Boolean(Ctor) || serverAvailable) && !disabled;
+  // only while a dictation path can run and the composer isn't disabled, so
+  // the chord is inert when it can't do anything.
+  const hotkeyEnabled = enableHotkey && canDictate && !disabled;
   useVoiceDictationHotkey(toggle, hotkeyEnabled);
 
   // While listening, Enter commits (end the take, keep the text) and Esc
@@ -513,6 +621,7 @@ export const ComposerMicButton = ({
           session.cancel();
           setIsListening(false);
         } else {
+          webSpeechTakeRef.current = null;
           try {
             recognitionRef.current?.stop();
           } catch {
@@ -525,7 +634,7 @@ export const ComposerMicButton = ({
     return () => window.removeEventListener("keydown", handler, true);
   }, [isListening, toggle]);
 
-  if (!Ctor && !serverAvailable) return null;
+  if (!canDictate) return null;
 
   // Stable accessible name with aria-pressed signals toggle state to
   // screen readers. Error text takes over the tooltip when set.

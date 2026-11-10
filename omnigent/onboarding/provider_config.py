@@ -113,9 +113,9 @@ _VALID_WIRE_API = (RESPONSES_WIRE_API, CHAT_WIRE_API)
 # - ``databricks``: a Databricks profile from ``~/.databrickscfg``.
 # - ``cli-config``: a custom model provider the harness CLI's own config
 #   file defines and authenticates (today: a ``[model_providers.X]`` table
-#   in ``~/.codex/config.toml`` with self-contained auth, e.g. written by
-#   ``isaac configure codex``). The entry pins the provider *by name*; the
-#   provider definition and credential stay in the CLI's config file.
+#   in ``~/.codex/config.toml`` with self-contained auth). The entry pins the
+#   provider *by name*; the provider definition and credential stay in the
+#   CLI's config file.
 KEY_KIND = "key"
 SUBSCRIPTION_KIND = "subscription"
 GATEWAY_KIND = "gateway"
@@ -974,7 +974,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
     if kind == CLI_CONFIG_KIND:
         cli_raw = raw.get("cli")
         # Only codex has a model_provider concept; a claude analog (e.g. an
-        # isaac-written settings.json) would be a different mechanism and a
+        # wrapper-written settings.json) would be a different mechanism and a
         # deliberate extension, not a value to silently accept here.
         if cli_raw != "codex":
             raise OmnigentError(
