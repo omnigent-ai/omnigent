@@ -2071,7 +2071,10 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
         "missing_target": "tmux target is not advertised",
     }[refusal]
     assert expected_detail in error.message
-    assert error.undelivered is (refusal in {"draft_persisted", "missing_target"} or not submitted)
+    assert error.undelivered is (refusal == "missing_target" or not submitted)
+    if submitted:
+        assert error.code == "claude_delivery_unconfirmed"
+        assert error.preserve_session is True
 
 
 @pytest.mark.asyncio
@@ -2380,3 +2383,42 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
 
     assert isinstance(events[0], ExecutorError)
     assert events[0].message == "terminal did not become ready"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_injection", [False, True], ids=["turn", "live-steer"])
+async def test_uncertain_native_delivery_preserves_the_pane_and_never_reports_undelivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_injection: bool
+) -> None:
+    from omnigent.harnesses.claude_native.bridge import ClaudeDeliveryUnconfirmed
+    from omnigent.inner.executor import InjectionDeliveryAmbiguous
+
+    attempts = []
+
+    def uncertain(bridge_dir: Path, *, content: str, **_kwargs: Any) -> None:
+        attempts.append(content)
+        raise ClaudeDeliveryUnconfirmed("The original paste may still be queued")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", uncertain)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda *_args, **_kwargs: pytest.fail("uncertain input must keep its pane"),
+    )
+    executor = ClaudeNativeExecutor(tmp_path)
+    if live_injection:
+        with pytest.raises(InjectionDeliveryAmbiguous) as raised:
+            await executor.enqueue_session_message("main", "original input")
+        assert raised.value.code == "claude_delivery_unconfirmed"
+    else:
+        [failure] = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "original input"}], [], ""
+            )
+        ]
+        assert isinstance(failure, ExecutorError)
+        assert failure.code == "claude_delivery_unconfirmed"
+        assert failure.undelivered is False
+        assert failure.preserve_session is True
+    assert attempts == ["original input"]

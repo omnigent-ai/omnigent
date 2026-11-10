@@ -59,6 +59,10 @@ def render(*_args):
 
 signal.signal(signal.SIGWINCH, render)
 render()
+if startup.startswith("pre-draft-stall"):
+    gate_started.with_suffix(".stalled").touch()
+    time.sleep(13.0)
+    gate_started.with_suffix(".resumed").write_text(str(time.monotonic()))
 pending = b""
 while True:
     pending += os.read(sys.stdin.fileno(), 65536)
@@ -103,6 +107,8 @@ while True:
         "exit-after-ready",
         "stale-frame",
         "stale-shell-frame",
+        "pre-draft-stall",
+        "pre-draft-stall-multiline",
     ],
 )
 @pytest.mark.timeout(20)
@@ -139,10 +145,17 @@ def test_first_message_survives_slow_terminal_startup(
         *,
         timeout_s: float,
         bridge_dir: Path | None = None,
+        extend_for_slow_boot: bool = True,
     ) -> None:
         started_at.append(time.monotonic())
         gate_started.touch()
-        original_wait(socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir)
+        original_wait(
+            socket_path,
+            tmux_target,
+            timeout_s=timeout_s,
+            bridge_dir=bridge_dir,
+            extend_for_slow_boot=extend_for_slow_boot,
+        )
         if startup == "exit-after-ready":
             subprocess.run(
                 ["tmux", "-S", socket_path, "kill-server"],
@@ -205,6 +218,29 @@ def test_first_message_survives_slow_terminal_startup(
                 )
                 assert time.monotonic() - started_at[0] >= 1.0
                 assert json.loads(delivered.read_text()) == [["prompt", "FIRST_PROMPT_DELIVERED"]]
+                assert bridge._claude_pane_state(str(socket_path), "main").alive
+            elif startup.startswith("pre-draft-stall"):
+                message = "Send my prompt just once after the terminal wakes"
+                if startup.endswith("multiline"):
+                    message = message.replace(" just", "\njust").replace(" the", "\nthe")
+                bridge.inject_user_message(bridge_dir, content=message, timeout_s=0.3)
+                returned_at = time.monotonic()
+                deadline = returned_at + 5.0
+                while not delivered.exists():
+                    assert time.monotonic() < deadline, (
+                        "The recovered TUI did not submit the input."
+                    )
+                    time.sleep(0.05)
+                resumed_at = float(gate_started.with_suffix(".resumed").read_text())
+                submitted = json.loads(delivered.read_text())
+                assert submitted == [["prompt", message]], (
+                    "Original input was corrupted; "
+                    f"returned_before_read={returned_at < resumed_at}; "
+                    f"submitted={submitted!r}"
+                )
+                assert returned_at >= resumed_at, (
+                    "Delivery reported success before stdin was read."
+                )
                 assert bridge._claude_pane_state(str(socket_path), "main").alive
             elif startup.startswith("stale-"):
                 bridge.inject_user_message(bridge_dir, content="ONLY_NEW_INPUT", timeout_s=2.0)

@@ -19,6 +19,7 @@ from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudeComposerNotCleared,
+    ClaudeDeliveryUnconfirmed,
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
@@ -50,6 +51,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     TextChunk,
     ToolSpec,
@@ -183,6 +185,8 @@ class ClaudeNativeExecutor(Executor):
         try:
             async with self._inject_lock:
                 await self._inject_prompt(text, framework_notices(content))
+        except ClaudeDeliveryUnconfirmed as exc:
+            raise InjectionDeliveryAmbiguous(str(exc), code="claude_delivery_unconfirmed") from exc
         except RuntimeError:
             return False
         return True
@@ -548,6 +552,18 @@ class ClaudeNativeExecutor(Executor):
                 extra={"session_id": self._request_session_id},
             )
             yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except ClaudeDeliveryUnconfirmed as exc:
+            _logger.warning(
+                "claude-native: input delivery remains unconfirmed",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(
+                message=describe_exception(exc),
+                code="claude_delivery_unconfirmed",
+                undelivered=False,
+                preserve_session=True,
+            )
             return
         except RuntimeError as exc:
             _logger.exception(

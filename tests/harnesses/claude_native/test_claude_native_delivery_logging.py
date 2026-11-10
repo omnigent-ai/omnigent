@@ -21,7 +21,7 @@ from omnigent.native.input_diagnostics import input_delivery_scope
         ("normal", "draft_absent", "returned"),
         ("session_fallback", "draft_absent", "returned"),
         ("unknown_command", "draft_absent", "returned"),
-        ("blank_line", "unverified", "returned"),
+        ("blank_line", "unverified", "error"),
         ("retry", "draft_absent", "returned"),
         ("timeout", "draft_still_present", "error"),
         ("empty_capture", "inconclusive_capture", "error"),
@@ -210,15 +210,15 @@ def test_delivery_diagnostics(
         assert attrs["elapsed_ms"] == (80 if scenario == "empty_capture" else 30)
         if scenario == "empty_capture":
             assert attrs["submit_sent"] is True
-            assert attrs["error_type"] == "RuntimeError"
+            assert attrs["error_type"] == "ClaudeDeliveryUnconfirmed"
             assert enters == 1
 
     if scenario == "blank_line":
         assert attrs["draft_seen"] is False
         assert attrs["draft_needle_visible_below_prompt"] is True
         assert attrs["leading_blank_line"] is True
-        assert attrs["submit_sent"] is True
-        assert enters == 1
+        assert attrs["submit_sent"] is False
+        assert enters == 0
         assert pane == "❯ \n" + secret
     elif scenario in {"normal", "retry", "timeout", "empty_capture", "missing_glyph"}:
         assert attrs["retries"] == enters - 1

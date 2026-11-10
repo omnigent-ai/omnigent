@@ -495,12 +495,19 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
     harness once it drains the injection into the running turn.
     """
 
-    def __init__(self, gate: asyncio.Event, completion_gate: asyncio.Event | None = None) -> None:
+    def __init__(
+        self,
+        gate: asyncio.Event,
+        completion_gate: asyncio.Event | None = None,
+        *,
+        ambiguous: bool = False,
+    ) -> None:
         """Initialize with gates for consumption and optional turn completion."""
         super().__init__([])
         self._gate = gate
         self._consumed_ids: list[str] = []
         self._completion_gate = completion_gate
+        self._ambiguous = ambiguous
 
     def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
         """Turn-1 stream: created → (gate) → consumed markers → completed."""
@@ -509,6 +516,7 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
         gate = self._gate
         consumed_ids = self._consumed_ids
         completion_gate = self._completion_gate
+        ambiguous = self._ambiguous
 
         class _Ctx:
             status_code = 200
@@ -528,7 +536,23 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
                 # Mirror the executor adapter: once injections are consumed
                 # into the running turn, echo each correlation id back.
                 for inj_id in list(consumed_ids):
-                    yield _sse({"type": "injection.consumed", "injection_id": inj_id})
+                    yield _sse(
+                        {
+                            "type": "injection.consumed",
+                            "injection_id": inj_id,
+                            **(
+                                {
+                                    "delivery_outcome": "delivery_unconfirmed",
+                                    "error": {
+                                        "code": "claude_delivery_unconfirmed",
+                                        "message": "reply lost",
+                                    },
+                                }
+                                if ambiguous
+                                else {}
+                            ),
+                        }
+                    )
                 if completion_gate is not None:
                     await completion_gate.wait()
                 yield _sse({"type": "response.completed", "response": {"id": "resp_1"}})
@@ -557,6 +581,8 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
 def _build_handshake_app(
     gate: asyncio.Event,
     completion_gate: asyncio.Event | None = None,
+    *,
+    ambiguous: bool = False,
 ) -> tuple[FastAPI, _FakeProcessManager, _HandshakeHarnessClient]:
     """Build a runner app whose harness emits the consumed-handshake.
 
@@ -566,7 +592,7 @@ def _build_handshake_app(
     :returns: ``(app, process_manager, harness_client)``.
     """
     spec = AgentSpec(spec_version=1, name="t")
-    harness_client = _HandshakeHarnessClient(gate, completion_gate)
+    harness_client = _HandshakeHarnessClient(gate, completion_gate, ambiguous=ambiguous)
     pm = _FakeProcessManager(harness_client)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -584,13 +610,14 @@ def _build_handshake_app(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("runs", [(None, None), ("A", "A"), ("A", "B"), ("A", None), (None, "A")])
 @pytest.mark.parametrize("stream_response", [False, True], ids=["background", "stream"])
+@pytest.mark.parametrize("ambiguous", [False, True], ids=["accepted", "unconfirmed"])
 async def test_midturn_message_not_double_delivered_to_harness(
-    monkeypatch, runs, stream_response
+    monkeypatch, runs, stream_response, ambiguous
 ) -> None:
     """Live steering is consumed once and retains the initiating turn context."""
     gate = asyncio.Event()
     completion_gate = asyncio.Event()
-    app, _pm, hc = _build_handshake_app(gate, completion_gate)
+    app, _pm, hc = _build_handshake_app(gate, completion_gate, ambiguous=ambiguous)
     sid = "ede98a0180773a70b1e81cc854ff7d8a"
     stream = hc.stream
 
@@ -619,7 +646,10 @@ async def test_midturn_message_not_double_delivered_to_harness(
             "role": "user",
             "model": "test-agent",
             "content": [{"type": "input_text", "text": text}],
-            "pending_id": "pending_" + text,
+            "pending_id": "pending_" + ("1" if text == "first" else "2") * 32,
+            "delivery_attempt_id": ("3" if text == "first" else "4") * 32,
+            "input_stable_id": ("5" if text == "first" else "6") * 32,
+            "input_enqueued_at_ms": 1000,
             "harness": "openai-agents",
         }
 
@@ -654,6 +684,25 @@ async def test_midturn_message_not_double_delivered_to_harness(
                 assert _body_contains_text(hc.patched_events[0], "second")
                 # Consumed and queued inputs both retain their IDs until delivery completes.
                 assert app.state.active_turns
+                queue = app.state.session_event_queues[sid]
+                observed = []
+                while not queue.empty():
+                    event = queue.get_nowait()
+                    if isinstance(event, dict):
+                        observed.append(event)
+                unconfirmed = [e for e in observed if e.get("type") == "session.input.unconfirmed"]
+                assert len(unconfirmed) == int(ambiguous)
+                if ambiguous:
+                    assert unconfirmed[0] == {
+                        "type": "session.input.unconfirmed",
+                        "pending_id": "pending_" + "2" * 32,
+                        "delivery_attempt_id": "4" * 32,
+                        "input_stable_id": "6" * 32,
+                        "input_enqueued_at_ms": 1000,
+                        "response_id": "resp_1",
+                        "error": {"code": "claude_delivery_unconfirmed", "message": "reply lost"},
+                    }
+                assert not any(e.get("type") == "response.failed" for e in observed)
                 repeated = await client.post(
                     f"/v1/sessions/{sid}/events", json=message("second"), headers=headers(runs[1])
                 )
@@ -680,6 +729,134 @@ async def test_midturn_message_not_double_delivered_to_harness(
         "task-" + run if run else None for run in expected
     ]
     assert all(row["session_id"] == sid for row in probes)
+
+
+@pytest.mark.asyncio
+async def test_uncertain_claude_input_is_not_replayed_after_a_buffered_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real executor and adapter retire the runner turn without replaying uncertain input."""
+    import threading
+    from unittest.mock import Mock
+
+    from starlette.responses import StreamingResponse
+
+    from omnigent.inner import claude_native_executor
+    from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import MessageEvent
+
+    started = threading.Event()
+    release = threading.Event()
+    attempts: list[str] = []
+    frames: list[str] = []
+
+    def inject(_bridge_dir: Path, *, content: str, **_kwargs: Any) -> None:
+        attempts.append(content)
+        if content == "first":
+            started.set()
+            assert release.wait(timeout=budget(5))
+        else:
+            raise claude_native_bridge.ClaudeDeliveryUnconfirmed("The paste may still be queued")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda *_args, **_kwargs: pytest.fail("uncertain delivery destroyed the native pane"),
+    )
+    monkeypatch.setattr(claude_native_bridge, "bridge_dir_for_bridge_id", lambda _id: tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "start_tool_relay", Mock(return_value=Mock()))
+    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", lambda *_a, **_k: None)
+    executor = ClaudeNativeExecutor(tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    class AdapterClient(_ScriptedHarnessClient):
+        def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+            del method, url, timeout
+            self.posted_bodies.append(json)
+
+            class Stream:
+                status_code = 200
+                response: StreamingResponse
+
+                async def __aenter__(self) -> Any:
+                    response = await adapter._start_or_inject_turn(
+                        MessageEvent.model_validate(json).to_create_request()
+                    )
+                    assert isinstance(response, StreamingResponse)
+                    self.response = response
+                    return self
+
+                async def __aexit__(self, *_args: Any) -> None:
+                    return None
+
+                async def aiter_text(self) -> AsyncIterator[str]:
+                    async for chunk in self.response.body_iterator:
+                        frame = chunk.decode() if isinstance(chunk, bytes) else str(chunk)
+                        frames.append(frame)
+                        yield frame
+
+            return Stream()
+
+    harness = AdapterClient([])
+    process_manager = _FakeProcessManager(harness)
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def resolver(_agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session_id = "uncertain-claude-buffered"
+    message = {"type": "message", "role": "user", "model": "test-agent", "agent_id": "a" * 32}
+    try:
+        async with _runner_client(app) as client:
+            first = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={**message, "content": [{"type": "input_text", "text": "first"}]},
+            )
+            assert first.status_code == 202
+            await poll_until_async(started.is_set, timeout_s=budget(5))
+            buffered = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={**message, "content": [{"type": "input_text", "text": "uncertain"}]},
+            )
+            assert buffered.status_code == 202
+            assert buffered.json()["status"] == "buffered"
+            release.set()
+            await poll_until_async(
+                lambda: len(attempts) == 2 and not app.state.active_turns,
+                timeout_s=budget(5),
+            )
+            assert not app.state.session_message_buffers.get(session_id)
+        assert attempts == ["first", "uncertain"]
+        assert len(harness.posted_bodies) == 2
+        assert not harness.patched_events
+        assert adapter._executor is executor
+        assert process_manager.released == []
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for frame in frames
+            for line in frame.splitlines()
+            if line.startswith("data: ")
+        ]
+        failed = [event for event in events if event["type"] == "response.failed"]
+        assert len(failed) == 1
+        error = failed[0]["response"]["error"]
+        assert error["code"] == "claude_delivery_unconfirmed"
+        assert not error.get("undelivered")
+    finally:
+        release.set()
+        await adapter.on_shutdown()
 
 
 class _RefusingSteerHarnessClient(_HandshakeHarnessClient):

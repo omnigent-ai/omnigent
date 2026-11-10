@@ -5854,92 +5854,121 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
     replay_captures: int,
     recovered_draft: str,
 ) -> None:
-    """
-    A paste that lands while a resumed TUI is still replaying must not be submitted blind.
-
-    The first paste is dropped while replaying; the composer may return before
-    the paste wait ends. Delivery pastes once more and presses Enter only after
-    the draft is visible in the input box.
-    """
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
-    )
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    """An invisible paste cannot safely be retried, even if a fake knows it was dropped."""
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_OBSERVE_SLOW_TIMEOUT_S", 0.6)
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/example/tmux.sock"),
-        tmux_target="claude:0.0",
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_args: claude_native_bridge._ClaudePaneState(True),
     )
+    bridge_dir = _picker_bridge_dir(tmp_path)
     replay_pane = "Resuming the conversation from the transcript...\n"
-    pasted_pane = _composer_pane().replace("❯ \n", "❯\n  [Pasted text #1 +7 lines]\n")
-    tui: dict[str, Any] = {
-        "pane": _composer_pane(),
-        "replaying": False,
-        "replay_captures": 0,
-        "pastes": 0,
-        "enter_saw_draft": [],
-    }
+    tui: dict[str, Any] = {"pane": _composer_pane(), "captures": 0, "pastes": 0, "enters": 0}
 
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        """
-        Simulate a TUI that drops the paste while replaying a resumed transcript.
-
-        :param cmd: Argv list passed to subprocess.run.
-        :param kwargs: Subprocess kwargs (ignored).
-        :returns: Fake CompletedProcess; capture-pane returns the simulated pane.
-        """
-        del kwargs
+    def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
         if "capture-pane" in cmd:
-            if tui["replaying"]:
-                tui["replay_captures"] += 1
-                if tui["replay_captures"] > replay_captures:
-                    tui["replaying"] = False
-                    tui["pane"] = _composer_pane(recovered_draft)
-                else:
-                    return SimpleNamespace(returncode=0, stdout=replay_pane, stderr="")
+            if tui["pastes"]:
+                tui["captures"] += 1
+                tui["pane"] = (
+                    _composer_pane(recovered_draft)
+                    if tui["captures"] > replay_captures
+                    else replay_pane
+                )
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
             tui["pastes"] += 1
-            if tui["pastes"] == 1:
-                # The first paste is swallowed while the resumed TUI replays its transcript.
-                tui["replaying"] = True
-                tui["pane"] = replay_pane
-            else:
-                tui["pane"] = pasted_pane
         if cmd[-1] == "Enter":
-            tui["enter_saw_draft"].append("[Pasted text" in tui["pane"])
-            if "[Pasted text" in tui["pane"]:
-                tui["pane"] = _composer_pane()
+            tui["enters"] += 1
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    if recovered_draft:
-        monkeypatch.setattr(
-            claude_native_bridge,
-            "has_pending_user_prompt",
-            lambda _bridge_dir: tui["pastes"] > 0 and not tui["replaying"],
-        )
-        with pytest.raises(claude_native_bridge.ClaudeUserPromptPending):
-            inject_user_message(
-                bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8
-            )
-        assert tui["pastes"] == 1
-        assert tui["enter_saw_draft"] == []
-        assert tui["pane"] == _composer_pane(recovered_draft)
-        return
-    inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with pytest.raises(claude_native_bridge.ClaudeDeliveryUnconfirmed):
+        inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
+    assert tui["pastes"] == 1
+    assert tui["enters"] == 0
+    assert tui["pane"] == _composer_pane(recovered_draft)
 
-    assert tui["enter_saw_draft"] == [True], (
-        "An Enter was pressed while the composer was not showing the draft: "
-        f"{tui['enter_saw_draft']}"
+
+@pytest.mark.parametrize(
+    "surface,alive,cancelled",
+    [
+        ("idle", True, False),
+        ("capture-loss", True, False),
+        ("auto-submit", True, False),
+        ("idle", False, False),
+        ("idle", None, False),
+        ("idle", True, True),
+    ],
+    ids=["live", "capture-loss", "paste-submitted", "dead", "unknown", "cancelled"],
+)
+def test_unobserved_paste_stops_without_a_second_paste_or_blind_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    alive: bool | None,
+    cancelled: bool,
+) -> None:
+    """A live pane gets a finite observation extension; no outcome authorizes replay."""
+    clock = _VirtualClock()
+    cancellation = threading.Event()
+    message = "Keep this original input just once"
+    writes: list[tuple[str, ...]] = []
+    payloads: list[bytes] = []
+    submissions: list[str] = []
+
+    def capture(*_args: str) -> str:
+        if cancelled and clock.monotonic() >= 0.3:
+            cancellation.set()
+        if surface == "capture-loss":
+            return ""
+        if surface == "auto-submit":
+            return f"❯ {message}\n" + _composer_pane()
+        return _composer_pane()
+
+    def run(_socket_path: str, *args: str) -> None:
+        writes.append(args)
+        if args[0] == "load-buffer":
+            payloads.append(Path(args[-1]).read_bytes())
+        if args[0] == "paste-buffer" and surface == "auto-submit":
+            submissions.append(message)
+
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_OBSERVE_SLOW_TIMEOUT_S", 0.6)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.05)
+    monkeypatch.setattr(claude_native_bridge, "_clear_composer", lambda *_a, **_k: None)
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _d: False)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_args: claude_native_bridge._ClaudePaneState(alive),
     )
-    assert tui["pastes"] == 2, "The message should be pasted again once the composer is back."
-    assert tui["pane"] == _composer_pane(), "The message was left unsent in the input box."
+    expected = (
+        claude_native_bridge.ClaudeInjectionCancelled
+        if cancelled
+        else claude_native_bridge.ClaudeDeliveryUnconfirmed
+    )
+    with claude_native_bridge.cancellable_injection(cancellation), pytest.raises(expected):
+        claude_native_bridge._paste_and_submit(
+            tmp_path,
+            "synthetic.sock",
+            "main",
+            text=message,
+            needle=message,
+        )
+    assert [args[0] for args in writes] == ["load-buffer", "paste-buffer"]
+    assert payloads == [(message + "\r").encode()]
+    assert submissions == ([message] if surface == "auto-submit" else [])
+    if cancelled:
+        assert 0.3 <= clock.monotonic() < 0.6
+    else:
+        assert clock.monotonic() == pytest.approx(0.6 if alive else 0.2)
 
 
 _SUBMITTED_ECHO = """\
@@ -6189,12 +6218,12 @@ def test_inject_user_message_raises_when_draft_never_submits(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    error_message = "could not be confirmed" if capture_lost else "message was not delivered"
-    with pytest.raises(RuntimeError, match=error_message) as caught:
+    error_message = "could not be confirmed" if capture_lost else "did not confirm"
+    with pytest.raises(
+        claude_native_bridge.ClaudeDeliveryUnconfirmed, match=error_message
+    ) as caught:
         inject_user_message(bridge_dir, content="fix the flaky test")
-    assert (
-        isinstance(caught.value, claude_native_bridge.ClaudeMessageNotAccepted) is not capture_lost
-    )
+    assert not isinstance(caught.value, claude_native_bridge.ClaudeMessageNotAccepted)
     if capture_lost:
         assert tui["enters"] == 1
 
@@ -6253,7 +6282,7 @@ def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered"):
+    with pytest.raises(claude_native_bridge.ClaudeDeliveryUnconfirmed, match="did not confirm"):
         inject_user_message(bridge_dir, content="fix the flaky test")
 
     # The initial submit plus backed-off retries at 0.05/0.1/0.2/0.2s

@@ -137,7 +137,7 @@ def test_recovered_surface_is_retained_when_a_later_submit_fails(
     terminal.clears_surface = True
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
-        pytest.raises(bridge.ClaudeMessageNotAccepted),
+        pytest.raises(bridge.ClaudeDeliveryUnconfirmed),
     ):
         bridge.inject_user_message(terminal.directory, content=_PRIVATE_TEXT)
 
@@ -161,11 +161,21 @@ def test_pending_prompt_records_source_and_delivery_boundary(
     terminal.pending_after_paste = after_paste
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
-        pytest.raises(bridge.ClaudeUserPromptPending),
+        pytest.raises(
+            bridge.ClaudeDeliveryUnconfirmed
+            if after_paste and source == "visible_prompt"
+            else bridge.ClaudeUserPromptPending
+        ),
     ):
         bridge.inject_user_message(terminal.directory, content=_PRIVATE_TEXT)
 
     attrs = _summary(caplog)
+    if after_paste and source == "visible_prompt":
+        assert attrs["draft_seen"] is False
+        assert attrs["submit_sent"] is False
+        assert attrs["verification"] == "unverified"
+        assert terminal.pasted
+        return
     assert attrs["pending_prompt_source"] == source
     assert attrs["pending_prompt_after_paste"] is after_paste
     assert attrs["pending_prompt_after_submit"] is False
@@ -185,7 +195,7 @@ def test_rejected_submit_distinguishes_unchanged_and_growing_composers(
     terminal.newline_on_enter = newline_on_enter
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
-        pytest.raises(bridge.ClaudeMessageNotAccepted),
+        pytest.raises(bridge.ClaudeDeliveryUnconfirmed),
     ):
         bridge.inject_user_message(terminal.directory, content=_PRIVATE_TEXT)
 
@@ -216,7 +226,7 @@ def test_composer_observation_failure_preserves_submit_refusal(
     monkeypatch.setattr(delivery_diagnostics, "record_submit_composer", broken_observation)
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
-        pytest.raises(bridge.ClaudeMessageNotAccepted),
+        pytest.raises(bridge.ClaudeDeliveryUnconfirmed),
     ):
         bridge.inject_user_message(terminal.directory, content=_PRIVATE_TEXT)
 
