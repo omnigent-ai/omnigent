@@ -1254,7 +1254,7 @@ def register_core_routes(
             body.sibling_source_id = sibling_source.id
             body.project_id = sibling_source.project_id
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
-        resp, conv = await _create_session_from_existing_agent(
+        resp, conv, body = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,

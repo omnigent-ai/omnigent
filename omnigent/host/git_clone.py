@@ -74,7 +74,7 @@ def clone_repository(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResu
         command = [
             "git",
             "clone",
-            *GitCloneOptions().clone_args(repository.get("branch")),
+            *GitCloneOptions(single_branch=False).clone_args(repository.get("branch")),
             "--",
             repository["url"],
             str(destination),

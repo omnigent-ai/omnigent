@@ -15,6 +15,7 @@ import pytest
 
 from omnigent.host.frames import HostCloneRepositoryFrame
 from omnigent.host.git_clone import clone_repository, validate_clone_path
+from omnigent.host.git_worktree import create_worktree
 
 REPOSITORY_URL = "https://git.example.com/team/sample.git"
 
@@ -70,6 +71,12 @@ def test_clone_local_repository(
     assert subprocess.check_output(
         ["git", "-C", str(destination), "branch", "--show-current"], text=True
     ).strip() == (branch or "main")
+    worktree = create_worktree(
+        repo_path=str(destination),
+        branch_name="feature/work",
+        base_branch="origin/main" if branch else "origin/release",
+    )
+    assert (Path(worktree.worktree_path) / "README").read_text() == "initial checkout\n"
 
 
 @pytest.mark.parametrize("kind", ["directory", "file", "symlink"])
