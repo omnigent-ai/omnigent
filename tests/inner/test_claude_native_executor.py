@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import errno
 import json
 import logging
 import shutil
@@ -25,7 +26,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTerminalExited,
     TmuxSessionNotAdvertised,
 )
-from omnigent.inner import claude_native_executor
+from omnigent.inner import claude_native_executor, native_attachments
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TextChunk, TurnComplete
 from omnigent.inner.native_attachments import attachment_cache_dir
@@ -381,37 +382,108 @@ async def test_run_turn_holds_a_message_until_the_transcript_disk_has_space(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("disk_full", [False, True])
+async def test_storage_probe_keeps_later_input_behind_preparation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, disk_full: bool
+) -> None:
+    """A slow capacity probe cannot let later steering overtake its original input."""
+    started, release = threading.Event(), threading.Event()
+    injected = Mock()
+
+    def probe(_: Path) -> bool:
+        started.set()
+        assert release.wait(5)
+        return disk_full
+
+    monkeypatch.setattr(claude_native_executor, "_transcript_disk_full", probe)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
+    executor = ClaudeNativeExecutor(tmp_path)
+    turn = executor.run_turn(
+        messages=[{"role": "user", "content": "original input"}], tools=[], system_prompt=""
+    )
+    pending = asyncio.create_task(turn.__anext__())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        accepted = await executor.enqueue_session_message("session-key", "later input")
+        calls_during_probe = injected.call_count
+    finally:
+        release.set()
+    first = await pending
+    if disk_full:
+        assert isinstance(first, TextChunk)
+        await turn.aclose()
+        injected.assert_not_called()
+    else:
+        assert isinstance(first, TurnComplete)
+        await turn.aclose()
+        assert injected.call_count == 1
+        assert injected.call_args.kwargs["content"] == "original input"
+    assert not accepted
+    assert calls_during_probe == 0
+    assert not executor._holding_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_filesystem", ["transcript", "attachments"])
+@pytest.mark.parametrize("wait_outcome", ["cancel", "session_replaced"])
 async def test_run_turn_cancels_a_full_disk_hold_without_failing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    full_filesystem: str,
+    wait_outcome: str,
 ) -> None:
     """Closing a full-disk turn releases the wait without an error or keystrokes."""
     transcript = tmp_path / "projects" / "session.jsonl"
     (tmp_path / claude_bridge._STATE_FILE).write_text(
         json.dumps({"transcript_path": str(transcript)}), encoding="utf-8"
     )
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "original-session")
+    monkeypatch.setattr(
+        claude_native_executor, "read_active_session_id", lambda _: "original-session"
+    )
+    monkeypatch.setattr(claude_native_executor, "_HOST_DISK_POLL_S", 0)
     monkeypatch.setattr(
         claude_native_executor,
         "_transcript_disk_full",
-        Mock(return_value=True),
+        Mock(return_value=full_filesystem == "transcript"),
     )
+    content: Any = "hello from web"
+    if full_filesystem == "attachments":
+        content = [
+            {"type": "input_image", "image_url": _TINY_PNG_DATA_URI, "filename": "held.png"}
+        ]
+        monkeypatch.setattr(
+            native_attachments,
+            "_create_no_follow",
+            Mock(side_effect=OSError(errno.ENOSPC, "attachment cache full")),
+        )
     injected = Mock()
     monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
     executor = ClaudeNativeExecutor(tmp_path)
     turn = executor.run_turn(
-        messages=[{"role": "user", "content": "hello from web"}],
+        messages=[{"role": "user", "content": content}],
         tools=[],
         system_prompt="ignored",
     )
 
     assert isinstance(await turn.__anext__(), TextChunk)
-    pending_next = asyncio.create_task(turn.__anext__())
-    await asyncio.sleep(0)
-    pending_next.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await pending_next
-    await turn.aclose()
-
+    assert await executor.enqueue_session_message("session-key", "later input") is False
+    if wait_outcome == "session_replaced":
+        monkeypatch.setattr(
+            claude_native_executor, "read_active_session_id", lambda _: "new-session"
+        )
+        remaining = [event async for event in turn]
+        assert len(remaining) == 1
+        assert isinstance(remaining[0], ExecutorError)
+        assert remaining[0].undelivered
+    else:
+        pending_next = asyncio.create_task(turn.__anext__())
+        await asyncio.sleep(0)
+        pending_next.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pending_next
+        await turn.aclose()
+    assert not executor._holding_message
     injected.assert_not_called()
 
 
@@ -702,9 +774,15 @@ def _stub_inject(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "storage_errno",
+    [None, errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)],
+    ids=["available", "disk_full", "quota_full"],
+)
 async def test_run_turn_materializes_image_to_bridge_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    storage_errno: int | None,
 ) -> None:
     """
     An ``input_image`` block with a resolved data URI is decoded to a
@@ -718,6 +796,20 @@ async def test_run_turn_materializes_image_to_bridge_dir(
         _stub_inject(sent),
     )
 
+    if storage_errno is not None:
+        create = native_attachments._create_no_follow
+        refused = False
+
+        def storage_write(dir_fd: int, name: str, data: bytes) -> str:
+            nonlocal refused
+            if name == "screenshot.png" and not refused:
+                refused = True
+                raise OSError(storage_errno, "attachment storage exhausted")
+            return create(dir_fd, name, data)
+
+        monkeypatch.setattr(native_attachments, "_create_no_follow", storage_write)
+        monkeypatch.setattr(claude_native_executor, "_HOST_DISK_POLL_S", 0)
+
     executor = ClaudeNativeExecutor(tmp_path)
     events = [
         event
@@ -726,6 +818,11 @@ async def test_run_turn_materializes_image_to_bridge_dir(
                 {
                     "role": "user",
                     "content": [
+                        *(
+                            [{"type": "input_image", "image_url": _TINY_PNG_DATA_URI}]
+                            if storage_errno is not None
+                            else []
+                        ),
                         {
                             "type": "input_image",
                             "image_url": _TINY_PNG_DATA_URI,
@@ -740,8 +837,15 @@ async def test_run_turn_materializes_image_to_bridge_dir(
         )
     ]
 
-    # Turn completes successfully after injection.
-    assert events == [TurnComplete(response=None)]
+    # Turn completes successfully only after its complete input is available.
+    assert events == (
+        [TurnComplete(response=None)]
+        if storage_errno is None
+        else [
+            TextChunk(text=claude_native_executor._HOST_DISK_WAIT_MESSAGE),
+            TurnComplete(response=None),
+        ]
+    )
     assert len(sent) == 1
     injected = sent[0]["content"]
 
@@ -764,13 +868,10 @@ async def test_run_turn_materializes_image_to_bridge_dir(
     # The file was written to disk with the correct content.
     uploads = attachment_cache_dir(tmp_path)
     written = list(uploads.iterdir())
-    # Exactly 1 file — the materialized PNG.
-    assert len(written) == 1, (
-        f"Expected 1 written file, got {len(written)}. If 0, the attachment was not materialized."
-    )
-    assert written[0].name == "screenshot.png"
-    # Byte-level check: decoded content matches the original PNG.
-    assert written[0].read_bytes() == _TINY_PNG_BYTES
+    # A successful unnamed upload before the fault must not accumulate retry copies.
+    assert len(written) == (1 if storage_errno is None else 2)
+    assert (uploads / "screenshot.png").read_bytes() == _TINY_PNG_BYTES
+    assert all(path.read_bytes() == _TINY_PNG_BYTES for path in written)
 
 
 @pytest.mark.asyncio
@@ -1126,9 +1227,15 @@ async def test_run_turn_image_without_filename_gets_generated_name(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "storage_errno",
+    [None, errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)],
+    ids=["available", "disk_full", "quota_full"],
+)
 async def test_enqueue_session_message_materializes_image(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    storage_errno: int | None,
 ) -> None:
     """
     Steering messages with multimodal content blocks also materialize
@@ -1146,18 +1253,25 @@ async def test_enqueue_session_message_materializes_image(
     )
 
     executor = ClaudeNativeExecutor(tmp_path)
-    accepted = await executor.enqueue_session_message(
-        "session-key",
-        [
-            {
-                "type": "input_image",
-                "image_url": _TINY_PNG_DATA_URI,
-                "filename": "steering_img.png",
-            },
-            framework_notice_block(dimensions),
-            {"type": "input_text", "text": "look at this"},
-        ],
-    )
+    content = [
+        {
+            "type": "input_image",
+            "image_url": _TINY_PNG_DATA_URI,
+            "filename": "steering_img.png",
+        },
+        framework_notice_block(dimensions),
+        {"type": "input_text", "text": "look at this"},
+    ]
+    if storage_errno is not None:
+        with monkeypatch.context() as fault:
+            fault.setattr(
+                native_attachments,
+                "_create_no_follow",
+                Mock(side_effect=OSError(storage_errno, "attachment cache full")),
+            )
+            assert await executor.enqueue_session_message("session-key", content) is False
+        assert sent == []
+    accepted = await executor.enqueue_session_message("session-key", content)
 
     assert accepted is True
     assert len(sent) == 1

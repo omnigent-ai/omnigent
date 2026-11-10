@@ -267,7 +267,19 @@ def attachment_cache_dir(bridge_dir: Path) -> Path:
     return data_dir().resolve() / "attachments" / key
 
 
-def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Path | None:
+class NativeAttachmentStorageFull(OSError):
+    """Local attachment preparation failed before an input could be submitted."""
+
+
+def _raise_attachment_storage_full(exc: OSError, enabled: bool) -> None:
+    """Preserve capacity failures for callers that can retain unsent input."""
+    if enabled and exc.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+        raise NativeAttachmentStorageFull(exc.errno, exc.strerror) from exc
+
+
+def materialize_attachment(
+    block: Mapping[str, object], bridge_dir: Path, *, raise_storage_errors: bool = False
+) -> Path | None:
     """
     Decode an attachment into the session's cache outside the working directory.
 
@@ -280,8 +292,10 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         e.g. ``"data:image/png;base64,iVBOR..."``. May also carry a
         ``filename``, e.g. ``"diagram.png"``.
     :param bridge_dir: Session bridge path, used to identify its attachment cache.
+    :param raise_storage_errors: Raise capacity errors so a caller can retain the input.
     :returns: Path to the written file, or ``None`` if the block could
         not be materialized (missing data URI, decode error).
+    :raises NativeAttachmentStorageFull: On disk/quota exhaustion when requested.
     """
     decoded = _decode_attachment_block(block)
     if decoded is None:
@@ -305,7 +319,8 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
             )
         finally:
             os.close(root_fd)
-    except OSError:
+    except OSError as exc:
+        _raise_attachment_storage_full(exc, raise_storage_errors)
         _logger.warning("Refusing to materialize into %s", attachments_dir, exc_info=True)
         return None
     try:
@@ -320,7 +335,8 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
                 return attachments_dir / name
         _logger.warning("Attachment names for %s already hold other content", filename)
         return None
-    except OSError:
+    except OSError as exc:
+        _raise_attachment_storage_full(exc, raise_storage_errors)
         _logger.warning("Failed to materialize attachment %s", filename, exc_info=True)
         return None
     finally:
@@ -357,11 +373,13 @@ def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] |
     ext = MIME_TO_EXT.get(parsed.mime_type, "")
     filename = block.get("filename")
     if not isinstance(filename, str) or not filename:
-        filename = f"attachment_{uuid.uuid4().hex[:8]}{ext}"
+        filename = f"attachment_{hashlib.sha256(raw_bytes).hexdigest()[:12]}{ext}"
     else:
         # ``.name`` drops any directory part, so "../../etc/passwd" becomes
         # "passwd" and a traversal attempt can't escape the destination dir.
-        filename = Path(filename).name or f"attachment_{uuid.uuid4().hex[:8]}{ext}"
+        filename = (
+            Path(filename).name or f"attachment_{hashlib.sha256(raw_bytes).hexdigest()[:12]}{ext}"
+        )
     return raw_bytes, _MARKER_UNSAFE.sub("_", filename)
 
 
@@ -425,6 +443,8 @@ def _create_no_follow(
     except FileExistsError:
         return "taken"
     except OSError as exc:
+        if exc.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+            raise
         return "symlink" if exc.errno == errno.ELOOP else "taken"
     try:
         view = memoryview(raw_bytes)
@@ -493,7 +513,9 @@ def unresolved_attachment_marker(block: Mapping[str, object]) -> str:
     return f"[Attachment {_MARKER_UNSAFE.sub('_', name)} could not be loaded]"
 
 
-def attachment_reference_line(block: Mapping[str, object], bridge_dir: Path) -> str:
+def attachment_reference_line(
+    block: Mapping[str, object], bridge_dir: Path, *, raise_storage_errors: bool = False
+) -> str:
     """
     Materialize *block* and return the transcript line referencing it.
 
@@ -504,10 +526,11 @@ def attachment_reference_line(block: Mapping[str, object], bridge_dir: Path) -> 
     :param block: Attachment content block (see
         :func:`materialize_attachment`).
     :param bridge_dir: Session bridge path identifying the attachment cache.
+    :param raise_storage_errors: Propagate capacity failures for unsent-input recovery.
     :returns: ``"[Attached: <path>]"`` on success, else the visible
         marker from :func:`unresolved_attachment_marker`.
     """
-    path = materialize_attachment(block, bridge_dir)
+    path = materialize_attachment(block, bridge_dir, raise_storage_errors=raise_storage_errors)
     if path is not None:
         return f"[Attached: {path}]"
     return unresolved_attachment_marker(block)

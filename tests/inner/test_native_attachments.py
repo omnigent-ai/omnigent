@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,7 @@ from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENTS,
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     DataUri,
+    NativeAttachmentStorageFull,
     attachment_cache_dir,
     attachment_reference_line,
     codex_resize_metadata_path,
@@ -103,6 +106,52 @@ def test_materialize_attachment_writes_decoded_bytes(tmp_path: Path) -> None:
     assert path.parent == attachment_cache_dir(tmp_path)
     assert path.read_bytes() == base64.b64decode(_PNG_B64)
     assert path.suffix == ".png"  # MIME-derived extension when no filename given
+
+
+@pytest.mark.parametrize("stage", ["cache_directory", "file_open", "partial_write"])
+@pytest.mark.parametrize(
+    "storage_errno", [errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC), errno.EACCES]
+)
+@pytest.mark.parametrize("strict", [False, True], ids=["legacy_placeholder", "retain_input"])
+def test_attachment_capacity_failure_preserves_original_for_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, storage_errno: int, strict: bool
+) -> None:
+    """Exhaustion can affect the cache, inode allocation or a partially written upload."""
+    block = {"type": "input_image", "image_url": _PNG_DATA_URI, "filename": "sample.png"}
+    open_file, write = os.open, os.write
+    fault_reached = False
+
+    def fail_capacity(*args: Any, **kwargs: Any) -> Any:
+        nonlocal fault_reached
+        fault_reached = True
+        if stage == "partial_write":
+            write(args[0], args[1][:8])
+        raise OSError(storage_errno, "local storage exhausted")
+
+    with monkeypatch.context() as fault:
+        if stage == "cache_directory":
+            fault.setattr(os, "mkdir", fail_capacity)
+        elif stage == "file_open":
+
+            def open_or_fail(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+                if flags & os.O_CREAT:
+                    return fail_capacity(path, flags, *args, **kwargs)
+                return open_file(path, flags, *args, **kwargs)
+
+            fault.setattr(os, "open", open_or_fail)
+        else:
+            fault.setattr(os, "write", fail_capacity)
+        if strict and storage_errno != errno.EACCES:
+            with pytest.raises(NativeAttachmentStorageFull) as caught:
+                materialize_attachment(block, tmp_path, raise_storage_errors=True)
+            assert caught.value.errno == storage_errno
+        else:
+            assert materialize_attachment(block, tmp_path, raise_storage_errors=strict) is None
+    assert fault_reached
+    path = materialize_attachment(block, tmp_path, raise_storage_errors=True)
+    assert path is not None
+    assert path.read_bytes() == base64.b64decode(_PNG_B64)
+    assert list(path.parent.iterdir()) == [path]
 
 
 def test_materialize_attachment_uses_block_filename(tmp_path: Path) -> None:
@@ -218,7 +267,10 @@ def test_unresolved_attachment_marker_sanitizes_bracketed_names() -> None:
     assert re.fullmatch(UNRESOLVED_ATTACHMENT_MARKER_PATTERN, multiline)
 
 
-def test_materialize_attachment_reuses_identical_existing_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("filename", ["photo.png", None])
+def test_materialize_attachment_reuses_identical_existing_file(
+    tmp_path: Path, filename: str | None
+) -> None:
     """
     Re-materializing identical bytes returns the existing file.
 
@@ -227,12 +279,12 @@ def test_materialize_attachment_reuses_identical_existing_file(tmp_path: Path) -
     copy per resume. Different bytes under the same name still get a
     fresh suffixed path.
     """
-    block = {"type": "input_image", "image_url": _PNG_DATA_URI, "filename": "photo.png"}
+    block = {"type": "input_image", "image_url": _PNG_DATA_URI, "filename": filename}
     other_payload = base64.b64encode(b"other-bytes").decode()
     other = {
         "type": "input_image",
         "image_url": f"data:image/png;base64,{other_payload}",
-        "filename": "photo.png",
+        "filename": filename,
     }
 
     first = materialize_attachment(block, tmp_path)

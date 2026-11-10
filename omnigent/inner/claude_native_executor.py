@@ -58,6 +58,7 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.native_attachments import (
     FRAMEWORK_NOTICE_BLOCK_TYPE,
+    NativeAttachmentStorageFull,
     attachment_reference_line,
     framework_notices,
 )
@@ -169,21 +170,21 @@ class ClaudeNativeExecutor(Executor):
         if self._holding_message:
             # Refused, it follows as the next turn, behind the held message.
             return False
-        text = _content_to_text(content, self._bridge_dir)
-        if not text:
-            return False
-        if is_auth_slash_command(text):
-            # Same dead end as in run_turn(): /login and /logout must
-            # never be typed into the pane. Refusing the live injection
-            # keeps the runner's buffered copy (no injection.consumed is
-            # emitted), so the message re-arrives as the next turn and
-            # run_turn's short-circuit answers it with the `omni setup`
-            # guidance instead of spending a model turn on it.
-            return False
         try:
+            text = _content_to_text(content, self._bridge_dir)
+            if not text:
+                return False
+            if is_auth_slash_command(text):
+                # Same dead end as in run_turn(): /login and /logout must
+                # never be typed into the pane. Refusing the live injection
+                # keeps the runner's buffered copy (no injection.consumed is
+                # emitted), so the message re-arrives as the next turn and
+                # run_turn's short-circuit answers it with the `omni setup`
+                # guidance instead of spending a model turn on it.
+                return False
             async with self._inject_lock:
                 await self._inject_prompt(text, framework_notices(content))
-        except RuntimeError:
+        except (RuntimeError, NativeAttachmentStorageFull):
             return False
         return True
 
@@ -406,54 +407,64 @@ class ClaudeNativeExecutor(Executor):
         if not _session_is_active(self._bridge_dir, self._request_session_id):
             yield ExecutorError(message=_STALE_SESSION_MESSAGE, undelivered=True)
             return
-        text = _latest_user_text(messages, self._bridge_dir)
         notices = _latest_framework_notices(messages)
-        if not text:
-            yield ExecutorError(message="Claude native turn had no user text to send")
-            return
-        if is_auth_slash_command(text):
-            # Claude Code's sign-in is an interactive TUI handoff the bridge
-            # cannot drive; typed as prose, /login only gets the same expired
-            # login answer back. Answer with a reachable remedy, typing nothing.
-            yield ExecutorError(
-                message=(
-                    _AUTH_COMMAND_GUIDANCE_MANAGED_SANDBOX
-                    if in_managed_sandbox()
-                    else _AUTH_COMMAND_GUIDANCE
-                ),
-                undelivered=True,
-            )
-            return
-        if await asyncio.to_thread(_transcript_disk_full, self._bridge_dir):
-            _logger.warning(
-                "claude-native: host disk is full; holding the message",
-                extra={"session_id": self._request_session_id},
-            )
-            yield TextChunk(text=_HOST_DISK_WAIT_MESSAGE)
-            while await asyncio.to_thread(_transcript_disk_full, self._bridge_dir):
-                await asyncio.sleep(_HOST_DISK_POLL_S)
         from omnigent.runtime import telemetry
 
-        # Span the tmux send-keys inject — the input half of the decoupled
-        # native path. session.id is applied generically by the span processor
-        # (the executor adapter binds session_scope for the turn), so there's
-        # no per-call-site stamping here.
-        #
-        # Apply a routed ``/model`` switch and inject the message as ONE
-        # step under ``_inject_lock``. Intelligent routing used to switch
-        # the model with a separate server-issued ``model_change`` event
-        # that raced this inject on the same tmux pane, so the message's
-        # keystrokes could land mid-switch and be lost (the "routing drops
-        # the first message" bug). Folding the switch into the turn under
-        # the same lock removes the second writer entirely: ``/model`` fully
-        # commits, then ``inject_user_message`` (which waits for the input
-        # box and verifies its submit) delivers the message — in order,
-        # once.
-        wanted_model = config.model if config is not None else None
-        # ``/model`` only accepts this session's picker values, aliases, and
-        # custom slot; anything else is ignored and the pane keeps its model.
-        wanted_model_arg = self._model_command_arg(wanted_model)
+        text: str | None = None
+        storage_waited = False
+        self._holding_message = True
         try:
+            while True:
+                self._require_active_session()
+                if text is None:
+                    with contextlib.suppress(NativeAttachmentStorageFull):
+                        text = _latest_user_text(messages, self._bridge_dir)
+                if text is not None:
+                    if not text:
+                        yield ExecutorError(message="Claude native turn had no user text to send")
+                        return
+                    if is_auth_slash_command(text):
+                        yield ExecutorError(
+                            message=(
+                                _AUTH_COMMAND_GUIDANCE_MANAGED_SANDBOX
+                                if in_managed_sandbox()
+                                else _AUTH_COMMAND_GUIDANCE
+                            ),
+                            undelivered=True,
+                        )
+                        return
+                    if not await asyncio.to_thread(_transcript_disk_full, self._bridge_dir):
+                        if not storage_waited:
+                            self._holding_message = False
+                        break
+                if not storage_waited:
+                    storage_waited = True
+                    _logger.warning(
+                        "claude-native: local storage is full; holding the message",
+                        extra={"session_id": self._request_session_id},
+                    )
+                    yield TextChunk(text=_HOST_DISK_WAIT_MESSAGE)
+                await asyncio.sleep(_HOST_DISK_POLL_S)
+
+            # Span the tmux send-keys inject — the input half of the decoupled
+            # native path. session.id is applied generically by the span processor
+            # (the executor adapter binds session_scope for the turn), so there's
+            # no per-call-site stamping here.
+            #
+            # Apply a routed ``/model`` switch and inject the message as ONE
+            # step under ``_inject_lock``. Intelligent routing used to switch
+            # the model with a separate server-issued ``model_change`` event
+            # that raced this inject on the same tmux pane, so the message's
+            # keystrokes could land mid-switch and be lost (the "routing drops
+            # the first message" bug). Folding the switch into the turn under
+            # the same lock removes the second writer entirely: ``/model`` fully
+            # commits, then ``inject_user_message`` (which waits for the input
+            # box and verifies its submit) delivers the message — in order,
+            # once.
+            wanted_model = config.model if config is not None else None
+            # ``/model`` only accepts this session's picker values, aliases, and
+            # custom slot; anything else is ignored and the pane keeps its model.
+            wanted_model_arg = self._model_command_arg(wanted_model)
             with telemetry.span("claude_native.inject"):
                 hold_deadline: float | None = None
                 while True:
@@ -556,6 +567,8 @@ class ClaudeNativeExecutor(Executor):
             )
             yield ExecutorError(message=describe_exception(exc))
             return
+        finally:
+            self._holding_message = False
         yield TurnComplete(response=None)
 
     async def _inject(self, operation: Callable[[], None]) -> None:
@@ -808,7 +821,9 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
                 if isinstance(text, str):
                     text_parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                attachment_lines.append(attachment_reference_line(block, bridge_dir))
+                attachment_lines.append(
+                    attachment_reference_line(block, bridge_dir, raise_storage_errors=True)
+                )
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)
     return ""
