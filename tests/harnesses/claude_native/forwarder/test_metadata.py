@@ -1024,6 +1024,7 @@ async def test_forward_pane_signals_captures_once_and_relays_both(
         pytest.param(["closed", "second", "second", "second"], 2, id="closed"),
         pytest.param(["answering", "second", "second", "second"], 2, id="answering"),
         pytest.param(["torn", "first", "first", "first"], 1, id="torn-capture"),
+        pytest.param(["torn-bullet", "first", "first", "first"], 1, id="torn-bullet-capture"),
     ],
 )
 async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
@@ -1037,10 +1038,11 @@ async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
 
     Claude Code keeps /btw history, so the second ask lists the first above it
     and settles on the same question and answer. One torn capture that loses
-    the footer does not end the display, though the answer quotes a composer.
+    the footer does not end the display, though the question ends with the
+    close hint and the answer quotes a composer or starts with an answering bullet.
     """
     scrollback = [f"scrollback line {n}" for n in range(30)]
-    border, question = "▔" * 80, "    /btw hello"
+    border, question = "▔" * 80, "    /btw what does Esc to close"
     answer = ["      Type it like this:", "      " + "─" * 40, "      ❯ example"]
     first_ask = "\n".join(
         [
@@ -1082,6 +1084,17 @@ async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
             ]
         ),
         "torn": "\n".join([*scrollback, border, question, "", *answer, ""]),
+        "torn-bullet": "\n".join(
+            [
+                *scrollback,
+                border,
+                question,
+                "",
+                "      * Answering is a literal bullet, not a spinner",
+                "      This intervening answer row is not a footer",
+                "      Esc to close",
+            ]
+        ),
     }
     frames = [first_ask] * 3 + [named_frames[name] for name in later_frames]
     write_tmux_target(tmp_path, socket_path=tmp_path / "tmux.sock", tmux_target="claude:0.0")
@@ -1101,7 +1114,7 @@ async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
 
     relayed = [c["data"] for c in calls if c["type"] == "external_btw_sidechat"]
     exchange = {
-        "question": "/btw hello",
+        "question": "/btw what does Esc to close",
         "answer": "Type it like this:\n" + "─" * 40 + "\n❯ example",
         "truncated": False,
     }

@@ -16889,6 +16889,54 @@ def test_btw_overlay_present_false_on_bare_composer(quoted_overlay: str) -> None
             id="settled-answer-ends-with-close-hint",
         ),
         pytest.param(
+            _btw_pane(
+                "    /btw what does Esc to close",
+                "",
+                "      A",
+                "      " + "─" * 40,
+                "      ❯ example",
+                "",
+                _BTW_COMPLETE_FOOTER,
+            ),
+            False,
+            id="settled-question-ends-with-close-hint",
+        ),
+        pytest.param(
+            _btw_pane(
+                "    /btw what does Esc to close",
+                "",
+                "      Press Esc to close",
+                "      " + "─" * 40,
+                "      ❯ example",
+                "",
+            ),
+            False,
+            id="torn-footer-after-close-hints",
+        ),
+        pytest.param(
+            _btw_pane(
+                "    /btw q",
+                "",
+                "      * Answering is a literal bullet, not a spinner",
+                "      This intervening answer row is not a footer",
+                "      Esc to close",
+            ),
+            False,
+            id="torn-footer-after-answering-bullet",
+        ),
+        pytest.param(
+            _btw_pane(
+                "    /btw q",
+                "",
+                "      ✻ Answering…",
+                "",
+                "    ⇧←/→ to browse · x to clear history ·",
+                "    Esc to close",
+            ),
+            True,
+            id="answering-with-wrapped-footer",
+        ),
+        pytest.param(
             _WRAPPED_BTW_PANE + "\n" + _composer_pane(), True, id="closed-below-earlier-overlay"
         ),
         pytest.param("", False, id="failed-capture"),
