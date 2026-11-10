@@ -20137,6 +20137,24 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "description": "`workspace` confines the read to the workspace root.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "workspace",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
+            }
           }
         ],
         "responses": {
@@ -20328,6 +20346,24 @@
               "default": false,
               "title": "Download",
               "type": "boolean"
+            }
+          },
+          {
+            "description": "`workspace` also confines owner reads, including symlinks.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "workspace",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
             }
           }
         ],

@@ -50,6 +50,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     RunnerSessionInitSnapshot,
 )
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
@@ -942,7 +943,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
     assert build_calls[0]["trust_project"] is True
     assert build_calls[0]["reconcile_process_registry"] is False
-    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
+    assert build_calls[0]["developer_instructions"] == (
+        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    )
     # Persisted pass-through args must reach launch resolution (--profile layering).
     assert resolve_calls and all(
         call["terminal_launch_args"] == ["--config", "approval_policy=on-request"]
@@ -1914,7 +1917,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "mean the session snapshot workspace was ignored."
     )
     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
-    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
+    assert build_calls[0]["developer_instructions"] == (
+        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    )
 
     # Sandbox-override regression: the launched Codex terminal must inherit
     # the agent's sandbox: none rather than falling back to the platform
