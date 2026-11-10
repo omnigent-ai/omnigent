@@ -49,3 +49,20 @@ export function getSessionState(
   if (conversation?.background_work_running) return { kind: "running", background: true };
   return null;
 }
+
+/**
+ * Whether archiving would interrupt the agent: a turn is running or waiting on
+ * an approval, or background work outlives the last turn.
+ */
+export function isSessionWorking(
+  conversation: Pick<
+    Conversation,
+    "status" | "pending_elicitations_count" | "background_work_running"
+  >,
+): boolean {
+  return (
+    conversation.status === "running" ||
+    (conversation.pending_elicitations_count ?? 0) > 0 ||
+    conversation.background_work_running === true
+  );
+}
