@@ -139,7 +139,7 @@ Package mirrors that embargo new releases, such as the Databricks PyPI proxy
 used for internal builds, install omnigent from the requirements declared in
 `pyproject.toml`, not from `uv.lock`. When you raise a dependency floor or add a
 dependency, keep the floor at a release those mirrors already serve and let
-`uv.lock` pin anything newer. With Databricks network access, run
+`uv.lock` pin anything newer. With access to the mirror, run
 `just check-internal-mirror` before merging; it resolves through the proxy
 without writing `uv.lock`. The `young-dependency-floor` custom lint fails when a
 floor needs a release inside the uv cooldown. An urgent bump, such as a security

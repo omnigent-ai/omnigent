@@ -258,7 +258,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   renewal. States: valid, invalid, checking, skipped, refreshing, failed, and
   CLI not installed.
 - `launch-action-required`: while a managed launch needs the user to do
-  something, such as an Arclet waiting for its owner's dbcert, the session's chat
+  something, such as a sandbox still waiting for its owner's credentials, the session's chat
   transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
@@ -368,9 +368,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   alone must not open the browser, and renewal alone must not create a sandbox.
   While **Checking laptop credentials…** is visible, **Skip** starts that launch
   without waiting for verification or opening sign-in. Later launches check again.
-- On a deployment whose launches report that the user needs to act, such as
-  Databricks' managed Arclets, start a managed session whose launch needs you,
-  e.g. an Arclet whose owner's dbcert hasn't arrived. The session's chat
+- On a deployment whose launches can report that the user needs to act, start a
+  managed session whose launch needs you, e.g. a sandbox still waiting for its
+  owner's credentials. The session's chat
   transcript keeps showing **Provisioning sandbox…** and adds a yellow banner
   saying what to do. The terminal view doesn't show it.
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
@@ -427,9 +427,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - With an Arca connected, choose **Arclet Sandbox** with a native terminal agent
   and type `/` for Claude or `$` for Codex before the first send. The menu previews that Arca's home-level
   catalog; selecting a skill completes the prompt while the launch stays on Arclet.
-  Runtime availability follows Arclet's existing skill sync and plugin installation;
-  custom skill roots or plugins installed only on Arca may be absent on Arclet.
-  With no connected Arca, host skills become available after the sandbox starts.
+  Skill roots or plugins installed only on the connected host may be missing on
+  the sandbox. With no connected Arca, host skills become available after the sandbox starts.
   SDK agents continue using their bundled skills before the sandbox starts.
   Browser coverage: `tests/browser_ui/chat/test_arclet_skills.py`.
 - Open **MCPs** in the workspace bar above the composer (the plug icon when space is tight), then turn
@@ -887,8 +886,8 @@ Other connection providers alone do not enable the managed MCP picker.
   native bridge, CLI process, and local server with a fake dbcert executable and
   machine policy. Follow `web/electron/e2e/README.md` for build and recording
   prerequisites. It proves explicit refresh and launch, preserved input, skipping
-  a pending check, and skipped kubeconfig updates and existing-Arca sync; macOS
-  SSO and Companion transfer need a manual managed-desktop check. Component tests in
+  a pending check, and skipped kubeconfig updates and host sync; macOS sign-in
+  needs a manual managed-desktop check. Component tests in
   `web/src/shell/NewChatDialog.test.tsx` and
   `web/src/components/DbcertBanner.test.tsx` cover leaving during a check, late
   results after skipping, retry, dismissal, check errors, and older shells.
@@ -916,11 +915,10 @@ Other connection providers alone do not enable the managed MCP picker.
 - Test touch sizing with a real touch device or browser touch emulation; resizing
   a mouse browser alone does not enable it.
 
-- The Arclet dbcert preflight needs both the updated desktop shell and web UI,
-  with Databricks-internal features enabled for the managed server. Browsers,
-  older shells, other sandbox providers, and already-connected hosts do not
-  perform this laptop check. The existing session banner checks the host's
-  certificate instead; refreshing it does not prove new-session gating works.
+- The Arclet dbcert preflight needs the updated desktop shell and web UI, with
+  managed features enabled on the server. Browsers, older shells, other sandbox
+  providers, and already-connected hosts skip this check. Refreshing a host's
+  credential from the session banner does not prove new-session gating works.
   Skip bypasses only this launch's check; it does not renew credentials or
   guarantee that sandbox authentication will succeed.
 - The launch action banner appears only on deployments whose launch code

@@ -817,7 +817,7 @@ describe("Arca extend IPC", () => {
         canExtendArca: true,
         canRefreshDbcert: true,
         arcaPreviewRecovery: true,
-        // Internal-feature fixtures simulate macOS on every test host.
+        // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
       },
     );
@@ -848,7 +848,7 @@ describe("Arca extend IPC", () => {
     assert.deepEqual(h.calls.arcaExtends, []);
   });
 
-  it("rejects Arca extension on a local server even with internal features", async (t) => {
+  it("rejects Arca extension on a local server even with managed features", async (t) => {
     const h = loadNavigationHarness({ serverUrl: "http://localhost:6767", internalFeatures: true });
     t.after(h.cleanup);
     h.api.registerIpc();
@@ -1072,7 +1072,7 @@ describe("dbcert refresh IPC", () => {
 
   for (const [what, options] of [
     ["a local server", { serverUrl: "http://localhost:6767", internalFeatures: true }],
-    ["a machine without Databricks-internal features", { serverUrl }],
+    ["a machine without managed features", { serverUrl }],
   ]) {
     it(`refuses ${what}`, async (t) => {
       const h = loadNavigationHarness(options);
@@ -1252,7 +1252,7 @@ describe("Arca auto-connect wiring", () => {
       );
     const failed = { ok: false, errorKind: "timeout", error: "timed out" };
 
-    it("prepares sign-in before connecting to the identical SPOG workspace", async (t) => {
+    it("prepares sign-in before connecting to the identical workspace", async (t) => {
       const spog = "https://account.databricks.com/omnigent?o=123";
       let prepared = false;
       const h = harness(t, {
@@ -1339,7 +1339,7 @@ describe("Arca auto-connect wiring", () => {
       assert.equal(saved(h).arca_auto_connect, true);
     });
 
-    it("does not share sign-in or host success across SPOG workspace selectors", async (t) => {
+    it("does not share sign-in or host success across workspace selectors", async (t) => {
       const firstTarget = "https://account.databricks.com/omnigent?o=123";
       const secondTarget = "https://account.databricks.com/omnigent?o=456";
       const authenticated = new Set();
@@ -1515,7 +1515,7 @@ describe("Arca auto-connect wiring", () => {
     assert.deepEqual(h.calls.arcaConnects, []);
   });
 
-  it("skips servers that aren't Databricks-managed", async (t) => {
+  it("skips servers that aren't managed", async (t) => {
     const local = "http://localhost:6767";
     const h = loadNavigationHarness({ serverUrl: local, arcaPath });
     t.after(h.cleanup);
@@ -2892,8 +2892,8 @@ describe("managed server preference wiring", () => {
   });
 });
 
-describe("Databricks-internal local-host CLI wiring", () => {
-  it("selects isaac omni only behind the internal flag and Databricks server gate", () => {
+describe("managed local-host CLI wiring", () => {
+  it("selects isaac omni only behind the managed features flag and managed server gate", () => {
     assert.match(
       liveCode,
       /function hostCliCommand\(serverUrl\)[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,120}isDatabricksManagedServerUrl\(serverUrl\)[\s\S]{0,300}prefixArgs:\s*\["omni"\]/,
@@ -3107,9 +3107,9 @@ describe("server selector default", () => {
   const devUrl = "http://localhost:5174/server-selector-v2.html";
 
   for (const [name, options, settings, v2] of [
-    ["new internal macOS install", { internalFeatures: true }, null, true],
+    ["new macOS install with managed features", { internalFeatures: true }, null, true],
     [
-      "existing internal macOS install",
+      "existing macOS install with managed features",
       { internalFeatures: true },
       { recent_servers: ["https://team.example.com/"] },
       true,
@@ -3117,14 +3117,19 @@ describe("server selector default", () => {
     ["new public macOS install", {}, null, false],
     ["existing public macOS install", {}, { recent_servers: ["https://team.example.com/"] }, false],
     [
-      "MDM server presets without internal features",
+      "managed server presets without managed features",
       { managedServers: ["https://team.example.com/"] },
       null,
       false,
     ],
     ["Linux install", { platform: "linux", internalFeatures: true }, null, false],
     ["Windows install", { platform: "win32", internalFeatures: true }, null, false],
-    ["unpackaged internal macOS build", { isPackaged: false, internalFeatures: true }, null, true],
+    [
+      "unpackaged macOS build with managed features",
+      { isPackaged: false, internalFeatures: true },
+      null,
+      true,
+    ],
     ["unpackaged public macOS build", { isPackaged: false }, null, false],
     ["null selector preference", { internalFeatures: true }, { server_selector_v2: null }, true],
     [
@@ -3168,7 +3173,7 @@ describe("server selector default", () => {
     });
   }
 
-  it("falls back to bundled V2 when the internal macOS dev server is unavailable", async () => {
+  it("falls back to bundled V2 when the macOS dev server with managed features is unavailable", async () => {
     const h = loadNavigationHarness({
       internalFeatures: true,
       env: { OMNIGENT_SERVER_SELECTOR_V2_DEV_URL: devUrl },
@@ -3448,7 +3453,7 @@ describe("recent-server startup wiring (src/main.js)", () => {
     }
   });
 
-  it("counts MDM presets toward the setup page's returning-user signal", () => {
+  it("counts managed presets toward the setup page's returning-user signal", () => {
     // Raw recents, NOT managed-excluded: a preset-only history is still returning.
     assert.match(
       liveCode,
@@ -4503,7 +4508,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         canExtendArca: true,
         canRefreshDbcert: true,
         arcaPreviewRecovery: true,
-        // Internal-feature fixtures simulate macOS on every test host.
+        // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
       },
     );
@@ -4962,7 +4967,7 @@ describe("onboarding runner IPC", () => {
     );
   });
 
-  it("offers no remote environment without the internal flag, and refuses to connect one", async (t) => {
+  it("offers no remote environment without the managed features flag, and refuses to connect one", async (t) => {
     const h = harness(t);
     const event = { sender: setupSender(), senderFrame: setupFrame(h) };
     assert.deepEqual(plain(h.ipc.get("omnigent:get-runner-options")(event, server)), {
@@ -4999,7 +5004,7 @@ describe("onboarding runner IPC", () => {
     assert.deepEqual(plain(result), { ok: false, error: legacyError, errorMessage, errorAction });
   });
 
-  // Remote runs on a managed server behind the internal flag; local uses a laptop CLI.
+  // Remote runs on a managed server behind the managed features flag; local uses a laptop CLI.
   const managedServer = "https://workspace.cloud.databricks.com/omnigent";
   const connectCases = [
     [
@@ -5802,12 +5807,16 @@ describe("SSH connect IPC", () => {
     assert.deepEqual(h.calls.sshConnects, []);
   });
 
-  // Run on Arca replaces SSH connect where it is offered: the internal flag on a managed server.
+  // Run on Arca replaces SSH connect where it is offered: the managed features flag on a managed server.
   const managed = "https://workspace.cloud.databricks.com/omnigent";
   const arcaCases = {
-    "an internal laptop on a Databricks server, which offers Run on Arca": [managed, true, false],
+    "a laptop with managed features on a managed server, which offers Run on Arca": [
+      managed,
+      true,
+      false,
+    ],
     "any other laptop on a Databricks server": [managed, false, true],
-    "an internal laptop on a self-hosted server": [server, true, true],
+    "a laptop with managed features on a self-hosted server": [server, true, true],
   };
   for (const [label, [serverUrl, internalFeatures, connects]] of Object.entries(arcaCases)) {
     it(`${connects ? "connects" : "refuses"} for ${label}`, async (t) => {

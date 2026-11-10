@@ -244,8 +244,19 @@ async def test_post_cap_holds_under_concurrency_and_id_spellings(
         {"links": [{"type": "url", "ref": "https://["}]},
         {"body_md": "".join(chr(0x4E00 + (n * 7919) % 20000) for n in range(8000))},
         {"topic": "\u0130" * 100},
+        {
+            "links": [
+                {"type": "pr", "ref": "https://github.com/acme/app/pull/7"},
+                {"type": "url", "ref": "javascript:alert(1)"},
+            ]
+        },
     ],
-    ids=["unparseable-link", "body-too-large-to-store", "topic-too-long-once-lowercased"],
+    ids=[
+        "unparseable-link",
+        "body-too-large-to-store",
+        "topic-too-long-once-lowercased",
+        "bad-secondary-link",
+    ],
 )
 async def test_post_rejects_items_it_cannot_store(
     client: httpx.AsyncClient, stores: SimpleNamespace, overrides: dict[str, Any]
