@@ -174,7 +174,9 @@ describe("useReconnectLiveMcpServer", () => {
           answerRead = resolve;
         }),
       )
-      .mockResolvedValueOnce(json({ live: true, servers: [{ name: "docs", status: "connected" }] }));
+      .mockResolvedValueOnce(
+        json({ live: true, servers: [{ name: "docs", status: "connected" }] }),
+      );
     const { result } = renderHook(
       () => ({
         live: useSessionLiveMcpServers("conv_a", true),
