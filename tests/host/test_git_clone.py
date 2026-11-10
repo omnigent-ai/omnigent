@@ -53,13 +53,15 @@ def local_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return source
 
 
-@pytest.mark.parametrize("branch", [None, "release"])
+@pytest.mark.parametrize("branch,home_relative", [(None, False), ("release", False), (None, True)])
 def test_clone_local_repository(
-    local_repository: Path, tmp_path: Path, branch: str | None
+    local_repository: Path, tmp_path: Path, branch: str | None, home_relative: bool
 ) -> None:
     destination = tmp_path / "checkout"
     result = clone_repository(
-        HostCloneRepositoryFrame("clone", REPOSITORY_URL, str(destination), branch)
+        HostCloneRepositoryFrame(
+            "clone", REPOSITORY_URL, "~/checkout" if home_relative else str(destination), branch
+        )
     )
     assert result.status == "ok", result.error
     assert result.path == str(destination)
@@ -169,14 +171,6 @@ def test_failed_clone_cleans_readonly_objects_or_logs_failure(
     assert (
         "Could not remove incomplete repository checkout" in caplog.text
     ) is not cleanup_allowed
-
-
-def test_clone_expands_home_on_host(
-    local_repository: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
-    result = clone_repository(HostCloneRepositoryFrame("clone", REPOSITORY_URL, "~/checkout"))
-    assert result.path == str(tmp_path / "checkout")
 
 
 @pytest.mark.parametrize("path", ["relative/path", "~another/checkout", "", "/tmp/bad\x00path"])

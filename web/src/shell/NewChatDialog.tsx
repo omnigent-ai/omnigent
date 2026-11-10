@@ -2104,6 +2104,8 @@ interface LandingDraft {
   sandboxProvider: string | null;
   sandboxProfile: SandboxProfileSelection | null;
   sandboxRepoSelections: LastSandboxRepo[];
+  repositorySeeded: boolean;
+  repositoryPlacementEdited: boolean;
   workspace: string;
   branchName: string;
   autoSeededBranch: string;
@@ -2457,6 +2459,8 @@ function NewChatLandingContent({
           // they are location state too — keeping them would clone another
           // project's repository into this project's sandbox.
           sandboxRepoSelections: [],
+          repositorySeeded: false,
+          repositoryPlacementEdited: false,
           workspace: "",
           branchName: "",
           // The branch may be the worktree-default's auto-seed, generated for
@@ -2696,12 +2700,8 @@ function NewChatLandingContent({
     effectiveSandboxProvider !== null &&
     info.sandbox_provider_capabilities?.[effectiveSandboxProvider]?.multi_repo === true;
   const maxSandboxRepos = sandboxMultiRepo ? MAX_SANDBOX_REPOS : 1;
-  const repositorySeededRef = useRef(
-    landingDraft !== null && landingDraft.project === projectParam,
-  );
-  const repositoryPlacementEditedRef = useRef(
-    landingDraft !== null && landingDraft.project === projectParam,
-  );
+  const repositorySeededRef = useRef(restoredDraft?.repositorySeeded ?? false);
+  const repositoryPlacementEditedRef = useRef(restoredDraft?.repositoryPlacementEdited ?? false);
   const repositoryCapabilities = sandboxRepositoryCapabilities(info, effectiveSandboxProvider);
   const [pendingRepoUrl, setPendingRepoUrl] = useState("");
   const [sandboxRepoPopoverOpen, setSandboxRepoPopoverOpen] = useState(false);
@@ -2908,6 +2908,8 @@ function NewChatLandingContent({
     sandboxProvider,
     sandboxProfile,
     sandboxRepoSelections,
+    repositorySeeded: repositorySeededRef.current,
+    repositoryPlacementEdited: repositoryPlacementEditedRef.current,
     workspace,
     branchName,
     autoSeededBranch,
@@ -2932,7 +2934,11 @@ function NewChatLandingContent({
     return () => {
       onScreenRef.current = false;
       if (!submittedRef.current) {
-        writeLandingDraft(draftState, draftRef.current);
+        writeLandingDraft(draftState, {
+          ...draftRef.current,
+          repositorySeeded: repositorySeededRef.current,
+          repositoryPlacementEdited: repositoryPlacementEditedRef.current,
+        });
       } else if (submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
       }

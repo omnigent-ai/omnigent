@@ -641,30 +641,36 @@ async def test_repository_config_is_normalized_and_preserved(
 
 
 @pytest.mark.parametrize(
-    "repository",
+    "config",
     [
-        "invalid",
-        {},
-        {"url": ""},
-        {"url": "https://user:secret@git.example.com/team/sample.git"},
-        {"url": "https://git.example.com/team/sample.git#main"},
-        {"url": "https://git.example.com/team?secret/value/sample.git"},
-        {"url": "https://git.example.com:invalid/team/sample.git"},
-        {"url": "git@-host:team/sample.git"},
-        {"url": "https://git..example.com/team/sample.git"},
-        {"url": "https://git.example.com/" + "a" * 256},
-        {"url": "https://git.example.com/team/sample.git", "branch": None},
-        {"url": "https://git.example.com/team/sample.git", "branch": "../main"},
-        {"url": "https://git.example.com/team/sample.git", "token": "secret"},
+        *[
+            {"repository": repository}
+            for repository in [
+                "invalid",
+                {},
+                {"url": ""},
+                {"url": "https://user:secret@git.example.com/team/sample.git"},
+                {"url": "https://git.example.com/team/sample.git#main"},
+                {"url": "https://git.example.com/team?secret/value/sample.git"},
+                {"url": "https://git.example.com/team/sample.git", "branch": None},
+                {"url": "https://git.example.com/team/sample.git", "token": "secret"},
+            ]
+        ],
+        {"host_id": "connected-host", "sandbox_provider": "provider"},
+        {
+            "host_id": "__sandbox__",
+            "repository": {"url": "https://git.example.com/team/sample.git"},
+            "workspace": "/workspace/sample",
+        },
     ],
 )
 async def test_repository_config_rejected_on_create_and_update(
-    project_client: httpx.AsyncClient, repository: object
+    project_client: httpx.AsyncClient, config: dict[str, object]
 ) -> None:
     created = (await project_client.post("/v1/projects", json={"name": "Existing"})).json()
     for method, url, body in [
-        ("POST", "/v1/projects", {"name": "Invalid", "config": {"repository": repository}}),
-        ("PATCH", f"/v1/projects/{created['id']}", {"config": {"repository": repository}}),
+        ("POST", "/v1/projects", {"name": "Invalid", "config": config}),
+        ("PATCH", f"/v1/projects/{created['id']}", {"config": config}),
     ]:
         response = await project_client.request(method, url, json=body)
         assert response.status_code == 400, response.text

@@ -20,6 +20,17 @@ _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # Git-forbidden ref characters, plus ``#`` (the workspace splits on the first one).
 _BRANCH_FORBIDDEN_CHARS = set(" \t~^:?*[\\#")
+_INVALID_IPV6_MESSAGE = "an IPv6 repository URL must use a valid IPv6 address"
+
+
+def _validate_ipv6_host(host: str) -> None:
+    """Keep scoped addresses unsupported and address errors stable across Python versions."""
+    if "%" in host:
+        raise ValueError("an IPv6 repository URL must not contain a scope identifier")
+    try:
+        ipaddress.IPv6Address(host)
+    except ipaddress.AddressValueError:
+        raise ValueError(_INVALID_IPV6_MESSAGE) from None
 
 
 def is_repo_workspace(workspace: str) -> bool:
@@ -145,10 +156,26 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
                 f"'{url}' is not a usable https repository URL — expected "
                 "'https://<host>/<org>/<repo>'"
             )
-        parsed = urlsplit(url)
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            if "[" in host or "]" in host:
+                raise ValueError(_INVALID_IPV6_MESSAGE) from None
+            raise
         # Accessing port validates its syntax and range without contacting the host.
         _ = parsed.port
         host = parsed.hostname or ""
+        if ":" in host:
+            _validate_ipv6_host(host)
+        elif (
+            not host
+            or len(host) > 253
+            or not all(
+                re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                for label in host.removesuffix(".").split(".")
+            )
+        ):
+            raise ValueError("a repository URL must have a valid hostname")
     elif url.startswith("git@"):
         rest = url[len("git@") :]
         if "@" in rest:
@@ -158,11 +185,13 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
             colon, path = suffix[:1], suffix[1:]
             if not close or colon != ":" or not path.strip("/"):
                 raise ValueError("an IPv6 SSH repository URL must use 'git@[address]:path'")
-            if "%" in host:
-                raise ValueError("an IPv6 SSH repository URL must not contain a scope identifier")
-            ipaddress.IPv6Address(host)
+            _validate_ipv6_host(host)
         else:
             host, colon, path = rest.partition(":")
+            # SSH aliases are configuration names, not necessarily DNS hostnames.
+            # A slash before the colon is a local path to Git, not an SSH alias.
+            if any(character in host for character in "/\\[]"):
+                raise ValueError("an SSH repository URL must have an unambiguous host alias")
         if not host or not colon or not path.strip("/"):
             raise ValueError(
                 f"'{url}' is not a usable ssh repository URL — expected 'git@<host>:<org>/<repo>'"
@@ -172,17 +201,6 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
             f"'{url}' is not a supported repository URL — use "
             "'https://<host>/<org>/<repo>' or 'git@<host>:<org>/<repo>'"
         )
-    if ":" in host:
-        ipaddress.IPv6Address(host)
-    elif (
-        not host
-        or len(host) > 253
-        or not all(
-            re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
-            for label in host.removesuffix(".").split(".")
-        )
-    ):
-        raise ValueError("a repository URL must have a valid hostname")
     branch = _validate_clone_branch(fragment) if sep else None
     return RepoWorkspace(url=url, branch=branch, repo_name=_derive_repo_name(url))
 

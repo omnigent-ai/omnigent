@@ -1684,28 +1684,33 @@ describe("saved project repositories", () => {
   const config = { host_id: "__sandbox__", sandbox_provider: "example", repository };
   const capabilities = { sandbox_providers: ["modal", "example"] };
 
-  it("waits for config, prefills the saved provider and repository ahead of remembered placement", async () => {
-    localStorage.setItem(
-      "omnigent:last-sandbox-repos",
-      JSON.stringify([{ url: "https://git.example.com/other/remembered.git", branch: "" }]),
-    );
-    writeProjectLaunchDefaults("proj_alpha", { hostId: "host_1", workspace: "/other" }, config);
-    setProjectConfig(undefined, true);
-    const { rerender } = renderSandboxLanding(capabilities);
-    setProjectConfig(config);
-    rerender(<NewChatLandingScreen />);
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("sample"),
-    );
-    const body = await submitAndReadBody();
-    expect(body).toMatchObject({
-      host_type: "managed",
-      sandbox_provider: "example",
-      workspaces: [repository.url + "#release"],
-      workspace: null,
-      git: null,
-    });
-  });
+  it.each([false, true])(
+    "waits for config and prefills the saved provider and repository (restore draft=%s)",
+    async (restoreDraft) => {
+      localStorage.setItem(
+        "omnigent:last-sandbox-repos",
+        JSON.stringify([{ url: "https://git.example.com/other/remembered.git", branch: "" }]),
+      );
+      writeProjectLaunchDefaults("proj_alpha", { hostId: "host_1", workspace: "/other" }, config);
+      setProjectConfig(undefined, true);
+      const first = renderSandboxLanding(capabilities);
+      if (restoreDraft) first.unmount();
+      setProjectConfig(config);
+      if (restoreDraft) renderSandboxLanding(capabilities);
+      else first.rerender(<NewChatLandingScreen />);
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("sample"),
+      );
+      const body = await submitAndReadBody();
+      expect(body).toMatchObject({
+        host_type: "managed",
+        sandbox_provider: "example",
+        workspaces: [repository.url + "#release"],
+        workspace: null,
+        git: null,
+      });
+    },
+  );
 
   it("keeps an explicit clear through rerenders and a restored draft", async () => {
     setProjectConfig(config);

@@ -395,7 +395,7 @@ export async function cloneHostRepository(
     },
   );
   if (!response.ok) throw await apiErrorFromResponse(response);
-  const body: unknown = await response.json();
+  const body: unknown = await response.json().catch(() => null);
   if (
     body === null ||
     typeof body !== "object" ||
