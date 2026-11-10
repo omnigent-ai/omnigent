@@ -114,18 +114,21 @@ class SysUserInboxPostTool(Tool):
                                 "additionalProperties": False,
                             },
                         },
-                        "chart": {
-                            "type": "object",
+                        "media": {
+                            "type": "array",
                             "description": (
-                                "Optional chart drawn on the card, only when it shows the "
-                                "point of the item. Use only numbers from queries you ran, "
-                                "and state the key numbers in body_md too. Shape: {version: "
-                                "1, type: 'line' | 'bar', title, unit?, x: [labels, at most "
-                                "60], series: [{name, values: [number or null, one per x "
-                                "label], emphasis?}] (at most 4), highlight?: {from, to} "
-                                "(x labels), markers?: [{x, label}] (at most 3), source?: "
-                                "{label, href?}}."
+                                "Optional rich content drawn on the card, at most three "
+                                "blocks; add one only when it shows the point of the item. "
+                                "The one block type is a chart: {type: 'chart', chart: "
+                                "{version: 1, type: 'line' | 'bar', title, unit?, x: "
+                                "[labels, at most 60], series: [{name, values: [number or "
+                                "null, one per x label], emphasis?}] (at most 4), "
+                                "highlight?: {from, to} (x labels), markers?: [{x, label}] "
+                                "(at most 3), source?: {label, href?}}}. Use only numbers "
+                                "from queries you ran, and state the key numbers in body_md "
+                                "too."
                             ),
+                            "items": {"type": "object"},
                         },
                         "expires_at": {
                             "type": "integer",

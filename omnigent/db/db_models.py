@@ -1825,9 +1825,11 @@ class SqlInboxItem(OmnigentBase):
     actions: Mapped[str] = mapped_column(
         CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
     )
-    # JSON chart drawn on the card (see omnigent.server.inbox_chart), stored compressed.
-    chart: Mapped[str | None] = mapped_column(
-        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=True
+    # JSON list of typed rich-content blocks drawn on the card, such as a chart
+    # (see omnigent.server.inbox_media), stored compressed. A new block type
+    # needs no schema change.
+    media: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
     )
     # Duplicate-key inputs and the versioned key built from them.
     primary_link: Mapped[str | None] = mapped_column(String(2048), nullable=True)
@@ -1894,8 +1896,8 @@ class SqlInboxItem(OmnigentBase):
             name="ck_inbox_items_actions_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
-            "chart IS NULL OR length(CAST(chart AS BLOB)) <= 16383",
-            name="ck_inbox_items_chart_bytes",
+            "media IS NULL OR length(CAST(media AS BLOB)) <= 16383",
+            name="ck_inbox_items_media_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
             "feedback_text IS NULL OR length(CAST(feedback_text AS BLOB)) <= 16383",

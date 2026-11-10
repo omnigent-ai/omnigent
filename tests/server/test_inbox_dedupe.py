@@ -125,7 +125,7 @@ def _item(**overrides: Any) -> InboxItem:
         "body_md": "b",
         "links": [],
         "actions": [],
-        "chart": None,
+        "media": [],
         "primary_link": None,
         "topic": "digest",
         "dedupe_key": "",

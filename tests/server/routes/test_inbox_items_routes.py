@@ -128,7 +128,9 @@ async def test_post_creates_an_item(client: httpx.AsyncClient, stores: SimpleNam
     assert (item["state"], item["resolution"]) == ("unread", "none")
 
 
-async def test_post_stores_a_chart(client: httpx.AsyncClient, stores: SimpleNamespace) -> None:
+async def test_post_stores_a_chart_block(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
     chart = {
         "version": 1,
         "type": "bar",
@@ -138,21 +140,70 @@ async def test_post_stores_a_chart(client: httpx.AsyncClient, stores: SimpleName
     }
 
     ok = await client.post(
-        "/v1/inbox/items", json=_body(chart=chart), headers=_from(_session(stores))
+        "/v1/inbox/items",
+        json=_body(media=[{"type": "chart", "chart": chart}]),
+        headers=_from(_session(stores)),
     )
     bad = await client.post(
         "/v1/inbox/items",
-        json=_body(topic="other", chart={**chart, "x": ["a"]}),
+        json=_body(topic="other", media=[{"type": "chart", "chart": {**chart, "x": ["a"]}}]),
         headers=_from(_session(stores)),
     )
 
-    assert ok.json()["item"]["chart"] == {
-        **chart,
-        "markers": [],
-        "series": [{"name": "n", "values": [1.0, 2.0], "emphasis": False}],
-    }
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["item"]["media"] == [
+        {
+            "type": "chart",
+            "chart": {
+                **chart,
+                "markers": [],
+                "series": [{"name": "n", "values": [1.0, 2.0], "emphasis": False}],
+            },
+        }
+    ]
     assert bad.status_code == 422
     assert "one value per x label" in bad.text
+
+
+@pytest.mark.parametrize(
+    "media",
+    [
+        [{"type": "svg", "svg": "<svg/>"}],
+        [{"type": "chart"}],
+        [{"type": "chart", "chart": {"version": 2}}],
+    ],
+    ids=["unknown-type", "missing-content", "unknown-chart-version"],
+)
+async def test_post_rejects_media_the_server_cannot_validate(
+    client: httpx.AsyncClient, stores: SimpleNamespace, media: list[dict[str, Any]]
+) -> None:
+    resp = await client.post(
+        "/v1/inbox/items", json=_body(media=media), headers=_from(_session(stores))
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+async def test_post_rejects_more_media_than_fits(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
+    labels = [f"{n:02d}" + "x" * 38 for n in range(60)]
+    chart = {
+        "version": 1,
+        "type": "line",
+        "title": "t",
+        "x": labels,
+        # Each chart fits on its own; three of them do not.
+        "series": [{"name": f"s{n}", "values": [1.2345678901234] * 60} for n in range(4)],
+    }
+    resp = await client.post(
+        "/v1/inbox/items",
+        json=_body(media=[{"type": "chart", "chart": chart}] * 3),
+        headers=_from(_session(stores)),
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "larger than" in resp.text
 
 
 async def test_repeat_post_returns_the_existing_item(

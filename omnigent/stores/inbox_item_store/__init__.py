@@ -34,7 +34,7 @@ class NewInboxItem:
     :param body_md: Markdown body.
     :param links: Evidence links; the first is the primary link.
     :param actions: Agent-defined actions, each ``{"label": ..., "prompt": ...}``.
-    :param chart: A validated chart, or ``None``.
+    :param media: Validated rich-content blocks, possibly empty.
     :param primary_link: Canonical form of the first link, or ``None``.
     :param topic: Normalized topic slug.
     :param dedupe_key: Versioned duplicate-detection key.
@@ -50,7 +50,7 @@ class NewInboxItem:
     body_md: str
     links: list[dict[str, Any]]
     actions: list[dict[str, str]]
-    chart: dict[str, Any] | None
+    media: list[dict[str, Any]]
     primary_link: str | None
     topic: str
     dedupe_key: str

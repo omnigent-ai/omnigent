@@ -33,7 +33,7 @@ def _new(dedupe_key: str = "v1:aaa", user_id: str = "alice", **overrides: object
         "body_md": "The PR merged yesterday.",
         "links": [{"type": "pr", "ref": "https://github.com/acme/app/pull/7"}],
         "actions": [{"label": "Ramp it up", "prompt": "Ramp up the flag"}],
-        "chart": None,
+        "media": [],
         "primary_link": "github.com/acme/app/pull/7",
         "topic": "rampup-flag",
         "dedupe_key": dedupe_key,
