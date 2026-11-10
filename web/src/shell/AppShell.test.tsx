@@ -581,11 +581,17 @@ function sessionShellTree(
 function renderShell(
   path: string,
   info?: ServerInfo,
-  options: { rerenderable?: boolean; sessionNavTo?: string; dirtyFileViewer?: boolean } = {},
+  options: {
+    rerenderable?: boolean;
+    sessionNavTo?: string;
+    dirtyFileViewer?: boolean;
+    seedQueryClient?: (client: QueryClient) => void;
+  } = {},
 ) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  options.seedQueryClient?.(qc);
   const tree = shellTree(
     qc,
     path,
@@ -894,29 +900,55 @@ describe("AppShell header", () => {
     {
       source: "the bound live store",
       snapshotStatus: "idle",
-      boundId: "conv_off_window",
       boundStatus: "running",
+      row: null,
       asks: true,
     },
     {
       source: "the snapshot before binding",
       snapshotStatus: "waiting",
-      boundId: "conv_other",
-      boundStatus: "idle",
+      boundStatus: null,
+      row: null,
       asks: true,
     },
     {
       source: "the bound live store over a stale snapshot",
       snapshotStatus: "running",
-      boundId: "conv_off_window",
       boundStatus: "idle",
+      row: null,
+      asks: false,
+    },
+    {
+      source: "the streamed row's goal-driven background work",
+      snapshotStatus: "idle",
+      boundStatus: "idle",
+      row: { status: "idle", background_work_running: true },
+      asks: true,
+    },
+    {
+      source: "the streamed row over a stale snapshot",
+      snapshotStatus: "running",
+      boundStatus: null,
+      row: { status: "idle", background_work_running: false },
       asks: false,
     },
   ] as const)(
     "archive confirmation for an off-window session follows $source",
-    async ({ snapshotStatus, boundId, boundStatus, asks }) => {
+    async ({ snapshotStatus, boundStatus, row, asks }) => {
+      const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) =>
+        Response.json({ id: "conv_off_window", archived: true }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      onTestFinished(() => {
+        vi.unstubAllGlobals();
+      });
+      const archiveRequests = () =>
+        fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH");
       mockConversations([]);
-      useChatStore.setState({ conversationId: boundId, sessionStatus: boundStatus });
+      useChatStore.setState({
+        conversationId: boundStatus === null ? "conv_other" : "conv_off_window",
+        sessionStatus: boundStatus ?? "idle",
+      });
       useSessionMock.mockReturnValue({
         session: {
           id: "conv_off_window",
@@ -939,7 +971,21 @@ describe("AppShell header", () => {
         error: null,
       });
 
-      renderShell("/c/conv_off_window");
+      renderShell("/c/conv_off_window", undefined, {
+        // The open-session row the session-updates stream keeps current.
+        seedQueryClient: (client) => {
+          if (!row) return;
+          client.setQueryData(["conversation-backfill", "conv_off_window"], {
+            id: "conv_off_window",
+            object: "conversation",
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            labels: {},
+            permission_level: 4,
+            ...row,
+          });
+        },
+      });
       fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
         button: 0,
         ctrlKey: false,
@@ -947,13 +993,19 @@ describe("AppShell header", () => {
       fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
 
       if (!asks) {
-        await waitFor(() => expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull());
+        expect(await screen.findByText("home")).toBeInTheDocument();
         expect(screen.queryByTestId("archive-running-dialog")).toBeNull();
+        await waitFor(() => expect(archiveRequests()).toHaveLength(1));
+        const [url, init] = archiveRequests()[0];
+        expect(String(url)).toContain("/v1/sessions/conv_off_window");
+        expect(JSON.parse(String(init?.body))).toEqual({ archived: true });
         return;
       }
       const dialog = await screen.findByRole("dialog", { name: "Archive running session?" });
       fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
       await waitFor(() => expect(screen.queryByTestId("archive-running-dialog")).toBeNull());
+      expect(screen.queryByText("home")).toBeNull();
+      expect(archiveRequests()).toHaveLength(0);
     },
   );
 

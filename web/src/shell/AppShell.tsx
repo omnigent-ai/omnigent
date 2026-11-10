@@ -29,6 +29,7 @@ import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
 import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
@@ -797,9 +798,14 @@ function AppShellImpl() {
   const isKnownTopLevel =
     activeConv != null ||
     (activeSessionMatchesRoute && activeSession != null && activeSession.parentSessionId == null);
-  // An off-window session has no list row to say whether its agent is working.
-  // Once bound, the live store is authoritative (the snapshot only refreshes on
-  // bind); before binding, archive's confirmation falls back to the snapshot.
+  // Archive's confirmation for an off-window session reads its streamed open-session
+  // row (the only carrier of goal-driven background work) and the live store; the
+  // snapshot, which only refreshes on bind, is a fallback while neither is known.
+  const openSessionRow = useOpenSessionRow(
+    !conversationsLoading && !activeConv && isKnownTopLevel && isOwnerLevel(permissionLevel)
+      ? (serverConversationId ?? null)
+      : null,
+  );
   const boundSessionStatus = useChatStore((s) =>
     s.conversationId === serverConversationId ? s.sessionStatus : null,
   );
@@ -810,11 +816,30 @@ function AppShellImpl() {
     if (!isKnownTopLevel || !isOwnerLevel(permissionLevel)) return null;
     if (activeConv) return activeConv;
     if (!activeSessionMatchesRoute || !activeSession) return null;
-    const isBound = boundSessionStatus !== null;
-    const liveStatus = boundSessionStatus ?? activeSession.status;
-    const backgroundTaskCount = isBound
-      ? boundBackgroundTaskCount
-      : (activeSession.backgroundTaskCount ?? 0);
+    const fallback =
+      boundSessionStatus === null
+        ? {
+            status: activeSession.status,
+            pending: activeSession.pendingElicitations?.length ?? 0,
+            backgroundWork:
+              activeSession.status === "waiting" || (activeSession.backgroundTaskCount ?? 0) > 0,
+          }
+        : { status: "idle", pending: 0, backgroundWork: false };
+    const rowStatus = openSessionRow?.status ?? fallback.status;
+    // A bound session with a pending prompt reports `running`; `waiting` is the
+    // loop parked on background work, which list rows report separately.
+    const status =
+      boundSessionStatus === "running" || rowStatus === "running"
+        ? "running"
+        : rowStatus === "failed"
+          ? "failed"
+          : "idle";
+    const backgroundWorkRunning =
+      (openSessionRow
+        ? openSessionRow.background_work_running === true
+        : fallback.backgroundWork) ||
+      boundSessionStatus === "waiting" ||
+      boundBackgroundTaskCount > 0;
     return {
       id: activeSession.id,
       object: "conversation",
@@ -834,12 +859,10 @@ function AppShellImpl() {
       agent_name: activeSession.agentName,
       family: activeSession.family,
       git_branch: activeSession.gitBranch ?? null,
-      // `useArchivePrompt` applies `isSessionWorking` to these. As in list rows,
-      // `waiting` (parked on background work) maps to `background_work_running`;
-      // a bound session with a pending prompt reports `running`.
-      status: liveStatus === "running" || liveStatus === "failed" ? liveStatus : "idle",
-      pending_elicitations_count: isBound ? 0 : (activeSession.pendingElicitations?.length ?? 0),
-      background_work_running: liveStatus === "waiting" || backgroundTaskCount > 0,
+      // `useArchivePrompt` applies `isSessionWorking` to these.
+      status,
+      pending_elicitations_count: openSessionRow?.pending_elicitations_count ?? fallback.pending,
+      background_work_running: backgroundWorkRunning,
     };
   }, [
     activeConv,
@@ -848,6 +871,7 @@ function AppShellImpl() {
     boundBackgroundTaskCount,
     boundSessionStatus,
     isKnownTopLevel,
+    openSessionRow,
     permissionLevel,
   ]);
   // Header action gating, hoisted so the desktop buttons and the mobile

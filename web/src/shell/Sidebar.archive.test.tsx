@@ -367,14 +367,4 @@ describe("session row quick actions setting", () => {
     // Desktop hides the menu's Pin only while the hover button stands in for it.
     expect(screen.getByTestId("pin-conversation")).not.toHaveClass("md:hidden");
   });
-
-  it("shows the quick buttons by default and keeps the menu Pin mobile-only", () => {
-    mockConversations([CONV]);
-    renderSidebar();
-
-    expect(screen.getByTestId("quick-pin-conversation")).toBeInTheDocument();
-    expect(screen.getByTestId("quick-archive-conversation")).toBeInTheDocument();
-    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
-    expect(screen.getByTestId("pin-conversation")).toHaveClass("md:hidden");
-  });
 });

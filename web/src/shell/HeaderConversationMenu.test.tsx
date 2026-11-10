@@ -887,30 +887,21 @@ describe("HeaderConversationMenu desktop menu commands", () => {
     await reportsPin(true);
   });
 
-  it("archives through the same worktree prompt as the menu item", () => {
-    renderMenu();
-    act(() => sendCommand({ command: "archive-session", browserViewId: null }));
-    expect(mocks.archive).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Yes, delete worktree" }));
-    expect(mocks.archive).toHaveBeenCalledWith({
-      id: "conv-1",
-      archived: true,
-      deleteWorktree: true,
-    });
-  });
-
-  it("confirms a running session before Session → Archive reaches the worktree prompt", () => {
-    renderMenu({ conversation: { ...CONVERSATION, status: "running" } });
-    act(() => sendCommand({ command: "archive-session", browserViewId: null }));
-    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
-    expect(mocks.archive).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "No, archive only" }));
-    expect(mocks.archive).toHaveBeenCalledWith({
-      id: "conv-1",
-      archived: true,
-      deleteWorktree: false,
-    });
-  });
+  it.each([
+    { status: "idle", worktreeChoice: "Yes, delete worktree", deleteWorktree: true },
+    { status: "running", worktreeChoice: "No, archive only", deleteWorktree: false },
+  ] as const)(
+    "archives a $status session through the menu item's prompts from Session → Archive",
+    ({ status, worktreeChoice, deleteWorktree }) => {
+      renderMenu({ conversation: { ...CONVERSATION, status } });
+      act(() => sendCommand({ command: "archive-session", browserViewId: null }));
+      if (status === "running") fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+      else expect(screen.queryByTestId("archive-running-dialog")).toBeNull();
+      expect(mocks.archive).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: worktreeChoice }));
+      expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true, deleteWorktree });
+    },
+  );
 
   it("shows the desktop chords on Pin, Archive and Fork", () => {
     renderMenu();
