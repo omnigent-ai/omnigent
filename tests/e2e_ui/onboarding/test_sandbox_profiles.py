@@ -300,9 +300,12 @@ def test_provider_owned_profiles(
 
 @pytest.mark.parametrize("provider_profile_server", ["demo-small"], indirect=True)
 def test_composer_preselects_the_provider_default(
-    page: Page, provider_profile_server: tuple[str, Path]
+    page: Page, provider_profile_server: tuple[str, Path], tmp_path: Path
 ) -> None:
     base, _catalog_file = provider_profile_server
+    evidence = Path(os.environ.get("OMNIGENT_SANDBOX_PROFILE_EVIDENCE_DIR", str(tmp_path)))
+    evidence.mkdir(parents=True, exist_ok=True)
+    page.set_viewport_size({"width": 1440, "height": 1000})
     page.set_extra_http_headers({"X-Forwarded-Email": "alice@example.test"})
     page.goto(base)
     expect(
@@ -310,6 +313,11 @@ def test_composer_preselects_the_provider_default(
     ).to_be_visible()
     page.get_by_test_id("new-chat-landing-input").fill("Build in the default sandbox.")
     expect(page.get_by_role("button", name="Start session", exact=True)).to_be_enabled()
+    page.screenshot(
+        path=evidence / "provider-08-default-preselected.png",
+        full_page=True,
+        animations="disabled",
+    )
     launches: list[dict[str, Any]] = []
 
     def intercept_launch(route: Route) -> None:
