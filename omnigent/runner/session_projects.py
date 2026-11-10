@@ -307,7 +307,12 @@ async def execute_session_move(
         return json.dumps(
             {"error": f"session_ids must list 1 to {MAX_SESSIONS_PER_MOVE} session IDs"}
         )
-    if not isinstance(project, str) or len(project) > MAX_PROJECT_NAME_LENGTH:
+    # Only an exact "" unfiles; a blank-looking name must not unfile every target.
+    if (
+        not isinstance(project, str)
+        or len(project) > MAX_PROJECT_NAME_LENGTH
+        or (project and not project.strip())
+    ):
         return json.dumps(
             {"error": 'project must be a name of at most 100 characters, or "" to unfile'}
         )

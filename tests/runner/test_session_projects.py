@@ -32,6 +32,7 @@ def _client(handler) -> httpx.AsyncClient:
         ({"session_ids": [7], "project": "Q3"}, "session_ids must list"),
         ({"session_ids": [SOURCE]}, "project must be a name"),
         ({"session_ids": [SOURCE], "project": "x" * 101}, "project must be a name"),
+        ({"session_ids": [SOURCE], "project": "  "}, "project must be a name"),
     ],
 )
 async def test_move_rejects_invalid_arguments_before_any_request(args, message):

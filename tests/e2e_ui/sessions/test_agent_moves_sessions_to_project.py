@@ -21,6 +21,7 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests._helpers.live_server import terminate_process
 from tests.e2e_ui.conftest import (
     _create_bundled_session,
     _ensure_runner_online,
@@ -142,9 +143,7 @@ def filing_journey(
                     httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
             _delete_projects_named(live_server, {existing_project, new_project})
         finally:
-            if respawned is not None:
-                respawned.terminate()
-                respawned.wait(timeout=5)
+            terminate_process(respawned)
 
 
 def _tool_call(name: str, arguments: dict[str, object]) -> dict[str, object]:
