@@ -419,9 +419,9 @@ describe("SandboxRepositoryPicker", () => {
     expect(branch).toHaveAttribute("aria-invalid", "true");
     expect(branch).toHaveAccessibleDescription(/Clear the branch/);
     expect(screen.getByLabelText("Repository URL")).not.toHaveAttribute("aria-describedby");
-    expect(screen.getByRole("alert")).toHaveTextContent("Clear the branch");
+    expect(screen.getByText(/Clear the branch/)).toHaveAttribute("aria-live", "polite");
     fireEvent.change(screen.getByLabelText("Branch (optional)"), { target: { value: "" } });
-    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText(/Clear the branch/)).toBeNull();
   });
 
   it("single mode describes an invalid branch on its branch field", () => {
@@ -469,6 +469,6 @@ describe("SandboxRepositoryPicker", () => {
       single: true,
       urlInput: false,
     });
-    expect(screen.getByRole("alert")).toHaveTextContent("unavailable on this target");
+    expect(screen.getByText(/unavailable on this target/)).toHaveAttribute("aria-live", "polite");
   });
 });

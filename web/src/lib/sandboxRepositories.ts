@@ -206,6 +206,8 @@ export function repositorySelectionError(
     return "This target uses the default branch. Clear the branch or choose another target.";
   if (selection.url.trim() === "")
     return branch.trim() === "" ? null : "Choose a repository for this branch.";
+  if (selection.url.includes("#"))
+    return "Remove the #branch suffix and enter the branch separately.";
   if (!isValidSandboxRepoUrl(selection.url))
     return "Enter a valid HTTPS or SSH repository URL without credentials.";
   if (!isValidSandboxBranch(branch)) return INVALID_BRANCH_MESSAGE;

@@ -278,7 +278,11 @@ export function NewProjectButton({
           return;
         }
         if (hostCloneMessage !== null) {
-          setSubmitError(hostDetailLoading ? null : hostCloneMessage);
+          setSubmitError(
+            hostDetailLoading
+              ? "Checking this host's repository support. Try again shortly."
+              : hostCloneMessage,
+          );
           return;
         }
         if (!isNavigablePath(destination) || destination.includes("\0")) {
@@ -355,14 +359,21 @@ export function NewProjectButton({
             if (submission !== submissionGeneration.current) return;
             submitting.current = false;
             setPhase(null);
-            const uncertain =
-              !(error instanceof ApiError) ||
-              error.code === "clone_transport_error" ||
-              (error.status === 504 && error.code !== "clone_timeout");
+            const definiteFailure =
+              error instanceof ApiError &&
+              [
+                "invalid_input",
+                "clone_unsupported",
+                "clone_destination_conflict",
+                "clone_timeout",
+                "clone_failed",
+                "not_found",
+                "forbidden",
+              ].includes(error.code ?? "");
             setSubmitError(
-              uncertain
-                ? `The clone result is unknown. Check ${destination} on the host before retrying. If the checkout is ready, select it in Folder mode.`
-                : error.message,
+              definiteFailure
+                ? error.message
+                : `The clone result is unknown. Check ${destination} on the host before retrying. If the checkout is ready, select it in Folder mode.`,
             );
             return;
           }
@@ -549,7 +560,8 @@ export function NewProjectButton({
                     onChange={(event) => {
                       targetEdited.current = true;
                       setTargetChoice(event.target.value || null);
-                      setClonedWorkspace(null);
+                      setCloneParent("~");
+                      setCloneDestination(null);
                       setWorkspace(null);
                       setCreatedWorkspace(null);
                       setSubmitError(null);
@@ -607,10 +619,7 @@ export function NewProjectButton({
                   <SandboxRepositoryPicker
                     single
                     selections={repositories}
-                    onChange={(next) => {
-                      setRepositories(next);
-                      setClonedWorkspace(null);
-                    }}
+                    onChange={setRepositories}
                     maxRepos={1}
                     enabled={open && !isPending}
                     {...repositoryCapabilities}
@@ -630,10 +639,7 @@ export function NewProjectButton({
                         <input
                           id="new-project-clone-path"
                           value={destination}
-                          onChange={(event) => {
-                            setCloneDestination(event.target.value);
-                            setClonedWorkspace(null);
-                          }}
+                          onChange={(event) => setCloneDestination(event.target.value)}
                           className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm"
                         />
                         <Button
@@ -726,7 +732,6 @@ export function NewProjectButton({
                   if (repositoryMode) {
                     setCloneParent(path);
                     setCloneDestination(null);
-                    setClonedWorkspace(null);
                   } else if (dialogHostId !== null) {
                     setWorkspace({ hostId: dialogHostId, path });
                   }
@@ -744,6 +749,13 @@ export function NewProjectButton({
         {(submitError || createProject.isError) && (
           <p className="text-ui text-destructive" role="alert">
             {submitError ?? friendlyProjectError(createProject.error)}
+          </p>
+        )}
+        {clonedWorkspace !== null && !isPending && (
+          <p className="text-ui text-muted-foreground" role="status">
+            The repository was cloned to {clonedWorkspace.path}. The checkout stays on that host if
+            you cancel or change this setup. To reuse it, choose the same host and select this path
+            in Folder mode.
           </p>
         )}
         <DialogFooter className="border-t-0 bg-transparent">
