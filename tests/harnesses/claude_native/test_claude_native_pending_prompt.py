@@ -40,6 +40,15 @@ _WRAPPED_SELECT_QUESTION = _QUESTION.replace("Enter to select", "Enter to\nselec
 _WRAPPED_MULTISELECT = _WRAPPED_QUESTION.replace(
     "Enter to select", "Space to select · Enter to\nsubmit"
 )
+_EXIT_PLAN = """\
+────────────────────────────────────────────────────────────────────────────────
+ Exit plan mode?
+  Claude wants to exit plan mode
+  ❯ 1. Yes, and switch to default (ask each time) for this session
+    2. No
+"""
+_WRAPPED_EXIT_PLAN = _EXIT_PLAN.replace("Exit plan mode?", "Exit plan\n mode?")
+_EXIT_PLAN_SELECTED_NO = _EXIT_PLAN.replace("❯ 1.", "  1.").replace("  2.", "❯ 2.")
 
 
 @pytest.fixture
@@ -81,6 +90,9 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
         _WRAPPED_SELECT_QUESTION,
         _WRAPPED_MULTISELECT,
         _PERMISSION,
+        _EXIT_PLAN,
+        _WRAPPED_EXIT_PLAN,
+        _EXIT_PLAN_SELECTED_NO,
     ],
     ids=[
         "question",
@@ -89,6 +101,9 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
         "wrapped-select",
         "wrapped-submit",
         "permission",
+        "exit-plan",
+        "wrapped-exit-plan",
+        "exit-plan-selected-no",
     ],
 )
 @pytest.mark.parametrize("operation", ["message", "settings"])
@@ -112,13 +127,41 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
 
 @pytest.mark.parametrize(
     "pane",
-    [_QUESTION, _WRAPPED_QUESTION, _WRAPPED_SELECT_QUESTION, _WRAPPED_MULTISELECT, _PERMISSION],
-    ids=["question", "wrapped-cancel", "wrapped-select", "wrapped-submit", "permission"],
+    [
+        _QUESTION,
+        _WRAPPED_QUESTION,
+        _WRAPPED_SELECT_QUESTION,
+        _WRAPPED_MULTISELECT,
+        _PERMISSION,
+        _EXIT_PLAN,
+        _WRAPPED_EXIT_PLAN,
+        _EXIT_PLAN_SELECTED_NO,
+    ],
+    ids=[
+        "question",
+        "wrapped-cancel",
+        "wrapped-select",
+        "wrapped-submit",
+        "permission",
+        "exit-plan",
+        "wrapped-exit-plan",
+        "exit-plan-selected-no",
+    ],
 )
 def test_decision_text_above_a_ready_composer_does_not_block_delivery(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_: pane + _COMPOSER)
+    assert not bridge.has_pending_user_prompt(native_bridge)
+
+
+@pytest.mark.parametrize(
+    "pane", [_EXIT_PLAN.replace("❯ ", ""), _EXIT_PLAN.replace("Exit plan mode?", "Plan summary")]
+)
+def test_plan_text_without_a_live_decision_does_not_hold_input(
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
+) -> None:
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: pane)
     assert not bridge.has_pending_user_prompt(native_bridge)
 
 
@@ -159,8 +202,24 @@ def test_question_appearing_after_readiness_prevents_paste(
 
 @pytest.mark.parametrize(
     "pane",
-    [_QUESTION, _WRAPPED_QUESTION, _WRAPPED_SELECT_QUESTION, _WRAPPED_MULTISELECT],
-    ids=["question", "wrapped-cancel", "wrapped-select", "wrapped-submit"],
+    [
+        _QUESTION,
+        _WRAPPED_QUESTION,
+        _WRAPPED_SELECT_QUESTION,
+        _WRAPPED_MULTISELECT,
+        _EXIT_PLAN,
+        _WRAPPED_EXIT_PLAN,
+        _EXIT_PLAN_SELECTED_NO,
+    ],
+    ids=[
+        "question",
+        "wrapped-cancel",
+        "wrapped-select",
+        "wrapped-submit",
+        "exit-plan",
+        "wrapped-exit-plan",
+        "exit-plan-selected-no",
+    ],
 )
 def test_question_appearing_during_readiness_does_not_become_a_terminal_timeout(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
