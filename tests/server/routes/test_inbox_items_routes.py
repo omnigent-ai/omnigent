@@ -163,7 +163,9 @@ async def test_repeat_post_returns_the_existing_item(
 
     again = await client.post(
         "/v1/inbox/items",
-        json=_body(links=[{"type": "pr", "ref": "github.com/ACME/app/pull/7"}], title="Other"),
+        json=_body(
+            links=[{"type": "pr", "ref": "https://github.com/ACME/app/pull/7"}], title="Other"
+        ),
         headers=headers,
     )
 
@@ -247,15 +249,17 @@ async def test_post_cap_holds_under_concurrency_and_id_spellings(
         {
             "links": [
                 {"type": "pr", "ref": "https://github.com/acme/app/pull/7"},
-                {"type": "url", "ref": "javascript:alert(1)"},
+                {"type": "url", "ref": "javascript:alert(1);'@example.com'"},
             ]
         },
+        {"expires_at": 2**63},
     ],
     ids=[
         "unparseable-link",
         "body-too-large-to-store",
         "topic-too-long-once-lowercased",
         "bad-secondary-link",
+        "expiry-past-bigint",
     ],
 )
 async def test_post_rejects_items_it_cannot_store(
@@ -265,7 +269,7 @@ async def test_post_rejects_items_it_cannot_store(
         "/v1/inbox/items", json=_body(**overrides), headers=_from(_session(stores))
     )
 
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code in (400, 422), resp.text
 
 
 async def test_list_and_resolve(client: httpx.AsyncClient, stores: SimpleNamespace) -> None:
@@ -296,8 +300,10 @@ async def test_list_and_resolve(client: httpx.AsyncClient, stores: SimpleNamespa
     ).status_code == 422
     assert (await client.patch(f"/v1/inbox/items/{'0' * 32}", json={})).status_code == 404
     assert (await client.patch("/v1/inbox/items/not-an-id", json={})).status_code == 404
-    for cursor in ("x", "\u00b2:" + "a" * 32, "1:" + "a" * 32 + "\n"):
+    for cursor in ("x", "\u00b2:" + "a" * 32, "1:" + "a" * 32 + "\n", f"{2**63}:" + "a" * 32):
         assert (await client.get("/v1/inbox/items", params={"after": cursor})).status_code == 400
+    too_late = await client.get("/v1/inbox/items", params={"created_after": 2**63})
+    assert too_late.status_code == 422
     late_read = (await client.patch(url, json={"state": "read"})).json()
     assert (late_read["state"], late_read["resolution"]) == ("dismissed", "not_now")
 

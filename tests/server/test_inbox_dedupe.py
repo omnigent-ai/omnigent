@@ -24,7 +24,7 @@ from omnigent.server.inbox_dedupe import (
         "https://github.com/Acme/App/pull/7",
         "http://github.com/acme/app/pull/7/",
         "https://www.github.com/acme/app/pull/7/files",
-        "github.com/acme/app/pull/7#discussion_r1",
+        "https://github.com/acme/app/pull/7#discussion_r1",
         "https://github.com/acme/app/pull/7/commits?w=1",
     ],
 )
@@ -55,10 +55,22 @@ def test_other_links() -> None:
         {"type": "url", "ref": "https://["},
         {"type": "url", "ref": "https://example.test:99999/a"},
         {"type": "url", "ref": "javascript:alert(1)"},
+        {"type": "url", "ref": "javascript:alert(1);'@example.com'"},
+        {"type": "url", "ref": "example.com/no-scheme"},
+        {"type": "url", "ref": "https://user:secret@example.com/a"},
         {"type": "url", "ref": "ftp://example.test/a"},
         {"type": "session", "ref": "s" * 2048},
     ],
-    ids=["unparseable", "bad-port", "script", "non-web-scheme", "too-long-once-canonical"],
+    ids=[
+        "unparseable",
+        "bad-port",
+        "script",
+        "script-as-userinfo",
+        "no-scheme",
+        "credentials",
+        "non-web-scheme",
+        "too-long-once-canonical",
+    ],
 )
 def test_links_the_server_cannot_store_are_rejected(link: dict[str, str]) -> None:
     with pytest.raises(InvalidLinkError):

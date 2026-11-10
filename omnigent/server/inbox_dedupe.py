@@ -85,8 +85,9 @@ def canonical_link(link: Mapping[str, Any]) -> str | None:
 
     :param link: A link with ``type`` and ``ref``.
     :returns: The canonical form, or ``None`` when ``ref`` is empty.
-    :raises InvalidLinkError: If ``ref`` is not a parseable http(s) URL with a
-        host, or its canonical form is longer than :data:`MAX_CANONICAL_LINK_CHARS`.
+    :raises InvalidLinkError: If ``ref`` is not an http(s) URL with a host and
+        no user name or password, or its canonical form is longer than
+        :data:`MAX_CANONICAL_LINK_CHARS`.
     """
     ref = str(link.get("ref") or "").strip()
     if not ref:
@@ -95,13 +96,17 @@ def canonical_link(link: Mapping[str, Any]) -> str | None:
         canonical = f"session:{ref}"
     else:
         try:
-            parts = urlsplit(ref if "://" in ref else f"https://{ref}")
+            parts = urlsplit(ref)
             host = (parts.hostname or "").lower()
             port = parts.port
         except ValueError as exc:
             raise InvalidLinkError(f"invalid link: {exc}") from exc
+        # The stored ref is what the Inbox renders, so it must itself be a plain
+        # web URL: an explicit http(s) scheme, a host, and no credentials.
         if parts.scheme.lower() not in _DEFAULT_PORTS or not host:
             raise InvalidLinkError("links must be http or https URLs with a host")
+        if parts.username is not None or parts.password is not None:
+            raise InvalidLinkError("links must not carry a user name or password")
         if host == "www.github.com":
             host = "github.com"
         path = parts.path.rstrip("/")
