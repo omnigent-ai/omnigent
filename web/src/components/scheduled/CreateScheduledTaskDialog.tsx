@@ -8,6 +8,7 @@ import {
   BoxIcon,
   CalendarOffIcon,
   ChevronDownIcon,
+  ChevronRightIcon,
   ClockIcon,
   FolderIcon,
   FolderOpenIcon,
@@ -36,6 +37,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -117,6 +119,7 @@ import {
 import { localTimezone } from "@/lib/timezones";
 import { describeSchedule } from "@/lib/scheduleText";
 import { Link } from "@/lib/routing";
+import { inferHostSshTarget } from "@/lib/editorLinks";
 import { useSession } from "@/hooks/useSession";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
@@ -127,7 +130,8 @@ const PROVIDER_DEFAULT = "provider-default";
 const PERMISSION_SELECT_DEFAULT = "__agent_default__";
 const DEFAULT_AUTOMATION_PROJECT = "Omnigent Automation";
 const AUTOMATION_CONTROL_TRIGGER_CLASS_NAME =
-  "h-8 min-h-8 max-w-full rounded-lg border border-input bg-transparent px-2.5 py-1 text-ui leading-5 md:min-h-8";
+  "h-9! min-h-9! max-w-full justify-start gap-1.5 rounded-lg border border-input bg-transparent py-2 pr-2 pl-2.5 text-ui leading-5 font-normal md:min-h-9! [&_svg]:p-0! [&>svg:last-child]:ml-auto [&>svg:last-child]:text-muted-foreground [&>svg:last-child]:opacity-100 [&_[data-testid$='-agent-model-value']]:font-normal";
+const AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME = `${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} border-transparent`;
 
 type AutomationTriggerType = "schedule" | TriggerSource;
 const AUTOMATION_TRIGGER_TYPES: readonly AutomationTriggerType[] = ["schedule", ...TRIGGER_SOURCES];
@@ -1194,13 +1198,13 @@ export function CreateScheduledTaskDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className="flex max-h-[90vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[960px]"
+        className="flex max-h-[90vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[720px]"
         data-testid="create-scheduled-task-dialog"
         onOpenAutoFocus={(event) => {
-          const instructions = document.getElementById("task-prompt");
-          if (instructions) {
+          const title = document.getElementById("task-name");
+          if (title) {
             event.preventDefault();
-            instructions.focus();
+            title.focus();
           }
         }}
         // Keep a nested Select's dismiss (pick an option, OR click empty modal
@@ -1212,13 +1216,22 @@ export function CreateScheduledTaskDialog({
         onInteractOutside={guardDialogDismiss}
       >
         <DialogHeader className="shrink-0 px-6 pt-6 pb-0">
-          <DialogTitle>
+          <DialogTitle className="sr-only">
             {fromSession
               ? `New automation from “${fromSession.title || "this session"}”`
               : isEdit
                 ? "Edit automation"
                 : "New automation"}
           </DialogTitle>
+          <Input
+            id="task-name"
+            value={name}
+            placeholder="Name your automation"
+            aria-label="Automation title"
+            data-testid="task-name-input"
+            className="h-8 border-0 px-0 py-0 pr-10 font-heading text-[1.25em] leading-[32px] font-[600] focus-visible:border-transparent focus-visible:ring-0 md:text-[1.25em]"
+            onChange={(event) => setName(event.target.value)}
+          />
           <DialogDescription className="sr-only">
             {triggerMode
               ? "Starts an agent session for each matching item."
@@ -1232,17 +1245,6 @@ export function CreateScheduledTaskDialog({
           className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 py-5"
           data-testid="scheduled-task-dialog-body"
         >
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="task-name">Name</Label>
-            <Input
-              id="task-name"
-              value={name}
-              placeholder="Name this automation"
-              data-testid="task-name-input"
-              className="text-ui focus-visible:ring-0"
-              onChange={(e) => setName(e.target.value)}
-            />
-          </div>
           {startsFromSessionId !== null && (
             <StartsFromField
               sessionId={startsFromSessionId}
@@ -1256,357 +1258,81 @@ export function CreateScheduledTaskDialog({
               onSession={fromSession ? setSourceSnapshot : undefined}
             />
           )}
-          {!isEdit && !fromSession && (
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="task-trigger-type">Trigger type</Label>
-              <Select
-                value={triggerType}
-                onValueChange={(value) => handleTriggerTypeChange(value as AutomationTriggerType)}
-                onOpenChange={handleSelectOpenChange}
-                disabled={curationPending || mutationPending}
-                componentId="tasks.scheduled.trigger_type"
-              >
-                <SelectTrigger
-                  id="task-trigger-type"
-                  data-testid="task-trigger-type"
-                  className="w-full"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  {AUTOMATION_TRIGGER_TYPES.map((type) => (
-                    <SelectItem
-                      key={type}
-                      value={type}
-                      disabled={type !== "schedule" && !triggersSupported}
-                      data-testid={`task-trigger-type-${type}`}
-                    >
-                      <TriggerTypeOption type={type} />
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {!curationPending && !triggersSupported && (
-                <p className="text-sm text-muted-foreground">
-                  Integration triggers aren't available on this server.
-                </p>
-              )}
-            </div>
-          )}
-          <ScheduleFields
-            timezone={timezone}
-            onTimezoneChange={setTimezone}
-            model={schedule}
-            anchoredScheduling={anchoredScheduling}
-            sessionMode={sessionMode}
-            executionTarget={executionTarget}
-            subhourSupported={subhourSupported}
-            recurrenceUnsupported={scheduleUnsupported}
-            allowPastEnd={allowPastEnd}
-            onChange={setSchedule}
-            onRecurrenceSelect={() => setScheduleUnsupported(false)}
-            onSelectOpenChange={handleSelectOpenChange}
-            embedded
-          >
-            {({ recurrenceFields, endingFields }) => (
-              <>
-                {trigger !== null ? (
-                  <TriggerTemplateFields
-                    source={trigger}
-                    fields={triggerFields}
-                    onChange={setTriggerFields}
-                    onSelectOpenChange={handleSelectOpenChange}
-                    // Arclet sandboxes provide their agents' MCP tools, Jira and Slack included.
-                    toolsProvided={
-                      sandboxMode && info !== "loading" && info.sandbox_provider === "arclet"
-                    }
-                    renderedPrompt={renderedTriggerPrompt}
-                    onEditAsPrompt={() => {
-                      const parts = splitTriggerPrompt(renderedTriggerPrompt);
-                      setPrompt(parts.userPrompt);
-                      setSystemPrompt(parts.systemPrompt);
-                      setSystemPromptOpen(false);
-                      setEditingSystemPrompt(false);
-                      setTrigger(null);
-                    }}
-                  />
-                ) : (
-                  <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
-                    <Label htmlFor="task-prompt">
-                      {startsFromSession
-                        ? "Additional instructions"
-                        : systemPrompt === null
-                          ? "Instructions"
-                          : "Your prompt"}
-                    </Label>
-                    <Textarea
-                      id="task-prompt"
-                      value={prompt}
-                      rows={5}
-                      placeholder={
-                        startsFromSession
-                          ? "Optional. For example: Use this week's data."
-                          : "What should the agent do each run?"
-                      }
-                      data-testid="task-prompt-input"
-                      componentId="tasks.scheduled.prompt"
-                      className="min-h-32 resize-y rounded-xl text-ui focus-visible:ring-0"
-                      onChange={(e) => setPrompt(e.target.value)}
-                    />
-                    {systemPrompt !== null &&
-                      splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
-                        <p role="status" className="text-sm text-warning">
-                          {prompt.trim() === ""
-                            ? "Your prompt can't be empty."
-                            : systemPrompt.trim() === ""
-                              ? "System prompt can't be empty. Expand System prompt and click Edit system prompt to restore it."
-                              : "These edits change the template structure. After saving, the full text will appear as one prompt."}
-                        </p>
-                      )}
-                    {systemPrompt !== null && (
-                      <Collapsible
-                        open={systemPromptOpen}
-                        onOpenChange={(expanded) => {
-                          setSystemPromptOpen(expanded);
-                          setEditingSystemPrompt(false);
-                        }}
-                        className="mt-2 rounded-md border border-border p-3"
-                      >
-                        <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-2 rounded-sm text-ui text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
-                          <ChevronDownIcon className="size-4 transition-transform group-data-[state=closed]:-rotate-90" />
-                          System prompt
-                        </CollapsibleTrigger>
-                        <CollapsibleContent className="space-y-2 pt-3">
-                          <p className="text-sm text-muted-foreground">
-                            Instructions for how the automation runs. Your prompt is added
-                            separately.
-                          </p>
-                          {editingSystemPrompt ? (
-                            <Textarea
-                              aria-label="System prompt"
-                              autoFocus
-                              value={systemPrompt}
-                              rows={8}
-                              className="max-h-80 resize-y text-ui focus-visible:ring-0"
-                              componentId="tasks.scheduled.system_prompt"
-                              onChange={(event) => setSystemPrompt(event.target.value)}
-                            />
-                          ) : (
-                            <pre className="max-h-56 overflow-y-auto rounded-md bg-muted/40 p-2 font-sans text-sm whitespace-pre-wrap break-words">
-                              {systemPrompt}
-                            </pre>
-                          )}
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            componentId="tasks.scheduled.edit_system_prompt"
-                            onClick={() => setEditingSystemPrompt(!editingSystemPrompt)}
-                          >
-                            {editingSystemPrompt
-                              ? "Done editing system prompt"
-                              : "Edit system prompt"}
-                          </Button>
-                        </CollapsibleContent>
-                      </Collapsible>
-                    )}
-                  </div>
-                )}
-                <div className="flex min-w-0 flex-col gap-5">
-                  <div className="border-t border-border pt-5">
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <Select
-                        value={sandboxMode ? SANDBOX_HOST : hostId}
-                        componentId="tasks.scheduled.host"
-                        onValueChange={handleTargetChange}
-                        onOpenChange={handleSelectOpenChange}
-                      >
-                        <SelectTrigger asChild hideIcon>
-                          <ComposerHarnessTrigger
-                            label="Run on"
-                            model={runTargetLabel}
-                            icon={
-                              sandboxMode ? (
-                                <BoxIcon className="size-4 shrink-0" />
-                              ) : (
-                                <MonitorIcon className="size-4 shrink-0" />
-                              )
-                            }
-                            className={AUTOMATION_CONTROL_TRIGGER_CLASS_NAME}
-                            data-testid="task-host-trigger"
-                          />
-                        </SelectTrigger>
-                        <SelectContent position="popper" align="end">
-                          {(managedSandboxesEnabled || sandboxMode) && (
-                            <SelectItem value={SANDBOX_HOST} data-testid="task-host-sandbox-option">
-                              {sandboxLabel}
-                            </SelectItem>
-                          )}
-                          {hostOptions.map((host) => (
-                            <SelectItem key={host.host_id} value={host.host_id}>
-                              {host.name} {host.status === "offline" ? "(offline)" : ""}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-
-                      {!editingWorkerSettings && (
-                        <div data-testid="task-agent-picker">
-                          <AgentHarnessPicker
-                            agentEntries={agentEntries}
-                            harnessEntries={harnessEntries}
-                            effectiveAgentId={effectiveAgentId}
-                            agentLabel={agentLabel}
-                            hasAgents={selectedAgent !== undefined || agentList.length > 0}
-                            loading={curationPending}
-                            curatedEntries={
-                              curation.restrictToAgentNames.size > 0 ? agentList : undefined
-                            }
-                            host={sandboxMode ? undefined : badgeHost}
-                            onSelectAgent={handleSelectAgent}
-                            pendingAgent={null}
-                            pendingAgentId="__unused_pending_agent__"
-                            onSelectPending={() => {}}
-                            onCreateCustomAgent={() => {}}
-                            sandboxSelected={sandboxMode}
-                            allowCreateCustomAgent={false}
-                            open={agentMenuOpen}
-                            onOpenChange={changeAgentMenuOpen}
-                            dropdownModal={false}
-                            contentClassName="w-80"
-                            contentAlign="end"
-                            triggerDetails={automationPickerDetails}
-                            triggerIcon={
-                              selectedAgent ? (
-                                <span className="flex size-4 shrink-0 items-center justify-center">
-                                  <ComposerAgentIcon agent={selectedAgent} />
-                                </span>
-                              ) : null
-                            }
-                            selectedConfigContent={automationPickerConfig}
-                            isEntryConfigurable={(agent) =>
-                              !reusesExistingSession &&
-                              (nativeAgentHasModelSettings(agent) ||
-                                (agent.id === effectiveAgentId && supportsModel))
-                            }
-                            triggerClassName={AUTOMATION_CONTROL_TRIGGER_CLASS_NAME}
-                          />
-                        </div>
-                      )}
-
-                      {!editingWorkerSettings && permissionOptions.length > 0 && (
+          <TooltipProvider>
+            <ScheduleFields
+              timezone={timezone}
+              onTimezoneChange={setTimezone}
+              model={schedule}
+              anchoredScheduling={anchoredScheduling}
+              sessionMode={sessionMode}
+              executionTarget={executionTarget}
+              subhourSupported={subhourSupported}
+              recurrenceUnsupported={scheduleUnsupported}
+              allowPastEnd={allowPastEnd}
+              onChange={setSchedule}
+              onRecurrenceSelect={() => setScheduleUnsupported(false)}
+              onSelectOpenChange={handleSelectOpenChange}
+              embedded
+            >
+              {({ recurrenceFields, endingFields }) => (
+                <div className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-6">
+                  {!isEdit && !fromSession && (
+                    <div className="contents">
+                      <div className="contents">
                         <Select
-                          disabled={curationPending || reusesExistingSession}
-                          value={permissionSelectValue}
-                          componentId="tasks.scheduled.permission_mode"
-                          valueHasNoPii
-                          onValueChange={handlePermissionChange}
+                          value={triggerType}
+                          onValueChange={(value) =>
+                            handleTriggerTypeChange(value as AutomationTriggerType)
+                          }
                           onOpenChange={handleSelectOpenChange}
+                          disabled={curationPending || mutationPending}
+                          componentId="tasks.scheduled.trigger_type"
                         >
-                          <SelectTrigger asChild hideIcon>
-                            <ComposerHarnessTrigger
-                              label="Permissions"
-                              model={permissionLabel}
-                              icon={<ShieldCheckIcon className="size-4 shrink-0" />}
-                              className={AUTOMATION_CONTROL_TRIGGER_CLASS_NAME}
-                              data-testid="task-permission-trigger"
-                            />
-                          </SelectTrigger>
-                          <SelectContent position="popper" align="end">
-                            <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
-                            {permissionOptions.map((option) => (
-                              <SelectItem key={option.value} value={option.value}>
-                                {option.label}
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="inline-flex w-full sm:col-span-3">
+                                <SelectTrigger
+                                  id="task-trigger-type"
+                                  aria-label="Trigger type"
+                                  data-testid="task-trigger-type"
+                                  className="h-9! w-full"
+                                >
+                                  <SelectValue />
+                                </SelectTrigger>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>Trigger type</TooltipContent>
+                          </Tooltip>
+                          <SelectContent position="popper" align="start">
+                            {AUTOMATION_TRIGGER_TYPES.map((type) => (
+                              <SelectItem
+                                key={type}
+                                value={type}
+                                disabled={type !== "schedule" && !triggersSupported}
+                                data-testid={`task-trigger-type-${type}`}
+                              >
+                                <TriggerTypeOption type={type} />
                               </SelectItem>
                             ))}
                           </SelectContent>
                         </Select>
-                      )}
-                    </div>
-                  </div>
-                  <Collapsible className="border-t border-border pt-5">
-                    <CollapsibleTrigger
-                      className="group flex w-full cursor-pointer items-center justify-between gap-2 rounded-sm text-left text-ui font-medium outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50"
-                      data-testid="task-advanced-settings-trigger"
-                    >
-                      <span>
-                        Advanced settings{" "}
-                        <span className="font-normal text-muted-foreground">(optional)</span>
-                      </span>
-                      <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
-                    </CollapsibleTrigger>
-                    <CollapsibleContent className="pt-3">
-                      <div
-                        className="flex flex-wrap items-center gap-1.5"
-                        data-testid="task-top-level-controls"
-                      >
-                        {sessionModesSupported &&
-                          trigger === null &&
-                          !startsFromSession &&
-                          (!editingTemplateTrigger || editingTask?.sessionId) && (
-                            <div className="contents" data-testid="task-session-mode-field">
-                              <DropdownMenu>
-                                <DropdownMenuTrigger asChild>
-                                  <ComposerHarnessTrigger
-                                    label="Session continuity"
-                                    model={
-                                      sessionMode === "new"
-                                        ? "New session each run"
-                                        : "Continue one session"
-                                    }
-                                    icon={<RefreshCwIcon className="size-4 shrink-0" />}
-                                    className={AUTOMATION_CONTROL_TRIGGER_CLASS_NAME}
-                                    data-testid="task-session-mode-trigger"
-                                  />
-                                </DropdownMenuTrigger>
-                                <DropdownMenuContent align="end" className="min-w-64">
-                                  {!editingTemplateTrigger && (
-                                    <DropdownMenuRadioGroup
-                                      value={sessionMode}
-                                      onValueChange={(value) =>
-                                        setSessionMode(value as ScheduledTaskSessionMode)
-                                      }
-                                    >
-                                      <DropdownMenuRadioItem value="new">
-                                        New session each run
-                                      </DropdownMenuRadioItem>
-                                      <DropdownMenuRadioItem value="continue">
-                                        Continue one session
-                                      </DropdownMenuRadioItem>
-                                    </DropdownMenuRadioGroup>
-                                  )}
-                                  {isEdit &&
-                                    sessionMode === "continue" &&
-                                    editingTask?.sessionId && (
-                                      <>
-                                        {!editingTemplateTrigger && <DropdownMenuSeparator />}
-                                        <DropdownMenuCheckboxItem
-                                          checked={startNewSession}
-                                          onCheckedChange={(checked) =>
-                                            setStartNewSession(checked === true)
-                                          }
-                                          onSelect={(event) => event.preventDefault()}
-                                          data-testid="task-start-new-session"
-                                        >
-                                          Start a new session on the next run
-                                        </DropdownMenuCheckboxItem>
-                                      </>
-                                    )}
-                                </DropdownMenuContent>
-                              </DropdownMenu>
-                            </div>
-                          )}
-
                         <Popover open={scheduleMenuOpen} onOpenChange={changeScheduleMenuOpen}>
-                          <PopoverTrigger asChild>
-                            <ComposerHarnessTrigger
-                              label="Schedule"
-                              model={scheduleSummary}
-                              icon={<ClockIcon className="size-4 shrink-0" />}
-                              className={AUTOMATION_CONTROL_TRIGGER_CLASS_NAME}
-                              data-testid="task-schedule-trigger"
-                            />
-                          </PopoverTrigger>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="inline-flex w-full sm:col-span-3">
+                                <PopoverTrigger asChild>
+                                  <ComposerHarnessTrigger
+                                    label="Schedule"
+                                    model={scheduleSummary}
+                                    icon={<ClockIcon className="size-4 shrink-0" />}
+                                    className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                                    data-testid="task-schedule-trigger"
+                                  />
+                                </PopoverTrigger>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>Schedule</TooltipContent>
+                          </Tooltip>
                           <PopoverContent
                             align="end"
                             className="menu-surface w-[min(28rem,calc(100vw-2rem))] gap-0 p-0"
@@ -1657,305 +1383,720 @@ export function CreateScheduledTaskDialog({
                             )}
                           </PopoverContent>
                         </Popover>
+                      </div>
+                      {!curationPending && !triggersSupported && (
+                        <p className="text-sm text-muted-foreground sm:col-span-6">
+                          Integration triggers aren't available on this server.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  <div className="sm:col-span-6">
+                    {trigger !== null ? (
+                      <TriggerTemplateFields
+                        source={trigger}
+                        fields={triggerFields}
+                        onChange={setTriggerFields}
+                        onSelectOpenChange={handleSelectOpenChange}
+                        // Managed sandboxes provide their agents' integration tools.
+                        toolsProvided={
+                          sandboxMode &&
+                          info !== "loading" &&
+                          inferHostSshTarget({
+                            name: "automation",
+                            sandbox_provider: info.sandbox_provider,
+                          }) !== null
+                        }
+                        renderedPrompt={renderedTriggerPrompt}
+                        onEditAsPrompt={() => {
+                          const parts = splitTriggerPrompt(renderedTriggerPrompt);
+                          setPrompt(parts.userPrompt);
+                          setSystemPrompt(parts.systemPrompt);
+                          setSystemPromptOpen(false);
+                          setEditingSystemPrompt(false);
+                          setTrigger(null);
+                        }}
+                      />
+                    ) : (
+                      <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
+                        <Textarea
+                          id="task-prompt"
+                          aria-label={
+                            startsFromSession
+                              ? "Additional instructions"
+                              : systemPrompt === null
+                                ? "Instructions"
+                                : "Your prompt"
+                          }
+                          value={prompt}
+                          rows={5}
+                          placeholder={
+                            startsFromSession
+                              ? "Optional. For example: Use this week's data."
+                              : "What should the agent do each run?"
+                          }
+                          data-testid="task-prompt-input"
+                          componentId="tasks.scheduled.prompt"
+                          className="min-h-40 resize-y rounded-xl text-ui focus-visible:ring-0"
+                          onChange={(e) => setPrompt(e.target.value)}
+                        />
+                        {systemPrompt !== null &&
+                          splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
+                            <p role="status" className="text-sm text-warning">
+                              {prompt.trim() === ""
+                                ? "Your prompt can't be empty."
+                                : systemPrompt.trim() === ""
+                                  ? "System prompt can't be empty. Expand System prompt and click Edit system prompt to restore it."
+                                  : "These edits change the template structure. After saving, the full text will appear as one prompt."}
+                            </p>
+                          )}
+                        {systemPrompt !== null && (
+                          <Collapsible
+                            open={systemPromptOpen}
+                            onOpenChange={(expanded) => {
+                              setSystemPromptOpen(expanded);
+                              setEditingSystemPrompt(false);
+                            }}
+                            className="mt-2 rounded-md border border-border p-3"
+                          >
+                            <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-2 rounded-sm text-ui text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
+                              <ChevronDownIcon className="size-4 transition-transform group-data-[state=closed]:-rotate-90" />
+                              System prompt
+                            </CollapsibleTrigger>
+                            <CollapsibleContent className="space-y-2 pt-3">
+                              <p className="text-sm text-muted-foreground">
+                                Instructions for how the automation runs. Your prompt is added
+                                separately.
+                              </p>
+                              {editingSystemPrompt ? (
+                                <Textarea
+                                  aria-label="System prompt"
+                                  autoFocus
+                                  value={systemPrompt}
+                                  rows={8}
+                                  className="max-h-80 resize-y text-ui focus-visible:ring-0"
+                                  componentId="tasks.scheduled.system_prompt"
+                                  onChange={(event) => setSystemPrompt(event.target.value)}
+                                />
+                              ) : (
+                                <pre className="max-h-56 overflow-y-auto rounded-md bg-muted/40 p-2 font-sans text-sm whitespace-pre-wrap break-words">
+                                  {systemPrompt}
+                                </pre>
+                              )}
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                componentId="tasks.scheduled.edit_system_prompt"
+                                onClick={() => setEditingSystemPrompt(!editingSystemPrompt)}
+                              >
+                                {editingSystemPrompt
+                                  ? "Done editing system prompt"
+                                  : "Edit system prompt"}
+                              </Button>
+                            </CollapsibleContent>
+                          </Collapsible>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <div className="contents">
+                    <div className="contents">
+                      <div className="contents">
+                        <Select
+                          value={sandboxMode ? SANDBOX_HOST : hostId}
+                          componentId="tasks.scheduled.host"
+                          onValueChange={handleTargetChange}
+                          onOpenChange={handleSelectOpenChange}
+                        >
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="inline-flex w-full sm:col-span-2">
+                                <SelectTrigger asChild hideIcon>
+                                  <ComposerHarnessTrigger
+                                    label="Run on"
+                                    model={runTargetLabel}
+                                    icon={
+                                      sandboxMode ? (
+                                        <BoxIcon className="size-4 shrink-0" />
+                                      ) : (
+                                        <MonitorIcon className="size-4 shrink-0" />
+                                      )
+                                    }
+                                    className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                                    data-testid="task-host-trigger"
+                                  />
+                                </SelectTrigger>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>Run on</TooltipContent>
+                          </Tooltip>
+                          <SelectContent position="popper" align="end">
+                            {(managedSandboxesEnabled || sandboxMode) && (
+                              <SelectItem
+                                value={SANDBOX_HOST}
+                                data-testid="task-host-sandbox-option"
+                              >
+                                {sandboxLabel}
+                              </SelectItem>
+                            )}
+                            {hostOptions.map((host) => (
+                              <SelectItem key={host.host_id} value={host.host_id}>
+                                {host.name} {host.status === "offline" ? "(offline)" : ""}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
 
-                        {!triggerMode && (
-                          <Popover open={endingMenuOpen} onOpenChange={changeEndingMenuOpen}>
-                            <PopoverTrigger asChild>
-                              <ComposerHarnessTrigger
-                                label="Ends"
-                                model={endingSummary}
-                                icon={<CalendarOffIcon className="size-4 shrink-0" />}
-                                className={AUTOMATION_CONTROL_TRIGGER_CLASS_NAME}
-                                data-testid="task-ending-trigger"
-                              />
-                            </PopoverTrigger>
-                            <PopoverContent
-                              align="end"
-                              className="menu-surface w-[min(28rem,calc(100vw-2rem))] gap-0 p-0"
-                              onPointerDownOutside={guardDialogDismiss}
-                              onInteractOutside={guardDialogDismiss}
-                            >
-                              {endingFields}
-                            </PopoverContent>
-                          </Popover>
+                        {!editingWorkerSettings && (
+                          <div className="sm:col-span-2" data-testid="task-agent-picker">
+                            <AgentHarnessPicker
+                              agentEntries={agentEntries}
+                              harnessEntries={harnessEntries}
+                              effectiveAgentId={effectiveAgentId}
+                              agentLabel={agentLabel}
+                              hasAgents={selectedAgent !== undefined || agentList.length > 0}
+                              loading={curationPending}
+                              curatedEntries={
+                                curation.restrictToAgentNames.size > 0 ? agentList : undefined
+                              }
+                              host={sandboxMode ? undefined : badgeHost}
+                              onSelectAgent={handleSelectAgent}
+                              pendingAgent={null}
+                              pendingAgentId="__unused_pending_agent__"
+                              onSelectPending={() => {}}
+                              onCreateCustomAgent={() => {}}
+                              sandboxSelected={sandboxMode}
+                              allowCreateCustomAgent={false}
+                              open={agentMenuOpen}
+                              onOpenChange={changeAgentMenuOpen}
+                              dropdownModal={false}
+                              contentClassName="w-80"
+                              contentAlign="end"
+                              triggerDetails={automationPickerDetails}
+                              triggerIcon={
+                                selectedAgent ? (
+                                  <span className="flex size-4 shrink-0 items-center justify-center">
+                                    <ComposerAgentIcon agent={selectedAgent} />
+                                  </span>
+                                ) : null
+                              }
+                              selectedConfigContent={automationPickerConfig}
+                              isEntryConfigurable={(agent) =>
+                                !reusesExistingSession &&
+                                (nativeAgentHasModelSettings(agent) ||
+                                  (agent.id === effectiveAgentId && supportsModel))
+                              }
+                              triggerClassName={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                              triggerTooltip="Agent, model, and effort"
+                            />
+                          </div>
                         )}
 
-                        {sandboxMode && sandboxRepoCatalog.length > 0 ? (
+                        {!editingWorkerSettings && permissionOptions.length > 0 && (
                           <Select
-                            value={sandboxWorkspace || PROVIDER_DEFAULT}
-                            onValueChange={(value) =>
-                              setWorkspace(value === PROVIDER_DEFAULT ? "" : value)
-                            }
+                            disabled={curationPending || reusesExistingSession}
+                            value={permissionSelectValue}
+                            componentId="tasks.scheduled.permission_mode"
+                            valueHasNoPii
+                            onValueChange={handlePermissionChange}
                             onOpenChange={handleSelectOpenChange}
-                            componentId="tasks.scheduled.sandbox_repository"
                           >
-                            <SelectTrigger asChild hideIcon>
-                              <ComposerHarnessTrigger
-                                label="Repository"
-                                model={workspaceSummary}
-                                icon={<FolderOpenIcon className="size-4 shrink-0" />}
-                                className={AUTOMATION_CONTROL_TRIGGER_CLASS_NAME}
-                                data-testid="task-sandbox-repository"
-                              />
-                            </SelectTrigger>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="inline-flex w-full sm:col-span-2">
+                                  <SelectTrigger asChild hideIcon>
+                                    <ComposerHarnessTrigger
+                                      label="Permissions"
+                                      model={permissionLabel}
+                                      icon={<ShieldCheckIcon className="size-4 shrink-0" />}
+                                      className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                                      data-testid="task-permission-trigger"
+                                    />
+                                  </SelectTrigger>
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>Permissions</TooltipContent>
+                            </Tooltip>
                             <SelectContent position="popper" align="end">
-                              <SelectItem value={PROVIDER_DEFAULT}>Provider default</SelectItem>
-                              {savedSandboxWorkspace &&
-                                !sandboxRepoCatalog.some(
-                                  (repo) => repo.url === savedSandboxWorkspace,
-                                ) && (
-                                  <SelectItem value={savedSandboxWorkspace}>
-                                    {savedSandboxWorkspace}
-                                  </SelectItem>
-                                )}
-                              {sandboxRepoCatalog.map((repo) => (
-                                <SelectItem key={repo.url} value={repo.url}>
-                                  {repo.name}
+                              <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
+                              {permissionOptions.map((option) => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  {option.label}
                                 </SelectItem>
                               ))}
                             </SelectContent>
                           </Select>
-                        ) : (
-                          !sandboxMode && (
-                            <Popover
-                              open={workspaceMenuOpen}
-                              onOpenChange={changeWorkspaceMenuOpen}
-                            >
-                              <PopoverTrigger asChild>
-                                <ComposerHarnessTrigger
-                                  label="Workspace"
-                                  model={workspaceSummary}
-                                  icon={<FolderOpenIcon className="size-4 shrink-0" />}
-                                  disabled={hostId === ""}
-                                  className={AUTOMATION_CONTROL_TRIGGER_CLASS_NAME}
-                                  data-testid="task-workspace-trigger"
-                                />
-                              </PopoverTrigger>
-                              <PopoverContent
-                                align="end"
-                                className="menu-surface w-[min(26rem,calc(100vw-2rem))] p-3"
-                                onPointerDownOutside={guardDialogDismiss}
-                                onInteractOutside={guardDialogDismiss}
+                        )}
+                      </div>
+                    </div>
+                    <Collapsible className="border-t border-border pt-3 sm:col-span-6">
+                      <CollapsibleTrigger
+                        className="group flex w-full cursor-pointer items-center justify-start gap-2 rounded-sm text-left text-ui font-medium outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50"
+                        data-testid="task-advanced-settings-trigger"
+                      >
+                        <span>
+                          Advanced settings{" "}
+                          <span className="font-normal text-muted-foreground">(optional)</span>
+                        </span>
+                        <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
+                      </CollapsibleTrigger>
+                      <CollapsibleContent className="pt-3">
+                        <div
+                          className="divide-y divide-border"
+                          data-testid="task-top-level-controls"
+                        >
+                          {sessionModesSupported &&
+                            trigger === null &&
+                            !startsFromSession &&
+                            (!editingTemplateTrigger || editingTask?.sessionId) && (
+                              <div
+                                className="flex min-h-9 items-center justify-between gap-4 py-px"
+                                data-testid="task-session-mode-field"
                               >
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  className="w-full justify-start gap-2"
-                                  disabled={workspaceHostOffline}
-                                  onClick={() => {
-                                    changeWorkspaceMenuOpen(false);
-                                    setWorkspaceBrowserOpen(true);
-                                  }}
-                                  data-testid="task-workspace-browse"
+                                <span className="text-ui text-muted-foreground">
+                                  Session continuity
+                                </span>
+                                <DropdownMenu>
+                                  <DropdownMenuTrigger asChild>
+                                    <ComposerHarnessTrigger
+                                      label="Session continuity"
+                                      model={
+                                        sessionMode === "new"
+                                          ? "New session each run"
+                                          : "Continue one session"
+                                      }
+                                      icon={<RefreshCwIcon className="size-4 shrink-0" />}
+                                      className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                      data-testid="task-session-mode-trigger"
+                                    />
+                                  </DropdownMenuTrigger>
+                                  <DropdownMenuContent align="end" className="min-w-64">
+                                    {!editingTemplateTrigger && (
+                                      <DropdownMenuRadioGroup
+                                        value={sessionMode}
+                                        onValueChange={(value) =>
+                                          setSessionMode(value as ScheduledTaskSessionMode)
+                                        }
+                                      >
+                                        <DropdownMenuRadioItem value="new">
+                                          New session each run
+                                        </DropdownMenuRadioItem>
+                                        <DropdownMenuRadioItem value="continue">
+                                          Continue one session
+                                        </DropdownMenuRadioItem>
+                                      </DropdownMenuRadioGroup>
+                                    )}
+                                    {isEdit &&
+                                      sessionMode === "continue" &&
+                                      editingTask?.sessionId && (
+                                        <>
+                                          {!editingTemplateTrigger && <DropdownMenuSeparator />}
+                                          <DropdownMenuCheckboxItem
+                                            checked={startNewSession}
+                                            onCheckedChange={(checked) =>
+                                              setStartNewSession(checked === true)
+                                            }
+                                            onSelect={(event) => event.preventDefault()}
+                                            data-testid="task-start-new-session"
+                                          >
+                                            Start a new session on the next run
+                                          </DropdownMenuCheckboxItem>
+                                        </>
+                                      )}
+                                  </DropdownMenuContent>
+                                </DropdownMenu>
+                              </div>
+                            )}
+
+                          {(isEdit || fromSession !== null) && (
+                            <div className="flex min-h-9 items-center justify-between gap-4 py-px">
+                              <span className="text-ui text-muted-foreground">Schedule</span>
+                              <Popover
+                                open={scheduleMenuOpen}
+                                onOpenChange={changeScheduleMenuOpen}
+                              >
+                                <PopoverTrigger asChild>
+                                  <ComposerHarnessTrigger
+                                    label="Schedule"
+                                    model={scheduleSummary}
+                                    icon={<ClockIcon className="size-4 shrink-0" />}
+                                    className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                    data-testid="task-schedule-trigger"
+                                  />
+                                </PopoverTrigger>
+                                <PopoverContent
+                                  align="end"
+                                  className="menu-surface w-[min(28rem,calc(100vw-2rem))] gap-0 p-0"
+                                  onPointerDownOutside={guardDialogDismiss}
+                                  onInteractOutside={guardDialogDismiss}
                                 >
-                                  <FolderOpenIcon className="size-4 text-muted-foreground" />
-                                  <span className="truncate">{workspace || "Browse folders…"}</span>
-                                </Button>
-                                {workspaceHostOffline && (
-                                  <p className="text-sm text-muted-foreground">
-                                    Connect your host to select a workspace.
-                                  </p>
-                                )}
-                                {workspace && (
-                                  <p className="truncate font-mono text-sm text-muted-foreground">
-                                    {workspace}
-                                  </p>
-                                )}
-                                {workspace &&
-                                  worktreesSupported &&
-                                  (!isGitWorkspace && baseBranch !== null ? (
-                                    <div className="text-sm text-muted-foreground">
-                                      <p>Random worktree is enabled. {worktreeStatus}</p>
+                                  {!triggerMode && recurrenceFields}
+                                  {triggerMode && !scheduleInvalid && (
+                                    <p
+                                      className="px-4 py-3 text-sm text-muted-foreground"
+                                      data-testid="task-trigger-cadence"
+                                    >
+                                      Checks for new matches:{" "}
+                                      {describeSchedule(buildRRule(schedule))}. Matching items start
+                                      sessions automatically.
+                                    </p>
+                                  )}
+                                  {triggerMode && scheduleInvalid && (
+                                    <div className="space-y-2 px-4 py-3">
+                                      <p className="text-sm text-destructive" role="alert">
+                                        This polling configuration is no longer supported. Use the
+                                        server default to save your changes.
+                                      </p>
                                       <Button
                                         type="button"
-                                        variant="link"
-                                        onClick={() => setBaseBranch(null)}
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() => {
+                                          setSchedule(defaultTriggerSchedule);
+                                          setScheduleUnsupported(false);
+                                        }}
                                       >
-                                        Turn off random worktree
+                                        Use server default (
+                                        {describeSchedule(buildRRule(defaultTriggerSchedule))})
                                       </Button>
                                     </div>
-                                  ) : (
-                                    isGitWorkspace && (
-                                      <>
-                                        <div className="flex items-center gap-2">
-                                          <Checkbox
-                                            id="task-random-worktree"
-                                            checked={baseBranch !== null}
-                                            onCheckedChange={(checked) =>
-                                              setBaseBranch(
-                                                checked === true ? RANDOM_WORKTREE_BASE_REF : null,
-                                              )
-                                            }
-                                            componentId="tasks.scheduled.random_worktree"
-                                          />
-                                          <label
-                                            htmlFor="task-random-worktree"
-                                            className="cursor-pointer text-sm"
-                                          >
-                                            Random worktree
-                                          </label>
-                                        </div>
-                                        <p className="text-sm text-muted-foreground">
-                                          {sessionMode === "continue"
-                                            ? "Creates a random worktree when starting a session. Later runs reuse it."
-                                            : "Creates a fresh random worktree for each run."}
-                                        </p>
-                                      </>
-                                    )
-                                  ))}
-                              </PopoverContent>
-                            </Popover>
-                          )
-                        )}
+                                  )}
+                                  {!triggerMode && scheduleUnsupported && (
+                                    <p className="px-4 pb-3 text-sm text-destructive" role="alert">
+                                      This schedule can&apos;t be edited in this form yet. Choose a
+                                      frequency to replace it.
+                                    </p>
+                                  )}
+                                  {!triggerMode && unsupportedByScheduler && (
+                                    <p className="px-4 pb-3 text-sm text-destructive" role="alert">
+                                      This server does not support custom schedules or occurrence
+                                      limits. Choose a supported frequency to replace this schedule.
+                                    </p>
+                                  )}
+                                </PopoverContent>
+                              </Popover>
+                            </div>
+                          )}
 
-                        {projectsSupported && (
-                          <div data-testid="task-project-field">
-                            <DropdownMenu
-                              open={projectMenuOpen}
-                              onOpenChange={changeProjectMenuOpen}
-                            >
-                              <DropdownMenuTrigger asChild>
-                                <ComposerHarnessTrigger
-                                  label="Project"
-                                  model={unresolvedProjectLabel ?? (projectName || "No project")}
-                                  icon={
-                                    projectName !== "" || unresolvedProjectLabel !== null ? (
-                                      <ProjectRowIcon icon={projectIcon} />
-                                    ) : (
-                                      <FolderIcon className="size-4 shrink-0" />
-                                    )
+                          {!triggerMode && (
+                            <div className="flex min-h-9 items-center justify-between gap-4 py-px">
+                              <span className="text-ui text-muted-foreground">Ends</span>
+                              <Popover open={endingMenuOpen} onOpenChange={changeEndingMenuOpen}>
+                                <PopoverTrigger asChild>
+                                  <ComposerHarnessTrigger
+                                    label="Ends"
+                                    model={endingSummary}
+                                    icon={<CalendarOffIcon className="size-4 shrink-0" />}
+                                    className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                    data-testid="task-ending-trigger"
+                                  />
+                                </PopoverTrigger>
+                                <PopoverContent
+                                  align="end"
+                                  className="menu-surface w-[min(28rem,calc(100vw-2rem))] gap-0 p-0"
+                                  onPointerDownOutside={guardDialogDismiss}
+                                  onInteractOutside={guardDialogDismiss}
+                                >
+                                  {endingFields}
+                                </PopoverContent>
+                              </Popover>
+                            </div>
+                          )}
+
+                          {(!sandboxMode || sandboxRepoCatalog.length > 0) && (
+                            <div className="flex min-h-9 items-center justify-between gap-4 py-px">
+                              <span className="text-ui text-muted-foreground">
+                                {sandboxMode ? "Repository" : "Workspace"}
+                              </span>
+                              {sandboxMode ? (
+                                <Select
+                                  value={sandboxWorkspace || PROVIDER_DEFAULT}
+                                  onValueChange={(value) =>
+                                    setWorkspace(value === PROVIDER_DEFAULT ? "" : value)
                                   }
-                                  className={AUTOMATION_CONTROL_TRIGGER_CLASS_NAME}
-                                  data-testid="task-project-trigger"
-                                />
-                              </DropdownMenuTrigger>
-                              <DropdownMenuContent align="end" className="min-w-56">
-                                {savedProjectUnresolved && !savedProjectDeleted && (
-                                  <DropdownMenuItem
-                                    className="px-2 py-1"
-                                    onSelect={() => {
-                                      setProjectChoice("");
-                                      setPickedProjectId(null);
-                                    }}
+                                  onOpenChange={handleSelectOpenChange}
+                                  componentId="tasks.scheduled.sandbox_repository"
+                                >
+                                  <SelectTrigger asChild hideIcon>
+                                    <ComposerHarnessTrigger
+                                      label="Repository"
+                                      model={workspaceSummary}
+                                      icon={<FolderOpenIcon className="size-4 shrink-0" />}
+                                      className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                      data-testid="task-sandbox-repository"
+                                    />
+                                  </SelectTrigger>
+                                  <SelectContent position="popper" align="end">
+                                    <SelectItem value={PROVIDER_DEFAULT}>
+                                      Provider default
+                                    </SelectItem>
+                                    {savedSandboxWorkspace &&
+                                      !sandboxRepoCatalog.some(
+                                        (repo) => repo.url === savedSandboxWorkspace,
+                                      ) && (
+                                        <SelectItem value={savedSandboxWorkspace}>
+                                          {savedSandboxWorkspace}
+                                        </SelectItem>
+                                      )}
+                                    {sandboxRepoCatalog.map((repo) => (
+                                      <SelectItem key={repo.url} value={repo.url}>
+                                        {repo.name}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              ) : (
+                                <Popover
+                                  open={workspaceMenuOpen}
+                                  onOpenChange={changeWorkspaceMenuOpen}
+                                >
+                                  <PopoverTrigger asChild>
+                                    <ComposerHarnessTrigger
+                                      label="Workspace"
+                                      model={workspaceSummary}
+                                      icon={<FolderOpenIcon className="size-4 shrink-0" />}
+                                      disabled={hostId === ""}
+                                      className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                      data-testid="task-workspace-trigger"
+                                    />
+                                  </PopoverTrigger>
+                                  <PopoverContent
+                                    align="end"
+                                    className="menu-surface w-[min(26rem,calc(100vw-2rem))] p-3"
+                                    onPointerDownOutside={guardDialogDismiss}
+                                    onInteractOutside={guardDialogDismiss}
                                   >
-                                    No project
-                                  </DropdownMenuItem>
-                                )}
-                                <ProjectPicker
-                                  currentProject={projectName || null}
-                                  onSelect={(next) => {
-                                    setProjectChoice(next);
-                                    setPickedProjectId(
-                                      projects.find((project) => project.name === next)?.id ?? null,
-                                    );
-                                  }}
-                                />
-                              </DropdownMenuContent>
-                            </DropdownMenu>
-                          </div>
-                        )}
-                      </div>
+                                    <Button
+                                      type="button"
+                                      variant="outline"
+                                      className="w-full justify-start gap-2"
+                                      disabled={workspaceHostOffline}
+                                      onClick={() => {
+                                        changeWorkspaceMenuOpen(false);
+                                        setWorkspaceBrowserOpen(true);
+                                      }}
+                                      data-testid="task-workspace-browse"
+                                    >
+                                      <FolderOpenIcon className="size-4 text-muted-foreground" />
+                                      <span className="truncate">
+                                        {workspace || "Browse folders…"}
+                                      </span>
+                                    </Button>
+                                    {workspaceHostOffline && (
+                                      <p className="text-sm text-muted-foreground">
+                                        Connect your host to select a workspace.
+                                      </p>
+                                    )}
+                                    {workspace && (
+                                      <p className="truncate font-mono text-sm text-muted-foreground">
+                                        {workspace}
+                                      </p>
+                                    )}
+                                    {workspace &&
+                                      worktreesSupported &&
+                                      (!isGitWorkspace && baseBranch !== null ? (
+                                        <div className="text-sm text-muted-foreground">
+                                          <p>Random worktree is enabled. {worktreeStatus}</p>
+                                          <Button
+                                            type="button"
+                                            variant="link"
+                                            onClick={() => setBaseBranch(null)}
+                                          >
+                                            Turn off random worktree
+                                          </Button>
+                                        </div>
+                                      ) : (
+                                        isGitWorkspace && (
+                                          <>
+                                            <div className="flex items-center gap-2">
+                                              <Checkbox
+                                                id="task-random-worktree"
+                                                checked={baseBranch !== null}
+                                                onCheckedChange={(checked) =>
+                                                  setBaseBranch(
+                                                    checked === true
+                                                      ? RANDOM_WORKTREE_BASE_REF
+                                                      : null,
+                                                  )
+                                                }
+                                                componentId="tasks.scheduled.random_worktree"
+                                              />
+                                              <label
+                                                htmlFor="task-random-worktree"
+                                                className="cursor-pointer text-sm"
+                                              >
+                                                Random worktree
+                                              </label>
+                                            </div>
+                                            <p className="text-sm text-muted-foreground">
+                                              {sessionMode === "continue"
+                                                ? "Creates a random worktree when starting a session. Later runs reuse it."
+                                                : "Creates a fresh random worktree for each run."}
+                                            </p>
+                                          </>
+                                        )
+                                      ))}
+                                  </PopoverContent>
+                                </Popover>
+                              )}
+                            </div>
+                          )}
 
-                      <WorkspacePickerDialog
-                        open={workspacePickerVisible}
-                        onOpenChange={setWorkspaceBrowserOpen}
-                        hostId={hostId}
-                        initialPath={workspace}
-                        onConfirm={(path) => {
-                          if (path !== workspace) setBaseBranch(null);
-                          setWorkspace(path);
-                        }}
-                      />
-
-                      <div className="mt-3 space-y-2">
-                        {!sandboxMode && selectedHost?.status === "offline" && (
-                          <p className="text-sm text-muted-foreground">
-                            This host is offline. Runs fail until it reconnects.
-                          </p>
-                        )}
-                        {agentChanged && (
-                          <p className="text-sm text-muted-foreground">
-                            Future runs use {agentLabel}; past runs keep the agent they ran with.
-                          </p>
-                        )}
-                        {workspaceWithoutHost && (
-                          <p
-                            className="flex items-center gap-1.5 text-sm text-destructive"
-                            data-testid="workspace-without-host-error"
-                          >
-                            <TriangleAlertIcon className="size-3.5 shrink-0" />
-                            Pick a host before pinning a workspace.
-                          </p>
-                        )}
-                        {editingWorkerSettings && pollingBlockedReason && (
-                          <p role="alert" className="text-sm text-destructive">
-                            Polling session cannot start: {pollingBlockedReason}
-                          </p>
-                        )}
-                        {editingWorkerSettings && workerSettings !== null && editingTask ? (
-                          <div className="space-y-3 rounded-xl border border-border p-3">
-                            <TriggerWorkerHarnessField
-                              value={workerSettings}
-                              pollingAgentId={editingTask.agentId}
-                              agents={agentList}
-                              selectedAgent={workerAgent}
-                              disabled={curationPending}
-                              onSelectOpenChange={handleSelectOpenChange}
-                              onChange={handleWorkerSettingsChange}
-                            />
-                            <TriggerWorkerSettingsFields
-                              value={workerSettings}
-                              settings={workerHarnessSettings}
-                              disabled={curationPending}
-                              onSelectOpenChange={handleSelectOpenChange}
-                              onChange={handleWorkerSettingsChange}
-                            />
-                          </div>
-                        ) : editingWorkerSettings ? (
-                          <p className="text-sm text-muted-foreground" role="status">
-                            Worker controls are unavailable for these customized instructions. Edit
-                            the prompt or system prompt above to configure matching sessions.
-                          </p>
-                        ) : (
-                          harnessSettings.blockedReason && (
-                            <p
-                              role="alert"
-                              data-testid="task-harness-unsupported"
-                              className="text-sm text-destructive"
+                          {projectsSupported && (
+                            <div
+                              className="flex min-h-9 items-center justify-between gap-4 py-px"
+                              data-testid="task-project-field"
                             >
-                              {harnessSettings.blockedReason}
+                              <span className="text-ui text-muted-foreground">Project</span>
+                              <DropdownMenu
+                                open={projectMenuOpen}
+                                onOpenChange={changeProjectMenuOpen}
+                              >
+                                <DropdownMenuTrigger asChild>
+                                  <ComposerHarnessTrigger
+                                    label="Project"
+                                    model={unresolvedProjectLabel ?? (projectName || "No project")}
+                                    icon={
+                                      projectName !== "" || unresolvedProjectLabel !== null ? (
+                                        <ProjectRowIcon icon={projectIcon} />
+                                      ) : (
+                                        <FolderIcon className="size-4 shrink-0" />
+                                      )
+                                    }
+                                    className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                    data-testid="task-project-trigger"
+                                  />
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="min-w-56">
+                                  {savedProjectUnresolved && !savedProjectDeleted && (
+                                    <DropdownMenuItem
+                                      className="px-2 py-1"
+                                      onSelect={() => {
+                                        setProjectChoice("");
+                                        setPickedProjectId(null);
+                                      }}
+                                    >
+                                      No project
+                                    </DropdownMenuItem>
+                                  )}
+                                  <ProjectPicker
+                                    currentProject={projectName || null}
+                                    onSelect={(next) => {
+                                      setProjectChoice(next);
+                                      setPickedProjectId(
+                                        projects.find((project) => project.name === next)?.id ??
+                                          null,
+                                      );
+                                    }}
+                                  />
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </div>
+                          )}
+                        </div>
+
+                        <WorkspacePickerDialog
+                          open={workspacePickerVisible}
+                          onOpenChange={setWorkspaceBrowserOpen}
+                          hostId={hostId}
+                          initialPath={workspace}
+                          onConfirm={(path) => {
+                            if (path !== workspace) setBaseBranch(null);
+                            setWorkspace(path);
+                          }}
+                        />
+
+                        <div className="mt-3 space-y-2">
+                          {!sandboxMode && selectedHost?.status === "offline" && (
+                            <p className="text-sm text-muted-foreground">
+                              This host is offline. Runs fail until it reconnects.
                             </p>
-                          )
-                        )}
-                        {reusesExistingSession && (
-                          <div
-                            className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"
-                            data-testid="task-session-settings-note"
-                            role="status"
-                          >
-                            <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
-                            <p>
-                              This automation continues in an existing session, so its model,
-                              effort, and permission mode are controlled by that session. Edit the
-                              session directly to change them.
+                          )}
+                          {agentChanged && (
+                            <p className="text-sm text-muted-foreground">
+                              Future runs use {agentLabel}; past runs keep the agent they ran with.
                             </p>
-                          </div>
-                        )}
-                      </div>
-                      {!isEdit &&
-                        !curationPending &&
-                        agents !== undefined &&
-                        effectiveAgentId === null && (
-                          <p role="alert" className="text-sm text-destructive">
-                            No agents are available for this automation.
-                          </p>
-                        )}
-                    </CollapsibleContent>
-                  </Collapsible>
+                          )}
+                          {workspaceWithoutHost && (
+                            <p
+                              className="flex items-center gap-1.5 text-sm text-destructive"
+                              data-testid="workspace-without-host-error"
+                            >
+                              <TriangleAlertIcon className="size-3.5 shrink-0" />
+                              Pick a host before pinning a workspace.
+                            </p>
+                          )}
+                          {editingWorkerSettings && pollingBlockedReason && (
+                            <p role="alert" className="text-sm text-destructive">
+                              Polling session cannot start: {pollingBlockedReason}
+                            </p>
+                          )}
+                          {editingWorkerSettings && workerSettings !== null && editingTask ? (
+                            <div className="space-y-3 rounded-xl border border-border p-3">
+                              <TriggerWorkerHarnessField
+                                value={workerSettings}
+                                pollingAgentId={editingTask.agentId}
+                                agents={agentList}
+                                selectedAgent={workerAgent}
+                                disabled={curationPending}
+                                onSelectOpenChange={handleSelectOpenChange}
+                                onChange={handleWorkerSettingsChange}
+                              />
+                              <TriggerWorkerSettingsFields
+                                value={workerSettings}
+                                settings={workerHarnessSettings}
+                                disabled={curationPending}
+                                onSelectOpenChange={handleSelectOpenChange}
+                                onChange={handleWorkerSettingsChange}
+                              />
+                            </div>
+                          ) : editingWorkerSettings ? (
+                            <p className="text-sm text-muted-foreground" role="status">
+                              Worker controls are unavailable for these customized instructions.
+                              Edit the prompt or system prompt above to configure matching sessions.
+                            </p>
+                          ) : (
+                            harnessSettings.blockedReason && (
+                              <p
+                                role="alert"
+                                data-testid="task-harness-unsupported"
+                                className="text-sm text-destructive"
+                              >
+                                {harnessSettings.blockedReason}
+                              </p>
+                            )
+                          )}
+                          {reusesExistingSession && (
+                            <div
+                              className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"
+                              data-testid="task-session-settings-note"
+                              role="status"
+                            >
+                              <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                              <p>
+                                This automation continues in an existing session, so its model,
+                                effort, and permission mode are controlled by that session. Edit the
+                                session directly to change them.
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                        {!isEdit &&
+                          !curationPending &&
+                          agents !== undefined &&
+                          effectiveAgentId === null && (
+                            <p role="alert" className="text-sm text-destructive">
+                              No agents are available for this automation.
+                            </p>
+                          )}
+                      </CollapsibleContent>
+                    </Collapsible>
+                  </div>
                 </div>
-              </>
-            )}
-          </ScheduleFields>
+              )}
+            </ScheduleFields>
+          </TooltipProvider>
           {error && (
             <div
               role="alert"

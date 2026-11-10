@@ -470,7 +470,9 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
 
 describe("onCreated", () => {
   function fillRequiredFields() {
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Morning review" } });
+    fireEvent.change(screen.getByLabelText("Automation title"), {
+      target: { value: "Morning review" },
+    });
     fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), {
       target: { value: "Review pull requests" },
     });
@@ -550,7 +552,9 @@ describe("prompt-first automation setup", () => {
       { expandAdvanced: false },
     );
     const instructions = screen.getByRole("textbox", { name: "Instructions" });
-    expect(instructions).toHaveFocus();
+    const title = screen.getByLabelText("Automation title");
+    expect(title).toHaveFocus();
+    expect(screen.getByTestId("create-scheduled-task-dialog")).toHaveClass("sm:max-w-[720px]");
     expect(screen.getByTestId("task-host-trigger")).toHaveAccessibleName("Run on");
     expect(screen.getByTestId("task-agent-picker")).toBeVisible();
     const advancedTrigger = screen.getByTestId("task-advanced-settings-trigger");
@@ -573,7 +577,10 @@ describe("prompt-first automation setup", () => {
     expect(screen.queryByRole("button", { name: "Run setup" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Context" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Controls" })).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Name")).toBeVisible();
+    expect(title).toBeVisible();
+    expect(title).toHaveAttribute("placeholder", "Automation title");
+    expect(title).toHaveClass("font-heading", "text-[1.25em]");
+    expect(screen.queryByLabelText("Name")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Frequency")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Schedule ends")).not.toBeInTheDocument();
 
@@ -588,13 +595,15 @@ describe("prompt-first automation setup", () => {
 
     fireEvent.change(instructions, { target: { value: "Review pull requests" } });
     expect(screen.queryByTestId("task-execution-summary")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Name")).toHaveValue("");
+    expect(title).toHaveValue("");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Morning review" } });
+    fireEvent.change(screen.getByLabelText("Automation title"), {
+      target: { value: "Morning review" },
+    });
     fireEvent.change(instructions, {
       target: { value: "  Review pull requests\n and report CI failures.  " },
     });
-    expect(screen.getByLabelText("Name")).toHaveValue("Morning review");
+    expect(title).toHaveValue("Morning review");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
@@ -603,6 +612,25 @@ describe("prompt-first automation setup", () => {
       prompt: "Review pull requests\n and report CI failures.",
       hostId: "host_1",
     });
+  });
+
+  it("shows DS tooltips for the modal controls", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
+    async function expectTooltip(testId: string, label: string) {
+      const trigger = screen.getByTestId(testId);
+      fireEvent.pointerMove(trigger.parentElement!, { pointerType: "mouse" });
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
+      fireEvent.keyDown(trigger, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+    }
+    await expectTooltip("task-trigger-type", "Trigger type");
+    await expectTooltip("task-schedule-trigger", "Schedule");
+    await expectTooltip("task-host-trigger", "Run on");
+    await expectTooltip("task-permission-trigger", "Permissions");
+    expect(screen.getByTestId("task-advanced-settings-trigger")).not.toHaveAttribute(
+      "data-slot",
+      "tooltip-trigger",
+    );
   });
 
   it.each([
@@ -878,7 +906,9 @@ describe("agent picker readiness (needs-setup badges)", () => {
         { expandAdvanced: false },
       );
       if (!editing && empty) {
-        fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Nightly" } });
+        fireEvent.change(screen.getByLabelText("Automation title"), {
+          target: { value: "Nightly" },
+        });
         fireEvent.change(screen.getByLabelText("Instructions"), {
           target: { value: "Review changes" },
         });
@@ -1680,14 +1710,17 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("hostId");
   });
 
-  it("shows Run on and Agent before the top-level Schedule control", () => {
+  it("shows Schedule inline after Trigger type", () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
     const scheduleSection = screen.getByRole("button", { name: "Schedule" });
     expect(scheduleSection).toHaveAttribute("aria-expanded", "false");
     const hostTrigger = screen.getByTestId("task-host-trigger");
     expect(hostTrigger).toBeVisible();
     expect(screen.getByTestId("task-agent-picker")).toBeVisible();
-    expect(hostTrigger.compareDocumentPosition(scheduleSection)).toBe(
+    expect(screen.getByTestId("task-trigger-type").compareDocumentPosition(scheduleSection)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(scheduleSection.compareDocumentPosition(hostTrigger)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
     fireEvent.click(screen.getByTestId("pick-agent-polly"));
@@ -1732,7 +1765,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     ["Yearly", "FREQ=YEARLY;INTERVAL=1;BYMONTH=1;BYMONTHDAY=1;BYHOUR=17;BYMINUTE=7"],
   ])("edits and validates %s custom start times inline", async (frequency, rule) => {
     renderDialog();
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "T" } });
+    fireEvent.change(screen.getByLabelText("Automation title"), { target: { value: "T" } });
     fireEvent.change(screen.getByLabelText("Instructions"), { target: { value: "P" } });
     fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "Custom schedule" }));
@@ -1787,9 +1820,9 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(timeField).toHaveValue("05:07 PM");
   });
 
-  it("uses text-ui for dialog text fields that wrap shared primitives", () => {
+  it("uses title typography for the automation name and text-ui for instructions", () => {
     renderDialog();
-    expect(screen.getByTestId("task-name-input")).toHaveClass("text-ui");
+    expect(screen.getByTestId("task-name-input")).toHaveClass("font-heading", "text-[1.25em]");
     expect(screen.getByTestId("task-prompt-input")).toHaveClass("text-ui");
   });
 
@@ -1871,7 +1904,9 @@ describe("CreateScheduledTaskDialog submit", () => {
           <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
         </CapabilitiesProvider>,
       );
-      fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Interval check" } });
+      fireEvent.change(screen.getByLabelText("Automation title"), {
+        target: { value: "Interval check" },
+      });
       fireEvent.change(screen.getByLabelText("Instructions"), {
         target: { value: "Review recent changes" },
       });
@@ -2878,7 +2913,9 @@ describe("nested dropdowns do not dismiss the Dialog (isInsidePopper guard)", ()
         const openTrigger = screen.queryByTestId(testId);
         if (openTrigger?.getAttribute("aria-expanded") === "true") fireEvent.click(openTrigger);
       }
-      fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Unsaved draft" } });
+      fireEvent.change(screen.getByLabelText("Automation title"), {
+        target: { value: "Unsaved draft" },
+      });
       const trigger = screen.getByTestId(`task-${field}-trigger`);
       const role = field === "project" ? "menu" : "listbox";
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -2894,7 +2931,7 @@ describe("nested dropdowns do not dismiss the Dialog (isInsidePopper guard)", ()
         } else {
           expect(screen.queryByRole(role)).not.toBeInTheDocument();
         }
-        expect(screen.getByLabelText("Name")).toHaveValue("Unsaved draft");
+        expect(screen.getByLabelText("Automation title")).toHaveValue("Unsaved draft");
         expect(onOpenChange).not.toHaveBeenCalled();
       }
     },
@@ -5519,7 +5556,7 @@ describe("creating an automation from a session", () => {
     renderFromSession();
 
     expect(screen.getByText("New automation from “Weekly rubric”")).toBeInTheDocument();
-    expect(screen.getByLabelText("Name")).toHaveValue("Weekly rubric");
+    expect(screen.getByLabelText("Automation title")).toHaveValue("Weekly rubric");
     const startsFrom = screen.getByTestId("task-starts-from-link");
     expect(startsFrom).toHaveAttribute("href", "/c/conv_src");
     expect(startsFrom).toHaveTextContent("Weekly rubric");
@@ -5658,7 +5695,9 @@ describe("creating an automation from a session", () => {
     );
     expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
 
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Rubric refresh" } });
+    fireEvent.change(screen.getByLabelText("Automation title"), {
+      target: { value: "Rubric refresh" },
+    });
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const { input } = updateMutateAsync.mock.calls[0][0];
