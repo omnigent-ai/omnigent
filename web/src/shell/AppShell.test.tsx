@@ -891,13 +891,32 @@ describe("AppShell header", () => {
   );
 
   it.each([
-    { source: "the live store", snapshotStatus: "idle", boundStatus: "running" },
-    { source: "the snapshot", snapshotStatus: "waiting", boundStatus: "idle" },
+    {
+      source: "the bound live store",
+      snapshotStatus: "idle",
+      boundId: "conv_off_window",
+      boundStatus: "running",
+      asks: true,
+    },
+    {
+      source: "the snapshot before binding",
+      snapshotStatus: "waiting",
+      boundId: "conv_other",
+      boundStatus: "idle",
+      asks: true,
+    },
+    {
+      source: "the bound live store over a stale snapshot",
+      snapshotStatus: "running",
+      boundId: "conv_off_window",
+      boundStatus: "idle",
+      asks: false,
+    },
   ] as const)(
-    "asks before archiving an off-window session working per $source, and Cancel keeps it",
-    async ({ snapshotStatus, boundStatus }) => {
+    "archive confirmation for an off-window session follows $source",
+    async ({ snapshotStatus, boundId, boundStatus, asks }) => {
       mockConversations([]);
-      useChatStore.setState({ conversationId: "conv_off_window", sessionStatus: boundStatus });
+      useChatStore.setState({ conversationId: boundId, sessionStatus: boundStatus });
       useSessionMock.mockReturnValue({
         session: {
           id: "conv_off_window",
@@ -927,6 +946,11 @@ describe("AppShell header", () => {
       });
       fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
 
+      if (!asks) {
+        await waitFor(() => expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull());
+        expect(screen.queryByTestId("archive-running-dialog")).toBeNull();
+        return;
+      }
       const dialog = await screen.findByRole("dialog", { name: "Archive running session?" });
       fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
       await waitFor(() => expect(screen.queryByTestId("archive-running-dialog")).toBeNull());
