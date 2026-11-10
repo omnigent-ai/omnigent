@@ -26,8 +26,9 @@ implements them separately, so a fix for one harness does not reach the others.
   reported unavailable until the user picks an offered one. Display only;
   [automations](automation-templates.md) share this curation while preserving
   saved selections on edit. Project-settings pickers are unchanged.
-- `agent-instructions`: Pi native delivers authored instructions at launch/resume;
-  authors can keep or replace Pi's base prompt and disable automatic context files.
+- `agent-instructions`: supported native startup paths preserve authored instructions
+  and add shared guidance for showing workspace screenshots; Pi authors can keep
+  or replace its base prompt and disable automatic context files.
 - `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
   Pi gateway executor) also get the MCP servers configured for Claude Code, Codex
   and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
@@ -119,11 +120,15 @@ implements them separately, so a fix for one harness does not reach the others.
   turn and reconnect must not leave a stale idle or working state. The sidebar
   status follows these rules:
   - Claude: the status Claude Code reports for itself (OSC 7501) decides
-    working, idle and waiting for input, with three exceptions. A background
+    working, idle and waiting for input, with four exceptions. A background
     shell still running after its turn keeps the session working until it
-    exits. A prompt that a turn waits on in Claude's terminal, with no card in
-    Chat, shows "Needs response" and its tooltip names the prompt. A sign-in block
-    after a failed turn shows the turn as failed, not working.
+    exits. A background agent still running after its turn reports `waiting`:
+    the sidebar keeps the session working, Chat says "Background agent running"
+    with the agent's description instead of "Working…", a follow-up is sent at
+    once rather than queued, and a headless `-p` run keeps waiting until the
+    agent finishes. A prompt that a turn waits on in Claude's terminal, with no
+    card in Chat, shows "Needs response" and its tooltip names the prompt. A
+    sign-in block after a failed turn shows the turn as failed, not working.
   - Codex: an active goal keeps the session working between turns, and a
     background terminal keeps it working after its turn until it exits. A goal
     stopped by its usage or budget limit fails the session, and so does a
@@ -194,7 +199,13 @@ interface creating the fork. Gateway requests carry `Databricks-Custom-Coding-Ag
 creating interface use `omnigent` as a fallback.
 Routes configured by ug retain the additional `ug` surface.
 
-**Agent instructions (Pi native):** launch an agent whose spec contains inline
+**Agent instructions:** supported native startup paths add Omnigent's guidance
+to embed existing workspace screenshots in replies using their real file paths.
+After upgrading, start a new session or restart/cold-resume an existing one to
+load this guidance. Reopening the Terminal view alone does not update a running
+process.
+
+For Pi native, launch an agent whose spec contains inline
 instructions or references a bundled instruction file. Reopen its terminal and
 check the same authored role is present once. For a custom Pi-native agent,
 `executor.context_files: false` excludes automatic workspace/global notes, and
@@ -308,6 +319,9 @@ unchanged. Saved preferences remain available when the flags are re-enabled.
 `/settings/harnesses` or its harness detail pages, or the import review modal
 shown once for the host desktop onboarding just connected → See more. It opens
 only when the server enables the `import_review` release feature.
+A session's `/mcp` panel → Go to Settings opens the harness page for that
+session's host (`?host=<id>`), and keeps that host selected even when it is a
+sandbox host the host pickers hide.
 
 **Harness credential repair:** Settings → Harnesses → a needs-auth harness →
 Settings. Activate either the credential card or its Reconfigure affordance;

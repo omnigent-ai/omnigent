@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, NoReturn, TextIO
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    CLAUDE_STARTUP_CONTEXT_FILE,
     approval_wait_marker_path,
     hold_approval_wait_marker,
     read_active_session_id,
@@ -224,8 +225,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_evaluate_policy(raw_argv[1:])
     if raw_argv and raw_argv[0] == "route-turn":
         return _main_route_turn(raw_argv[1:])
-    if raw_argv and raw_argv[0] == "framework-context":
-        return _main_framework_context(raw_argv[1:])
+    if raw_argv and raw_argv[0] in ("framework-context", "startup-context"):
+        return _main_framework_context(raw_argv[1:], startup=raw_argv[0] == "startup-context")
     # Backwards compat: older bridge dirs may still reference the
     # pre-tool-use subcommand before the terminal is restarted.
     if raw_argv and raw_argv[0] == "pre-tool-use":
@@ -1333,8 +1334,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _main_framework_context(argv: list[str]) -> int:
-    """Add framework context only to the prompt that owns it."""
+def _main_framework_context(argv: list[str], *, startup: bool = False) -> int:
+    """Retain startup context; consume prompt context only for its owning input."""
     from omnigent.harnesses.claude_native.framework_context import consume_prompt_framework_context
 
     args = _parse_evaluate_policy_args(argv)
@@ -1345,7 +1346,11 @@ def _main_framework_context(argv: list[str]) -> int:
     if not isinstance(payload, dict):
         return 0
     try:
-        text = consume_prompt_framework_context(Path(args.bridge_dir), payload)
+        text = (
+            (Path(args.bridge_dir) / CLAUDE_STARTUP_CONTEXT_FILE).read_text(encoding="utf-8")
+            if startup
+            else consume_prompt_framework_context(Path(args.bridge_dir), payload)
+        )
     except (OSError, RuntimeError, ValueError):
         return 0
     if text:
@@ -1353,7 +1358,7 @@ def _main_framework_context(argv: list[str]) -> int:
             json.dumps(
                 {
                     "hookSpecificOutput": {
-                        "hookEventName": "UserPromptSubmit",
+                        "hookEventName": "SessionStart" if startup else "UserPromptSubmit",
                         "additionalContext": text,
                     }
                 }

@@ -43,6 +43,7 @@ from omnigent.native import native_terminal
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
 from omnigent.runtime import workflow
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec import load_omnigent_yaml
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
@@ -6772,7 +6773,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     assert prepared.reattached is False
 
 
-def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> None:
     """The ``omnigent claude`` wrapper's own materialized spec is resolvable.
 
     Its ``prompt`` field is real ``AgentSpec.instructions`` content (the
@@ -6781,16 +6782,19 @@ def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
     instructions.
     """
     spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
-    result = claude_native._wrapper_spec_raw_instructions(spec_path)
+    result = claude_native._wrapper_spec_startup_instructions(spec_path)
     assert result is not None
     assert "Claude Code is running in the session terminal" in result
+    assert result.endswith(WORKSPACE_IMAGE_INSTRUCTION)
 
 
-def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
     """A malformed wrapper spec must not block the terminal launch."""
     bad_spec = tmp_path / "bad.yaml"
     bad_spec.write_text("not: [valid, agent, spec")
-    assert claude_native._wrapper_spec_raw_instructions(bad_spec) is None
+    assert (
+        claude_native._wrapper_spec_startup_instructions(bad_spec) == WORKSPACE_IMAGE_INSTRUCTION
+    )
 
 
 @pytest.mark.asyncio

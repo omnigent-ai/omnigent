@@ -121,6 +121,7 @@ from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
+CLAUDE_STARTUP_CONTEXT_FILE = "startup_context.txt"
 
 _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
@@ -2613,6 +2614,23 @@ def build_hook_settings(
             f"{_python_hook_command(framework_context_parts)} 2>> {observer_stderr}"
         ),
     }
+    startup_context_parts = [
+        python,
+        "-I",
+        "-m",
+        "omnigent.harnesses.claude_native.hook",
+        "startup-context",
+        "--bridge-dir",
+        str(bridge_dir),
+    ]
+    startup_context_file = shlex.quote(str(bridge_dir / CLAUDE_STARTUP_CONTEXT_FILE))
+    startup_context_hook = {
+        "type": "command",
+        "command": (
+            f"if [ ! -e {startup_context_file} ]; then cat >/dev/null; exit 0; fi; "
+            f"{_python_hook_command(startup_context_parts)} 2>> {observer_stderr}"
+        ),
+    }
     session_start_hook = {
         "type": "command",
         "command": (
@@ -2635,7 +2653,7 @@ def build_hook_settings(
         ),
     }
     hooks: dict[str, list[_JsonObject]] = {
-        "SessionStart": [{"hooks": [session_start_hook]}],
+        "SessionStart": [{"hooks": [session_start_hook, startup_context_hook]}],
         "SessionEnd": [{"hooks": [hook]}],
         "Stop": [{"hooks": [turn_end_hook]}],
         "StopFailure": [{"hooks": [turn_end_hook]}],
@@ -3023,10 +3041,9 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag, placed before a
-        caller-supplied inline prompt instead of replacing it.
+    :param append_system_prompt: Optional startup instructions, placed before
+        a caller-supplied inline prompt. With a caller prompt file, delivered
+        through SessionStart context so Claude reads the file in its sandbox.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -3074,7 +3091,7 @@ def augment_claude_args(
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
     args.extend(["--settings", str(settings_path)])
-    args = _merge_append_system_prompt(args, append_system_prompt)
+    args = _merge_append_system_prompt(args, append_system_prompt, bridge_dir=bridge_dir)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -3162,32 +3179,46 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
-def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
+def _merge_append_system_prompt(
+    args: list[str], extra: str | None, *, bridge_dir: Path
+) -> list[str]:
     """Put ``extra`` before the caller's ``--append-system-prompt`` value.
 
     Claude Code keeps only the last value of the flag, so ``extra`` joins that
     value in place, or a new flag carries it. The scan stops at a bare ``--``.
-    Other caller tokens, including an ``--append-system-prompt-file``, are left
-    as they are. Claude Code 2.1.295+ applies such a file before the inline
-    prompt; 2.1.161 and 2.1.278 refuse to start with both.
+    Caller prompt files stay in Claude's sandbox. With a file flag, deliver only
+    ``extra`` through SessionStart so older CLIs do not receive a second flag.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
-    :returns: ``args`` whose last prompt value carries both prompts.
+    :param bridge_dir: Owner-only directory for generated startup context.
+    :returns: ``args`` with inline instructions merged, or caller file flags intact.
     """
+    startup_context = bridge_dir / CLAUDE_STARTUP_CONTEXT_FILE
     if not extra:
+        startup_context.unlink(missing_ok=True)
         return args
     flag = "--append-system-prompt"
-    joined_prefix = f"{flag}="
+    file_flag = f"{flag}-file"
     location: tuple[int, int] | None = None
+    has_prompt_file = False
     idx = 0
     while idx < len(args) and args[idx] != "--":
-        if args[idx].startswith(joined_prefix):
-            location = (idx, len(joined_prefix))
+        if args[idx] == file_flag:
+            has_prompt_file = True
+            idx += 1
+        elif args[idx].startswith(f"{file_flag}="):
+            has_prompt_file = True
+        elif args[idx].startswith(f"{flag}="):
+            location = (idx, len(flag) + 1)
         elif args[idx] == flag and idx + 1 < len(args):
             location = (idx + 1, 0)
             idx += 1
         idx += 1
+    if has_prompt_file:
+        _write_private_file(startup_context, extra)
+        return args
+    startup_context.unlink(missing_ok=True)
     if location is None:
         args.extend([flag, extra])
         return args
@@ -3282,6 +3313,10 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
                 seen = read_seen_claude_session_ids(bridge_dir)
                 seen.add(claude_session_id)
                 state["seen_claude_session_ids"] = sorted(seen)
+            if event_name == "Stop":
+                state["background_agents_after_turn"] = _background_agent_hold(payload)
+            elif event_name in {"UserPromptSubmit", "StopFailure", "SessionStart"}:
+                state["background_agents_after_turn"] = None
         else:
             _logger.debug(
                 "Ignoring identity fields from side-channel hook event; "
@@ -3332,6 +3367,88 @@ def read_claude_session_id(bridge_dir: Path) -> str | None:
     if not isinstance(raw, str) or not raw:
         return None
     return raw
+
+
+class BackgroundAgentsAfterTurnReader:
+    """
+    Read whether the main session's last turn ended with a background agent running.
+
+    Claude keeps reporting itself busy for as long as such an agent runs,
+    although its prompt is free, so the session reports ``waiting`` instead.
+    Set by the main session's ``Stop`` hook and cleared by its next
+    ``UserPromptSubmit``, ``StopFailure`` or ``SessionStart``.
+    A blocking ``Stop`` hook resumes the same turn with no new prompt, so a main
+    conversation entry after that turn's last reply also ends it, as does a
+    transcript cut short of that reply. Each read parses only the complete
+    transcript lines appended since the previous one.
+
+    :param bridge_dir: Bridge directory path.
+    """
+
+    def __init__(self, bridge_dir: Path) -> None:
+        self._bridge_dir = bridge_dir
+        self._hold: tuple[str, int] | None = None
+        self._transcript_identity: tuple[int, int] | None = None
+        self._scanned_to = 0
+        self._released = False
+        self._agents: list[_JsonObject] = []
+
+    @property
+    def agents(self) -> list[_JsonObject]:
+        """Display fields of the agents the last ``Stop`` left running.
+
+        Read alongside :meth:`read`; meaningful only while it returns ``True``.
+        An entry has ``id`` / ``type`` / ``status`` / ``description`` when Claude
+        sent them, e.g. ``{"id": "a1", "type": "subagent", "description": "Audit"}``.
+        """
+        return list(self._agents)
+
+    def read(self) -> bool:
+        """
+        Return whether the last ``Stop`` still holds the session waiting on its agents.
+
+        :returns: ``True`` between that ``Stop`` and the next main-session turn.
+        """
+        state = _read_json_file(self._bridge_dir / _STATE_FILE)
+        raw = state.get("background_agents_after_turn") if isinstance(state, dict) else None
+        transcript_path = raw.get("transcript_path") if isinstance(raw, dict) else None
+        offset = raw.get("transcript_offset") if isinstance(raw, dict) else None
+        if not isinstance(transcript_path, str) or not isinstance(offset, int):
+            self._hold = None
+            self._agents = []
+            return False
+        if self._hold != (transcript_path, offset):
+            self._hold = (transcript_path, offset)
+            self._transcript_identity = None
+            self._released = False
+            raw_agents = raw.get("agents") if isinstance(raw, dict) else None
+            self._agents = (
+                [agent for agent in raw_agents if isinstance(agent, dict)]
+                if isinstance(raw_agents, list)
+                else []
+            )
+        if self._released:
+            return False
+        try:
+            with open(transcript_path, "rb") as handle:
+                status = os.fstat(handle.fileno())
+                if status.st_size < offset:
+                    self._released = True
+                    return False
+                identity = (status.st_dev, status.st_ino)
+                if identity != self._transcript_identity or status.st_size < self._scanned_to:
+                    self._transcript_identity, self._scanned_to = identity, offset
+                handle.seek(self._scanned_to)
+                for line in handle:
+                    if not line.endswith(b"\n"):
+                        break
+                    self._scanned_to += len(line)
+                    if _main_conversation_entry_type(line) in {"user", "assistant"}:
+                        self._released = True
+                        return False
+        except OSError:
+            return False
+        return True
 
 
 def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
@@ -4242,6 +4359,7 @@ _BACKGROUND_TASK_FORWARD_LIMIT = 100
 _BACKGROUND_TASK_FIELD_MAX_CHARS = 512
 _BACKGROUND_TASK_FIELDS: tuple[str, ...] = ("id", "type", "status", "description", "command")
 _BACKGROUND_AGENT_TASK_TYPES: frozenset[str] = frozenset({"agent", "local_agent", "subagent"})
+_TURN_END_SCAN_BYTES = 256 * 1024
 
 
 def _is_background_shell(raw: object) -> bool:
@@ -4249,6 +4367,68 @@ def _is_background_shell(raw: object) -> bool:
     if not isinstance(raw, dict):
         return True
     return raw.get("type") not in _BACKGROUND_AGENT_TASK_TYPES
+
+
+def _background_agent_hold(payload: _JsonObject) -> _JsonObject | None:
+    """Where the turn's last reply ends at a ``Stop`` that left an agent running, if one did.
+
+    The hold also keeps the running agents' display fields, so the session can
+    say what it is still waiting on.
+    """
+    raw_tasks = payload.get("background_tasks")
+    transcript_path = payload.get("transcript_path")
+    if not isinstance(raw_tasks, list) or not isinstance(transcript_path, str):
+        return None
+    running = [
+        task
+        for task in raw_tasks
+        if isinstance(task, dict)
+        and task.get("type") in _BACKGROUND_AGENT_TASK_TYPES
+        and task.get("status") not in _TERMINAL_BACKGROUND_TASK_STATUSES
+    ]
+    if not running:
+        return None
+    offset = _offset_after_last_main_reply(transcript_path)
+    if offset is None:
+        return None
+    agents = [
+        detail
+        for task in running[:_BACKGROUND_TASK_FORWARD_LIMIT]
+        if (detail := _normalize_background_task(task)) is not None
+    ]
+    return {"transcript_path": transcript_path, "transcript_offset": offset, "agents": agents}
+
+
+def _offset_after_last_main_reply(transcript_path: str) -> int | None:
+    """Byte offset just past the transcript's last main ``assistant`` entry, if near the end.
+
+    Claude runs ``Stop`` hooks in parallel and may already have appended a blocking
+    hook's feedback, so the file size at ``Stop`` is not the turn's end.
+    """
+    try:
+        with open(transcript_path, "rb") as handle:
+            start = max(0, handle.seek(0, os.SEEK_END) - _TURN_END_SCAN_BYTES)
+            handle.seek(start)
+            tail = handle.read()
+    except OSError:
+        return None
+    position, found = start, None
+    for line in tail.splitlines(keepends=True):
+        position += len(line)
+        if line.endswith(b"\n") and _main_conversation_entry_type(line) == "assistant":
+            found = position
+    return found
+
+
+def _main_conversation_entry_type(line: bytes) -> str | None:
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(entry, dict) or entry.get("isSidechain"):
+        return None
+    entry_type = entry.get("type")
+    return entry_type if isinstance(entry_type, str) else None
 
 
 def _normalize_background_task(raw: object) -> _JsonObject | None:

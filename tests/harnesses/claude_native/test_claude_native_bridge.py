@@ -40,6 +40,8 @@ from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _LOGIN_GUIDANCE,
+    _TURN_END_SCAN_BYTES,
+    BackgroundAgentsAfterTurnReader,
     _build_tools,
     _claude_prompt_rendered,
     _escape_slash_command_text,
@@ -839,6 +841,259 @@ def test_record_hook_event_first_event_bootstraps_identity(tmp_path: Path) -> No
 
     assert read_transcript_path(bridge_dir) == transcript_path
     assert read_claude_session_id(bridge_dir) == "claude-session"
+
+
+_STOP_HOOK_FEEDBACK = {
+    "type": "user",
+    "isMeta": True,
+    "message": {"content": "Stop hook feedback:\nwait"},
+}
+
+
+def _write_turn(transcript_path: Path, *later_entries: dict[str, Any]) -> None:
+    entries = [
+        {"type": "user", "message": {"content": "go"}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        *later_entries,
+    ]
+    transcript_path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+
+
+def _stop_leaving_agent_running(transcript_path: Path) -> dict[str, Any]:
+    return {
+        "hook_event_name": "Stop",
+        "session_id": "claude-session",
+        "transcript_path": str(transcript_path),
+        "background_tasks": [{"id": "a1", "type": "subagent", "status": "running"}],
+    }
+
+
+def _append_entries(transcript_path: Path, *entries: dict[str, Any]) -> None:
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        for entry in entries:
+            transcript.write(json.dumps(entry) + "\n")
+
+
+@pytest.mark.parametrize(
+    ("background_tasks", "agent_running"),
+    [
+        ([{"id": "a1", "type": "subagent", "status": "running"}], True),
+        ([{"id": "a1", "type": "local_agent"}], True),
+        ([{"id": "a1", "type": "agent", "status": "completed"}], False),
+        ([{"id": "b1", "type": "local_bash", "status": "running"}], False),
+        (None, False),
+    ],
+)
+def test_record_hook_event_marks_a_stop_that_leaves_a_background_agent(
+    tmp_path: Path, background_tasks: list[dict[str, str]] | None, agent_running: bool
+) -> None:
+    """Each main-session Stop records whether it left an unfinished background agent."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path, {"type": "system", "subtype": "stop_hook_summary"})
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    assert reader.read() is True
+    stop: dict[str, Any] = {
+        "hook_event_name": "Stop",
+        "session_id": "claude-session",
+        "transcript_path": str(transcript_path),
+    }
+    if background_tasks is not None:
+        stop["background_tasks"] = background_tasks
+
+    record_hook_event(bridge_dir, stop)
+
+    assert reader.read() is agent_running
+
+
+def test_background_agent_mark_names_only_the_running_agents(tmp_path: Path) -> None:
+    """The hold keeps each running agent's display fields, not shells or finished agents."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+            "background_tasks": [
+                {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"},
+                {"id": "a2", "type": "agent", "status": "completed", "description": "Done"},
+                {"id": "b1", "type": "local_bash", "status": "running", "command": "sleep 9"},
+                {"id": "a3", "type": "local_agent", "description": "x" * 600, "extra": 1},
+            ],
+        },
+    )
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+
+    assert reader.read() is True
+    assert reader.agents == [
+        {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"},
+        {"id": "a3", "type": "local_agent", "description": "x" * 512},
+    ]
+
+    record_hook_event(
+        bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "claude-session"}
+    )
+    assert reader.read() is False
+    assert reader.agents == []
+
+
+@pytest.mark.parametrize("next_event", ["UserPromptSubmit", "StopFailure", "SessionStart"])
+def test_record_hook_event_clears_the_background_agent_mark_on_the_next_turn(
+    tmp_path: Path, next_event: str
+) -> None:
+    """Only the main session's next turn clears the mark; the agent's own hooks do not."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    for child_event in ("UserPromptSubmit", "Stop"):
+        record_hook_event(
+            bridge_dir,
+            {"hook_event_name": child_event, "session_id": "claude-session", "agent_id": "a1"},
+        )
+    assert reader.read() is True
+
+    record_hook_event(bridge_dir, {"hook_event_name": next_event, "session_id": "claude-session"})
+
+    assert reader.read() is False
+
+
+@pytest.mark.parametrize(
+    ("appended_entries", "still_held"),
+    [
+        (
+            [
+                {"type": "attachment", "attachment": {"type": "hook_success"}},
+                {"type": "system", "subtype": "stop_hook_summary"},
+                {"type": "user", "isSidechain": True, "message": {"content": "agent step"}},
+                {"type": {}},
+                {"type": ["user"]},
+            ],
+            True,
+        ),
+        ([_STOP_HOOK_FEEDBACK], False),
+        ([{"type": "assistant", "message": {"content": []}}], False),
+    ],
+)
+def test_background_agent_mark_ends_when_the_main_conversation_continues(
+    tmp_path: Path, appended_entries: list[dict[str, Any]], still_held: bool
+) -> None:
+    """A blocking Stop hook resumes the turn with no new prompt; its entries end the hold."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    assert reader.read() is True
+
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        transcript.write("not json\n")
+    _append_entries(transcript_path, *appended_entries)
+
+    assert reader.read() is still_held
+
+
+def test_background_agent_mark_ignores_a_stop_another_hook_already_blocked(
+    tmp_path: Path,
+) -> None:
+    """Claude may log a blocking hook's feedback before this hook records the Stop."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path, _STOP_HOOK_FEEDBACK, {"type": "attachment"})
+
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+
+    assert BackgroundAgentsAfterTurnReader(bridge_dir).read() is False
+
+
+@pytest.mark.parametrize(
+    "transcript", ["missing_at_stop", "deleted_after_stop", "no_reply", "reply_beyond_scan"]
+)
+def test_background_agent_mark_needs_a_readable_turn_end(tmp_path: Path, transcript: str) -> None:
+    """Without the turn's last reply in the transcript, a busy session stays running."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    if transcript == "no_reply":
+        transcript_path.write_text('{"type": "user", "message": {"content": "go"}}\n')
+    elif transcript == "reply_beyond_scan":
+        _write_turn(transcript_path, {"type": "attachment", "padding": "x" * _TURN_END_SCAN_BYTES})
+    elif transcript == "deleted_after_stop":
+        _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    if transcript == "deleted_after_stop":
+        assert reader.read() is True
+        transcript_path.unlink()
+
+    assert reader.read() is False
+
+
+def test_background_agent_mark_parses_each_complete_appended_line_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Polling through a long agent run parses only new lines, each once it is complete."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    parsed: list[bytes] = []
+    entry_type = claude_native_bridge._main_conversation_entry_type
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_main_conversation_entry_type",
+        lambda line: parsed.append(line) or entry_type(line),
+    )
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    progress = json.dumps({"type": "progress", "data": {"type": "agent_progress"}})
+    reply = json.dumps({"type": "assistant", "message": {"content": []}})
+
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        transcript.write(progress + "\n")
+        transcript.flush()
+        assert reader.read() is True
+        assert reader.read() is True
+        transcript.write(reply)
+        transcript.flush()
+        assert reader.read() is True
+        transcript.write("\n")
+        transcript.flush()
+        assert reader.read() is False
+        assert reader.read() is False
+
+    assert parsed == [f"{progress}\n".encode(), f"{reply}\n".encode()]
+
+
+@pytest.mark.parametrize("rewrite", ["replaced", "truncated", "cut_before_turn_end"])
+def test_background_agent_mark_rescans_a_rewritten_transcript(
+    tmp_path: Path, rewrite: str
+) -> None:
+    """A replaced or shortened transcript is rescanned; one without the turn's reply ends it."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    padding = {"type": "attachment", "padding": "x" * 1000}
+    _append_entries(transcript_path, padding)
+    assert reader.read() is True
+
+    if rewrite == "replaced":
+        replacement = tmp_path / "replacement.jsonl"
+        _write_turn(replacement, _STOP_HOOK_FEEDBACK, padding)
+        os.replace(replacement, transcript_path)
+    elif rewrite == "truncated":
+        _write_turn(transcript_path, _STOP_HOOK_FEEDBACK)
+    else:
+        transcript_path.write_text('{"type": "user", "message": {"content": "go"}}\n')
+
+    assert reader.read() is False
+    _append_entries(transcript_path, padding)
+    assert reader.read() is False
 
 
 @pytest.mark.parametrize("updated_file", ["hook_identity", "model_vocabulary"])
@@ -4069,6 +4324,8 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     settings = _load_invocation_settings(args)
     prompt_hooks = settings["hooks"]["UserPromptSubmit"][0]["hooks"]
     assert any("framework-context" in hook["command"] for hook in prompt_hooks)
+    startup_hooks = settings["hooks"]["SessionStart"][0]["hooks"]
+    assert any("startup-context" in hook["command"] for hook in startup_hooks)
     assert (
         "omnigent.harnesses.claude_native.hook"
         in settings["hooks"]["Stop"][0]["hooks"][0]["command"]
@@ -4131,7 +4388,7 @@ def test_generated_claude_subprocesses_pin_runner_tmpdir(
         for hook in entry["hooks"]
         if "/venv/bin/python" in hook["command"]
     ]
-    assert len(python_commands) == 19
+    assert len(python_commands) == 20
     expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
     assert all(expected_tmpdir in command for command in python_commands)
 
@@ -4206,6 +4463,42 @@ def test_framework_context_hook_consumes_hidden_notice(
     output = json.loads(capsys.readouterr().out)
     assert output["hookSpecificOutput"]["additionalContext"] == "downscaled"
     assert not handle.path.exists()
+
+
+def test_session_start_hook_preserves_generated_startup_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    startup_context = "Follow the authored role.\n\nKeep image guidance."
+    augment_claude_args(
+        ("--append-system-prompt-file", "profile.md"),
+        bridge_dir=tmp_path,
+        append_system_prompt=startup_context,
+    )
+    notice = tmp_path / claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
+    notice.write_text("One-shot notice", encoding="utf-8")
+    for source in ("startup", "resume", "clear", "compact"):
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO(json.dumps({"hook_event_name": "SessionStart", "source": source})),
+        )
+        assert claude_native_hook.main(["startup-context", "--bridge-dir", str(tmp_path)]) == 0
+        assert json.loads(capsys.readouterr().out) == {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": startup_context,
+            }
+        }
+        assert (
+            tmp_path / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+        ).read_text() == startup_context
+        assert notice.read_text() == "One-shot notice"
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"hook_event_name":"UserPromptSubmit"}'))
+    assert claude_native_hook.main(["--bridge-dir", str(tmp_path)]) == 0
+    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize(
@@ -4569,18 +4862,8 @@ _FRAMEWORK_PROMPT = "Keep framework metadata separate."
             ("--append-system-prompt=Earlier.", "--append-system-prompt="),
             ("--append-system-prompt=Earlier.", f"--append-system-prompt={_FRAMEWORK_PROMPT}"),
         ),
-        (("--append-system-prompt-file", "profile.md"), None),
-        (("--append-system-prompt-file=profile.md",), None),
-        (
-            ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
-            (
-                "--append-system-prompt-file",
-                "profile.md",
-                "--append-system-prompt",
-                f"{_FRAMEWORK_PROMPT}\n\nReview.",
-            ),
-        ),
         (("--", "--append-system-prompt=Positional."), None),
+        (("--", "--append-system-prompt-file=missing.md"), None),
     ],
     ids=[
         "no-user-prompt",
@@ -4589,40 +4872,24 @@ _FRAMEWORK_PROMPT = "Keep framework metadata separate."
         "repeated-flags-last-wins",
         "final-empty-value-clears",
         "final-empty-joined-value-clears",
-        "caller-file-separate-value",
-        "caller-file-joined-value",
-        "caller-file-and-prompt",
         "after-end-of-options",
+        "file-after-end-of-options",
     ],
 )
 def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     user_args: tuple[str, ...],
     merged_args: tuple[str, ...] | None,
 ) -> None:
     """Omnigent's prompt joins the caller's last prompt value, or is added when there is none."""
-    # Claude reads a caller's prompt file itself, so Omnigent must never open it.
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
-
-    def refuse_caller_prompt_file(real_open: Callable[..., Any]) -> Callable[..., Any]:
-        def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
-            if isinstance(file, str | os.PathLike) and os.path.basename(file) == "profile.md":
-                raise AssertionError("Omnigent opened the caller's prompt file")
-            return real_open(file, *args, **kwargs)
-
-        return guarded_open
-
-    monkeypatch.setattr("builtins.open", refuse_caller_prompt_file(io.open))
-    monkeypatch.setattr(io, "open", refuse_caller_prompt_file(io.open))
-    monkeypatch.setattr(os, "open", refuse_caller_prompt_file(os.open))
     omnigent_args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
         append_system_prompt=_FRAMEWORK_PROMPT,
     )
+    startup_context = tmp_path / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+    startup_context.write_text("Stale startup context", encoding="utf-8")
 
     args = augment_claude_args(
         user_args,
@@ -4630,6 +4897,7 @@ def test_augment_claude_args_appends_caller_system_prompt(
         python_executable="/venv/bin/python",
         append_system_prompt=_FRAMEWORK_PROMPT,
     )
+    assert not startup_context.exists()
 
     prompt_index = omnigent_args.index("--append-system-prompt")
     assert omnigent_args.count("--append-system-prompt") == 1
@@ -4640,6 +4908,90 @@ def test_augment_claude_args_appends_caller_system_prompt(
         # The caller's prompt is sent once, so the launch command does not grow by its size.
         del omnigent_args[prompt_index : prompt_index + 2]
         assert args == [*merged_args, *omnigent_args]
+
+
+@pytest.mark.parametrize(
+    "user_args",
+    [
+        ("--append-system-prompt-file", "profile.md"),
+        ("--append-system-prompt-file=profile.md",),
+        ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
+        (
+            "--append-system-prompt",
+            "Earlier.",
+            "--append-system-prompt-file=missing.md",
+            "--append-system-prompt-file",
+            "profile.md",
+            "--append-system-prompt=Later.",
+        ),
+        (
+            "--append-system-prompt=Earlier.",
+            "--append-system-prompt-file=profile.md",
+            "--append-system-prompt=",
+        ),
+    ],
+    ids=["file-separate", "file-joined", "file-and-inline", "last-values-win", "empty-inline"],
+)
+def test_augment_claude_args_leaves_caller_prompt_files_to_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, user_args: tuple[str, ...]
+) -> None:
+    """Only generated instructions enter the bridge; caller files stay unopened."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "profile.md"
+    file_text = "Reviewer profile.\n"
+    source.write_text(file_text, encoding="utf-8")
+    bridge_dir = tmp_path / "bridge"
+    omnigent_args = augment_claude_args(
+        (), bridge_dir=bridge_dir, workspace=workspace, python_executable="/venv/bin/python"
+    )
+
+    def refuse_caller_prompt_file(real_open: Callable[..., Any]) -> Callable[..., Any]:
+        def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and os.path.basename(file) in (
+                "profile.md",
+                "missing.md",
+            ):
+                raise AssertionError("Omnigent opened the caller's prompt file")
+            return real_open(file, *args, **kwargs)
+
+        return guarded_open
+
+    monkeypatch.setattr("builtins.open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(io, "open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(os, "open", refuse_caller_prompt_file(os.open))
+
+    args = augment_claude_args(
+        ("--resume", "session-id", *user_args),
+        bridge_dir=bridge_dir,
+        workspace=workspace,
+        python_executable="/venv/bin/python",
+        append_system_prompt=_FRAMEWORK_PROMPT,
+    )
+
+    assert args == ["--resume", "session-id", *user_args, *omnigent_args]
+    startup_context = bridge_dir / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+    assert startup_context.read_text(encoding="utf-8") == _FRAMEWORK_PROMPT
+    if os.name != "nt":
+        assert startup_context.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("file_contents", [None, b"\xff"], ids=["missing", "invalid-utf8"])
+def test_augment_claude_args_delegates_prompt_file_errors_to_claude(
+    tmp_path: Path, file_contents: bytes | None
+) -> None:
+    if file_contents is not None:
+        (tmp_path / "profile.md").write_bytes(file_contents)
+
+    args = augment_claude_args(
+        ("--append-system-prompt-file", "profile.md"),
+        bridge_dir=tmp_path / "bridge",
+        workspace=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=_FRAMEWORK_PROMPT,
+    )
+    assert args[:2] == ["--append-system-prompt-file", "profile.md"]
+    assert "--append-system-prompt" not in args
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
@@ -4660,15 +5012,22 @@ def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None
     ]
 
 
-def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("user_args", [(), ("--append-system-prompt-file", "missing.md")])
+def test_augment_claude_args_omits_unsupplied_system_prompt(
+    tmp_path: Path, user_args: tuple[str, ...]
+) -> None:
     """The bridge does not invent framework policy on its own."""
+    startup_context = tmp_path / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+    startup_context.write_text("Stale startup context", encoding="utf-8")
     args = augment_claude_args(
-        (),
+        user_args,
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
     )
 
     assert "--append-system-prompt" not in args
+    assert args[: len(user_args)] == list(user_args)
+    assert not startup_context.exists()
 
 
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
@@ -16244,8 +16603,9 @@ async def _run_hook_command(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_startup_context", [False, True])
 async def test_lifecycle_hooks_record_through_the_relay_without_starting_python(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, has_startup_context: bool
 ) -> None:
     """The lifecycle hook posts to the relay with curl.
 
@@ -16264,6 +16624,10 @@ async def test_lifecycle_hooks_record_through_the_relay_without_starting_python(
         (bridge_dir / "bridge.json").write_text(
             json.dumps({"active_session_id": "conv_hook_eval"}), encoding="utf-8"
         )
+        if has_startup_context:
+            (bridge_dir / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE).write_text(
+                "Startup guidance", encoding="utf-8"
+            )
         lifecycle_hook = _unmatched_hook_command(
             settings, "UserPromptSubmit", "/hook/claude/event"
         )
@@ -16494,11 +16858,14 @@ async def test_relay_hook_failures_reach_the_sessions_hook_stderr_file(
     assert "omnigent claude hook: failed to record hook" in stderr_file.read_text()
 
 
-def test_framework_context_hook_starts_python_only_for_pending_context(tmp_path: Path) -> None:
-    """Without pending framework context the shell answers the prompt hook.
+@pytest.mark.parametrize("startup", [False, True], ids=["pending-notice", "startup"])
+def test_framework_context_hook_starts_python_only_for_pending_context(
+    tmp_path: Path, startup: bool
+) -> None:
+    """Without framework context the shell answers the hook.
 
-    Pending context still goes to the Python hook, which reads and removes it,
-    so Claude gets it once.
+    The terminal-side Python hook consumes prompt notices and retains startup
+    context for later SessionStart events.
     """
     from omnigent.harnesses.claude_native import framework_context
 
@@ -16516,11 +16883,13 @@ def test_framework_context_hook_starts_python_only_for_pending_context(tmp_path:
         env=_TERMINAL_ENV,
         prompt_framework_context=True,
     )
+    event_name = "SessionStart" if startup else "UserPromptSubmit"
+    subcommand = "startup-context" if startup else "framework-context"
     fake_python, runs = _fake_hook_python(tmp_path)
     fake_settings = claude_native_bridge.build_hook_settings(
         bridge_dir, python_executable=str(fake_python)
     )
-    fake_hook = _unmatched_hook_command(fake_settings, "UserPromptSubmit", "framework-context")
+    fake_hook = _unmatched_hook_command(fake_settings, event_name, subcommand)
     # The isolated hook must import this worktree instead of another editable install.
     source_python = tmp_path / "source-python"
     source_python.write_text(
@@ -16535,12 +16904,12 @@ def test_framework_context_hook_starts_python_only_for_pending_context(tmp_path:
     source_python.chmod(0o755)
     real_hook = _unmatched_hook_command(
         claude_native_bridge.build_hook_settings(bridge_dir, python_executable=str(source_python)),
-        "UserPromptSubmit",
-        "framework-context",
+        event_name,
+        subcommand,
     )
     payload = json.dumps(
         {
-            "hook_event_name": "UserPromptSubmit",
+            "hook_event_name": event_name,
             "session_id": "native-context",
             "prompt": "inspect this input",
         }
@@ -16562,19 +16931,50 @@ def test_framework_context_hook_starts_python_only_for_pending_context(tmp_path:
     assert run(fake_hook) == ""
     assert not runs.exists()
     handle = framework_context.write_prompt_framework_context(
-        bridge_dir, "inspect this input", ["pending context"]
+        bridge_dir, "inspect this input", ["generated context"]
     )
-    outputs = [run(real_hook), run(fake_hook)]
+    if startup:
+        context_file = bridge_dir / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+        context_file.write_text("generated context", encoding="utf-8")
+    else:
+        context_file = handle.path
+    outputs = [run(real_hook), run(real_hook)]
 
     assert json.loads(outputs[0]) == {
         "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": "pending context",
+            "hookEventName": event_name,
+            "additionalContext": "generated context",
         }
     }
-    assert outputs[1] == ""
-    assert not runs.exists()
+    assert outputs[1] == (outputs[0] if startup else "")
+    assert context_file.exists() == startup
+    if startup:
+        assert handle.path.exists()
+        payload = json.dumps(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "native-context",
+                "prompt": "inspect this input",
+            }
+        )
+        prompt_hook = _unmatched_hook_command(
+            claude_native_bridge.build_hook_settings(
+                bridge_dir, python_executable=str(source_python)
+            ),
+            "UserPromptSubmit",
+            "framework-context",
+        )
+        assert json.loads(run(prompt_hook)) == {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "generated context",
+            }
+        }
+        assert context_file.read_text() == "generated context"
     assert not handle.path.exists()
+    context_file.unlink(missing_ok=True)
+    assert run(fake_hook) == ""
+    assert not runs.exists()
 
 
 @pytest.mark.asyncio
