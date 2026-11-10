@@ -5894,6 +5894,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
         copy_items: bool = True,
+        copy_journal: bool = True,
         continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
@@ -6027,6 +6028,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param copy_items: ``False`` copies no items at all, whatever the
             source holds when the fork commits. A truncation; exclusive with
             both cutoffs.
+        :param copy_journal: ``False`` leaves the source's journal behind, so
+            the fork starts with none, e.g. an automation run's copy of its
+            source session, which plans its own work.
         :param continue_source: Also copy the source's workspace and branch,
             its host (in the same write that creates the fork, holding the
             host row lock; a deleted host is not copied), its routing
@@ -6085,6 +6089,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             up_to_response_id=up_to_response_id,
             before_item_id=before_item_id,
             copy_items=copy_items,
+            copy_journal=copy_journal,
             continue_source=continue_source,
             project_id=project_id,
             file_id_map=file_id_map,
@@ -6119,6 +6124,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
         copy_items: bool = True,
+        copy_journal: bool = True,
         continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
@@ -6284,8 +6290,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             source_items = session.execute(items_query).scalars().all() if copy_items else []
             # The fork carries the journal its history wrote: all of it, or for a
             # truncated fork what was written by its last copied item. A side chat
-            # is about the session, not a continuation, so it starts with none.
-            copy_journal = copy_items and side_chat_parent_id is None
+            # is about the session, not a continuation, so it starts with none, as
+            # does a fork whose caller leaves the journal behind.
+            copy_journal = copy_journal and copy_items and side_chat_parent_id is None
             journal_through: int | None = None
             if copy_journal and cutoff_position is not None:
                 if source_items:

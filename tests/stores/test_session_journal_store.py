@@ -307,6 +307,18 @@ def test_a_side_chat_or_an_empty_fork_starts_with_no_journal(
         assert journal.current_plan(fork.id) is None
 
 
+def test_a_fork_that_leaves_the_journal_keeps_its_history_and_starts_one(
+    conversations: SqlAlchemyConversationStore, journal: SessionJournalStore
+) -> None:
+    # An automation run's copy of its source session plans its own work.
+    journal.append(SESSION, "plan", _plan("a"), idempotency_key="k0")
+    fork = conversations.fork_conversation(SESSION, copy_journal=False)
+    assert journal.list_entries(fork.id).entries == []
+    first = journal.append(fork.id, "plan", _plan("b"), idempotency_key="k1")
+    assert first.entry.position == 0
+    assert [e.kind for e in journal.list_entries(SESSION).entries] == ["plan"]
+
+
 def test_a_truncated_fork_copies_only_what_its_history_wrote(
     monkeypatch: pytest.MonkeyPatch,
     conversations: SqlAlchemyConversationStore,
