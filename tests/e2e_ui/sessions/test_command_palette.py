@@ -35,25 +35,15 @@ from __future__ import annotations
 import re
 import sys
 
-import httpx
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.sessions._sidebar_helpers import patch_session
 
 _COMPOSER = "Send a message…"
 # The palette's search box — its user-visible handle, stable across the
 # dialog's internals.
 _PALETTE_INPUT = "Search sessions or run a command"
-
-
-def _set_title(base_url: str, session_id: str, title: str) -> None:
-    """Title a session via ``PATCH /v1/sessions/{id}`` so its row is legible."""
-    resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"title": title},
-        timeout=10.0,
-    )
-    resp.raise_for_status()
 
 
 def test_command_palette_opens_and_switches_session(
@@ -62,8 +52,8 @@ def test_command_palette_opens_and_switches_session(
 ) -> None:
     """⌘/Ctrl+K opens the palette; picking session B navigates to it."""
     base_url, session_a, session_b = seeded_session_pair
-    _set_title(base_url, session_a, "e2e-palette-a")
-    _set_title(base_url, session_b, "e2e-palette-b")
+    patch_session(base_url, session_a, title="e2e-palette-a")
+    patch_session(base_url, session_b, title="e2e-palette-b")
 
     page.goto(f"{base_url}/c/{session_a}")
 
@@ -145,8 +135,8 @@ def test_session_switch_chord_does_not_navigate_behind_open_palette(
 ) -> None:
     """The session-switch bracket chord cannot navigate behind the palette."""
     base_url, session_a, session_b = seeded_session_pair
-    _set_title(base_url, session_a, "e2e-yield-a")
-    _set_title(base_url, session_b, "e2e-yield-b")
+    patch_session(base_url, session_a, title="e2e-yield-a")
+    patch_session(base_url, session_b, title="e2e-yield-b")
 
     page.goto(f"{base_url}/c/{session_a}")
     expect(page.locator(f'a[href="/c/{session_a}"]')).to_be_visible(timeout=30_000)

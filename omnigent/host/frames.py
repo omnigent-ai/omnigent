@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from os import PathLike
 from typing import Any, NoReturn
@@ -30,13 +30,21 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harness_accounts import HarnessAccounts, normalize_harness_accounts
-from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.harness_availability import (
+    HARNESS_CLI_UNRESPONSIVE,
+    HARNESS_TMUX_UNAVAILABLE,
+    HARNESS_VERSION_TOO_LOW,
+    HarnessAvailability,
+    is_harness_availability,
+)
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_FILESYSTEM_ATTACHMENTS,
 )
+from omnigent.scheduled_context import parse_scheduled_run
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -77,6 +85,7 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+CAP_MCP_SERVER_ENABLED = "mcp_server_enabled"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_HARNESS_ACCOUNTS = "harness_accounts"
 CAP_HARNESS_LOGIN = "harness_login"
@@ -93,6 +102,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
+    CAP_MCP_SERVER_ENABLED,
     CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
@@ -101,6 +111,63 @@ HOST_CAPABILITIES: list[str] = [
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
 ]
+
+# Server capabilities, advertised on the tunnel's WebSocket upgrade response (the
+# server sends no frame before the host's hello). Older servers send no header.
+SERVER_CAPABILITIES_HEADER = "X-Omnigent-Server-Capabilities"
+# The server accepts ``"tmux-unavailable"`` readiness. An older server's live
+# readiness decoder rejects the whole frame for it, so hosts down-map it to True.
+SERVER_CAP_TMUX_READINESS = "tmux_readiness"
+SERVER_CAPABILITIES: list[str] = [SERVER_CAP_TMUX_READINESS]
+
+
+def parse_server_capabilities(header_value: str | None) -> frozenset[str]:
+    """Parse the comma-separated :data:`SERVER_CAPABILITIES_HEADER` value.
+
+    :param header_value: Raw header value, e.g. ``"tmux_readiness"``, or ``None``.
+    :returns: The advertised capability tokens; empty for an older server.
+    """
+    if not header_value:
+        return frozenset()
+    return frozenset(token.strip() for token in header_value.split(",") if token.strip())
+
+
+def frame_for_server(frame: HostFrame, server_capabilities: frozenset[str]) -> HostFrame:
+    """Down-map readiness states the connected server can't decode.
+
+    ``"tmux-unavailable"`` only replaces ``True``, so the older server gets the
+    readiness it saw before tmux was checked. ``False`` would make it offer the
+    CLI installer for a CLI that is already installed; with ``True`` the launch
+    fails with the terminal's own "install tmux" error instead.
+
+    :param frame: Any host frame; only frames with a readiness map change.
+    :param server_capabilities: Tokens from :func:`parse_server_capabilities`.
+    :returns: *frame*, or a copy whose ``"tmux-unavailable"`` entries read
+        ``True`` for a server without :data:`SERVER_CAP_TMUX_READINESS`.
+    """
+    if not isinstance(
+        frame,
+        HostHelloFrame
+        | HostHarnessReadinessFrame
+        | HostInstallHarnessResultFrame
+        | HostRefreshHarnessesResultFrame
+        | HostHarnessLoginCompletedFrame
+        | HostHarnessLogoutResultFrame
+        | HostStoreSecretResultFrame,
+    ):
+        return frame
+    configured = frame.configured_harnesses
+    if (
+        not configured
+        or SERVER_CAP_TMUX_READINESS in server_capabilities
+        or HARNESS_TMUX_UNAVAILABLE not in configured.values()
+    ):
+        return frame
+    downgraded: dict[str, HarnessAvailability] = {
+        harness: True if availability == HARNESS_TMUX_UNAVAILABLE else availability
+        for harness, availability in configured.items()
+    }
+    return replace(frame, configured_harnesses=downgraded)
 
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
@@ -200,6 +267,8 @@ class HostFrameKind(str, Enum):
     PLUGINS_RESULT = "host.plugins_result"
     SKILL_CONTENT = "host.skill_content"
     SKILL_CONTENT_RESULT = "host.skill_content_result"
+    SET_MCP_SERVER_ENABLED = "host.set_mcp_server_enabled"
+    SET_MCP_SERVER_ENABLED_RESULT = "host.set_mcp_server_enabled_result"
     MCP_TOOLS = "host.mcp_tools"
     MCP_TOOLS_RESULT = "host.mcp_tools_result"
     HARNESS_STARTUP = "host.harness_startup"
@@ -321,6 +390,8 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param mcp_disabled_servers_active_harnesses: Harness families whose MCP preferences
+        apply to this launch. Absent on older servers or while the feature is disabled.
     :param superseded_runner_ids: Runners this launch replaces, which the
         host stops once the new runner is alive. ``None`` (an older server)
         falls back to stopping every runner launched for ``session_id``; an
@@ -335,6 +406,8 @@ class HostLaunchRunnerFrame:
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
+    scheduled_run: ScheduledRunLogContext | None = None
+    mcp_disabled_servers_active_harnesses: list[str] | None = None
 
 
 @dataclass
@@ -1301,6 +1374,29 @@ class HostSkillContentResultFrame:
 
 
 @dataclass
+class HostSetMcpServerEnabledFrame:
+    """Server → host: save an Omnigent-only MCP launch preference."""
+
+    request_id: str
+    harness: str
+    server: str
+    enabled: bool
+    plugin: str | None = None
+    source_id: str | None = None
+
+
+@dataclass
+class HostSetMcpServerEnabledResultFrame:
+    """Host → server: saved server summary or a stable failure code."""
+
+    request_id: str
+    status: str
+    server: dict[str, str] | None = None
+    error: str | None = None
+    error_code: str | None = None
+
+
+@dataclass
 class HostMcpToolsFrame:
     """Server → host: probe one configured MCP server, only on demand."""
 
@@ -1501,6 +1597,8 @@ HostFrame = (
     | HostPluginsResultFrame
     | HostSkillContentFrame
     | HostSkillContentResultFrame
+    | HostSetMcpServerEnabledFrame
+    | HostSetMcpServerEnabledResultFrame
     | HostMcpToolsFrame
     | HostMcpToolsResultFrame
     | HostHarnessStartupFrame
@@ -1516,6 +1614,38 @@ HostFrame = (
 
 
 # ── Encode / decode ──────────────────────────────────────
+
+
+# Older servers reject a readiness frame holding a state they don't know, so an
+# unresponsive CLI travels as "version-too-low" plus this list for newer servers.
+_CLI_UNRESPONSIVE_HARNESSES_KEY = "cli_unresponsive_harnesses"
+
+
+def _encode_configured_harnesses(
+    configured_harnesses: dict[str, HarnessAvailability] | None,
+) -> _JsonObject:
+    """Return the wire fields for a readiness map that older servers accept.
+
+    :param configured_harnesses: Readiness keyed by harness, or ``None``.
+    :returns: ``configured_harnesses`` limited to states older servers decode,
+        plus ``cli_unresponsive_harnesses`` when any harness is in that state.
+    """
+    if configured_harnesses is None:
+        return {"configured_harnesses": None}
+    unresponsive = [
+        harness
+        for harness, availability in configured_harnesses.items()
+        if availability == HARNESS_CLI_UNRESPONSIVE
+    ]
+    if not unresponsive:
+        return {"configured_harnesses": configured_harnesses}
+    return {
+        "configured_harnesses": {
+            harness: HARNESS_VERSION_TOO_LOW if harness in unresponsive else availability
+            for harness, availability in configured_harnesses.items()
+        },
+        _CLI_UNRESPONSIVE_HARNESSES_KEY: unresponsive,
+    }
 
 
 def _encode_payload(payload: _JsonObject) -> str:
@@ -1559,7 +1689,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "frame_protocol_version": frame.frame_protocol_version,
                 "name": frame.name,
                 "runners": list(frame.runners),
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
                 "interactive_shells": frame.interactive_shells,
@@ -1582,7 +1712,7 @@ def encode_host_frame(frame: HostFrame) -> str:
         return _encode_payload(
             {
                 "kind": HostFrameKind.HARNESS_READINESS.value,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
             }
@@ -1597,6 +1727,12 @@ def encode_host_frame(frame: HostFrame) -> str:
             "harness": frame.harness,
             "inference_config": frame.inference_config,
         }
+        if frame.mcp_disabled_servers_active_harnesses is not None:
+            payload["mcp_disabled_servers_active_harnesses"] = (
+                frame.mcp_disabled_servers_active_harnesses
+            )
+        if frame.scheduled_run is not None:
+            payload["scheduled_run"] = frame.scheduled_run.model_dump()
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
         return _encode_payload(payload)
@@ -1799,7 +1935,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.INSTALL_HARNESS_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "version": frame.version,
                 "gateway_inference": frame.gateway_inference,
@@ -1819,7 +1955,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.REFRESH_HARNESSES_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
                 "error": frame.error,
@@ -1890,7 +2026,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "success": frame.success,
                 "expired": frame.expired,
                 "error": frame.error,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
             }
         )
@@ -1908,7 +2044,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.HARNESS_LOGOUT_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "error": frame.error,
             }
@@ -1933,7 +2069,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.STORE_SECRET_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
                 "error": frame.error,
@@ -2067,6 +2203,29 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "status": frame.status,
                 "skill": frame.skill,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostSetMcpServerEnabledFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SET_MCP_SERVER_ENABLED.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+                "server": frame.server,
+                "enabled": frame.enabled,
+                "plugin": frame.plugin,
+                "source_id": frame.source_id,
+            }
+        )
+    if isinstance(frame, HostSetMcpServerEnabledResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SET_MCP_SERVER_ENABLED_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "server": frame.server,
+                "error": frame.error,
+                "error_code": frame.error_code,
             }
         )
     if isinstance(frame, HostMcpToolsFrame):
@@ -2507,7 +2666,7 @@ def _decode_known_host_frame(
                 success=_required_bool(msg, "success"),
                 expired=_required_bool(msg, "expired") if "expired" in msg else False,
                 error=_optional_nullable_str(msg, "error"),
-                configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+                configured_harnesses=_decode_configured_harnesses(msg),
                 harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
             )
         case HostFrameKind.HARNESS_LOGOUT:
@@ -2519,7 +2678,7 @@ def _decode_known_host_frame(
             return HostHarnessLogoutResultFrame(
                 request_id=_required_str(msg, "request_id"),
                 status=_required_str(msg, "status"),
-                configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+                configured_harnesses=_decode_configured_harnesses(msg),
                 harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
                 error=_optional_nullable_str(msg, "error"),
             )
@@ -2591,6 +2750,30 @@ def _decode_known_host_frame(
             )
         case HostFrameKind.SKILL_CONTENT_RESULT:
             return _decode_skill_content_result(msg)
+        case HostFrameKind.SET_MCP_SERVER_ENABLED:
+            return HostSetMcpServerEnabledFrame(
+                request_id=_required_str(msg, "request_id"),
+                harness=_required_str(msg, "harness"),
+                server=_required_str(msg, "server"),
+                enabled=_required_bool(msg, "enabled"),
+                plugin=_optional_nullable_str(msg, "plugin"),
+                source_id=_optional_nullable_str(msg, "source_id"),
+            )
+        case HostFrameKind.SET_MCP_SERVER_ENABLED_RESULT:
+            raw_server = msg.get("server")
+            servers = _decode_mcp_servers_result(
+                {
+                    **msg,
+                    "mcp_servers": [raw_server] if raw_server is not None else [],
+                }
+            ).mcp_servers
+            return HostSetMcpServerEnabledResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                server=servers[0] if servers else None,
+                error=_optional_nullable_str(msg, "error"),
+                error_code=_optional_nullable_str(msg, "error_code"),
+            )
         case HostFrameKind.MCP_TOOLS:
             return HostMcpToolsFrame(
                 request_id=_required_str(msg, "request_id"),
@@ -2625,7 +2808,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         frame_protocol_version=_required_int(msg, "frame_protocol_version"),
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
-        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        configured_harnesses=_decode_configured_harnesses(msg),
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         interactive_shells=(
@@ -2645,11 +2828,11 @@ def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
     raw = msg.get("configured_harnesses")
     if not isinstance(raw, dict):
         raise ValueError("harness readiness frame requires a configured_harnesses object")
-    configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
+    # Unknown states from a newer host drop per entry (that harness reads as not
+    # ready) so the frame's other readiness, account and gateway updates still apply.
+    configured_harnesses = _decode_configured_harnesses(msg)
     if configured_harnesses is None:
         raise ValueError("harness readiness frame requires a configured_harnesses object")
-    if len(configured_harnesses) != len(raw):
-        raise ValueError("harness readiness frame contains an unsupported availability state")
     if not configured_harnesses:
         raise ValueError("harness readiness frame requires a non-empty configured_harnesses map")
     return HostHarnessReadinessFrame(
@@ -2675,6 +2858,12 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
+        scheduled_run=parse_scheduled_run(msg.get("scheduled_run")),
+        mcp_disabled_servers_active_harnesses=(
+            _optional_str_list(msg, "mcp_disabled_servers_active_harnesses")
+            if "mcp_disabled_servers_active_harnesses" in msg
+            else None
+        ),
         # Absent (an older server) is distinct from an empty list.
         superseded_runner_ids=(
             tuple(_optional_str_list(msg, "superseded_runner_ids"))
@@ -3017,7 +3206,7 @@ def _decode_install_harness_result(msg: _JsonObject) -> HostInstallHarnessResult
     return HostInstallHarnessResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
-        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        configured_harnesses=_decode_configured_harnesses(msg),
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         version=_optional_nullable_str(msg, "version"),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
@@ -3030,7 +3219,7 @@ def _decode_refresh_harnesses_result(msg: _JsonObject) -> HostRefreshHarnessesRe
     return HostRefreshHarnessesResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
-        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        configured_harnesses=_decode_configured_harnesses(msg),
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         error=_optional_nullable_str(msg, "error"),
@@ -3064,7 +3253,7 @@ def _decode_store_secret_result(msg: _JsonObject) -> HostStoreSecretResultFrame:
     return HostStoreSecretResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
-        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        configured_harnesses=_decode_configured_harnesses(msg),
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         error=_optional_nullable_str(msg, "error"),
@@ -3224,7 +3413,7 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
 
 
 _MCP_SERVER_FIELDS = ("name", "harness", "transport", "scope")
-_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id", "managed")
+_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id", "managed", "enabled", "locked")
 #: Account states a host may report. Anything else is dropped rather than rejected, so a
 #: newer host reporting a state this build does not know degrades to "no state reported".
 MCP_AUTH_STATUSES = ("connected", "sign_in_required")
@@ -3573,6 +3762,22 @@ def _optional_str_availability_map(
     if not isinstance(val, dict):
         return None
     return {k: v for k, v in val.items() if isinstance(k, str) and is_harness_availability(v)}
+
+
+def _decode_configured_harnesses(msg: _JsonObject) -> dict[str, HarnessAvailability] | None:
+    """Decode ``configured_harnesses``, restoring states sent in compatible form.
+
+    :param msg: Decoded frame object.
+    :returns: The readiness map, or ``None`` when absent or malformed.
+    """
+    configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
+    unresponsive = msg.get(_CLI_UNRESPONSIVE_HARNESSES_KEY)
+    if configured_harnesses is None or not isinstance(unresponsive, list):
+        return configured_harnesses
+    for harness in unresponsive:
+        if isinstance(harness, str) and harness in configured_harnesses:
+            configured_harnesses[harness] = HARNESS_CLI_UNRESPONSIVE
+    return configured_harnesses
 
 
 def optional_str_bool_map(msg: _JsonObject, key: str) -> dict[str, bool] | None:

@@ -91,6 +91,11 @@ integration evidence separately; the browser test does not exercise them.
   Native `/clear` and `/fork` reauthorize and
   bind the replacement before detaching the source; the last directly bound
   runner session cannot detach. Host and profile mismatches remain blocked.
+  claude-sdk `/clear` continues in an empty fork (authorized like `/fork`) bound
+  to the source's host, workspace and live runner. It stays in the same sandbox,
+  so it keeps the source's `omnigent.sandbox.*` labels: a relaunch re-clones
+  the same repositories and routes by the same host id. No history or files
+  are copied, and a fork that cannot be bound is deleted again.
 - Missing sandboxes use the bound session's reference for replacement. Legacy host
   recovery rejects histories over 200 sessions; use controller lookup for larger
   histories. Runner-host discovery and reconnect liveness have a separate limit
@@ -105,5 +110,11 @@ integration evidence separately; the browser test does not exercise them.
   changes or new indexes are involved.
   Before first opt-in, complete the [legacy-label audit](../docs/extending/provider_profiles.md#rollout-rollback-and-verification)
   after upgrading every writer. Enable the flag before configuring a provider that requires profiles.
+- Existing unprofiled sessions retain wake, relaunch, missing-sandbox replacement
+  and runner rotation after opt-in. The provider must retain its unselected
+  lifecycle path; scoped lookup returns `None` only for an authorized legacy
+  resource. Fresh sandbox creation still requires selection, and saved profiles
+  never fall back to defaults. The rollout regression lives in
+  `tests/server/integration/test_sandbox_profile_launch.py::test_unprofiled_session_survives_provider_opt_in`.
 
 Controller recovery is covered in `tests/server/integration/test_sandbox_profile_controller.py`: last-session deletion, restart, historical revision, revocation and missing-sandbox replacement. The [controller walkthrough](../examples/sandbox-profile-provider/README.md#controller-recovery-demo) is runnable without a cluster.

@@ -129,8 +129,8 @@ _DATABRICKS_ANTHROPIC_GATEWAY_PATH = "/ai-gateway/anthropic"
 
 # The Databricks Unity Gateway exposes one surface per protocol under the same
 # workspace origin: Codex/OpenAI-Responses at ``/codex/v1`` and Anthropic
-# Messages at ``/anthropic``. ``isaac configure codex`` writes the Codex
-# base_url; pi-native rewrites it to the Anthropic surface Pi speaks natively.
+# Messages at ``/anthropic``. The Codex base_url comes from a wrapper's
+# Codex setup; pi-native rewrites it to the Anthropic surface Pi speaks natively.
 _DATABRICKS_GATEWAY_CODEX_SUFFIX = "/codex/v1"
 _DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX = "/anthropic"
 
@@ -344,7 +344,7 @@ class PiProviderConfig:
             "start a new Pi session."
         )
 
-    def to_models_config(self) -> _PiModelsConfig:
+    def to_models_config(self, *, client_surface: str | None = None) -> _PiModelsConfig:
         """Render this provider as a Pi ``models.json`` mapping."""
         models: list[_PiModelEntry] = list(self.extra_models)
         additional: dict[str, _PiProviderPayload] = dict(self.additional_providers)
@@ -399,7 +399,10 @@ class PiProviderConfig:
             if is_databricks_ai_gateway_url(payload["baseUrl"]):
                 # Copy rather than mutate: additional payloads are shared across renders.
                 headers = with_gateway_attribution(
-                    payload.get("headers"), PI_AGENT, payload["baseUrl"]
+                    payload.get("headers"),
+                    PI_AGENT,
+                    payload["baseUrl"],
+                    client_surface=client_surface,
                 )
                 providers[provider_id] = {**payload, "headers": headers}
         return {"providers": providers}
@@ -1346,10 +1349,10 @@ def _with_configured_default_limits(
 def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
     """Resolve a Codex ``cli-config`` Databricks-gateway provider into Pi config.
 
-    The common enterprise setup: ``isaac configure codex`` writes a custom
-    ``[model_providers.X]`` table (base_url + token-printing ``auth`` command)
-    into ``~/.codex/config.toml`` and ``omnigent setup`` adopts it as a
-    ``cli-config`` provider. Codex-native routes through that table; pi-native
+    The common enterprise setup: a custom ``[model_providers.X]`` table
+    (base_url + token-printing ``auth`` command) in ``~/.codex/config.toml``,
+    which ``omnigent setup`` adopts as a ``cli-config`` provider. Codex-native
+    routes through that table; pi-native
     used to return ``None`` here — silently falling back to Pi's own
     ``/login`` (often stale creds) — which is the bug this fixes.
 
@@ -1966,6 +1969,7 @@ def pi_native_provider_launch(
     *,
     selection: str | None = None,
     global_agent_dir: Path | None = None,
+    client_surface: str | None = None,
 ) -> PiNativeLaunch:
     """Write the managed config and return the launch env + CLI args for Pi.
 
@@ -1983,7 +1987,7 @@ def pi_native_provider_launch(
     """
     # Render once and reuse: rendering logs how an uncataloged model was routed,
     # and this function both writes the config and reads it back for --provider.
-    rendered = provider.to_models_config()
+    rendered = provider.to_models_config(client_surface=client_surface)
     # Resolve which provider the selected model lives in. Non-Claude models
     # (GLM, GPT, Llama…) are in secondary providers; Claude models are in the
     # primary provider. Read the rendered config so family fallbacks agree.

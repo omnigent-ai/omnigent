@@ -1,11 +1,10 @@
 """
 A refusal before a web message was typed holds the message instead of failing it.
 
-When a Claude question or permission prompt refuses the message before anything
-was typed, the turn waits for the person to answer it and then delivers the
-message. When Claude Code's input box could not be verified clear, the turn
-waits until it reads clear. A refusal after typing began, or a hold that runs
-out, still fails as before.
+Questions, permission prompts and answerable terminal dialogs hold the message
+until the person answers them. An uncleared input box waits until clear; shell
+mode and history search wait until chat input is available. Refusals after typing
+and expired holds still fail as before.
 """
 
 from __future__ import annotations
@@ -17,6 +16,8 @@ import pytest
 
 from omnigent.harnesses.claude_native.bridge import (
     ClaudeComposerNotCleared,
+    ClaudeInputBoxOccupied,
+    ClaudeTerminalDialog,
     ClaudeUserPromptPending,
 )
 from omnigent.inner import claude_native_executor
@@ -27,6 +28,16 @@ _REFUSAL = "Answer the pending Claude question or permission request before send
 _NOT_CLEARED = (
     "Claude Code's input box could not be verified clear, so nothing was sent. "
     "Open the terminal, expand it and clear the input box, then retry."
+)
+_DIALOG = "Claude Code is waiting for an answer in its terminal (Settings Error)"
+_INSTALL_QUESTION = (
+    "Claude Code's launch command is waiting for installation confirmation in its "
+    "terminal, so the message was not delivered. Open the terminal, answer the install "
+    "prompt, then resend your message."
+)
+_SHELL_MODE = (
+    "Claude Code's input box is occupied by shell mode, so the message was not "
+    "delivered. Open the terminal, dismiss it, then resend your message."
 )
 
 
@@ -43,6 +54,7 @@ class _Pane:
     def __init__(self, refusals: list[bool | Exception], pending_polls: int) -> None:
         self.refusals = list(refusals)
         self.pending_polls = pending_polls
+        self.dialog_polls = 0
         self.delivered: list[str] = []
         self.deliveries = 0
         self.polls = 0
@@ -70,6 +82,17 @@ class _Pane:
     def input_box_reads_clear(self, bridge_dir: Path, *, repaint: bool = False) -> bool:
         del bridge_dir
         self.repaints += repaint
+        return not self._still_refusing()
+
+    def terminal_dialog_pending(self, bridge_dir: Path) -> bool:
+        del bridge_dir
+        if self.dialog_polls > 0:
+            self.dialog_polls -= 1
+            return True
+        return False
+
+    def claude_pane_ready(self, bridge_dir: Path) -> bool:
+        del bridge_dir
         return not self._still_refusing()
 
     def _still_refusing(self) -> bool:
@@ -100,6 +123,12 @@ def pane(monkeypatch: pytest.MonkeyPatch) -> _Pane:
         "input_box_reads_clear",
         fake.input_box_reads_clear,
         raising=False,
+    )
+    monkeypatch.setattr(
+        claude_native_executor, "claude_pane_ready", fake.claude_pane_ready, raising=False
+    )
+    monkeypatch.setattr(
+        claude_native_executor, "terminal_dialog_pending", fake.terminal_dialog_pending
     )
     monkeypatch.setattr(claude_native_executor, "kill_session", fake.kill_session)
     monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_POLL_S", 0.0, raising=False)
@@ -325,3 +354,115 @@ async def test_stopping_a_turn_held_for_the_input_box_keeps_the_pane(
     assert pane.kills == 0
     assert pane.deliveries == 1
     assert pane.delivered == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["shell mode", "the prompt-history search"])
+async def test_a_message_an_occupied_input_box_refused_waits_for_chat_input(
+    pane: _Pane, tmp_path: Path, surface: str
+) -> None:
+    """
+    The turn holds the message until the box takes chat input again, then delivers it once.
+
+    Shell mode or the prompt-history search owns the box when the message arrives;
+    nothing was typed, so the refusal is a wait rather than a failed turn.
+    """
+    pane.refusals = [ClaudeInputBoxOccupied(_SHELL_MODE, surface=surface)]
+
+    events = await _run(tmp_path)
+
+    assert events == [TurnComplete(response=None)]
+    assert pane.delivered == ["hello from the web"]
+    assert pane.deliveries == 2
+    assert pane.polls == 3, "The hold ends on the first poll that finds chat input."
+    assert pane.repaints == 0, "Leaving the mode is the person's step; no repaint is asked."
+    assert pane.kills == 0, "A held message must not reap the pane."
+
+
+@pytest.mark.asyncio
+async def test_an_occupied_input_box_and_a_prompt_share_one_hold(
+    pane: _Pane, tmp_path: Path
+) -> None:
+    """A prompt that opens once the box leaves shell mode is waited out too, then it goes."""
+    pane.refusals = [ClaudeInputBoxOccupied(_SHELL_MODE, surface="shell mode"), True]
+
+    events = await _run(tmp_path)
+
+    assert events == [TurnComplete(response=None)]
+    assert pane.delivered == ["hello from the web"]
+    assert pane.deliveries == 3
+
+
+@pytest.mark.asyncio
+async def test_an_input_box_kept_in_shell_mode_fails_with_the_refusal(
+    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the hold the turn fails exactly as it did without one."""
+    monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_S", 0.05, raising=False)
+    monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_POLL_S", 0.01, raising=False)
+    pane.refusals = [ClaudeInputBoxOccupied(_SHELL_MODE, surface="shell mode")]
+    pane.pending_polls = 10**6
+
+    events = await _run(tmp_path)
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].message == _SHELL_MODE
+    assert events[0].undelivered is True
+    assert pane.deliveries == 1
+    assert pane.delivered == []
+    assert pane.kills == 0
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_dialog_holds_the_message_until_it_closes(
+    pane: _Pane, tmp_path: Path
+) -> None:
+    """A dialog only the terminal shows, such as a settings error, holds the message."""
+    pane.refusals = [ClaudeTerminalDialog(_DIALOG, awaits_answer=True)]
+    pane.pending_polls = 0
+    pane.dialog_polls = 2
+
+    events = await _run(tmp_path)
+
+    assert events == [TurnComplete(response=None)]
+    assert pane.delivered == ["hello from the web"]
+    assert pane.deliveries == 2
+    assert pane.kills == 0, "A held message must not reap the pane."
+
+
+@pytest.mark.asyncio
+async def test_a_launcher_install_question_holds_the_message_until_it_is_answered(
+    pane: _Pane, tmp_path: Path
+) -> None:
+    """
+    The launcher's install question, printed before Claude Code runs, holds the message.
+
+    On main the refusal failed the turn at once; the person then had to answer in
+    the terminal and resend.
+    """
+    pane.refusals = [ClaudeTerminalDialog(_INSTALL_QUESTION, awaits_answer=True)]
+    pane.pending_polls = 0
+    pane.dialog_polls = 2
+
+    events = await _run(tmp_path)
+
+    assert events == [TurnComplete(response=None)]
+    assert pane.delivered == ["hello from the web"]
+    assert pane.deliveries == 2
+    assert pane.kills == 0, "A held message must not reap the pane."
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_dialog_that_awaits_no_answer_is_reported_at_once(
+    pane: _Pane, tmp_path: Path
+) -> None:
+    """A surface refusal that names no answer for the person is not held."""
+    pane.refusals = [ClaudeTerminalDialog(_DIALOG)]
+
+    events = await _run(tmp_path)
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].message.startswith(_DIALOG)
+    assert events[0].undelivered is True
+    assert pane.deliveries == 1
+    assert pane.polls == 0

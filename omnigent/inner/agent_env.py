@@ -65,6 +65,9 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # without it a corporate-CA user upgrading would hit TLS failures from
         # every harness that does not happen to own a NODE_ prefix of its own.
         "NODE_EXTRA_CA_CERTS",
+        # git's CA paths, for git builds that ignore SSL_CERT_FILE.
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
         # ssh-agent socket path, so an agent's git-over-SSH and SSH-cert
         # tooling authenticates. A path to a unix socket, not a bearer token:
         # reaching the agent still requires the user's own ssh-agent to be
@@ -74,9 +77,11 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # The user's URL-opener command, so an agent's CLI logins open URLs the
         # way the user configured (e.g. forwarded to a laptop from a remote box).
         "BROWSER",
-        # Config locations, not bearer tokens: agent tools use the host's CLI login.
+        # Config locations and hosts let agent tools use the host's CLI login.
         "GH_CONFIG_DIR",
         "GLAB_CONFIG_DIR",
+        "GITLAB_HOST",
+        "GLAB_HOST",
         OMNIGENT_SESSION_ENV_VAR,
         # Windows system / profile constants (SYSTEMROOT is mandatory for
         # Winsock init, USERPROFILE for Path.home(), etc.); no-ops on POSIX

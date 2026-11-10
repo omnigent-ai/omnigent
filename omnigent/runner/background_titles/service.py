@@ -43,7 +43,7 @@ BACKGROUND_TITLE_INSTRUCTIONS = (
 
 #: Economy-tier title model per canonical harness, armed from the owned
 #: fallback records (see ``omnigent.models.model_fallbacks``). Title calls are tiny
-#: (<=64 output tokens, no tools, low effort), so they always run on the
+#: (short text, no tools, low effort), so they always run on the
 #: family's cheapest arm regardless of the session's model.
 _BACKGROUND_TITLE_MODELS: dict[str, str] = {
     "claude-sdk": BACKGROUND_TITLE_CLAUDE_ECONOMY_MODEL,

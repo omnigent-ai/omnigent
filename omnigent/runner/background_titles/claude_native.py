@@ -14,6 +14,7 @@ from omnigent.runner.background_titles.service import (
     BackgroundTitleContext,
     build_background_title_instructions,
 )
+from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR
 
 _logger = logging.getLogger("omnigent.runner.background_titles.claude_native")
 
@@ -93,7 +94,11 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
                 )
                 return None
     env = dict(os.environ)
-    env.update(build_native_claude_terminal_env(claude_config))
+    env.update(
+        build_native_claude_terminal_env(
+            claude_config, client_surface=context.spawn_env.get(CLIENT_SURFACE_ENV_VAR)
+        )
+    )
     for name in _claude_terminal_env_unset(claude_config):
         env.pop(name, None)
 
