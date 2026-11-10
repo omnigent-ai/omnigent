@@ -933,6 +933,11 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
                 if evidence == "permission_prompt":
                     bridge.approval_wait_marker_path(conv_id).unlink()
                 background(conv_id, False)
+                monkeypatch.setattr(
+                    app.state.session_resource_registry,
+                    "session_has_background_agents",
+                    lambda session_id: False,
+                )
                 monkeypatch.setattr(instance, "screen_changed_within", Mock(return_value=False))
                 monkeypatch.setattr(
                     instance, "client_interaction_within", Mock(return_value=False)
