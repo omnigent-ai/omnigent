@@ -156,8 +156,7 @@ def main():
     marker = b""
     pasted = None
     emit_claude_hook("SessionStart")
-    if MODE == "hidden":
-        sys.stdout.write("\\x1b[?2004h")
+    sys.stdout.write("\\x1b[?2004h")
     render("", transcript)
     try:
         while True:
@@ -165,7 +164,7 @@ def main():
             if not data:
                 break
             byte = data[0]
-            if MODE == "hidden":
+            if marker or byte == 27 or pasted is not None:
                 if marker or byte == 27:
                     marker += data
                     if marker == b"\\x1b[200~":
@@ -177,13 +176,17 @@ def main():
                         chars = list(content)
                         marker = b""
                         pasted = None
-                        deadline = time.monotonic() + STALL_S
-                        while not RELEASE.exists():
-                            if time.monotonic() >= deadline:
-                                raise RuntimeError("test did not release the hidden draft")
-                            time.sleep(0.01)
+                        if MODE == "hidden":
+                            deadline = time.monotonic() + STALL_S
+                            while not RELEASE.exists():
+                                if time.monotonic() >= deadline:
+                                    raise RuntimeError("test did not release the hidden draft")
+                                time.sleep(0.01)
                         render("".join(chars), transcript)
                         record("draft_visible")
+                        if MODE == "visible" and not stalled and STALL_TRIGGER in content:
+                            stalled = True
+                            time.sleep(STALL_S)
                     elif not any(
                         value.startswith(marker) for value in (b"\\x1b[200~", b"\\x1b[201~")
                     ):

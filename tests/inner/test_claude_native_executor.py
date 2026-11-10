@@ -35,6 +35,7 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_cache_dir
+from tests.inner._claude_native_peer import prepare_native_peer
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -54,77 +55,13 @@ def _native_executor(
     native_ready: bool = True,
 ) -> _ClaudeNativeExecutor:
     """Seed the owned native peer that the executor scenarios replace with callbacks."""
-    from omnigent.harnesses.claude_native.framework_context import (
-        consume_prompt_framework_context,
-        prompt_framework_context_capability_ready,
+    prepare_native_peer(
+        bridge_dir,
+        monkeypatch=monkeypatch,
+        root=root,
+        submit_hook=submit_hook,
+        native_ready=native_ready,
     )
-    from omnigent.harnesses.claude_native.hook import record_hook_payload
-    from omnigent.inner.terminal_lifecycle import TERMINAL_INSTANCE_ID_ENV, TERMINAL_LAUNCH_ID_ENV
-
-    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", root)
-    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", root.parent)
-    bridge_dir.mkdir(parents=True, exist_ok=True)
-    records = {
-        "bridge.json": {
-            "active_session_id": claude_native_executor._request_session_id_from_env()
-            or "native-test"
-        },
-        "state.json": {"claude_session_id": "native-session"} if native_ready else {},
-        "tmux.json": {
-            "socket_path": str(root / "native.sock"),
-            "tmux_target": "main",
-            "launch_id": "c" * 32,
-            "instance_id": "d" * 32,
-        },
-    }
-    for name, payload in records.items():
-        if not (bridge_dir / name).exists():
-            claude_bridge._write_json_file(bridge_dir / name, payload)
-    owner = claude_bridge.read_delivery_owner(bridge_dir)
-    if owner.launch_id is not None:
-        monkeypatch.setenv(TERMINAL_LAUNCH_ID_ENV, owner.launch_id)
-    if owner.instance_id is not None:
-        monkeypatch.setenv(TERMINAL_INSTANCE_ID_ENV, owner.instance_id)
-    if (
-        owner.session_id
-        and owner.native_session_id
-        and owner.launch_id
-        and owner.instance_id
-        and not prompt_framework_context_capability_ready(bridge_dir)
-    ):
-        record_hook_payload(
-            bridge_dir,
-            {
-                "hook_event_name": "SessionStart",
-                "session_id": owner.native_session_id,
-                "source": "startup",
-            },
-            env={
-                TERMINAL_LAUNCH_ID_ENV: owner.launch_id,
-                TERMINAL_INSTANCE_ID_ENV: owner.instance_id,
-            },
-            prompt_framework_context=True,
-        )
-    injector = claude_native_executor.inject_user_message
-    if (
-        submit_hook
-        and injector is not claude_bridge.inject_user_message
-        and not getattr(injector, "_emits_owned_submit_hook", False)
-    ):
-
-        def inject_with_hook(directory: Path, *, content: str, **kwargs: Any) -> None:
-            injector(directory, content=content, **kwargs)
-            consume_prompt_framework_context(
-                directory,
-                {
-                    "hook_event_name": "UserPromptSubmit",
-                    "session_id": claude_bridge.read_delivery_owner(directory).native_session_id,
-                    "prompt": content,
-                },
-            )
-
-        inject_with_hook._emits_owned_submit_hook = True
-        monkeypatch.setattr(claude_native_executor, "inject_user_message", inject_with_hook)
     return _ClaudeNativeExecutor(bridge_dir)
 
 
