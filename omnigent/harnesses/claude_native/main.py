@@ -269,6 +269,9 @@ _CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBAC
 # tool's `tmux kill-session` or `kill-server` ends Claude itself.
 _CLAUDE_CODE_ENV_FILE_ENV = "CLAUDE_ENV_FILE"
 _CLAUDE_TOOL_ENV_SCRIPT = "claude_tool_env.sh"
+# Set for a terminal nobody is watching. ucode then never waits on a person: no
+# sudo password prompt, and a browser sign-in is printed as a link instead.
+_UCODE_NONINTERACTIVE_ENV = "UG_NONINTERACTIVE"
 # Claude Code waits 10 minutes by default for response headers, so a request
 # whose connection died silently (e.g. across host sleep) stalls the turn.
 _CLAUDE_CODE_API_TIMEOUT_ENV = "API_TIMEOUT_MS"
@@ -1665,6 +1668,7 @@ def claude_tool_env_file() -> str:
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
     *,
+    unattended: bool = False,
     client_surface: str | None = None,
 ) -> dict[str, str]:
     """
@@ -1685,6 +1689,10 @@ def build_native_claude_terminal_env(
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
         ``None`` means use Claude Code's own native auth.
+    :param unattended: ``True`` for a terminal the runner launches with no
+        CLI client attached, so ucode must not wait for a person.
+    :param client_surface: Request surface used to attribute gateway usage,
+        e.g. ``"desktop"``.
     :returns: Environment overrides for the terminal process, e.g.
         ``{"ENABLE_TOOL_SEARCH": "true"}``.
     """
@@ -1694,6 +1702,8 @@ def build_native_claude_terminal_env(
         _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV: "1",
         _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV: "1",
     }
+    if unattended:
+        terminal_env[_UCODE_NONINTERACTIVE_ENV] = "1"
     if claude_config is not None:
         terminal_env.update(claude_config.env)
         terminal_env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
