@@ -5852,9 +5852,9 @@ def _btw_display_ended(pane: str) -> bool:
     Report whether a captured pane ends the previous ``/btw`` display.
 
     True only on positive evidence: the overlay is answering anew, or the live
-    input box it hides is back. Rows from the overlay's border through its
-    ``Esc to close`` footer belong to the overlay, so a composer-shaped answer
-    in a capture that lost its footer does not count. Failed captures, history
+    input box it hides is back. Rows from the overlay's border through its last
+    ``Esc to close`` belong to the overlay, so a composer-shaped answer, or one
+    in a capture that lost its footer, does not count. Failed captures, history
     browsing and the copy indicator also keep the display open.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
@@ -5869,7 +5869,7 @@ def _btw_display_ended(pane: str) -> bool:
         footer_end = next(
             (
                 count
-                for count in range(1, len(overlay_rows) + 1)
+                for count in range(len(overlay_rows), 0, -1)
                 if "".join(overlay_rows[:count]).endswith(_BTW_FOOTER_CLOSE_HINT)
             ),
             None,
