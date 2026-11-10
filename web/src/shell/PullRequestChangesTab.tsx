@@ -918,7 +918,14 @@ export function PullRequestChangesTab({
           shownMatch.current?.target === findTarget ? shownMatch.current.shown : findTarget,
         )
       : -1;
-  const activeMatch = activeIndex >= 0 ? matches[activeIndex] : null;
+  // While a regex reruns, the reader's occurrence stays shown, so the row neither loses its
+  // highlight nor re-centres, and a file the reader collapsed stays collapsed.
+  const activeMatch =
+    activeIndex >= 0
+      ? matches[activeIndex]
+      : search.searching && findTarget && shownMatch.current?.target === findTarget
+        ? shownMatch.current.shown
+        : null;
   useEffect(() => {
     // A rerunning regex keeps the reader's occurrence, which the refreshed result is measured from.
     if (search.searching) return;

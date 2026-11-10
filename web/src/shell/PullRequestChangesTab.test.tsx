@@ -548,6 +548,28 @@ describe("PullRequestChangesTab", () => {
     expect(await screen.findByText("2 of 3")).toBeInTheDocument();
   });
 
+  it("keeps a regex match in place, without re-centring or reopening its file, when another file refreshes", async () => {
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    const { rerender } = renderTab({ conversationId: "find-regex-steady" });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+    fireEvent.click(sectionHeader("b.ts", true));
+    expect(isCollapsed("b.ts")).toBe(true);
+    scroll.mockClear();
+
+    // Only a.ts changes, so the regex reruns over a new corpus with b.ts's match unmoved.
+    const release = holdRegexSearches();
+    rerender(addedFile("a.ts", ["alpha", "beta", "delta"]) + B + C);
+    expect(await screen.findByText("Searching…")).toBeInTheDocument();
+    expect(isCollapsed("b.ts")).toBe(true);
+    await release();
+
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+    expect(isCollapsed("b.ts")).toBe(true);
+    expect(scroll).not.toHaveBeenCalled();
+  });
+
   it("does not move the match while a regex search runs, from the buttons or the find input", async () => {
     const { rerender } = renderTab({ conversationId: "find-pending-step" });
     openFind("needle");
