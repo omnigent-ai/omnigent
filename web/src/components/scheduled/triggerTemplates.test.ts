@@ -165,42 +165,69 @@ describe("saved trigger prompts", () => {
     },
   );
 
-  it.each(
-    [true, false].flatMap((linkBack) =>
-      ["replace attribution", "append text", "trailing newline"].map((edit) => ({
-        linkBack,
-        edit,
-      })),
-    ),
-  )("preserves worker posting scope with link-back $linkBack: $edit", ({ linkBack, edit }) => {
-    const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields({ linkBack }), CTX));
-    const [manager, posting] = parts.systemPrompt!.split(
-      "\n\nPosting instructions for each session:\n",
-    );
-    const editedPosting =
-      edit === "replace attribution"
-        ? posting.replace("Sent with Omnigent", "Automated reply")
-        : posting + (edit === "append text" ? "\nInclude a summary." : "\n");
-    const systemPrompt = `${manager}\n\nPosting instructions for each session:\n${editedPosting}`;
-    const saved = combineTriggerPrompt("New user prompt.", systemPrompt);
-    const [savedManager, workerInstructions] = saved.split("\n\nInstructions for each session:\n");
-    expect(savedManager).toBe(manager);
-    expect(workerInstructions).toBe(
-      `New user prompt.\n\nPosting instructions for each session:\n${editedPosting}`,
-    );
-    expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: "New user prompt.", systemPrompt });
-  });
+  /** The worker and posting headings a prompt in each mode is split on. */
+  const HEADINGS = {
+    new: {
+      instructions: "Instructions for each session:",
+      posting: "Posting instructions for each session:",
+    },
+    continue: {
+      instructions: "Instructions for the task session:",
+      posting: "Posting instructions for the task session:",
+    },
+  } as const;
 
-  it.each(["", "  \n"])("preserves intentionally cleared posting instructions (%j)", (posting) => {
-    const parts = splitTriggerPrompt(renderTriggerPrompt("jira", fields(), CTX));
-    const [manager] = parts.systemPrompt!.split("\n\nPosting instructions for each session:\n");
-    const systemPrompt = `${manager}\n\nPosting instructions for each session:\n${posting}`;
-    const saved = combineTriggerPrompt(parts.userPrompt, systemPrompt);
-    expect(saved).toBe(
-      `${manager}\n\nInstructions for each session:\n${parts.userPrompt}\n\nPosting instructions for each session:\n${posting}`,
-    );
-    expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: parts.userPrompt, systemPrompt });
-  });
+  it.each(
+    (["new", "continue"] as const).flatMap((taskSessionMode) =>
+      [true, false].flatMap((linkBack) =>
+        ["replace attribution", "append text", "trailing newline"].map((edit) => ({
+          taskSessionMode,
+          linkBack,
+          edit,
+        })),
+      ),
+    ),
+  )(
+    "preserves worker posting scope in $taskSessionMode mode with link-back $linkBack: $edit",
+    ({ taskSessionMode, linkBack, edit }) => {
+      const heading = HEADINGS[taskSessionMode];
+      const parts = splitTriggerPrompt(
+        renderTriggerPrompt("jira", fields({ linkBack }), { ...CTX, taskSessionMode }),
+      );
+      const [manager, posting] = parts.systemPrompt!.split(`\n\n${heading.posting}\n`);
+      const editedPosting =
+        edit === "replace attribution"
+          ? posting.replace("Sent with Omnigent", "Automated reply")
+          : posting + (edit === "append text" ? "\nInclude a summary." : "\n");
+      const systemPrompt = `${manager}\n\n${heading.posting}\n${editedPosting}`;
+      const saved = combineTriggerPrompt("New user prompt.", systemPrompt);
+      const [savedManager, workerInstructions] = saved.split(`\n\n${heading.instructions}\n`);
+      expect(savedManager).toBe(manager);
+      expect(workerInstructions).toBe(`New user prompt.\n\n${heading.posting}\n${editedPosting}`);
+      expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: "New user prompt.", systemPrompt });
+    },
+  );
+
+  it.each(
+    (["new", "continue"] as const).flatMap((taskSessionMode) =>
+      ["", "  \n"].map((posting) => ({ taskSessionMode, posting })),
+    ),
+  )(
+    "preserves intentionally cleared posting instructions in $taskSessionMode mode ($posting)",
+    ({ taskSessionMode, posting }) => {
+      const heading = HEADINGS[taskSessionMode];
+      const parts = splitTriggerPrompt(
+        renderTriggerPrompt("jira", fields(), { ...CTX, taskSessionMode }),
+      );
+      const [manager] = parts.systemPrompt!.split(`\n\n${heading.posting}\n`);
+      const systemPrompt = `${manager}\n\n${heading.posting}\n${posting}`;
+      const saved = combineTriggerPrompt(parts.userPrompt, systemPrompt);
+      expect(saved).toBe(
+        `${manager}\n\n${heading.instructions}\n${parts.userPrompt}\n\n${heading.posting}\n${posting}`,
+      );
+      expect(splitTriggerPrompt(saved)).toEqual({ userPrompt: parts.userPrompt, systemPrompt });
+    },
+  );
 
   it("preserves an independently specified saved template", () => {
     const saved =
@@ -1408,7 +1435,7 @@ describe("one task session for every match", () => {
     );
     // The same lookup runs before a first start and before a replacement.
     expect(prompt).toContain(
-      `So before you start a task session, and to resolve an unconfirmed start, call sys_session_list once with include_archived true, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID and whose title is ${TITLE}. One that isn't archived and that you don't already know as a task session, including one named after "replacing" on a pending entry, is your task session.`,
+      `So before you start a task session, and to resolve an unconfirmed start, call sys_session_list once with include_archived true, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID and whose title is ${TITLE}. One that isn't archived and wasn't known as a task session before this run (named on a "Task session:" line, returned by your own earlier calls, or named after "replacing" on a pending entry) is your task session.`,
     );
     expect(prompt).toContain(
       "If you have no task session, look for one as in step 2. If you find one, the run that started it may already have sent it this ticket: check its latest items for the title before sending. If there is none, start one",
@@ -1455,7 +1482,7 @@ describe("one task session for every match", () => {
       'If a call times out or its result is unclear, the ticket may have been delivered: don\'t retry it in this run; list it on a "Delivery pending:" line as "<title> <task session ID>", or, if you were starting a task session, as "<title> unconfirmed", adding "replacing <ID>" when it replaced one, and stop there.',
     );
     expect(prompt).toContain(
-      "3. For each pending delivery, find the session it went to: by the conversation_id on its line, or, for an unconfirmed start, among the sessions step 2 lists: one with that title that you don't already know as a task session, archived or not. If there is none and the listed rows carry an archived field (so archived sessions were included), the start never happened: drop the entry, fetch that ticket again by the key in its title, and handle it with this run's matches below",
+      "3. For each pending delivery, find the session it went to: by the conversation_id on its line, or, for an unconfirmed start, among the sessions step 2 lists: one with that title that wasn't known as a task session before this run, archived or not, which can be the one step 2 just made your task session. If there is none and the listed rows carry an archived field (so archived sessions were included), the start never happened: drop the entry, fetch that ticket again by the key in its title, and handle it with this run's matches below",
     );
     expect(prompt).toContain(
       "If a task message from your session there names the entry's title, it was delivered: drop the entry. If none does, keep the entry pending and point the owner to that session in your reply: the task message may still be queued, or be older than the items you can read, so never resend it.",
@@ -1466,6 +1493,9 @@ describe("one task session for every match", () => {
     expect(prompt).toContain(
       'If starting the task session returns a conversation_id with status created_initial_message_failed, the task session exists but that ticket wasn\'t delivered: it is your task session, but don\'t resend now; list it as "<title> <conversation_id>" on a "Delivery pending:" line and go on.',
     );
+    // Step 2 may adopt the session an unconfirmed start made; step 3 must still match it.
+    expect(prompt).not.toContain("don't already know as a task session");
+    expect(prompt.match(/wasn't known as a task session before this run/g)).toHaveLength(2);
     // A failed first message must not leave later ones without the role or worktree setup.
     expect(prompt).not.toContain("first task message");
     expect(prompt).toContain("so each task message also tells it to make its own git worktree");
