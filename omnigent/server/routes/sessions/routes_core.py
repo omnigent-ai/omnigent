@@ -321,13 +321,19 @@ def _require_attachment_compatible_history(
     return filename
 
 
-async def _wake_runner_for_model_change(
+async def _wake_runner_for_live_change(
     request: Request,
     conv: Conversation,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    *,
+    action: str,
 ) -> Conversation:
-    """Restore a sleeping native session before applying an explicit model pick."""
+    """Restore a sleeping native session before applying an explicit live change.
+
+    :param action: What the caller is doing, for the offline error, e.g.
+        ``"switch models"``.
+    """
     if await _get_runner_client(conv.id, runner_router) is not None:
         return conv
     runner_client, conv = await ensure_runner_connected(
@@ -340,7 +346,7 @@ async def _wake_runner_for_model_change(
     )
     if runner_client is None:
         raise OmnigentError(
-            "Cannot switch models while the session host is offline. Reconnect the host and retry.",
+            f"Cannot {action} while the session host is offline. Reconnect the host and retry.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
     terminal_ready = await _ensure_runner_session_initialized(
@@ -3781,16 +3787,24 @@ def register_core_routes(
             and not defer_side_settings
             and (model_override is not None or clear_model)
         )
-        wake_for_model_change = (
-            live_model_change
-            and conv is not None
-            and conv.host_id is not None
-            and _is_native_terminal_session(conv)
+        wakeable_native_session = (
+            conv is not None and conv.host_id is not None and _is_native_terminal_session(conv)
         )
-        if wake_for_model_change:
+        wake_for_model_change = live_model_change and wakeable_native_session
+        wake_for_approval_mode_change = (
+            requested_codex_approval_mode is not None
+            and not body.silent
+            and not defer_side_settings
+            and wakeable_native_session
+        )
+        if wake_for_model_change or wake_for_approval_mode_change:
             assert conv is not None
-            conv = await _wake_runner_for_model_change(
-                request, conv, conversation_store, runner_router
+            conv = await _wake_runner_for_live_change(
+                request,
+                conv,
+                conversation_store,
+                runner_router,
+                action="switch models" if wake_for_model_change else "switch approval modes",
             )
 
         if set_project or family_pin_value is not None:
