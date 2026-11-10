@@ -1,3 +1,4 @@
+import { isFeatureEnabled } from "@/lib/capabilities";
 import {
   useEffect,
   useRef,
@@ -393,7 +394,7 @@ export function HeaderConversationMenu({
           }}
         >
           <InfoIcon className="size-3.5" />
-          Agent info
+          {isFeatureEnabled(info, "session_overview") ? "Agent details" : "Agent info"}
         </DropdownMenuItem>
       )}
       {/* Rename is also reachable on desktop by clicking the breadcrumb title

@@ -77,12 +77,14 @@ vi.mock("@/lib/mcpRegistry", () => ({ registryRequest: vi.fn() }));
 
 const versionEnv = vi.hoisted(() => ({
   enabledConnections: [] as string[],
+  overviewEnabled: false,
   serverVersion: null as string | null,
   hostVersion: undefined as string | null | undefined,
 }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     server_version: versionEnv.serverVersion,
+    features: { session_overview: versionEnv.overviewEnabled },
     enabled_connections: versionEnv.enabledConnections,
   }),
 }));
@@ -101,6 +103,7 @@ import {
 afterEach(() => {
   cleanup();
   versionEnv.enabledConnections = [];
+  versionEnv.overviewEnabled = false;
   copyTextMock.mockClear();
   createMcpMutate.mockClear();
   updateMcpMutate.mockClear();
@@ -411,6 +414,15 @@ describe("AgentInfoButton hover behavior", () => {
 });
 
 describe("AgentInfoButton session cost row", () => {
+  it("keeps configuration but moves usage out when the overview is enabled", () => {
+    versionEnv.overviewEnabled = true;
+    useChatStore.setState({ sessionCostUsd: 1.25 });
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_cost");
+    fireEvent.click(screen.getByRole("button", { name: "Agent details" }));
+    expect(screen.queryByTestId("agent-info-session-cost")).toBeNull();
+    expect(screen.queryByTestId("agent-info-usage-by-model")).toBeNull();
+    expect(screen.getByTestId("agent-info-session-id")).toHaveTextContent("conv_cost");
+  });
   // The per-session cost lives in the info popover (moved out of the
   // composer status line). It reads from the shared chat store, so reset
   // the field between cases to keep them independent.

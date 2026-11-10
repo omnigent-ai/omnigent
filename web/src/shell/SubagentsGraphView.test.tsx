@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import {
+  buildGraphLayout,
   buildTree,
   childActivity,
   computeSubtreeWidths,
@@ -492,6 +493,16 @@ describe("layoutTree", () => {
 // ===========================================================================
 
 describe("buildTree", () => {
+  it("carries each agent's own cost through the graph without adding descendants", () => {
+    const children = new Map<string, ChildSessionInfo[]>([
+      ["root", [childInfo({ id: "child", own_cost_usd: 1.25 })]],
+      ["child", [childInfo({ id: "grandchild", own_cost_usd: 3 })]],
+    ]);
+    const { nodes } = buildGraphLayout("root", "Main", "idle", "Idle", null, children, "root", 80);
+    expect(nodes.find((node) => node.id === "child")?.data.ownCostUsd).toBe(1.25);
+    expect(nodes.find((node) => node.id === "grandchild")?.data.ownCostUsd).toBe(3);
+    expect(nodes.find((node) => node.id === "child")?.position.y).toBe(110);
+  });
   it("creates a leaf when no children exist in the map", () => {
     const tree = buildTree("root", "main", "idle", "Idle", null, new Map(), 0);
     expect(tree).toEqual({

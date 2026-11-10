@@ -1,3 +1,6 @@
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { SubagentCost } from "./SubagentCost";
 // Subagents tab content for the right-side rail. Renders the session
 // tree under the root conversation — a "main" link back to the root,
 // then its sub-agent sessions recursively (children, grandchildren,
@@ -68,6 +71,7 @@ const PI_AGENT_NAME = "pi";
 type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
 
 interface SubagentsPanelProps {
+  active?: boolean;
   /** The conversation currently rendered in main. Used only to
    *  highlight the active row. */
   conversationId: string;
@@ -80,8 +84,14 @@ interface SubagentsPanelProps {
 
 type ViewMode = "list" | "graph";
 
-export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
-  const { children, isLoading, error } = useChildSessions(rootSessionId);
+export function SubagentsPanel({
+  conversationId,
+  rootSessionId,
+  active = true,
+}: SubagentsPanelProps) {
+  const overviewEnabled = isFeatureEnabled(useServerInfo(), "session_overview");
+  const pollMs = overviewEnabled && active ? 10_000 : undefined;
+  const { children, isLoading, error } = useChildSessions(rootSessionId, pollMs);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
@@ -123,7 +133,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             </div>
           }
         >
-          <SubagentsGraphView conversationId={conversationId} rootSessionId={rootSessionId} />
+          <SubagentsGraphView
+            conversationId={conversationId}
+            rootSessionId={rootSessionId}
+            active={active}
+          />
         </Suspense>
       </div>
     );
@@ -152,6 +166,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={toggleCollapsedRow}
+            pollMs={pollMs}
           />
         ))}
       </ul>
@@ -468,6 +483,7 @@ function SubagentRow({
   conversationId,
   collapsedRows,
   onToggleCollapsed,
+  pollMs,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
@@ -478,6 +494,7 @@ function SubagentRow({
   conversationId: string;
   collapsedRows: Record<string, boolean>;
   onToggleCollapsed: (id: string) => void;
+  pollMs?: number;
 }) {
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
@@ -493,7 +510,10 @@ function SubagentRow({
   // This child's own sub-agents, rendered as the next tree level.
   // Disabled (null id) at the depth cap so the fan-out of fetches is
   // bounded; ``useChildSessions`` skips the query entirely for null.
-  const { children: grandchildren } = useChildSessions(depth < MAX_TREE_DEPTH ? child.id : null);
+  const { children: grandchildren } = useChildSessions(
+    depth < MAX_TREE_DEPTH ? child.id : null,
+    collapsed ? undefined : pollMs,
+  );
   const hasGrandchildren = grandchildren.length > 0;
   const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
   return (
@@ -612,6 +632,7 @@ function SubagentRow({
                   </span>
                 ) : null}
               </div>
+              <SubagentCost costUsd={child.own_cost_usd} />
               {child.last_message_preview && (
                 <p className="mt-0.5 truncate text-sm text-muted-foreground">
                   {child.last_message_preview}
@@ -631,6 +652,7 @@ function SubagentRow({
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={onToggleCollapsed}
+            pollMs={pollMs}
           />
         ))}
     </>

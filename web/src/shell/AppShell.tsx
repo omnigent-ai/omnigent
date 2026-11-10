@@ -129,6 +129,8 @@ import {
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
+import { SessionOverview } from "./SessionOverview";
+import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import {
@@ -340,6 +342,9 @@ function AppShellImpl() {
   const navigateTo = useNavigate();
   const rebasePath = useRebasePath();
   const serverInfo = useServerInfo();
+  const overviewEnabled = isFeatureEnabled(serverInfo, "session_overview");
+  const [overviewTarget, setOverviewTarget] = useState<HTMLDivElement | null>(null);
+  const [overviewMeasure, setOverviewMeasure] = useState<HTMLDivElement | null>(null);
   const canvasMode =
     extensionId === undefined &&
     isCanvasPathname(location.pathname, rebasePath("/canvas")) &&
@@ -753,6 +758,7 @@ function AppShellImpl() {
     environmentQuery,
     showFilesPanel,
     changedCount,
+    changedFiles,
     isChangedPath,
   } = useWorkspaceResources({
     sessionId: serverConversationId,
@@ -2299,10 +2305,14 @@ function AppShellImpl() {
     setExecutionLogsKey(key);
   }
 
-  // Mobile FAB → "Files" / "Changes" both open the files drawer (mirroring the
-  // desktop rail's two tabs); the entry picks the scope the drawer opens in.
+  // Open the selected scope in the desktop workspace or mobile drawer.
   const openFilesDrawer = useCallback(
     (flatView: boolean) => {
+      if (!isMobileViewport()) {
+        handleRightRailTabChange(flatView ? "changes" : "files");
+        revealRightPanel();
+        return;
+      }
       setSelectedFilePath(null); // close file viewer
       clearFileViewerUrl();
       setPanelInitialKey(null); // close terminals panel
@@ -2315,14 +2325,18 @@ function AppShellImpl() {
       setFilesDrawerFlatView(flatView);
       setFilesPanelOpen(true);
     },
-    [clearFileViewerUrl, setPanelInitialKey],
+    [clearFileViewerUrl, setPanelInitialKey, handleRightRailTabChange, revealRightPanel],
   );
   const openFilesPanel = () => openFilesDrawer(false);
   const openChangesPanel = () => openFilesDrawer(true);
 
-  // Mobile FAB → "Agents" opens the subagents list (the desktop rail's
-  // Agents tab) as a full-screen drawer.
+  // Open the agent tree in the desktop workspace or mobile drawer.
   function openSubagentsPanel() {
+    if (!isMobileViewport()) {
+      handleRightRailTabChange("subagents");
+      revealRightPanel();
+      return;
+    }
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
     setPanelInitialKey(null); // close terminals panel
@@ -2800,8 +2814,51 @@ function AppShellImpl() {
                   } as CSSProperties
                 }
               >
+                {overviewEnabled && (
+                  <div
+                    ref={setOverviewMeasure}
+                    aria-hidden="true"
+                    className={cn(
+                      "pointer-events-none invisible absolute h-0 w-full",
+                      CHAT_COLUMN_WIDTH,
+                    )}
+                  />
+                )}
                 {!extensionOwnsHeader && (
                   <ChatHeader
+                    sessionOverview={
+                      overviewEnabled && serverConversationId ? (
+                        <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
+                          <SessionOverview
+                            key={serverConversationId}
+                            sessionId={serverConversationId}
+                            title={activeSession?.title ?? UNTITLED_CONVERSATION_LABEL}
+                            dockTarget={overviewTarget}
+                            chatWidthMeasure={overviewMeasure}
+                            dockAllowed={
+                              !rightPanelOpen &&
+                              !panelOpen &&
+                              !executionLogsOpen &&
+                              !filesPanelOpen &&
+                              !rightPanelMaximized &&
+                              !canvasMode &&
+                              !gridId &&
+                              !debugMode
+                            }
+                            workspaceUnavailable={
+                              environmentQuery.isError ||
+                              liveness.kind === "host_asleep" ||
+                              liveness.kind === "host_offline" ||
+                              liveness.kind === "local_stranded"
+                            }
+                            changedFiles={changedFiles}
+                            showChanges={showFilesPanel}
+                            onOpenChanges={openChangesPanel}
+                            onOpenAgents={openSubagentsPanel}
+                          />
+                        </SubagentPanelOpenerContext.Provider>
+                      ) : undefined
+                    }
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
                     // is a transient card floating over the collapsed layout (the
                     // docked sidebar stays w-0), so the header must keep its
@@ -2888,6 +2945,7 @@ function AppShellImpl() {
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
                 </GridSessionMain>
+                {overviewEnabled && <div ref={setOverviewTarget} className="flex shrink-0" />}
 
                 {/* Debug-mode execution-logs rail — desktop only, hidden when a
               push panel is open (the panel itself becomes the focus). Only
@@ -3086,7 +3144,7 @@ function AppShellImpl() {
             <Dialog open={agentInfoOpen} onOpenChange={setAgentInfoOpen}>
               <DialogContent>
                 <DialogHeader>
-                  <DialogTitle>Agent</DialogTitle>
+                  <DialogTitle>{overviewEnabled ? "Agent details" : "Agent"}</DialogTitle>
                   <DialogDescription className="sr-only">
                     Tools and policies configured for the active agent.
                   </DialogDescription>

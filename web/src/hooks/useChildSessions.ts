@@ -26,6 +26,8 @@ export interface ChildSessionError {
  * tolerated and ignored.
  */
 export interface ChildSessionInfo {
+  /** Recorded cost for this agent only, excluding descendants. */
+  own_cost_usd?: number | null;
   /** Child conversation/session identifier, e.g. ``"conv_child123"``. */
   id: string;
   /** Full title, ``"{tool}:{session_name}"``, e.g. ``"researcher:auth"``. */
@@ -70,6 +72,7 @@ export interface ChildSessionInfo {
  * model. Extra wire fields are silently ignored.
  */
 interface ChildSessionWire {
+  own_cost_usd?: number | null;
   id: string;
   title: string | null;
   task_summary?: string | null;
@@ -214,6 +217,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   // snapshot loads.
   for (const row of json.data) setSessionParent(row.id, sessionId);
   return json.data.map((row) => ({
+    own_cost_usd: row.own_cost_usd ?? null,
     id: row.id,
     title: row.title,
     task_summary: row.task_summary ?? null,

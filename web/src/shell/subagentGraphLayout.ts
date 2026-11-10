@@ -12,6 +12,7 @@ export interface AgentNodeData {
   sessionId: string;
   isActive: boolean;
   preview: string | null;
+  ownCostUsd?: number | null;
   [key: string]: unknown;
 }
 
@@ -21,6 +22,7 @@ export interface TreeNode {
   activity: AgentActivity;
   statusLabel: string;
   preview: string | null;
+  ownCostUsd?: number | null;
   children: TreeNode[];
 }
 
@@ -75,6 +77,7 @@ export function computeSubtreeWidths(node: TreeNode): Map<string, number> {
 export function layoutTree(
   root: TreeNode,
   activeId: string,
+  nodeHeight = NODE_HEIGHT,
 ): { nodes: LayoutNode[]; edges: LayoutEdge[] } {
   const subtreeWidths = computeSubtreeWidths(root);
   const nodes: LayoutNode[] = [];
@@ -92,12 +95,13 @@ export function layoutTree(
         sessionId: node.id,
         isActive: node.id === activeId,
         preview: node.preview,
+        ownCostUsd: node.ownCostUsd,
       },
     });
 
     if (node.children.length === 0) return;
 
-    const childY = y + NODE_HEIGHT + VERTICAL_GAP;
+    const childY = y + nodeHeight + VERTICAL_GAP;
     const totalChildrenWidth =
       node.children.reduce((sum, c) => sum + (subtreeWidths.get(c.id) ?? NODE_WIDTH), 0) +
       (node.children.length - 1) * HORIZONTAL_GAP;
@@ -172,16 +176,19 @@ export function buildTree(
                     child.title ??
                     child.tool ??
                     child.id);
-              return buildTree(
-                child.id,
-                label,
-                status.activity,
-                status.label,
-                child.last_message_preview,
-                childrenMap,
-                depth + 1,
-                visited,
-              );
+              return {
+                ...buildTree(
+                  child.id,
+                  label,
+                  status.activity,
+                  status.label,
+                  child.last_message_preview,
+                  childrenMap,
+                  depth + 1,
+                  visited,
+                ),
+                ownCostUsd: child.own_cost_usd,
+              };
             }),
   };
 }
@@ -194,6 +201,7 @@ export function buildGraphLayout(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   activeId: string,
+  nodeHeight = NODE_HEIGHT,
 ): { nodes: LayoutNode[]; edges: LayoutEdge[] } {
   const tree = buildTree(
     rootId,
@@ -204,5 +212,5 @@ export function buildGraphLayout(
     childrenMap,
     0,
   );
-  return layoutTree(tree, activeId);
+  return layoutTree(tree, activeId, nodeHeight);
 }

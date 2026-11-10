@@ -1,3 +1,5 @@
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -773,7 +775,7 @@ describe("SubagentsPanel", () => {
 
     renderPanel({ rootSessionId: "conv_root" });
 
-    expect(useChildSessionsMock).toHaveBeenCalledWith("conv_root");
+    expect(useChildSessionsMock).toHaveBeenCalledWith("conv_root", undefined);
     expect(useChildSessionsMock).not.toHaveBeenCalledWith("conv_root", expect.any(Number));
   });
 
@@ -1528,7 +1530,7 @@ describe("SubagentsPanel", () => {
     ).toEqual(["c1", "c2", "c3"]);
     // The depth-3 row's child query is disabled (null id) instead of
     // fetching c3's children.
-    expect(useChildSessionsMock).toHaveBeenCalledWith(null);
+    expect(useChildSessionsMock).toHaveBeenCalledWith(null, undefined);
     expect(useChildSessionsMock).not.toHaveBeenCalledWith("c3");
   });
 
@@ -1570,4 +1572,44 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "conv_grandchild").className.split(/\s+/)).toContain("bg-accent");
     expect(childRow(container, "conv_child").className.split(/\s+/)).not.toContain("bg-accent");
   });
+});
+
+it("shows each child cost when the overview flag is enabled", () => {
+  useChildSessionsMock.mockImplementation((id) => ({
+    children: id === "root" ? [childInfo({ id: "child", own_cost_usd: 1.25 })] : [],
+    isLoading: false,
+    error: null,
+  }));
+  useSessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
+  const view = render(
+    <MemoryRouter>
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { session_overview: true } }}
+      >
+        <SubagentsPanel conversationId="root" rootSessionId="root" />
+      </CapabilitiesProvider>
+    </MemoryRouter>,
+  );
+  expect(screen.getByLabelText("Agent cost: $1.25; excludes subagents")).toBeInTheDocument();
+  useChildSessionsMock.mockClear();
+  view.rerender(
+    <MemoryRouter>
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { session_overview: true } }}
+      >
+        <SubagentsPanel conversationId="root" rootSessionId="root" active={false} />
+      </CapabilitiesProvider>
+    </MemoryRouter>,
+  );
+  expect(useChildSessionsMock).toHaveBeenCalledWith("root", undefined);
+  expect(useChildSessionsMock).not.toHaveBeenCalledWith(expect.anything(), 10_000);
+
+  view.rerender(
+    <MemoryRouter>
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <SubagentsPanel conversationId="root" rootSessionId="root" />
+      </CapabilitiesProvider>
+    </MemoryRouter>,
+  );
+  expect(screen.queryByText("$1.25")).toBeNull();
 });

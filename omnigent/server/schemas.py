@@ -971,6 +971,9 @@ class ChildSessionSummary(BaseModel):
     routed_model: str | None = None
     routing_decision_id: str | None = None
     depth: int | None = None
+    own_cost_usd: float | None = Field(
+        default=None, description="Recorded cost for this agent only, excluding descendants."
+    )
 
 
 # ── Responses ───────────────────────────────────────────────────

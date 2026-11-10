@@ -46,6 +46,7 @@ export function useWorkspaceResources({
     environmentQuery,
     showFilesPanel: canBrowseWorkspace && environmentQuery.data?.available !== false,
     changedCount: changedFiles.data?.data.length ?? 0,
+    changedFiles,
     isChangedPath,
     terminals,
     agentTerminal,

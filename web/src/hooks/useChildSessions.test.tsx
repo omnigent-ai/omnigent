@@ -4,7 +4,7 @@ import type { PropsWithChildren } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { useChildSessions, useDescendantSession } from "./useChildSessions";
+import { fetchChildSessions, useChildSessions, useDescendantSession } from "./useChildSessions";
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
@@ -25,6 +25,21 @@ beforeEach(() => {
 });
 
 describe("useChildSessions", () => {
+  it("preserves zero, priced and missing own-agent costs", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          data: [
+            { id: "free", own_cost_usd: 0 },
+            { id: "priced", own_cost_usd: 1.25 },
+            { id: "older" },
+          ],
+        }),
+      ),
+    );
+    const children = await fetchChildSessions("parent");
+    expect(children.map((child) => child.own_cost_usd)).toEqual([0, 1.25, null]);
+  });
   it("does not fetch child sessions for a provisional conversation", () => {
     const { result } = renderHook(() => useChildSessions("temp:pending-create"), { wrapper });
 

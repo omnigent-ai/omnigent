@@ -1,3 +1,6 @@
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { SubagentCost } from "./SubagentCost";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NodeTypes, NodeProps, Node } from "@xyflow/react";
 import { ReactFlow, Background, Position, Handle, useReactFlow } from "@xyflow/react";
@@ -75,6 +78,7 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
           <span className="flex-1" />
           <NodeStatusDot activity={activity} />
         </div>
+        {data.ownCostUsd !== undefined && <SubagentCost costUsd={data.ownCostUsd} />}
         {preview && (
           <p className="mt-1 truncate text-[10px] leading-tight text-muted-foreground">{preview}</p>
         )}
@@ -131,12 +135,14 @@ function ChildCollector({
   parentId,
   depth,
   onCollected,
+  pollMs,
 }: {
   parentId: string;
   depth: number;
+  pollMs?: number;
   onCollected: (parentId: string, children: ChildSessionInfo[]) => void;
 }) {
-  const { children } = useChildSessions(depth < MAX_TREE_DEPTH ? parentId : null);
+  const { children } = useChildSessions(depth < MAX_TREE_DEPTH ? parentId : null, pollMs);
 
   useEffect(() => {
     onCollected(parentId, children);
@@ -151,6 +157,7 @@ function ChildCollector({
           parentId={child.id}
           depth={depth + 1}
           onCollected={onCollected}
+          pollMs={pollMs}
         />
       ))}
     </>
@@ -158,13 +165,20 @@ function ChildCollector({
 }
 
 interface SubagentsGraphViewProps {
+  active?: boolean;
   conversationId: string;
   rootSessionId: string;
 }
 
-export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsGraphViewProps) {
+export function SubagentsGraphView({
+  conversationId,
+  rootSessionId,
+  active = true,
+}: SubagentsGraphViewProps) {
   const { session } = useSession(rootSessionId);
-  const { children: rootChildren } = useChildSessions(rootSessionId);
+  const overviewEnabled = isFeatureEnabled(useServerInfo(), "session_overview");
+  const pollMs = overviewEnabled && active ? 10_000 : undefined;
+  const { children: rootChildren } = useChildSessions(rootSessionId, pollMs);
 
   const [childrenMap, setChildrenMap] = useState<Map<string, ChildSessionInfo[]>>(() => new Map());
 
@@ -206,8 +220,17 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
         null,
         childrenMap,
         conversationId,
+        overviewEnabled ? 80 : undefined,
       ),
-    [rootSessionId, rootLabel, rootActivity, rootStatusLabel, childrenMap, conversationId],
+    [
+      rootSessionId,
+      rootLabel,
+      rootActivity,
+      rootStatusLabel,
+      childrenMap,
+      conversationId,
+      overviewEnabled,
+    ],
   );
 
   const navigate = useNavigate();
@@ -261,6 +284,7 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
           parentId={child.id}
           depth={1}
           onCollected={handleCollected}
+          pollMs={pollMs}
         />
       ))}
     </div>

@@ -2213,7 +2213,11 @@ function WorkspacePanelImpl({
             </RenderErrorBoundary>
           ) : scopeView === "subagents" && rootSessionId ? (
             <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
-              <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+              <SubagentsPanel
+                conversationId={conversationId}
+                rootSessionId={rootSessionId}
+                active={open && !inert}
+              />
             </SubagentPanelOpenerContext.Provider>
           ) : scopeView === "empty" ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">

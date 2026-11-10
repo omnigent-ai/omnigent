@@ -225,6 +225,24 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     assert row["pending_elicitations_count"] == 0
     # Set only by ``?descendants=true``; clients use it to tell the modes apart.
     assert row["depth"] is None
+    assert row["own_cost_usd"] is None
+
+
+@pytest.mark.parametrize("cost", [0.0, 0.004, 1.25])
+async def test_child_sessions_cost_excludes_descendants(
+    client: httpx.AsyncClient, db_uri: str, cost: float
+) -> None:
+    """Child cards report their own priced usage, including a genuine zero."""
+    session = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(conv_store=store, parent_id=session["id"], title="worker:task")
+    grandchild = _seed_child(conv_store=store, parent_id=child.id, title="worker:nested")
+    store.set_session_usage(child.id, {"total_cost_usd": cost})
+    store.set_session_usage(grandchild.id, {"total_cost_usd": 10.0})
+
+    response = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    assert response.status_code == 200
+    assert response.json()["data"][0]["own_cost_usd"] == cost
 
 
 async def test_child_sessions_surfaces_durable_failure_error(

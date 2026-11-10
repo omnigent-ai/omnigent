@@ -40,6 +40,7 @@ class Feature(StrEnum):
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
+    SESSION_OVERVIEW = "session_overview"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
@@ -58,6 +59,12 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.SESSION_OVERVIEW,
+        description="Session overview with usage, subagents and workspace changes",
+        owner="web",
+        review_by_release="0.24.0",
+    ),
     FeatureDefinition(
         feature=Feature.CODEX_PLAN_AT_LAUNCH,
         description="Start Codex in Plan mode with host compatibility checks",

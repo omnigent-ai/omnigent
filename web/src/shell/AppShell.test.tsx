@@ -803,6 +803,37 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("AppShell session overview", () => {
+  it.each([false, true])(
+    "gates the header and opens the existing Agents workspace (enabled=%s)",
+    (enabled) => {
+      const baseMatchMedia = window.matchMedia;
+      const media = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...baseMatchMedia(query),
+        matches: query === "(min-width: 768px)",
+      }));
+      onTestFinished(() => media.mockRestore());
+      writeWorkspacePanelDefault("collapsed");
+      mockConversations([{ id: "conv_overview", permission_level: null }]);
+      renderShell("/c/conv_overview", serverInfo({ features: { session_overview: enabled } }));
+      const trigger = screen.queryByRole("button", { name: /Session overview, cost/ });
+      if (!enabled) {
+        expect(trigger).toBeNull();
+        return;
+      }
+      fireEvent.click(trigger!);
+      expect(screen.getByText("Includes subagents")).toBeInTheDocument();
+      fireEvent.click(screen.getByText("View all agents →"));
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: /Agents/ })).toHaveAttribute("aria-selected", "true");
+      expect(screen.queryByText("Includes subagents")).toBeNull();
+      fireEvent.click(trigger!);
+      fireEvent.click(screen.getByText("View changes →"));
+      expect(screen.getByRole("tab", { name: /Changes/ })).toHaveAttribute("aria-selected", "true");
+    },
+  );
+});
+
 describe("AppShell header", () => {
   it("renders the sidebar toggle on all pages", () => {
     mockConversations([]);

@@ -1,3 +1,6 @@
+import type { ReactNode } from "react";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { isIndentedSibling } from "@/lib/sessionFamilies";
 import {
   ArrowLeftIcon,
@@ -131,6 +134,7 @@ interface MobileSessionMenuProps {
  * stays in one place.
  */
 interface ChatHeaderProps {
+  sessionOverview?: ReactNode;
   /** Whether the left sidebar is open (hides the open-sidebar button). */
   sidebarOpen: boolean;
   /** Open the left sidebar. */
@@ -335,6 +339,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
  * All state lives in AppShell — this is a pure presentational component.
  */
 export function ChatHeader({
+  sessionOverview,
   sidebarOpen,
   onOpenSidebar,
   settingsMode = false,
@@ -369,6 +374,7 @@ export function ChatHeader({
   mobileMenu,
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
+  const overviewEnabled = isFeatureEnabled(useServerInfo(), "session_overview");
   const canvas = useCanvasWorkspace();
   const { trackClick } = useOmnigentAnalytics();
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
@@ -649,6 +655,7 @@ export function ChatHeader({
             the three-dot "Session actions" menu below. Fork is also
             available from the session menus and assistant messages. */}
         {pending && <PendingHeaderActions isMobile={isMobile} />}
+        {!pending && sessionOverview}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {!pending && conversationId && (
@@ -776,7 +783,7 @@ export function ChatHeader({
                     className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <InfoIcon className="size-4" />
-                    Agent info
+                    {overviewEnabled ? "Agent details" : "Agent info"}
                   </DropdownMenuItem>
                 )}
                 {hasHeaderMenu && workspaceItems && <DropdownMenuSeparator />}

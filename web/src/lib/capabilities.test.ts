@@ -201,6 +201,18 @@ describe("resolveServerInfo sandbox_providers", () => {
 });
 
 describe("resolveServerInfo release features", () => {
+  it("keeps the overview off while server info is unavailable", async () => {
+    const { isFeatureEnabled, FALLBACK_SERVER_INFO } = await import("./capabilities");
+    expect(isFeatureEnabled("loading", "session_overview")).toBe(false);
+    expect(isFeatureEnabled(FALLBACK_SERVER_INFO, "session_overview")).toBe(false);
+  });
+
+  it.each([undefined, false, true])("reads the overview release flag: %s", async (enabled) => {
+    const { isFeatureEnabled } = await import("./capabilities");
+    const parsed = await probe({ features: { session_overview: enabled } });
+    expect(isFeatureEnabled(parsed, "session_overview")).toBe(enabled === true);
+  });
+
   it("keeps boolean feature values and drops malformed entries", async () => {
     const parsed = await probe({
       features: {
@@ -225,6 +237,7 @@ describe("resolveServerInfo release features", () => {
     expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
     expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
     expect(isFeatureEnabled(parsed, "canvas")).toBe(false);
+    expect(isFeatureEnabled(parsed, "session_overview")).toBe(false);
   });
 
   it("falls back to the legacy harness field from an older server", async () => {
