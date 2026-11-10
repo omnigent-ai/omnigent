@@ -591,6 +591,8 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
             received.append(
                 (request.url.params.get("include_archived"), request.url.params.get("visibility"))
             )
+            if len(received) == 1:
+                return httpx.Response(503)
             return _server_page(request, rows)
         raise AssertionError(f"unexpected path {request.url.path}")
 
@@ -608,7 +610,10 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
                 )
             )
 
-        first = await call({"limit": 100, "include_archived": True})
+        failed = await call({"limit": 100, "include_archived": True})
+        first = await call(
+            {"limit": 100, "include_archived": True, "cursor": failed["page"]["next_cursor"]}
+        )
         cursor = first["page"]["next_cursor"]
         second = await call({"limit": 100, "include_archived": True, "cursor": cursor})
         mismatched = await call({"limit": 100, "cursor": cursor})
@@ -623,14 +628,17 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
             }
         )
 
+    assert failed["sessions"] == []
     assert received == [
+        ("true", expected_visibility),
         ("true", expected_visibility),
         ("true", expected_visibility),
         (None, "mine"),
         ("true", "all"),
         ("true", "all"),
     ]
-    # Only the first page of an owned archive listing checks the server's capability.
+    # Only the first page of an owned archive listing checks the server's capability,
+    # including when its sessions read fails and is retried from the cursor.
     assert len(info_requests) == 1
     assert first["sessions"][0] == {
         "session_id": "conv_0000",
