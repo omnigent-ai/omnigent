@@ -60,16 +60,38 @@ export function useSandboxProfileCatalog(
   const unpicked = required && explicit === null && provider !== null;
   // With nothing picked, start on the profile last launched here while the provider still
   // lists it, else on the provider's default. Either may be beyond the first page. The
-  // remembered one is only a preference, so failing to find it falls back too.
+  // remembered one is only a preference: it is used once the same by-id check a selection
+  // gets passes, and failing to find or check it falls back to the default.
   const remembered = useProfileById(provider, profiles, unpicked ? rememberedProfileId : null);
+  const rememberedCheck = useQuery({
+    queryKey: [
+      ...SANDBOX_PROFILES_QUERY_KEY,
+      provider,
+      "selected",
+      remembered.profile?.id,
+      remembered.profile?.revision,
+    ],
+    queryFn: ({ signal }) =>
+      fetchSandboxProfiles(provider ?? undefined, { profileId: remembered.profile?.id, signal }),
+    enabled: remembered.profile !== undefined,
+    staleTime: 30_000,
+    retry: false,
+  });
+  const rememberedRejected =
+    remembered.profile !== undefined &&
+    (rememberedCheck.isError ||
+      (rememberedCheck.isSuccess &&
+        rememberedCheck.data.profiles.find(
+          (p) => p.id === remembered.profile?.id && p.provider === provider,
+        )?.revision !== remembered.profile.revision));
   const defaultProfileId =
     unpicked &&
     provider !== null &&
-    (rememberedProfileId === null || remembered.missing || remembered.failed)
+    (rememberedProfileId === null || remembered.missing || remembered.failed || rememberedRejected)
       ? (query.data?.default_profile_ids?.[provider] ?? null)
       : null;
   const fallback = useProfileById(provider, profiles, defaultProfileId);
-  const preferred = remembered.profile ?? fallback.profile;
+  const preferred = (rememberedRejected ? undefined : remembered.profile) ?? fallback.profile;
   const selection: SandboxProfileSelection | null =
     explicit ??
     (unpicked && preferred !== undefined

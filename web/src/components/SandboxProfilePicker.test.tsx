@@ -157,6 +157,29 @@ it("falls back to the provider default when looking up the last launched profile
   );
 });
 
+it.each([
+  ["fails", () => Promise.reject(new Error("check failed"))],
+  ["no longer lists it", null],
+])(
+  "falls back to the provider default when checking a listed last launched profile %s",
+  async (_case, check) => {
+    defaults = { company: "profile-3" };
+    const listPage = vi.mocked(fetchSandboxProfiles).getMockImplementation()!;
+    vi.mocked(fetchSandboxProfiles).mockImplementation(async (provider, options) => {
+      if (options?.profileId !== "profile-5") return listPage(provider, options);
+      if (check) return check();
+      return { profiles: [], managed_providers: ["company"], next_cursor: null };
+    });
+    mount(null, "profile-5");
+    expect(
+      await screen.findByRole("button", { name: "Sandbox profile: Build profile 3" }),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Start" })).toHaveProperty("disabled", false),
+    );
+  },
+);
+
 it("launches the last launched profile on its current revision", async () => {
   available = rows.map((p) => (p.id === "profile-5" ? { ...p, revision: "v2" } : p));
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
