@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from email.message import Message
 from pathlib import Path
 
 import pytest
@@ -198,6 +201,7 @@ def real_catalog_loader(
     monkeypatch.setattr(_providers_mod, "_fetch_provider_catalog", _REAL_FETCH_PROVIDER_CATALOG)
     monkeypatch.setattr(_providers_mod, "_catalog_cache_root", lambda: tmp_path)
     monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    monkeypatch.setattr(_providers_mod, "_catalog_download_failed_at", None)
     _providers_mod._catalog_cache.clear()
     return tmp_path
 
@@ -465,6 +469,51 @@ def test_provider_catalog_uses_stale_disk_only_after_live_failure(
     assert "provider=anthropic" in caplog.text
     assert "source=https://github.com/" in caplog.text
     assert (real_catalog_loader / "anthropic.json").is_file()
+
+
+def test_provider_catalog_skips_network_briefly_after_unreachable_download(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable host costs one timeout, and skipped providers recover after it."""
+    del real_catalog_loader
+    attempts: list[str] = []
+    reachable = False
+
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(_FAKE_CATALOG["anthropic"]).encode()
+
+    def _urlopen(url: str, timeout: float) -> _Response:
+        attempts.append(url)
+        if "fireworks_ai" in url:
+            raise urllib.error.HTTPError(url, 404, "Not Found", Message(), None)
+        if not reachable:
+            raise TimeoutError("timed out")
+        return _Response()
+
+    monkeypatch.setattr(_providers_mod.urllib.request, "urlopen", _urlopen)
+
+    # A missing file for one provider does not stop the others.
+    assert _REAL_FETCH_PROVIDER_CATALOG("fireworks_ai") == {}
+    assert _REAL_FETCH_PROVIDER_CATALOG("openai") == {}
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == {}
+    assert len(attempts) == 2
+
+    reachable = True
+    monkeypatch.setattr(
+        _providers_mod,
+        "_catalog_download_failed_at",
+        time.monotonic() - _providers_mod._CATALOG_DOWNLOAD_BACKOFF_SECONDS - 1,
+    )
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == _FAKE_CATALOG["anthropic"]
+    assert len(attempts) == 3
 
 
 def test_provider_catalog_rejects_over_age_cache(
