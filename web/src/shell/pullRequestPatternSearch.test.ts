@@ -109,6 +109,7 @@ describe("searchPatternInWorker", () => {
     worker.reply({ started: true });
     worker.reply({ matches: [{ index: 1, start: 0, end: 6 }], truncated: false, invalid: false });
 
+    expect(vi.getTimerCount()).toBe(0);
     await expect(result).resolves.toBeNull();
     expect(worker.terminated).toBe(true);
   });
@@ -175,6 +176,7 @@ describe("searchPatternInWorker", () => {
     worker.reply({ matches: [], truncated: false, invalid: false });
 
     await expect(result).resolves.toEqual({ ...NO_MATCHES, failed: true });
+    expect(vi.getTimerCount()).toBe(0);
     vi.advanceTimersByTime(PATTERN_TIME_BUDGET_MS);
     await expect(result).resolves.toEqual({ ...NO_MATCHES, failed: true });
   });
@@ -187,5 +189,6 @@ describe("searchPatternInWorker", () => {
     worker.reply({ matches: [], truncated: false, invalid: false });
 
     await expect(result).resolves.toEqual({ ...NO_MATCHES, tooSlow: true });
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

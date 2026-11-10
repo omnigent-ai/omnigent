@@ -66,7 +66,7 @@ export function useFindSearch(
           setSettled({ run, search: { ...FAILED, searching: false } });
       },
     );
-    // Typing a new pattern stops the previous worker, so a runaway pattern can't keep running.
+    // Abort on any input change or unmount so a runaway pattern stops.
     return () => controller.abort();
   }, [run, corpus, query, matchCase, runsInWorker]);
 
