@@ -27,6 +27,8 @@ export interface AppShellOverlaysProps {
   allConversations: Conversation[] | undefined;
   serverConversationId: string | undefined;
   updateOverlayHeight: number;
+  /** Opens Go to File for the routed session's workspace; absent when there's none. */
+  onGoToFile?: () => void;
 }
 
 /**
@@ -46,6 +48,7 @@ export function AppShellOverlays({
   allConversations,
   serverConversationId,
   updateOverlayHeight,
+  onGoToFile,
 }: AppShellOverlaysProps) {
   return (
     <>
@@ -74,6 +77,7 @@ export function AppShellOverlays({
         onToggleLeftSidebar={toggleLeftSidebar}
         onToggleRightSidebar={toggleRightPanel}
         rightSidebarShortcutEnabled={!gridRoute}
+        onGoToFile={onGoToFile}
       />
       <RecentSessionsSwitcher
         conversations={allConversations}

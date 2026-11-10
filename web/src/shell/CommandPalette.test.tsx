@@ -255,6 +255,20 @@ describe("CommandPalette — sessions", () => {
     expect(chordsFor("Toggle workspace sidebar")).toEqual([]);
   });
 
+  it("offers Go to File only when given, and closes before opening it", () => {
+    renderPalette();
+    expect(screen.queryByText("Go to File…")).toBeNull();
+    cleanup();
+
+    const order: string[] = [];
+    const onGoToFile = vi.fn(() => order.push("go-to-file"));
+    const onOpenChange = vi.fn((open: boolean) => order.push(`open:${open}`));
+    renderPalette({ onGoToFile, onOpenChange });
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "file" } });
+    fireEvent.click(screen.getByText("Go to File…"));
+    expect(order).toEqual(["open:false", "go-to-file"]);
+  });
+
   it("lists sessions by display label with their agent type", () => {
     setSessions([conv("c1", "Fix the parser", "research-agent"), conv("c2", null)]);
     renderPalette();
