@@ -498,6 +498,8 @@ _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
 _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 # What :func:`_occupying_surface` reports when no input box is drawn.
 _OVERLAY_SURFACE = "an overlay"
+_DETAILED_TRANSCRIPT_SURFACE = "the detailed transcript view"
+_DETAILED_TRANSCRIPT_FOOTER = "showingdetailedtranscript·ctrl+ototoggle·?forshortcuts"
 # What :func:`_occupying_surface` reports when the box is in ``!`` shell mode.
 _SHELL_MODE_SURFACE = "shell mode"
 # What :func:`_occupying_surface` reports when a draft taller than the pane
@@ -6735,7 +6737,9 @@ def claude_pane_input_box_shown(pane: str) -> bool:
     :param pane: Captured pane text, e.g. the watcher's last capture.
     :returns: ``False`` when a dialog or picker replaces the input box.
     """
-    return _composer_box(pane) is not None or _history_search_overlay_shown(pane)
+    return not _detailed_transcript_view_shown(pane) and (
+        _composer_box(pane) is not None or _history_search_overlay_shown(pane)
+    )
 
 
 def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
@@ -7040,6 +7044,9 @@ def _restore_occupied_input(
     the pane, which scrolls the box's glyph row out of view
     (:func:`_scrolled_draft_rows`).
 
+    The detailed transcript view uses Ctrl+O instead of Escape. Toggle it
+    once after two matching captures; repeating it could reopen the view.
+
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
     startup dialogs whose Escape quits Claude Code instead of closing them
@@ -7049,7 +7056,7 @@ def _restore_occupied_input(
     it once with Ctrl+L before any edit keys can erase its identifying prefix,
     then check the actual composer and pending prompts again.
 
-    Escape is only sent while the surface is verifiably on screen —
+    Dismissal keys are only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
     in-flight turn. A screen with no input box counts only when it
     advertises Escape as its dismissal; before Claude Code draws its input
@@ -7083,6 +7090,8 @@ def _restore_occupied_input(
     confirmed = False
     unclearable_seen = False
     notice_redrawn = False
+    transcript_view_seen = False
+    transcript_toggled = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(
@@ -7098,6 +7107,9 @@ def _restore_occupied_input(
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
             return None
         surface = _occupying_surface(pane)
+        if transcript_toggled and not pane.strip():
+            # A torn capture cannot confirm that the toggled view closed.
+            surface = _DETAILED_TRANSCRIPT_SURFACE
         delivery_diagnostics.record_restore_observation(pane=pane, surface=surface)
         box = _composer_box(pane)
         if (
@@ -7132,6 +7144,13 @@ def _restore_occupied_input(
             # can misreport during a repaint. A real surface is still there a
             # poll later; a repaint artifact is not.
             confirmed = True
+        elif surface == _DETAILED_TRANSCRIPT_SURFACE:
+            if transcript_view_seen and not transcript_toggled:
+                _logger.info("claude-native: leaving the detailed transcript view")
+                delivery_diagnostics.record_restore_action("transcript_toggle")
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-o")
+                # Repeating a toggle against a stale capture would reopen the view.
+                transcript_toggled = True
         elif unclearable:
             # Give it up only on two consecutive hint-less sightings, so a
             # torn frame mid-redraw of a dismissible surface does not hand a
@@ -7157,6 +7176,7 @@ def _restore_occupied_input(
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             last_escape = now
         unclearable_seen = unclearable
+        transcript_view_seen = surface == _DETAILED_TRANSCRIPT_SURFACE
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
@@ -7200,6 +7220,8 @@ def _occupying_surface(pane: str) -> str | None:
     """
     if not pane.strip():
         return None
+    if _detailed_transcript_view_shown(pane):
+        return _DETAILED_TRANSCRIPT_SURFACE
     if _history_search_footer_shown(pane):
         return "the prompt-history search"
     row = _composer_row(pane)
@@ -7518,7 +7540,17 @@ def _claude_prompt_rendered(pane: str) -> bool:
     row = _composer_row(pane)
     if row is None or not row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return False
-    return not _history_search_footer_shown(pane)
+    return not _history_search_footer_shown(pane) and not _detailed_transcript_view_shown(pane)
+
+
+def _detailed_transcript_view_shown(pane: str) -> bool:
+    """Match the view's complete footer below its last rule, including wrapped text."""
+    lines = pane.splitlines()
+    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
+    if last_rule is None:
+        return False
+    footer = "".join("".join(lines[last_rule + 1 :]).split()).lower()
+    return footer in {_DETAILED_TRANSCRIPT_FOOTER, _DETAILED_TRANSCRIPT_FOOTER + "verbose"}
 
 
 def _history_search_footer_shown(pane: str) -> bool:
@@ -7960,11 +7992,17 @@ def _wait_for_claude_prompt_ready(
         if _claude_prompt_rendered(pane):
             return
         remaining = hard_deadline - time.monotonic()
+        occupying_surface = _occupying_surface(pane)
         if (
             bridge_dir is not None
             and remaining > 0
-            and _occupying_surface(pane) == _OVERLAY_SURFACE
-            and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+            and (
+                occupying_surface == _DETAILED_TRANSCRIPT_SURFACE
+                or (
+                    occupying_surface == _OVERLAY_SURFACE
+                    and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+                )
+            )
             and _terminal_dialog_headline(pane) is None
             and not _escape_quits_claude(pane)
         ):
