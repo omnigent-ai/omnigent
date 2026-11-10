@@ -1458,14 +1458,25 @@ def _load_agent_spec_bundle(
     dest = _agent_cache_dest(spec_cache_root, agent_id, f"{version}-{digest}")
     # An older runner may not support sub-agents validated by a newer server.
     try:
-        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+        spec = load(
+            dest,
+            expand_env=expand_env,
+            enforce_handler_allowlist=not expand_env,
+            prune_invalid_sub_agents=True,
+        )
     except Exception:  # noqa: BLE001 — the downloaded bundle must validate before replacement
         # Cached files can be missing, truncated, or malformed. Validate the
         # downloaded bundle privately before replacing any cached files.
         spec_cache_root.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(prefix=".spec-", dir=spec_cache_root) as staging_dir:
             staging = Path(staging_dir)
-            load(resp.content, dest=staging, expand_env=expand_env, prune_invalid_sub_agents=True)
+            load(
+                resp.content,
+                dest=staging,
+                expand_env=expand_env,
+                enforce_handler_allowlist=not expand_env,
+                prune_invalid_sub_agents=True,
+            )
             if dest.exists():
                 shutil.rmtree(dest)
                 _logger.warning(
@@ -1474,7 +1485,12 @@ def _load_agent_spec_bundle(
                     extra={"session_id": session_id},
                 )
             staging.rename(dest)
-        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+        spec = load(
+            dest,
+            expand_env=expand_env,
+            enforce_handler_allowlist=not expand_env,
+            prune_invalid_sub_agents=True,
+        )
     spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
     # Older servers send no header; keep the tools there, as before.
     if resp.headers.get(AUTOMATIONS_HEADER) == "0":

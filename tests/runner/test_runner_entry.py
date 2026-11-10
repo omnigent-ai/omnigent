@@ -4164,3 +4164,48 @@ async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path
     ]
     assert len({result.workdir for result in results}) == 1
     assert "registry" not in (results[0].workdir / "config.yaml").read_text()
+
+
+_UNREGISTERED_HANDLER_CONFIG = (
+    "spec_version: 1\nname: handler-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    "guardrails:\n  policies:\n    custom_gate:\n      type: function\n      on: [tool_call]\n"
+    "      function:\n        path: example_org.policies.custom_gate\n        arguments: {}\n"
+)
+
+
+async def test_resolve_agent_spec_rejects_unregistered_handler_in_tenant_bundle(
+    tmp_path: Path,
+) -> None:
+    """A session-scoped (tenant) bundle may not name an unregistered policy handler."""
+    bundle = bundle_files({"config.yaml": _UNREGISTERED_HANDLER_CONFIG.encode()})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        with pytest.raises(OmnigentError, match="not a registered policy handler"):
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_tenant", session_id="conv_test"
+            )
+
+
+async def test_resolve_agent_spec_keeps_custom_handler_for_operator_bundle(
+    tmp_path: Path,
+) -> None:
+    """An operator-authored bundle keeps its custom handlers."""
+    bundle = bundle_files({"config.yaml": _UNREGISTERED_HANDLER_CONFIG.encode()})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, content=bundle, headers={"X-Agent-Session-Scoped": "false"}
+            )
+        ),
+        base_url="http://server.test",
+    ) as client:
+        resolved = await _resolve_agent_spec_from_server(
+            client, _AgentSpecCache(tmp_path), "ag_operator", session_id="conv_test"
+        )
+
+    assert resolved is not None
+    assert resolved.spec.name == "handler-agent"
