@@ -704,12 +704,20 @@ describe("row actions", () => {
 
   it("duplicates a task via the row menu and confirms the paused copy", () => {
     setTasks([task({ id: "st_1" })]);
-    renderPage();
+    renderPage("/tasks", "", { ...TRIGGER_INFO, scheduled_task_duplicate: true });
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     fireEvent.click(screen.getByTestId("task-duplicate"));
     expect(duplicateMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
     duplicateMutate.mock.calls[0][1].onSuccess(task({ id: "st_2", name: "copy name" }));
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining("copy name"));
+  });
+
+  it("leaves Duplicate out of the row menu on a server that can't duplicate", () => {
+    setTasks([task({ id: "st_1" })]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-duplicate")).toBeNull();
   });
 });
 

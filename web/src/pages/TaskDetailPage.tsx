@@ -221,6 +221,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const info = useServerInfo();
   const { data: projects } = useProjects({ enabled: task?.projectId != null });
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
+  // Older servers lack the duplicate route, so the header leaves the button out.
+  const duplicateSupported = info !== "loading" && info.scheduled_task_duplicate === true;
   const agent = agents?.find((candidate) => candidate.id === task?.agentId);
   const agentLabel = agent?.display_name ?? task?.agentId ?? "";
   const agentHarness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent?.harness;
@@ -386,16 +388,18 @@ function TaskDetail({ taskId }: { taskId: string }) {
           >
             <PencilIcon className="size-4" />
           </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Duplicate automation"
-            data-testid="task-detail-duplicate"
-            disabled={busy}
-            onClick={handleDuplicate}
-          >
-            <CopyIcon className="size-4" />
-          </Button>
+          {duplicateSupported && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Duplicate automation"
+              data-testid="task-detail-duplicate"
+              disabled={busy}
+              onClick={handleDuplicate}
+            >
+              <CopyIcon className="size-4" />
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon-sm"

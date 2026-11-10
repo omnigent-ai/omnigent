@@ -3211,6 +3211,32 @@ async def test_a_running_sessions_newest_reply_stays_out_of_the_copy(
     assert resp.status_code == 200, resp.text
     assert _item_texts(db_uri, resp.json()["source_session_id"])[-1] == last_copied
 
+    # Duplicating copies the automation's own source copy, which can also be mid-turn.
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=_session_with_history(db_uri)),
+            headers=_headers(),
+        )
+    ).json()
+    copy_id = original["source_session_id"]
+    store.append(
+        copy_id,
+        [
+            _message("user", "resp_3", "and the next turn"),
+            _message("assistant", "resp_3", "checking the next one"),
+            _message("assistant", "resp_3", "all fixed"),
+        ],
+    )
+    store.set_session_live_status(copy_id, live_status)
+
+    duplicated = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/duplicate", headers=_headers()
+    )
+
+    assert duplicated.status_code == 200, duplicated.text
+    assert _item_texts(db_uri, duplicated.json()["source_session_id"])[-1] == last_copied
+
 
 async def test_a_source_session_must_be_the_owners_top_level_session(
     auth_client: httpx.AsyncClient, db_uri: str

@@ -65,7 +65,8 @@ export function ScheduledTaskRow({
   // props — one ticker for the whole list, and deterministic in tests.
   now: Date;
   onEdit: (task: ScheduledTask) => void;
-  onDuplicate: (task: ScheduledTask) => void;
+  // Omitted when the server can't duplicate, which hides the action.
+  onDuplicate?: (task: ScheduledTask) => void;
   onPauseToggle: (task: ScheduledTask) => void;
   onRunNow: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
@@ -260,7 +261,7 @@ function TaskMenuItems({
   paused: boolean;
   triggerMode: boolean;
   onEdit: (task: ScheduledTask) => void;
-  onDuplicate: (task: ScheduledTask) => void;
+  onDuplicate?: (task: ScheduledTask) => void;
   onPauseToggle: (task: ScheduledTask) => void;
   onRunNow: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
@@ -290,16 +291,18 @@ function TaskMenuItems({
         <PencilIcon className="size-4" />
         Edit
       </Item>
-      <Item
-        onSelect={() => {
-          trackClick("tasks.scheduled.duplicate", "button");
-          onDuplicate(task);
-        }}
-        data-testid="task-duplicate"
-      >
-        <CopyIcon className="size-4" />
-        Duplicate
-      </Item>
+      {onDuplicate && (
+        <Item
+          onSelect={() => {
+            trackClick("tasks.scheduled.duplicate", "button");
+            onDuplicate(task);
+          }}
+          data-testid="task-duplicate"
+        >
+          <CopyIcon className="size-4" />
+          Duplicate
+        </Item>
+      )}
       <Item
         onSelect={() => {
           trackClick("tasks.scheduled.pause_resume", "button");

@@ -838,8 +838,12 @@ def create_scheduled_tasks_router(
                 "The session this automation starts from no longer exists",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # The copy can be mid-turn, so leave its in-progress reply out as create does.
         up_to = await asyncio.to_thread(
-            last_finished_response_id, conversation_store, conv.id, running=False
+            last_finished_response_id,
+            conversation_store,
+            conv.id,
+            running=_session_status_from_cache(conv.id, conv.live_status) == "running",
         )
         if up_to is None:
             raise OmnigentError(

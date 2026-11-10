@@ -341,6 +341,9 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
+    # POST /v1/scheduled-tasks/{id}/duplicate; absent on older servers, which
+    # clients treat as unsupported.
+    scheduled_task_duplicate: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -3735,6 +3738,7 @@ def create_app(
                 },
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
+                "scheduled_task_duplicate": True,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),

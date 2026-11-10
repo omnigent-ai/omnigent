@@ -88,6 +88,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     info !== "loading" &&
     info.scheduled_task_session_modes === true &&
     isFeatureEnabled(info, "session_orchestration");
+  // Older servers lack the duplicate route, so the row menus leave it out.
+  const duplicateSupported = info !== "loading" && info.scheduled_task_duplicate === true;
   // Workers' links are posted outside Omnigent, so they go through the same
   // share-link path as the Share dialog, host transform included.
   const rebasePath = useRebasePath();
@@ -403,7 +405,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   now={now}
                   busy={busyId === task.id}
                   onEdit={handleEdit}
-                  onDuplicate={handleDuplicate}
+                  onDuplicate={duplicateSupported ? handleDuplicate : undefined}
                   onPauseToggle={handlePauseToggle}
                   onRunNow={handleRunNow}
                   onDelete={handleDelete}

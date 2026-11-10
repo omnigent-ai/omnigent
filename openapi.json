@@ -6557,6 +6557,11 @@
             "title": "Scheduled Task Approval Skipping Modes",
             "type": "boolean"
           },
+          "scheduled_task_duplicate": {
+            "default": false,
+            "title": "Scheduled Task Duplicate",
+            "type": "boolean"
+          },
           "scheduled_task_harness_settings": {
             "default": true,
             "title": "Scheduled Task Harness Settings",

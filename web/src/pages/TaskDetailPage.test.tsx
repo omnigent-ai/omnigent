@@ -794,11 +794,26 @@ describe("header actions", () => {
       (_id: string, opts?: { onSuccess?: (copy: ScheduledTask) => void }) =>
         opts?.onSuccess?.(task({ id: "st_2", name: "nightly (copy)", state: "paused" })),
     );
-    renderPage();
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_duplicate: true }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
     fireEvent.click(screen.getByTestId("task-detail-duplicate"));
     expect(duplicateMutate).toHaveBeenCalledWith("st_1", expect.anything());
     expect(navigate).toHaveBeenCalledWith("/tasks/st_2");
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining("nightly (copy)"));
+  });
+
+  it("hides duplicate on a server that can't duplicate", () => {
+    setTask(task());
+    render(
+      <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>{pageTree()}</CapabilitiesProvider>,
+    );
+    expect(screen.getByTestId("task-detail-edit")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-detail-duplicate")).toBeNull();
   });
 
   it("edit opens the reused create dialog in edit mode", () => {
