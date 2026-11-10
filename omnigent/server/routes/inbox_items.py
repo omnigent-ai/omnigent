@@ -18,7 +18,6 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from omnigent.db.db_models import INBOX_ITEMS_PER_SESSION
 from omnigent.entities import InboxItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
@@ -36,6 +35,7 @@ from omnigent.server.routes._agent_origin import require_agent_origin
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.inbox_item_store import (
+    INBOX_ITEMS_PER_SESSION,
     DuplicateInboxItemError,
     InboxItemStore,
     InboxItemTooLargeError,

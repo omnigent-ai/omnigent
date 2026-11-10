@@ -31,8 +31,8 @@ from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from omnigent.db.bounded_binary import BoundedBinary
 from omnigent.db.compression import CompressedText
+from omnigent.db.envelope import EnvelopedJSON
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
@@ -1821,11 +1821,13 @@ class SqlInboxItem(OmnigentBase):
     # What the agent posted, which a deployment may encrypt, as one storage
     # envelope: {"kind", "title", "body_md", "links", "actions", "topic",
     # "primary_link", "media"}. Always read and written together.
-    content: Mapped[bytes] = mapped_column(BoundedBinary(_INBOX_MAX_STORED_BYTES), nullable=False)
+    content: Mapped[dict[str, Any]] = mapped_column(
+        EnvelopedJSON(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=False
+    )
     # How the owner answered, in its own envelope since it is written alone:
     # {"reason", "action", "text"}. NULL until the owner answers.
-    resolution: Mapped[bytes | None] = mapped_column(
-        BoundedBinary(_INBOX_MAX_STORED_BYTES), nullable=True
+    resolution: Mapped[dict[str, Any] | None] = mapped_column(
+        EnvelopedJSON(max_stored_bytes=_INBOX_MAX_STORED_BYTES), nullable=True
     )
     # Unix epoch seconds.
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

@@ -38,9 +38,8 @@ class InboxItem:
         ``"useful"``, ``"not_relevant"``, ``"incorrect"``, ``"not_now"``).
     :param feedback_text: The user's comment, or ``None``.
     :param created_at: Unix epoch seconds when the item was posted.
-    :param read_at: Unix epoch seconds when the user first read it.
-    :param acted_at: Unix epoch seconds of the user's last action on it
-        (taking an action or dismissing it).
+    :param resolved_at: Unix epoch seconds when the owner last resolved it
+        (took an action or dismissed it), or ``None``.
     :param expires_at: Unix epoch seconds after which a new post with the
         same key creates a fresh item, or ``None`` for never.
     :param resolution_action: Index into ``actions`` of the action taken, or ``None``.
@@ -64,7 +63,6 @@ class InboxItem:
     resolution: str
     feedback_text: str | None
     created_at: int
-    read_at: int | None = None
-    acted_at: int | None = None
+    resolved_at: int | None = None
     expires_at: int | None = None
     resolution_action: int | None = None

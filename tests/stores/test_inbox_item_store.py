@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy.exc import IntegrityError
 
-from omnigent.db.db_models import INBOX_ITEMS_PER_SESSION
 from omnigent.stores.inbox_item_store import (
+    INBOX_ITEMS_PER_SESSION,
     DuplicateInboxItemError,
     InboxItemTooLargeError,
     InboxSessionCapError,
@@ -43,15 +42,18 @@ def _new(dedupe_key: str = "v1:aaa", user_id: str = "alice", **overrides: object
 
 
 def test_create_and_read_back(store: SqlAlchemyInboxItemStore) -> None:
-    created = store.create(_new())
+    chart = {"type": "chart", "chart": {"title": "Errors", "x": ["a"], "series": []}}
+    created = store.create(_new(media=[chart]))
 
     assert (created.state, created.resolution, created.resolution_action) == (
         "unread",
         "none",
         None,
     )
+    assert (created.kind, created.feedback_text, created.resolved_at) == ("followup", None, None)
     assert created.actions == [{"label": "Ramp it up", "prompt": "Ramp up the flag"}]
     assert created.links == [{"type": "pr", "ref": "https://github.com/acme/app/pull/7"}]
+    assert created.media == [chart]
     assert store.get(created.id, "alice") == created
     assert store.get_by_dedupe_key("alice", "v1:aaa") == created
 
@@ -101,67 +103,31 @@ def test_replacing_an_expired_item_in_a_full_session_reports_the_cap(
         store.create(_new(dedupe_key="v1:k"), retire_item_id=expired.id)
 
 
-def test_a_lost_slot_is_retried_when_replacing_an_expired_item(
-    store: SqlAlchemyInboxItemStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    expired = store.create(_new(dedupe_key="v1:k", expires_at=1))
-    real_insert = store._insert
-    calls = {"n": 0}
-
-    def lose_the_first_slot(item: NewInboxItem, retire: str | None) -> object:
-        calls["n"] += 1
-        if calls["n"] == 1:
-            # What a concurrent post taking the chosen slot looks like on PostgreSQL/MySQL.
-            raise IntegrityError("INSERT", {}, Exception("duplicate session slot"))
-        return real_insert(item, retire)
-
-    monkeypatch.setattr(store, "_insert", lose_the_first_slot)
-
-    fresh = store.create(_new(dedupe_key="v1:k"), retire_item_id=expired.id)
-
-    assert fresh.id != expired.id
-    assert calls["n"] == 2
-
-
-def test_a_post_outlasts_successive_slot_conflicts(
-    store: SqlAlchemyInboxItemStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Concurrent posts that keep taking the chosen slot do not fail a post while slots remain."""
-    real_insert = store._insert
-    calls = {"n": 0}
-
-    def lose_to_a_competitor(item: NewInboxItem, retire: str | None) -> object:
-        calls["n"] += 1
-        if calls["n"] <= 4:
-            # A competitor commits into the slot this attempt picked.
-            real_insert(_new(dedupe_key=f"v1:competitor-{calls['n']}"), None)
-            raise IntegrityError("INSERT", {}, Exception("duplicate session slot"))
-        return real_insert(item, retire)
-
-    monkeypatch.setattr(store, "_insert", lose_to_a_competitor)
-
-    created = store.create(_new(dedupe_key="v1:target"))
-
-    assert created.dedupe_key == "v1:target"
-    assert calls["n"] == 5
-
-
-def test_content_is_stored_in_envelopes(store: SqlAlchemyInboxItemStore) -> None:
-    """The agent's text, media, and the owner's comment are plaintext envelopes in the database."""
+def test_content_and_answer_are_stored_in_envelopes(store: SqlAlchemyInboxItemStore) -> None:
+    """What the agent posted and how the owner answered are plaintext envelopes in the database."""
     from sqlalchemy import text
 
     from omnigent.db.envelope import ENVELOPE_FORMAT
 
     created = store.create(_new(title="Private title"))
-    store.update(created.id, "alice", feedback_text="Private comment", now=1)
-
     with store._engine.connect() as conn:
-        row = conn.execute(text("SELECT content, media, feedback FROM inbox_items")).one()
-    for column in row:
-        assert bytes(column)[:2] == bytes((ENVELOPE_FORMAT, 0x00))
+        content, resolution = conn.execute(
+            text("SELECT content, resolution FROM inbox_items")
+        ).one()
+    assert bytes(content)[:2] == bytes((ENVELOPE_FORMAT, 0x00))
+    assert resolution is None
+
+    store.update(created.id, "alice", feedback_text="Private comment", now=1)
+    with store._engine.connect() as conn:
+        resolution = conn.execute(text("SELECT resolution FROM inbox_items")).scalar_one()
+    assert bytes(resolution)[:2] == bytes((ENVELOPE_FORMAT, 0x00))
     read = store.get(created.id, "alice")
     assert read is not None
-    assert (read.title, read.feedback_text) == ("Private title", "Private comment")
+    assert (read.title, read.feedback_text, read.resolution) == (
+        "Private title",
+        "Private comment",
+        "none",
+    )
 
 
 def test_oversized_text_is_rejected(store: SqlAlchemyInboxItemStore) -> None:
@@ -230,11 +196,13 @@ def test_unread_count_is_bounded(store: SqlAlchemyInboxItemStore) -> None:
     assert store.count_unread("alice", limit=2) == 2
 
 
-def test_update_stamps_read_and_acted_times(store: SqlAlchemyInboxItemStore) -> None:
+def test_update_records_the_answer_and_when_it_was_given(
+    store: SqlAlchemyInboxItemStore,
+) -> None:
     created = store.create(_new())
 
     read = store.update(created.id, "alice", state="read", now=100)
-    assert read is not None and read.read_at == 100 and read.acted_at is None
+    assert read is not None and (read.state, read.resolved_at) == ("read", None)
 
     acted = store.update(
         created.id,
@@ -247,8 +215,25 @@ def test_update_stamps_read_and_acted_times(store: SqlAlchemyInboxItemStore) -> 
     )
     assert acted is not None
     assert (acted.state, acted.resolution, acted.resolution_action) == ("done", "action_taken", 0)
-    assert (acted.read_at, acted.acted_at, acted.feedback_text) == (100, 200, "thanks")
+    assert (acted.resolved_at, acted.feedback_text) == (200, "thanks")
     assert store.get(created.id, "alice") == acted
+
+    # Reopening clears the action but keeps the comment; a late read mark changes nothing.
+    reopened = store.update(created.id, "alice", state="read", resolution="none", now=300)
+    assert reopened is not None
+    assert (reopened.state, reopened.resolution, reopened.resolution_action) == (
+        "read",
+        "none",
+        None,
+    )
+    assert (reopened.feedback_text, reopened.resolved_at) == ("thanks", 200)
+    dismissed = store.update(created.id, "alice", state="dismissed", resolution="not_now", now=400)
+    assert dismissed is not None and dismissed.resolved_at == 400
+    late_read = store.update(created.id, "alice", state="read", now=500)
+    assert late_read is not None and (late_read.state, late_read.resolution) == (
+        "dismissed",
+        "not_now",
+    )
 
 
 def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) -> None:
@@ -266,21 +251,20 @@ def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) ->
             "id": f"{index:032x}",
             "user_id": "plan-owner",
             "source_session_id": f"{index // 10:032x}",
-            "session_slot": index % 10,
             "agent_id": "a" * 32,
-            "kind": 1,
+            "dedupe_key": f"v1:{index}",
+            "state": 1 + index % 2,
             "content": {
+                "kind": "info",
                 "title": "t",
                 "body_md": "b",
                 "links": [],
                 "actions": [],
                 "topic": "t",
                 "primary_link": None,
+                "media": [],
             },
-            "media": [],
-            "dedupe_key": f"v1:{index}",
-            "state": 1 + index % 2,
-            "resolution": 0,
+            "resolution": None,
             "created_at": index // 10,
         }
         for index in range(10_000)
