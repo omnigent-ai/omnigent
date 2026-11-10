@@ -5794,16 +5794,13 @@ async def _auto_create_codex_terminal(
         from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
-    _codex_developer_instructions = (
-        "\n\n".join(
-            x
-            for x in [
-                _native_startup_instructions_from_spec(agent_spec),
-                _codex_routing_note,
-            ]
-            if x
-        )
-        or None
+    _codex_developer_instructions = "\n\n".join(
+        x
+        for x in [
+            _native_startup_instructions_from_spec(agent_spec),
+            _codex_routing_note,
+        ]
+        if x
     )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
@@ -9843,8 +9840,7 @@ async def _auto_create_claude_terminal(
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
             x for x in [_native_startup_instructions_from_spec(agent_spec), routed_spawn_note] if x
-        )
-        or None,
+        ),
         allowed_tools=routed_spawn_tools,
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.
