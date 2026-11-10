@@ -71,6 +71,7 @@ import {
   selectVisibleFiles,
   unquoteGitPath,
   type Match,
+  type PatchMatchTarget,
 } from "./pullRequestReview";
 import { useChangesViewState, type FindState } from "./useChangesViewState";
 import { useCommitViewState } from "./useCommitViewState";
@@ -80,6 +81,18 @@ import { useFindSearch } from "./useFindSearch";
 function stepTarget(activeIndex: number, direction: 1 | -1, length: number): number {
   if (activeIndex >= 0) return (activeIndex + direction + length) % length;
   return direction > 0 ? 0 : length - 1;
+}
+
+/** Whether the corpus still holds this target with the same text, so its highlight still fits. */
+function hasSameTarget(corpus: PatchMatchTarget[], target: PatchMatchTarget): boolean {
+  return corpus.some(
+    (entry) =>
+      entry.path === target.path &&
+      entry.kind === target.kind &&
+      entry.side === target.side &&
+      entry.line === target.line &&
+      entry.text === target.text,
+  );
 }
 
 /** Frames to wait for a section to mount before a pending jump gives up. */
@@ -918,21 +931,22 @@ export function PullRequestChangesTab({
           shownMatch.current?.target === findTarget ? shownMatch.current.shown : findTarget,
         )
       : -1;
-  // While a regex reruns, the reader's occurrence stays shown, so the row neither loses its
-  // highlight nor re-centres, and a file the reader collapsed stays collapsed.
-  const activeMatch =
-    activeIndex >= 0
-      ? matches[activeIndex]
-      : search.searching && findTarget && shownMatch.current?.target === findTarget
-        ? shownMatch.current.shown
-        : null;
+  const settledMatch = activeIndex >= 0 ? matches[activeIndex] : null;
+  // While a regex reruns, the reader's occurrence keeps its file, so a collapsed file stays
+  // collapsed. Its highlight stays only while that row still has the same text.
+  const pendingMatch =
+    search.searching && findTarget && shownMatch.current?.target === findTarget
+      ? shownMatch.current.shown
+      : null;
+  const pendingHighlightValid = !!pendingMatch && hasSameTarget(searchCorpus, pendingMatch.target);
+  const activeMatch = settledMatch ?? (pendingHighlightValid ? pendingMatch : null);
   useEffect(() => {
-    // A rerunning regex keeps the reader's occurrence, which the refreshed result is measured from.
+    // Keep measuring from the reader's occurrence until the rerun settles.
     if (search.searching) return;
     shownMatch.current =
       findTarget && activeMatch ? { target: findTarget, shown: activeMatch } : null;
   });
-  const activeFilePath = activeMatch?.target.path ?? null;
+  const activeFilePath = (settledMatch ?? pendingMatch)?.target.path ?? null;
   // A line match is painted by its section; split out the primitives so a refresh that
   // keeps the same match doesn't re-centre the row.
   const lineMatch = activeMatch?.target.kind === "line" ? activeMatch : null;

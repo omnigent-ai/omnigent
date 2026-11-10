@@ -570,6 +570,40 @@ describe("PullRequestChangesTab", () => {
     expect(scroll).not.toHaveBeenCalled();
   });
 
+  it("drops a held highlight whose row's text changed until the regex rerun settles", async () => {
+    const registry = new Map<string, { ranges: Range[] }>();
+    vi.stubGlobal("CSS", { escape: CSS.escape, highlights: registry });
+    vi.stubGlobal(
+      "Highlight",
+      class {
+        ranges: Range[];
+        constructor(...ranges: Range[]) {
+          this.ranges = ranges;
+        }
+      },
+    );
+    const painted = () => registry.get("pr-find-active")?.ranges[0]?.toString() ?? null;
+    const { rerender } = renderTab({
+      conversationId: "find-regex-stale-row",
+      patch: A + addedFile("b.ts", ["needle top", "gamma", "needle here"]) + C,
+    });
+    openFind("needle");
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    expect(await screen.findByText("1 of 3")).toBeInTheDocument();
+    fireEvent.keyDown(findInput(), { key: "Enter" });
+    expect(painted()).toBe("needle");
+
+    // Line 3 no longer reads "needle here", so its old offsets would mark unrelated text.
+    const release = holdRegexSearches();
+    rerender(A + addedFile("b.ts", ["x1", "x2", "x3", "x4", "gamma", "needle here"]) + C);
+    expect(await screen.findByText("Searching…")).toBeInTheDocument();
+    expect(painted()).toBeNull();
+
+    await release();
+    expect(await screen.findByText("1 of 2")).toBeInTheDocument();
+    expect(painted()).toBe("needle");
+  });
+
   it("does not move the match while a regex search runs, from the buttons or the find input", async () => {
     const { rerender } = renderTab({ conversationId: "find-pending-step" });
     openFind("needle");
