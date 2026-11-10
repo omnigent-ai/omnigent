@@ -6363,6 +6363,179 @@ async def test_live_cached_client_is_reused_between_turns() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="bwrap binds the credentials file on Linux")
+@pytest.mark.parametrize(
+    ("created_before_executor", "replaced", "rebuilt"),
+    [
+        pytest.param(True, True, True, id="replaced-under-bwrap"),
+        pytest.param(True, False, False, id="unchanged"),
+        pytest.param(False, True, False, id="file-created-after-wrapper"),
+    ],
+)
+async def test_sandboxed_cli_restarts_after_its_credentials_file_is_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    created_before_executor: bool,
+    replaced: bool,
+    rebuilt: bool,
+) -> None:
+    """A CLI whose wrapper granted the credentials file restarts once the file is replaced."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    credentials = tmp_path / ".claude" / ".credentials.json"
+    credentials.parent.mkdir()
+    if created_before_executor:
+        credentials.write_text("v1")
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor()
+    executor._cli_wrapper_path = "/tmp/claude-wrapper"
+    if not created_before_executor:
+        credentials.write_text("v1")
+    old_client = fake_sdk.ClaudeSDKClient(options=None)
+    fake_sdk.created_clients.clear()
+    state = _ClaudeClientState(client=old_client, model=None)
+    if created_before_executor:
+        started = credentials.stat()
+        state.sandboxed_credentials = (started.st_dev, started.st_ino)
+    executor._clients["sess-1"] = state
+    if replaced:
+        staged = credentials.with_name(".credentials.json.new")
+        staged.write_text("v2")
+        os.replace(staged, credentials)
+
+    messages = [
+        {"role": "user", "content": "first question", "session_id": "sess-1"},
+        {"role": "assistant", "content": "first answer", "session_id": "sess-1"},
+        {"role": "user", "content": "second question", "session_id": "sess-1"},
+    ]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch.object(executor, "_force_close_client", new_callable=AsyncMock) as close,
+    ):
+        events = [e async for e in executor.run_turn(messages, [], "")]
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+    if rebuilt:
+        close.assert_awaited_once_with(old_client)
+        assert old_client.prompts == []
+        (fresh,) = fake_sdk.created_clients
+        assert executor._clients["sess-1"].client is fresh
+        # The new CLI starts without session memory, so the history is replayed.
+        assert "first answer" in fresh.prompts[0]
+    else:
+        close.assert_not_awaited()
+        assert fake_sdk.created_clients == []
+        assert old_client.prompts == ["second question"]
+
+
+@pytest.mark.asyncio
+async def test_compact_runs_on_the_existing_cli_even_after_credentials_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """/compact needs the live context, so a stale-bind restart waits for the next turn."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    credentials = tmp_path / ".claude" / ".credentials.json"
+    credentials.parent.mkdir()
+    credentials.write_text("v1")
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor()
+    executor._cli_wrapper_path = "/tmp/claude-wrapper"
+    old_client = fake_sdk.ClaudeSDKClient(options=None)
+    fake_sdk.created_clients.clear()
+    state = _ClaudeClientState(client=old_client, model=None)
+    started = credentials.stat()
+    state.sandboxed_credentials = (started.st_dev, started.st_ino)
+    executor._clients["sess-1"] = state
+    staged = credentials.with_name(".credentials.json.new")
+    staged.write_text("v2")
+    os.replace(staged, credentials)
+    messages = [
+        {"role": "user", "content": "first question", "session_id": "sess-1"},
+        {"role": "assistant", "content": "first answer", "session_id": "sess-1"},
+        {"role": "user", "content": "/compact", "session_id": "sess-1"},
+    ]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        events = [e async for e in executor.run_turn(messages, [], "")]
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert fake_sdk.created_clients == []
+    assert old_client.prompts == ["/compact"]
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "platform", "granted", "expected"),
+    [
+        pytest.param("/tmp/claude-wrapper", "linux", True, True, id="bwrap"),
+        pytest.param("/tmp/claude-wrapper", "linux", False, False, id="file-absent-at-build"),
+        pytest.param("/tmp/claude-wrapper", "darwin", True, False, id="seatbelt-is-path-based"),
+        pytest.param(None, "linux", True, False, id="unwrapped"),
+    ],
+)
+def test_only_a_bwrap_wrapped_cli_bind_mounts_its_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    wrapper: str | None,
+    platform: str,
+    granted: bool,
+    expected: bool,
+) -> None:
+    """Only a bwrap wrapper built while the credentials file existed binds it."""
+    from omnigent.inner import claude_sdk_executor as module
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    executor._cli_wrapper_path = wrapper
+    executor._wrapper_grants_credentials = granted
+    monkeypatch.setattr(module.sys, "platform", platform)
+    assert executor._cli_bind_mounts_credentials() is expected
+
+
+def test_wrapper_grant_is_decided_when_the_executor_is_built(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A credentials file created after the executor was built is not granted to its wrapper."""
+    from omnigent.inner import claude_sdk_executor as module
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(module, "_find_system_claude", lambda: None)
+    executor = ClaudeSDKExecutor()
+    credentials = tmp_path / ".claude" / ".credentials.json"
+    credentials.parent.mkdir()
+    credentials.write_text("{}")
+
+    assert executor._wrapper_grants_credentials is False
+    assert ClaudeSDKExecutor()._wrapper_grants_credentials is True
+
+
+def test_claude_credentials_identity_changes_when_the_file_is_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Saving the sign-in by rename gives the file a new identity; absent reads as (0, 0)."""
+    from omnigent.inner.claude_sdk_executor import _claude_credentials_identity
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _claude_credentials_identity() == (0, 0)
+
+    credentials = tmp_path / ".claude" / ".credentials.json"
+    credentials.parent.mkdir()
+    credentials.write_text("{}")
+    first = _claude_credentials_identity()
+    assert first != (0, 0)
+
+    credentials.write_text('{"refreshed": false}')
+    assert _claude_credentials_identity() == first
+
+    replacement = credentials.with_name(".credentials.json.tmp")
+    replacement.write_text('{"refreshed": true}')
+    replacement.replace(credentials)
+    assert _claude_credentials_identity() != first
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("declared_window", "model_override"),
     [(4_200, None), (1_000_000, "small-window-model")],
