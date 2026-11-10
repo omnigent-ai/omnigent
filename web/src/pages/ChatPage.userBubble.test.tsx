@@ -605,16 +605,31 @@ describe("UserBubble edit button", () => {
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
   });
 
-  it("is absent while the message is still sending", () => {
+  const midTurnSend = (posted: boolean) =>
+    buildPendingBubbles(
+      [
+        {
+          tempId: "pend_mid",
+          content: [{ type: "input_text", text: "hello" }],
+          sentMidTurn: true,
+          ...(posted ? { posted: true } : {}),
+        },
+      ],
+      null,
+    )[0]!;
+
+  it("is absent until the server accepts the message", () => {
     renderEditable(userBubble("hello", { pending: true }));
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
     cleanup();
-    renderEditable(userBubble("hello", { pending: true, awaitingAgent: true, stillSending: true }));
+    // Sent mid-turn, but the send request hasn't succeeded yet.
+    renderEditable(midTurnSend(false));
+    expect(screen.getByText("The agent will read this after its current step")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
   });
 
   it("offers Edit on a mid-turn message the agent hasn't read yet", () => {
-    const onEdit = renderEditable(userBubble("hello", { pending: true, awaitingAgent: true }));
+    const onEdit = renderEditable(midTurnSend(true));
     expect(screen.getByText("The agent will read this after its current step")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     expect(onEdit).toHaveBeenCalledWith(expect.objectContaining({ text: "hello" }));

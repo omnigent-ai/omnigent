@@ -232,6 +232,7 @@ export function buildPendingBubbles(
       pending: true,
       ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
       ...(p.stillSending && p.posted !== true ? { stillSending: true } : {}),
+      ...(p.posted === true ? { accepted: true } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -992,7 +993,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // mid-turn send the agent hasn't read yet.
   const canEdit =
     editSentMessage !== null &&
-    (!bubble.pending || (bubble.awaitingAgent === true && !bubble.stillSending)) &&
+    (!bubble.pending || (bubble.awaitingAgent === true && bubble.accepted === true)) &&
     (author === undefined || author === getCurrentUserId()) &&
     Boolean(text || images.length || fileChips.length);
 

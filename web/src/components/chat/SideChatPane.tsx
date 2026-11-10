@@ -225,7 +225,11 @@ export function SideChatPane({
     serverInfo === "loading" ? null : (serverInfo.filesystem_attachments ?? null);
   // Edit on this tab's own messages loads them into this tab's composer. It has
   // no "@"-mention picker, so mentions come back as their attachment markers.
-  const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
+  const {
+    editMessage: editSentMessage,
+    draftSent: editedDraftSent,
+    confirmDialog: replaceDraftDialog,
+  } = useEditSentMessage({
     target: childId,
     canAccept: () => !readOnly && !starting,
     hasDraft: () => {
@@ -377,9 +381,10 @@ export function SideChatPane({
     if (followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
   }, [bubbles.length, activeResponse]);
   const followSentMessage = useCallback(() => {
+    editedDraftSent();
     followTail.current = true;
     bottomRef.current?.scrollIntoView({ block: "end" });
-  }, []);
+  }, [editedDraftSent]);
 
   const loadFailed = !pending && conversationLoadError !== null && bubbles.length === 0;
   const isEmpty =

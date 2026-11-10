@@ -264,6 +264,46 @@ describe("editing a sent side-chat message", () => {
     }
   });
 
+  it("loads an attachment-only message into this side chat's composer", async () => {
+    seedSentMessage("");
+    vi.spyOn(filesApi, "downloadSessionFile").mockResolvedValue(
+      new File(["error: boom"], "build.log", { type: "text/plain" }),
+    );
+    useChatStore.setState({ sideChatComposers: { [childId]: { text: "", files: [] } } });
+    renderPane(<SideChatPane childId={childId} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    await waitFor(() =>
+      expect(
+        useChatStore.getState().sideChatComposers[childId]?.files.map((file) => file.name),
+      ).toEqual(["build.log"]),
+    );
+  });
+
+  it("drops attachments still loading once the edited draft is sent", async () => {
+    seedSentMessage();
+    let finishDownload: () => void = () => {};
+    vi.spyOn(filesApi, "downloadSessionFile").mockImplementation(
+      () =>
+        new Promise<File>((resolve) => {
+          finishDownload = () => resolve(new File(["error: boom"], "build.log"));
+        }),
+    );
+    useChatStore.setState({ sideChatComposers: { [childId]: { text: "", files: [] } } });
+    renderPane(<SideChatPane childId={childId} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("Why did this build fail?"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+    await act(async () => finishDownload());
+
+    expect(useChatStore.getState().sideChatComposers[childId]?.files ?? []).toEqual([]);
+  });
+
   it("is not offered in a read-only side chat", () => {
     seedSentMessage();
     renderPane(<SideChatPane childId={childId} readOnly />);

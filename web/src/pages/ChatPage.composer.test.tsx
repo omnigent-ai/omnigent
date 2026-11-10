@@ -7335,7 +7335,7 @@ describe("Composer — editing a sent message", () => {
     expect(screen.getByText("notes.txt")).toBeInTheDocument();
   });
 
-  it("drops attachments that arrive after the draft was emptied", async () => {
+  it("drops attachments still loading when the edited draft is sent, and says so", async () => {
     let finishDownload: () => void = () => {};
     fetchMock.mockImplementation(
       () =>
@@ -7344,13 +7344,37 @@ describe("Composer — editing a sent message", () => {
         }),
     );
     const ref = createRef<ComponentRef<typeof Composer>>();
-    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    const props = composerProps();
+    renderWithTooltips(<Composer {...props} ref={ref} />);
 
     act(() => ref.current?.editSentMessage({ ...sentMessage, content: notesContent.slice(0, 1) }));
-    fireEvent.change(textarea(), { target: { value: "" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    fireEvent.change(textarea(), { target: { value: "a new thought" } });
     await act(async () => finishDownload());
 
+    expect(props.onSend).toHaveBeenCalledWith("Summarize these", undefined);
     expect(screen.queryByText("notes.txt")).toBeNull();
+    expect(toasts).toEqual([
+      "The edited message's attachments were still loading, so they weren't sent.",
+    ]);
+  });
+
+  it.each([
+    ["no text", ""],
+    ["only an upload marker", "[Attached: /tmp/uploads/notes.txt]"],
+  ])("loads an attachment-only message with %s", async (_label, text) => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+
+    act(() =>
+      ref.current?.editSentMessage({ ...sentMessage, text, content: notesContent.slice(0, 1) }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
+
+    await waitFor(() => expect(screen.getByText("notes.txt")).toBeInTheDocument());
+    expect(textarea()).toHaveValue("");
   });
   it("drops a load that finishes after switching conversations", async () => {
     let finishDownload: () => void = () => {};

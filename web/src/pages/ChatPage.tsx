@@ -3872,7 +3872,11 @@ function ComposerImpl(
     else restoreFiles(loadedFiles);
     textareaRef.current?.focus();
   };
-  const { editMessage: editSentMessage, confirmDialog: replaceDraftDialog } = useEditSentMessage({
+  const {
+    editMessage: editSentMessage,
+    draftSent: editedDraftSent,
+    confirmDialog: replaceDraftDialog,
+  } = useEditSentMessage({
     target: conversationId,
     // An edited message may land wherever the user could type it.
     canAccept: () => !inputDisabled,
@@ -4125,6 +4129,7 @@ function ComposerImpl(
       const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
       onSend(withSessionMentionHint(expand(message), tagsSessions), sendFiles);
     }
+    editedDraftSent();
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();
