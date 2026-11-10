@@ -8,6 +8,7 @@ import contextlib
 import errno
 import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -39,7 +40,7 @@ from omnigent.inner.executor import (
     InjectionDeliveryAmbiguous,
     TurnComplete,
 )
-from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN, attachment_cache_dir
 from omnigent.native.input_diagnostics import input_delivery_scope
 
 # A 1x1 transparent PNG, base64-encoded — a real decodable image small
@@ -2214,6 +2215,97 @@ def test_input_file_text_is_inlined_as_a_text_item(
     # No image channel item for a file, and no uploads dir written.
     assert all(item["type"] != "localImage" for item in items)
     assert not (attachment_cache_dir(tmp_path)).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"])
+@pytest.mark.parametrize(
+    ("prompt", "file_texts", "prompt_first"),
+    [
+        ("Read this file", ["large log\n" * 150_000], True),
+        ("Compare these files", ["a" * 400_000, "b" * 400_000, "c" * 400_000], True),
+        ("p" * 700_000, ["a" * 400_000], True),
+        ("p" * 700_000, ["a" * 400_000], False),
+        ("Read the Unicode file", ["雪" * 400_000], True),
+    ],
+    ids=["large-file", "combined-files", "large-prompt", "file-before-prompt", "unicode-file"],
+)
+async def test_large_text_attachments_reach_codex_without_exceeding_input_limit(
+    active_turn_id: str | None,
+    prompt: str,
+    file_texts: list[str],
+    prompt_first: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Preserve uploaded bytes while keeping both start and steer below Codex's input cap."""
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    files = [
+        {
+            "type": "input_file",
+            "filename": f"file-{index}.txt",
+            "file_data": "data:text/plain;base64," + base64.b64encode(text.encode()).decode(),
+        }
+        for index, text in enumerate(file_texts)
+    ]
+    prompt_block = {"type": "input_text", "text": prompt}
+    content = [prompt_block, *files] if prompt_first else [*files, prompt_block]
+    events = [
+        event
+        async for event in CodexNativeExecutor(bridge_dir=tmp_path).run_turn(
+            [{"role": "user", "content": content}], [], ""
+        )
+    ]
+    assert [type(event) for event in events] == [TurnComplete]
+    method, params = _FakeCodexNativeClient.requests[-1]
+    assert method == ("turn/steer" if active_turn_id else "turn/start")
+    items = params["input"]
+    assert sum(len(item["text"].encode()) for item in items) < 1024 * 1024
+    assert items[0 if prompt_first else -1] == {"type": "text", "text": prompt}
+    delivered_files = items[1:] if prompt_first else items[:-1]
+    referenced_files = 0
+    for item, text in zip(delivered_files, file_texts, strict=True):
+        if item["text"] == text:
+            continue
+        assert item["text"].startswith("[Attached file: ")
+        assert re.fullmatch(ATTACHMENT_MARKER_STRIP_PATTERN, item["text"])
+        path = Path(item["text"][len("[Attached file: ") : -len("]")])
+        assert path.parent == attachment_cache_dir(tmp_path)
+        assert path.read_bytes() == text.encode()
+        referenced_files += 1
+    assert referenced_files > 0
+
+
+@pytest.mark.parametrize("decode_error", [False, True], ids=["cache-failure", "corrupt-data-uri"])
+def test_unloadable_text_attachment_does_not_fall_back_to_inline_payload(
+    decode_error: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An unreadable upload keeps its visible failure marker without leaking its payload."""
+    file_data = "data:text/plain;base64," + base64.b64encode(b"x" * 1_100_000).decode()
+    if decode_error:
+        file_data = "data:text/plain;base64,a"
+    else:
+        monkeypatch.setattr(codex_native_executor, "materialize_attachment", lambda *_args: None)
+    items = codex_native_executor._content_to_input_items(
+        [{"type": "input_file", "filename": "large.txt", "file_data": file_data}], tmp_path
+    )
+    assert items == [{"type": "text", "text": "[Attachment large.txt could not be loaded]"}]
+    assert not attachment_cache_dir(tmp_path).exists()
+
+
+def test_oversized_user_text_is_preserved_for_codex_to_refuse(tmp_path: Path) -> None:
+    """File budgeting never truncates or rewrites a person's own prompt."""
+    prompt = "p" * 1_100_000
+    assert codex_native_executor._content_to_input_items(
+        [{"type": "input_text", "text": prompt}], tmp_path
+    ) == [{"type": "text", "text": prompt}]
 
 
 def test_input_file_binary_is_materialized_and_referenced_by_path(

@@ -7759,6 +7759,7 @@ async def _post_user_message(
         item_data=item_data,
         response_id=_response_id(params),
         source_id=source_id or _source_id(params, item),
+        delivery_attempt_id=(value if isinstance(value := item.get("clientId"), str) else None),
     )
 
 
@@ -8390,6 +8391,7 @@ async def _post_external_item(
     response_id: str,
     message_id: str | None = None,
     source_id: str | None = None,
+    delivery_attempt_id: str | None = None,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -8405,6 +8407,7 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :param message_id: Optional live-preview stream finalized by this item.
     :param source_id: Stable native source id for server-side idempotency.
+    :param delivery_attempt_id: Native user-message client id identifying its web input.
     :returns: Whether the item was accepted by the server.
     """
     data: _JsonObject = {
@@ -8416,6 +8419,8 @@ async def _post_external_item(
         data["message_id"] = message_id
     if source_id is not None:
         data["source_id"] = _bounded_source_id(source_id)
+    if delivery_attempt_id is not None:
+        data["delivery_attempt_id"] = delivery_attempt_id
 
     async def _post() -> httpx.Response | None:
         return await _post_session_event(

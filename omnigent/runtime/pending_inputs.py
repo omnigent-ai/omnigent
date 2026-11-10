@@ -255,9 +255,9 @@ class DrainedInput:
 @dataclass
 class MatchedDrain:
     """
-    Result from draining pending inputs up to a text-matched entry.
+    Result from matching a native mirror to its pending input.
 
-    :param matched: The entry whose text the mirror carried, or ``None``.
+    :param matched: The entry identified by the mirror, or ``None``.
     :param skipped: Older entries the match jumped over that are known to be
         lost: no mirror of theirs can still arrive, so the caller records them
         as undelivered.
@@ -642,6 +642,30 @@ def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
         if not entries:
             _pending.pop(conversation_id, None)
         return _drained_input(entry) if entry is not None else None
+
+
+def resolve_delivery_attempt(
+    conversation_id: str, delivery_attempt_id: object, *, hold: bool = False
+) -> DrainedInput | None:
+    """Settle only the input named by a native receipt, leaving other mirrors pending."""
+    if input_attributes({"delivery_attempt_id": delivery_attempt_id}) != {
+        "delivery_attempt_id": delivery_attempt_id
+    }:
+        return None
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id, {})
+        for pending_id, entry in entries.items():
+            if entry.held or entry.delivery_attempt_id != delivery_attempt_id:
+                continue
+            if hold:
+                entry.held = True
+            else:
+                entries.pop(pending_id)
+                if not entries:
+                    _pending.pop(conversation_id, None)
+            return _drained_input(entry)
+    return None
 
 
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:

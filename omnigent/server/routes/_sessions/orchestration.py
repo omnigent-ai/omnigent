@@ -3161,20 +3161,33 @@ async def _persist_external_conversation_item_unlocked(
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
     if drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
-        # Match the mirror to its entry by text: a pasted message the TUI never
-        # recorded leaves a stale head entry, and draining by position would
-        # hand it to THIS message (see ``omnigent.runtime.pending_inputs``).
-        # Skipped older entries are persisted as undelivered. A miss falls back
-        # to the oldest entry, except for Kiro, whose prompt text is exact.
+        # Native receipts identify reformatted and attachment-only messages.
+        # Legacy mirrors match text before falling back to the oldest input.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
         native_agent = _native_coding_agent_for_session(conv)
-        matched = pending_inputs.resolve_matching_text(
-            session_id,
-            text,
-            hold=True,
-            claude_commands=native_agent is not None and native_agent.harness == "claude-native",
+        has_delivery_receipt = (
+            native_agent is not None
+            and native_agent.harness == "codex-native"
+            and "delivery_attempt_id" in body.data
         )
+        if has_delivery_receipt:
+            # Receipts can arrive out of order; an exact id says nothing about older inputs.
+            matched = pending_inputs.MatchedDrain(
+                matched=pending_inputs.resolve_delivery_attempt(
+                    session_id, body.data["delivery_attempt_id"], hold=True
+                ),
+                skipped=[],
+                match_method="delivery_attempt_id",
+            )
+        else:
+            matched = pending_inputs.resolve_matching_text(
+                session_id,
+                text,
+                hold=True,
+                claude_commands=native_agent is not None
+                and native_agent.harness == "claude-native",
+            )
         drained = matched.matched
         match_method = matched.match_method
         if agent_message_candidate:
@@ -3194,7 +3207,12 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
+        if (
+            drained is None
+            and not has_delivery_receipt
+            and not agent_message_candidate
+            and not _is_kiro_native_session(conv)
+        ):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
                 match_method = "fifo_fallback"

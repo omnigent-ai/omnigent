@@ -52,6 +52,23 @@ def test_unknown_delivery_stage_is_observable_without_overwriting_state(
     assert record.attributes["pending_id"] == pending_id
 
 
+@pytest.mark.parametrize("hold", [False, True])
+def test_native_delivery_receipt_resolves_only_its_input(hold: bool) -> None:
+    """An out-of-order receipt preserves earlier inputs and supports persist rollback."""
+    first = pending_inputs.record("conv", [_text_block("earlier")])
+    second = pending_inputs.record("conv", [{"type": "input_file", "file_id": "file_current"}])
+    attempt = pending_inputs.delivery_attributes_for("conv", second)["delivery_attempt_id"]
+    drained = pending_inputs.resolve_delivery_attempt("conv", attempt, hold=hold)
+    assert drained is not None and drained.pending_id == second
+    assert pending_inputs.pending_ids("conv") == [first]
+    assert pending_inputs.resolve_delivery_attempt("conv", attempt, hold=hold) is None
+    if hold:
+        pending_inputs.restore("conv", drained)
+        assert pending_inputs.pending_ids("conv") == [first, second]
+        assert pending_inputs.resolve_delivery_attempt("conv", attempt) == drained
+    assert pending_inputs.pending_ids("conv") == [first]
+
+
 @pytest.mark.parametrize("hold", [True, False])
 @pytest.mark.parametrize("interrupted", [True, False])
 def test_delivery_identity_and_original_enqueue_time_survive_retry_and_restore(

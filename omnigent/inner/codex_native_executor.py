@@ -110,6 +110,8 @@ _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
 _COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
 _DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
 _DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
+# Leave room below Codex's 1 MiB input cap for paths and other input metadata.
+_INLINE_TEXT_INPUT_BUDGET_BYTES = 512 * 1024
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     message="Codex is still compacting, so this message was not delivered.",
     code="codex_compacting",
@@ -1494,9 +1496,9 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     materialized to disk and referenced as
     ``{"type": "localImage", "path": ...}`` — sending the base64 data
     URI inline as text would blow past the app-server's 1 MiB input
-    limit. Files inline their decoded text when they are textual;
-    binary files are materialized and referenced by path in a text
-    item so the model can open them with its tools.
+    limit. Textual files inline their decoded text while it fits the
+    message's remaining budget. Larger files and binary files are
+    materialized and referenced by path so the model can open them.
 
     :param content: Message content, e.g. a string or a list of content
         blocks like ``{"type": "input_text", "text": "..."}`` and
@@ -1508,6 +1510,13 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
         return [{"type": "text", "text": content}] if content else []
     if isinstance(content, list):
         items: list[dict[str, object]] = []
+        # Count the whole prompt first, including text that follows an upload.
+        inline_file_budget = _INLINE_TEXT_INPUT_BUDGET_BYTES - sum(
+            len(text.encode("utf-8"))
+            for block in content
+            if isinstance(block, dict) and block.get("type") in {"input_text", "text"}
+            if isinstance(text := block.get("text"), str)
+        )
         for raw_block in content:
             block = _json_object(raw_block)
             if block is None:
@@ -1537,9 +1546,12 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
                 else:
                     items.append({"type": "text", "text": unresolved_attachment_marker(block)})
             elif block_type == "input_file":
-                file_item = _file_block_to_input_item(block, bridge_dir)
+                file_item = _file_block_to_input_item(
+                    block, bridge_dir, inline_text_budget=max(0, inline_file_budget)
+                )
                 if file_item is not None:
                     items.append(file_item)
+                    inline_file_budget -= len(str(file_item["text"]).encode("utf-8"))
         return items
     if content is None:
         return []
@@ -1567,20 +1579,22 @@ def _apply_resize_notice_to_latest_image(
 def _file_block_to_input_item(
     block: Mapping[str, object],
     bridge_dir: Path,
+    *,
+    inline_text_budget: int,
 ) -> dict[str, object] | None:
     """
     Convert an ``input_file`` block into a Codex input item.
 
     The Codex app-server has no native file input item, so a textual
-    file (``text/*``) is inlined as a ``text`` item. A binary file is
-    materialized to disk and referenced by path in a ``text`` item so
-    the model can open it with its tools. This keeps multi-megabyte
-    base64 payloads out of the turn's text input.
+    file (``text/*``) is inlined when it fits the remaining input budget.
+    Larger or binary files are materialized and referenced by path so
+    the model can open them without exceeding the app-server's input cap.
 
     :param block: An ``input_file`` content block, expected to carry a
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
     :param bridge_dir: Session bridge path identifying the attachment cache.
+    :param inline_text_budget: Remaining bytes available for decoded file text.
     :returns: A Codex ``text`` input item; a visible could-not-load
         marker item when the file failed to materialize; or ``None``
         for an empty text file.
@@ -1591,7 +1605,10 @@ def _file_block_to_input_item(
             parsed = parse_data_uri(file_data)
             if parsed.mime_type.startswith("text/"):
                 text = base64.b64decode(parsed.base64_payload).decode("utf-8", errors="replace")
-                return {"type": "text", "text": text} if text else None
+                if not text:
+                    return None
+                if len(text.encode("utf-8")) <= inline_text_budget:
+                    return {"type": "text", "text": text}
         except (ValueError, binascii.Error):
             _logger.warning("Failed to decode input_file data URI", exc_info=True)
     path = materialize_attachment(block, bridge_dir)
