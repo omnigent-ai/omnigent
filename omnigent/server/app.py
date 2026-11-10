@@ -130,6 +130,9 @@ from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.inbox_items import create_inbox_items_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
+from omnigent.server.routes.proactive_agent_settings import (
+    create_proactive_agent_settings_router,
+)
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
@@ -187,6 +190,7 @@ from omnigent.stores.inbox_item_store import InboxItemStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.preference_store import PreferenceStore
+from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.dispatch import ScheduledTaskDispatchStore
@@ -281,8 +285,9 @@ class ServerInfoResponse(BaseModel):
     installable_harnesses: list[str]
     # Whether the scheduled-tasks routes are mounted and enabled for this caller.
     automations_enabled: bool = False
-    # Whether agent-posted Inbox items are enabled for this caller.
-    proactive_agent_enabled: bool = False
+    # Whether the deployment offers the proactive agent to this caller; each
+    # user's own on/off state is at ``GET /v1/proactive-agent/settings``.
+    proactive_agent_available: bool = False
     dictation_available: bool
     # Scheduled tasks accept the optional random-worktree base ref.
     scheduled_task_worktrees: bool = True
@@ -1634,6 +1639,7 @@ def create_app(
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
     inbox_item_store: InboxItemStore | None = None,
     proactive_agent: DeploymentGate | None = None,
+    proactive_agent_settings_store: ProactiveAgentSettingsStore | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1679,11 +1685,16 @@ def create_app(
         When off, the ``/v1/scheduled-tasks`` routes return 404 and ``GET /v1/info``
         reports ``automations_enabled`` false. Scheduling of existing tasks is not
         affected.
-    :param proactive_agent: Whether this request's caller can use agent-posted Inbox
-        items. A static bool or a zero-arg callable resolved per request; ``None``
-        follows the ``proactive_agent`` release feature (off by default). When off,
-        ``/v1/inbox/items`` returns 404 and ``GET /v1/info`` reports
-        ``proactive_agent_enabled`` false.
+    :param proactive_agent: Whether the deployment offers the proactive agent and
+        agent-posted Inbox items to this request's caller. A static bool or a
+        zero-arg callable resolved per request; ``None`` follows the
+        ``proactive_agent`` release feature (off by default). When off,
+        ``/v1/inbox/items`` and ``/v1/proactive-agent/settings`` return 404 and
+        ``GET /v1/info`` reports ``proactive_agent_available`` false.
+    :param proactive_agent_settings_store: The workspace and per-user on/off
+        settings. Where the deployment offers the agent, a user gets it only when
+        both are on. ``None`` treats both as on and leaves the settings routes
+        unmounted.
     :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
         the owner identity fires act under, or a replacement executor. ``None``
         uses the built-in executor with every host owned by this replica.
@@ -2398,12 +2409,25 @@ def create_app(
     )
 
     def proactive_agent_available() -> bool:
-        """Whether this request's caller can use agent-posted Inbox items."""
+        """Whether the deployment offers the proactive agent to this request's caller."""
         return inbox_item_store is not None and deployment_gate_enabled(
             proactive_agent_gate, "proactive_agent"
         )
 
+    def proactive_agent_enabled_for(user_id: str) -> bool:
+        """Whether the agent and its Inbox items are on for *user_id*.
+
+        Evaluated in that user's request or identity scope, since the
+        deployment gate may read the current user.
+        """
+        if not proactive_agent_available():
+            return False
+        if proactive_agent_settings_store is None:
+            return True
+        return all(proactive_agent_settings_store.read(user_id))
+
     app.state.proactive_agent_available = proactive_agent_available
+    app.state.proactive_agent_enabled_for = proactive_agent_enabled_for
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
@@ -3746,7 +3770,7 @@ def create_app(
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
                 "automations_enabled": automations_enabled,
-                "proactive_agent_enabled": app.state.proactive_agent_available(),
+                "proactive_agent_available": app.state.proactive_agent_available(),
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
@@ -4010,7 +4034,7 @@ def create_app(
         app.include_router(
             create_inbox_items_router(
                 inbox_item_store,
-                enabled=proactive_agent_available,
+                enabled=proactive_agent_enabled_for,
                 conversation_store=conversation_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
@@ -4020,6 +4044,17 @@ def create_app(
             prefix="/v1",
             tags=["inbox_items"],
         )
+        if proactive_agent_settings_store is not None:
+            app.include_router(
+                create_proactive_agent_settings_router(
+                    proactive_agent_settings_store,
+                    offered=proactive_agent_available,
+                    auth_provider=auth_provider,
+                    permission_store=permission_store,
+                ),
+                prefix="/v1",
+                tags=["proactive_agent"],
+            )
     if comment_store is not None:
         app.include_router(
             create_comments_router(
