@@ -741,6 +741,10 @@ async def test_active_creates_session_grant_and_run(session_mode: str, trigger: 
     # A conversation was created bound to the task's agent.
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["agent_id"] == "ag_1"
+    # A task without MCP services adds no selection labels.
+    assert not [
+        k for k in conv_store.created[0]["labels"] if k.startswith("omnigent.mcp_service.")
+    ]
     assert conv_store.created[0]["title"] == (
         "[automation job] nightly" if trigger and session_mode == "continue" else "nightly"
     )
@@ -805,22 +809,6 @@ async def test_every_fired_session_starts_with_the_task_mcp_services(
     assert len(conv_store.created) == 2
     for created in conv_store.created:
         assert expected.items() <= created["labels"].items()
-
-
-@pytest.mark.asyncio
-async def test_task_without_mcp_services_adds_no_selection_labels() -> None:
-    conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task()})
-
-    async def _launch(conv: Any, task: Any) -> None:
-        return None
-
-    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
-    await on_fire(0, "task_1")
-    await _drain()
-
-    labels = conv_store.created[0]["labels"]
-    assert not [key for key in labels if key.startswith("omnigent.mcp_service.")]
 
 
 class FakeProjectStore:
@@ -4249,6 +4237,39 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
     assert conv_store.host_bindings == [("conv_1", "host_1", "/repo", None)]
     assert [conv.id for conv in launched] == ["conv_1"]
     assert [run["status"] for run in store.runs] == ["running"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_services", "dropped", "added"),
+    [
+        (("github",), {"omnigent.mcp_service.slack"}, {"omnigent.mcp_service.github": "1"}),
+        ((), set(), {}),
+    ],
+    ids=["task-selection-replaces", "no-task-selection-keeps-the-copy"],
+)
+async def test_a_copied_run_uses_the_task_mcp_services_instead_of_the_source(
+    task_services: tuple[str, ...], dropped: set[str], added: dict[str, str]
+) -> None:
+    conv_store = FakeConversationStore()
+    conv_store.get_conversation = lambda conversation_id: _FakeConversation(  # type: ignore[method-assign]
+        id=conversation_id, agent_id="ag_1", labels={"omnigent.mcp_service.slack": "1"}
+    )
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(source_session_id="conv_source", mcp_services=task_services)}
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    await build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)(
+        0, "task_1"
+    )
+    await _drain()
+
+    (fork,) = conv_store.forked
+    assert ("omnigent.mcp_service.slack" in fork["dropped_label_keys"]) == bool(dropped)
+    assert added.items() <= fork["extra_labels"].items()
 
 
 @pytest.mark.asyncio

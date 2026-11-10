@@ -213,6 +213,9 @@ and both start with a saved selection:
   needs. It is stored on the task and stamped as `omnigent.mcp_service.<id>`
   labels on every session the task creates. `[]` clears it. Changing it makes a
   continue task's next run start a new session, as other session settings do.
+  A task that starts each run from a copy of a session replaces the copy's
+  selection with its own; with no services of its own, the copy keeps the
+  source session's.
 - **Independent workers** a session starts through `sys_session_create`
   inherit that session's selection when the request selects none of its own.
   The worker starts without it if a service is no longer usable by the owner,

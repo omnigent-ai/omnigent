@@ -436,10 +436,18 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 current = _to_entity(row)
                 if any(
                     getattr(current, field) != getattr(expected_schedule, field)
-                    for field in ("rrule", "session_mode", "execution_target")
+                    # The agent and MCP services are validated together, so an
+                    # edit to either since the snapshot invalidates the other.
+                    for field in (
+                        "rrule",
+                        "session_mode",
+                        "execution_target",
+                        "agent_id",
+                        "mcp_services",
+                    )
                 ):
                     raise OmnigentError(
-                        "The automation's schedule or execution settings changed. "
+                        "The automation's schedule, execution, agent or MCP settings changed. "
                         "Reload and try again.",
                         code=ErrorCode.CONFLICT,
                     )

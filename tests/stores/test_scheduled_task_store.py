@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.scheduled.schedule import next_scheduled_time
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
@@ -928,6 +928,31 @@ def test_mcp_services_longer_than_the_column_are_rejected_on_every_write(
     kept = store.get(_uid("st_mcp_fit"))
     assert kept is not None
     assert kept.mcp_services == fits
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ({"agent_id": _uid("ag_b")}, {"mcp_services": ("github",)}),
+        ({"mcp_services": ("github",)}, {"agent_id": _uid("ag_b")}),
+    ],
+    ids=["agent-then-services", "services-then-agent"],
+)
+def test_update_from_a_stale_snapshot_conflicts_on_agent_or_mcp_changes(
+    store: SqlAlchemyScheduledTaskStore, first: dict[str, Any], second: dict[str, Any]
+) -> None:
+    """Services are validated against an agent, so neither may change under the other."""
+    snapshot = _session_task(store, "st_stale_mcp")
+    applied = store.update(snapshot.id, expected_schedule=snapshot, **first)
+    assert applied is not None
+
+    with pytest.raises(OmnigentError, match="Reload and try again") as raised:
+        store.update(snapshot.id, expected_schedule=snapshot, **second)
+
+    assert raised.value.code == ErrorCode.CONFLICT
+    saved = store.get(snapshot.id)
+    assert saved is not None
+    assert (saved.agent_id, saved.mcp_services) == (applied.agent_id, applied.mcp_services)
 
 
 def test_update_last_run_conversation_id_can_be_cleared_to_null(

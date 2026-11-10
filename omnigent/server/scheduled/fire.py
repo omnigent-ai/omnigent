@@ -1934,6 +1934,12 @@ async def _copy_source_session_for_run(
     dropped = run_copy_dropped_label_keys(
         source.labels if source is not None else {}, agent_changed=agent_changed
     )
+    if task.mcp_services and source is not None:
+        # The task's own MCP services replace the copy's rather than adding to them.
+        selection = session_mcp_selection(deps.app_state)
+        dropped = dropped | frozenset(
+            selection.session_labels(selection.selected_services(source.labels))
+        )
     project_id = await _fire_project_id(deps, task)
     try:
         conv = await asyncio.to_thread(
