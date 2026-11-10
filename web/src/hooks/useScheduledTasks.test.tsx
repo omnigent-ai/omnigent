@@ -133,6 +133,19 @@ describe("mutations invalidate the list", () => {
     const { result } = renderHook(() => useDeleteScheduledTask(), { wrapper });
     await result.current.mutateAsync("st_1");
     expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });
+    expect(spy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+
+  it("deleting an automation that runs from a session refreshes the cached sessions", async () => {
+    const { queryClient, wrapper } = makeWrapper();
+    queryClient.setQueryData(SCHEDULED_TASKS_KEY, [{ ...TASK, sourceSessionId: "conv_copy" }]);
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useDeleteScheduledTask(), { wrapper });
+    await result.current.mutateAsync(TASK.id);
+    // The server cleared the copy's automation label; the sidebar must refetch it.
+    for (const queryKey of [["conversations"], ["project-sessions"], ["session", "conv_copy"]]) {
+      expect(spy).toHaveBeenCalledWith({ queryKey });
+    }
   });
 
   it("a deleted task's detail page refetches instead of rendering from cache", async () => {

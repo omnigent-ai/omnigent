@@ -4190,6 +4190,37 @@ async def test_relay_still_fails_mid_turn_session_without_handoff_evidence(
 
 
 @pytest.mark.asyncio
+async def test_native_policy_notice_logs_its_persisted_cause_once(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A durable policy notice has one warning with the same session, code and cause."""
+    from unittest.mock import Mock
+
+    from omnigent.entities import ErrorData
+    from omnigent.server.routes._sessions import helpers
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    published = Mock()
+    monkeypatch.setattr(helpers, "_publish_error_event", published)
+    reason = "Codex policy hook could not be trusted: provider name must not be empty"
+
+    with capture_debug_rows("server") as rows:
+        await helpers._persist_native_policy_notice(conversation.id, store, reason)
+        await helpers._persist_native_policy_notice(conversation.id, store, reason)
+
+    [notice] = [row for row in rows if row.get("event_name") == "native_policy_not_enforced"]
+    [item] = store.list_items(conversation.id, type="error").data
+    assert isinstance(item.data, ErrorData)
+    assert notice["session_id"] == conversation.id
+    assert notice["level"] == "WARNING"
+    assert notice["attributes"]["code"] == item.data.code == "native_policy_not_enforced"
+    assert notice["message"] == item.data.message
+    assert reason in notice["message"]
+    published.assert_called_once_with(conversation.id, item.data)
+
+
+@pytest.mark.asyncio
 async def test_relay_persist_error_once_emits_debug_row() -> None:
     """_relay_persist_error_once logs an error_item_persisted debug row on success."""
     from unittest.mock import MagicMock

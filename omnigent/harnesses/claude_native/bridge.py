@@ -416,6 +416,8 @@ _QUEUED_MESSAGE_HINT = "Press up to edit queued messages"
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
 _DRAFT_NEEDLE_MAX_CHARS = 24
+# A shorter end-of-draft marker could match unrelated words left in the box.
+_MIN_TAIL_NEEDLE_CHARS = 8
 # Mode footer Claude Code renders below its input box, keyed by
 # ``--permission-mode`` value. There is no non-interactive mode command, so
 # a live switch cycles with shift+tab and reads this footer to know where it
@@ -3659,6 +3661,79 @@ def read_transcript_items_since_with_position(
     )
 
 
+def _log_unmirrored_human_prompt(
+    entry: _JsonObject,
+    parsed: list[ClaudeTranscriptItem],
+    *,
+    line_number: int,
+) -> None:
+    """
+    Warn when a prompt Claude marks as human-typed yields no user message.
+
+    The server settles a queued web message only when its mirrored user
+    message arrives, so a dropped record later surfaces as "never recorded".
+    Command echoes are expected to become other item types and are skipped.
+    Only the record's shape is logged, never its text.
+
+    :param entry: Decoded Claude transcript record.
+    :param parsed: Items the forwarder produced for *entry*.
+    :param line_number: One-based transcript line number, for correlation.
+    """
+    attachment = entry.get("attachment")
+    if entry.get("type") == "attachment":
+        if not isinstance(attachment, dict) or attachment.get("type") != "queued_command":
+            return
+        # A queued shell command or notification is dropped on purpose, not lost.
+        if attachment.get("commandMode") != "prompt":
+            return
+        origin = attachment.get("origin")
+        content: object = attachment.get("prompt")
+    else:
+        origin = entry.get("origin")
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(origin, dict) or origin.get("kind") != "human":
+        return
+    if any(
+        item.item_type == "message"
+        and item.data.get("role") == "user"
+        and item.data.get("is_meta") is not True
+        for item in parsed
+    ):
+        return
+    texts = (
+        [content]
+        if isinstance(content, str)
+        else [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        if isinstance(content, list)
+        else []
+    )
+    if any(
+        _is_slash_command_echo(text) or text.lstrip().startswith(("<bash-", "<local-command"))
+        for text in texts
+    ):
+        return
+    joined = "\n".join(texts)
+    _logger.warning(
+        "claude-native: human prompt record produced no user message; record_type=%s "
+        "line=%d content_shape=%s content_chars=%d is_meta=%s command_mode=%s "
+        "item_types=%s has_command_markup=%s has_shell_markup=%s",
+        entry.get("type"),
+        line_number,
+        type(content).__name__,
+        len(joined),
+        entry.get("isMeta") is True,
+        attachment.get("commandMode") if isinstance(attachment, dict) else None,
+        sorted({item.item_type for item in parsed}),
+        "<command-name>" in joined or "<command-message>" in joined,
+        any(marker in joined for marker in ("<bash-input>", "<bash-stdout>", "<bash-stderr>")),
+    )
+
+
 def read_transcript_items_from_offset(
     transcript_path: Path,
     byte_offset: int,
@@ -3750,6 +3825,7 @@ def read_transcript_items_from_offset(
             pending_settled_at=pending_settled_at,
             include_sidechains=include_sidechains,
         )
+        _log_unmirrored_human_prompt(entry, parsed, line_number=record.line_number)
         if legacy_agent_messages and any(item.agent_message_candidate for item in parsed):
             active_response_id = previous_response_id
         items.extend(parsed)
@@ -4632,13 +4708,14 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message.",
             nothing_typed=True,
         )
+    tail_needle = _submit_tail_needle(text) if needle else ""
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first, or the paste lands inside the person's draft and
     # Enter submits both together.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     transcript_before_paste = _capture_pane(socket_path, tmux_target)
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-        bridge_dir, socket_path, tmux_target, text=text, needle=needle
+        bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
     )
     box = _composer_box(pane)
     # A TUI that submits the paste itself leaves an empty box and a new transcript line.
@@ -4662,7 +4739,7 @@ def _paste_and_submit(
         )
         _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
         draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-            bridge_dir, socket_path, tmux_target, text=text, needle=needle
+            bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
         )
     delivery_diagnostics.record_draft(
         pane=pane,
@@ -4707,6 +4784,7 @@ def _paste_and_submit(
             socket_path,
             tmux_target,
             needle=needle,
+            tail_needle=tail_needle,
             what="submitted message",
             bridge_dir=bridge_dir,
             submit_boundary=submit_boundary,
@@ -4733,6 +4811,7 @@ def _paste_and_await_draft(
     *,
     text: str,
     needle: str,
+    tail_needle: str = "",
 ) -> tuple[bool, str, int, int, float]:
     """
     Paste *text* into the composer, then poll until its draft shows or the paste budget ends.
@@ -4742,6 +4821,7 @@ def _paste_and_await_draft(
     :param tmux_target: tmux pane target string.
     :param text: Exact text to paste.
     :param needle: Draft marker from :func:`_submit_needle`.
+    :param tail_needle: End-of-draft marker from :func:`_submit_tail_needle`.
     :returns: ``(draft_seen, last_pane, polls, empty_captures, wait_started)``.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
@@ -4791,7 +4871,7 @@ def _paste_and_await_draft(
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
         empty_captures += not pane.strip()
-        if _draft_in_input_box(pane, needle):
+        if _draft_in_input_box(pane, needle, tail_needle=tail_needle):
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -4804,6 +4884,7 @@ def _verify_submit_accepted(
     *,
     needle: str,
     what: str,
+    tail_needle: str = "",
     bridge_dir: Path | None = None,
     submit_boundary: SubmitBoundary | None = None,
     submitted_text: str | None = None,
@@ -4825,6 +4906,7 @@ def _verify_submit_accepted(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
+    :param tail_needle: End-of-draft marker from :func:`_submit_tail_needle`.
     :param bridge_dir: Bridge whose pending questions protect submit retries.
     :param submit_boundary: Native transcript boundary captured before Enter.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
@@ -4854,7 +4936,7 @@ def _verify_submit_accepted(
             and _fresh_matching_hook_block(bridge_dir, submit_boundary, submitted_text)
         ):
             delivery_diagnostics.record_verification(
-                draft_still_present=_draft_in_input_box(pane, needle),
+                draft_still_present=_draft_in_input_box(pane, needle, tail_needle=tail_needle),
                 pane=pane,
                 needle=needle,
                 prompt_glyph=_CLAUDE_PROMPT_GLYPH,
@@ -4871,7 +4953,7 @@ def _verify_submit_accepted(
         # neither that the draft cleared nor that another Enter is safe.
         if not pane.strip():
             continue
-        if not _draft_in_input_box(pane, needle):
+        if not _draft_in_input_box(pane, needle, tail_needle=tail_needle):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
                 pane=pane,
@@ -4906,7 +4988,7 @@ def _verify_submit_accepted(
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
     delivery_diagnostics.record_verification(
-        draft_still_present=_draft_in_input_box(pane, needle),
+        draft_still_present=_draft_in_input_box(pane, needle, tail_needle=tail_needle),
         pane=pane,
         needle=needle,
         prompt_glyph=_CLAUDE_PROMPT_GLYPH,
@@ -6198,7 +6280,7 @@ def _request_claude_repaint(
     without a handler ignores it, so running processes under the pane get it:
     a launcher may run Claude Code as its child. Suspended processes stay paused.
 
-    A launcher may also run Claude Code outside that tree: isaac's fast launch
+    A launcher may also run Claude Code outside that tree: a fast launch
     pumps the pane to a pre-started worker's terminal. Claude Code's session
     registry still names its process, so that process gets the signal too.
 
@@ -6335,13 +6417,15 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    # Narrow panes wrap the decision footer across captured lines.
+    footer = " ".join(region.split())
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
         or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
-            any(hint in region for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in region
+            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
+            and "Esc to cancel" in footer
         )
     )
 
@@ -6611,7 +6695,7 @@ def _restore_occupied_input(
     startup dialogs whose Escape quits Claude Code instead of closing them
     (:func:`_escape_quits_claude`): they are left for the person to answer.
 
-    Isaac's idle-compaction log can overwrite the rendered input box. Redraw
+    A launcher's idle-compaction log can overwrite the rendered input box. Redraw
     it once with Ctrl+L before any edit keys can erase its identifying prefix,
     then check the actual composer and pending prompts again.
 
@@ -7243,7 +7327,34 @@ def _submit_needle(content: str) -> str:
     return ""
 
 
-def _draft_in_input_box(pane: str, needle: str) -> bool:
+def _submit_tail_needle(content: str) -> str:
+    r"""
+    Derive a marker for the end of *content*, where a scrolled draft stays in view.
+
+    Claude Code keeps the cursor row of a draft taller than its input box on
+    screen, so the first line :func:`_submit_needle` reads can scroll away
+    while the last one stays visible.
+
+    :param content: Raw user text, e.g. ``"step 1\n…\nstep 9 then run the tests"``.
+    :returns: The last :data:`_DRAFT_NEEDLE_MAX_CHARS` characters of the last
+        non-empty line after its final control character, e.g.
+        ``"step 9 then run the tests"``; empty when that marker is too short
+        to tell the draft from other text in the box.
+    """
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    for line in reversed(normalized.split("\n")):
+        for idx in range(len(line) - 1, -1, -1):
+            if ord(line[idx]) < 0x20:
+                line = line[idx + 1 :]
+                break
+        line = line.strip()
+        if line:
+            tail = line[-_DRAFT_NEEDLE_MAX_CHARS:].strip()
+            return tail if len(_comparable_draft_text(tail)) >= _MIN_TAIL_NEEDLE_CHARS else ""
+    return ""
+
+
+def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> bool:
     """
     Return whether the pasted draft is visible in Claude's input box.
 
@@ -7260,16 +7371,24 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     Whitespace is ignored, so a needle wrapped across rows still matches,
     and so are Unicode control and format characters (e.g. U+FEFF), which
     Claude Code keeps in the draft but does not render.
+    A shell-mode box (``!`` glyph) is read too: Claude Code turns a draft's
+    leading ``!`` into that glyph, so the needle is matched without it.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :param needle: Marker from :func:`_submit_needle`, e.g.
         ``"fix the bug"``. Empty means the draft can't be identified;
         only the paste placeholder is then considered.
+    :param tail_needle: Marker from :func:`_submit_tail_needle`, matched as
+        well: a draft taller than the box scrolls its first line out of view.
     :returns: ``True`` when the draft is still sitting in the input box.
     """
     rows = _composer_rows(pane)
+    first_row = rows[0].strip() if rows else ""
     if rows and _CLAUDE_PROMPT_GLYPH in rows[0]:
         tail = "\n".join([rows[0].split(_CLAUDE_PROMPT_GLYPH, 1)[1], *rows[1:]])
+    elif first_row.startswith(_SHELL_MODE_GLYPH):
+        tail = "\n".join([first_row[len(_SHELL_MODE_GLYPH) :], *rows[1:]])
+        needle = needle.removeprefix(_SHELL_MODE_GLYPH)
     else:
         glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
         if not glyph_lines:
@@ -7278,9 +7397,11 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
     # The hint is not a draft, but a short needle such as "to" or "a" matches its words.
-    tail = tail.replace(_QUEUED_MESSAGE_HINT, "")
-    target = _comparable_draft_text(needle)
-    return bool(target) and target in _comparable_draft_text(tail)
+    tail = _comparable_draft_text(tail.replace(_QUEUED_MESSAGE_HINT, ""))
+    return any(
+        target and target in tail
+        for target in (_comparable_draft_text(needle), _comparable_draft_text(tail_needle))
+    )
 
 
 def _comparable_draft_text(text: str) -> str:
@@ -10701,23 +10822,22 @@ def _user_transcript_items_from_entry(
             # assistant text must inherit this id so it clusters with
             # the indicator, not the prior bubble.
             return fallback_response_id, [item]
-        # ``!cmd`` terminal commands may arrive here in older Claude
-        # builds; newer builds use top-level ``local_command`` records.
-        # In both shapes, surface the command and result as their own
-        # transcript group instead of inheriting the previous assistant
-        # response id.
-        terminal_response_id = (
-            fallback_response_id
-            if _BASH_INPUT_RE.search(content) is not None
-            else current_response_id or fallback_response_id
-        )
-        terminal_items = _terminal_command_items_from_content(
-            content,
-            source_key=source_key,
-            response_id=terminal_response_id,
-        )
-        if terminal_items:
-            return terminal_response_id, terminal_items
+        # Legacy ``!cmd`` records start with ``<bash-*>`` (newer builds use top-level
+        # ``local_command``) and get their own transcript group, not the prior response id.
+        # A prompt that merely quotes the markup (a pasted log) stays the person's message.
+        if stripped.startswith("<bash-"):
+            terminal_response_id = (
+                fallback_response_id
+                if _BASH_INPUT_RE.search(content) is not None
+                else current_response_id or fallback_response_id
+            )
+            terminal_items = _terminal_command_items_from_content(
+                content,
+                source_key=source_key,
+                response_id=terminal_response_id,
+            )
+            if terminal_items:
+                return terminal_response_id, terminal_items
         # Other CLI-scaffolding records (stdout/stderr from /effort, etc.)
         # arrive as standalone ``role=user`` records and must drop instead
         # of leaking as user bubbles.

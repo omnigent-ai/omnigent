@@ -16,9 +16,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e.conftest import get_mock_requests
-from tests.e2e_ui.chat.test_claude_sdk_terminated_cli_recovery import (
-    _create_claude_sdk_session,
-)
+from tests.e2e_ui._claude_sdk_session import create_claude_sdk_session
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
 ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
@@ -58,8 +56,8 @@ def test_claude_sdk_clear_follows_a_new_empty_session(
     created: list[str] = []
     try:
         runner_id = str(_server_state["runner_id"])
-        source_id, _agent_name = _create_claude_sdk_session(
-            live_server, runner_id, mock_llm_server_url
+        source_id, _agent_name = create_claude_sdk_session(
+            live_server, runner_id, mock_llm_server_url, name_prefix="sdk-clear"
         )
         created.append(source_id)
         token = f"clear-prompt-{uuid.uuid4().hex[:6]}"
