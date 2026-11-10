@@ -395,7 +395,17 @@ export async function cloneHostRepository(
     },
   );
   if (!response.ok) throw await apiErrorFromResponse(response);
-  return ((await response.json()) as { path: string }).path;
+  const body: unknown = await response.json();
+  if (
+    body === null ||
+    typeof body !== "object" ||
+    !("path" in body) ||
+    typeof body.path !== "string" ||
+    body.path.trim() === ""
+  ) {
+    throw new Error("Host returned no checkout path. Check the clone destination before retrying.");
+  }
+  return body.path;
 }
 
 export function useCloneHostRepository() {
