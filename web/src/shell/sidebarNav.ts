@@ -550,16 +550,23 @@ export function pinOrderWrites(
 
 /**
  * The pin label writes that put a not-yet-pinned `fromId` at the bottom of the
- * (already pin-ordered) Pinned list: just past the highest value any shown row
- * sorts by, including a family member shown without its representative. When a
- * row has no value (it sorts last), the pins are renumbered after the last
- * pin-order unit instead. Returns `[]` when there's no unit to renumber.
+ * (already pin-ordered) Pinned list, numbered past the highest value any shown
+ * row sorts by, including a family member shown without its representative.
+ * Rows with no value sort last, so they're numbered first, in their shown
+ * order; no existing row changes place. Returns `[]` (a plain pin) when there's
+ * nothing to number past, or the values are too large to step past.
  */
 export function appendPinWrites(rows: readonly Conversation[], fromId: string): PinOrderWrite[] {
-  const highest = Math.max(...rows.map(pinnedSortValue));
-  if (highest + 1 > highest) return [{ id: fromId, pinnedAt: highest + 1 }];
-  const lastUnit = rows.filter(isPinOrderUnit).at(-1);
-  return lastUnit ? pinOrderWrites(rows, fromId, lastUnit.id, true) : [];
+  const values = rows.map(pinnedSortValue);
+  const finite = values.filter(Number.isFinite);
+  // A nested family row can't take a value without splitting it out of its
+  // family, so when one has none the new pin stays above the unvalued rows.
+  const unvalued = rows.filter((_, index) => !Number.isFinite(values[index]));
+  const renumber = unvalued.every(isPinOrderUnit) ? unvalued : [];
+  if (finite.length === 0 && renumber.length === 0) return [];
+  const start = finite.length > 0 ? Math.max(...finite) + 1 : Date.now() - renumber.length;
+  if (start + renumber.length > Number.MAX_SAFE_INTEGER) return [];
+  return [...renumber, { id: fromId }].map(({ id }, index) => ({ id, pinnedAt: start + index }));
 }
 
 // ── Drag-and-drop ────────────────────────────────────────────────────────────
