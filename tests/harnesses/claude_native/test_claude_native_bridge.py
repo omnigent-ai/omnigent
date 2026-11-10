@@ -16937,7 +16937,20 @@ def test_btw_overlay_present_false_on_bare_composer(quoted_overlay: str) -> None
             id="answering-with-wrapped-footer",
         ),
         pytest.param(
-            _WRAPPED_BTW_PANE + "\n" + _composer_pane(), True, id="closed-below-earlier-overlay"
+            _btw_pane(
+                "    /btw q",
+                "",
+                "      Esc to close",
+                "",
+                "      " + "─" * 40,
+                "      ❯ example",
+                "",
+            ),
+            False,
+            id="torn-footer-quoting-close-hint-and-composer",
+        ),
+        pytest.param(
+            _WRAPPED_BTW_PANE + "\n" + _composer_pane(), False, id="composer-below-overlay"
         ),
         pytest.param("", False, id="failed-capture"),
     ],

@@ -5882,26 +5882,20 @@ def _btw_display_ended(pane: str) -> bool:
     """
     Report whether a captured pane ends the previous ``/btw`` display.
 
-    True only on positive evidence: the overlay is answering anew, or the live
-    input box it hides is back. Rows from the overlay's border through its
-    footer belong to the overlay, so a composer-shaped answer, or one in a
-    capture without a recognized footer, does not count. Failed captures,
-    history browsing and the copy indicator also keep the display open.
+    True only on positive evidence: the overlay is answering anew, or no
+    overlay border is on screen and the live input box it hides is back.
+    While a border shows, a composer-shaped row belongs to the overlay's
+    text, whatever footer the capture kept. Failed captures, history
+    browsing and the copy indicator also keep the display open.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: True when a later settled exchange is a new display.
     """
     if _btw_answering(pane):
         return True
-    lines = pane.splitlines()
-    border_idx = _btw_border_index(lines)
-    if border_idx is not None:
-        rows = lines[border_idx + 1 :]
-        span = _btw_footer_span(rows)
-        if span is None:
-            return False
-        lines = rows[span[1] :]
-    return _composer_row("\n".join(lines)) is not None
+    if _btw_border_index(pane.splitlines()) is not None:
+        return False
+    return _composer_row(pane) is not None
 
 
 def _dedent_overlay_lines(overlay_lines: list[str]) -> str:

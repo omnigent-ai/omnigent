@@ -1021,9 +1021,10 @@ async def test_forward_pane_signals_captures_once_and_relays_both(
 @pytest.mark.parametrize(
     ("later_frames", "relays"),
     [
-        pytest.param(["closed", "second", "second", "second"], 2, id="closed"),
-        pytest.param(["answering", "second", "second", "second"], 2, id="answering"),
+        pytest.param(["closed", "closed", "second", "second", "second"], 2, id="closed"),
+        pytest.param(["answering", "answering", "second", "second", "second"], 2, id="answering"),
         pytest.param(["torn", "first", "first", "first"], 1, id="torn-capture"),
+        pytest.param(["borderless", "first", "first", "first"], 1, id="torn-borderless-capture"),
         pytest.param(["torn-bullet", "first", "first", "first"], 1, id="torn-bullet-capture"),
     ],
 )
@@ -1037,13 +1038,19 @@ async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
     The same /btw is relayed again once the overlay closes or answers anew.
 
     Claude Code keeps /btw history, so the second ask lists the first above it
-    and settles on the same question and answer. One torn capture that loses
-    the footer does not end the display, though the question ends with the
-    close hint and the answer quotes a composer or starts with an answering bullet.
+    and settles on the same question and answer. A display ends only on two
+    consecutive reads, so one torn capture does not end it, even when its
+    question or answer resembles the close hint, the composer or the spinner.
     """
     scrollback = [f"scrollback line {n}" for n in range(30)]
     border, question = "▔" * 80, "    /btw what does Esc to close"
-    answer = ["      Type it like this:", "      " + "─" * 40, "      ❯ example"]
+    answer = [
+        "      Type it like this:",
+        "      Esc to close",
+        "",
+        "      " + "─" * 40,
+        "      ❯ example",
+    ]
     first_ask = "\n".join(
         [
             *scrollback,
@@ -1084,6 +1091,7 @@ async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
             ]
         ),
         "torn": "\n".join([*scrollback, border, question, "", *answer, ""]),
+        "borderless": "\n".join([*scrollback, question, "", *answer, ""]),
         "torn-bullet": "\n".join(
             [
                 *scrollback,
@@ -1115,7 +1123,7 @@ async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
     relayed = [c["data"] for c in calls if c["type"] == "external_btw_sidechat"]
     exchange = {
         "question": "/btw what does Esc to close",
-        "answer": "Type it like this:\n" + "─" * 40 + "\n❯ example",
+        "answer": "Type it like this:\nEsc to close\n\n" + "─" * 40 + "\n❯ example",
         "truncated": False,
     }
     assert relayed == [exchange] * relays

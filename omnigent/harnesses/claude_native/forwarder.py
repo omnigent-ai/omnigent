@@ -950,6 +950,7 @@ class _ForwardDedupeState:
     pending_compaction_dismiss_seq: int | None = None
     # /btw side-chat relay state, scraped from the pane; see ``_relay_btw_overlay``.
     btw_pending_key: str | None = None
+    btw_display_end_pending: bool = False
     posted_btw_keys: dict[str, None] = field(default_factory=dict)
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
@@ -6324,10 +6325,14 @@ async def _relay_btw_overlay(
         ``None`` when none is shown.
     :param dedupe: Shared per-session dedupe state; mutated in place.
     :param display_ended: True when the pane showed the overlay closed or
-        answering anew, so a repeated question and answer is relayed again.
+        answering anew. Two consecutive such reads let a repeated question
+        and answer relay again.
     """
-    if display_ended:
+    # Like posting below, a display end needs two consecutive reads, so one
+    # torn capture whose answer text resembles chrome can't reset the dedupe.
+    if display_ended and dedupe.btw_display_end_pending:
         dedupe.posted_btw_keys.clear()
+    dedupe.btw_display_end_pending = display_ended
     if overlay is None:
         dedupe.btw_pending_key = None
         return
