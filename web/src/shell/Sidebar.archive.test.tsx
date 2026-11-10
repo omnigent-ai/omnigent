@@ -150,6 +150,8 @@ describe("archive flow", () => {
     fireEvent.click(screen.getByTestId("quick-archive-conversation"));
 
     // Same single-PATCH contract as the kebab item, just a different affordance.
+    // An idle session skips the running-session confirmation.
+    expect(screen.queryByTestId("archive-running-dialog")).not.toBeInTheDocument();
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
     expect(mocks.archive.mutate).toHaveBeenCalledWith({
       id: "conv_1",
@@ -309,15 +311,6 @@ describe("archive running-session prompt", () => {
 
     expect(screen.queryByTestId("archive-running-dialog")).not.toBeInTheDocument();
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
-  });
-
-  it("archives an idle session without asking", () => {
-    mockConversations([CONV]);
-    renderSidebar();
-    fireEvent.click(screen.getByTestId("quick-archive-conversation"));
-
-    expect(screen.queryByTestId("archive-running-dialog")).not.toBeInTheDocument();
-    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
 
   it("continues to the worktree prompt after confirming a running worktree session", async () => {

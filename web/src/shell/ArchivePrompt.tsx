@@ -33,14 +33,8 @@ interface PendingRunningPrompt {
 }
 
 /**
- * Gate an archive on confirmations the user may need to give first.
- *
- * Archiving a session whose agent is still working asks to confirm, since
- * archiving stops it. Then the "Delete worktrees for archived sessions"
- * preference applies: `requestArchive` proceeds immediately when no session has
- * a worktree or the user has already chosen, and otherwise asks. The caller
- * must render the returned `dialog`. Dismissing either prompt cancels the
- * archive. Servers that predate worktree cleanup always archive only.
+ * Confirm archiving working sessions, then apply the worktree preference.
+ * Callers render `dialog`; dismissing either prompt cancels the archive.
  */
 export function useArchivePrompt(): {
   requestArchive: (conversations: readonly Conversation[], proceed: ProceedFn) => void;
