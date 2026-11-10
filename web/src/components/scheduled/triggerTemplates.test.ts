@@ -10,6 +10,7 @@ import {
   jiraAssignee,
   parseGithubReviewer,
   isTriggerPrompt,
+  triggerPromptSource,
   readTriggerWorkerSettings,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerPrompt,
@@ -738,14 +739,17 @@ describe("triggerScopeOperators", () => {
   });
 });
 
-describe("isTriggerPrompt", () => {
-  it.each(TRIGGER_SOURCES)("recognizes a rendered %s prompt", (source) => {
-    expect(isTriggerPrompt(renderTriggerPrompt(source, fields(), CTX))).toBe(true);
+describe("isTriggerPrompt and triggerPromptSource", () => {
+  it.each(TRIGGER_SOURCES)("recognizes a rendered %s prompt and its source", (source) => {
+    const prompt = renderTriggerPrompt(source, fields(), CTX);
+    expect(isTriggerPrompt(prompt)).toBe(true);
+    expect(triggerPromptSource(prompt)).toBe(source);
   });
 
   it("doesn't match a prompt written by hand", () => {
     expect(isTriggerPrompt("Summarize the new Jira tickets.")).toBe(false);
     expect(isTriggerPrompt(` ${renderTriggerPrompt("jira", fields(), CTX)}`)).toBe(false);
+    expect(triggerPromptSource("Summarize the new Jira tickets.")).toBeNull();
   });
 });
 

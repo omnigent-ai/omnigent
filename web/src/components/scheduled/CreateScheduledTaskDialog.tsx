@@ -51,6 +51,7 @@ import {
   TRIGGER_SOURCES,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
+  triggerPromptSource,
   triggerServiceName,
   updateTriggerWorkerSettings,
   type TriggerFields,
@@ -220,6 +221,9 @@ export function CreateScheduledTaskDialog({
   // Temporary prompt edits must not expose controls that can rebind the poller.
   const editingWorkerSettings =
     editingTemplateTrigger && readTriggerWorkerSettings(editingTask.prompt) !== null;
+  const editingTriggerSource = editingTemplateTrigger
+    ? triggerPromptSource(editingTask.prompt)
+    : null;
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -403,13 +407,24 @@ export function CreateScheduledTaskDialog({
     baseBranch === (editingTask.baseBranch ?? null) &&
     (hostId === "" || hostId === editingTask.hostId);
   // An active trigger template replaces the Prompt field; the saved prompt is
-  // rendered from its fields. Create-only: an edit always shows the prompt.
+  // rendered from its fields. An edit shows the saved prompt unless the user
+  // switches the trigger to another integration.
   const [trigger, setTrigger] = useState<TriggerSource | null>(null);
   const [triggerType, setTriggerType] = useState<AutomationTriggerType>("schedule");
   const typeDrafts = useRef<Partial<Record<AutomationTriggerType, AutomationTypeDraft>>>({});
   const [triggerFields, setTriggerFields] = useState<TriggerFields>(() =>
     emptyTriggerFields("jira"),
   );
+  // Editing a trigger under another source: the saved prompt editor to restore,
+  // each source's fields, and the worker settings carried into the new prompt.
+  const savedSourcePrompt = useRef<{
+    prompt: string;
+    systemPrompt: string | null;
+    startNewSession: boolean;
+  } | null>(null);
+  const editSourceDrafts = useRef<Partial<Record<TriggerSource, TriggerFields>>>({});
+  const [switchedWorkerSettings, setSwitchedWorkerSettings] =
+    useState<TriggerWorkerSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
   const defaultTriggerSchedule = useMemo(
@@ -434,6 +449,9 @@ export function CreateScheduledTaskDialog({
   useEffect(() => {
     if (open && !wasOpen.current) {
       typeDrafts.current = {};
+      savedSourcePrompt.current = null;
+      editSourceDrafts.current = {};
+      setSwitchedWorkerSettings(null);
       setTriggerType(sourceSession ? "schedule" : (initialTrigger ?? "schedule"));
       resetMenus();
       setAdvancedOpen(false);
@@ -599,6 +617,10 @@ export function CreateScheduledTaskDialog({
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
   function handleWorkerSettingsChange(settings: TriggerWorkerSettings) {
+    if (trigger !== null) {
+      setSwitchedWorkerSettings(settings);
+      return;
+    }
     const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
     if (updated === null) return;
     const parts = splitTriggerPrompt(updated);
@@ -606,12 +628,18 @@ export function CreateScheduledTaskDialog({
     setSystemPrompt(parts.systemPrompt);
   }
 
-  const workerSettings = editingWorkerSettings
-    ? readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt))
-    : null;
-  const workerPlacement = editingWorkerSettings
-    ? readTriggerWorkerPlacement(combineTriggerPrompt(prompt, systemPrompt))
-    : null;
+  let workerSettings: TriggerWorkerSettings | null = null;
+  if (editingWorkerSettings) {
+    workerSettings =
+      trigger !== null
+        ? switchedWorkerSettings
+        : readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt));
+  }
+  // A switched source renders its workers beside the poller, like a new template.
+  const workerPlacement =
+    editingWorkerSettings && trigger === null
+      ? readTriggerWorkerPlacement(combineTriggerPrompt(prompt, systemPrompt))
+      : null;
   const workerSandboxMode = workerPlacement === "managed" || sandboxMode;
   const workerAgent = agents?.find(
     (agent) => agent.id === (workerSettings?.agentId ?? editingTask?.agentId),
@@ -778,7 +806,7 @@ export function CreateScheduledTaskDialog({
     unsupportedByScheduler ||
     validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
       null;
-  const renderedTriggerPrompt =
+  const renderedTemplatePrompt =
     trigger !== null && triggerFieldsComplete(triggerFields, trigger)
       ? renderTriggerPrompt(trigger, triggerFields, {
           // Workers run where the manager runs: beside it on a connected host,
@@ -793,6 +821,11 @@ export function CreateScheduledTaskDialog({
           effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
         })
       : "";
+  const renderedTriggerPrompt =
+    workerSettings !== null && renderedTemplatePrompt !== ""
+      ? (updateTriggerWorkerSettings(renderedTemplatePrompt, workerSettings) ??
+        renderedTemplatePrompt)
+      : renderedTemplatePrompt;
   const effectivePrompt =
     trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
   const triggerMode =
@@ -892,6 +925,49 @@ export function CreateScheduledTaskDialog({
     setTimezone(draft?.timezone ?? timezone);
     setSessionMode(draft?.sessionMode ?? (next === "schedule" ? "new" : "continue"));
     setScheduleUnsupported(false);
+    setSystemPromptOpen(false);
+    setEditingSystemPrompt(false);
+    setError(null);
+  }
+
+  // The source an edited trigger watches now: its open form, or its prompt's opening line.
+  const editedTriggerSource =
+    trigger ?? triggerPromptSource(effectivePrompt) ?? editingTriggerSource;
+
+  /** Edit only: watch another integration, or restore the saved prompt for the original one. */
+  function handleEditTriggerSourceChange(next: TriggerSource) {
+    if (editingTriggerSource === null || editedTriggerSource === null) return;
+    if (next === editedTriggerSource) return;
+    if (savedSourcePrompt.current === null) {
+      savedSourcePrompt.current = { prompt, systemPrompt, startNewSession };
+    }
+    if (trigger !== null) editSourceDrafts.current[trigger] = triggerFields;
+    // A split template prompt's user part is the instructions for each session.
+    let instructions = "";
+    if (trigger !== null) instructions = triggerFields.instructions;
+    else if (systemPrompt !== null) instructions = prompt;
+    if (name === TRIGGER_TEMPLATES[editedTriggerSource].name) {
+      setName(TRIGGER_TEMPLATES[next].name);
+    }
+    if (next === editingTriggerSource) {
+      const saved = savedSourcePrompt.current;
+      savedSourcePrompt.current = null;
+      setPrompt(
+        saved.systemPrompt !== null && instructions.trim() !== "" ? instructions : saved.prompt,
+      );
+      setSystemPrompt(saved.systemPrompt);
+      setStartNewSession(saved.startNewSession);
+      setTrigger(null);
+    } else {
+      if (trigger === null) setSwitchedWorkerSettings(workerSettings);
+      setTriggerFields({
+        ...(editSourceDrafts.current[next] ?? emptyTriggerFields(next)),
+        instructions,
+      });
+      setTrigger(next);
+      // The polling session's state tracks the old source's items.
+      setStartNewSession(true);
+    }
     setSystemPromptOpen(false);
     setEditingSystemPrompt(false);
     setError(null);
@@ -1131,6 +1207,44 @@ export function CreateScheduledTaskDialog({
               {!curationPending && !triggersSupported && (
                 <p className="text-sm text-muted-foreground">
                   Integration triggers aren't available on this server.
+                </p>
+              )}
+            </div>
+          )}
+          {editingTriggerSource !== null && editedTriggerSource !== null && triggersSupported && (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="task-trigger-type">Trigger type</Label>
+              <Select
+                value={editedTriggerSource}
+                onValueChange={(value) => handleEditTriggerSourceChange(value as TriggerSource)}
+                onOpenChange={handleSelectOpenChange}
+                disabled={curationPending || mutationPending}
+                componentId="tasks.scheduled.trigger_type"
+              >
+                <SelectTrigger
+                  id="task-trigger-type"
+                  data-testid="task-trigger-type"
+                  className="w-full"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {TRIGGER_SOURCES.map((source) => (
+                    <SelectItem
+                      key={source}
+                      value={source}
+                      data-testid={`task-trigger-type-${source}`}
+                    >
+                      <TriggerTypeOption type={source} />
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {editedTriggerSource !== editingTriggerSource && (
+                <p className="text-sm text-muted-foreground" data-testid="task-trigger-type-note">
+                  Saving replaces the {triggerServiceName(editingTriggerSource)} trigger. The next
+                  run starts a new polling session that watches{" "}
+                  {triggerServiceName(editedTriggerSource)}.
                 </p>
               )}
             </div>

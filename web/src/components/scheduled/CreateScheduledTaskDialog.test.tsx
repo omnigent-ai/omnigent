@@ -41,6 +41,8 @@ import {
   readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
+  triggerPromptSource,
+  updateTriggerWorkerSettings,
   type TriggerSource,
 } from "./triggerTemplates";
 
@@ -3266,6 +3268,88 @@ describe("automation trigger type", () => {
     render(dialog({ editingTask: scheduledTask() }));
     expect(screen.queryByLabelText("Trigger type")).not.toBeInTheDocument();
     expect(screen.getByTestId("task-prompt-input")).toHaveValue("Summarize overnight activity");
+  });
+
+  describe("editing a trigger's source", () => {
+    const slackPrompt = updateTriggerWorkerSettings(
+      renderTriggerPrompt(
+        "slack",
+        { ...emptyTriggerFields("slack"), scope: "support", instructions: "Answer the question." },
+        { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
+      ),
+      { agentId: "ag_claude_native", model: "opus", effort: "" },
+    )!;
+    const slackTask = scheduledTask({
+      name: "Slack messages",
+      prompt: slackPrompt,
+      sessionMode: "continue",
+      sessionId: "poller",
+      rrule: "FREQ=MINUTELY;INTERVAL=30",
+    });
+
+    it("offers only integrations, with the saved source selected and its prompt editor shown", async () => {
+      render(dialog({ editingTask: slackTask }));
+      expect(screen.getByLabelText("Trigger type")).toHaveTextContent("Slack");
+      expect(screen.getByTestId("task-prompt-input")).toHaveValue("Answer the question.");
+      expect(screen.queryByTestId("task-trigger-type-note")).not.toBeInTheDocument();
+      fireEvent.keyDown(screen.getByLabelText("Trigger type"), { key: "Enter" });
+      await screen.findByRole("listbox");
+      expect(screen.queryByRole("option", { name: "Schedule" })).not.toBeInTheDocument();
+      for (const label of ["Jira", "Slack", "GitHub", "Linear", "PagerDuty"]) {
+        expect(screen.getByRole("option", { name: label })).toBeInTheDocument();
+      }
+    });
+
+    it("saves the new source's trigger with the saved instructions and worker, in a new polling session", async () => {
+      render(dialog({ editingTask: slackTask }));
+      await choose("Jira");
+      expect(screen.getByTestId("task-name-input")).toHaveValue("Jira tickets");
+      expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
+      expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Answer the question.");
+      expect(screen.getByTestId("task-trigger-type-note")).toHaveTextContent(
+        "Saving replaces the Slack trigger. The next run starts a new polling session that watches Jira.",
+      );
+      expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Claude Code");
+      expect(screen.queryByTestId("schedule-preset-trigger")).not.toBeInTheDocument();
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      type("task-trigger-scope", "ES");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(triggerPromptSource(input.prompt)).toBe("jira");
+      expect(input.prompt).toContain('project = "ES"');
+      expect(splitTriggerPrompt(input.prompt).userPrompt).toBe("Answer the question.");
+      expect(readTriggerWorkerSettings(input.prompt)).toEqual({
+        agentId: "ag_claude_native",
+        model: "opus",
+        effort: "",
+      });
+      expect(input).toMatchObject({ name: "Jira tickets", sessionId: null });
+      expect(input.rrule).toBe("FREQ=MINUTELY;INTERVAL=30");
+      expect(input).not.toHaveProperty("sessionMode");
+    });
+
+    it("keeps each source's draft and restores the saved prompt for the original source", async () => {
+      render(dialog({ editingTask: { ...slackTask, name: "Support desk" } }));
+      await choose("GitHub");
+      type("task-trigger-scope", "acme/app");
+      type("task-trigger-instructions", "Answer the question quickly.");
+      await choose("Linear");
+      expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
+      await choose("GitHub");
+      expect(screen.getByTestId("task-trigger-scope")).toHaveValue("acme/app");
+      await choose("Slack");
+      expect(screen.queryByTestId("task-trigger-fields")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("task-trigger-type-note")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-name-input")).toHaveValue("Support desk");
+      expect(screen.getByTestId("task-prompt-input")).toHaveValue("Answer the question quickly.");
+      type("task-prompt-input", "Answer the question.");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(input.prompt).toBe(slackPrompt);
+      expect(input).not.toHaveProperty("sessionId");
+    });
   });
 });
 

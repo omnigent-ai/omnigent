@@ -713,7 +713,12 @@ function triggerPromptOpening(source: TriggerSource): string {
  * record its template, so the edit form recognizes the prompt's opening line.
  */
 export function isTriggerPrompt(prompt: string): boolean {
-  return TRIGGER_SOURCES.some((source) => prompt.startsWith(triggerPromptOpening(source)));
+  return triggerPromptSource(prompt) !== null;
+}
+
+/** The service a rendered trigger prompt watches, from its opening line; null otherwise. */
+export function triggerPromptSource(prompt: string): TriggerSource | null {
+  return TRIGGER_SOURCES.find((source) => prompt.startsWith(triggerPromptOpening(source))) ?? null;
 }
 
 /**
