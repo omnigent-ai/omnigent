@@ -152,6 +152,13 @@ interface SessionResponseWire {
    * it. Absent when none are tracked.
    */
   background_tasks?: BackgroundTaskInfo[] | null;
+  /**
+   * Background agents a finished claude-native turn left running, while the
+   * session waits on them. `status` still reads ``"running"`` then, for older
+   * headless clients; {@link sessionFromWire} reads the pair as ``"waiting"``.
+   * Absent otherwise.
+   */
+  background_agents?: BackgroundTaskInfo[] | null;
   created_at: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -293,13 +300,9 @@ interface SessionItemsResponseWire {
 }
 
 /**
- * Initial (and per-scroll-up-page) item count for conversation history
- * hydration. Bounds how many items the chat surface fetches, parses,
- * and renders when a conversation is opened. The synchronous first-paint
- * render scales ~linearly with this count (parse/walk are negligible;
- * mounting the markdown/Streamdown tree per bubble is the cost), so a
- * smaller window keeps thread-switch render cheap. `loadMoreHistory`
- * pages older items on scroll-up.
+ * Default `fetchSessionItemsPage` size. The reconnect backfill pages with it:
+ * a short disconnect gap usually fits in one small page. Opening a session
+ * uses `INITIAL_WINDOW_ITEMS` and scroll-up uses `OLDER_HISTORY_PAGE_ITEMS`.
  */
 export const SESSION_HISTORY_PAGE_SIZE = 20;
 
@@ -341,6 +344,19 @@ function pendingInputsFromWire(wire: PendingInputWire[] | undefined): PendingInp
   }));
 }
 
+/**
+ * The snapshot's status as the live stream would report it. The server keeps
+ * a claude-native background-agent wait at ``"running"`` so released headless
+ * clients keep polling, and names the agents beside it.
+ */
+function snapshotStatus(wire: SessionResponseWire): SessionStatus {
+  const waitingOnAgents =
+    wire.status === "running" &&
+    Array.isArray(wire.background_agents) &&
+    wire.background_agents.length > 0;
+  return waitingOnAgents ? "waiting" : wire.status;
+}
+
 function sessionFromWire(wire: SessionResponseWire): Session {
   // Record the session's host so slice-key routing (turn dispatch, terminal
   // attach) can pin to the replica holding that host's runner tunnel; a
@@ -358,9 +374,10 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     hostOnline: wire.host_online ?? undefined,
     hostResumable: wire.host_resumable ?? false,
     archived: wire.archived ?? false,
-    status: wire.status,
+    status: snapshotStatus(wire),
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
+    backgroundAgents: parseBackgroundTasks(wire.background_agents),
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,
@@ -1494,6 +1511,15 @@ export async function exportSessionTranscript(sessionId: string): Promise<string
  * is then the reader's scroll, not a background fetch.
  */
 export const INITIAL_WINDOW_ITEMS = 100;
+
+/**
+ * Items per scroll-up page (`loadMoreHistory`): the same as opening a session.
+ * Pages are sequential round trips, and a tool-heavy turn folds hundreds of
+ * items into one row, so small pages leave the reader waiting at the top.
+ * Past this size, a full scroll-back gets only a little faster, while each
+ * page's download and wait keep growing.
+ */
+export const OLDER_HISTORY_PAGE_ITEMS = 100;
 
 /**
  * Flatten a `GET /v1/sessions/{id}` item into the flat

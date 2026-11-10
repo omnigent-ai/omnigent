@@ -1,7 +1,7 @@
 # GitLab merge requests
 
-The session pull request panel shows GitLab merge requests using `glab` on the
-execution host. Sign in there before opening the panel:
+The session pull request panel shows GitLab merge requests using `glab` or a
+GitLab token on the execution host. To use an existing CLI login:
 
 ```sh
 glab auth login --hostname gitlab.com
@@ -11,6 +11,8 @@ glab auth status --hostname gitlab.com
 Omnigent uses the CLI's existing credentials. It does not require a GitLab OAuth
 connection in Omnigent. Install and authenticate `glab` inside a sandbox when
 that sandbox runs the session.
+
+The GitHub CLI (`gh`) is not required.
 
 ## Private instances and remotes
 
@@ -52,6 +54,31 @@ use an HTTPS remote to select the intended one.
 
 Existing `OMNIGENT_GIT_PROVIDER_GITLAB_HOSTS`, `GITLAB_HOST`, and `GLAB_HOST`
 overrides remain supported when explicit instance configuration is useful.
+`GITLAB_HOST` and `GLAB_HOST` are forwarded to background hosts, runners, and
+agent tools. Restart the host after changing these environment variables.
+
+## Token authentication without a CLI
+
+If `glab` is not installed, the panel can read GitLab directly using an exported
+`GITLAB_TOKEN` with API read access. For a private instance, select its HTTPS
+host explicitly. When Omnigent launches a background host and runner, opt in to
+forwarding that credential:
+
+```sh
+export GITLAB_HOST=git.example.com
+export OMNIGENT_RUNNER_ENV_PASSTHROUGH=GITLAB_TOKEN
+```
+
+Keep any existing passthrough names in the comma-separated list. `GLAB_HOST`
+and `GLAB_TOKEN` are also supported; name `GLAB_TOKEN` in the passthrough list
+when using it. Restart the host and reconnect the session after setting these
+variables. Agent tools still need their own explicitly granted token access.
+
+The token is used only for the selected host, including its HTTPS port;
+without a host selector it applies to GitLab.com. Other instances use their
+saved `glab` login. When `glab` is installed, its configuration continues to
+control API routing. SSH keys authenticate git fetch/push, but cannot read MR
+details from the GitLab API.
 
 ## Panel and tracking
 

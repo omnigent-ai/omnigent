@@ -250,6 +250,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _read_explicit_unread,
     _read_last_seen,
     _session_active_response_cache,
+    _session_background_agents_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
@@ -5062,6 +5063,7 @@ def _publish_status(
     failure_intake: Mapping[str, str] | None = None,
     disconnect_evidence: Mapping[str, str] | None = None,
     turn_completed: bool = False,
+    background_agents: list[BackgroundTaskInfo] | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -5102,6 +5104,9 @@ def _publish_status(
     :param turn_completed: Whether an ``"idle"`` edge reports a turn the harness
         confirmed finished (e.g. claude-native's ``Stop`` hook), which clears a
         sticky ``failed`` like a ``running`` edge would.
+    :param background_agents: Background agents a finished claude-native turn
+        left running, on its ``"waiting"`` edge. Kept for snapshots until the
+        next non-``waiting`` edge; ignored on every other status.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -5130,6 +5135,13 @@ def _publish_status(
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
     _set_blocked_on(session_id, blocked_on)
+    # Only a ``waiting`` edge names background agents; any other edge ends that wait.
+    if status != "waiting":
+        background_agents = None
+    if background_agents:
+        _session_background_agents_cache[session_id] = background_agents
+    else:
+        _session_background_agents_cache.pop(session_id, None)
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
@@ -5236,6 +5248,7 @@ def _publish_status(
         error=error,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        background_agents=background_agents or None,
         blocked_on=blocked_on,
     )
     payload = event.model_dump()
@@ -5248,6 +5261,8 @@ def _publish_status(
     # its detail when the count clears).
     if not background_tasks:
         payload.pop("background_tasks", None)
+    if not background_agents:
+        payload.pop("background_agents", None)
     if blocked_on is None:
         payload.pop("blocked_on", None)
     session_stream.publish(session_id, payload)
@@ -6563,6 +6578,7 @@ async def _launch_runner_on_host_locked(
                 # same configuration check it does at create-time launch. None
                 # (agent not resolvable) skips the host-side check — fail open.
                 harness=_resolve_harness(conv),
+                mcp_disabled_servers_active_harnesses=host_registry.mcp_disabled_servers_active_harnesses(),
                 inference_config=(
                     conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
                 ),
@@ -7473,6 +7489,16 @@ async def _persist_native_policy_notice(
     # one-shot flag already prevents re-surfacing; this dedups a same-turn
     # retry against an already-recorded notice).
     if persisted == "persisted":
+        _logger.warning(
+            "%s",
+            error.message,
+            extra=debug_event(
+                _NATIVE_POLICY_NOT_ENFORCED_CODE,
+                session_id=session_id,
+                code=error.code,
+                source=error.source,
+            ),
+        )
         _publish_error_event(session_id, error)
 
 
@@ -10916,6 +10942,7 @@ def _reject_server_reserved_label_seed(labels: Mapping[str, str | None] | None) 
         CREATED_BY_SESSION_LABEL_KEY,
         FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
@@ -10924,6 +10951,8 @@ def _reject_server_reserved_label_seed(labels: Mapping[str, str | None] | None) 
         raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        # Deleting a session also deletes the automation this label names.
+        SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
     ):

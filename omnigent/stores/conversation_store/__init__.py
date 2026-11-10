@@ -195,6 +195,9 @@ ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 # Server-owned origin, retained when a schedule's run history is deleted.
 SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
 SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_source_sha256"
+# Server-owned: marks the copy an automation starts each run from (its source
+# session). The value is the task id; runs never inherit it.
+SCHEDULED_TASK_SOURCE_LABEL_KEY = "omnigent.scheduled_task_source"
 
 # Creation provenance only; this does not confer parentage or permissions.
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
@@ -260,6 +263,8 @@ _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     CREATED_BY_SESSION_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
+    # A fork of an automation's copy isn't what the automation runs from.
+    SCHEDULED_TASK_SOURCE_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
@@ -2235,6 +2240,7 @@ class ConversationStore(ABC):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        copy_inference_snapshot: bool = True,
         override_model_override: str | None = None,
         override_model_override_set: bool = False,
         override_reasoning_effort: str | None = None,
@@ -2296,6 +2302,10 @@ class ConversationStore(ABC):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param copy_inference_snapshot: When ``True`` (default), the fork
+            keeps the source's saved provider binding. When ``False``, it has
+            none and resolves its provider like a new session: used when the
+            fork binds another agent, whose provider may differ.
         :param copy_terminal_launch_args: When ``True`` (default), copy the
             source's ``terminal_launch_args``. When ``False``, the fork starts
             with none — used when the fork switches to a different CLI, where

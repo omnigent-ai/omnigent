@@ -195,6 +195,7 @@ from omnigent.server.routes._sessions.helpers import (
     reconcile_orphaned_running_status,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    HOST_OFFLINE_HOLD_S,
     _best_effort_stop,
     _build_session_list_item,
     _build_session_response,
@@ -205,6 +206,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _ensure_runner_relay_ready,
     _ensure_runner_session_initialized,
     _get_session_snapshot,
+    _host_row_offline,
     _is_native_terminal_session,
     _labels_for_viewer,
     _mark_session_moving,
@@ -240,7 +242,10 @@ from omnigent.server.schemas import (
     SupersessionReason,
     UpdateSessionRequest,
 )
-from omnigent.server.session_orchestration import require_orchestration_source
+from omnigent.server.session_orchestration import (
+    require_named_source_private,
+    require_orchestration_source,
+)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -964,6 +969,7 @@ def register_core_routes(
                 # spawning. None (agent not resolvable) skips the
                 # host-side check.
                 harness=harness,
+                mcp_disabled_servers_active_harnesses=host_registry.mcp_disabled_servers_active_harnesses(),
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
                     if target.conv.inference_snapshot
@@ -2164,7 +2170,8 @@ def register_core_routes(
             ``project``, only owned sessions are returned so first-class
             project names resolve within the caller's projects.
             ``"all"`` (default) returns all accessible non-archived
-            sessions, matching the legacy behaviour.
+            sessions, matching the legacy behaviour. ``include_archived``
+            adds archived rows to ``"mine"``, ``"shared"`` and ``"all"``.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -2200,13 +2207,15 @@ def register_core_routes(
             accessible_by_param: str | None = None
             owned_by_param: str | None = user_id
             shared_only_param = False
-            include_archived_param = False
+            # The sidebar tabs never send include_archived; agents listing their
+            # own sessions (sys_session_list) do, to find archived workers.
+            include_archived_param = include_archived
             archived_only_param = False
         elif effective_visibility == "shared":
             accessible_by_param = user_id
             owned_by_param = None
             shared_only_param = True
-            include_archived_param = False
+            include_archived_param = include_archived
             archived_only_param = False
         elif effective_visibility == "archived":
             accessible_by_param = user_id
@@ -2347,16 +2356,31 @@ def register_core_routes(
                     orphan_liveness = await asyncio.to_thread(
                         liveness_lookup, [conv.id for conv in orphan_suspects]
                     )
+                    offline_hosts: dict[str, bool | None] = {}
+                    now = int(time.time())
+                    # Heartbeat expiry and reconnect grace can precede the hold.
+                    hold_stale_before = now - HOST_OFFLINE_HOLD_S - 2 * RUNNER_LIVENESS_TTL_S
                     for conv in orphan_suspects:
                         result = orphan_liveness.get(conv.id)
                         # False means no replica has a tunnel and the heartbeat
                         # expired, so reconnecting runners within grace survive.
                         if result is not None and not result.runner_online:
+                            if result.host_online is False and conv.host_id is not None:
+                                # A sleeping host can resume its runner; a list read
+                                # must not end that bounded wait on another replica.
+                                if conv.host_id not in offline_hosts:
+                                    offline_hosts[conv.host_id] = await _host_row_offline(
+                                        getattr(request.app.state, "host_store", None),
+                                        conv.host_id,
+                                        updated_since=hold_stale_before,
+                                    )
+                                if offline_hosts[conv.host_id] is not False:
+                                    continue
                             await asyncio.to_thread(
                                 reconcile_orphaned_running_status,
                                 conv.id,
                                 conversation_store,
-                                int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                                now - RUNNER_LIVENESS_TTL_S,
                             )
             # Build items after reconciliation so each settled row reads its new
             # status straight from the (now-updated) cache.
@@ -3156,6 +3180,16 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
+        if set_project:
+            # A session shared with edit access must not let collaborators
+            # refile the owner's other sessions through agent tools.
+            await asyncio.to_thread(
+                require_named_source_private,
+                request,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
