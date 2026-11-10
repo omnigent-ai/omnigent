@@ -296,6 +296,7 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.session_pull_request_store import SessionSummary
 from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
+from omnigent.util.claude_launch_args import without_claude_session_id_arg
 from omnigent.util.cost_plan import (
     reserved_cost_control_keys,
 )
@@ -5139,6 +5140,13 @@ def register_core_routes(
             and override_launch_args[1] in _CLAUDE_NATIVE_PERMISSION_MODES
         ):
             extra_labels[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = override_launch_args[1]
+
+        # A continuation is a new session, so it can't reuse the explicit Claude
+        # ``--session-id`` its source launched with; the other launch args carry over.
+        if continue_source and not launch_args_set and source.terminal_launch_args:
+            fresh_launch_args = without_claude_session_id_arg(source.terminal_launch_args)
+            if fresh_launch_args != source.terminal_launch_args:
+                override_launch_args, launch_args_set = fresh_launch_args, True
 
         # Side chats use the source for shared-runner routing and stay hidden
         # from the sidebar while appearing in the Workspace rail.

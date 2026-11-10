@@ -176,6 +176,51 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     assert new_id in live_runner.announced
 
 
+@pytest.mark.parametrize("item_index", [0, 2], ids=["first-prompt", "later-prompt"])
+@pytest.mark.parametrize(
+    "session_id_args",
+    [["--session-id", "0c5d1a52-8f8e-4c55-a0b1-5e2f4d8f0a11"], ["--session-id=0c5d1a52"]],
+    ids=["separate-value", "joined-value"],
+)
+async def test_rewind_gives_the_fork_a_fresh_claude_session_id(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    item_index: int,
+    session_id_args: list[str],
+) -> None:
+    """A source launched with ``--session-id`` doesn't pass that used id to its rewound fork.
+
+    Rewound to the first prompt, the fork has no transcript to resume, so a kept
+    id would reach Claude's launch and be refused; its other launch args stay.
+    """
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    store.update_conversation(
+        source_id,
+        harness_override="claude-native",
+        terminal_launch_args=["--permission-mode", "acceptEdits", *session_id_args, "--verbose"],
+    )
+    items = item_ids(store, source_id)
+
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/rewind", json={"item_id": items[item_index]}
+    )
+
+    assert resp.status_code == 200, resp.text
+    fork = store.get_conversation(resp.json()["session_id"])
+    assert fork is not None
+    assert fork.terminal_launch_args == ["--permission-mode", "acceptEdits", "--verbose"]
+    source = store.get_conversation(source_id)
+    assert source is not None
+    assert source.terminal_launch_args == [
+        "--permission-mode",
+        "acceptEdits",
+        *session_id_args,
+        "--verbose",
+    ]
+
+
 @pytest.mark.parametrize(
     ("harness", "rewound_to", "status"),
     [
