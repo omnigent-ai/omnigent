@@ -3951,6 +3951,13 @@ describe("editing template prompts", () => {
       expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Polly");
       expect(screen.getByTestId("task-worker-agent-trigger")).toBeVisible();
       expect(screen.queryByTestId("task-trigger-session-mode-field")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+      expect(screen.getByTestId("task-worker-settings")).toHaveTextContent(
+        taskSessionMode === "continue"
+          ? "Applies to the next task session. The current task session and the polling session keep their settings"
+          : "Applies to new sessions started for matching items.",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
       expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
       await select("task-worker-agent-trigger", "Claude Code");
       expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(

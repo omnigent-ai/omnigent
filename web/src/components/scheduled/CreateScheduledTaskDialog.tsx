@@ -1725,6 +1725,7 @@ export function CreateScheduledTaskDialog({
                         <TriggerWorkerSettingsFields
                           value={workerSettings}
                           settings={workerHarnessSettings}
+                          taskSession={sendsToTaskSession}
                           disabled={curationPending}
                           onSelectOpenChange={handleSelectOpenChange}
                           onChange={handleWorkerSettingsChange}
@@ -1792,6 +1793,8 @@ export function CreateScheduledTaskDialog({
                                         To change the model or harness for future workers, edit the
                                         worker creation instructions in the{" "}
                                         {systemPrompt === null ? "prompt" : "system prompt"}.{" "}
+                                        {sendsToTaskSession &&
+                                          "The current task session keeps its settings; archive it so the next match starts one with the new settings. "}
                                         <button
                                           type="button"
                                           className="underline underline-offset-2"

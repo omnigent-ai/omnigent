@@ -1446,11 +1446,33 @@ describe("one task session for every match", () => {
     expect(prompt).toContain(
       'Comment "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" on each ticket you sent to the task session.',
     );
-    expect(prompt).toContain("Replace CONVERSATION_ID with your task session's conversation_id");
+    // A replacement between two deliveries must not relink the earlier item.
+    expect(prompt).toContain(
+      "Replace CONVERSATION_ID with the conversation_id of the task session that item went to, which differs from the current one if it was replaced later in the run,",
+    );
+    expect(prompt).toContain(
+      "Reply with the title of each ticket you sent to the task session, and of any an earlier run sent without recording it, each with the conversation_id of the task session it went to,",
+    );
     expect(prompt).not.toContain("that sys_session_create returned");
     // A pending link-back keeps the session it was recorded with, even after a replacement.
     expect(prompt).toContain(
       "4. Post each pending link-back, the same way as below, with the conversation_id on its entry. Don't send anything to the task session for them; one that fails again stays pending.",
+    );
+  });
+
+  it("leaves out link-back steps when link-back is off", () => {
+    const prompt = renderTriggerPrompt("jira", fields({ linkBack: false }), SHARED);
+
+    expect(prompt).not.toContain("Omnigent session:");
+    expect(prompt).not.toContain("Link-back pending:");
+    expect(prompt).toContain(
+      "Stopping means sending no more matches in this run; still write your reply.",
+    );
+    expect(prompt).toContain(
+      "\n7. Reply with the title of each ticket you sent to the task session,",
+    );
+    expect(prompt).toContain(
+      'a "Delivery pending:" line for anything still pending. End with "Checked through: <time>"',
     );
   });
 
