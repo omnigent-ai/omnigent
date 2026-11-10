@@ -115,8 +115,11 @@ the header menu), and each place is a separate entry point.
   Each repository starts on its current branch if pushed, otherwise its original
   launch branch. A quiet note explains an unpushed branch's fallback; unavailable
   source workspaces retain their original selections.
-- `fork-access`: require read access to the source and, for a custom target,
-  its owning session. The caller owns the fork; source grants are not copied.
+- `fork-access`: require read access to the source and, for a custom target
+  another user owns, edit access to its owning session. The caller owns the
+  fork; source grants are not copied. Without edit access to the source, the
+  fork's agent copy keeps only the agent's name and harness, since its bundle
+  can carry the author's credentials.
 - `unsupported-sandbox-actions`: Databricks Sandbox and Arclet host-switch
   controls stay visible but disabled, with hover and keyboard explanations.
   Their forms cannot submit. Fork is not restricted for these sessions.
@@ -214,7 +217,11 @@ the header menu), and each place is a separate entry point.
   drawer or the dimmed chat strip beside it drags the drawer shut. Lifting past
   a third of its width, or after a quick flick, closes it; a shorter drag springs
   back. List scrolling, row taps, long-press reordering and horizontal scrollers
-  keep their own touch handling.
+  keep their own touch handling. Swiping right across the chat drags the closed
+  drawer open the same way, except from within 24px of the left screen edge or
+  on inputs, terminals and horizontal scrollers. On wide touch phones (600–767px
+  wide, at least 3:4) the open sidebar docks beside the chat with no dimmed strip
+  and a **Close sidebar** toggle; Settings keeps the overlay drawer.
 
 ## How to get to it (user POV)
 
@@ -504,9 +511,9 @@ than the main session.
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
-**Closing the mobile drawer by swipe:** at phone width, open the sidebar with
-the header's Open sidebar button or, in the iOS app, a right swipe from the
-left edge. Swipe left on the drawer or the dimmed chat strip beside it; past a
+**Mobile drawer swipes:** at phone width, open the sidebar with the header's
+Open sidebar button, a right swipe across the chat or, in the iOS app, a right
+swipe from the left edge. Swipe left on the drawer or the dimmed chat strip beside it; past a
 third of the drawer's width or after a quick flick it closes on the current
 chat, otherwise it springs back. Settings and desktop widths don't use it.
 
@@ -696,10 +703,14 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_scrolls_edit_row_into_view_above_keyboard`
 - **`mobile-drawer-swipe`:**
   `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_close.py::test_swipe_left_closes_open_drawer`,
-  `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_close.py::test_drawer_stays_open_for_scroll_and_short_drag`.
+  `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_close.py::test_drawer_stays_open_for_scroll_and_short_drag`,
+  `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_open.py::test_swipe_right_opens_drawer`,
+  `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_open.py::test_short_vertical_and_edge_drags_leave_drawer_closed`,
+  `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_open.py::test_wide_phone_docks_sidebar_beside_chat`.
   These touch-drive the built SPA in desktop Chromium at a phone viewport with
-  mocked APIs and a stubbed iOS bridge. Thresholds, multi-touch and long-press
-  hand-off are covered in `web/src/hooks/useSidebarSwipeToClose.test.tsx`.
+  mocked APIs; the close tests also stub the iOS bridge. Thresholds, multi-touch and long-press
+  hand-off are covered in `web/src/hooks/useSidebarSwipeToClose.test.tsx` and
+  `web/src/hooks/useSidebarSwipeToOpen.test.tsx`.
 - **`archive`:**
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
@@ -830,7 +841,8 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`fork-access` (server integration, plain `uv run pytest`):**
   `tests/server/integration/test_sessions_permissions.py::test_fork_session_requires_read_access`,
   `tests/server/integration/test_sessions_permissions.py::test_fork_switch_binds_session_scoped_target_with_access`,
-  `tests/server/integration/test_sessions_permissions.py::test_fork_switch_denies_session_scoped_target_without_access`.
+  `tests/server/integration/test_sessions_permissions.py::test_fork_switch_denies_session_scoped_target_without_access`,
+  `tests/server/routes/test_agent_bundle_read_authority.py::test_fork_agent_copy_is_redacted_only_for_read`.
   These exercise authenticated routes and stores; the single-user browser
   recipe cannot prove cross-user access rules.
 - **`clone`:**
@@ -1273,7 +1285,8 @@ its discoverability.
   recovery offers connected hosts only. Verify a managed sandbox fork with
   `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`.
 - A custom agent outlives its sessions: forks of your own sessions share it,
-  and forking someone else's session gives you your own copy. Appearing in the
+  and forking someone else's session gives you your own copy, redacted to its
+  name and harness unless you can edit the source. Appearing in the
   picker does not prove the fork API accepts it; check the bound agent after
   navigation.
 - A copied web transcript does not prove the native CLI received that history.

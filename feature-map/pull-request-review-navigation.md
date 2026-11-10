@@ -179,7 +179,7 @@ Component coverage for these helpers and views lives in
   They are separate for each Omnigent server, signed-in user and pull request, and
   clearing site data removes them. If the browser refuses storage, your changes stay in
   this tab over the stored marks, so other tabs' writes still show. A reload drops them,
-  with the toast `Viewed files can’t be saved on this device.` Clearing site data also
+  with the toast `Viewed files can't be saved on this device.` Clearing site data also
   discards them.
 - **Marks follow the content, not the head.** Each mark is the hash of a file's hunks
   as you viewed them. One mark per file covers every head of the pull request, and a

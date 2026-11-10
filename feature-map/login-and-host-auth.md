@@ -114,6 +114,9 @@ their original destination in the browser. `--no-open` suppresses both.
 
 **Web:** a harness that needs sign-in is marked in the harness picker, and a
 session whose host went offline offers reconnect (see [sessions](./sessions.md)).
+In a browser, the sidebar's bottom profile menu offers **Sign out** when the
+server has a sign-in page (accounts or OIDC): accounts mode opens the login
+form, OIDC follows the server's logout redirect. Servers without one show none.
 
 **Desktop:** Connect on the setup screen (or the server selector) to an OIDC
 server; relaunching the app, New Window, deep links, and switching servers on a
@@ -309,6 +312,12 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   "signs a workspace out…", "Server → Sign Out of Server…", and "holds a
   connection that starts during sign-out…" cases in `web/electron/test/main.test.js`,
   and `web/src/shell/SidebarServerPicker.test.tsx`.
+- **Browser sign-out (sidebar profile menu):** sign in to an accounts or OIDC
+  server in a browser, open the profile menu at the bottom of the sidebar and
+  choose **Sign out**; on a server without sign-in, confirm it is absent.
+  Component tests: the "signs a browser out through the %s flow" and "hides Sign
+  out in a browser whose server has no sign-in" cases in
+  `web/src/shell/SidebarServerPicker.test.tsx`.
 
 ## Gotchas
 
