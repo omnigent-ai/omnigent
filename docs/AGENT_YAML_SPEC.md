@@ -659,14 +659,14 @@ os_env:
     type: linux_bwrap
     egress_rules:
       - "* pypi.org/**"                              # your other egress needs
-      - "* dbc-adb7b1a3-9097.cloud.databricks.com/**"  # the proxied workspace
+      - "* dbc-87654321-dcba.cloud.databricks.com/**"  # the proxied workspace
     credential_proxy:
       - type: databricks_cli
-        profiles: [dbc-adb7b1a3-9097, oss]
-        default: dbc-adb7b1a3-9097   # optional; sets DATABRICKS_CONFIG_PROFILE
+        profiles: [dbc-87654321-dcba, oss]
+        default: dbc-87654321-dcba   # optional; sets DATABRICKS_CONFIG_PROFILE
 ```
 
-Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
+Inside the sandbox, `databricks --profile dbc-87654321-dcba current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
 ### Git over SSH from a sandbox
@@ -994,6 +994,7 @@ tool_groups:
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+  projects: false         # sys_project_list / sys_session_update
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values
