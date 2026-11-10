@@ -12,6 +12,7 @@ import {
 import type { ProjectConfig } from "./projectsApi";
 
 const STORAGE_KEY = "omnigent:project-launch-defaults";
+const CODEX_DEFAULT_MIGRATION_KEY = "omnigent:project-codex-default-mode-migrated";
 const START = {
   agentId: "ag_codex",
   pickedHarness: null,
@@ -39,6 +40,41 @@ describe("projectLaunchPreferences", () => {
       agentId: "ag_claude",
       hostId: "host_2",
     });
+  });
+
+  it("migrates legacy Codex Default starts without changing other projects", () => {
+    const legacyCodex = {
+      ...START,
+      harnessOptions: { ...START.harnessOptions, mode: "default" },
+    };
+    writeProjectLaunchDefaults("proj_codex", legacyCodex, {});
+    writeProjectLaunchDefaults(
+      "proj_claude",
+      { harness: "claude-native", harnessOptions: { mode: "default" } },
+      {},
+    );
+    localStorage.removeItem(CODEX_DEFAULT_MIGRATION_KEY);
+
+    expect(readProjectLaunchDefaults("proj_codex", {})).toEqual({
+      ...legacyCodex,
+      harnessOptions: { ...legacyCodex.harnessOptions, mode: "approve-for-me" },
+    });
+    expect(readProjectLaunchDefaults("proj_claude", {})).toEqual({
+      harness: "claude-native",
+      harnessOptions: { mode: "default" },
+    });
+    expect(localStorage.getItem(CODEX_DEFAULT_MIGRATION_KEY)).toBe("1");
+  });
+
+  it("keeps a new explicit Codex Default after the one-time migration", () => {
+    const explicitDefault = {
+      harness: "codex-native",
+      harnessOptions: { mode: "default" },
+    };
+    writeProjectLaunchDefaults("proj_codex", explicitDefault, {});
+
+    expect(readProjectLaunchDefaults("proj_codex", {})).toEqual(explicitDefault);
+    expect(localStorage.getItem(CODEX_DEFAULT_MIGRATION_KEY)).toBe("1");
   });
 
   it("drops a start once the project's stored defaults change", () => {

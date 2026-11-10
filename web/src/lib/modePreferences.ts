@@ -19,11 +19,37 @@
 // remembered mode survives the generalization without a reset.
 
 const STORAGE_KEY = "omnigent:last-mode-by-harness";
+const CODEX_DEFAULT_MIGRATION_KEY = "omnigent:codex-default-mode-migrated";
+const CODEX_DEFAULT_MIGRATION_VERSION = "1";
 
 /** A harness's remembered option knobs (e.g. `{ mode, model, effort }`). */
 export type HarnessOptions = Record<string, string>;
 
 type OptionsMap = Record<string, HarnessOptions>;
+
+/** Map the old Codex Default preference to its equivalent explicit preset. */
+export function migrateLegacyCodexDefaultMode(options: HarnessOptions): HarnessOptions {
+  return options.mode === "default" ? { ...options, mode: "approve-for-me" } : options;
+}
+
+function migrateCodexDefaultMode(options: OptionsMap): OptionsMap {
+  if (
+    window.localStorage.getItem(CODEX_DEFAULT_MIGRATION_KEY) === CODEX_DEFAULT_MIGRATION_VERSION
+  ) {
+    return options;
+  }
+  let migratedOptions = options;
+  const current = options["codex-native"];
+  if (current !== undefined) {
+    const migrated = migrateLegacyCodexDefaultMode(current);
+    if (migrated !== current) {
+      migratedOptions = { ...options, "codex-native": migrated };
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(migratedOptions));
+    }
+  }
+  window.localStorage.setItem(CODEX_DEFAULT_MIGRATION_KEY, CODEX_DEFAULT_MIGRATION_VERSION);
+  return migratedOptions;
+}
 
 /**
  * Coerce one stored entry into a clean string->string options map. Returns an
@@ -55,7 +81,7 @@ function readMap(): OptionsMap {
       const entry = coerceEntry(value);
       if (Object.keys(entry).length > 0) out[harness] = entry;
     }
-    return out;
+    return migrateCodexDefaultMode(out);
   } catch {
     return {};
   }
@@ -87,6 +113,7 @@ export function writeHarnessOption(
     const map = readMap();
     map[harness] = { ...map[harness], ...patch };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
+    window.localStorage.setItem(CODEX_DEFAULT_MIGRATION_KEY, CODEX_DEFAULT_MIGRATION_VERSION);
   } catch {
     // localStorage quota or access errors shouldn't break the composer.
   }

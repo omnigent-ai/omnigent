@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readHarnessOptions, writeHarnessOption } from "./modePreferences";
 
 const KEY = "omnigent:last-mode-by-harness";
+const CODEX_DEFAULT_MIGRATION_KEY = "omnigent:codex-default-mode-migrated";
 
 afterEach(() => {
   localStorage.clear();
@@ -76,6 +77,34 @@ describe("modePreferences (per-harness options)", () => {
     // mode survives — not reset to default.
     localStorage.setItem(KEY, JSON.stringify({ "claude-native": "plan" }));
     expect(readHarnessOptions("claude-native")).toEqual({ mode: "plan" });
+  });
+
+  it.each([
+    ["an options object", { mode: "default", model: "gpt-5.6", effort: "high" }],
+    ["a bare mode string", "default"],
+  ])("preserves the automatic meaning of legacy Codex Default from %s", (_label, stored) => {
+    localStorage.setItem(
+      KEY,
+      JSON.stringify({
+        "claude-native": { mode: "plan" },
+        "codex-native": stored,
+      }),
+    );
+
+    expect(readHarnessOptions("codex-native")).toEqual({
+      ...(typeof stored === "string" ? {} : stored),
+      mode: "approve-for-me",
+    });
+    expect(readHarnessOptions("claude-native")).toEqual({ mode: "plan" });
+    expect(JSON.parse(localStorage.getItem(KEY)!)["codex-native"].mode).toBe("approve-for-me");
+    expect(localStorage.getItem(CODEX_DEFAULT_MIGRATION_KEY)).toBe("1");
+  });
+
+  it("keeps a new explicit Codex Default after the one-time migration", () => {
+    writeHarnessOption("codex-native", { mode: "default" });
+
+    expect(readHarnessOptions("codex-native")).toEqual({ mode: "default" });
+    expect(localStorage.getItem(CODEX_DEFAULT_MIGRATION_KEY)).toBe("1");
   });
 
   it("drops non-string fields and structurally-corrupt entries", () => {

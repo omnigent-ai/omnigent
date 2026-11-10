@@ -4,10 +4,12 @@
 
 import { z } from "zod";
 import { AUTO_NATIVE_HARNESS_ID } from "./agentLabels";
-import type { HarnessOptions } from "./modePreferences";
+import { migrateLegacyCodexDefaultMode, type HarnessOptions } from "./modePreferences";
 import type { ProjectConfig } from "./projectsApi";
 
 const STORAGE_KEY = "omnigent:project-launch-defaults";
+const CODEX_DEFAULT_MIGRATION_KEY = "omnigent:project-codex-default-mode-migrated";
+const CODEX_DEFAULT_MIGRATION_VERSION = "1";
 
 const entrySchema = z.object({
   agentId: z.string().optional(),
@@ -78,9 +80,31 @@ function configSignature(config: ProjectConfig): string {
 function readAll(): Record<string, unknown> {
   try {
     const parsed: unknown = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? "null");
-    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    let entries = parsed as Record<string, unknown>;
+    if (
+      window.localStorage.getItem(CODEX_DEFAULT_MIGRATION_KEY) === CODEX_DEFAULT_MIGRATION_VERSION
+    ) {
+      return entries;
+    }
+    let changed = false;
+    entries = Object.fromEntries(
+      Object.entries(entries).map(([projectId, entry]) => {
+        const validated = entrySchema.safeParse(entry);
+        if (!validated.success || validated.data.harness !== "codex-native") {
+          return [projectId, entry];
+        }
+        const current = validated.data.harnessOptions;
+        if (current === undefined) return [projectId, entry];
+        const migrated = migrateLegacyCodexDefaultMode(current);
+        if (migrated === current) return [projectId, entry];
+        changed = true;
+        return [projectId, { ...(entry as Record<string, unknown>), harnessOptions: migrated }];
+      }),
+    );
+    if (changed) window.localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
+    window.localStorage.setItem(CODEX_DEFAULT_MIGRATION_KEY, CODEX_DEFAULT_MIGRATION_VERSION);
+    return entries;
   } catch {
     return {};
   }
@@ -117,6 +141,7 @@ export function writeProjectLaunchDefaults(
     const all = readAll();
     all[projectId] = { ...defaults, configSignature: configSignature(config) };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
+    window.localStorage.setItem(CODEX_DEFAULT_MIGRATION_KEY, CODEX_DEFAULT_MIGRATION_VERSION);
   } catch {
     // localStorage quota or access errors shouldn't break the composer.
   }
@@ -133,6 +158,7 @@ export function clearProjectLaunchDefaults(projectId: string): void {
   try {
     const { [projectId]: _cleared, ...rest } = readAll();
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(rest));
+    window.localStorage.setItem(CODEX_DEFAULT_MIGRATION_KEY, CODEX_DEFAULT_MIGRATION_VERSION);
   } catch {
     // localStorage quota or access errors shouldn't break the settings save.
   }
