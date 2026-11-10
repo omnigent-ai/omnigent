@@ -10,13 +10,10 @@ import type { WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { SessionOverview } from "./SessionOverview";
 
 const mobile = vi.hoisted(() => ({ value: false }));
+const useChildSessionsMock = vi.hoisted(() => vi.fn());
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => mobile.value }));
 vi.mock("@/hooks/useChildSessions", () => ({
-  useChildSessions: () => ({
-    children: [{ id: "child", task_summary: "Review changes", busy: true, own_cost_usd: 0.25 }],
-    isLoading: false,
-    error: null,
-  }),
+  useChildSessions: useChildSessionsMock,
 }));
 
 type Props = ComponentProps<typeof SessionOverview>;
@@ -50,6 +47,11 @@ function file(path: string, added: number | null, removed: number | null): Works
 }
 
 beforeEach(() => {
+  useChildSessionsMock.mockReset().mockReturnValue({
+    children: [{ id: "child", task_summary: "Review changes", busy: true, own_cost_usd: 0.25 }],
+    isLoading: false,
+    error: null,
+  });
   mobile.value = false;
   width = 1200;
   localStorage.clear();
@@ -114,6 +116,16 @@ afterEach(() => {
 });
 
 describe("Session overview", () => {
+  it.each([
+    { isLoading: true, error: null, message: "Loading…" },
+    { isLoading: false, error: null, message: "No subagents yet" },
+    { isLoading: false, error: new Error("offline"), message: "Couldn’t refresh subagents." },
+  ])("shows the subagent state: $message", ({ isLoading, error, message }) => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading, error });
+    render(<SessionOverview {...props} />, { wrapper: Wrapper });
+    expect(screen.getByText(message)).toBeInTheDocument();
+  });
+
   it("shows authoritative spend, cumulative tokens and partial workspace counts with working links", () => {
     render(<SessionOverview {...props} />, { wrapper: Wrapper });
     const card = within(screen.getByRole("complementary", { name: "Session overview" }));
@@ -132,14 +144,20 @@ describe("Session overview", () => {
 
   it("remembers explicit dismissal and restores from the cost button", () => {
     const view = render(<SessionOverview {...props} />, { wrapper: Wrapper });
+    expect(useChildSessionsMock).toHaveBeenCalledWith("session", 10_000);
     fireEvent.click(screen.getByRole("button", { name: "Hide session overview" }));
     expect(screen.queryByRole("complementary")).toBeNull();
     expect(screen.getByRole("button", { name: /Session overview, cost/ })).toHaveFocus();
+    useChildSessionsMock.mockClear();
+    view.rerender(<SessionOverview {...props} />);
+    expect(useChildSessionsMock).not.toHaveBeenCalled();
     view.unmount();
     render(<SessionOverview {...props} />, { wrapper: Wrapper });
     expect(screen.queryByRole("complementary")).toBeNull();
+    expect(useChildSessionsMock).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
     expect(screen.getByRole("complementary")).toBeInTheDocument();
+    expect(useChildSessionsMock).toHaveBeenCalledWith("session", 10_000);
   });
 
   it("restores after Workspace closes or space returns without changing the preference", () => {
@@ -166,14 +184,19 @@ describe("Session overview", () => {
     "opens an on-demand overview without closing Workspace (mobile=%s)",
     (isMobile) => {
       mobile.value = isMobile;
-      render(<SessionOverview {...props} dockAllowed={false} />, { wrapper: Wrapper });
+      const view = render(<SessionOverview {...props} dockAllowed={false} />, { wrapper: Wrapper });
       expect(screen.queryByText("Includes subagents")).toBeNull();
+      expect(useChildSessionsMock).not.toHaveBeenCalled();
       fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
       expect(screen.getByText("Includes subagents")).toBeInTheDocument();
+      expect(useChildSessionsMock).toHaveBeenCalledWith("session", 10_000);
       expect(props.onOpenChanges).not.toHaveBeenCalled();
       fireEvent.click(screen.getByText("View changes →"));
       expect(props.onOpenChanges).toHaveBeenCalledOnce();
       expect(screen.queryByText("Includes subagents")).toBeNull();
+      useChildSessionsMock.mockClear();
+      view.rerender(<SessionOverview {...props} dockAllowed={false} />);
+      expect(useChildSessionsMock).not.toHaveBeenCalled();
     },
   );
 

@@ -1,6 +1,3 @@
-import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
-import { SubagentCost } from "./SubagentCost";
 // Subagents tab content for the right-side rail. Renders the session
 // tree under the root conversation — a "main" link back to the root,
 // then its sub-agent sessions recursively (children, grandchildren,
@@ -49,10 +46,13 @@ import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useOpenSubagentInPanel } from "./subagentPanelOpener";
+import { SubagentCost } from "./SubagentCost";
 
 const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),

@@ -56,22 +56,41 @@ const useChildSessionsMock = vi.mocked(useChildSessions);
 const useSessionMock = vi.mocked(useSession);
 
 interface RenderOptions {
+  active?: boolean;
+  overviewEnabled?: boolean;
+  initialEntries?: string[];
   /** The conversation in main — used only for active-row highlighting. */
   conversationId?: string;
   /** The root id whose children populate the list. */
   rootSessionId?: string;
 }
 
-function renderPanel({
-  conversationId = "conv_parent",
-  rootSessionId = "conv_parent",
-  initialEntries,
-}: RenderOptions & { initialEntries?: string[] } = {}) {
-  return render(
-    <MemoryRouter initialEntries={initialEntries}>
-      <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-    </MemoryRouter>,
+function renderPanel(initialOptions: RenderOptions = {}) {
+  let options = initialOptions;
+  const tree = () => (
+    <MemoryRouter initialEntries={options.initialEntries}>
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          features: { session_overview: options.overviewEnabled === true },
+        }}
+      >
+        <SubagentsPanel
+          conversationId={options.conversationId ?? "conv_parent"}
+          rootSessionId={options.rootSessionId ?? "conv_parent"}
+          active={options.active}
+        />
+      </CapabilitiesProvider>
+    </MemoryRouter>
   );
+  const view = render(tree());
+  return {
+    ...view,
+    rerenderPanel(next: Partial<RenderOptions>) {
+      options = { ...options, ...next };
+      view.rerender(tree());
+    },
+  };
 }
 
 /** Build a full ChildSessionInfo, defaulting the fields a given test
@@ -1581,38 +1600,20 @@ it("shows each child cost when the overview flag is enabled", () => {
     error: null,
   }));
   useSessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
-  const view = render(
-    <MemoryRouter>
-      <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, features: { session_overview: true } }}
-      >
-        <SubagentsPanel conversationId="root" rootSessionId="root" />
-      </CapabilitiesProvider>
-    </MemoryRouter>,
-  );
+  const { rerenderPanel } = renderPanel({
+    conversationId: "root",
+    rootSessionId: "root",
+    overviewEnabled: true,
+  });
   expect(
     screen.getByRole("note", { name: "Agent cost: $1.25; excludes subagents" }),
   ).toBeInTheDocument();
   expect(useChildSessionsMock).toHaveBeenCalledWith("root", 10_000);
   useChildSessionsMock.mockClear();
-  view.rerender(
-    <MemoryRouter>
-      <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, features: { session_overview: true } }}
-      >
-        <SubagentsPanel conversationId="root" rootSessionId="root" active={false} />
-      </CapabilitiesProvider>
-    </MemoryRouter>,
-  );
+  rerenderPanel({ active: false });
   expect(useChildSessionsMock).toHaveBeenCalledWith("root", undefined);
   expect(useChildSessionsMock).not.toHaveBeenCalledWith(expect.anything(), 10_000);
 
-  view.rerender(
-    <MemoryRouter>
-      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
-        <SubagentsPanel conversationId="root" rootSessionId="root" />
-      </CapabilitiesProvider>
-    </MemoryRouter>,
-  );
+  rerenderPanel({ active: true, overviewEnabled: false });
   expect(screen.queryByText("$1.25")).toBeNull();
 });

@@ -135,7 +135,11 @@ export function AppShellWorkspacePanels({
           onClose={() => setSubagentsPanelOpen(false)}
           testId="subagents-panel-drawer"
         >
-          <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+          <SubagentsPanel
+            conversationId={conversationId}
+            rootSessionId={rootSessionId}
+            active={mobileViewport}
+          />
         </MobilePanelDrawer>
       )}
       {conversationId && (

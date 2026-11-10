@@ -74,7 +74,9 @@ vi.mock("./FilesPanel", () => ({
   ),
 }));
 vi.mock("./SubagentsPanel", () => ({
-  SubagentsPanel: () => <div data-testid="subagents-stub" />,
+  SubagentsPanel: ({ active }: { active: boolean }) => (
+    <div data-testid="subagents-stub" data-active={active} />
+  ),
 }));
 vi.mock("./ContentSearchPanel", () => ({
   ContentSearchPanel: ({ inputRef }: { inputRef: RefObject<HTMLInputElement | null> }) => (
@@ -237,6 +239,7 @@ function renderWorkspace(
     animateVisibility?: boolean;
     resizing?: boolean;
     inert?: boolean;
+    rootSessionId?: string;
     mobileSideChatsOpen?: boolean;
     queryClient?: QueryClient;
     initialPath?: string;
@@ -291,7 +294,7 @@ function renderWorkspace(
         changedCount={overrides.changedCount ?? 0}
         subagentsWorking={0}
         agentCount={1}
-        rootSessionId={null}
+        rootSessionId={overrides.rootSessionId ?? null}
         selectedFilePath={overrides.selectedFilePath ?? null}
         openFiles={overrides.openFiles ?? []}
         openFileViewer={openFileViewer}
@@ -354,6 +357,26 @@ function renderWorkspace(
 }
 
 describe("WorkspacePanel surface presentation", () => {
+  it("pauses Agents when the viewport hides the rail, but keeps contained panels active", () => {
+    const { rerender } = renderWorkspace({
+      rightRailTab: "subagents",
+      rootSessionId: "conv_ws",
+      open: true,
+    });
+    expect(screen.getByTestId("subagents-stub")).toHaveAttribute("data-active", "true");
+
+    isMobileMock.mockReturnValue(true);
+    rerender({});
+    expect(screen.getByTestId("subagents-stub")).toHaveAttribute("data-active", "false");
+
+    rerender({ contained: true });
+    expect(screen.getByTestId("subagents-stub")).toHaveAttribute("data-active", "true");
+
+    isMobileMock.mockReturnValue(false);
+    rerender({ contained: false });
+    expect(screen.getByTestId("subagents-stub")).toHaveAttribute("data-active", "true");
+  });
+
   it("offers unpinned pages in + without requiring shell or browser support", () => {
     writePinnedWorkspaceTabs(["files", "subagents"]);
     const { onRightRailTabChange } = renderWorkspace({ showGithubTab: true });

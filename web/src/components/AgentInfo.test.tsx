@@ -414,6 +414,10 @@ describe("AgentInfoButton hover behavior", () => {
 });
 
 describe("AgentInfoButton session cost row", () => {
+  beforeEach(() => {
+    useChatStore.setState({ sessionCostUsd: null, sessionUsageByModel: null });
+  });
+
   it("keeps configuration but moves usage out when the overview is enabled", () => {
     versionEnv.overviewEnabled = true;
     useChatStore.setState({
@@ -435,13 +439,6 @@ describe("AgentInfoButton session cost row", () => {
     expect(screen.queryByTestId("agent-info-usage-by-model")).toBeNull();
     expect(screen.getByTestId("agent-info-session-id")).toHaveTextContent("conv_cost");
   });
-  // The per-session cost lives in the info popover (moved out of the
-  // composer status line). It reads from the shared chat store, so reset
-  // the field between cases to keep them independent.
-  beforeEach(() => {
-    useChatStore.setState({ sessionCostUsd: null, sessionUsageByModel: null });
-  });
-
   it("shows the formatted session cost in the popover when priced", () => {
     useChatStore.setState({ sessionCostUsd: 1.234 });
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_cost");

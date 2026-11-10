@@ -1186,6 +1186,19 @@
             "title": "Object",
             "type": "string"
           },
+          "own_cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Recorded cost for this agent only, excluding descendants.",
+            "title": "Own Cost Usd"
+          },
           "parent_session_id": {
             "description": "Parent conversation id (echo of the route's `session_id` path parameter), e.g. `\"conv_parent987\"`. Stable join key for clients that cache child rows across multiple parents.",
             "title": "Parent Session Id",

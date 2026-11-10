@@ -235,8 +235,8 @@ vi.mock("./InlineTerminalsSection", () => ({
   ),
 }));
 vi.mock("./SubagentsPanel", () => ({
-  SubagentsPanel: ({ conversationId }: { conversationId: string }) => (
-    <div data-testid="subagents-panel" data-conversation-id={conversationId} />
+  SubagentsPanel: ({ conversationId, active }: { conversationId: string; active: boolean }) => (
+    <div data-testid="subagents-panel" data-conversation-id={conversationId} data-active={active} />
   ),
 }));
 // The real WorkspacePanel mounts a rail xterm for an open shell tab; stub the
@@ -2426,6 +2426,21 @@ describe("Sidebar across the md breakpoint", () => {
         }
       });
   }
+
+  it("pauses the mobile Agents drawer when widening to desktop and resumes on return", () => {
+    const resize = mockViewportWidth(700);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Agents/i }));
+    const drawer = within(screen.getByTestId("subagents-panel-drawer"));
+    expect(drawer.getByTestId("subagents-panel")).toHaveAttribute("data-active", "true");
+
+    resize(1280);
+    expect(drawer.getByTestId("subagents-panel")).toHaveAttribute("data-active", "false");
+    resize(700);
+    expect(drawer.getByTestId("subagents-panel")).toHaveAttribute("data-active", "true");
+  });
 
   it("leaves the session without closing a selected file in a responsive-hidden rail", () => {
     const resize = mockViewportWidth(1280);

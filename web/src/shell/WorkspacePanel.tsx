@@ -2216,7 +2216,7 @@ function WorkspacePanelImpl({
               <SubagentsPanel
                 conversationId={conversationId}
                 rootSessionId={rootSessionId}
-                active={open && !inert}
+                active={open && !inert && !isMobile}
               />
             </SubagentPanelOpenerContext.Provider>
           ) : scopeView === "empty" ? (
