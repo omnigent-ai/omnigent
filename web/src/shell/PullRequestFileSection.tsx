@@ -307,8 +307,7 @@ export function PullRequestFileSection({
       return;
     }
     setSelectionError(undefined);
-    if (!threadContext.canCreate) composer.setDestination("local");
-    composer.selectLines(lines);
+    composer.selectLines(lines, threadContext.canCreate ? undefined : "local");
   };
 
   useEffect(() => {
@@ -502,25 +501,6 @@ export function PullRequestFileSection({
                   type="button"
                   className={cn(
                     "inline-flex h-[calc(100%-1px)] cursor-pointer items-center justify-center rounded-md border border-transparent px-1.5 py-0.5 text-ui font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
-                    local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
-                  )}
-                  aria-pressed={local}
-                  disabled={!canCommentLocally || composer.draft.pending}
-                  onClick={() => composer.setDestination("local")}
-                >
-                  Agent
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>
-                Save in this session and attach to your next message to the agent.
-              </TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  className={cn(
-                    "inline-flex h-[calc(100%-1px)] cursor-pointer items-center justify-center rounded-md border border-transparent px-1.5 py-0.5 text-ui font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
                     !local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
                   )}
                   aria-pressed={!local}
@@ -531,6 +511,23 @@ export function PullRequestFileSection({
                 </button>
               </TooltipTrigger>
               <TooltipContent>Post a review comment on the GitHub pull request.</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className={cn(
+                    "inline-flex h-[calc(100%-1px)] cursor-pointer items-center justify-center rounded-md border border-transparent px-1.5 py-0.5 text-ui font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
+                    local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
+                  )}
+                  aria-pressed={local}
+                  disabled={!canCommentLocally || composer.draft.pending}
+                  onClick={() => composer.setDestination("local")}
+                >
+                  Agent
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>Leave a comment for your agent in this session.</TooltipContent>
             </Tooltip>
           </div>
         }

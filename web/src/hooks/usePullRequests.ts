@@ -1,5 +1,6 @@
 import { createComment, type Comment } from "./useComments";
 import { requestLocalReviewContext } from "@/lib/localReviewContext";
+import { createStoredChoicePreference } from "@/lib/storedChoicePreference";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 // Serves every git provider. Runtime names (query keys, routes, test ids) keep
 // the `github` prefix because they are stable wire ids.
@@ -1390,6 +1391,12 @@ export interface PullRequestCommentDraft {
   destination?: "github" | "local";
 }
 
+const reviewCommentDestination = createStoredChoicePreference(
+  "omnigent:pr-comment-destination",
+  ["github", "local"],
+  "github",
+);
+
 function usePullRequestCommentDraft(key: readonly string[]) {
   const queryClient = useQueryClient();
   const initialDraft: PullRequestCommentDraft = { body: "", pending: false, error: null };
@@ -1566,7 +1573,6 @@ export function usePullRequestReviewThreadComposer(
           body: "",
           pending: false,
           error: null,
-          destination: "local",
         });
         void queryClient.invalidateQueries({ queryKey: ["comments", target.conversationId] });
         if (comment) requestLocalReviewContext(comment);
@@ -1612,17 +1618,29 @@ export function usePullRequestReviewThreadComposer(
     stale,
     setBody: (body: string) => updateDraft({ body, error: null }),
     setDestination: (destination: "github" | "local") => {
-      if (!draft.pending) updateDraft({ destination, error: null });
+      if (!draft.pending) {
+        updateDraft({ destination, error: null });
+        reviewCommentDestination.write(destination);
+      }
     },
-    selectLines: (lines: Pick<ReviewThreadAnchor, "side" | "line" | "start_line">) => {
-      if (!draft.pending)
+    selectLines: (
+      lines: Pick<ReviewThreadAnchor, "side" | "line" | "start_line">,
+      destinationOverride?: PullRequestCommentDraft["destination"],
+    ) => {
+      const current = queryClient.getQueryData<PullRequestCommentDraft>(key);
+      if (current && !current.pending)
         updateDraft({
           anchor: { ...lines, path, head_sha: headSha, base_sha: baseSha },
+          destination:
+            destinationOverride ??
+            current.destination ??
+            (current.anchor || !localSupported ? "github" : reviewCommentDestination.read()),
           error: null,
         });
     },
     cancel: () => {
-      if (!draft.pending) updateDraft({ anchor: undefined, body: "", error: null });
+      if (!draft.pending)
+        updateDraft({ anchor: undefined, body: "", error: null, destination: undefined });
     },
     post: () => {
       const current = queryClient.getQueryData<PullRequestCommentDraft>(key);

@@ -32,8 +32,10 @@ together in Comments.
 - `local-review`: Save session-only comments on either diff side, with pencil and
   trash actions in the comment header. Submitting an **Agent** comment attaches a context chip
   to the session composer while preserving existing text and attachments. Hover
-  previews the comment; clicking reveals it in Changes. The full snapshots are
-  sent only when the user submits their chat message.
+  previews the comment; clicking reveals it in Changes with a border highlight
+  that fades over three seconds. GitHub appears first in the destination selector;
+  new comments use the browser's last explicit choice without changing open drafts.
+  The full snapshots are sent only when the user submits their chat message.
 - `file-controls`: The sidebar **Filter changed files** input (on narrow screens a
   toolbar button opens it above the list; hiding it clears the filter). Escape
   clears it, and **Clear filter** restores the list. Each file header has a
@@ -112,8 +114,10 @@ For local review, use any of the four entry points above, select a diff line,
 choose **Agent**, and submit comments on two files. Confirm two context chips
 appear beside the existing chat draft without changing its text or attachments.
 Hover each chip to preview the body and click it to reveal the comment in
-Changes. Send the chat message and confirm both comment snapshots reach the
-agent. Switch PRs and sessions to check isolation. After a new commit, verify
+Changes with a brief border highlight. Open another comment and confirm the
+destination choice is remembered, including after a reload. Send the chat message
+and confirm both comment snapshots reach the agent. Switch PRs and sessions to
+check isolation. After a new commit, verify
 earlier comments retain their old line references. Repeat in split and unified
 layouts and on mobile.
 

@@ -3597,7 +3597,17 @@ it("saves a local comment as agent context and retains earlier revisions", async
   const { client } = renderChanges();
   const contexts = renderHook(() => usePendingLocalReviewContexts("conv_1"));
   await userEvent.click(screen.getByRole("button", { name: "Start a new review conversation" }));
+  expect(
+    within(screen.getByRole("group", { name: "Comment destination" }))
+      .getAllByRole("button")
+      .map((button) => button.textContent),
+  ).toEqual(["GitHub", "Agent"]);
   expect(screen.getByRole("button", { name: "Agent" })).toHaveAttribute("aria-pressed", "true");
+  await userEvent.hover(screen.getByRole("button", { name: "Agent" }));
+  expect(await screen.findByRole("tooltip")).toHaveTextContent(
+    "Leave a comment for your agent in this session.",
+  );
+  await userEvent.unhover(screen.getByRole("button", { name: "Agent" }));
   await userEvent.type(
     screen.getByRole("textbox", { name: "New review comment" }),
     "Handle empty input",

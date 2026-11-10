@@ -13,8 +13,57 @@ import type { Comment } from "./useComments";
 afterEach(() => {
   clearLocalReviewContexts("session");
   cleanup();
+  localStorage.clear();
   vi.unstubAllGlobals();
   vi.useRealTimers();
+});
+
+it("remembers the last destination for new comments while preserving open drafts", async () => {
+  const client = new QueryClient();
+  const wrapper = ({ children }: PropsWithChildren) => (
+    <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, comment_anchor_metadata: true }}>
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    </CapabilitiesProvider>
+  );
+  const initialProps = { session: "session", url: "pr", path: "app.py" };
+  const useComposer = ({ session, url, path }: typeof initialProps) =>
+    usePullRequestReviewThreadComposer(session, url, path, "head", "base");
+  const { result, rerender, unmount } = renderHook(useComposer, { wrapper, initialProps });
+  const lines = { side: "RIGHT" as const, line: 2, start_line: null };
+  act(() => result.current.selectLines(lines));
+  await waitFor(() => expect(result.current.draft.destination).toBe("github"));
+  act(() => result.current.setDestination("local"));
+  act(() => result.current.setBody("Keep this draft local"));
+  rerender({ session: "another-session", url: "another-pr", path: "other.py" });
+  act(() => result.current.selectLines(lines));
+  await waitFor(() => expect(result.current.draft.destination).toBe("local"));
+  act(() => result.current.setDestination("github"));
+  rerender(initialProps);
+  act(() => result.current.selectLines({ ...lines, line: 3 }));
+  await waitFor(() =>
+    expect(result.current.draft).toMatchObject({
+      destination: "local",
+      body: "Keep this draft local",
+    }),
+  );
+  act(() => result.current.cancel());
+  act(() => result.current.selectLines(lines));
+  await waitFor(() => expect(result.current.draft.destination).toBe("github"));
+
+  // A provider without GitHub posting uses Agent without changing the saved preference.
+  act(() => result.current.cancel());
+  act(() => result.current.selectLines(lines, "local"));
+  await waitFor(() => expect(result.current.draft.destination).toBe("local"));
+  act(() => result.current.cancel());
+  act(() => result.current.selectLines(lines));
+  await waitFor(() => expect(result.current.draft.destination).toBe("github"));
+
+  act(() => result.current.setDestination("local"));
+  unmount();
+  client.clear();
+  const remounted = renderHook(useComposer, { wrapper, initialProps });
+  act(() => remounted.result.current.selectLines(lines));
+  await waitFor(() => expect(remounted.result.current.draft.destination).toBe("local"));
 });
 
 it("retains a new range draft, requires reselection after a revision change, and isolates a late write", async () => {
@@ -309,7 +358,8 @@ it("retains the local destination and settles a save after navigating away", asy
   rerender({ url: "pr" });
   await waitFor(() => expect(result.current.draft.pending).toBe(false));
   expect(result.current.draft.body).toBe("");
-  expect(result.current.draft.destination).toBe("local");
+  act(() => result.current.selectLines({ side: "RIGHT", line: 2, start_line: null }));
+  await waitFor(() => expect(result.current.draft.destination).toBe("local"));
   const contexts = renderHook(() => usePendingLocalReviewContexts("session"));
   expect(contexts.result.current).toEqual([savedLocalComment]);
 });

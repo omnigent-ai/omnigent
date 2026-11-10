@@ -21,11 +21,7 @@ import {
   type PullRequestIdentity,
 } from "@/lib/pullRequestViewed";
 import type { Comment } from "@/hooks/useComments";
-import {
-  requestLocalReviewNavigation,
-  consumeLocalReviewNavigation,
-  useLocalReviewNavigation,
-} from "@/lib/localReviewContext";
+import { requestLocalReviewNavigation, useLocalReviewNavigation } from "@/lib/localReviewContext";
 import type * as SonnerModule from "sonner";
 import { PullRequestChangesTab } from "./PullRequestChangesTab";
 import { useChangesViewState } from "./useChangesViewState";
@@ -63,6 +59,7 @@ const mocks = vi.hoisted(() => ({
     head_sha: string;
     base_sha: string;
   },
+  animateComment: vi.fn<Element["animate"]>(),
 }));
 const comments = vi.hoisted(() => ({ data: [] as Comment[], isSuccess: true }));
 vi.mock("@/hooks/useComments", () => ({
@@ -70,7 +67,13 @@ vi.mock("@/hooks/useComments", () => ({
 }));
 vi.mock("./LocalReviewComment", () => ({
   LocalReviewComment: ({ comment }: { comment: Comment }) => (
-    <section data-local-review-comment={comment.id} tabIndex={-1}>
+    <section
+      data-local-review-comment={comment.id}
+      tabIndex={-1}
+      ref={(element) => {
+        if (element) element.animate = mocks.animateComment;
+      }}
+    >
       {comment.body}
     </section>
   ),
@@ -260,6 +263,7 @@ function renderTab({
   );
   const result = render(element(patch));
   return {
+    unmount: result.unmount,
     rerender: (next: string, pending = false) => {
       patchLoading = pending;
       tabSelected = true;
@@ -291,10 +295,22 @@ describe("PullRequestChangesTab", () => {
     vi.unstubAllGlobals();
   });
 
-  it.each([true, false])(
-    "waits for the patch, tab mount, and accepted focus (initially selected: %s)",
-    async (selected) => {
-      const conversationId = "local-comment-loading";
+  it.each([
+    { selected: true, mode: "changes", reducedMotion: false },
+    { selected: false, mode: "changes", reducedMotion: false },
+    { selected: true, mode: "commits", reducedMotion: true },
+  ] as const)(
+    "reveals review context from $mode after loading and mounting (selected: $selected)",
+    async ({ selected, mode, reducedMotion }) => {
+      const cancelHighlight = vi.fn();
+      mocks.animateComment
+        .mockReset()
+        .mockReturnValue({ cancel: cancelHighlight } as unknown as Animation);
+      const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+      vi.spyOn(window, "matchMedia").mockReturnValue({ ...media, matches: reducedMotion });
+      const conversationId = `local-comment-loading-${mode}-${selected}`;
+      const view = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
+      act(() => view.result.current.setMode(mode));
       const comment = {
         id: "local-comment",
         conversation_id: conversationId,
@@ -314,7 +330,14 @@ describe("PullRequestChangesTab", () => {
       vi.spyOn(Element.prototype, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
       const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
       const navigation = renderHook(() => useLocalReviewNavigation(conversationId));
-      const tab = renderTab({ conversationId, patch: "", loading: true, selected });
+      const tab = renderTab({
+        conversationId,
+        patch: "",
+        loading: true,
+        selected,
+        commitHistory: true,
+        listing: { head_sha: "head" },
+      });
       vi.useFakeTimers();
       try {
         act(() => requestLocalReviewNavigation(comment));
@@ -323,6 +346,7 @@ describe("PullRequestChangesTab", () => {
         });
         expect(navigation.result.current).toBe(comment);
         expect(scroll).not.toHaveBeenCalled();
+        expect(mocks.animateComment).not.toHaveBeenCalled();
         const frame = vi.spyOn(window, "requestAnimationFrame");
         comments.data = [];
         comments.isSuccess = false;
@@ -345,8 +369,20 @@ describe("PullRequestChangesTab", () => {
         expect(diffOf("b.ts")?.querySelector("[data-local-review-comment]")).toHaveFocus(),
       );
       await waitFor(() => expect(navigation.result.current).toBeUndefined());
+      expect(view.result.current.mode).toBe("changes");
       expect(focus.mock.calls.length).toBeGreaterThan(1);
-      consumeLocalReviewNavigation(conversationId);
+      expect(mocks.animateComment).toHaveBeenCalledWith(
+        [
+          { borderColor: "var(--ring)", offset: 0 },
+          { borderColor: "var(--ring)", offset: reducedMotion ? 1 : 0.8 },
+        ],
+        { duration: 3000, easing: "ease-out" },
+      );
+      act(() => requestLocalReviewNavigation(comment));
+      await waitFor(() => expect(mocks.animateComment).toHaveBeenCalledTimes(2));
+      expect(cancelHighlight).toHaveBeenCalledTimes(1);
+      tab.unmount();
+      expect(cancelHighlight).toHaveBeenCalledTimes(2);
     },
   );
 

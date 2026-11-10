@@ -520,6 +520,11 @@ export function PullRequestChangesTab({
   const { revealedPaths, reveal, clearReveal, find, setPathFilter, setHideViewed } = view;
   const navigationTarget = useLocalReviewNavigation(conversationId);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const commentHighlight = useRef<Animation | null>(null);
+  useEffect(
+    () => () => commentHighlight.current?.cancel(),
+    [conversationId, selectedPrUrl, selected],
+  );
   useEffect(() => {
     if (
       !selected ||
@@ -551,6 +556,16 @@ export function PullRequestChangesTab({
         element.focus({ preventScroll: true });
         if ((element.getRootNode() as Document | ShadowRoot).activeElement === element) {
           element.scrollIntoView({ block: "center" });
+          commentHighlight.current?.cancel();
+          const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+          commentHighlight.current =
+            element.animate?.(
+              [
+                { borderColor: "var(--ring)", offset: 0 },
+                { borderColor: "var(--ring)", offset: reducedMotion ? 1 : 0.8 },
+              ],
+              { duration: 3000, easing: "ease-out" },
+            ) ?? null;
           consumeLocalReviewNavigation(conversationId);
           return;
         }
