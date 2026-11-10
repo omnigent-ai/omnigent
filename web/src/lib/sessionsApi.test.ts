@@ -1232,6 +1232,11 @@ describe("getSession", () => {
       );
       const session = await getSession("conv_abc");
       expect(session.status).toBe(expected);
+      expect(session.backgroundAgents).toEqual(
+        backgroundAgents !== undefined && backgroundAgents.length > 0
+          ? backgroundAgents
+          : undefined,
+      );
     },
   );
 

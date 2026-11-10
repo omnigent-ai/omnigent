@@ -1296,7 +1296,8 @@ describe("chatStore — switchTo", () => {
         return mockResponse({
           id: "conv_waiting_agent",
           agent_id: "agent_xyz",
-          status: "waiting",
+          // The server's wire shape for the hold: collapsed status plus the agents.
+          status: "running",
           background_agents: [{ id: "a1", type: "subagent", description: "Audit" }],
           created_at: 0,
           items: [],

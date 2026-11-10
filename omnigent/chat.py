@@ -140,9 +140,9 @@ _PER_TURN_TIMEOUT_S = 120.0
 # Overall budget for following one headless ``-p`` session to idle
 # (first-turn recovery and the extra-turns loop share it).
 _LOOP_TIMEOUT_S = 1800.0  # 30 min total
-# Snapshot statuses that keep a headless ``-p`` run going. The server collapses an
-# async orchestrator's ``waiting`` to ``running``, but a claude-native turn waiting
-# on its background agent reads ``waiting``, and its output isn't final yet either.
+# Snapshot statuses that keep a headless ``-p`` run going. The server reports any
+# ``waiting`` (an async orchestrator's, or a claude-native turn's background-agent
+# hold) as ``running``; ``waiting`` is here in case a snapshot ever carries it raw.
 _HEADLESS_UNFINISHED_STATUSES = frozenset({"running", "launching", "waiting"})
 
 # Optional bearer token for remote omnigent servers that sit

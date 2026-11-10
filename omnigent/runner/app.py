@@ -1870,6 +1870,7 @@ def create_runner_app(
         inferred: bool = False,
     ) -> None:
         background_agents: list[dict[str, object]] = []
+        wire_status = status
         if status == "waiting":
             # Claude's background-agent hold. A server that may predate
             # ``waiting`` gets ``idle``: the turn ended, and ``running`` would
@@ -1879,10 +1880,10 @@ def create_runner_app(
             # session-init envelope, so only a legacy server whose probe failed
             # lands here.
             if _server_version is None or not _version_supports_waiting_status(_server_version):
-                status = "idle"
+                wire_status = "idle"
             else:
                 background_agents = resource_registry.session_background_agents(session_id)
-        event: dict[str, object] = {"type": "session.status", "status": status}
+        event: dict[str, object] = {"type": "session.status", "status": wire_status}
         if background_agents:
             event["background_agents"] = background_agents
         if status == "failed":
@@ -1918,6 +1919,10 @@ def create_runner_app(
         if inferred:
             event["inferred"] = True
         _publish_event(session_id, event)
+        if wire_status != status:
+            # Only the server's copy is downgraded: the agent still works in
+            # this pane, so the runner keeps counting the session as busy.
+            _native_pane_status[session_id] = status
 
     resource_registry.set_session_status_publisher(
         _publish_session_status,
@@ -2206,6 +2211,19 @@ def create_runner_app(
                 event.session_id
             )
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            _release_required_terminal_session(event)
+            return
+
+        # The finished turn's background agent died with the pane. Nothing else
+        # ends the server's ``waiting`` (or clears its agent list), so settle it
+        # here; a replacement pane owns the session's status instead.
+        if event.session_was_waiting:
+            _required_terminal_exit_errors.pop(event.session_id, None)
+            if _terminal_exit_still_owns_session(event, exit_turn_epoch):
+                _clean_terminal_exit_responses[event.session_id] = _live_response_id.get(
+                    event.session_id
+                )
+                _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             _release_required_terminal_session(event)
             return
 

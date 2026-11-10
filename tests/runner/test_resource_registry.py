@@ -2415,8 +2415,22 @@ async def test_pty_edges_drive_status_when_poller_inactive(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hold_edges", "status_before_exit", "was_waiting"),
+    [
+        ((), "idle", False),
+        (("waiting",), "waiting", True),
+        (("waiting", "idle"), "idle", False),
+        (("waiting", "failed"), "failed", False),
+    ],
+    ids=["idle", "background_agent_hold", "hold_ended", "hold_failed"],
+)
 async def test_required_terminal_exit_while_idle_is_clean_shutdown(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    hold_edges: tuple[str, ...],
+    status_before_exit: str,
+    was_waiting: bool,
 ) -> None:
     """A required terminal that exits after going idle is not a failure.
 
@@ -2424,9 +2438,16 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     finishes. A pane exit observed while idle means the work was already
     delivered and the process simply shut down, so the exit event must carry
     ``session_was_idle=True`` — the runner uses that to avoid flipping the chat
-    to ``failed`` (the spurious-"failed"-session bug).
+    to ``failed`` (the spurious-"failed"-session bug). A finished turn that
+    published a background-agent ``waiting`` instead is just as finished, and
+    the exit also says the server still holds that wait, so the runner can end
+    it; once a later edge replaced the wait, it doesn't.
 
     :param tmp_path: Temporary directory for fake terminal paths.
+    :param hold_edges: Status edges published after the turn, instead of the
+        pane's own idle edge; empty for a plain idle turn.
+    :param status_before_exit: The status the exit should report.
+    :param was_waiting: Whether the exit should report the server's wait.
     """
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
@@ -2451,7 +2472,12 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     on_idle = callbacks["on_idle"]
     assert callable(on_activity) and callable(on_idle)
     on_activity()
-    on_idle()
+    if hold_edges:
+        # The status poller's edges for a turn that left a background agent running.
+        for status in hold_edges:
+            assert registry._claim_status_edge("conv_idle", status, None)
+    else:
+        on_idle()
     # Then the pane disappeared (e.g. Claude Code exited cleanly).
     on_exit = callbacks["on_exit"]
     assert callable(on_exit)
@@ -2460,7 +2486,8 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
 
     assert len(exits) == 1
     assert exits[0].lifecycle == TerminalLifecycle.REQUIRED
-    assert exits[0].session_was_idle is True
+    assert exits[0].session_was_idle is (status_before_exit != "failed")
+    assert exits[0].session_was_waiting is was_waiting
     assert registry.session_activity_epoch("conv_idle") == initial_activity
     record = next(
         record
@@ -2469,7 +2496,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     )
     assert record.session_id == "conv_idle"
     assert record.attributes["terminal_lifecycle"] == "required"
-    assert record.attributes["session_status_before_exit"] == "idle"
+    assert record.attributes["session_status_before_exit"] == status_before_exit
 
 
 @pytest.mark.asyncio

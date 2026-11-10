@@ -525,7 +525,8 @@ export interface ClientTaskCancel {
  * harness-start signal. `waiting` arrives when the parent agent loop parks
  * on background tools / sub-agents, or when a claude-native turn ends with a
  * background agent still running (then `backgroundAgents` names them). The
- * session snapshot reports `waiting` only for that claude-native case.
+ * session snapshot's wire status stays `running` for that claude-native case,
+ * with `background_agents` set; the API adapter turns that pair into `waiting`.
  */
 export interface SessionStatusEvent {
   type: "session_status";

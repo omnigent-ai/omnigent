@@ -209,6 +209,9 @@ class TerminalExitEvent:
         ``True`` marks a clean shutdown after the turn finished; ``False`` (the
         default — last seen ``running``, or never observed) keeps a mid-turn
         crash or boot failure a failure.
+    :param session_was_waiting: Whether the last status edge published for the
+        session was a finished turn's background-agent ``waiting``. Nothing
+        else ends that wait once the pane is gone, so the exit settles it.
     :param expected_close: ``True`` when Omnigent killed the pane itself to
         fail the turn (a delivery timeout). That turn reports its own error,
         so the exit is not a second failure.
@@ -230,6 +233,7 @@ class TerminalExitEvent:
     last_output: str | None = None
     exit_status: int | None = None
     session_was_idle: bool = False
+    session_was_waiting: bool = False
     expected_close: bool = False
     closed_outside_omnigent: bool = False
     terminal_instance_id: str | None = None
@@ -787,12 +791,17 @@ class SessionResourceRegistry:
 
     def _take_session_status_memo(self, session_id: str) -> str | None:
         """Pop and return the session's recorded PTY status (or ``None``)."""
+        return self._take_session_exit_status(session_id)[0]
+
+    def _take_session_exit_status(self, session_id: str) -> tuple[str | None, str | None]:
+        """Pop the session's status state, returning ``(memo, last published status)``."""
         with self._lock:
             self._active_session_turns.discard(session_id)
-            self._published_session_status.pop(session_id, None)
+            published = self._published_session_status.pop(session_id, None)
             self._status_pollers.pop(session_id, None)
             self._background_agent_readers.pop(session_id, None)
-            return self._last_session_status.pop(session_id, None)
+            memo = self._last_session_status.pop(session_id, None)
+            return memo, published[0] if published is not None else None
 
     def _claim_status_edge(
         self,
@@ -2335,13 +2344,15 @@ class SessionResourceRegistry:
                     superseded_by = current
 
         # A replaced launch must not consume its successor's status memo.
-        session_status_before_exit = (
-            self._take_session_status_memo(session_id)
+        session_status_before_exit, published_before_exit = (
+            self._take_session_exit_status(session_id)
             if superseded_by is None and not before_observation
-            else None
+            else (None, None)
         )
         # A turn waiting on its background agent had already ended.
         session_was_idle = session_status_before_exit in {"idle", "waiting"}
+        # The server holds ``waiting`` only while that was the last edge sent.
+        session_was_waiting = session_status_before_exit == "waiting" == published_before_exit
         lifecycle_context["session_status_before_exit"] = session_status_before_exit or "unknown"
         if superseded_by is not None:
             lifecycle_context.pop("session_turn_active_before_exit", None)
@@ -2426,6 +2437,7 @@ class SessionResourceRegistry:
                     last_output=last_output,
                     exit_status=exit_status,
                     session_was_idle=session_was_idle,
+                    session_was_waiting=session_was_waiting,
                     expected_close=expected_close,
                     closed_outside_omnigent=closed_outside_omnigent,
                     terminal_instance_id=instance.diagnostic_id if instance is not None else None,
