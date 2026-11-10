@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import http.server
+import shlex
 import socketserver
 import subprocess
 import sys
@@ -170,6 +171,24 @@ def test_environment_and_shell_sources_cannot_refresh(source: dict[str, object])
         _parse_credential_proxy(
             [{"type": "gh_basic", "source": {**source, "refresh_interval_seconds": 60}}]
         )
+
+
+def test_command_source_does_not_run_after_sandbox_replaces_script(
+    sandbox: SandboxPolicy,
+) -> None:
+    workspace = sandbox.write_roots[0]
+    script = workspace / "token.sh"
+    marker = workspace / "executed-after-startup"
+    script.write_text("printf first")
+    source = CredentialSourceSpec(kind="command", command=f"/bin/sh {shlex.quote(str(script))}")
+    spec = CredentialProxySpec(
+        entries=[CredentialProxyEntry(host="model.example.com", scheme="bearer", source=source)]
+    )
+    runtime = prepare_credential_proxy_runtime(spec, parent_env={}, sandbox=sandbox)
+
+    script.write_text(f"touch {shlex.quote(str(marker))}; printf second")
+    assert runtime.rewrites[0].resolve_secret() == "first"
+    assert not marker.exists()
 
 
 def test_host_bindings_share_one_provider_per_declaration(

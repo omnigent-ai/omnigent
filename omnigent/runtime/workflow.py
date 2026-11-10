@@ -13,6 +13,7 @@ import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 
@@ -39,6 +40,8 @@ from omnigent.errors import (
     restart_on_stale_cursor,
 )
 from omnigent.harness_aliases import is_claude_sdk_harness_name
+from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND, CODEX_GATEWAY_TOKEN_ENV
+from omnigent.inner.egress.rules import parse_rules
 from omnigent.inner.model_egress import (
     UCODE_SIGNER_BINDING_ID,
     registered_model_provider_binding,
@@ -1496,6 +1499,81 @@ def _apply_codex_provider_env(
         # default model_provider. (Gateway mode never reaches here: it resolves a
         # provider above, and the executor rejects a double pin.)
         env["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
+    _bind_codex_gateway_credential(env, spec)
+
+
+def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None:
+    """Use a host-bound placeholder for an explicitly brokered Codex gateway."""
+    locked = spec.executor.config.get("broker_gateway", False)
+    if not isinstance(locked, bool):
+        raise OmnigentError(
+            "executor.config.broker_gateway must be a boolean", code=ErrorCode.INVALID_INPUT
+        )
+    base_url = env.get("HARNESS_CODEX_GATEWAY_BASE_URL")
+    sandbox = spec.os_env.sandbox if spec.os_env is not None else None
+    proxy = sandbox.credential_proxy if sandbox is not None else None
+    reserved_bindings = (
+        [entry for entry in proxy.entries if CODEX_GATEWAY_TOKEN_ENV in entry.inject_env]
+        if proxy is not None
+        else []
+    )
+    if not locked and not reserved_bindings:
+        return
+    if not base_url:
+        raise OmnigentError(
+            "Codex gateway credential_proxy requires a gateway HTTPS provider",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        parsed = urlparse(base_url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise OmnigentError("invalid Codex gateway URL", code=ErrorCode.INVALID_INPUT) from None
+    if not locked:
+        raise OmnigentError(
+            "Codex gateway reserved binding requires executor.config.broker_gateway: true",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    binding = reserved_bindings[0] if len(reserved_bindings) == 1 else None
+    model_path = parsed.path.rstrip("/") + "/responses"
+    try:
+        rules = parse_rules(sandbox.egress_rules or []) if sandbox is not None else []
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    model_rules = [rule for rule in rules if host and rule._host_matches(host)]
+    if (
+        len(reserved_bindings) != 1
+        or parsed.scheme != "https"
+        or port not in (None, 443)
+        or parsed.username is not None
+        or not host
+        or parsed.query
+        or parsed.fragment
+        or binding is None
+        or binding.host != host
+        or binding.scheme != "bearer"
+        or binding.inject_env != [CODEX_GATEWAY_TOKEN_ENV]
+        or binding.source.kind not in ("file", "unix_socket")
+        or binding.source.refresh_interval_seconds is None
+        or sandbox is None
+        or sandbox.type not in ("linux_bwrap", "darwin_seatbelt")
+        or len(model_rules) != 1
+        or any(
+            rule.host_pattern != host
+            or rule.methods != frozenset({"POST"})
+            or rule.path_pattern != model_path
+            for rule in model_rules
+        )
+    ):
+        raise OmnigentError(
+            "Codex gateway credential_proxy requires one matching HTTPS bearer "
+            "renewable file/socket binding with env OMNIGENT_CODEX_GATEWAY_TOKEN "
+            "and the exact POST Responses egress rule",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] = BROKERED_CODEX_AUTH_COMMAND
+    env["HARNESS_CODEX_BROKERED_GATEWAY"] = "true"
 
 
 def _build_codex_spawn_env(
@@ -1510,17 +1588,8 @@ def _build_codex_spawn_env(
     Maps spec.executor fields → the ``HARNESS_CODEX_*`` env vars
     defined in ``omnigent/inner/codex_harness.py``. Mirrors
     :func:`_build_claude_sdk_spawn_env` — same per-spawn env-var
-    pattern from §Step 5a. The codex-specific env vars
-    (``HARNESS_CODEX_PATH``, ``HARNESS_CODEX_ENABLE_WEB_SEARCH``,
-    ``HARNESS_CODEX_DISABLE_NATIVE_TOOLS``) are not threaded
-    through here in v1: the legacy
-    :func:`omnigent.inner.executor_factory.create_executor`
-    path doesn't surface them either, so AP-side parity is
-    preserved by leaving them at the inner executor's defaults.
-    Operators who want non-default values set those env vars
-    on the Omnigent server directly (they propagate to the subprocess
-    through normal env inheritance — the wrap's per-spawn
-    overrides only override, they don't filter).
+    pattern from §Step 5a. Explicit web search and native-tool settings
+    override the harness defaults for this launch.
 
     :param spec: The agent spec.
     :param workdir: The bundle's on-disk path (extracted by the
@@ -1543,6 +1612,18 @@ def _build_codex_spawn_env(
     # unchanged.
     provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
     _apply_codex_provider_env(env, spec, provider)
+    for config_key, env_key in (
+        ("web_search", "HARNESS_CODEX_ENABLE_WEB_SEARCH"),
+        ("disable_native_tools", "HARNESS_CODEX_DISABLE_NATIVE_TOOLS"),
+    ):
+        value = spec.executor.config.get(config_key)
+        if value is not None:
+            if not isinstance(value, bool):
+                raise OmnigentError(
+                    f"executor.config.{config_key} must be a boolean",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            env[env_key] = "true" if value else "false"
     # Skills bridge — same shape as the claude-sdk variant. Always
     # set so the harness wrap doesn't fall back to its ``"all"``
     # default and override an explicit ``skills: none`` spec.

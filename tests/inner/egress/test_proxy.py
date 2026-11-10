@@ -17,10 +17,16 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.inner.credential_proxy import (
+    CODEX_GATEWAY_TOKEN_ENV,
     SYNTHETIC_CREDENTIAL_PREFIX,
     CredentialRewriteRule,
     RefreshingSecretProvider,
     prepare_credential_proxy_runtime,
+)
+from omnigent.inner.datamodel import (
+    CredentialProxyEntry,
+    CredentialProxySpec,
+    CredentialSourceSpec,
 )
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
@@ -2489,6 +2495,96 @@ async def test_credential_rewrite_injects_on_access_without_header(
     # The proxy synthesized the Authorization header from the rule — the
     # client sent none.
     assert captured[0].authorization == "Bearer real-secret-value"
+
+
+@pytest.mark.asyncio
+async def test_brokered_rule_needs_placeholder_and_https(
+    ca_paths: tuple[Path, Path, Path],
+    tmp_path: Path,
+) -> None:
+    cert_path, key_path, _ = ca_paths
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    token_file = tmp_path / "model-token"
+    token_file.write_text("real-secret-value")
+    runtime = prepare_credential_proxy_runtime(
+        CredentialProxySpec(
+            entries=[
+                CredentialProxyEntry(
+                    host="127.0.0.1",
+                    scheme="bearer",
+                    source=CredentialSourceSpec(
+                        kind="file", path=str(token_file), refresh_interval_seconds=300
+                    ),
+                    inject_env=[CODEX_GATEWAY_TOKEN_ENV],
+                )
+            ]
+        ),
+        parent_env={},
+        sandbox=SandboxPolicy(
+            backend_type="darwin_seatbelt",
+            active=True,
+            read_roots=[workspace],
+            write_roots=[],
+            write_files=[],
+            allow_network=False,
+        ),
+        cwd=workspace,
+    )
+    rule = runtime.rewrites[0]
+    assert not rule.inject_on_missing
+    assert rule.https_only
+    assert rule.required_tls_port == 443
+    assert rule.synthetic == runtime.helper_env_updates[CODEX_GATEWAY_TOKEN_ENV]
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules(["POST 127.0.0.1/v1/responses"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        request = (
+            f"POST http://127.0.0.1:{upstream_port}/v1/responses HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{upstream_port}\r\n"
+            f"Authorization: Bearer {rule.synthetic}\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        writer.write(request.encode())
+        await writer.drain()
+        response = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+        assert b"403 Forbidden" in response
+        assert captured == []
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        writer.write(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n")
+        await writer.drain()
+        response = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+        assert b"403 Forbidden" in response
+        assert captured == []
+        bare = proxy._rewrite_authorization(
+            method="POST", host="127.0.0.1", headers_raw=b"Host: 127.0.0.1\r\n\r\n"
+        )
+        assert b"Authorization" not in bare.headers
+        upgraded = proxy._rewrite_authorization(
+            method="POST",
+            host="127.0.0.1",
+            headers_raw=f"Authorization: Bearer {rule.synthetic}\r\n\r\n".encode(),
+        )
+        assert upgraded.error is None
+        assert b"Authorization: Bearer real-secret-value" in upgraded.headers
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
 
 
 # ---------------------------------------------------------------------------

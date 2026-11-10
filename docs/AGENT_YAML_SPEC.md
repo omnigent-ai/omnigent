@@ -669,6 +669,71 @@ os_env:
 Inside the sandbox, `databricks --profile dbc-87654321-dcba current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
+A sandboxed `codex` executor can use an HTTPS gateway through the same proxy.
+Bind the gateway host with `https_bearer`, set `env` to
+`OMNIGENT_CODEX_GATEWAY_TOKEN`, and allow the gateway's exact Responses route.
+The runner replaces the provider's auth command with a fixed command that
+prints only the placeholder. The trusted parent reads the protected source and
+renews its token; Codex receives a private home without host auth or provider
+configuration. A locked profile requires an explicit `broker_gateway: true`;
+missing or mismatched bindings prevent launch. Other gateway profiles retain
+their existing authentication.
+
+```yaml
+executor:
+  model: gpt-daybreak-blue-latest
+  auth:
+    type: provider
+    name: locked-model
+  config:
+    harness: codex
+    broker_gateway: true
+    web_search: false
+    disable_native_tools: true
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt # or linux_bwrap
+    egress_rules:
+      - "POST model.example.com/cyber/v1/responses"
+    credential_proxy:
+      - type: https_bearer
+        target: model.example.com
+        env: OMNIGENT_CODEX_GATEWAY_TOKEN
+        source:
+          unix_socket: /private/model-token.sock
+          refresh_interval_seconds: 300
+```
+
+Configure this provider in the host's `~/.omnigent/config.yaml`:
+
+```yaml
+providers:
+  locked-model:
+    kind: gateway
+    openai:
+      base_url: https://model.example.com/cyber/v1
+      wire_api: responses
+      auth_command: "false" # required by the provider schema; locked mode replaces it
+      models:
+        default: gpt-daybreak-blue-latest
+```
+
+The locked profile replaces the provider's auth command with the brokered
+placeholder command before Codex starts. Other uses of this provider would
+run `false` and fail authentication.
+
+The reserved gateway binding requires a placeholder-bearing HTTPS request on
+port 443 in both the Codex relay and the Omnigent OS-tool proxy. A bare request
+or plaintext HTTP request receives no bearer.
+
+The socket path must be absolute and outside sandbox read/write grants. A
+separate trusted issuer must serve `GET /token` and refresh the bearer; Omnigent
+does not start that issuer. Keep its code, dependencies, configuration, and
+credential storage outside sandbox write grants. Locked Codex profiles should
+disable both web search and native tools so their shell and file operations
+use Omnigent tools and policies.
+
 ### Git over SSH from a sandbox
 
 `sandbox.git_ssh` grants one Git repository and one SSH operation at a time.
@@ -749,8 +814,9 @@ when the workspace is read-only. Hard-linked files and sockets are rejected.
 Canonical source paths stay protected through launcher serialization: Linux
 rejects mounts that expose them, including implicit toolchain mounts; macOS
 denies file access and Unix-socket connections even under implicit read grants.
-These protections also apply to startup-only Unix socket sources. Existing
-startup-only file, environment, and command sources are unchanged.
+These protections also apply to startup-only Unix socket sources. Command
+sources run in the trusted parent with a filtered environment and a bounded
+timeout. Their stdout, stderr, and command text are omitted from worker errors.
 
 Source checks run before startup resolution and every refresh. A symlink source
 must retain its original canonical target for the session; replacing the file
@@ -764,9 +830,8 @@ be ready before the helper starts: a source failure during startup prevents
 launch, rather than producing a recoverable request-time 502. Without a refresh
 interval, sources resolve once at startup.
 Environment sources cannot refresh because a running process inherits a fixed
-environment. Shell command sources remain startup-only: a sandbox might otherwise
-replace a script or dependency before the trusted parent executes it again. Use
-a private broker for renewable credentials instead.
+environment. Shell command sources remain startup-only because a sandbox could
+change an executable, script, or dependency before the next refresh.
 
 ## Tools
 

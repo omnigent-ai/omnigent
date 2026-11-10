@@ -9,6 +9,7 @@ import os
 import stat
 import sys
 import tempfile
+import tomllib
 import unittest
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -29,18 +30,25 @@ from omnigent.inner.codex_executor import (
     _CodexAppServerSession,
     _CodexSessionState,
     _databricks_codex_config_overrides,
+    _default_app_session_factory,
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
     _parse_codex_gateway_error,
+    _populate_codex_home_config,
     _prompt_for_turn,
     _provider_codex_config_overrides,
     _require_brokered_codex_version,
     _to_codex_input_items,
+    materialize_codex_provider_config,
+    populate_codex_skills_from_bundle,
+    verify_brokered_codex_native_tools_disabled,
+    write_required_brokered_model_catalog,
 )
 from omnigent.inner.codex_goal_command import (
     GOAL_OBJECTIVE_MAX_CHARS,
     goal_objective_length_error,
 )
+from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND, BROKERED_CODEX_ENV
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorConfig,
@@ -75,6 +83,260 @@ def _run(coro):
     finally:
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
+
+
+def test_brokered_home_contains_only_generated_gateway_config(tmp_path: Path) -> None:
+    source = tmp_path / "host-home"
+    source.mkdir()
+    (source / "auth.json").write_text("host-auth-secret")
+    (source / "hooks.json").write_text("host-hook-secret")
+    (source / "config.toml").write_text('model_provider="host-provider"\n')
+    target = tmp_path / "session-home"
+    target.mkdir()
+    _populate_codex_home_config(target, source, minimal_config=True, include_credentials=False)
+    overrides = _databricks_codex_config_overrides(
+        model="gpt-daybreak-blue-latest",
+        base_url="https://model.example.com/cyber/v1",
+        auth_command=BROKERED_CODEX_AUTH_COMMAND,
+        auth_refresh_interval_ms=None,
+    )
+    materialize_codex_provider_config(target, overrides)
+    assert sorted(path.name for path in target.iterdir()) == ["config.toml"]
+    config = (target / "config.toml").read_text()
+    assert (
+        tomllib.loads(config)["model_providers"]["omnigent_databricks"]["auth"]["args"][-1]
+        == BROKERED_CODEX_AUTH_COMMAND
+    )
+    assert "host-auth-secret" not in config
+    assert "host-hook-secret" not in config
+    assert "host-provider" not in config
+
+
+def test_brokered_home_loads_only_bundle_skills(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    host_home = tmp_path / "host-home"
+    host_skill = host_home / ".codex" / "skills" / "host-skill"
+    host_skill.mkdir(parents=True)
+    (host_skill / "SKILL.md").write_text("host state")
+    shared_skill = host_home / ".agents" / "skills" / "shared-skill"
+    shared_skill.mkdir(parents=True)
+    (shared_skill / "SKILL.md").write_text("shared state")
+    bundle = tmp_path / "bundle"
+    bundle_skill = bundle / "skills" / "intended-skill"
+    bundle_skill.mkdir(parents=True)
+    (bundle_skill / "SKILL.md").write_text("bundle skill")
+    target = tmp_path / "session-home"
+    monkeypatch.setenv("HOME", str(host_home))
+
+    populate_codex_skills_from_bundle(
+        target, bundle, "all", copy_skills=True, include_host_skills=False
+    )
+
+    assert [path.name for path in (target / "skills").iterdir()] == ["intended-skill"]
+
+
+def test_brokered_gateway_removes_inherited_auth_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABRICKS_BEARER", "real-databricks-token")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "real-client-secret")
+    monkeypatch.setenv("OPENAI_ORG_ID", "ambient-org")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/host/config")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/host/ssh-agent.sock")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/host/gh")
+    monkeypatch.setenv("BROWSER", "/host/browser")
+    monkeypatch.setenv("CODEX_HOME", "/host/codex")
+    monkeypatch.setenv("DECLARED_TOOL_SECRET", "tool-only-secret")
+    monkeypatch.setenv("PARENT_MODEL_TOKEN", "parent-model-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SESSION_ENV_NAMES", "PARENT_MODEL_TOKEN")
+    os_env = OSEnvSpec(
+        sandbox=OSEnvSandboxSpec(
+            type="darwin_seatbelt",
+            egress_rules=["POST model.example.com/cyber/v1/responses"],
+            env_passthrough=["DECLARED_TOOL_SECRET", "PARENT_MODEL_TOKEN"],
+        )
+    )
+    with pytest.raises(ValueError, match="requires disabled web search and native tools"):
+        CodexExecutor(
+            codex_path="/bin/echo",
+            os_env=os_env,
+            model="gpt-daybreak-blue-latest",
+            gateway=True,
+            brokered_gateway=True,
+            gateway_host="https://model.example.com",
+            base_url_override="https://model.example.com/cyber/v1",
+            gateway_auth_command=BROKERED_CODEX_AUTH_COMMAND,
+        )
+    executor = CodexExecutor(
+        codex_path="/bin/echo",
+        os_env=os_env,
+        model="gpt-daybreak-blue-latest",
+        gateway=True,
+        brokered_gateway=True,
+        gateway_host="https://model.example.com",
+        base_url_override="https://model.example.com/cyber/v1",
+        gateway_auth_command=BROKERED_CODEX_AUTH_COMMAND,
+        enable_web_search=False,
+        disable_native_tools=True,
+    )
+    assert executor._env[BROKERED_CODEX_ENV] == "1"
+    assert not any(key.startswith("DATABRICKS_") for key in executor._env)
+    assert "OPENAI_API_KEY" not in executor._env
+    assert "OPENAI_ORG_ID" not in executor._env
+    for key in (
+        "XDG_CONFIG_HOME",
+        "SSH_AUTH_SOCK",
+        "GH_CONFIG_DIR",
+        "BROWSER",
+        "CODEX_HOME",
+        "DECLARED_TOOL_SECRET",
+        "PARENT_MODEL_TOKEN",
+    ):
+        assert key not in executor._env
+    assert "real-databricks-token" not in repr(executor._codex_config_overrides)
+    assert "real-client-secret" not in repr(executor._codex_config_overrides)
+
+
+def test_brokered_gateway_pins_generated_thread_provider() -> None:
+    from omnigent.spec.types import RetryPolicy
+
+    session = _default_app_session_factory(
+        codex_path="/bin/echo",
+        cwd=None,
+        env={BROKERED_CODEX_ENV: "1"},
+        tool_executor=None,
+        codex_config_overrides=[],
+        retry_policy=RetryPolicy(),
+        disable_native_tools=True,
+        bundle_dir=None,
+        skills_filter="none",
+        os_env=None,
+    )
+    assert session._thread_model_provider == "omnigent_databricks"
+
+
+def test_brokered_native_tool_preflight_requires_disabled_shell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    names = (
+        "shell_tool",
+        "apps",
+        "browser_use",
+        "browser_use_external",
+        "browser_use_full_cdp_access",
+        "in_app_browser",
+        "view_image",
+        "image_generation",
+        "multi_agent",
+        "code_mode",
+    )
+
+    def _result(enabled: str | None = None) -> SimpleNamespace:
+        stdout = "".join(
+            f"{name} stable {'true' if name == enabled else 'false'}\n" for name in names
+        )
+        return SimpleNamespace(returncode=0, stdout=stdout.encode())
+
+    run = unittest.mock.Mock(return_value=_result())
+    monkeypatch.setattr("omnigent.inner.codex_executor.subprocess.run", run)
+    verify_brokered_codex_native_tools_disabled("/bin/codex", tmp_path)
+    assert run.call_args.args[0][-2:] == ["features", "list"]
+    assert "features.shell_tool=false" in run.call_args.args[0]
+    run.return_value = _result("apps")
+    with pytest.raises(RuntimeError, match="disables native tools"):
+        verify_brokered_codex_native_tools_disabled("/bin/codex", tmp_path)
+    run.return_value = SimpleNamespace(returncode=1, stdout=b"shell_tool stable false\n")
+    with pytest.raises(RuntimeError, match="disables native tools"):
+        verify_brokered_codex_native_tools_disabled("/bin/codex", tmp_path)
+    run.side_effect = OSError("private diagnostic")
+    with pytest.raises(RuntimeError, match="disables native tools"):
+        verify_brokered_codex_native_tools_disabled("/bin/codex", tmp_path)
+
+
+def test_brokered_catalog_removes_native_shell_and_patch_tools(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bundled = {
+        "models": [
+            {
+                "slug": "test-model",
+                "shell_type": "unified_exec",
+                "apply_patch_tool_type": "freeform",
+                "experimental_supported_tools": ["test_sync_tool"],
+            }
+        ]
+    }
+    completed = SimpleNamespace(returncode=0, stdout=json.dumps(bundled).encode())
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.subprocess.run", unittest.mock.Mock(return_value=completed)
+    )
+    catalog_path = write_required_brokered_model_catalog(
+        tmp_path, codex_path="/bin/codex", strip_native_tools=True
+    )
+    model = json.loads(catalog_path.read_text())["models"][0]
+    assert model["shell_type"] == "disabled"
+    assert model["apply_patch_tool_type"] is None
+    assert model["experimental_supported_tools"] == []
+
+    signer_home = tmp_path / "signer"
+    signer_catalog = write_required_brokered_model_catalog(signer_home, codex_path="/bin/codex")
+    signer_model = json.loads(signer_catalog.read_text())["models"][0]
+    assert signer_model["shell_type"] == "unified_exec"
+    assert signer_model["apply_patch_tool_type"] == "freeform"
+    assert signer_model["experimental_supported_tools"] == ["test_sync_tool"]
+
+
+@pytest.mark.parametrize("with_dynamic_tool", [False, True])
+def test_disabled_native_tools_apply_with_or_without_dynamic_tools(
+    with_dynamic_tool: bool,
+) -> None:
+    async def run() -> None:
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo",
+            cwd="/tmp/workspace",
+            env={},
+            tool_executor=None,
+            disable_native_tools=True,
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+
+        async def complete() -> None:
+            await asyncio.sleep(0.01)
+            session._events.put_nowait(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1"}},
+                }
+            )
+
+        task = asyncio.create_task(complete())
+        _ = [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[{"name": "sys_os_shell", "description": "Shell"}]
+                if with_dynamic_tool
+                else [],
+                system_prompt="",
+                model="test-model",
+                cwd=".",
+                sandbox="workspace-write",
+            )
+        ]
+        await task
+        params = session._request.await_args_list[0].args[1]
+        assert params["config"]["features.shell_tool"] is False
+        assert params["config"]["features.unified_exec"] is False
+
+    _run(run())
 
 
 @dataclass
@@ -1173,64 +1435,6 @@ class TestCodexExecutor(unittest.TestCase):
             tool_complete = next(e for e in events if isinstance(e, ToolCallComplete))
             self.assertEqual(tool_request.metadata, {"call_id": "call_abc123"})
             self.assertEqual(tool_complete.metadata, {"call_id": "call_abc123"})
-
-        _run(_t())
-
-    def test_app_server_run_turn_can_disable_native_tools_when_requested(self):
-        async def _t():
-            session = _CodexAppServerSession(
-                codex_path="/bin/echo",
-                cwd="/tmp/workspace",
-                env={},
-                tool_executor=None,
-                disable_native_tools=True,
-            )
-            session.start = AsyncMock()
-            session._proc = _FakeProcess()
-            session._request = AsyncMock(
-                side_effect=[
-                    {"result": {"thread": {"id": "thread-1"}}},
-                    {"result": {"turn": {"id": "turn-1"}}},
-                ]
-            )
-
-            async def _inject_turn_completed() -> None:
-                await asyncio.sleep(0.01)
-                session._events.put_nowait(
-                    {
-                        "method": "turn/completed",
-                        "params": {
-                            "turn": {"id": "turn-1"},
-                        },
-                    }
-                )
-
-            inject_task = asyncio.create_task(_inject_turn_completed())
-            _ = [
-                event
-                async for event in session.run_turn(
-                    messages=[{"role": "user", "content": "hi"}],
-                    tools=[
-                        {
-                            "name": "sys_os_shell",
-                            "description": "Shell",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {"command": {"type": "string"}},
-                            },
-                        }
-                    ],
-                    system_prompt="Be helpful.",
-                    model="gpt-5.4-mini",
-                    cwd=".",
-                    sandbox="workspace-write",
-                )
-            ]
-            await inject_task
-
-            thread_start_call = session._request.await_args_list[0]
-            params = thread_start_call.args[1]
-            self.assertEqual(params["config"]["features.shell_tool"], False)
 
         _run(_t())
 
