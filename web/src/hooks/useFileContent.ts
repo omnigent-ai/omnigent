@@ -101,9 +101,14 @@ export async function fetchFileContent(
   conversationId: string,
   path: string,
   signal?: AbortSignal,
+  options: { scope?: "workspace" } = {},
 ): Promise<FileContentResponse> {
-  const res = await authenticatedFetch(workspaceFileUrl(conversationId, path), { signal });
+  const res = await authenticatedFetch(workspaceFileUrl(conversationId, path, options), { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  // Older servers ignore scope; automatic previews must fail closed there.
+  if (options.scope && res.headers.get("X-Omnigent-File-Scope") !== options.scope) {
+    throw new Error("Workspace-constrained file reads are unavailable");
+  }
   return (await res.json()) as FileContentResponse;
 }
 
