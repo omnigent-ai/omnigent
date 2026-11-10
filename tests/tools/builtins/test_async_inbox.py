@@ -342,6 +342,55 @@ def test_async_enabled_false_with_dispatch_still_registers_inbox(
     assert SysCancelAsyncTool.name() not in names
 
 
+@pytest.mark.asyncio
+async def test_dispatching_spec_inbox_drains_runner_queue() -> None:
+    import asyncio
+
+    import httpx
+
+    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.tools.base import ToolContext
+
+    spec = AgentSpec(
+        spec_version=1,
+        async_enabled=False,
+        tools=ToolsConfig(agents=["researcher"]),
+    )
+    manager = ToolManager(spec=spec)
+    tool = manager.get_tool(SysReadInboxTool.name())
+    assert tool is not None
+    ctx = ToolContext(
+        task_id="task_parent", agent_id="agent_parent", conversation_id="conv_parent"
+    )
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    inbox.put_nowait(
+        {
+            "type": "sub_agent",
+            "handle_id": "task_1",
+            "agent": "researcher",
+            "title": "topic",
+            "status": "completed",
+            "output": "research result",
+        }
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as client:
+        result = await execute_tool(
+            tool_name=tool.name(),
+            arguments="{}",
+            agent_spec=spec,
+            server_client=client,
+            task_id=ctx.task_id,
+            agent_id=ctx.agent_id,
+            conversation_id=ctx.conversation_id,
+            session_inbox=inbox,
+        )
+    assert "research result" in result
+    assert inbox.empty()
+
+
 def test_async_enabled_true_registers() -> None:
     """
     With ``async_enabled=True`` (the default) the manager

@@ -1668,6 +1668,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         """
         return self.skills_filter != "none"
 
+
 def spec_dispatches_subagents(spec: AgentSpec) -> bool:
     """
     Whether *spec* can dispatch sub-agents.
