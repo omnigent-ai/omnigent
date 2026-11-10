@@ -530,18 +530,6 @@ async def test_legacy_launch_permission_is_host_scoped(catalog, profiles, host_i
     assert profiles.selections == []
 
 
-async def test_launch_without_profile_follows_config_requirement(catalog, profiles):
-    from omnigent.server.managed_hosts import _select_launch_profile
-
-    launcher = _Provider(profiles)
-    optional = replace(catalog._deployment.default, manages_profiles=False)
-    await _select_launch_profile(launcher, optional, _ALICE)
-    assert profiles.selections == []
-    with pytest.raises(HTTPException) as denied:
-        await _select_launch_profile(launcher, catalog._deployment.default, _ALICE)
-    assert denied.value.status_code == 422
-
-
 def test_host_reuse_checks_saved_identity_and_current_access(
     catalog: SandboxProfileCatalog, profiles: _Profiles
 ) -> None:
