@@ -1681,7 +1681,7 @@ async def test_resume_reports_a_stuck_managed_wake_as_failed(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Each Resume of a sandbox whose provider never answers fails with the wake's reason."""
+    """Resume fails while the sandbox provider hangs and wakes the sandbox once it answers."""
     import threading
 
     from omnigent.server import managed_hosts
@@ -1701,7 +1701,14 @@ async def test_resume_reports_a_stuck_managed_wake_as_failed(
     conv = conv_store.create_conversation(
         agent_id=None, host_id=host.host_id, workspace="/root/workspace"
     )
-    fake = FakeSandboxLauncher(can_resume=True)
+    fake = FakeSandboxLauncher(
+        can_resume=True,
+        on_host_start=lambda invocation: host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=RESERVED_USER_LOCAL,
+        ),
+    )
     fake.provider = "islo"  # type: ignore[misc]
     provider_unblocked = threading.Event()
     resume_calls: list[str] = []
@@ -1730,7 +1737,6 @@ async def test_resume_reports_a_stuck_managed_wake_as_failed(
             )
         ),
         managed_launches=ManagedLaunchTracker(),
-        host_registry=SimpleNamespace(get=lambda _host_id: None),
     )
 
     try:
@@ -1759,6 +1765,19 @@ async def test_resume_reports_a_stuck_managed_wake_as_failed(
     assert resume_calls == ["sb-unreachable-islo"]
     assert fake.host_starts == []
     assert host_store.resolve_launch_token(host.host_id, "tok-unreachable-islo") is not None
+
+    # With the provider answering again, the next Resume wakes the sandbox.
+    monkeypatch.setattr(managed_hosts, "MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S", 30.0)
+    monkeypatch.setattr(managed_hosts, "MANAGED_WAKE_TIMEOUT_S", 20.0)
+    assert await sessions_module._maybe_relaunch_managed_sandbox(
+        session_id=conv.id,
+        conv=conv,
+        app_state=app_state,
+        conversation_store=conv_store,
+    )
+    assert resume_calls == ["sb-unreachable-islo", "sb-unreachable-islo"]
+    assert len(fake.host_starts) == 1
+    assert stages[-1] == ("ready", None)
 
 
 @pytest.mark.parametrize("replaced", [False, True])
