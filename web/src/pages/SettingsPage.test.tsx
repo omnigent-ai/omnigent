@@ -53,6 +53,8 @@ const mocks = vi.hoisted(() => ({
   // single_user: explicit single-user marker; false for accounts/OIDC/
   // multi-user-header. Gates the settings-route single-user redirect.
   singleUser: false,
+  sessionTitleInstructions: false,
+  nestedAgents: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
@@ -81,8 +83,13 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    sibling_sessions: mocks.nestedAgents,
     enabled_connections: mocks.enabledConnections,
+    session_title_instructions: mocks.sessionTitleInstructions,
   }),
+}));
+vi.mock("@/components/SessionTitleInstructionsControl", () => ({
+  SessionTitleInstructionsControl: () => <div data-testid="mock-session-title-instructions" />,
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
   ImportSessionsPanel: mocks.importSessionsPanel,
@@ -213,6 +220,9 @@ vi.mock("@/pages/MembersPage", () => ({
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
 }));
+vi.mock("@/pages/AdminGeneralPage", () => ({
+  AdminGeneralPage: () => <div>admin-general-page-stub</div>,
+}));
 vi.mock("@/components/McpRegistry", () => ({
   McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
 }));
@@ -270,6 +280,8 @@ beforeEach(() => {
   mocks.theme = "system";
   mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
+  mocks.sessionTitleInstructions = false;
+  mocks.nestedAgents = false;
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
@@ -423,6 +435,17 @@ describe("SettingsPage", () => {
     renderPage("/settings/general");
 
     expect(await screen.findByTestId("background-session-titles-toggle")).toBeChecked();
+  });
+
+  it.each([
+    [true, true],
+    [false, false],
+  ])("shows title instructions only when the server stores them (%s)", async (supported, shown) => {
+    mocks.sessionTitleInstructions = supported;
+    renderPage("/settings/general");
+    const sessions = await screen.findByTestId("settings-group-sessions");
+
+    expect(within(sessions).queryByTestId("mock-session-title-instructions") !== null).toBe(shown);
   });
 
   it("persists session auto-rename changes", async () => {
@@ -1177,6 +1200,7 @@ describe("SettingsPage", () => {
       target: { value: "3" },
     });
     fireEvent.click(screen.getByTestId("project-folder-collapse-toggle"));
+    fireEvent.click(screen.getByTestId("session-row-quick-actions-toggle"));
     const folderPagination = renderHook(() => [
       useProjectFolderCollapse(),
       useProjectFolderPageSize(),
@@ -1208,6 +1232,11 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("fold-assistant-narration-toggle")).toHaveAttribute(
       "aria-checked",
       "true",
+    );
+    expect(localStorage.getItem("omnigent:session-row-quick-actions")).toBe("false");
+    expect(screen.getByTestId("session-row-quick-actions-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
     );
 
     // Open the confirmation dialog and confirm the reset.
@@ -1264,6 +1293,11 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:project-folder-collapse")).toBeNull();
     expect(localStorage.getItem("omnigent:project-folder-page-size")).toBeNull();
     expect(folderPagination.result.current).toEqual([true, 5]);
+    expect(localStorage.getItem("omnigent:session-row-quick-actions")).toBeNull();
+    expect(screen.getByTestId("session-row-quick-actions-toggle")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
   });
 
@@ -1572,6 +1606,12 @@ describe("SettingsPage", () => {
     renderPage("/settings/policies");
     expect(await screen.findByText("policies-page-stub")).toBeInTheDocument();
     expect(screen.queryByText("members-page-stub")).toBeNull();
+  });
+
+  it("renders Admin General at /settings/admin", async () => {
+    mocks.nestedAgents = true;
+    renderPage("/settings/admin");
+    expect(await screen.findByText("admin-general-page-stub")).toBeInTheDocument();
   });
 
   it("still renders the admin sections when accounts is off (OIDC)", async () => {

@@ -96,7 +96,10 @@ from omnigent.runtime.harnesses._executor_adapter import (
 )
 from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    WORKSPACE_IMAGE_INSTRUCTION,
+)
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
@@ -3887,9 +3890,11 @@ def test_subagent_read_tools_are_runner_local() -> None:
         pytest.param({"input": "continue"}, id="object-input-contract"),
     ],
 )
+@pytest.mark.parametrize("runner_features", [None, "-peer_session_messaging"])
 async def test_sys_session_send_reuses_existing_child_session(
     monkeypatch: pytest.MonkeyPatch,
     subagent_args: str | dict[str, str],
+    runner_features: str | None,
 ) -> None:
     """
     Re-sending to the same ``(agent, title)`` continues the existing child.
@@ -3903,10 +3908,15 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param subagent_args: ``sys_session_send`` ``args`` payload.
+    :param runner_features: Local feature override; ``None`` uses defaults.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
+    if runner_features is None:
+        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_FEATURES", runner_features)
     create_posts = 0
     event_posts: list[dict[str, Any]] = []
     dispatch_stamps: list[dict[str, Any]] = []
@@ -8044,7 +8054,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
 
     # agent_name forwarded to the server-side filter.
     assert sessions_params.get("agent_name") == "researcher"
-    assert sessions_params.get("visibility") == "all"
+    assert sessions_params.get("visibility") == "mine"
     # Both sessions projected with status + connectivity from the single
     # shared-runner status lookup.
     assert out["sessions"] == [
@@ -8057,6 +8067,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_online": True,
             "parent_session_id": None,
             "created_by_session_id": "conv_x",
+            "family": None,
         },
         {
             "session_id": "s2",
@@ -8067,6 +8078,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_online": True,
             "parent_session_id": None,
             "created_by_session_id": None,
+            "family": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share
@@ -12606,7 +12618,9 @@ _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
 
 def _contract_composed_instructions(*parts: str) -> str:
     """Compose expected author/request text with framework guidance."""
-    return "\n\n".join((*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION))
+    return "\n\n".join(
+        (*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION)
+    )
 
 
 async def _contract_run_no_harness(
@@ -13570,7 +13584,7 @@ _SIGN_IN_PROMPT_SCREEN = (
     "\n\thttps://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
 )
 _SIGNED_IN_SCREENS = {
-    # Codex draws inline: dbcert's lines stay above its banner.
+    # Codex draws inline: the launcher's lines stay above its banner.
     "codex-native": (
         _SIGN_IN_PROMPT_SCREEN + "dbcert: All credentials successfully written\n"
         "╭── OpenAI Codex (v0.156.1) ──╮\n"

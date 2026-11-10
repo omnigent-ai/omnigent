@@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec import load
 
 # The default-stance auto-review override normalize_codex_permission_launch_args
@@ -1003,6 +1004,78 @@ def test_preload_codex_thread_retries_provider_mismatch_once(
     assert retry == {**first, "modelProvider": "Databricks"}
     assert json.loads(rollout.read_text())["payload"]["model_provider"] == "Databricks"
     assert fake_client.closed is (retry_refused or not retain_client)
+
+
+_PROVIDER_NOT_CONFIGURED = {
+    "code": -32600,
+    "message": "This chat uses model provider “Databricks”, which is no longer configured.",
+    "data": {"type": "modelProviderNotConfigured", "modelProvider": "Databricks"},
+}
+
+
+class _ConfiguredProviderResumeClient(_ScriptedResumeClient):
+    """Scripted resume client whose ``config/read`` reports *effective_provider*."""
+
+    def __init__(self, errors: list[Exception], effective_provider: str | None) -> None:
+        super().__init__(errors)
+        self.effective_provider = effective_provider
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method != "config/read":
+            return await super().request(method, params)
+        self.requests.append((method, params))
+        return {"result": {"config": {"model_provider": self.effective_provider}}}
+
+
+@pytest.mark.parametrize(
+    ("launch_provider", "effective_provider", "restamped_to"),
+    [
+        ("omnigent_databricks", None, "omnigent_databricks"),
+        (None, "omnigent_databricks", "omnigent_databricks"),
+        (None, None, None),
+        (None, "Databricks", None),
+    ],
+    ids=["pinned_launch", "config_selected", "no_provider", "same_missing_provider"],
+)
+def test_preload_codex_thread_moves_unconfigured_thread_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    launch_provider: str | None,
+    effective_provider: str | None,
+    restamped_to: str | None,
+) -> None:
+    """A thread whose recorded provider is gone resumes under the launch's provider."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = b'{"type":"session_meta","payload":{"model_provider":"Databricks"}}\n'
+    rollout.write_bytes(original)
+    refusal = codex_native_app_server.CodexAppServerResponseError(_PROVIDER_NOT_CONFIGURED)
+    fake_client = _ConfiguredProviderResumeClient([refusal], effective_provider)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    preload = codex_native_app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:9876",
+        "thread_test",
+        model_provider=launch_provider,
+        rollout_path=rollout,
+    )
+
+    if restamped_to is None:
+        with pytest.raises(codex_native_app_server.CodexAppServerResponseError) as raised:
+            asyncio.run(preload)
+        assert raised.value is refusal
+        assert rollout.read_bytes() == original
+        assert [method for method, _params in fake_client.requests] == [
+            "thread/resume",
+            "config/read",
+        ]
+    else:
+        assert asyncio.run(preload) is None
+        resumes = [params for method, params in fake_client.requests if method == "thread/resume"]
+        assert len(resumes) == 2
+        assert resumes[1]["modelProvider"] == restamped_to
+        assert json.loads(rollout.read_text())["payload"]["model_provider"] == restamped_to
+    assert fake_client.closed
 
 
 @pytest.mark.parametrize(
@@ -8927,7 +9000,7 @@ def test_run_with_local_server_records_fresh_session_before_attach(
     assert order == ["prepare", "record:conv_fresh", "attach"]
 
 
-def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> None:
     """The ``omnigent codex`` wrapper's own materialized spec is resolvable.
 
     Its ``prompt`` field is real ``AgentSpec.instructions`` content, not
@@ -8935,9 +9008,10 @@ def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
     like any other codex-native author instructions.
     """
     spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
-    result = codex_native._wrapper_spec_raw_instructions(spec_path)
+    result = codex_native._wrapper_spec_startup_instructions(spec_path)
     assert result is not None
     assert "Codex is running in the session terminal" in result
+    assert result.endswith(WORKSPACE_IMAGE_INSTRUCTION)
 
 
 @pytest.mark.asyncio
@@ -8975,11 +9049,11 @@ async def test_create_codex_session_retries_429(monkeypatch: pytest.MonkeyPatch)
     assert all(b"approval_policy=on-request" in body for body in request_bodies)
 
 
-def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
     """A malformed wrapper spec must not block the terminal launch."""
     bad_spec = tmp_path / "bad.yaml"
     bad_spec.write_text("not: [valid, agent, spec")
-    assert codex_native._wrapper_spec_raw_instructions(bad_spec) is None
+    assert codex_native._wrapper_spec_startup_instructions(bad_spec) == WORKSPACE_IMAGE_INSTRUCTION
 
 
 @pytest.mark.asyncio

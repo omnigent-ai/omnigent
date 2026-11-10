@@ -26,6 +26,7 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Iterable,
     Mapping,
     MutableMapping,
@@ -69,7 +70,7 @@ from omnigent.models.codex_model_vocabulary import (
     EXTENDED_MODEL_EFFORTS,
     EXTENDED_MODEL_INPUT_MODALITIES,
 )
-from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
+from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.repo_scope import repo_scope_dirs
@@ -78,7 +79,11 @@ from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
-from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
+from ._subprocess_lifecycle import (
+    close_subprocess_transport,
+    subprocess_exited,
+    terminate_subprocess,
+)
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
@@ -1335,6 +1340,7 @@ def materialize_codex_provider_config(
     config_overrides: Iterable[str],
     *,
     retry_policy: RetryPolicy | None = None,
+    source_home: Path | None = None,
     effective_providers: Mapping[str, object] | None = None,
     client_surface: str | None = None,
 ) -> list[str]:
@@ -1354,6 +1360,8 @@ def materialize_codex_provider_config(
     :param config_overrides: Pending Codex config override strings.
     :param retry_policy: Omnigent retry policy to apply through Codex's native
         provider settings. ``None`` uses :class:`RetryPolicy` defaults.
+    :param source_home: Optional host config source for a selected custom provider
+        missing from a reused private home. Existing private provider tables win.
     :param effective_providers: Provider tables resolved by Codex's ``config/read``.
         Only display names and attribution headers are copied from inherited providers.
     :returns: Overrides safe to retain in subprocess arguments.
@@ -1361,7 +1369,10 @@ def materialize_codex_provider_config(
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(codex_home, 0o700)
     config_path = codex_home / "config.toml"
-    from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
+    from omnigent.onboarding.codex_auth_readiness import (
+        CODEX_BUILTIN_PROVIDERS,
+        effective_codex_model_provider,
+    )
 
     gateway_providers = {
         name: provider
@@ -1378,7 +1389,12 @@ def materialize_codex_provider_config(
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
-    if not provider_overrides and not config_path.is_file() and not gateway_providers:
+    if (
+        not provider_overrides
+        and not config_path.is_file()
+        and source_home is None
+        and not gateway_providers
+    ):
         return argv_overrides
     if not provider_overrides and config_path.is_symlink():
         return argv_overrides
@@ -1387,24 +1403,77 @@ def materialize_codex_provider_config(
 
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     document = tomlkit.parse(existing) if existing else tomlkit.document()
-    providers = document.get("model_providers")
-    if providers is None and not provider_overrides and not gateway_providers:
+    providers: MutableMapping[str, Any] | None = None
+    declared_providers = document.get("model_providers")
+    if declared_providers is not None:
+        if not isinstance(declared_providers, MutableMapping):
+            raise ValueError("Codex model_providers config must be a TOML table")
+        providers = declared_providers
+
+    if provider_overrides:
+        if providers is None:
+            providers = tomlkit.table()
+            document["model_providers"] = providers
+        for override in provider_overrides:
+            fragment = tomlkit.parse(override)
+            generated = fragment.get("model_providers")
+            if not isinstance(generated, MutableMapping) or not generated:
+                raise ValueError("Codex provider override must define model_providers")
+            for provider_name, provider_config in generated.items():
+                providers[provider_name] = provider_config
+
+    if source_home is not None:
+        selected: object = effective_codex_model_provider(document.unwrap())
+        for override in argv_overrides:
+            key, _, value = override.partition("=")
+            if key.strip() != "model_provider":
+                continue
+            # Like Codex's own ``-c`` parsing: a TOML value, else the bare string;
+            # the last override wins.
+            try:
+                selected = tomlkit.parse(override).get("model_provider")
+            except tomlkit.exceptions.TOMLKitError:
+                selected = value.strip()
+        if (
+            isinstance(selected, str)
+            and selected not in CODEX_BUILTIN_PROVIDERS
+            and (providers is None or selected not in providers)
+        ):
+            source_path = source_home / "config.toml"
+            try:
+                source = (
+                    tomlkit.parse(source_path.read_text(encoding="utf-8")).unwrap()
+                    if source_path.is_file()
+                    else {}
+                )
+            except (OSError, UnicodeDecodeError, tomlkit.exceptions.TOMLKitError) as exc:
+                logger.warning(
+                    "skipping unusable Codex source config %s for provider %r: %s",
+                    source_path,
+                    selected,
+                    exc,
+                )
+                source = {}
+            source_providers = source.get("model_providers")
+            source_provider = (
+                source_providers.get(selected) if isinstance(source_providers, dict) else None
+            )
+            if isinstance(source_provider, dict):
+                if providers is None:
+                    providers = tomlkit.table()
+                    document["model_providers"] = providers
+                # A plain dict takes the parent's table style, so an inline
+                # ``model_providers`` parent still serializes as valid TOML.
+                providers[selected] = source_provider
+
+    if providers is None and gateway_providers:
+        providers = tomlkit.table()
+        document["model_providers"] = providers
+
+    if providers is None:
         if config_path.is_file() and not config_path.is_symlink():
             os.chmod(config_path, 0o600)
         return argv_overrides
-    if providers is None:
-        document["model_providers"] = tomlkit.table()
-        providers = document["model_providers"]
-    if not isinstance(providers, MutableMapping):
-        raise ValueError("Codex model_providers config must be a TOML table")
-
-    for override in provider_overrides:
-        fragment = tomlkit.parse(override)
-        generated = fragment.get("model_providers")
-        if not isinstance(generated, MutableMapping) or not generated:
-            raise ValueError("Codex provider override must define model_providers")
-        for provider_name, provider_config in generated.items():
-            providers[provider_name] = provider_config
 
     for provider_name, effective_provider in gateway_providers.items():
         if provider_name in CODEX_BUILTIN_PROVIDERS:
@@ -2876,6 +2945,7 @@ class _CodexAppServerSession:
         env: dict[str, str],
         tool_executor: CodexToolExecutor | None,
         codex_config_overrides: list[str] | None = None,
+        active_harnesses: Collection[str] | None = None,
         retry_policy: RetryPolicy | None = None,
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
@@ -2890,7 +2960,9 @@ class _CodexAppServerSession:
         self._cwd = cwd
         self._env = env
         self._tool_executor = tool_executor
-        self._codex_config_overrides = list(codex_config_overrides or [])
+        self._base_codex_config_overrides = tuple(codex_config_overrides or ())
+        self._codex_config_overrides = list(self._base_codex_config_overrides)
+        self._mcp_active_harnesses = active_harnesses
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
@@ -2921,6 +2993,7 @@ class _CodexAppServerSession:
         self._reader_completed_turn: str | None = None
         self._next_id = 1
         self._started = False
+        self._starting = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self.thread_id: str | None = None
         self.active_turn_id: str | None = None
@@ -2974,15 +3047,23 @@ class _CodexAppServerSession:
 
     async def start(self) -> None:
         """Start signer and worker transactionally."""
+        self._starting = True
         try:
             await self._start_unchecked()
         except BaseException:
             await self.close()
             raise
+        finally:
+            self._starting = False
+            # Startup owns the signer across worker replacement. Hand EOF cleanup
+            # back to the reader, including EOF that arrived during initialize.
+            if not self._closing and self._reader_task is not None and self._reader_task.done():
+                await self._close_signer()
 
     async def _start_unchecked(self) -> None:
         if self._started:
             return
+        self._codex_config_overrides = list(self._base_codex_config_overrides)
         cleanup_task = self._cleanup_task
         if cleanup_task is not None and not cleanup_task.done():
             await asyncio.shield(cleanup_task)
@@ -3167,65 +3248,31 @@ class _CodexAppServerSession:
                 await asyncio.to_thread(worker_launch.close)
                 raise RuntimeError("Codex session closed during worker preparation")
             self._worker_launch = worker_launch
-            argv = [self._worker_launch.launch_path, "app-server"]
-            for override in self._codex_config_overrides:
-                argv.extend(["-c", override])
-            spawn_argv = argv
-            pass_fds: tuple[int, ...] = ()
-            liveness_read_fd: int | None = None
-            await self._require_live_signer()
-            if self._worker_launch.sandboxed and os.name == "posix":
-                liveness_read_fd, self._worker_liveness_fd = os.pipe()
-                os.set_inheritable(liveness_read_fd, True)
-                spawn_argv = [
-                    sys.executable,
-                    str(Path(__file__).with_name("_liveness_exec.py")),
-                    "--liveness-fd",
-                    str(liveness_read_fd),
-                    *argv,
-                ]
-                pass_fds = (liveness_read_fd,)
-            try:
-                spawn_task = asyncio.create_task(
-                    _create_subprocess_exec(
-                        *spawn_argv,
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        env=proc_env,
-                        pass_fds=pass_fds,
-                        **_proc.spawn_kwargs(),
-                        cwd=self._cwd or os.getcwd(),
-                    )
-                )
-                self._worker_spawn_task = spawn_task
-                proc = await asyncio.shield(spawn_task)
-                self._proc = proc
-                if self._worker_spawn_task is spawn_task:
-                    self._worker_spawn_task = None
-                _proc.remember_process_group(self._proc)
-                _proc.refresh_process_tree(self._proc)
-                if self._closing:
-                    raise RuntimeError("Codex session closed during worker spawn")
-                await self._require_live_signer()
-            finally:
-                if liveness_read_fd is not None:
-                    os.close(liveness_read_fd)
-            self._reader_task = asyncio.create_task(self._reader_loop())
-            self._stderr_task = asyncio.create_task(self._stderr_loop())
-            self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
-            initialized = await self._request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "omnigent",
-                        "version": "0.1",
-                    },
-                    "capabilities": {
-                        "experimentalApi": True,
-                    },
-                },
+            from omnigent.mcp_disabled_servers import (
+                RELAUNCH_WITHOUT_OVERRIDES_EVENT,
+                plan_codex_launch,
             )
+
+            mcp_plan = plan_codex_launch(
+                self._codex_config_overrides,
+                executor="codex",
+                active_harnesses=self._mcp_active_harnesses,
+                codex_home=self._codex_home_dir,
+                cwd=process_cwd,
+            )
+            try:
+                initialized = await self._spawn_and_initialize(mcp_plan.config_overrides, proc_env)
+            except Exception:
+                fallback = mcp_plan.overrides_after_early_exit()
+                if (
+                    fallback is None
+                    or self._proc is None
+                    or not await subprocess_exited(self._proc)
+                ):
+                    raise
+                logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
+                await self._discard_early_exit_worker()
+                initialized = await self._spawn_and_initialize(fallback, proc_env)
             user_agent = initialized.get("result", {}).get("userAgent")
             version = (
                 re.match(r"^[^/\s]+/(\d+)\.(\d+)\.(\d+)", user_agent)
@@ -3254,6 +3301,110 @@ class _CodexAppServerSession:
         except BaseException:
             await self.close()
             raise
+
+    async def _spawn_and_initialize(
+        self, overrides: Sequence[str], proc_env: dict[str, str]
+    ) -> CodexMessage:
+        """Spawn the prepared worker and complete its initialize handshake."""
+        assert self._worker_launch is not None
+        self._recent_stderr.clear()
+        self._certificate_failure = None
+        self._saw_connection_retry = False
+        self._pending_fatal_gateway_error = None
+        self._saw_retries_exhausted = False
+        self._fatal_gateway_error = None
+        argv = [self._worker_launch.launch_path, "app-server"]
+        for override in overrides:
+            argv.extend(["-c", override])
+        spawn_argv = argv
+        pass_fds: tuple[int, ...] = ()
+        liveness_read_fd: int | None = None
+        await self._require_live_signer()
+        if self._worker_launch.sandboxed and os.name == "posix":
+            liveness_read_fd, self._worker_liveness_fd = os.pipe()
+            os.set_inheritable(liveness_read_fd, True)
+            spawn_argv = [
+                sys.executable,
+                str(Path(__file__).with_name("_liveness_exec.py")),
+                "--liveness-fd",
+                str(liveness_read_fd),
+                *argv,
+            ]
+            pass_fds = (liveness_read_fd,)
+        try:
+            spawn_task = asyncio.create_task(
+                _create_subprocess_exec(
+                    *spawn_argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=proc_env,
+                    pass_fds=pass_fds,
+                    **_proc.spawn_kwargs(),
+                    cwd=self._cwd or os.getcwd(),
+                )
+            )
+            self._worker_spawn_task = spawn_task
+            proc = await asyncio.shield(spawn_task)
+            self._proc = proc
+            if self._worker_spawn_task is spawn_task:
+                self._worker_spawn_task = None
+            _proc.remember_process_group(self._proc)
+            _proc.refresh_process_tree(self._proc)
+            if self._closing:
+                raise RuntimeError("Codex session closed during worker spawn")
+            await self._require_live_signer()
+        finally:
+            if liveness_read_fd is not None:
+                os.close(liveness_read_fd)
+        self._reader_task = asyncio.create_task(self._reader_loop())
+        self._stderr_task = asyncio.create_task(self._stderr_loop())
+        self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
+        return await self._request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "omnigent",
+                    "version": "0.1",
+                },
+                "capabilities": {
+                    "experimentalApi": True,
+                },
+            },
+        )
+
+    async def _discard_early_exit_worker(self) -> None:
+        """Reap a pre-initialize worker while retaining its prepared sandbox and signer."""
+        self._close_worker_liveness()
+        proc = self._proc
+        if proc is not None:
+            reaped = await terminate_subprocess(
+                proc,
+                terminate_timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+                kill_timeout=1,
+                label="Codex app-server",
+                terminate_tree=_terminate_process_tree,
+                kill_tree=_kill_process_tree,
+            )
+            if not reaped:
+                raise RuntimeError("Codex early-exit worker could not be reaped")
+        tasks = [
+            task
+            for task in (self._reader_task, self._stderr_task, self._worker_census_task)
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for future in self._pending_requests.values():
+            if not future.done():
+                future.cancel()
+        self._pending_requests.clear()
+        if proc is not None:
+            close_subprocess_transport(proc)
+        self._proc = None
+        self._transport_error = None
+        self._events = asyncio.Queue()
 
     async def close(self) -> None:
         self._closing = True
@@ -4557,7 +4708,7 @@ class _CodexAppServerSession:
             logger.debug("Codex App Server reader loop ended: %s", exc)
             self._note_transport_closed(f"Codex app-server reader failed: {exc}", clean_eof=False)
         finally:
-            if not self._closing:
+            if not self._closing and not self._starting:
                 await self._close_signer()
 
     async def _stderr_loop(self) -> None:
@@ -4656,9 +4807,11 @@ def _default_app_session_factory(
     skills_dir: Path | None = None,
     os_env: OSEnvSpec | None,
     signer_launch_config: SignerLaunchConfig | None = None,
+    active_harnesses: Collection[str] | None = None,
 ) -> _CodexAppServerSession:
     return _CodexAppServerSession(
         codex_path=codex_path,
+        active_harnesses=active_harnesses,
         cwd=cwd,
         env=env,
         tool_executor=tool_executor,
@@ -4709,6 +4862,7 @@ class CodexExecutor(Executor):
         skills_filter: str | list[str] = "all",
         skills_dir: Path | None = None,
         signer_launch_config: SignerLaunchConfig | None = None,
+        active_harnesses: Collection[str] | None = None,
     ) -> None:
         """Create a CodexExecutor.
 
@@ -4962,6 +5116,7 @@ class CodexExecutor(Executor):
                 _AppSessionFactory,
                 partial(
                     _default_app_session_factory,
+                    active_harnesses=active_harnesses,
                     signer_launch_config=signer_launch_config,
                 ),
             )
@@ -5133,28 +5288,20 @@ class CodexExecutor(Executor):
         session_key = _session_key(messages)
         state = self._session_states.setdefault(session_key, _CodexSessionState())
         # cfg.model (per-request /model override) wins over the spec default.
-        # An unresolved default comes from the active provider catalog.
-        # On the cli-config path (model_provider_override set) the codex binary
-        # owns its own model list via its config.toml — omnigent does not pass a
-        # model override to thread/create, letting the binary use its configured
-        # default. Passing an unresolvable alias (e.g. gpt-5.6) would cause the
-        # binary to call UC and get a validation error.
+        # On the cli-config path (model_provider_override set) and on codex's
+        # own login (ChatGPT account / API key), codex owns its model list, so
+        # an unset model reaches thread/start as null and codex starts on its
+        # own configured or catalog default.
         model = cfg.model or self._model_override
         if self._model_provider_override is not None:
             model = None
-        elif model is None:
-            if self._gateway_uses_databricks_profile:
-                resolution = await run_sync_on_thread(
-                    model_catalog.resolve_catalog_model,
-                    "databricks",
-                    family="openai",
-                )
-                model = resolution.model_id
-            else:
-                # Codex's own login (ChatGPT account / API key), where codex is
-                # the vocabulary authority: the bundled OpenAI catalog's newest
-                # row is a bare family alias its backend rejects.
-                model = CODEX_DEFAULT_MODEL
+        elif model is None and self._gateway_uses_databricks_profile:
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "databricks",
+                family="openai",
+            )
+            model = resolution.model_id
         effective_cwd = (
             self._cwd or (self._os_env_spec.cwd if self._os_env_spec else None) or os.getcwd()
         )
