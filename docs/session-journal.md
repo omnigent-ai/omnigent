@@ -16,7 +16,7 @@ from an earlier message cuts the history. A side chat starts with none.
 | Kind     | Written by | Fields                                                                       |
 | -------- | ---------- | ---------------------------------------------------------------------------- |
 | `plan`   | agent      | `name`, `steps` (the whole graph), `version` (set by Omnigent), `source`     |
-| `status` | agent      | `status` (`started`, `done`, `needs_input`, `blocked` or `failed`) and `text`, for one step |
+| `status` | agent      | `status` (`started`, `done`, `needs_input` or `failed`) and `text`, for one step |
 | `note`   | agent      | `body`: Markdown whose first line is the summary                             |
 
 The newest `plan` entry is the session's current plan; earlier ones stay as
@@ -31,15 +31,15 @@ The newest status for a step is its current one:
   session is working, and as "Started 3h ago" once it's idle.
 - `done`: the step achieved its goal. Only `done` lets later steps start.
 - `needs_input`: the step waits for the session's user: an approval, a
-  decision, or a go-ahead. The agent also asks with its question tool, so the
-  question reaches the user's Inbox. It shows as Waiting for you, in pink.
-- `blocked`: something outside the session stops it, such as CI being down or
-  another team's review.
+  decision, a go-ahead, or how to get past something the agent can't clear
+  itself, such as CI being down, with the ways forward it sees. The agent also
+  asks with its question tool, so the question reaches the user's Inbox. It
+  shows as Waiting for you, in pink.
 - `failed`: the step's own work failed.
 
 The workflow skill keeps the agent working while any step is ready or started:
-it ends its turn only once everything left is done, failed, blocked or waiting
-for the user, unless told to stop sooner.
+it ends its turn only once everything left is done, failed or waiting for the
+user, unless told to stop sooner.
 
 A status belongs to a step ID, not to a plan version. When the agent replans, a
 step that keeps its ID keeps its status, so finished work stays finished.
@@ -107,7 +107,7 @@ plan replaces the agent's own list in both places.
 
 In the Tasks tab, the plan's name heads the list (the chat preview shows it on
 hover), and each task appears once, in order, with its state (not started,
-ready, running, stopped, waiting for you, done, blocked or failed), its newest
+ready, running, stopped, waiting for you, done or failed), its newest
 result, how long it took and its newest note. A started task is running while
 the session's turn, a background task it left running or a sub-agent is still
 going, and stopped once nothing is. It waits for you while a question or

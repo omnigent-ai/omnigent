@@ -11,7 +11,6 @@ import {
   ListChecksIcon,
   Loader2Icon,
   MessageCircleQuestionMarkIcon,
-  PauseIcon,
   XIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -53,7 +52,6 @@ const STATE_LABELS: Record<StepState, string> = {
   stopped: "Stopped",
   needs_input: WAITING_FOR_YOU,
   done: "Done",
-  blocked: "Blocked",
   failed: "Failed",
 };
 
@@ -64,7 +62,6 @@ const SEGMENT_COLORS: Record<StepState, string> = {
   stopped: "bg-status-gray",
   needs_input: "bg-brand-accent",
   done: "bg-success",
-  blocked: "bg-warning",
   failed: "bg-destructive",
 };
 
@@ -143,12 +140,6 @@ function StepGlyph({ state, number }: { state: StepState; number?: number }) {
           <XIcon className="size-3" strokeWidth={3} />
         </span>
       );
-    case "blocked":
-      return (
-        <span role="img" aria-label={label} className={cn(shape, "bg-warning/20 text-warning")}>
-          <PauseIcon className="size-2.5 fill-current" strokeWidth={0} />
-        </span>
-      );
     case "stopped":
       return (
         <span
@@ -198,13 +189,6 @@ function stepDetail(item: StepProgress): ReactNode {
           {` · ${text ?? "Respond in the chat"}`}
         </>
       );
-    case "blocked":
-      return (
-        <>
-          <span className="font-medium text-warning">Blocked</span>
-          {text && ` · ${text}`}
-        </>
-      );
     case "stopped":
       if (!item.status) return item.activeForm;
       return [stepStatusLabel("started", item.status.created_at, false), text]
@@ -249,13 +233,11 @@ function EntryDot({ entry, className }: { entry: JournalEntry; className?: strin
       ? "bg-success"
       : status === "failed"
         ? "bg-destructive"
-        : status === "blocked"
-          ? "bg-warning"
-          : status === "needs_input"
-            ? "bg-brand-accent"
-            : status === "started"
-              ? "bg-session-active"
-              : "bg-foreground-tertiary";
+        : status === "needs_input"
+          ? "bg-brand-accent"
+          : status === "started"
+            ? "bg-session-active"
+            : "bg-foreground-tertiary";
   return <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", color, className)} />;
 }
 
@@ -266,7 +248,6 @@ function entryLabel(entry: JournalEntry): string {
     started: "Started",
     done: "Done",
     needs_input: WAITING_FOR_YOU,
-    blocked: "Blocked",
     failed: "Failed",
   }[status];
 }
@@ -418,10 +399,7 @@ function StepRow({
   const detail = stepDetail(item);
   const waiting = item.state === "waiting";
   const emphasized =
-    item.state === "running" ||
-    item.state === "needs_input" ||
-    item.state === "failed" ||
-    item.state === "blocked";
+    item.state === "running" || item.state === "needs_input" || item.state === "failed";
   // A click goes to the task's marker in the chat; one that hasn't started has none.
   const markerId = taskMarkerTarget(item);
   // The agent's own tasks have no history to open.
@@ -529,7 +507,6 @@ function StepRow({
 const STATUS_LINE_COLORS: Partial<Record<StepState, string>> = {
   ready: "text-session-active",
   running: "text-session-active",
-  blocked: "text-warning",
   failed: "text-destructive",
 };
 
@@ -560,8 +537,6 @@ function statusLine(item: StepProgress, pending: readonly string[]): ReactNode {
       return took ? `Failed after ${took}` : "Failed";
     case "needs_input":
       return WAITING_FOR_YOU;
-    case "blocked":
-      return "Blocked";
   }
 }
 
@@ -665,7 +640,6 @@ function TasksHeader({
     { state: "needs_input" as const, className: "text-brand-accent" },
     { state: "running" as const, className: "text-session-active" },
     { state: "failed" as const, className: "text-destructive" },
-    { state: "blocked" as const, className: "text-warning" },
   ].filter((extra) => tally[extra.state] > 0);
   const finished = finishedTaskCount(progress);
   const allDone = tally.done === progress.length;

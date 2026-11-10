@@ -181,7 +181,7 @@ describe("TasksPanel", () => {
       status(3, "batch", "started"),
       status(4, "batch", "done", "Kept: -9%"),
       status(5, "pool", "failed", "Reverted"),
-      status(6, "tests", "blocked", "The test database is down"),
+      status(6, "tests", "needs_input", "The test database is down: wait, or skip it?"),
     ]);
     renderPanel();
     const steps = screen.getAllByTestId("tasks-row");
@@ -189,11 +189,12 @@ describe("TasksPanel", () => {
       "done",
       "done",
       "failed",
-      "blocked",
+      "needs_input",
       "waiting",
     ]);
     expect(steps[0].textContent).toContain("p95 434 ms");
-    expect(within(steps[3]).getByText("Blocked")).toBeTruthy();
+    expect(steps[3].textContent).toContain("Waiting for you");
+    expect(steps[3].textContent).toContain("The test database is down: wait, or skip it?");
     expect(within(steps[4]).getByRole("img", { name: "Not started" }).textContent).toBe("5");
     // The failed try counts as finished; the count beside the summary names it.
     expect(screen.getByTestId("tasks-summary").textContent).toBe("3 of 5 finished");

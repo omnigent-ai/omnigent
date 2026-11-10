@@ -9,9 +9,9 @@ import { relativeTime } from "@/lib/relativeTime";
 export type JournalEntryKind =
   "status" | "note" | "dispatch" | "dispatch_result" | "plan" | "plan_status";
 
-export type StepStatus = "started" | "done" | "needs_input" | "blocked" | "failed";
+export type StepStatus = "started" | "done" | "needs_input" | "failed";
 
-const STEP_STATUSES: readonly string[] = ["started", "done", "needs_input", "blocked", "failed"];
+const STEP_STATUSES: readonly string[] = ["started", "done", "needs_input", "failed"];
 
 /** What a task waiting for the user says, in pink: the sidebar's Needs response color. */
 export const WAITING_FOR_YOU = "Waiting for you";
@@ -108,9 +108,7 @@ export function stepStatusLabel(
     const ago = relativeTime(createdAtSeconds * 1000, nowMs);
     return ago === "now" ? "Started just now" : `Started ${ago} ago`;
   }
-  return { done: "Done", needs_input: WAITING_FOR_YOU, blocked: "Blocked", failed: "Failed" }[
-    status
-  ];
+  return { done: "Done", needs_input: WAITING_FOR_YOU, failed: "Failed" }[status];
 }
 
 export function noteBody(entry: JournalEntry): string {
@@ -134,7 +132,7 @@ export function currentPlan(entries: readonly JournalEntry[]): JournalEntry | nu
  * with a question or permission prompt waiting for an answer.
  */
 export type StepState =
-  "waiting" | "ready" | "running" | "stopped" | "needs_input" | "done" | "blocked" | "failed";
+  "waiting" | "ready" | "running" | "stopped" | "needs_input" | "done" | "failed";
 
 /** One task, a plan step or an item of the agent's own task list, and where it stands. */
 export interface StepProgress {
@@ -257,7 +255,6 @@ export function planTally(progress: readonly StepProgress[]): Record<StepState, 
     stopped: 0,
     needs_input: 0,
     done: 0,
-    blocked: 0,
     failed: 0,
   };
   for (const item of progress) tally[item.state] += 1;
@@ -381,14 +378,13 @@ export function taskPreviewText(
   paused: PausedLabel | null = null,
 ): string | null {
   if (progress.length === 0) return null;
-  const order: StepState[] = ["needs_input", "running", "stopped", "blocked", "ready", "waiting"];
+  const order: StepState[] = ["needs_input", "running", "stopped", "ready", "waiting"];
   for (const state of order) {
     const item = progress.find((candidate) => candidate.state === state);
     if (!item) continue;
     if (state === "needs_input") return `${WAITING_FOR_YOU}: ${item.step.name}`;
     if (state === "running") return item.activeForm ?? item.step.name;
     if (state === "stopped") return `Stopped: ${item.step.name}`;
-    if (state === "blocked") return `Blocked: ${item.step.name}`;
     return paused ? `${paused} · Next: ${item.step.name}` : `Next: ${item.step.name}`;
   }
   const failed = progress.filter((item) => item.state === "failed").length;

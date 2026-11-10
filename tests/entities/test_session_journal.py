@@ -47,14 +47,16 @@ def test_status_text_is_required_except_for_started() -> None:
         "status": "needs_input",
         "text": "Approve the deploy to prod?",
     }
-    for status in ("done", "needs_input", "blocked", "failed"):
+    for status in ("done", "needs_input", "failed"):
         with pytest.raises(InvalidJournalEntryError, match=f"text is required for a {status}"):
             normalize_status(status)
 
 
 def test_status_rejects_unknown_values_long_text_and_extra_fields() -> None:
-    with pytest.raises(InvalidJournalEntryError, match="status must be one of"):
-        normalize_status("running", text="x")
+    # A step the agent can't get past waits for the user, so there's no "blocked".
+    for status in ("running", "blocked"):
+        with pytest.raises(InvalidJournalEntryError, match="status must be one of"):
+            normalize_status(status, text="x")
     with pytest.raises(InvalidJournalEntryError, match="at most 80 characters"):
         normalize_status("done", text="x" * 81)
     with pytest.raises(InvalidJournalEntryError, match="unknown status fields: emoji"):

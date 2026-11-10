@@ -135,9 +135,9 @@ def test_a_step_starts_or_finishes_only_after_its_dependencies_are_done(
     with pytest.raises(StepNotReadyError, match="verify waits on deploy") as raised:
         status("k1", "verify", "started")
     assert raised.value.waiting == ["deploy"]
-    # Waiting for the user, blocked and failed need nothing done first.
+    # Waiting for the user and failed need nothing done first.
     status("k1b", "video", "needs_input", "Which region should the video show?")
-    status("k2", "video", "blocked", "Waiting on the swap")
+    status("k2", "video", "failed", "The swap never came up")
     status("k3", "deploy", "started")
     status("k4", "deploy", "failed", "Build broke")
     with pytest.raises(StepNotReadyError):
