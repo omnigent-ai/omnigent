@@ -26,16 +26,16 @@ from __future__ import annotations
 import json
 from typing import Any, Protocol
 
-from sqlalchemy import LargeBinary
 from sqlalchemy.engine import Dialect
-from sqlalchemy.types import TypeDecorator
 
+from omnigent.db.bounded_binary import BoundedBinary
 from omnigent.db.compression import decode, encode
 
 ENVELOPE_FORMAT = 0x01
 _PLAINTEXT = 0x00
 _CIPHERTEXT = 0x01
-# Bound on a decoded value, so a corrupt frame cannot allocate without limit.
+# Bound on a value's JSON text. Writes above it are refused, and reads stop at
+# it so a corrupt frame cannot allocate without limit.
 _MAX_DECODED_BYTES = 4 * 1024 * 1024
 
 
@@ -65,8 +65,14 @@ def set_envelope_cipher(cipher: EnvelopeCipher | None) -> None:
 
 
 def seal(value: Any) -> bytes:
-    """Return the envelope for a JSON-serializable *value*."""
-    framed = encode(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
+    """Return the envelope for a JSON-serializable *value*.
+
+    :raises ValueError: If the value's JSON text is larger than readers accept.
+    """
+    text = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    if len(text.encode("utf-8")) > _MAX_DECODED_BYTES:
+        raise ValueError(f"value exceeds {_MAX_DECODED_BYTES} bytes of JSON")
+    framed = encode(text)
     assert framed is not None
     if _cipher is None:
         return bytes((ENVELOPE_FORMAT, _PLAINTEXT)) + framed
@@ -105,32 +111,27 @@ def open_envelope(stored: bytes | memoryview) -> Any:
         rest = _cipher.decrypt(metadata, rest[2 + size :])
     elif variant != _PLAINTEXT:
         raise ValueError("unknown storage envelope variant")
-    return json.loads(decode(rest, max_decoded_bytes=_MAX_DECODED_BYTES) or "null")
+    text = decode(rest, max_decoded_bytes=_MAX_DECODED_BYTES)
+    if not text:
+        raise ValueError("empty storage envelope")
+    return json.loads(text)
 
 
-class EnvelopedJSON(TypeDecorator[Any]):
+class EnvelopedJSON(BoundedBinary):
     """A JSON value stored in a bounded binary column as an envelope.
 
     :param max_stored_bytes: Most bytes the envelope may take, metadata and
         ciphertext included. A larger value raises ``ValueError`` on write.
     """
 
-    impl = LargeBinary
     cache_ok = True
 
     def __init__(self, max_stored_bytes: int) -> None:
-        super().__init__()
-        self.max_stored_bytes = max_stored_bytes
+        super().__init__(max_stored_bytes)
 
     def process_bind_param(self, value: Any, dialect: Dialect) -> bytes | None:
-        del dialect
-        if value is None:
-            return None
-        stored = seal(value)
-        if len(stored) > self.max_stored_bytes:
-            raise ValueError(f"stored value exceeds {self.max_stored_bytes} bytes")
-        return stored
+        return None if value is None else super().process_bind_param(seal(value), dialect)
 
-    def process_result_value(self, value: bytes | None, dialect: Dialect) -> Any:
+    def process_result_value(self, value: bytes | memoryview | None, dialect: Dialect) -> Any:
         del dialect
         return None if value is None else open_envelope(value)
