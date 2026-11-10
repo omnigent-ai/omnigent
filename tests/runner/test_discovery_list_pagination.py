@@ -470,13 +470,16 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
             return _server_page(request, rows)
         raise AssertionError(f"unexpected path {request.url.path}")
 
-    legacy_cursor = _encode_cursor_payload(
-        {
-            "v": 1,
-            "tool": "sys_session_list",
-            "filters": {"agent_name": None},
-            "sections": {"sessions": ["at", "conv_0099"]},
-        }
+    legacy_cursor, legacy_archive_cursor = (
+        _encode_cursor_payload(
+            {
+                "v": 1,
+                "tool": "sys_session_list",
+                "filters": filters,
+                "sections": {"sessions": ["at", "conv_0099"]},
+            }
+        )
+        for filters in ({"agent_name": None}, {"agent_name": None, "include_archived": True})
     )
 
     async with httpx.AsyncClient(
@@ -497,6 +500,18 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
             client, {"limit": 100, "visibility": "all", "cursor": legacy_cursor}
         )
         legacy_narrowed = await _call_session(client, {"limit": 100, "cursor": legacy_cursor})
+        legacy_archives = await _call_session(
+            client,
+            {
+                "limit": 100,
+                "include_archived": True,
+                "visibility": "all",
+                "cursor": legacy_archive_cursor,
+            },
+        )
+        legacy_archives_narrowed = await _call_session(
+            client, {"limit": 100, "include_archived": True, "cursor": legacy_archive_cursor}
+        )
 
     assert first["sessions"][0]["session_id"] == "conv_0000"
     assert second["sessions"][0]["session_id"] == "conv_0100"
@@ -504,26 +519,37 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     assert shared_next["sessions"][0]["session_id"] == "conv_0100"
     # Cursors minted before ``visibility`` existed continue their ``all`` listing.
     assert legacy["sessions"][0]["session_id"] == "conv_0100"
-    assert received_afters == [None, "conv_0099", None, "conv_0099", "conv_0099"]
-    assert received_visibilities == ["mine", "mine", "all", "all", "all"]
+    assert legacy_archives["sessions"][0]["session_id"] == "conv_0100"
+    assert received_afters == [None, "conv_0099", None, "conv_0099", "conv_0099", "conv_0099"]
+    assert received_visibilities == ["mine", "mine", "all", "all", "all", "all"]
     # The cursor is bound to the visibility it was minted with.
     assert widened == {"error": "sys_session_list: cursor uses different filter arguments"}
     assert legacy_narrowed == widened
+    assert legacy_archives_narrowed == widened
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("info_status", "info_body", "expected_visibility"),
+    ("info_response", "expected_visibility"),
     [
-        (200, {"session_list_owned_archives": True}, "mine"),
-        (200, {}, "all"),
-        (200, [], "all"),
-        (404, {"detail": "Not Found"}, "all"),
+        (httpx.Response(200, json={"session_list_owned_archives": True}), "mine"),
+        (httpx.Response(200, json={}), "all"),
+        (httpx.Response(200, json=[]), "all"),
+        (httpx.Response(200, content=b"{"), "all"),
+        (httpx.Response(404, json={"detail": "Not Found"}), "all"),
+        (httpx.ConnectError("connection refused"), "all"),
     ],
-    ids=["owned-archives", "older-server", "non-object-info", "unreadable-info"],
+    ids=[
+        "owned-archives",
+        "older-server",
+        "non-object-info",
+        "malformed-info",
+        "unreadable-info",
+        "unreachable-info",
+    ],
 )
 async def test_sys_session_list_include_archived_lists_archived_rows_on_every_page(
-    info_status: int, info_body: object, expected_visibility: str
+    info_response: httpx.Response | httpx.HTTPError, expected_visibility: str
 ) -> None:
     """An archive-inclusive listing reaches the server on each page and marks archived rows.
 
@@ -558,7 +584,9 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
             info_requests.append(request.url.path)
             if len(info_requests) > 1:
                 return httpx.Response(503)
-            return httpx.Response(info_status, json=info_body)
+            if isinstance(info_response, httpx.HTTPError):
+                raise info_response
+            return info_response
         if request.url.path == "/v1/sessions":
             received.append(
                 (request.url.params.get("include_archived"), request.url.params.get("visibility"))
