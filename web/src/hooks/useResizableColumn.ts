@@ -17,7 +17,7 @@ export function useResizableColumn(
   const width = Math.max(minWidth, Math.min(maxWidth, preferredWidth));
   const widthRef = useRef(width);
   widthRef.current = width;
-  const dragging = useRef<{ startX: number; moved: boolean } | null>(null);
+  const dragging = useRef<{ startX: number; resized: boolean } | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
   const minRef = useRef(minWidth);
   const maxRef = useRef(maxWidth);
@@ -26,9 +26,10 @@ export function useResizableColumn(
 
   const resize = useCallback((nextWidth: number) => {
     const clamped = Math.max(minRef.current, Math.min(maxRef.current, nextWidth));
+    if (clamped === widthRef.current) return false;
     widthRef.current = clamped;
     setPreferredWidth(clamped);
-    return clamped;
+    return true;
   }, []);
 
   const persistWidth = useCallback(
@@ -45,7 +46,7 @@ export function useResizableColumn(
 
   const onMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
-    dragging.current = { startX: e.clientX, moved: false };
+    dragging.current = { startX: e.clientX, resized: false };
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
   }, []);
@@ -54,7 +55,9 @@ export function useResizableColumn(
     (event: React.KeyboardEvent) => {
       if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
       event.preventDefault();
-      persistWidth(resize(widthRef.current + (event.key === "ArrowRight" ? 16 : -16)));
+      if (resize(widthRef.current + (event.key === "ArrowRight" ? 16 : -16))) {
+        persistWidth(widthRef.current);
+      }
     },
     [persistWidth, resize],
   );
@@ -62,14 +65,13 @@ export function useResizableColumn(
   useEffect(() => {
     function onMouseMove(e: MouseEvent) {
       if (!dragging.current || !containerRef.current) return;
-      if (!dragging.current.moved && e.clientX === dragging.current.startX) return;
-      dragging.current.moved = true;
+      if (!dragging.current.resized && e.clientX === dragging.current.startX) return;
       const left = containerRef.current.getBoundingClientRect().left;
-      resize(e.clientX - left);
+      if (resize(e.clientX - left)) dragging.current.resized = true;
     }
     function onMouseUp() {
       if (!dragging.current) return;
-      if (dragging.current.moved) persistWidth(widthRef.current);
+      if (dragging.current.resized) persistWidth(widthRef.current);
       dragging.current = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";

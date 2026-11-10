@@ -3387,6 +3387,39 @@ describe("WorkspacePanel file tree split", () => {
     },
   );
 
+  it("switches routing at 524px and preserves the preview across the boundary", () => {
+    const notifyResize: (() => void)[] = [];
+    vi.spyOn(globalThis, "ResizeObserver").mockImplementation(function (callback) {
+      const observer = { observe() {}, unobserve() {}, disconnect() {} };
+      notifyResize.push(() => callback([], observer));
+      return observer;
+    });
+    const rect = document.body.getBoundingClientRect();
+    const measure = vi.mocked(HTMLElement.prototype.getBoundingClientRect);
+    measure.mockReturnValue({ ...rect, width: 523, right: 523 });
+    const { openFileViewer, openFileInTree } = renderWorkspace({
+      fileTreeSplitEnabled: true,
+      treePreviewPath: "src/saved.md",
+    });
+    expect(screen.queryByRole("separator", { name: "Resize file tree" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-open", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Open tree file" }));
+    expect(openFileViewer).toHaveBeenCalledWith("src/a.md");
+    expect(openFileInTree).not.toHaveBeenCalled();
+
+    measure.mockReturnValue({ ...rect, width: 524, right: 524 });
+    act(() => notifyResize.forEach((notify) => notify()));
+    expect(screen.getByRole("separator", { name: "Resize file tree" })).toBeInTheDocument();
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/saved.md");
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute(
+      "data-selected-file",
+      "src/saved.md",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open tree file" }));
+    expect(openFileInTree).toHaveBeenCalledWith("src/a.md");
+    expect(openFileViewer).toHaveBeenCalledTimes(1);
+  });
+
   it("applies the setting live and measures contained panes independently of the viewport", () => {
     isMobileMock.mockReturnValue(true);
     renderWorkspace({ fileTreeSplitEnabled: true, contained: true, treePreviewPath: "src/a.md" });

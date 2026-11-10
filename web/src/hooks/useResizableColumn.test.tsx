@@ -95,9 +95,9 @@ describe("useResizableColumn", () => {
     expect(result.current.width).toBe(250);
   });
 
-  it.each([false, true])(
-    "keeps the preferred width after a clamped click (vertical movement=%s)",
-    (verticalMovement) => {
+  it.each(["click", "vertical movement", "ArrowRight", "outward drag"])(
+    "keeps the preferred width after a clamped %s",
+    (gesture) => {
       localStorage.setItem(storageKey, "340");
       const { result, rerender } = renderHook(
         ({ min, max }) => useResizableColumn(260, min, max, storageKey),
@@ -110,18 +110,50 @@ describe("useResizableColumn", () => {
       vi.spyOn(container, "getBoundingClientRect").mockReturnValue({ left: 100 } as DOMRect);
       result.current.containerRef.current = container;
       act(() => {
-        result.current.handleProps.onMouseDown({
-          clientX: 340,
-          preventDefault: vi.fn(),
-        } as unknown as React.MouseEvent);
-        if (verticalMovement) fireEvent.mouseMove(window, { clientX: 340, clientY: 100 });
-        fireEvent.mouseUp(window);
+        if (gesture === "ArrowRight") {
+          result.current.handleProps.onKeyDown({
+            key: gesture,
+            preventDefault: vi.fn(),
+          } as unknown as React.KeyboardEvent);
+        } else {
+          result.current.handleProps.onMouseDown({
+            clientX: 340,
+            preventDefault: vi.fn(),
+          } as unknown as React.MouseEvent);
+          if (gesture === "vertical movement") {
+            fireEvent.mouseMove(window, { clientX: 340, clientY: 100 });
+          } else if (gesture === "outward drag") {
+            fireEvent.mouseMove(window, { clientX: 400 });
+          }
+          fireEvent.mouseUp(window);
+        }
       });
       expect(localStorage.getItem(storageKey)).toBe("340");
       rerender({ min: 200, max: 400 });
       expect(result.current.width).toBe(340);
       rerender({ min: 360, max: 400 });
       expect(result.current.width).toBe(360);
+
+      rerender({ min: 200, max: 240 });
+      act(() =>
+        result.current.handleProps.onKeyDown({
+          key: "ArrowLeft",
+          preventDefault: vi.fn(),
+        } as unknown as React.KeyboardEvent),
+      );
+      expect(result.current.width).toBe(224);
+      expect(localStorage.getItem(storageKey)).toBe("224");
+      act(() => {
+        result.current.handleProps.onMouseDown({
+          clientX: 324,
+          preventDefault: vi.fn(),
+        } as unknown as React.MouseEvent);
+        fireEvent.mouseMove(window, { clientX: 310 });
+        fireEvent.mouseUp(window);
+      });
+      expect(localStorage.getItem(storageKey)).toBe("210");
+      rerender({ min: 200, max: 400 });
+      expect(result.current.width).toBe(210);
     },
   );
 

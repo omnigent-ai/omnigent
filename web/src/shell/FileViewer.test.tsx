@@ -2774,7 +2774,7 @@ describe("file position navigation", () => {
               open,
               mediaActive,
               path: "file1.md",
-              frameless: true,
+              frameless: keepNavigationGuard,
               keepNavigationGuard,
             })}
           </FileViewerContext.Provider>

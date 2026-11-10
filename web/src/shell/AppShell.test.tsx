@@ -154,11 +154,7 @@ vi.mock("./Sidebar", () => ({
   ),
 }));
 vi.mock("./FilesPanel", () => ({
-  // Scope-only stand-in matching the real FilesPanel after the open-file tabs
-  // and the FileViewer moved up to WorkspacePanel. It echoes its fixed scope
-  // (data-flat-view) and exposes file-select buttons; the scope is now the
-  // Files vs Changes rail tab (driven by the real WorkspacePanel), not an
-  // in-panel toggle. Render the preview slot supplied by WorkspacePanel.
+  // Echo the scope, expose file selection, and render WorkspacePanel's preview slot.
   FilesPanel: ({
     onFileSelect,
     onFileOpenInTree,
@@ -190,6 +186,9 @@ vi.mock("./FilesPanel", () => ({
         onClick={() => (onFileOpenInTree ?? onFileSelect)("AGENTS.md")}
       >
         select-agents
+      </button>
+      <button type="button" onClick={() => onFileSelect("README.md")}>
+        Open README.md in tab
       </button>
       {filePreview}
     </div>
@@ -435,17 +434,26 @@ function LocationDisplay() {
  * router transition rather than a re-render.
  */
 /** A file viewer holding unsaved edits: file navigation waits until "allow leaving". */
-function DirtyFileViewerProbe() {
+function DirtyFileViewerProbe({ path }: { path?: string }) {
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
   const [allowLeaving, setAllowLeaving] = useState<(() => void) | null>(null);
   useLayoutEffect(
-    () => registerNavigationGuard?.((_path, _options, navigate) => setAllowLeaving(() => navigate)),
-    [registerNavigationGuard],
+    () =>
+      registerNavigationGuard?.((destination, _options, navigate) => {
+        if (path !== undefined && destination === path) navigate();
+        else setAllowLeaving(() => navigate);
+      }),
+    [registerNavigationGuard, path],
   );
   return allowLeaving ? (
-    <button type="button" onClick={allowLeaving}>
-      allow leaving
-    </button>
+    <>
+      <button type="button" onClick={allowLeaving}>
+        allow leaving
+      </button>
+      <button type="button" onClick={() => setAllowLeaving(null)}>
+        cancel leaving
+      </button>
+    </>
   ) : null;
 }
 
@@ -590,6 +598,7 @@ function renderShell(
     rerenderable?: boolean;
     sessionNavTo?: string;
     dirtyFileViewer?: boolean;
+    dirtyFilePath?: string;
     seedQueryClient?: (client: QueryClient) => void;
   } = {},
 ) {
@@ -618,7 +627,7 @@ function renderShell(
             <ForkDialogProbe />
             <NavProbe />
             {options.sessionNavTo && <SessionNavButton to={options.sessionNavTo} />}
-            {options.dirtyFileViewer && <DirtyFileViewerProbe />}
+            {options.dirtyFileViewer && <DirtyFileViewerProbe path={options.dirtyFilePath} />}
             <LocationDisplay />
           </>
         }
@@ -6443,6 +6452,8 @@ describe("AppShell desktop Close", () => {
 });
 
 describe("AppShell tree preview state", () => {
+  afterEach(() => vi.mocked(HTMLElement.prototype.getBoundingClientRect).mockRestore());
+
   beforeEach(() => {
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
       width: 600,
@@ -6509,6 +6520,36 @@ describe("AppShell tree preview state", () => {
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
     expect(readSessionWorkspaceState("conv_tree").rightRailTab).toBe("changes");
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+  });
+
+  it("guards opening the dirty inline file in its own tab even when the path matches", () => {
+    writeSessionWorkspaceState("conv_tree", {
+      treePreviewPath: "README.md",
+      selectedFilePath: null,
+    });
+    renderShell("/c/conv_tree", serverInfo({ features: { workspace_file_tree_split_ui: true } }), {
+      dirtyFileViewer: true,
+      dirtyFilePath: "README.md",
+    });
+    const preview = screen.getByTestId("file-viewer-inline");
+    const params = screen.getByTestId("url-params").textContent;
+    fireEvent.click(screen.getByRole("button", { name: "Open README.md in tab" }));
+    fireEvent.click(screen.getByRole("button", { name: "cancel leaving" }));
+    expect(screen.getByTestId("file-viewer-inline")).toBe(preview);
+    expect(screen.getByTestId("url-params").textContent).toBe(params);
+    expect(readSessionWorkspaceState("conv_tree")).toMatchObject({
+      treePreviewPath: "README.md",
+      selectedFilePath: null,
+      openFiles: [],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open README.md in tab" }));
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(readSessionWorkspaceState("conv_tree")).toMatchObject({
+      treePreviewPath: "README.md",
+      selectedFilePath: "README.md",
+      openFiles: ["README.md"],
+    });
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
   });
 
   it.each(["AGENTS.md", "README.md"])(

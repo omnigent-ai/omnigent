@@ -15,6 +15,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { retrySession } from "@/lib/sessionsApi";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 const fixture = vi.hoisted(() => ({
   labels: {} as Record<string, string>,
@@ -137,6 +139,7 @@ vi.mock("@/components/chat/SideChatPane", () => ({
 vi.mock("@/shell/WorkspacePanel", () => ({
   WorkspacePanel: (props: ComponentProps<typeof WorkspacePanel>) => {
     const [draft, setDraft] = useState("");
+    const context = useContext(FileViewerContext)!;
     return (
       <aside
         aria-label="Workspace"
@@ -160,6 +163,25 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         <div {...props.handleProps} />
         <button type="button" onClick={() => props.openFileInTree?.("tree.md")}>
           Preview tree file
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            const unregister = context.registerNavigationGuard?.((path, _options, navigate) => {
+              if (path === props.treePreviewPath) navigate();
+              else {
+                fixture.discardEdits = () => {
+                  unregister?.();
+                  navigate();
+                };
+              }
+            });
+          }}
+        >
+          Edit tree preview
+        </button>
+        <button type="button" onClick={() => props.openFileViewer(props.treePreviewPath!)}>
+          Open preview in tab
         </button>
         <button type="button" onClick={props.onCloseTreePreview}>
           Close tree preview
@@ -610,13 +632,17 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
 
 it("keeps grid tree previews per session and guards inline navigation", () => {
   render(
-    <MemoryRouter>
-      <TooltipProvider>
-        <RearrangeableGrid
-          grid={{ id: "tree-files", layout: splitGrid("first", "first", "second", "right")! }}
-        />
-      </TooltipProvider>
-    </MemoryRouter>,
+    <CapabilitiesProvider
+      info={{ ...FALLBACK_SERVER_INFO, features: { workspace_file_tree_split_ui: true } }}
+    >
+      <MemoryRouter>
+        <TooltipProvider>
+          <RearrangeableGrid
+            grid={{ id: "tree-files", layout: splitGrid("first", "first", "second", "right")! }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>
+    </CapabilitiesProvider>,
   );
   const workspace = screen.getByTestId("workspace-first");
   fireEvent.click(within(workspace).getByText("Preview tree file"));
@@ -627,10 +653,26 @@ it("keeps grid tree previews per session and guards inline navigation", () => {
     rightRailTab: "files",
   });
   expect(readSessionWorkspaceState("second").treePreviewPath).toBeNull();
+  fireEvent.click(within(workspace).getByText("Edit tree preview"));
+  const inlineState = readSessionWorkspaceState("first");
+  fireEvent.click(within(workspace).getByText("Open preview in tab"));
+  expect(fixture.discardEdits).not.toBeNull();
+  expect(readSessionWorkspaceState("first")).toEqual(inlineState);
+  // Keeping the inline editor never calls the pending navigation callback.
+  fixture.discardEdits = null;
+  fireEvent.click(within(workspace).getByText("Open preview in tab"));
+  expect(fixture.discardEdits).not.toBeNull();
+  expect(readSessionWorkspaceState("first")).toEqual(inlineState);
+  act(() => fixture.discardEdits?.());
+  expect(readSessionWorkspaceState("first")).toMatchObject({
+    treePreviewPath: "tree.md",
+    openFiles: ["tree.md"],
+    selectedFilePath: "tree.md",
+  });
   fireEvent.click(within(workspace).getByText("Open other"));
   expect(readSessionWorkspaceState("first")).toMatchObject({
     treePreviewPath: "tree.md",
-    openFiles: ["other.md"],
+    openFiles: ["tree.md", "other.md"],
     selectedFilePath: "other.md",
   });
   fireEvent.click(
@@ -643,6 +685,6 @@ it("keeps grid tree previews per session and guards inline navigation", () => {
   fireEvent.click(within(workspace).getByText("Close tree preview"));
   expect(readSessionWorkspaceState("first")).toMatchObject({
     treePreviewPath: null,
-    openFiles: ["other.md"],
+    openFiles: ["tree.md", "other.md"],
   });
 });
