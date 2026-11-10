@@ -4324,6 +4324,8 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     settings = _load_invocation_settings(args)
     prompt_hooks = settings["hooks"]["UserPromptSubmit"][0]["hooks"]
     assert any("framework-context" in hook["command"] for hook in prompt_hooks)
+    startup_hooks = settings["hooks"]["SessionStart"][0]["hooks"]
+    assert any("startup-context" in hook["command"] for hook in startup_hooks)
     assert (
         "omnigent.harnesses.claude_native.hook"
         in settings["hooks"]["Stop"][0]["hooks"][0]["command"]
@@ -4386,7 +4388,7 @@ def test_generated_claude_subprocesses_pin_runner_tmpdir(
         for hook in entry["hooks"]
         if "/venv/bin/python" in hook["command"]
     ]
-    assert len(python_commands) == 19
+    assert len(python_commands) == 20
     expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
     assert all(expected_tmpdir in command for command in python_commands)
 
@@ -4428,6 +4430,42 @@ def test_framework_context_hook_consumes_hidden_notice(
     output = json.loads(capsys.readouterr().out)
     assert output["hookSpecificOutput"]["additionalContext"] == "downscaled"
     assert not path.exists()
+
+
+def test_session_start_hook_preserves_generated_startup_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    startup_context = "Follow the authored role.\n\nKeep image guidance."
+    augment_claude_args(
+        ("--append-system-prompt-file", "profile.md"),
+        bridge_dir=tmp_path,
+        append_system_prompt=startup_context,
+    )
+    notice = tmp_path / claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
+    notice.write_text("One-shot notice", encoding="utf-8")
+    for source in ("startup", "resume", "clear", "compact"):
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO(json.dumps({"hook_event_name": "SessionStart", "source": source})),
+        )
+        assert claude_native_hook.main(["startup-context", "--bridge-dir", str(tmp_path)]) == 0
+        assert json.loads(capsys.readouterr().out) == {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": startup_context,
+            }
+        }
+        assert (
+            tmp_path / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+        ).read_text() == startup_context
+        assert notice.read_text() == "One-shot notice"
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"hook_event_name":"UserPromptSubmit"}'))
+    assert claude_native_hook.main(["--bridge-dir", str(tmp_path)]) == 0
+    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize(
@@ -4817,6 +4855,8 @@ def test_augment_claude_args_appends_caller_system_prompt(
         python_executable="/venv/bin/python",
         append_system_prompt=_FRAMEWORK_PROMPT,
     )
+    startup_context = tmp_path / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+    startup_context.write_text("Stale startup context", encoding="utf-8")
 
     args = augment_claude_args(
         user_args,
@@ -4824,6 +4864,7 @@ def test_augment_claude_args_appends_caller_system_prompt(
         python_executable="/venv/bin/python",
         append_system_prompt=_FRAMEWORK_PROMPT,
     )
+    assert not startup_context.exists()
 
     prompt_index = omnigent_args.index("--append-system-prompt")
     assert omnigent_args.count("--append-system-prompt") == 1
@@ -4837,45 +4878,55 @@ def test_augment_claude_args_appends_caller_system_prompt(
 
 
 @pytest.mark.parametrize(
-    ("user_args", "inline_prompt"),
+    "user_args",
     [
-        (("--append-system-prompt-file", "profile.md"), ""),
-        (("--append-system-prompt-file=profile.md",), ""),
+        ("--append-system-prompt-file", "profile.md"),
+        ("--append-system-prompt-file=profile.md",),
+        ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
         (
-            ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
-            "Review.",
+            "--append-system-prompt",
+            "Earlier.",
+            "--append-system-prompt-file=missing.md",
+            "--append-system-prompt-file",
+            "profile.md",
+            "--append-system-prompt=Later.",
         ),
         (
-            (
-                "--append-system-prompt",
-                "Earlier.",
-                "--append-system-prompt-file=missing.md",
-                "--append-system-prompt-file",
-                "profile.md",
-                "--append-system-prompt=Later.",
-            ),
-            "Later.",
-        ),
-        (
-            (
-                "--append-system-prompt=Earlier.",
-                "--append-system-prompt-file=profile.md",
-                "--append-system-prompt=",
-            ),
-            "",
+            "--append-system-prompt=Earlier.",
+            "--append-system-prompt-file=profile.md",
+            "--append-system-prompt=",
         ),
     ],
     ids=["file-separate", "file-joined", "file-and-inline", "last-values-win", "empty-inline"],
 )
-def test_augment_claude_args_combines_caller_prompt_file(
-    tmp_path: Path, user_args: tuple[str, ...], inline_prompt: str
+def test_augment_claude_args_leaves_caller_prompt_files_to_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, user_args: tuple[str, ...]
 ) -> None:
+    """Only generated instructions enter the bridge; caller files stay unopened."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     source = workspace / "profile.md"
     file_text = "Reviewer profile.\n"
     source.write_text(file_text, encoding="utf-8")
     bridge_dir = tmp_path / "bridge"
+    omnigent_args = augment_claude_args(
+        (), bridge_dir=bridge_dir, workspace=workspace, python_executable="/venv/bin/python"
+    )
+
+    def refuse_caller_prompt_file(real_open: Callable[..., Any]) -> Callable[..., Any]:
+        def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and os.path.basename(file) in (
+                "profile.md",
+                "missing.md",
+            ):
+                raise AssertionError("Omnigent opened the caller's prompt file")
+            return real_open(file, *args, **kwargs)
+
+        return guarded_open
+
+    monkeypatch.setattr("builtins.open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(io, "open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(os, "open", refuse_caller_prompt_file(os.open))
 
     args = augment_claude_args(
         ("--resume", "session-id", *user_args),
@@ -4885,35 +4936,29 @@ def test_augment_claude_args_combines_caller_prompt_file(
         append_system_prompt=_FRAMEWORK_PROMPT,
     )
 
-    assert args[:2] == ["--resume", "session-id"]
-    assert [arg for arg in args if arg.startswith("--append-system-prompt")] == [
-        "--append-system-prompt-file"
-    ]
-    combined = Path(args[args.index("--append-system-prompt-file") + 1])
-    expected = f"{file_text}\n\n{_FRAMEWORK_PROMPT}"
-    if inline_prompt:
-        expected += f"\n\n{inline_prompt}"
-    assert combined.parent == bridge_dir
-    assert combined.read_text(encoding="utf-8") == expected
-    assert combined.stat().st_mode & 0o777 == 0o600
-    assert source.read_text(encoding="utf-8") == file_text
+    assert args == ["--resume", "session-id", *user_args, *omnigent_args]
+    startup_context = bridge_dir / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+    assert startup_context.read_text(encoding="utf-8") == _FRAMEWORK_PROMPT
+    if os.name != "nt":
+        assert startup_context.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.parametrize("file_contents", [None, b"\xff"], ids=["missing", "invalid-utf8"])
-def test_augment_claude_args_rejects_unreadable_prompt_file(
+def test_augment_claude_args_delegates_prompt_file_errors_to_claude(
     tmp_path: Path, file_contents: bytes | None
 ) -> None:
     if file_contents is not None:
         (tmp_path / "profile.md").write_bytes(file_contents)
 
-    with pytest.raises(ValueError, match="Could not read --append-system-prompt-file"):
-        augment_claude_args(
-            ("--append-system-prompt-file", "profile.md"),
-            bridge_dir=tmp_path / "bridge",
-            workspace=tmp_path,
-            python_executable="/venv/bin/python",
-            append_system_prompt=_FRAMEWORK_PROMPT,
-        )
+    args = augment_claude_args(
+        ("--append-system-prompt-file", "profile.md"),
+        bridge_dir=tmp_path / "bridge",
+        workspace=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=_FRAMEWORK_PROMPT,
+    )
+    assert args[:2] == ["--append-system-prompt-file", "profile.md"]
+    assert "--append-system-prompt" not in args
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
@@ -4939,6 +4984,8 @@ def test_augment_claude_args_omits_unsupplied_system_prompt(
     tmp_path: Path, user_args: tuple[str, ...]
 ) -> None:
     """The bridge does not invent framework policy on its own."""
+    startup_context = tmp_path / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+    startup_context.write_text("Stale startup context", encoding="utf-8")
     args = augment_claude_args(
         user_args,
         bridge_dir=tmp_path,
@@ -4947,6 +4994,7 @@ def test_augment_claude_args_omits_unsupplied_system_prompt(
 
     assert "--append-system-prompt" not in args
     assert args[: len(user_args)] == list(user_args)
+    assert not startup_context.exists()
 
 
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
@@ -16245,8 +16293,9 @@ async def _run_hook_command(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_startup_context", [False, True])
 async def test_lifecycle_hooks_record_through_the_relay_without_starting_python(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, has_startup_context: bool
 ) -> None:
     """The lifecycle hook posts to the relay with curl.
 
@@ -16265,6 +16314,10 @@ async def test_lifecycle_hooks_record_through_the_relay_without_starting_python(
         (bridge_dir / "bridge.json").write_text(
             json.dumps({"active_session_id": "conv_hook_eval"}), encoding="utf-8"
         )
+        if has_startup_context:
+            (bridge_dir / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE).write_text(
+                "Startup guidance", encoding="utf-8"
+            )
         lifecycle_hook = _unmatched_hook_command(
             settings, "UserPromptSubmit", "/hook/claude/event"
         )
@@ -16491,21 +16544,31 @@ async def test_relay_hook_failures_reach_the_sessions_hook_stderr_file(
     assert "omnigent claude hook: failed to record hook" in stderr_file.read_text()
 
 
-def test_framework_context_hook_starts_python_only_for_pending_context(tmp_path: Path) -> None:
-    """Without pending framework context the shell answers the prompt hook.
+@pytest.mark.parametrize("startup", [False, True], ids=["pending-notice", "startup"])
+def test_framework_context_hook_starts_python_only_for_pending_context(
+    tmp_path: Path, startup: bool
+) -> None:
+    """Without framework context the shell answers the hook.
 
-    Pending context still goes to the Python hook, which reads and removes it,
-    so Claude gets it once.
+    The terminal-side Python hook consumes prompt notices and retains startup
+    context for later SessionStart events.
     """
+    event_name = "SessionStart" if startup else "UserPromptSubmit"
+    subcommand = "startup-context" if startup else "framework-context"
+    filename = (
+        claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+        if startup
+        else claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
+    )
     fake_python, runs = _fake_hook_python(tmp_path)
     fake_settings = claude_native_bridge.build_hook_settings(
         tmp_path, python_executable=str(fake_python)
     )
-    fake_hook = _unmatched_hook_command(fake_settings, "UserPromptSubmit", "framework-context")
+    fake_hook = _unmatched_hook_command(fake_settings, event_name, subcommand)
     real_hook = _unmatched_hook_command(
-        claude_native_bridge.build_hook_settings(tmp_path), "UserPromptSubmit", "framework-context"
+        claude_native_bridge.build_hook_settings(tmp_path), event_name, subcommand
     )
-    payload = json.dumps({"hook_event_name": "UserPromptSubmit"})
+    payload = json.dumps({"hook_event_name": event_name})
 
     def run(command: str) -> str:
         result = subprocess.run(
@@ -16521,18 +16584,20 @@ def test_framework_context_hook_starts_python_only_for_pending_context(tmp_path:
 
     assert run(fake_hook) == ""
     assert not runs.exists()
-    (tmp_path / claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE).write_text(
-        "pending context", encoding="utf-8"
-    )
-    outputs = [run(real_hook), run(fake_hook)]
+    context_file = tmp_path / filename
+    context_file.write_text("generated context", encoding="utf-8")
+    outputs = [run(real_hook), run(real_hook)]
 
     assert json.loads(outputs[0]) == {
         "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": "pending context",
+            "hookEventName": event_name,
+            "additionalContext": "generated context",
         }
     }
-    assert outputs[1] == ""
+    assert outputs[1] == (outputs[0] if startup else "")
+    assert context_file.exists() == startup
+    context_file.unlink(missing_ok=True)
+    assert run(fake_hook) == ""
     assert not runs.exists()
 
 
