@@ -1,5 +1,6 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { useLayoutEffect } from "react";
+import { toast } from "sonner";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
@@ -17,6 +18,8 @@ import {
   openBrowserTab,
   useBrowserTabs,
 } from "./useBrowserTabs";
+
+vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 
 // Unknown hosts stay public-only unless a test gives the session one.
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
@@ -633,6 +636,66 @@ describe("browser soft tabs", () => {
     expect(result.current.tabs).toEqual([selected, AGENT_BROWSER_TAB_ID]);
     expect(result.current.viewId).toBe("session-a");
     expect(result.current.agentBrowser).toBe(true);
+  });
+
+  it("opens each Cmd/Ctrl-clicked page link once as a background tab of the clicked session", async () => {
+    let openTab!: (request: { conversationId: string; url: string }) => void;
+    const stopOpenTabs = vi.fn();
+    const browserOpenOrNavigate = vi.fn().mockResolvedValue({ ok: true });
+    const browserSetOpenTabSupported = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, {
+      omnigentDesktop: {
+        browserOpenOrNavigate,
+        browserSetOpenTabSupported,
+        onBrowserOpenTab: vi.fn((callback: typeof openTab) => {
+          openTab = callback;
+          return stopOpenTabs;
+        }),
+      },
+    });
+    vi.mocked(getSessionSlim).mockImplementation(
+      async (id: string) => ({ id, hostId: "this-mac", labels: {} }) as unknown as Session,
+    );
+    openBrowserTab("session-a", "clicked");
+    const rail = renderHook(() => useBrowserTabs("session-a"));
+    const gridRail = renderHook(() => useBrowserTabs("session-a"));
+    expect(browserSetOpenTabSupported.mock.calls).toEqual([[true]]);
+
+    await act(async () => {
+      openTab({
+        conversationId: browserViewId("session-a", "clicked"),
+        url: "http://localhost:3000/linked",
+      });
+    });
+    await waitFor(() => expect(rail.result.current.tabs).toHaveLength(2));
+    const newTab = rail.result.current.tabs[1];
+    expect(rail.result.current.selected).toBe("clicked");
+    expect(gridRail.result.current.tabs).toEqual(["clicked", newTab]);
+    expect(browserOpenOrNavigate.mock.calls).toEqual([
+      [
+        browserViewId("session-a", newTab),
+        "http://localhost:3000/linked",
+        undefined,
+        { force: true, sourceHostId: "this-mac", sessionHostProtocol: SESSION_HOST_PROTOCOL },
+      ],
+    ]);
+
+    browserOpenOrNavigate.mockResolvedValueOnce({ ok: false, error: "browser view cap reached" });
+    await act(async () => {
+      openTab({ conversationId: "session-a", url: "https://example.com/eleventh" });
+    });
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "Couldn't open the link in a new tab: browser view cap reached",
+      ),
+    );
+    expect(rail.result.current.tabs).toEqual(["clicked", newTab]);
+
+    rail.unmount();
+    expect(stopOpenTabs).not.toHaveBeenCalled();
+    gridRail.unmount();
+    expect(stopOpenTabs).toHaveBeenCalledTimes(1);
+    expect(browserSetOpenTabSupported.mock.calls).toEqual([[true], [false]]);
   });
 
   it("keeps existing and agent views when accepted links open independent tabs", async () => {

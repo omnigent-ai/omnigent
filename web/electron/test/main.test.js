@@ -633,6 +633,7 @@ function loadNavigationHarness({
               closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
               setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
               setRecentSessionSwitchSupported: () => {},
+              setOpenTabSupported: () => {},
               activeConversationId: () => null,
             };
           },
