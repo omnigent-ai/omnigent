@@ -2168,7 +2168,8 @@ def register_core_routes(
             ``project``, only owned sessions are returned so first-class
             project names resolve within the caller's projects.
             ``"all"`` (default) returns all accessible non-archived
-            sessions, matching the legacy behaviour.
+            sessions, matching the legacy behaviour. ``include_archived``
+            adds archived rows to ``"mine"``, ``"shared"`` and ``"all"``.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -2204,13 +2205,15 @@ def register_core_routes(
             accessible_by_param: str | None = None
             owned_by_param: str | None = user_id
             shared_only_param = False
-            include_archived_param = False
+            # The sidebar tabs never send include_archived; agents listing their
+            # own sessions (sys_session_list) do, to find archived workers.
+            include_archived_param = include_archived
             archived_only_param = False
         elif effective_visibility == "shared":
             accessible_by_param = user_id
             owned_by_param = None
             shared_only_param = True
-            include_archived_param = False
+            include_archived_param = include_archived
             archived_only_param = False
         elif effective_visibility == "archived":
             accessible_by_param = user_id
