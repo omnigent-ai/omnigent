@@ -3135,7 +3135,11 @@ def _drop_claude_launch_args_from_another_host(
     if copied != source_args or source_host_id is None or source_host_id == conv.host_id:
         return conv
     mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
-    kept = ["--permission-mode", mode] if mode in _CLAUDE_NATIVE_PERMISSION_MODES else []
+    kept: list[str] = (
+        ["--permission-mode", mode]
+        if mode is not None and mode in _CLAUDE_NATIVE_PERMISSION_MODES
+        else []
+    )
     return conversation_store.update_conversation(conv.id, terminal_launch_args=kept) or conv
 
 
