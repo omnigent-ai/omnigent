@@ -334,7 +334,7 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
                         client,
                         base_url,
                         harness=harness.removesuffix("-native"),
-                        metadata={"workspace": str(workspace)},
+                        metadata={"workspace": str(workspace), "title": "Terminal hangup probe"},
                         **({"model": model} if harness == "codex-native" else {}),
                     )["session_id"]
                 )
@@ -478,7 +478,10 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
                 )
                 assert len(probe_requests()) == 1
                 if native_pid is not None:
-                    assert _wait_until(lambda: not _pid_running(native_pid), 15.0)
+                    assert _wait_until(lambda: not _pid_running(native_pid), 15.0), (
+                        f"native pane {native_pid} survived explicit {exit_action}\n"
+                        f"{terminal.log_path.read_text(errors='replace')[-12000:]}"
+                    )
                 print(f"explicit {exit_action}: runner stopped with the mock reply still held")
                 return
             assert host_exit[1] == signal.SIGHUP, f"host should die by SIGHUP, not {host_exit}"
