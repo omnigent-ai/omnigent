@@ -3704,3 +3704,137 @@ async def test_ask_user_question_roundtrip_real_executor_hook_through_adapter_br
     payload = getattr(params, "ask_user_question", None)
     assert payload is not None
     assert payload["questions"][0]["question"] == "Env?"
+
+
+class _LiveMcpExecutor(Executor):
+    """Executor whose MCP connections a test scripts, failing a reconnect on request."""
+
+    def __init__(self, reconnect_failure: BaseException | None = None) -> None:
+        from omnigent.inner.executor import LiveMcpServerStatus
+
+        self.statuses = [LiveMcpServerStatus(name="docs", status="failed", error="HTTP 401")]
+        self.reconnect_failure = reconnect_failure
+        self.status_failure: BaseException | None = None
+        self.reconnected: list[tuple[str, str]] = []
+
+    def supports_live_mcp_control(self) -> bool:
+        return True
+
+    async def live_mcp_statuses(self, session_key: str) -> list[Any] | None:
+        if self.status_failure is not None:
+            raise self.status_failure
+        return self.statuses
+
+    async def reconnect_live_mcp_server(self, session_key: str, name: str) -> None:
+        from omnigent.inner.executor import LiveMcpServerStatus
+
+        self.reconnected.append((session_key, name))
+        if self.reconnect_failure is not None:
+            raise self.reconnect_failure
+        self.statuses = [LiveMcpServerStatus(name=name, status="connected")]
+
+
+@contextlib.asynccontextmanager
+async def _live_mcp_client(adapter: Any) -> AsyncIterator[httpx.AsyncClient]:
+    app = adapter.build()
+    app.state.conversation_id = "conv_live_mcp"
+    app.state.harness_auth_token = "spawn-token"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer spawn-token"},
+    ) as client:
+        yield client
+
+
+async def test_live_mcp_routes_reach_only_an_executor_that_reports_them() -> None:
+    from omnigent.inner.executor import (
+        LiveMcpHarnessNotRunning,
+        LiveMcpReconnectRefused,
+        LiveMcpServerUnknown,
+    )
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    status_path = "/v1/sessions/conv_live_mcp/mcp-status"
+    reconnect_path = "/v1/sessions/conv_live_mcp/mcp-reconnect"
+
+    # Before the first turn builds the executor, nothing is connected yet.
+    adapter = ExecutorAdapter(executor_factory=_LiveMcpExecutor, session_key="conv_live_mcp")
+    async with _live_mcp_client(adapter) as client:
+        assert (await client.get(status_path)).json() == {"running": False, "servers": []}
+        resp = await client.post(reconnect_path, json={"name": "docs"})
+        assert (resp.status_code, resp.json()["error"]) == (409, "harness_not_running")
+
+        executor = adapter._ensure_executor()
+        resp = await client.get(status_path)
+        assert resp.json() == {
+            "running": True,
+            "servers": [{"name": "docs", "status": "failed", "error": "HTTP 401"}],
+        }
+        resp = await client.post(reconnect_path, json={"name": "docs"})
+        assert resp.json() == {
+            "running": True,
+            "servers": [{"name": "docs", "status": "connected"}],
+        }
+        assert executor.reconnected == [("conv_live_mcp", "docs")]
+
+        for body in ({}, {"name": " "}, ["docs"]):
+            assert (await client.post(reconnect_path, json=body)).status_code == 400
+        assert (await client.get("/v1/sessions/conv_other/mcp-status")).status_code == 404
+        unauthenticated = await client.get(status_path, headers={"Authorization": "Bearer wrong"})
+        assert unauthenticated.status_code == 401
+
+    # The harness's refusal comes back with the connections as they stand; other
+    # failures keep their text out of the answer.
+    for failure, expected_status, expected_body in (
+        (
+            LiveMcpReconnectRefused("still unauthorized"),
+            200,
+            {"reconnect_error": "still unauthorized"},
+        ),
+        (RuntimeError("internal detail"), 502, {"error": "mcp_reconnect_failed"}),
+        (LiveMcpServerUnknown("docs"), 404, {"error": "mcp_server_unknown"}),
+        (LiveMcpHarnessNotRunning("conv_live_mcp"), 409, {"error": "harness_not_running"}),
+        (TimeoutError(), 504, {"error": "mcp_reconnect_timeout"}),
+    ):
+        adapter = ExecutorAdapter(
+            executor_factory=lambda failure=failure: _LiveMcpExecutor(failure),
+            session_key="conv_live_mcp",
+        )
+        adapter._ensure_executor()
+        async with _live_mcp_client(adapter) as client:
+            resp = await client.post(reconnect_path, json={"name": "docs"})
+        assert resp.status_code == expected_status
+        assert expected_body.items() <= resp.json().items()
+        assert "internal detail" not in resp.text
+
+    # A failed status read reports the harness as running, without the exception's text.
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: _LiveMcpExecutor(LiveMcpReconnectRefused("still unauthorized")),
+        session_key="conv_live_mcp",
+    )
+    executor = adapter._ensure_executor()
+    executor.status_failure = RuntimeError("internal detail")
+    async with _live_mcp_client(adapter) as client:
+        resp = await client.get(status_path)
+        assert (resp.status_code, resp.json()) == (502, {"error": "mcp_status_failed"})
+        resp = await client.post(reconnect_path, json={"name": "docs"})
+    assert (resp.status_code, resp.json()) == (
+        200,
+        {
+            "running": True,
+            "servers": [],
+            "status_unavailable": True,
+            "reconnect_error": "still unauthorized",
+        },
+    )
+
+    # A harness that can't report MCP status says so instead of answering empty.
+    adapter = ExecutorAdapter(executor_factory=_StubExecutor, session_key="conv_live_mcp")
+    adapter._ensure_executor()
+    async with _live_mcp_client(adapter) as client:
+        for resp in (
+            await client.get(status_path),
+            await client.post(reconnect_path, json={"name": "docs"}),
+        ):
+            assert (resp.status_code, resp.json()["error"]) == (404, "unsupported")

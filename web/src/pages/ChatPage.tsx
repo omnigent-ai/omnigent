@@ -241,6 +241,13 @@ import {
   useHostMcpServers,
   type HostMcpServer,
 } from "@/hooks/useHarnessInventory";
+import {
+  liveMcpNameForHostServer,
+  liveMcpRowFields,
+  liveMcpStatusNote,
+  useReconnectLiveMcpServer,
+  useSessionLiveMcpServers,
+} from "@/hooks/useSessionLiveMcpServers";
 import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
 import {
   getSessionHost,
@@ -2773,6 +2780,15 @@ function ComposerImpl(
           : hostMcpQuery.isError
             ? "Couldn’t load MCP servers from this session’s host."
             : sdkAgentStatus;
+  // claude-sdk's CLI reports the connections it holds; other harnesses can't be asked.
+  const liveMcpQuery = useSessionLiveMcpServers(
+    composerSessionId,
+    mcpPanelRequested && sessionHarness === "claude-sdk",
+  );
+  // A failed refetch keeps the last data; showing it would present old state as live.
+  const liveMcp =
+    !liveMcpQuery.isError && liveMcpQuery.data?.live ? liveMcpQuery.data.servers : undefined;
+  const liveMcpReconnect = useReconnectLiveMcpServer(composerSessionId);
   const mcpSettingsHarness = nativeMcpHarness
     ? sessionHarness
     : hostMcpHarness && INVENTORY_HARNESS_IDS[hostMcpHarness];
@@ -3688,14 +3704,27 @@ function ComposerImpl(
       hasRegistryServers && registryCatalog.error
         ? "Couldn’t check MCP service connections."
         : undefined,
+      sessionHarness === "claude-sdk"
+        ? liveMcpStatusNote(liveMcpQuery.data, liveMcpQuery.isError)
+        : undefined,
     ]
       .filter(Boolean)
       .join(" ") || undefined;
   const mcpServers = useMemo(() => {
-    const byName = new Map<string, McpServerRow>(
+    const liveByName = new Map((liveMcp ?? []).map((server) => [server.name, server]));
+    const takeLive = (liveName: string) => {
+      const live = liveByName.get(liveName);
+      // An answer that omits a server means the session did not load it.
+      if (live === undefined) return liveMcp ? { live: { status: "not-loaded" } } : {};
+      liveByName.delete(liveName);
+      return liveMcpRowFields(live);
+    };
+    // Keyed by harness identity: two plugins can each ship a server with one name.
+    const rows = new Map<string, McpServerRow>(
       (hostMcpQuery.data ?? []).filter(isSessionHostServer).map((server) => [
-        server.name,
+        `host:${liveMcpNameForHostServer(server)}`,
         {
+          key: `host:${liveMcpNameForHostServer(server)}`,
           name: server.name,
           description:
             [server.plugin && `${server.plugin} plugin`, server.url_host]
@@ -3713,16 +3742,30 @@ function ComposerImpl(
           signIn: HOST_SIGN_IN_URL_RE.test(server.sign_in_url ?? "")
             ? { kind: "url", url: server.sign_in_url! }
             : undefined,
+          ...takeLive(liveMcpNameForHostServer(server)),
         },
       ]),
     );
+    // The CLI also loads servers the host inventory doesn't list, e.g. project ones.
+    // Wait for the inventory, or its servers would flash up here before merging.
+    if (!hostMcpQuery.isLoading) {
+      for (const live of liveByName.values()) {
+        const key = `live:${live.name}`;
+        rows.set(key, { key, name: live.name, ...liveMcpRowFields(live) });
+      }
+    }
     const catalogLoaded = !registryCatalog.loading && !registryCatalog.error;
     for (const server of selectedAgent?.mcp_servers ?? []) {
       // A shared name is not a shared endpoint, so an agent server claims none of
       // the host's account state: its Sign in could point at the wrong service.
+      const hostKeys = [...rows.entries()]
+        .filter(([key, row]) => key.startsWith("host:") && row.name === server.name)
+        .map(([key]) => key);
       const row: McpServerRow = {
+        key: hostKeys[0] ?? `agent:${server.name}`,
         name: server.name,
-        description: server.description ?? byName.get(server.name)?.description,
+        description:
+          server.description ?? (hostKeys[0] ? rows.get(hostKeys[0])?.description : undefined),
       };
       // Only a read from this open: a stale row would offer a needless popup.
       if (hasRegistryServers && server.transport === "registry" && catalogLoaded) {
@@ -3741,17 +3784,21 @@ function ComposerImpl(
           row.connection = "unavailable";
         }
       }
-      byName.set(server.name, row);
+      // Take the first host row's place and drop the rest, as the agent's server wins.
+      for (const key of hostKeys.slice(1)) rows.delete(key);
+      rows.set(row.key!, row);
     }
-    return [...byName.values()];
+    return [...rows.values()];
   }, [
     hasRegistryServers,
     isSessionHostServer,
     hostMcpQuery.data,
+    hostMcpQuery.isLoading,
     registryCatalog.error,
     registryCatalog.loading,
     registryCatalog.services,
     selectedAgent?.mcp_servers,
+    liveMcp,
   ]);
 
   const slashCompletionCommands = mcpPanelRequested
@@ -3778,9 +3825,11 @@ function ComposerImpl(
   const showMcpServers = mcpPanelRequested && !slashCompletion.inline;
   // Clear on both edges: a popup that rejects after the panel closes would
   // otherwise greet the next open with a stale message.
+  const { clearError: clearLiveMcpReconnectError } = liveMcpReconnect;
   useEffect(() => {
     clearRegistrySignInError();
-  }, [showMcpServers, clearRegistrySignInError]);
+    clearLiveMcpReconnectError();
+  }, [showMcpServers, clearRegistrySignInError, clearLiveMcpReconnectError]);
 
   // Mobile reserves the overlay height in the transcript's trailing padding.
   const composerFormRef = useRef<HTMLFormElement>(null);
@@ -4471,6 +4520,9 @@ function ComposerImpl(
                       ? { name: registrySignIn.error.id, message: registrySignIn.error.message }
                       : null
                   }
+                  onMcpReconnect={isReadOnly ? undefined : liveMcpReconnect.reconnect}
+                  mcpReconnectingName={liveMcpReconnect.reconnectingName}
+                  mcpReconnectError={liveMcpReconnect.error}
                 />
               )}
               {/* "@"-file-mention browser — native coding-agent sessions only.

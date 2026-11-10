@@ -4,6 +4,7 @@ import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTi
 import { orderSessionFamilies } from "@/lib/sessionFamilies";
 import {
   type ActiveChatOverride,
+  appendPinWrites,
   bareConversationId,
   computeNextActiveOverride,
   conversationDisplayLabel,
@@ -289,6 +290,19 @@ describe("pinOrderWrites", () => {
     ]);
   });
 
+  it("inserts a not-yet-pinned session below the row with below", () => {
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_1", true)).toEqual([
+      { id: "new", pinnedAt: 2001 },
+    ]);
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_0", true)).toEqual([
+      { id: "new", pinnedAt: 1500 },
+    ]);
+    // An existing pin still moves into the row's slot.
+    expect(pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_1", true)).toEqual(
+      pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_1"),
+    );
+  });
+
   it("is a no-op for a drop on itself or an unknown row", () => {
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "conv_0")).toEqual([]);
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "missing")).toEqual([]);
@@ -320,6 +334,65 @@ describe("pinOrderWrites", () => {
       "conv_1",
       "conv_2",
     ]);
+  });
+
+  it("appends a new pin past every shown row's value with appendPinWrites", () => {
+    const rows = pins(1000, 2000, undefined);
+    rows[2].family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "3000" };
+    expect(appendPinWrites(rows, "new")).toEqual([{ id: "new", pinnedAt: 3001 }]);
+    // A pin without a value sorts last, so it's numbered first.
+    expect(appendPinWrites(pins(1000, undefined), "new")).toEqual([
+      { id: "conv_1", pinnedAt: 1001 },
+      { id: "new", pinnedAt: 1002 },
+    ]);
+    expect(appendPinWrites([], "new")).toEqual([]);
+  });
+
+  it("keeps a valueless pin below a family shown without its representative when appending", () => {
+    // Shown order: conv_0 (1000), conv_1 (a family member, family at 3000), conv_2 (no value).
+    const rows = pins(1000, undefined, undefined);
+    rows[1].family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "3000" };
+    const writes = appendPinWrites(rows, "new");
+    expect(writes).toEqual([
+      { id: "conv_2", pinnedAt: 3001 },
+      { id: "new", pinnedAt: 3002 },
+    ]);
+    const byId = new Map(writes.map((w) => [w.id, w.pinnedAt]));
+    const next = [...rows, conversation("new", null, new Date(2026, 4, 14, 8))].map((c) =>
+      byId.has(c.id) ? { ...c, labels: { "omnigent.pinned": String(byId.get(c.id)) } } : c,
+    );
+    expect(orderByPinnedTimestamp(next).map((c) => c.id)).toEqual([
+      "conv_0",
+      "conv_1",
+      "conv_2",
+      "new",
+    ]);
+  });
+
+  it("doesn't give a valueless nested family row a value when appending", () => {
+    const rows = pins(1000, undefined, undefined);
+    rows[1].family = { id: "family", representative_id: "parent", pinned: true };
+    expect(appendPinWrites(rows, "new")).toEqual([{ id: "new", pinnedAt: 1001 }]);
+    rows[0].family = rows[1].family;
+    rows[0].labels = {};
+    expect(appendPinWrites(rows.slice(0, 2), "new")).toEqual([]);
+  });
+
+  it("numbers valueless pins just below now when no shown row has a value", () => {
+    vi.useFakeTimers({ now: 5000 });
+    try {
+      expect(appendPinWrites(pins(undefined, undefined), "new")).toEqual([
+        { id: "conv_0", pinnedAt: 4998 },
+        { id: "conv_1", pinnedAt: 4999 },
+        { id: "new", pinnedAt: 5000 },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back to a plain pin when the values are too large to step past", () => {
+    expect(appendPinWrites(pins(Number.MAX_SAFE_INTEGER), "new")).toEqual([]);
   });
 });
 

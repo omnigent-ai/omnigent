@@ -135,6 +135,7 @@ def prepare_managed_pi_agent_dir(
     *,
     overlay: Mapping[str, object] | None = None,
     global_agent_dir: Path | None = None,
+    pi_env: Mapping[str, str] | None = None,
 ) -> None:
     """
     Seed a managed ``PI_CODING_AGENT_DIR`` with the user's global Pi settings.
@@ -143,6 +144,9 @@ def prepare_managed_pi_agent_dir(
     *managed_dir*, applies *overlay* (e.g. Omnigent retry policy), and
     links supported resources, and preserves their relative settings paths.
     Linked resources are writable shared state; Pi may update MCP OAuth tokens.
+    MCP servers the host configures for Claude Code, Codex, or Cursor are added
+    through a managed ``mcp.json`` copy when the user's file lacks them (see
+    :func:`omnigent.inner.pi_mcp.sync_managed_pi_mcp_config`).
     Global context files (``AGENTS.md`` et al.) are linked so Pi applies them
     unless ``--no-context-files`` is set; ``SYSTEM.md``, ``APPEND_SYSTEM.md``
     and model credentials are not linked.
@@ -154,6 +158,8 @@ def prepare_managed_pi_agent_dir(
     :param overlay: Settings merged on top of the copied global file.
     :param global_agent_dir: Caller-resolved source root; defaults to
         :data:`DEFAULT_PI_AGENT_DIR`.
+    :param pi_env: Environment the Pi process will receive, used to resolve host
+        MCP placeholders; defaults to ``os.environ``.
     """
     agent_root = global_agent_dir if global_agent_dir is not None else DEFAULT_PI_AGENT_DIR
     agent_root = Path(os.path.abspath(agent_root.expanduser()))
@@ -179,3 +185,6 @@ def prepare_managed_pi_agent_dir(
         return
 
     _symlink_agent_resources(managed_dir, agent_root)
+    from omnigent.inner.pi_mcp import sync_managed_pi_mcp_config
+
+    sync_managed_pi_mcp_config(managed_dir, agent_root, pi_env)
