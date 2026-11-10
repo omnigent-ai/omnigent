@@ -3565,6 +3565,23 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(await submittedPrompt()).toContain('(project = "ES" AND assignee is EMPTY)');
   });
 
+  it("filters on a Jira custom field named in its row", async () => {
+    renderTrigger("jira");
+    fillJira();
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    expect(screen.queryByTestId("task-trigger-condition-0-name")).toBeNull();
+    pick("task-trigger-condition-0-field", "task-trigger-condition-0-field-custom_field");
+    type("task-trigger-condition-0-value", "Backend");
+    // The value alone doesn't say which field to compare.
+    expect(submit).toBeDisabled();
+    expect(screen.getByTestId("task-trigger-empty-condition")).toBeInTheDocument();
+    type("task-trigger-condition-0-name", "ES Component");
+    expect(submit).toBeEnabled();
+
+    expect(await submittedPrompt()).toContain('(project = "ES" AND "ES Component" = "Backend")');
+  });
+
   it("starts each worker in its own sandbox when the automation runs in a sandbox", async () => {
     renderTrigger("jira", { managed_sandboxes_enabled: true });
     fillJira();

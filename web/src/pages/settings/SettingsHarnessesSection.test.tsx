@@ -142,10 +142,15 @@ const INVENTORY: HarnessInventory = {
   },
 };
 let inventory: HarnessInventory = INVENTORY;
+let inventoryFamilies: readonly string[] | undefined;
 vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
   ...(await importActual()),
-  useHarnessInventory: (_host: Host, options: { includePluginMetadata: boolean }) => {
+  useHarnessInventory: (
+    _host: Host,
+    options: { includePluginMetadata: boolean; families?: readonly string[] },
+  ) => {
     pluginMetadataRequested = options.includePluginMetadata;
+    inventoryFamilies = options.families;
     return inventory;
   },
 }));
@@ -560,11 +565,50 @@ describe("Harness details", () => {
   });
 
   it("says the catalog isn't listed for a ready harness the inventory doesn't cover", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "opencode-native": true } }];
+    renderHarnesses("opencode-native");
+
+    expect(screen.getByText(/aren't listed for OpenCode yet/)).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: /MCP servers/ })).toBeNull();
+  });
+
+  it("lists Pi's MCP servers without offering a tool probe", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "pi-native": true } }];
+    inventory = {
+      ...INVENTORY,
+      context: {
+        ...INVENTORY.context,
+        mcps: [
+          ...INVENTORY.context.mcps,
+          { id: "pi:wiki", name: "wiki", harness: "pi", detail: "wiki.example.com" },
+        ],
+      },
+    };
     renderHarnesses("pi-native");
 
-    expect(screen.getByText(/aren't listed for Pi yet/)).toBeTruthy();
-    expect(screen.queryByRole("tab", { name: /MCP servers/ })).toBeNull();
+    expect(inventoryFamilies).toEqual(["pi"]);
+    expect(screen.getByRole("tab", { name: "MCP servers · 1" })).toBeTruthy();
+    const wiki = screen.getByTestId("catalog-row-wiki");
+    expect(within(wiki).getByText("wiki.example.com")).toBeTruthy();
+    expect(wiki.tagName).not.toBe("BUTTON");
+    expect(screen.queryByTestId("catalog-row-github")).toBeNull();
+    expect(mcpLookups).toEqual([]);
+  });
+
+  it("lists Pi's skills without opening their contents", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "pi-native": true } }];
+    inventory = {
+      ...INVENTORY,
+      context: {
+        ...INVENTORY.context,
+        skills: [...INVENTORY.context.skills, { id: "pi:plan", name: "plan", harness: "pi" }],
+      },
+    };
+    renderHarnesses("pi-native");
+
+    selectTab("Skills · 1");
+    expect(screen.getByTestId("catalog-row-plan").tagName).not.toBe("BUTTON");
+    expect(contentLookup).toBeNull();
   });
 
   it("uses the credential card as the warning for a missing credential", () => {

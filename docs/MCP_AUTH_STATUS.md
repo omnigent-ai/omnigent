@@ -26,7 +26,7 @@ directory; the host passes runners that resolved path.
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `harness` | yes | `claude`, `codex` or `cursor`: which harness loads the server. |
+| `harness` | yes | `claude`, `codex`, `cursor` or `pi`: which harness loads the server. |
 | `name` | yes | The server's name as the harness config spells it. |
 | `status` | yes | `connected` or `sign_in_required`. |
 | `sign_in_url` | no | Page that completes the sign-in. Only read with `sign_in_required`. |
