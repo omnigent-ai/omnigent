@@ -1554,17 +1554,19 @@ def test_forwarder_retries_undelivered_codex_async_question_answer(
 
 
 @pytest.mark.parametrize(
-    "shell_markers",
+    ("shell_markers", "shell_starts_during_steer"),
     [
-        {"active_turn_id": "turn_shell", "active_shell_turn_id": "turn_shell"},
-        {"active_turn_id": None, "pending_shell_command_id": "shell_command_1"},
+        ({"active_turn_id": "turn_shell", "active_shell_turn_id": "turn_shell"}, False),
+        ({"active_turn_id": None, "pending_shell_command_id": "shell_command_1"}, False),
+        ({"active_turn_id": "turn_shell", "active_shell_turn_id": "turn_shell"}, True),
     ],
-    ids=["shell_turn_running", "shell_command_pending"],
+    ids=["shell_turn_running", "shell_command_pending", "shell_turn_starts_during_steer"],
 )
 def test_forwarder_holds_codex_async_question_answer_during_shell_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     shell_markers: dict[str, Any],
+    shell_starts_during_steer: bool,
 ) -> None:
     """
     An answer is not sent while a shell command runs, which would drop it.
@@ -1572,12 +1574,37 @@ def test_forwarder_holds_codex_async_question_answer_during_shell_command(
     When the shell command outlasts the retries, the card reopens.
 
     :param shell_markers: Bridge fields of the running shell command.
+    :param shell_starts_during_steer: Whether the shell command replaces the
+        steered turn while the first steer is pending.
     """
     monkeypatch.setattr(
         codex_native_forwarder, "_CODEX_ASYNC_QUESTION_RETRY_DELAYS_S", (0.0, 0.0, 0.0)
     )
-    _write_forwarder_bridge(tmp_path, **shell_markers)
+    initial_markers = (
+        {"active_turn_id": "turn_123"} if shell_starts_during_steer else shell_markers
+    )
+    _write_forwarder_bridge(tmp_path, **initial_markers)
     fake_client = _FakeCodexAppServerClient()
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Start the shell command, then reject the steer of the turn it replaced.
+
+        :param method: JSON-RPC method.
+        :param params: JSON-RPC params.
+        :returns: Never; every send is rejected.
+        :raises CodexAppServerResponseError: Codex's stale-turn rejection.
+        """
+        fake_client.requests.append((method, params))
+        _write_forwarder_bridge(tmp_path, **shell_markers)
+        raise CodexAppServerResponseError(
+            {
+                "code": -32600,
+                "message": "expected active turn id `turn_123` but found `turn_shell`",
+            }
+        )
+
+    fake_client.request = fake_request  # type: ignore[method-assign]
 
     hook_bodies, posted_events = _answer_async_question(
         tmp_path,
@@ -1588,7 +1615,20 @@ def test_forwarder_holds_codex_async_question_answer_during_shell_command(
         ],
     )
 
-    assert fake_client.requests == []
+    assert (
+        fake_client.requests
+        == [
+            (
+                "turn/steer",
+                {
+                    "threadId": "thread_123",
+                    "expectedTurnId": "turn_123",
+                    "input": [{"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY}],
+                },
+            )
+        ]
+        * shell_starts_during_steer
+    )
     assert len(_undelivered_answer_notices(posted_events)) == 1
     assert [body["id"] for body in hook_bodies] == ["async_question:call-async-1"] * 2
 
@@ -1596,14 +1636,21 @@ def test_forwarder_holds_codex_async_question_answer_during_shell_command(
 @pytest.mark.parametrize(
     ("echoed_reply", "send_error", "echoing_send", "mirror_stalls"),
     [
-        (_TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"), ConnectionResetError, 1, False),
-        (_TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"), ConnectionResetError, 1, True),
-        (_TUI_ASYNC_QUESTION_REPLY, TimeoutError, 1, False),
-        (_TUI_ASYNC_QUESTION_REPLY, ConnectionResetError, 4, False),
+        (_TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"), ConnectionResetError(), 1, False),
+        (_TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"), ConnectionResetError(), 1, True),
+        (
+            _TUI_ASYNC_QUESTION_REPLY.replace("Alpha", "Beta"),
+            CodexAppServerResponseError({"code": -32600, "message": "no active turn to steer"}),
+            1,
+            False,
+        ),
+        (_TUI_ASYNC_QUESTION_REPLY, TimeoutError(), 1, False),
+        (_TUI_ASYNC_QUESTION_REPLY, ConnectionResetError(), 4, False),
     ],
     ids=[
         "refused_tui_answer",
         "refused_tui_answer_slow_mirror",
+        "stale_steer_tui_answer",
         "unacknowledged_own_reply",
         "final_attempt_own_reply",
     ],
@@ -1612,7 +1659,7 @@ def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     echoed_reply: str,
-    send_error: type[Exception],
+    send_error: Exception,
     echoing_send: int,
     mirror_stalls: bool,
 ) -> None:
@@ -1625,7 +1672,8 @@ def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
 
     :param echoed_reply: Tagged reply text in the echoed ``userMessage``.
     :param send_error: Failure from every send; ``TimeoutError`` is how an
-        unacknowledged send ends.
+        unacknowledged send ends, and a stale-turn rejection would otherwise
+        send the answer again to a newer or new turn.
     :param echoing_send: Send, counting from 1, during which Codex echoes.
     :param mirror_stalls: Whether posting the echo to the transcript stalls
         until delivery has ended.
@@ -1651,7 +1699,7 @@ def test_forwarder_stops_retrying_codex_async_question_answer_codex_echoes(
         if len(fake_client.requests) == echoing_send:
             echoing_send_started.set()
             await reply_echoed.wait()
-        raise send_error("app-server send failed")
+        raise send_error
 
     fake_client.request = fake_request  # type: ignore[method-assign]
     mirror_started = asyncio.Event()

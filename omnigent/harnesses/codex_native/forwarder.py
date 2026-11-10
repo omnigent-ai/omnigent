@@ -6779,20 +6779,21 @@ async def _send_codex_async_question_reply(
             state = read_bridge_state(bridge_dir) if bridge_dir is not None else None
             if state is not None and state.thread_id != question.thread_id:
                 state = None
-            if state is not None and (
-                state.pending_shell_command_id or state.active_shell_turn_id
-            ):
-                # A standalone shell turn accepts steered input without processing it.
-                _logger.info(
-                    "Codex async question answer waits for a shell command: item=%s",
-                    question.item_id,
-                )
-                continue
             async with asyncio.timeout(_CODEX_ASYNC_QUESTION_SEND_TIMEOUT_S):
-                await _send_codex_async_question_reply_once(
-                    codex_client, bridge_dir=bridge_dir, state=state, question=question, text=text
+                sent = await _send_codex_async_question_reply_once(
+                    codex_client,
+                    bridge_dir=bridge_dir,
+                    state=state,
+                    question=question,
+                    text=text,
+                    answered=answered,
                 )
-            return True
+            if sent:
+                return True
+            _logger.info(
+                "Codex async question answer waits for a shell command: item=%s",
+                question.item_id,
+            )
         except asyncio.CancelledError:
             raise
         except TimeoutError:
@@ -6818,7 +6819,8 @@ async def _send_codex_async_question_reply_once(
     state: CodexNativeBridgeState | None,
     question: _CodexAsyncQuestion,
     text: str,
-) -> None:
+    answered: Callable[[], bool],
+) -> bool:
     """
     Steer the active Codex turn with an async question reply, or start one.
 
@@ -6828,8 +6830,11 @@ async def _send_codex_async_question_reply_once(
         bridge does not track it.
     :param question: Answered Codex async question.
     :param text: Tagged reply text from :func:`_async_question_reply_text`.
-    :returns: None.
+    :param answered: Whether Codex has since echoed an answer to the question.
+    :returns: ``False`` when a shell command held the reply back, else ``True``.
     """
+    if _shell_command_running(state):
+        return False
     thread_id = question.thread_id
     input_items = [{"type": "text", "text": text}]
     tracked_bridge_dir: Path | None = None
@@ -6842,15 +6847,19 @@ async def _send_codex_async_question_reply_once(
                 "turn/steer",
                 {"threadId": thread_id, "expectedTurnId": expected_turn_id, "input": input_items},
             )
-            return
+            return True
         except CodexAppServerResponseError as error:
             if not is_stale_active_turn_error(error):
                 raise
         if tracked_bridge_dir is not None:
             clear_active_turn_id_if_matches(tracked_bridge_dir, expected_turn_id)
+        if answered():
+            return True  # Codex echoed an answer while the steer was pending.
     start_state = read_bridge_state(tracked_bridge_dir) if tracked_bridge_dir is not None else None
     if start_state is not None and start_state.thread_id != thread_id:
         start_state = None
+    if _shell_command_running(start_state):
+        return False
     if start_state is not None and start_state.active_turn_id:
         # Steer a turn that started before this re-read, not the rejected one.
         await codex_client.request(
@@ -6861,7 +6870,7 @@ async def _send_codex_async_question_reply_once(
                 "input": input_items,
             },
         )
-        return
+        return True
     # A turn started meanwhile absorbs this input instead of starting another.
     response = await codex_client.request(
         "turn/start",
@@ -6881,6 +6890,17 @@ async def _send_codex_async_question_reply_once(
         except OSError:
             # Codex already accepted the reply, so a retry would send it twice.
             _logger.warning("Codex async question turn not recorded: %s", turn_id, exc_info=True)
+    return True
+
+
+def _shell_command_running(state: CodexNativeBridgeState | None) -> bool:
+    """
+    Report whether the bridge records a shell command, whose turn drops steered input.
+
+    :param state: Bridge state for the asking thread, or ``None``.
+    :returns: ``True`` while a shell command is pending or its turn is running.
+    """
+    return state is not None and bool(state.pending_shell_command_id or state.active_shell_turn_id)
 
 
 async def _handle_turn_started(
