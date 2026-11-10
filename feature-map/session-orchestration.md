@@ -81,12 +81,19 @@ MCP independent creation.
   it once per session. An open sidebar regroups without a
   reload; a collapsed folder stays collapsed. Filing, renaming and pinning
   change only how the session is listed, so running sessions, including the
-  caller, keep their turn. Archiving stops the target's runner, as the
-  sidebar's Archive does, so the caller cannot archive itself.
-  `sys_project_update` renames a project or sets or clears its emoji icon,
-  keeping its other stored defaults. `sys_project_delete` deletes a project
-  only when no unarchived session is filed in it, unlike the sidebar's delete,
-  which archives the members first. Sub-agents follow their parent and a
+  caller, keep their turn. Archiving stops the target and its running
+  sub-agents, as the sidebar's Archive does, so the server refuses an
+  agent-tool archive of the caller or any session it runs under (its parent
+  chain or a side chat's source), and the tool also refuses a session on the
+  caller's runner. `sys_project_update` renames a project or sets or clears
+  its emoji icon, keeping its other stored defaults; like the sidebar's
+  rename it re-files sessions that still belong through the legacy label,
+  promotes a label-only folder to a project row, and reports any session it
+  could not move. `sys_project_delete` deletes a project only when no
+  unarchived session is filed in it, unlike the sidebar's delete, which
+  archives the members first; it walks every page of members, since the list
+  drops side chats after paging, and removes archived members from the
+  project before deleting the row. Sub-agents follow their parent and a
   family follows its representative for filing; each refusal names the
   session to update instead. An edit-shared caller cannot change a project or
   create, rename or delete one, or rename, pin or archive a session, while
@@ -98,7 +105,8 @@ MCP independent creation.
   drops all four tools. Covered by
   `tests/server/integration/test_session_orchestration_projects.py::test_project_tools_list_and_file_running_sessions`,
   `::test_organizing_tools_rename_pin_archive_and_manage_projects`,
-  `::test_organizing_tools_refuse_a_source_shared_with_edit_access`
+  `::test_organizing_tools_refuse_a_source_shared_with_edit_access`,
+  `::test_a_child_cannot_archive_its_rebound_parent`
   and the browser journeys in
   `tests/e2e_ui/sessions/test_agent_files_sessions_into_projects.py`.
 - `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding
@@ -128,9 +136,12 @@ MCP independent creation.
   word in their title or transcript, rename a project or give it an emoji, or
   delete an emptied project; the sidebar reflects each change live.
 - In a native Claude Code session's Chat or agent terminal, ask the same; the
-  relay exposes `mcp__omnigent__sys_project_list` and
-  `mcp__omnigent__sys_session_update`, and the session lands in its folder
-  mid-turn (`test_native_claude_files_itself_into_a_project`, nightly).
+  relay exposes `mcp__omnigent__sys_project_list`,
+  `mcp__omnigent__sys_session_update`, `mcp__omnigent__sys_project_update` and
+  `mcp__omnigent__sys_project_delete`, and the session lands in its folder
+  mid-turn (`test_native_claude_files_itself_into_a_project`, nightly). Cursor
+  and Antigravity sessions reach the same four tools through their relay
+  allowlists, which approve them without an in-terminal prompt.
 - Use the existing Share dialog to share the sender or receiver, then repeat.
   A read-only share of the sender keeps both tools working; an edit share
   refuses them.

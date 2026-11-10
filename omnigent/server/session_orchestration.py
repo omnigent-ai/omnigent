@@ -99,6 +99,37 @@ def require_private_bound_source(
     return source
 
 
+def require_archive_outside_source_lineage(
+    request: Request, session_id: str, conversations: ConversationStore
+) -> None:
+    """
+    Refuse an agent-tool archive of its calling session or any session it runs under.
+
+    Archiving stops the target and its running sub-agent descendants, so a
+    caller archiving an ancestor (its parent, even after the parent moved to
+    another runner, or a side chat's source) would stop itself. Requests
+    without the orchestration-source header are left alone.
+    """
+    raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+    if not raw_source:
+        return
+    target = normalize_uuid(session_id)
+    source_id = normalize_uuid(raw_source)
+    current = conversations.get_conversation(source_id) if source_id else None
+    seen: set[str] = set()
+    while current is not None and current.id not in seen and len(seen) < 32:
+        if current.id == target:
+            raise OmnigentError(
+                "An agent cannot archive its own session or a session it runs under",
+                code=ErrorCode.FORBIDDEN,
+            )
+        seen.add(current.id)
+        next_id = current.parent_conversation_id
+        if next_id is None and current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+            next_id = current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+        current = conversations.get_conversation(next_id) if next_id else None
+
+
 def require_named_source_private(
     request: Request,
     user_id: str | None,

@@ -242,6 +242,7 @@ from omnigent.server.schemas import (
     UpdateSessionRequest,
 )
 from omnigent.server.session_orchestration import (
+    require_archive_outside_source_lineage,
     require_named_source_private,
     require_orchestration_source,
 )
@@ -3188,6 +3189,10 @@ def register_core_routes(
             conversation_store,
             permission_store,
         )
+        if body.archived is True:
+            await asyncio.to_thread(
+                require_archive_outside_source_lineage, request, session_id, conversation_store
+            )
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store

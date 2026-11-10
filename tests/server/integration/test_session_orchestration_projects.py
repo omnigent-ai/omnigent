@@ -450,3 +450,27 @@ async def test_organizing_tools_refuse_a_source_shared_with_edit_access(
     assert not any(key.startswith("omnigent.pinned") for key in saved.labels)
     (project,) = (await auth_client.get("/v1/projects")).json()["data"]
     assert project == {**project, "id": project_id, "name": "Shared folder"}
+
+
+@_ONE_ENVIRONMENT
+async def test_a_child_cannot_archive_its_rebound_parent(auth_client, peers, db_uri):
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=source["id"]
+    )
+    # The parent moved to another runner while the child stayed on the original.
+    auth_client.headers.update(_bind_runner(db_uri, child.id))
+    store.clear_runner_id(source["id"])
+    assert store.set_runner_id(source["id"], "rebound-runner")
+
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_update",
+            arguments=json.dumps({"session_id": source["id"], "archived": True}),
+            server_client=auth_client,
+            conversation_id=child.id,
+        )
+    )
+    assert "cannot archive its own session or a session it runs under" in result["error"], result
+    assert store.get_conversation(source["id"]).archived is not True

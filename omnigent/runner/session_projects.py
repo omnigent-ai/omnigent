@@ -23,6 +23,8 @@ _DEFAULT_LISTED_SESSIONS = 50
 _SNAPSHOT_PARAMS = {"include_items": "false", "include_liveness": "false"}
 _CONCURRENT_NAME_READS = 8
 _SESSION_UPDATE_FIELDS = ("project", "title", "pinned", "archived")
+# Upper bound on pages walked when resolving a project or listing its members.
+_MAX_LOOKUP_PAGES = 20
 # /v1/info flags: the first covers only project filing, the second every other
 # organizing write (session title/pin/archive, project rename/icon/delete).
 _MOVE_SOURCE_CHECKS = "session_move_source_checks"
@@ -68,12 +70,100 @@ async def resolve_project_id(
 
 
 async def _find_project(client: httpx.AsyncClient, name: str) -> dict[str, Any] | None:
-    """Return the caller's project named exactly *name*, or ``None``."""
-    resp = await client.get("/v1/projects", timeout=30.0)
-    if resp.status_code >= 400:
-        raise ValueError(f"could not list projects: {resp.text[:200]}")
-    projects = resp.json().get("data", [])
-    return next((p for p in projects if p.get("name") == name and p.get("id")), None)
+    """Return the caller's project named exactly *name*, or ``None``, reading bounded pages."""
+    after: str | None = None
+    for _ in range(_MAX_LOOKUP_PAGES):
+        params: dict[str, str | int] = {"limit": MAX_LISTED_SESSIONS}
+        if after:
+            params["after"] = after
+        resp = await client.get("/v1/projects", params=params, timeout=30.0)
+        if resp.status_code >= 400:
+            raise ValueError(f"could not list projects: {resp.text[:200]}")
+        page = resp.json()
+        match = next(
+            (p for p in page.get("data", []) if p.get("name") == name and p.get("id")), None
+        )
+        if match is not None:
+            return match
+        after = page.get("last_id")
+        if not page.get("has_more") or not after:
+            return None
+    raise ValueError("could not list projects: too many to search")
+
+
+async def _project_members(
+    client: httpx.AsyncClient, name: str
+) -> tuple[list[dict[str, Any]], bool]:
+    """
+    Return the owner's sessions filed under *name*, archived included, and whether
+    the walk finished.
+
+    The sessions route drops rows (side chats) after paging, so an empty page
+    with ``has_more`` proves nothing; the walk follows the cursor to the end.
+    """
+    members: dict[str, dict[str, Any]] = {}
+    after: str | None = None
+    for _ in range(_MAX_LOOKUP_PAGES):
+        params: dict[str, str | int] = {
+            "visibility": "mine",
+            "include_archived": "true",
+            "project": name,
+            "limit": MAX_LISTED_SESSIONS,
+        }
+        if after:
+            params["after"] = after
+        resp = await client.get("/v1/sessions", params=params, timeout=30.0)
+        if resp.is_error:
+            raise ValueError(f"could not list the project's sessions: HTTP {resp.status_code}")
+        page = resp.json()
+        for row in page.get("data", []):
+            if isinstance(row.get("id"), str):
+                members[row["id"]] = row
+        after = page.get("last_id")
+        if not page.get("has_more") or not after:
+            return list(members.values()), True
+    return list(members.values()), False
+
+
+async def _refile_members(
+    client: httpx.AsyncClient,
+    members: list[dict[str, Any]],
+    *,
+    project_id: str,
+    headers: dict[str, str],
+) -> tuple[int, list[str]]:
+    """
+    File each member into *project_id* (``""`` unfiles) and clear its legacy label.
+
+    Matches the sidebar's rename and delete sweeps: only family representatives
+    are patched, since the rest of a family follows them.
+
+    :returns: ``(moved, failed)``: how many sessions were patched, and the ids
+        that could not be.
+    """
+    moved = 0
+    failed: list[str] = []
+    for member in members:
+        representative = (member.get("family") or {}).get("representative_id")
+        if representative and representative != member["id"]:
+            continue
+        labels = member.get("labels") or {}
+        if (member.get("project_id") or "") == project_id and not labels.get(PROJECT_LABEL_KEY):
+            continue
+        try:
+            response = await client.patch(
+                f"/v1/sessions/{member['id']}",
+                json={"project_id": project_id, "labels": {PROJECT_LABEL_KEY: ""}},
+                headers=headers,
+                timeout=30.0,
+            )
+            if response.is_error:
+                failed.append(member["id"])
+            else:
+                moved += 1
+        except httpx.HTTPError:
+            failed.append(member["id"])
+    return moved, failed
 
 
 def _same_session(left: str | None, right: str | None) -> bool:
@@ -570,9 +660,21 @@ async def execute_project_update(
         return json.dumps({"error": "sys_project_update requires an authenticated runner"})
     if not await _server_checks_source(client, _ORGANIZE_SOURCE_CHECKS):
         return _unchecked_server_error("sys_project_update", "a project")
+    headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
     project, error = await _owned_project(client, "sys_project_update", current_name)
     if project is None:
-        return json.dumps({"project": current_name, "error": error})
+        # A folder can exist only through its sessions' legacy label; promote it to
+        # a project row, as the sidebar does, so it can be renamed or given an icon.
+        try:
+            members, _ = await _project_members(client, current_name)
+            if not members:
+                return json.dumps({"project": current_name, "error": error})
+            promoted_id, _ = await resolve_project_id(client, current_name, headers=headers)
+            project = await _find_project(client, current_name)
+        except (httpx.HTTPError, ValueError) as exc:
+            return json.dumps({"project": current_name, "error": f"sys_project_update: {exc}"})
+        if project is None or project.get("id") != promoted_id:
+            return json.dumps({"project": current_name, "error": error})
     payload: dict[str, Any] = {}
     if new_name is not None and new_name != project.get("name"):
         payload["name"] = new_name
@@ -589,7 +691,7 @@ async def execute_project_update(
             response = await client.patch(
                 f"/v1/projects/{project['id']}",
                 json=payload,
-                headers={ORCHESTRATION_SOURCE_HEADER: source_id},
+                headers=headers,
                 timeout=30.0,
             )
         except httpx.HTTPError as exc:
@@ -601,7 +703,30 @@ async def execute_project_update(
                 {"project": current_name, "error": _project_refusal(response, new_name)}
             )
         status = "updated"
+    # Sessions that still belong through the legacy label follow the project row,
+    # so after a rename they would stay behind in a folder under the old name.
+    try:
+        stragglers, complete = await _project_members(client, current_name)
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps(
+            {
+                "project": new_name or current_name,
+                "status": status,
+                "error": f"project updated, but its sessions could not be checked: {exc}",
+            }
+        )
+    moved, not_moved = await _refile_members(
+        client, stragglers, project_id=str(project["id"]), headers=headers
+    )
+    if moved:
+        status = "updated"
+    if not_moved:
+        status = "partial"
     result: dict[str, Any] = {"project": new_name or current_name, "status": status}
+    if not_moved:
+        result["sessions_not_moved"] = not_moved
+    if not complete:
+        result["warning"] = "the project has too many sessions to check them all"
     if new_name is not None and new_name != current_name:
         result["previous_name"] = current_name
     if "icon" in args:
@@ -633,28 +758,39 @@ async def execute_project_delete(
     project, error = await _owned_project(client, "sys_project_delete", name)
     if project is None:
         return json.dumps({"project": name, "error": error})
+    headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
     try:
-        members = await client.get(
-            "/v1/sessions",
-            params={"visibility": "mine", "project": name, "limit": 1},
-            timeout=30.0,
-        )
-        if members.is_error:
-            return json.dumps({"project": name, "error": _project_refusal(members, None)})
-        if members.json().get("data"):
-            return json.dumps(
-                {
-                    "project": name,
-                    "error": "project still has sessions; move or archive them with "
-                    "sys_session_update first (sys_project_list with this project lists them)",
-                }
-            )
-        response = await client.delete(
-            f"/v1/projects/{project['id']}",
-            headers={ORCHESTRATION_SOURCE_HEADER: source_id},
-            timeout=30.0,
-        )
+        members, complete = await _project_members(client, name)
     except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps({"project": name, "error": f"sys_project_delete: {exc}"})
+    if not complete:
+        return json.dumps(
+            {"project": name, "error": "the project has too many sessions to check; not deleted"}
+        )
+    if any(member.get("archived") is not True for member in members):
+        return json.dumps(
+            {
+                "project": name,
+                "error": "project still has sessions; move or archive them with "
+                "sys_session_update first (sys_project_list with this project lists them)",
+            }
+        )
+    # Archived members would otherwise keep pointing at the deleted row.
+    _, not_unfiled = await _refile_members(client, members, project_id="", headers=headers)
+    if not_unfiled:
+        return json.dumps(
+            {
+                "project": name,
+                "error": "some archived sessions could not be removed from the project; "
+                "not deleted",
+                "sessions_not_moved": not_unfiled,
+            }
+        )
+    try:
+        response = await client.delete(
+            f"/v1/projects/{project['id']}", headers=headers, timeout=30.0
+        )
+    except httpx.HTTPError as exc:
         return json.dumps({"project": name, "error": f"delete could not be confirmed: {exc}"})
     if response.is_error:
         return json.dumps({"project": name, "error": _project_refusal(response, None)})

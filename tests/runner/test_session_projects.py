@@ -514,3 +514,102 @@ async def test_update_refuses_to_archive_a_session_on_the_callers_runner():
     assert "shares the calling session's runner" in result["error"]
     assert [r.url.path for r in requests if r.method == "GET"][-1] == f"/v1/sessions/{SOURCE}"
     assert not [r for r in requests if r.method == "PATCH"]
+
+
+def _paged_project_server(requests: list[httpx.Request], pages: list[list[dict]], *, rows=True):
+    """Project Q3 exists (when *rows*); its sessions are served across cursor *pages*."""
+    project = {"id": PROJECT_ID, "name": "Q3", "config": {}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/info":
+            return httpx.Response(200, json=ORGANIZE_INFO)
+        if path == "/v1/projects" and request.method == "GET":
+            return httpx.Response(200, json={"data": [project] if rows else []})
+        if path == "/v1/projects" and request.method == "POST":
+            return httpx.Response(200, json=project)
+        if path == "/v1/sessions":
+            index = int(request.url.params.get("after") or 0)
+            more = index + 1 < len(pages)
+            body = {"data": pages[index], "has_more": more, "last_id": str(index + 1)}
+            return httpx.Response(200, json=body)
+        return httpx.Response(200, json={})
+
+    return handler
+
+
+async def test_project_delete_follows_a_filtered_empty_page_to_the_active_member():
+    requests: list[httpx.Request] = []
+    pages = [[], [{"id": PARENT}]]
+    async with _client(_paged_project_server(requests, pages)) as client:
+        result = json.loads(await execute_project_delete({"project": "Q3"}, client, SOURCE))
+    assert "project still has sessions" in result["error"]
+    assert [r.url.params.get("after") for r in requests if r.url.path == "/v1/sessions"] == [
+        None,
+        "1",
+    ]
+    assert not [r for r in requests if r.method in ("PATCH", "DELETE")]
+
+
+async def test_project_delete_unfiles_archived_members_before_deleting():
+    requests: list[httpx.Request] = []
+    archived = {"id": PARENT, "archived": True, "project_id": PROJECT_ID}
+    async with _client(_paged_project_server(requests, [[archived]])) as client:
+        result = json.loads(await execute_project_delete({"project": "Q3"}, client, SOURCE))
+    assert result == {"project": "Q3", "status": "deleted"}
+    patched, deleted = [r for r in requests if r.method in ("PATCH", "DELETE")]
+    assert patched.url.path == f"/v1/sessions/{PARENT}"
+    assert json.loads(patched.content) == {"project_id": "", "labels": {"omni_project": ""}}
+    assert deleted.method == "DELETE" and deleted.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+
+
+async def test_project_rename_refiles_members_that_belong_through_the_legacy_label():
+    requests: list[httpx.Request] = []
+    members = [
+        {"id": PARENT, "labels": {"omni_project": "Q3"}},
+        {"id": FAMILY_MEMBER, "family": {"representative_id": PARENT}},
+        {"id": SUB_AGENT, "project_id": PROJECT_ID},
+    ]
+    async with _client(_paged_project_server(requests, [members])) as client:
+        result = json.loads(
+            await execute_project_update({"project": "Q3", "name": "Q4"}, client, SOURCE)
+        )
+    assert result == {"project": "Q4", "status": "updated", "previous_name": "Q3"}
+    swept = [r for r in requests if r.url.path == "/v1/sessions"]
+    assert swept[0].url.params["project"] == "Q3"
+    renamed, refiled = [r for r in requests if r.method == "PATCH"]
+    assert renamed.url.path == f"/v1/projects/{PROJECT_ID}"
+    assert refiled.url.path == f"/v1/sessions/{PARENT}"
+    assert refiled.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    assert json.loads(refiled.content) == {
+        "project_id": PROJECT_ID,
+        "labels": {"omni_project": ""},
+    }
+
+
+async def test_project_update_promotes_a_label_only_folder():
+    requests: list[httpx.Request] = []
+    rows = {"value": False}
+    base = _paged_project_server(requests, [[{"id": PARENT, "labels": {"omni_project": "Q3"}}]])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/projects" and request.method == "GET" and not rows["value"]:
+            requests.append(request)
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/projects" and request.method == "POST":
+            rows["value"] = True
+        return base(request)
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_project_update({"project": "Q3", "icon": "🧪"}, client, SOURCE)
+        )
+    assert result["status"] == "updated" and result["icon"] == "🧪"
+    (created,) = [r for r in requests if r.method == "POST"]
+    assert json.loads(created.content) == {"name": "Q3"}
+    assert created.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    assert [r.url.path for r in requests if r.method == "PATCH"] == [
+        f"/v1/projects/{PROJECT_ID}",
+        f"/v1/sessions/{PARENT}",
+    ]

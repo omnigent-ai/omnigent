@@ -170,7 +170,8 @@ class SysProjectUpdateTool(Tool):
             "Rename one of the user's projects or change its emoji icon, the same as the "
             "sidebar's project menu. Name the project as sys_project_list shows it, and "
             "pass only the fields to change. Its sessions stay in it, and running "
-            "sessions keep working."
+            "sessions keep working; status partial lists sessions_not_moved that "
+            "stayed under the old name."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -217,8 +218,8 @@ class SysProjectDeleteTool(Tool):
         return (
             "Delete one of the user's projects once no unarchived session is filed in "
             "it. Move or archive its sessions with sys_session_update first; a project "
-            "that still has sessions is refused. Archived sessions filed in it become "
-            "unfiled. Sessions are never deleted."
+            "that still has sessions is refused. Archived sessions filed in it are "
+            "removed from it first. Sessions are never deleted."
         )
 
     def get_schema(self) -> dict[str, Any]:
