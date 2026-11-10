@@ -3413,7 +3413,6 @@ function ComposerImpl(
           restoredSendDraft: {
             ...restoredSendDraft,
             ...unread,
-            replyDraft: kept?.replyDraft,
             delivered: false,
           },
         });
@@ -3425,7 +3424,7 @@ function ComposerImpl(
           pendingRetryStableId: kept.stableId,
         });
       }
-      const recalled = recallComposerDraft(unread.text, kept?.replyDraft);
+      const recalled = recallComposerDraft(unread.text, unread.replyDraft);
       replaceText(recalled.text, recalled.replyDraft);
       restoreTaggedMentionsRef.current({ files: [], sessions: recalled.sessions });
       attachmentsRef.current.replaceFiles(unread.files);

@@ -1794,6 +1794,9 @@ const inFlightSends = new Map<string, boolean>();
  */
 const stopReturnedSends = new Map<string, Set<string>>();
 
+/** The stable id of each open send kept for a reload (`rememberUnsentSend`), by bubble temp id. */
+const unsentSendIds = new Map<string, string>();
+
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
 // non-string key can never collide with a conversation id.
@@ -2919,6 +2922,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           authorId: senderId,
           ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
         });
+        unsentSendIds.set(tempId, stableId);
       }
       if (initialDraft && !(await waitForInitialDispatch(sessionId, tempId))) return;
 
@@ -3134,6 +3138,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         else if (verdict === "delivered") deliveredDespiteFailure = true;
         else unsettled = true;
       }
+      // The agent read it before the POST failed, so the composer must not keep it.
+      if (returnedByStop && deliveredDespiteFailure && draftSessionId !== null) {
+        setterFor(draftSessionId)((s) =>
+          updateReturnedParts(s, (parts) => {
+            const unread = parts.filter((part) => part.tempId !== tempId);
+            return unread.length < parts.length ? unread : null;
+          }),
+        );
+      }
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
@@ -3213,6 +3226,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } finally {
       inFlightSends.delete(stableId);
       stopReturnedSends.delete(tempId);
+      unsentSendIds.delete(tempId);
       if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
@@ -3388,7 +3402,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         return { failedSendDraft: withReturnedSteers(kept, sessionId, steers) };
       });
       for (const steer of steers) {
-        if (steer.posted !== true) stopReturnedSends.set(steer.tempId, new Set());
+        if (steer.posted === true) continue;
+        stopReturnedSends.set(steer.tempId, new Set());
+        // The composer's draft now carries it across a reload.
+        const unsentId = unsentSendIds.get(steer.tempId);
+        if (unsentId !== undefined) forgetUnsentSend(sessionId, unsentId);
       }
     }
     // A local follow-up must not prevent Interrupt from stopping earlier work.
@@ -8160,14 +8178,21 @@ function isUnreadSteer(p: PendingUserMessage): boolean {
   );
 }
 
-/** The composer text and attachments of the parts Stop handed back, in order. */
-export function joinReturnedParts(parts: readonly ReturnedPart[]): { text: string; files: File[] } {
+/** The composer draft of the parts Stop handed back, in order, reply cards included. */
+export function joinReturnedParts(parts: readonly ReturnedPart[]): {
+  text: string;
+  files: File[];
+  replyDraft: StoredReplyDraft | undefined;
+} {
+  // Joined as drafts, so the waiting draft's reply cards still frame only its own text.
+  const joined = parts
+    .filter((part) => part.text.trim() !== "")
+    .map((part) => restoreReplyDraft(part.text, part.draft?.replyDraft))
+    .reduce(appendReplyDraft, { quotes: [], text: "" });
   return {
-    text: parts
-      .map((part) => part.text)
-      .filter((text) => text.trim() !== "")
-      .join("\n\n"),
+    text: serializeReplyDraft(joined),
     files: parts.flatMap((part) => part.files),
+    replyDraft: snapshotReplyDraft(joined),
   };
 }
 
@@ -8205,7 +8230,6 @@ function withReturnedSteers(
     conversationId,
     ...joinReturnedParts(parts),
     returnedParts: parts,
-    replyDraft: keptDraft(parts)?.replyDraft,
     serverRefused: false,
     recovered: true,
   };
@@ -8235,7 +8259,6 @@ function updateReturnedParts(
           ...failed,
           ...joinReturnedParts(failedParts),
           returnedParts: failedParts,
-          replyDraft: keptDraft(failedParts)?.replyDraft,
         }
       : (keptDraft(failedParts) ?? null);
   }

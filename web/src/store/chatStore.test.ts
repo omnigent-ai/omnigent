@@ -7513,10 +7513,10 @@ describe("chatStore — stop", () => {
     expect(readConversationRows()[0]?.status).toBe("idle");
   });
 
-  const readSteer = (clearedPendingId: string, text: string) =>
+  const readSteer = (clearedPendingId: string, text: string, itemId = `item_${clearedPendingId}`) =>
     handleSessionEvent({
       type: "session_input_consumed",
-      itemId: `item_${clearedPendingId}`,
+      itemId,
       itemType: "message",
       clearedPendingId,
       data: { role: "user", content: [{ type: "input_text", text }] },
@@ -7579,10 +7579,14 @@ describe("chatStore — stop", () => {
 
   const failedEarlier = {
     conversationId: "conv_abc",
-    text: "failed earlier",
+    text: "> a quote\n\nfailed earlier",
     files: [],
     stableId: "c".repeat(32),
-    replyDraft: { version: 1 as const, quotes: [{ before: "", text: "a quote" }], text: "" },
+    replyDraft: {
+      version: 1 as const,
+      quotes: [{ before: "", text: "a quote" }],
+      text: "failed earlier",
+    },
     serverRefused: true,
   };
   const heldBubble = {
@@ -7614,7 +7618,7 @@ describe("chatStore — stop", () => {
 
       expect(useChatStore.getState().failedSendDraft).toMatchObject({
         text: `${kept.text}\n\nsteer`,
-        replyDraft: failed?.replyDraft,
+        replyDraft: failed ? { ...failed.replyDraft, text: "failed earlier\n\nsteer" } : undefined,
         recovered: true,
       });
       readSteer("pi_1", "steer");
@@ -7667,7 +7671,17 @@ describe("chatStore — stop", () => {
     { outcome: "read after its POST answers", readEarly: false, answer: "accepted" },
     { outcome: "read before its POST answers", readEarly: true, answer: "accepted" },
     { outcome: "kept when its POST fails", readEarly: false, answer: "failed" },
-    { outcome: "kept once when read before its POST fails", readEarly: true, answer: "failed" },
+    {
+      outcome: "kept when an unmatched read precedes its failed POST",
+      readEarly: true,
+      answer: "failed",
+    },
+    {
+      outcome: "dropped when its own receipt precedes its failed POST",
+      readEarly: true,
+      readOwn: true,
+      answer: "failed",
+    },
     {
       outcome: "kept, not requeued, when the host is offline",
       readEarly: false,
@@ -7679,8 +7693,10 @@ describe("chatStore — stop", () => {
       answer: "offline",
       queued: true,
     },
-  ])("returns a steer still posting at Stop, $outcome", async ({ readEarly, answer, queued }) => {
+  ])("returns a steer still posting at Stop, $outcome", async (testCase) => {
+    const { readEarly, readOwn, answer, queued } = testCase;
     let answerPost: ((response: Response) => void) | null = null;
+    let steerStableId: string | undefined;
     fetchMock.mockImplementation((input, init) => {
       const url = String(input);
       if (url.endsWith("/conv_existing/resources/files"))
@@ -7689,10 +7705,13 @@ describe("chatStore — stop", () => {
           name: "notes.txt",
           metadata: { filename: "notes.txt" },
         });
-      if (url.endsWith("/conv_existing/events") && String(init?.body).includes("steer"))
+      const event = url.endsWith("/conv_existing/events") ? JSON.parse(String(init?.body)) : null;
+      if (event?.type === "message") {
+        steerStableId = event.data.stable_id;
         return new Promise<Response>((resolve) => {
           answerPost = resolve;
         });
+      }
       return defaultFetchHandler(input, init);
     });
     const notes = new File(["notes"], "notes.txt");
@@ -7729,7 +7748,7 @@ describe("chatStore — stop", () => {
       recovered: true,
     });
     await vi.waitFor(() => expect(answerPost).not.toBeNull());
-    if (readEarly) readSteer("pi_late", "late steer");
+    if (readEarly) readSteer("pi_late", "late steer", readOwn ? steerStableId : undefined);
     const responses = {
       accepted: () => mockResponse({ queued: true, pending_id: "pi_late" }),
       offline: () => mockResponse({ error: { code: "host_offline" } }, { ok: false, status: 503 }),
@@ -7746,7 +7765,7 @@ describe("chatStore — stop", () => {
       readSteer("pi_late", "late steer");
     }
     expect(useChatStore.getState().failedSendDraft).toEqual(
-      answer === "accepted" ? null : returned,
+      answer === "accepted" || readOwn ? null : returned,
     );
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
@@ -23274,6 +23293,39 @@ describe("a send cut off by a reload", () => {
       abort!();
       await sending;
       expect(peekUnsentSend("conv_existing")?.text).toBe("rerun the failing test");
+    } finally {
+      window.dispatchEvent(new Event("pageshow"));
+    }
+  });
+
+  it("leaves a steer Stop hands to the composer to the composer's draft on reload", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+      status: "streaming",
+    });
+    let abort: (() => void) | undefined;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && abort === undefined) {
+        return new Promise<Response>((_, reject) => {
+          abort = () => reject(new TypeError("Failed to fetch"));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sending = useChatStore.getState().send("change of plan", "agent_xyz");
+    await vi.waitFor(() => expect(abort).toBeDefined());
+    expect(peekUnsentSend("conv_existing")?.text).toBe("change of plan");
+    useChatStore.getState().stop();
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: "change of plan" });
+    window.dispatchEvent(new Event("pagehide"));
+    try {
+      abort!();
+      await sending;
+      expect(peekUnsentSend("conv_existing")).toBeNull();
     } finally {
       window.dispatchEvent(new Event("pageshow"));
     }
