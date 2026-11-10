@@ -4351,7 +4351,7 @@ async def test_alive_runner_ids_preserves_exit_reporting(tmp_path: Path, forked:
         alive_proc.wait()
 
 
-def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
+def test_cleanup_runners_terminates_all(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """
     Verify that _cleanup_runners terminates every tracked runner.
 
@@ -4359,6 +4359,7 @@ def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
     If any runner survives, the host leaves orphaned processes.
     """
     host = _make_host_process()
+    caplog.set_level(logging.INFO, logger="omnigent.host.connect")
     procs = []
     for name in ("runner_a", "runner_b", "runner_c"):
         proc = subprocess.Popen(
@@ -4366,8 +4367,18 @@ def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        host._runners[name] = _RunnerHandle(proc=proc, log_path=tmp_path / f"{name}.log")
+        host._runners[name] = _RunnerHandle(
+            proc=proc,
+            log_path=tmp_path / f"{name}.log",
+            session_id=f"session_{name}",
+            create_time=123.0,
+        )
         procs.append(proc)
+    exited = subprocess.Popen(["true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    exited.wait()
+    host._runners["runner_exited"] = _RunnerHandle(
+        proc=exited, log_path=tmp_path / "runner-exited.log"
+    )
 
     host._cleanup_runners()
 
@@ -4375,6 +4386,74 @@ def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
     for proc in procs:
         assert proc.poll() is not None, f"Runner pid={proc.pid} should be dead after cleanup"
     # Tracking dict should be empty.
+    assert host._runners == {}
+    rows = [
+        row
+        for row in caplog.records
+        if getattr(row, "event_name", None) == "host_runner_stop_requested"
+    ]
+    assert len(rows) == 3
+    for row, proc, name in zip(rows, procs, ("runner_a", "runner_b", "runner_c"), strict=True):
+        assert row.session_id == f"session_{name}"
+        assert row.attributes == {
+            "host_id": "host_test_connect",
+            "host_pid": os.getpid(),
+            "runner_id": name,
+            "runner_pid": proc.pid,
+            "runner_create_time": 123.0,
+            "action": "terminate",
+            "reason": "host_shutdown",
+            **({"signal_name": "SIGTERM"} if os.name == "posix" else {}),
+        }
+
+
+@pytest.mark.parametrize("is_posix", [True, False])
+def test_cleanup_runners_reports_timeout_before_killing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    is_posix: bool,
+) -> None:
+    """A runner that misses the shutdown deadline records the escalation before it is killed."""
+    host = _make_host_process()
+    monkeypatch.setattr("omnigent.host.connect.IS_POSIX", is_posix)
+    caplog.set_level(logging.INFO, logger="omnigent.host.connect")
+    proc = Mock(spec=subprocess.Popen, pid=42)
+    proc.poll.return_value = None
+    proc.wait.side_effect = subprocess.TimeoutExpired("runner", 5)
+    requests_before_actions: list[str] = []
+    proc.terminate.side_effect = lambda: requests_before_actions.append(
+        caplog.records[-1].attributes["action"]
+    )
+    proc.kill.side_effect = lambda: requests_before_actions.append(
+        caplog.records[-1].attributes["action"]
+    )
+    host._runners["runner_slow"] = _RunnerHandle(
+        proc=proc, log_path=tmp_path / "runner-slow.log", session_id="session_slow"
+    )
+
+    host._cleanup_runners()
+
+    assert requests_before_actions == ["terminate", "kill"]
+    rows = [
+        row
+        for row in caplog.records
+        if getattr(row, "event_name", None) == "host_runner_stop_requested"
+    ]
+    assert [row.attributes["reason"] for row in rows] == ["host_shutdown", "shutdown_timeout"]
+    assert [row.levelno for row in rows] == [logging.INFO, logging.WARNING]
+    for row, signal_name in zip(rows, ("SIGTERM", "SIGKILL"), strict=True):
+        assert row.session_id == "session_slow"
+        assert row.attributes["host_id"] == "host_test_connect"
+        assert row.attributes["host_pid"] == os.getpid()
+        assert row.attributes["runner_id"] == "runner_slow"
+        assert row.attributes["runner_pid"] == 42
+        assert "runner_create_time" not in row.attributes
+        if is_posix:
+            assert row.attributes["signal_name"] == signal_name
+        else:
+            assert "signal_name" not in row.attributes
+    proc.wait.assert_called_once_with(timeout=5.0)
     assert host._runners == {}
 
 

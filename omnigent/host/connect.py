@@ -5327,14 +5327,55 @@ class HostProcess:
         """
         for runner_id, handle in self._runners.items():
             if handle.proc.poll() is None:
-                _logger.info("Terminating runner %s on shutdown", runner_id)
+                _logger.info(
+                    "Terminating runner %s on shutdown",
+                    runner_id,
+                    extra=self._runner_stop_event(
+                        runner_id, handle, action="terminate", reason="host_shutdown"
+                    ),
+                )
                 handle.proc.terminate()
-        for handle in self._runners.values():
+        for runner_id, handle in self._runners.items():
             try:
                 handle.proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
+                _logger.warning(
+                    "Killing runner %s after shutdown timed out",
+                    runner_id,
+                    extra=self._runner_stop_event(
+                        runner_id, handle, action="kill", reason="shutdown_timeout"
+                    ),
+                )
                 handle.proc.kill()
         self._runners.clear()
+
+    def _runner_stop_event(
+        self,
+        runner_id: str,
+        handle: _RunnerHandle,
+        *,
+        action: Literal["terminate", "kill"],
+        reason: str,
+    ) -> dict[str, object]:
+        attributes: dict[str, object] = {}
+        if IS_POSIX:
+            attributes["signal_name"] = "SIGTERM" if action == "terminate" else "SIGKILL"
+        if handle.create_time is not None:
+            attributes["runner_create_time"] = handle.create_time
+        event = debug_event(
+            "host_runner_stop_requested",
+            session_id=handle.session_id,
+        )
+        event["attributes"] = {
+            "host_id": self._identity.host_id,
+            "host_pid": os.getpid(),
+            "runner_id": runner_id,
+            "runner_pid": handle.proc.pid,
+            "action": action,
+            "reason": reason,
+            **attributes,
+        }
+        return event
 
     async def _connect_and_serve(self) -> None:
         """Single connection attempt: connect, hello, serve.
